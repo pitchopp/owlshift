@@ -290,7 +290,7 @@ D1, D2, D3, D5, D7, D10 and D11 are agreed; five decisions remain open, none of 
 | --- | --- | --- | --- |
 | D1 | Build from scratch or extend Sortie | Build Owlshift from scratch (decided 2026-09-27): Sortie is too small a base to be worth extending, and the three bets would rewrite its core anyway. Its `WORKFLOW.md` format and adapter pitfalls stay worth reading | Agreed |
 | D2 | Core language and desktop stack | A native Rust binary on every machine; a Tauri 2 app in P11; Docker only for servers and sandboxing | Agreed |
-| D3 | Product name | Owlshift, hosted on the maintainer's personal GitHub account; `owlshift.dev` to check | Agreed |
+| D3 | Product name | Owlshift, hosted on the maintainer's personal GitHub account; `owlshift.dev` not registered according to the `.dev` registry (2026-09-28, [check C6](build-plan.md#results)) | Agreed |
 | D4 | First adapter set (P1 to P5) | Tracker: Linear. Forge: GitHub. Harnesses: Claude Code for building, Codex for reviewing | Open |
 | D5 | Config format | TOML (decided 2026-09-27): a product-owned `owlshift.toml` for pipeline, routing and policy; importing a Symphony-style `WORKFLOW.md` stays an optional later addition | Agreed |
 | D6 | Second validation project for P9 | A project on another stack, ideally on GitHub Issues; to name | Open |
