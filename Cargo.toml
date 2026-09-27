@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/pitchopp/owlshift"
+publish = false
+
+[workspace.dependencies]
+owlshift-core = { path = "crates/owlshift-core" }
+owlshift-contracts = { path = "crates/owlshift-contracts" }
+owlshift-adapters = { path = "crates/owlshift-adapters" }
+owlshift-platform = { path = "crates/owlshift-platform" }
+owlshift-runner = { path = "crates/owlshift-runner" }

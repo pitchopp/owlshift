@@ -1,0 +1,9 @@
+[package]
+name = "owlshift-core"
+description = "Owlshift domain model and decisions: pure functions, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
