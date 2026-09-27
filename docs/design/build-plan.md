@@ -91,27 +91,29 @@ Everything runs in the foreground; `resume` arrives in P2, `watch` in P3, the ba
 
 ## P0 tasks & exit gate
 
+Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its blockers recorded as relations.
+
 - [x] Create the repository with its licence (2026-09-27)
-- [ ] Set up the Owlshift Linear workspace: team `OWL`, states including Needs Input and Triage, labels, one project per step
-- [ ] Run checks C1, C3, C6 and C7 (Claude part) and record the results
-- [ ] Settle decision D10 (contribution terms); add the contribution guide
-- [ ] Cargo workspace with the six crates; CI matrix on macOS, Linux and Windows (format, lint, tests)
-- [ ] Write the contracts and generate their JSON Schemas
-- [ ] Core: model, state machine, scheduler skeleton, policy floor, with unit tests
-- [ ] Fake harness, test tracker, local bare remote and scenario runner; one scenario end to end
-- [ ] CLI: `--version`, `doctor`, `config show`
+- [x] OWL-5 · Set up the Owlshift Linear workspace: team `OWL`, states including Needs Input and Triage, labels, one project per step (2026-09-27)
+- [ ] OWL-6 · Run checks C1, C3, C6 and C7 (Claude part) and record the results
+- [ ] OWL-7 · Settle decision D10 (contribution terms); add the contribution guide
+- [ ] OWL-8 · Cargo workspace with the six crates; CI matrix on macOS, Linux and Windows (format, lint, tests)
+- [ ] OWL-9 · Write the contracts and generate their JSON Schemas
+- [ ] OWL-10 · Core: model, state machine, scheduler skeleton, policy floor, with unit tests
+- [ ] OWL-11 · Fake harness, test tracker, local bare remote and scenario runner; one scenario end to end
+- [ ] OWL-12 · CLI: `--version`, `doctor`, `config show`
 
 **Exit gate.** CI green on the three platforms; one scenario runs end to end with the fake harness and the test tracker; `owlshift doctor` reports the maintainer's machine correctly.
 
 ## P1 tasks & exit gate
 
-- [ ] Linear tracker adapter: read a ticket, post a comment, with recorded fixtures and a conformance suite
-- [ ] Claude Code harness adapter: headless run on the user's login, model, effort, permission level, usage capture
-- [ ] Executor: worktree, brief, spawn, process-tree stop, result validation, isolation check
-- [ ] Gate commands from the project config before delivery
-- [ ] GitHub forge adapter: push the branch, open the PR, read the complete check set
-- [ ] Writer: delivery report on the ticket
-- [ ] Default build role prompt
-- [ ] CLI: `init`, `do`, `logs`
+- [ ] OWL-13 · Linear tracker adapter: read a ticket, post a comment, with recorded fixtures and a conformance suite
+- [ ] OWL-14 · Claude Code harness adapter: headless run on the user's login, model, effort, permission level, usage capture
+- [ ] OWL-15 · Executor: worktree, brief, spawn, process-tree stop, result validation, isolation check
+- [ ] OWL-16 · Gate commands from the project config before delivery
+- [ ] OWL-17 · GitHub forge adapter: push the branch, open the PR, read the complete check set
+- [ ] OWL-18 · Writer: delivery report on the ticket
+- [ ] OWL-19 · Default build role prompt
+- [ ] OWL-20 · CLI: `init`, `do`, `logs`
 
 **Exit gate.** Three real Owlshift tickets delivered as PRs by `owlshift do` on the maintainer's subscription, with no guardrail breach.

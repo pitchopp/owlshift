@@ -22,6 +22,10 @@ Design phase. Nothing to install yet. The design is in [`docs/design/`](docs/des
 | [Roadmap](docs/design/roadmap.md) | Twelve shippable steps, P0 to P11, with their exit gates |
 | [Build plan](docs/design/build-plan.md) | Checks to run first, workspace layout, contracts, CLI, tasks for P0 and P1 |
 
+## Project tracking
+
+The backlog lives in a Linear workspace (team `OWL`), with one project per roadmap step. It moves to public GitHub issues when the repository opens (step P9).
+
 ## License
 
 [Apache-2.0](LICENSE).
