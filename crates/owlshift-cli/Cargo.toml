@@ -1,0 +1,16 @@
+[package]
+name = "owlshift-cli"
+description = "The owlshift command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "owlshift"
+path = "src/main.rs"
+
+[dependencies]
+owlshift-runner.workspace = true

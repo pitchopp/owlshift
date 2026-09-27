@@ -1,0 +1,15 @@
+[package]
+name = "owlshift-runner"
+description = "Owlshift runner: the daemon that drives tickets through their pipelines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+owlshift-core.workspace = true
+owlshift-contracts.workspace = true
+owlshift-adapters.workspace = true
+owlshift-platform.workspace = true

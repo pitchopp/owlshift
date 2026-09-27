@@ -8,13 +8,19 @@ Until the repository opens publicly (roadmap step P9), work items live in the ma
 
 ## Development
 
-The Rust toolchain and the exact commands are set up with the Cargo workspace (issue OWL-8). The gate every change must pass, locally and in CI on macOS, Linux and Windows:
+Owlshift is a Cargo workspace; its crates live in `crates/`. Install [rustup](https://rustup.rs/): the toolchain is pinned in `rust-toolchain.toml`, and rustup installs that exact version, with rustfmt and clippy, the first time you run `cargo` in the repository.
+
+The gate every change must pass, locally and in CI on macOS, Linux and Windows:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
+
+CI adds `--locked` to the clippy and test steps, so a change to a `Cargo.toml` must come with its updated `Cargo.lock`.
+
+`owlshift-core` performs no I/O. `crates/owlshift-core/clippy.toml` lists the standard library's file, network, process, environment, standard-stream and clock entry points, and the clippy step fails on any use of them in that crate.
 
 ## Branches and pull requests
 

@@ -1,0 +1,95 @@
+# owlshift-core stays pure: no I/O of any kind (see docs/design/build-plan.md).
+# Clippy reads this file for this crate only; `cargo clippy -- -D warnings`
+# turns every use below into an error. The lists catch direct uses of the
+# standard library's I/O entry points; they are a guardrail, not a proof.
+# To check the guard after editing it, add a throwaway function calling a few
+# of the entries below to src/lib.rs and run
+# `cargo clippy -p owlshift-core -- -D warnings`: each call must be an error.
+
+disallowed-types = [
+    { path = "std::fs::File", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::OpenOptions", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::ReadDir", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::DirEntry", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::Metadata", reason = "owlshift-core does no file I/O" },
+    { path = "std::net::TcpStream", reason = "owlshift-core does no network I/O" },
+    { path = "std::net::TcpListener", reason = "owlshift-core does no network I/O" },
+    { path = "std::net::UdpSocket", reason = "owlshift-core does no network I/O" },
+    { path = "std::process::Command", reason = "owlshift-core spawns no process" },
+    { path = "std::process::Child", reason = "owlshift-core spawns no process" },
+    { path = "std::io::Stdin", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::io::Stdout", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::io::Stderr", reason = "owlshift-core does not touch the standard streams" },
+]
+
+disallowed-methods = [
+    # Files and directories.
+    { path = "std::fs::read", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::read_to_string", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::write", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::read_dir", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::metadata", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::symlink_metadata", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::exists", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::canonicalize", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::create_dir", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::create_dir_all", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::remove_file", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::remove_dir", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::remove_dir_all", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::copy", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::rename", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::hard_link", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::set_permissions", reason = "owlshift-core does no file I/O" },
+    { path = "std::fs::read_link", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::exists", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::try_exists", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::is_file", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::is_dir", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::is_symlink", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::metadata", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::symlink_metadata", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::read_dir", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::read_link", reason = "owlshift-core does no file I/O" },
+    { path = "std::path::Path::canonicalize", reason = "owlshift-core does no file I/O" },
+    # Network.
+    { path = "std::net::TcpStream::connect", reason = "owlshift-core does no network I/O" },
+    { path = "std::net::TcpListener::bind", reason = "owlshift-core does no network I/O" },
+    { path = "std::net::UdpSocket::bind", reason = "owlshift-core does no network I/O" },
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "owlshift-core resolves no host name" },
+    # Processes.
+    { path = "std::process::Command::new", reason = "owlshift-core spawns no process" },
+    { path = "std::process::exit", reason = "owlshift-core returns errors, it does not exit" },
+    { path = "std::process::abort", reason = "owlshift-core returns errors, it does not abort" },
+    # Environment.
+    { path = "std::env::var", reason = "configuration is passed in, not read from the environment" },
+    { path = "std::env::var_os", reason = "configuration is passed in, not read from the environment" },
+    { path = "std::env::vars", reason = "configuration is passed in, not read from the environment" },
+    { path = "std::env::vars_os", reason = "configuration is passed in, not read from the environment" },
+    { path = "std::env::set_var", reason = "owlshift-core does not change the environment" },
+    { path = "std::env::remove_var", reason = "owlshift-core does not change the environment" },
+    { path = "std::env::args", reason = "arguments are parsed by the CLI" },
+    { path = "std::env::args_os", reason = "arguments are parsed by the CLI" },
+    { path = "std::env::current_dir", reason = "paths are passed in, not read from the process" },
+    { path = "std::env::set_current_dir", reason = "owlshift-core does not change the process state" },
+    { path = "std::env::current_exe", reason = "paths are passed in, not read from the process" },
+    { path = "std::env::temp_dir", reason = "paths are passed in, not read from the process" },
+    { path = "std::env::home_dir", reason = "paths are passed in, not read from the process" },
+    # Standard streams.
+    { path = "std::io::stdin", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::io::stdout", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::io::stderr", reason = "owlshift-core does not touch the standard streams" },
+    # Clock: the current time is an input of the core, never read by it.
+    { path = "std::time::SystemTime::now", reason = "the current time is passed in, not read" },
+    { path = "std::time::Instant::now", reason = "the current time is passed in, not read" },
+    { path = "std::time::SystemTime::elapsed", reason = "the current time is passed in, not read" },
+    { path = "std::time::Instant::elapsed", reason = "the current time is passed in, not read" },
+]
+
+disallowed-macros = [
+    { path = "std::print", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::println", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::eprint", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::eprintln", reason = "owlshift-core does not touch the standard streams" },
+    { path = "std::dbg", reason = "owlshift-core does not touch the standard streams" },
+]
