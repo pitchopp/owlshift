@@ -36,9 +36,9 @@ Native binary on every developer machine; Windows goes through WSL2 first; Docke
 
 | Platform | Support | Background service | Notes |
 | --- | --- | --- | --- |
-| macOS | First class from v0 | A user LaunchAgent, label `dev.owlshift.daemon` | Minimum macOS version to set (D12) |
-| Linux | First class from v0: CI and servers | A systemd unit (user on desktops, system on servers) | Also the Docker image base |
-| Windows | Through WSL2 from v1, running as Linux | systemd inside WSL, or a logon task that starts it | Native Windows later, on demand |
+| macOS | First class from P0 | A user LaunchAgent, label `dev.owlshift.daemon` | Minimum macOS version to set (D12) |
+| Linux | First class from P0: CI and servers | A systemd unit (user on desktops, system on servers) | Also the Docker image base |
+| Windows | Through WSL2 from P1, running as Linux | systemd inside WSL, or a logon task that starts it | Native Windows later, on demand |
 
 **Why WSL2 first on Windows.** The risk is not Owlshift's own code but what it launches: project tooling (Makefiles, bash scripts) rarely runs on native Windows, and native support of each harness CLI and its sandbox must be checked one by one. Native Windows adds Job Objects for process trees, paths over 260 characters in worktrees, files locked while open, and antivirus slowing git.
 
@@ -79,7 +79,7 @@ Prerequisites: git, and at least one harness CLI installed and logged in (`claud
 
 **Where files live.** Platform-standard directories: Application Support on macOS, the XDG directories on Linux. Worktrees live under Owlshift's data directory, one per project and ticket, never inside the user's checkout. Tracker and forge secrets live in the system keychain: macOS Keychain, Secret Service on Linux, Credential Manager on Windows. Model credentials stay with each harness CLI.
 
-With the Tauri app (v4), start at login should go through the operating system's app login-item mechanism, so deleting the app removes it; to verify when the app is built.
+With the Tauri app (P11), start at login should go through the operating system's app login-item mechanism, so deleting the app removes it; to verify when the app is built.
 
 ## Updates & versions
 
@@ -148,7 +148,7 @@ always_human = ["billing", "auth"]   # adds to the floor, never removes
 
 ## Observability & the local web UI
 
-Every action is a recorded event, readable from the CLI from v0 and from a local web UI from v2; the tray app of v4 wraps that same UI instead of rebuilding it.
+Every action is a recorded event, readable from the CLI from P1 and from a local web UI from P8; the tray app of P11 wraps that same UI instead of rebuilding it.
 
 **Events and logs.** Each scan, decision, dispatch, run start and end, usage, gate and tracker write is a structured event in the local store. Each run's full harness output is captured to its own log file. On the ticket, comments give the human-readable trace.
 
@@ -164,7 +164,7 @@ Every action is a recorded event, readable from the CLI from v0 and from a local
 
 `why` is the most useful of them: a scheduler that cannot explain a wait looks broken.
 
-**The local web UI (v2)** is served by the daemon on `127.0.0.1` only, protected by a per-install token so no website open in the browser can drive it. It is identical on every platform and reachable on a server through an SSH tunnel.
+**The local web UI (P8)** is served by the daemon on `127.0.0.1` only, protected by a per-install token so no website open in the browser can drive it. It is identical on every platform and reachable on a server through an SSH tunnel.
 
 - **Overview:** tickets ready, running, waiting for a human, in review, and what blocks what.
 - **Ticket:** the stage timeline, each run with its live log, usage and result, the questions and answers.
@@ -172,7 +172,7 @@ Every action is a recorded event, readable from the CLI from v0 and from a local
 - **Config:** the effective configuration with the origin of each value and validation errors; an edit writes to the file.
 - **Controls:** pause, resume, retry or cancel a run, release a claim.
 
-**The tray app (v4)** is a Tauri shell around the same UI, adding the menu-bar icon, native notifications and the login item.
+**The tray app (P11)** is a Tauri shell around the same UI, adding the menu-bar icon, native notifications and the login item.
 
 **Telemetry:** none sent anywhere. An OpenTelemetry export can be switched on by a team for its own collector.
 
@@ -188,7 +188,7 @@ Almost everything is tested without network or tokens; the parts that touch the 
 | Live services | A sandbox tracker workspace and a test GitHub repository | Nightly |
 | Harness CLIs | Contract tests with a tiny real prompt against the latest CLI releases, on the maintainer's subscription | Nightly |
 | Operating-system integration | Service install and uninstall leave nothing behind (checked against the manifest); a process tree is fully stopped; an expired lease is taken over | Every commit, on macOS, Linux and Windows runners |
-| Real use | v1 on the first adopter's backlog | Continuous |
+| Real use | Owlshift's own backlog from P1, Locary's from P5 | Continuous |
 
 The fake harness is the keystone: it makes the needs-input loop, re-asks, crashes and usage-limit fallbacks reproducible without consuming a subscription.
 

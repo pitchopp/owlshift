@@ -19,7 +19,8 @@ Design phase. Nothing to install yet. The design is in [`docs/design/`](docs/des
 | [Design & architecture](docs/design/architecture.md) | Positioning, principles, core model, pipeline and gates, architecture, adapters, state and coordination, policy, cost, technology, milestones, decisions |
 | [Scenarios](docs/design/scenarios.md) | Seventeen user stories with acceptance criteria; each becomes an end-to-end test |
 | [Runtime & operations](docs/design/runtime-and-operations.md) | How it runs, platforms, install and uninstall, updates, configuration, observability, testing |
-| [v0 build plan](docs/design/v0-build-plan.md) | Checks to run first, workspace layout, contracts, CLI, task list and exit gate |
+| [Roadmap](docs/design/roadmap.md) | Twelve shippable steps, P0 to P11, with their exit gates |
+| [Build plan](docs/design/build-plan.md) | Checks to run first, workspace layout, contracts, CLI, tasks for P0 and P1 |
 
 ## License
 

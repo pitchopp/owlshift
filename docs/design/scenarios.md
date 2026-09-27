@@ -1,6 +1,6 @@
 # Owlshift — scenarios
 
-Status: draft, 2026-09-27. Seventeen user stories fix the product's behaviour from v0 to v4; each acceptance line is meant to become an end-to-end test on the Markdown tracker with a fake harness.
+Status: draft, 2026-09-27. Seventeen user stories fix the product's behaviour from P1 to P10 ([roadmap](roadmap.md) maps each one to its step); each acceptance line is meant to become an end-to-end test on the Markdown tracker with a fake harness.
 
 ## Nominal flow
 

@@ -2,3 +2,4 @@
 *.swp
 .DS_Store
 /.owlshift/worktrees/
+.env

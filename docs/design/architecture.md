@@ -1,6 +1,6 @@
 # Owlshift — design & architecture
 
-Status: draft, 2026-09-27. Companion documents: [scenarios](scenarios.md), [runtime & operations](runtime-and-operations.md), [v0 build plan](v0-build-plan.md).
+Status: draft, 2026-09-27. Companion documents: [scenarios](scenarios.md), [runtime & operations](runtime-and-operations.md), [roadmap](roadmap.md), [build plan](build-plan.md).
 
 Owlshift is an open-source runner that works a team's existing backlog continuously with coding agents, and brings a human in only where a decision is theirs, on the ticket, in the tracker they already use.
 
@@ -139,15 +139,15 @@ One event, end to end:
 4. **Writer** applies the result: comments, state transitions, follow-up proposals, the PR. It is the only component with write access to the tracker and forge, and it asks **Policy** before each write.
 5. Artifacts and the checkpoint go to the git remote; cost and run history go to the **Local store** (SQLite); the **Notifier** fires only when a human has become the blocker.
 
-**Deployment.** One runner process per machine serves several projects, with machine-wide caps (concurrent runs, the single browser slot, port ranges). A local API serves the CLI, the local web UI (v2) and the desktop app (v4). The same binary runs on a team server; since shared state lives in the tracker and git, moving from a laptop to a server needs no migration.
+**Deployment.** One runner process per machine serves several projects, with machine-wide caps (concurrent runs, the single browser slot, port ranges). A local API serves the CLI, the local web UI (P8) and the desktop app (P11). The same binary runs on a team server; since shared state lives in the tracker and git, moving from a laptop to a server needs no migration.
 
 ## 6. Adapters & contracts
 
 Five adapter kinds, each declaring its capabilities; `init` refuses a project whose adapters miss a required capability and applies a documented fallback for each optional one.
 
-| Kind | What the core needs | v1 | Kept in mind |
+| Kind | What the core needs | First (P1 to P5) | Kept in mind |
 | --- | --- | --- | --- |
-| Tracker | Tickets, comments, visible stage (table below) | Linear; Markdown files in the repo | GitHub Issues next; GitLab, Jira, Plane |
+| Tracker | Tickets, comments, visible stage (table below) | Linear; a test tracker in the repo | GitHub Issues and the public Markdown tracker in P9; GitLab, Jira, Plane |
 | Forge | Open a PR, read the complete check set and review comments, push branches and custom refs, read merge state | GitHub | GitLab, Gitea, Bitbucket |
 | Harness | Run one role headless in a directory through the vendor's own CLI and its existing login, with a model, an effort and a permission level; honour the result-file contract; report usage and usage limits | Claude Code, Codex | OpenCode, Gemini CLI; a third one on paper before the contract freezes |
 | Notifier | Send one short line to one person | Tracker mention; a generic webhook | Chat apps, e-mail, push services |
@@ -268,7 +268,7 @@ The costs: slower first iterations than TypeScript, and fewer casual contributor
 | TypeScript core + Electron app | Fastest to write, largest contributor pool | A Node runtime to ship, a heavy app, weaker as a long-running supervisor |
 | SwiftUI app + WinUI app over a shared core | Truly native widgets on each platform | Two UI codebases for one maintainer |
 
-**What the app is for.** A tray companion, not a second tracker: how many questions wait for me, answering a gate inline (posted to the ticket through the Writer, so the tracker stays the record), approving a plan next to its diff, runner health and spend. v1 does not need it: the tracker and notifications are enough.
+**What the app is for.** A tray companion, not a second tracker: how many questions wait for me, answering a gate inline (posted to the ticket through the Writer, so the tracker stays the record), approving a plan next to its diff, runner health and spend. The steps before P11 do not need it: the tracker and notifications are enough.
 
 **Distribution.** Binaries on GitHub Releases, Homebrew, winget and `cargo install`; signed installers once the app exists (Apple notarisation and Windows code signing carry a yearly cost to plan).
 
@@ -276,35 +276,27 @@ The costs: slower first iterations than TypeScript, and fewer casual contributor
 
 ## 11. Scope & milestones
 
-Five milestones, each closed by evidence rather than by a date; v1 is the bet, the human decision loop working on one real project. Exit criteria below are proposals.
+Twelve small steps, P0 to P11, each shippable and usable on its own; the full list, exit gates and scenario coverage are in the [roadmap](roadmap.md). P2, the question loop on the ticket, is the bet; parallelism waits until P6 because a serial drain cannot collide.
 
-| Milestone | Content | Exit gate |
-| --- | --- | --- |
-| v0 · Foundations | Core model, config schema, Markdown tracker, Claude Code harness, result contract, isolation checks | A sample ticket goes from intake to a green PR on the Markdown tracker |
-| **v1 · The decision loop on one real project** | Linear and GitHub adapters, Codex reviewers, gates with answer check, follow-up inbox; runner started by hand | 10 real tickets delivered, 3 of them through multi-round gates, no guardrail breach |
-| v2 · Unattended | Background service, claims and leases, resource scheduling, caps, budgets, notifications, local web UI | 7 days unattended with no double dispatch and no collision |
-| v3 · Proof of neutrality | GitHub Issues adapter, Codex as builder, a second project on another stack, conformance suites, `init` detection | The second project adopts with configuration only, no change to the core |
-| v4 · Teams and the app | Several developers, identity map, team-server mode, adapter protocol, Tauri tray app | Two developers share one project for two weeks |
-
-The first adopter is Locary (Linear, GitHub, a Django and Next.js stack), whose Linear team already has a Needs Input state and Triage enabled since 2026-09-21. The second project for v3 is still to be chosen (decision D6); without it, neutrality stays a claim.
+Owlshift works on its own backlog, in a dedicated Linear workspace, from P1; the first external adopter is Locary (Linear, GitHub, a Django and Next.js stack) from P5, whose Linear team already has a Needs Input state and Triage enabled since 2026-09-21. The second project for P9 is still to be chosen (decision D6); without it, neutrality stays a claim.
 
 **Out of scope for now:** merging automatically, a hosted service, a board or UI competing with the tracker, version control other than git, running third-party adapters in-process, telemetry of any kind.
 
 ## 12. Decisions
 
-D1, D2, D3, D5, D7 and D11 are agreed; six decisions remain open, none of them blocking v0. Also settled: open source under Apache-2.0, repository content in English, tracker, forge and harness as adapters.
+D1, D2, D3, D5, D7 and D11 are agreed; six decisions remain open, none of them blocking P0. Also settled: open source under Apache-2.0, repository content in English, tracker, forge and harness as adapters.
 
 | # | Decision | Outcome or recommendation | Status |
 | --- | --- | --- | --- |
 | D1 | Build from scratch or extend Sortie | Build Owlshift from scratch (decided 2026-09-27): Sortie is too small a base to be worth extending, and the three bets would rewrite its core anyway. Its `WORKFLOW.md` format and adapter pitfalls stay worth reading | Agreed |
-| D2 | Core language and desktop stack | A native Rust binary on every machine; a Tauri 2 app in v4; Docker only for servers and sandboxing | Agreed |
+| D2 | Core language and desktop stack | A native Rust binary on every machine; a Tauri 2 app in P11; Docker only for servers and sandboxing | Agreed |
 | D3 | Product name | Owlshift, hosted on the maintainer's personal GitHub account; `owlshift.dev` to check | Agreed |
-| D4 | v1 adapter set | Trackers: Linear and Markdown. Forge: GitHub. Harnesses: Claude Code for building, Codex for reviewing | Open |
+| D4 | First adapter set (P1 to P5) | Tracker: Linear. Forge: GitHub. Harnesses: Claude Code for building, Codex for reviewing | Open |
 | D5 | Config format | TOML (decided 2026-09-27): a product-owned `owlshift.toml` for pipeline, routing and policy; importing a Symphony-style `WORKFLOW.md` stays an optional later addition | Agreed |
-| D6 | Second validation project for v3 | A project on another stack, ideally on GitHub Issues; to name | Open |
-| D7 | Default runner location | The developer's machine; a team server is a v4 mode | Agreed |
-| D8 | Agent identity on Linear in v1 | Create a Linear app user, after check C4 confirms it works with polling and no public webhook endpoint; the `[agent]` marker otherwise | Open |
-| D9 | Windows scope | WSL2 from v1; native Windows only when a user needs it | Open |
+| D6 | Second validation project for P9 | A project on another stack, ideally on GitHub Issues; to name | Open |
+| D7 | Default runner location | The developer's machine; a team server is a P10 mode | Agreed |
+| D8 | Agent identity on Linear from P2 | Create a Linear app user, after check C4 confirms it works with polling and no public webhook endpoint; the `[agent]` marker otherwise | Open |
+| D9 | Windows scope | WSL2 from P1; native Windows only when a user needs it | Open |
 | D10 | Contribution terms | Developer Certificate of Origin sign-off on commits, no CLA: light for contributors, authorship still traced | Open |
 | D11 | Where the code lives | `~/Projects/owlshift`, on the personal GitHub account (`pitchopp/owlshift`), no dedicated organisation | Agreed |
 | D12 | Minimum supported systems | Set at the first release: the two latest macOS versions, the current Ubuntu LTS, Windows 11 with WSL2 | Open |
