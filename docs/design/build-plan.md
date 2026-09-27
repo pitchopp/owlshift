@@ -16,6 +16,35 @@ Seven assumptions carry the design; each is checked with a real call before the 
 | C6 | `owlshift` is free where it matters: crates.io and npm were free on 2026-09-27; the GitHub name `owlshift` is taken, so the repository lives on the maintainer's personal account (`pitchopp/owlshift`), and `owlshift.dev` still needs a registrar check | D3 | Registrar check | P0 |
 | C7 | Each provider's terms allow unattended headless use of a personal subscription through its own CLI; each CLI reports a reached usage limit in a detectable way (message, reset time, exit status) | Subscription-first design, S10, S17 | Read the current terms; trigger or capture a limit message for each CLI | P0 for Claude, P5 for Codex |
 
+### Results
+
+Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS. Account identifiers are left out on purpose.
+
+**C1 — passed, with one guardrail finding.** Seven tiny `claude -p` runs in a linked worktree of a scratch repository, each launched with `env -i HOME PATH USER LANG`: no `ANTHROPIC_API_KEY`, no `ANTHROPIC_BASE_URL`, no parent session variables.
+
+- Login: `claude auth status` reports `authMethod: claude.ai` on a Max subscription; the stream's `init` event reports `apiKeySource: none`.
+- `--model haiku` and `--model sonnet` reach the named model (`modelUsage`). `--effort` is applied: the same prompt used 0 thinking tokens at `low` and 2,389 at `max`.
+- `--permission-mode dontAsk` denied Write and Bash (`permission_denials`, no file created); `acceptEdits` wrote the file inside the worktree. `--json-schema` returns the object in `structured_output`.
+- Failure: an unknown model exits with status 1 and `is_error: true`, `api_error_status: 404`, `terminal_reason: "api_error"`, yet `subtype: "success"`. The harness adapter reads `is_error` and the exit status, never `subtype`.
+- `--bare` cannot be used: according to `claude --help`, its authentication is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper`, and the subscription login (OAuth, keychain) is never read.
+- **Guardrail finding.** By default a headless run loads the user's own configuration: hooks, `CLAUDE.md`, plugins and every MCP server, including claude.ai connectors to Linear, Slack and Gmail. That hands the agent tracker credentials, against the rule that agents get none. Verified mitigation, in one of the seven runs: with `--setting-sources project,local --strict-mcp-config`, the `init` event lists no MCP server, no user hook fires (the default run showed hook events), and the run succeeds on the subscription login (`apiKeySource: none`). Credentials outside Claude Code, such as the `gh` login in the system keyring, stay reachable from the agent's shell; the executor (OWL-15) has to close that path too.
+
+**C3 — passed.** On GitHub (`pitchopp/owlshift`, over SSH), 8 runners pushed concurrently to the same ref in each round, each with its own commit, and only under `refs/owlshift/check-c3/`:
+
+- Create, 5 rounds: `git push --porcelain --force-with-lease=<ref>: origin <commit>:<ref>` (empty expected value: the ref must not exist). Each round had exactly one `[new reference]`, and the remote ref then held the winner's commit. All 35 losers were rejected by the server: `[remote rejected] (cannot lock ref '<ref>': reference already exists)`.
+- Takeover, 3 rounds: the ref was first set to a stale lease, then all 8 runners pushed with `--force-with-lease=<ref>:<stale-oid>`. Each round had exactly one `(forced update)`. All 21 losers got `[remote rejected] (cannot lock ref '<ref>': is at <winner-oid> but expected <stale-oid>)`, which also names the new holder.
+- GitHub accepts refs outside `refs/heads` and `refs/tags`. All 8 test refs were deleted afterwards, and `git ls-remote origin 'refs/owlshift/*'` returns nothing.
+- Why this is a compare-and-swap: the push carries the expected old value with the new one (the zero id for "must not exist"). The server compares it with the current value under the ref lock and writes only on a match, so the check and the write are one step. A check made by the client alone would not do: every loser here was rejected by the server, after another runner's write had landed, a case a client-side check cannot see. GitHub's storage backend is not visible from outside, so for GitHub the evidence is the observed behaviour above, not its internals.
+- The rejection text differs from a plain bare repository, where the same races (10 create rounds, 5 takeover rounds, one winner each) gave `(reference already exists)` and `(incorrect old value provided)`. The forge adapter decides from the exit status and the per-ref `!` status of `--porcelain`, never from the text.
+
+**C6 — passed for registration.** The `.dev` registry's RDAP service (`https://pubapi.registry.google/rdap/domain/owlshift.dev`, where `rdap.org` redirects) answers 404 "owlshift.dev not found", while `google.dev` returns a domain record; `.dev` has no whois server. So the name is not registered. Whether a registrar prices it as premium or the registry reserves it shows only at checkout; the registrar search pages tried render availability in JavaScript only.
+
+**C7 (Claude) — terms: ambiguous, leaning permitted. Usage limit: detectable.**
+
+- Terms, read on 2026-09-28; a reading, not a legal conclusion. The [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) (effective October 8, 2025), section 3 "Use of our Services", forbid accessing the Services "through automated or non-human means", except with an API key "or where we otherwise explicitly permit it". The Claude Code [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance) forbids third-party developers "to route requests through Free, Pro, or Max plan credentials on behalf of their users", but does not prevent a user "signing in to the unmodified Claude Code binary with their own Claude subscription"; it adds that advertised limits "assume ordinary, individual usage". The help-center article [15036540](https://support.claude.com/en/articles/15036540) (June 2026) says `claude -p` still draws "from your subscription's usage limits", so headless use on a subscription is an anticipated, metered use. Owlshift sits on the permitted side of these lines: the user's own login, the unmodified `claude` binary, no credential handled or routed by Owlshift. Residual risk: whether an unattended runner working through a queue still counts as "ordinary, individual usage", and the same article announces a change to how Agent SDK and `claude -p` usage is counted, paused on June 15, 2026. P0 proceeds; a change to either page reopens this check.
+- Usage limit: the [error reference](https://code.claude.com/docs/en/errors) documents the message `You've hit your session limit · resets 3:45pm` (also weekly, Opus and Sonnet limits). The [Agent SDK reference](https://code.claude.com/docs/en/agent-sdk/typescript) documents a `rate_limit_event` whose `status` is `allowed`, `allowed_warning` or `rejected`, with `resetsAt` in epoch seconds, and an assistant error `rate_limit` for a 429 against the quota. Live: every `--output-format stream-json` run above emitted a `rate_limit_event` (`status: "allowed"`, `resetsAt`, `rateLimitType: "five_hour"`, utilisation of the five-hour and seven-day windows). Logged: headless sessions on this machine (entrypoint `sdk-cli`, Claude Code 2.1.251, 2026-08-29 and 30) recorded the limit as a synthetic assistant message with `error: "rate_limit"`, `apiErrorStatus: 429` and the text `You've hit your session limit · resets 2pm (<time zone>)`. The runner therefore reads the limit and its reset time from the stream, not from the message text.
+- Open item: the exit status and the final `result` record of `claude -p` when a limit is reached were not observed; the subscription was not exhausted on purpose. OWL-14 and OWL-15 record them the first time a real run hits a limit. The failure case above (status 1, `is_error: true`, `api_error_status`) is the likely shape, not a verified one.
+
 ## Repository & workspace layout
 
 One repository, a Cargo workspace of six crates split along the design's boundaries, so the pure core never depends on I/O.
@@ -95,7 +124,7 @@ Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its bl
 
 - [x] Create the repository with its licence (2026-09-27)
 - [x] OWL-5 · Set up the Owlshift Linear workspace: team `OWL`, states including Needs Input and Triage, labels, one project per step (2026-09-27)
-- [ ] OWL-6 · Run checks C1, C3, C6 and C7 (Claude part) and record the results
+- [x] OWL-6 · Run checks C1, C3, C6 and C7 (Claude part) and record the results (2026-09-28)
 - [x] OWL-7 · Settle decision D10 (contribution terms: DCO, 2026-09-28); add the contribution guide
 - [ ] OWL-8 · Cargo workspace with the six crates; CI matrix on macOS, Linux and Windows (format, lint, tests)
 - [ ] OWL-9 · Write the contracts and generate their JSON Schemas
