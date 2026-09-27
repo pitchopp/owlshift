@@ -96,7 +96,7 @@ Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its bl
 - [x] Create the repository with its licence (2026-09-27)
 - [x] OWL-5 · Set up the Owlshift Linear workspace: team `OWL`, states including Needs Input and Triage, labels, one project per step (2026-09-27)
 - [ ] OWL-6 · Run checks C1, C3, C6 and C7 (Claude part) and record the results
-- [ ] OWL-7 · Settle decision D10 (contribution terms); add the contribution guide
+- [x] OWL-7 · Settle decision D10 (contribution terms: DCO, 2026-09-28); add the contribution guide
 - [ ] OWL-8 · Cargo workspace with the six crates; CI matrix on macOS, Linux and Windows (format, lint, tests)
 - [ ] OWL-9 · Write the contracts and generate their JSON Schemas
 - [ ] OWL-10 · Core: model, state machine, scheduler skeleton, policy floor, with unit tests

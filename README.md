@@ -26,6 +26,10 @@ Design phase. Nothing to install yet. The design is in [`docs/design/`](docs/des
 
 The backlog lives in a Linear workspace (team `OWL`), with one project per roadmap step. It moves to public GitHub issues when the repository opens (step P9).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Every commit carries a Developer Certificate of Origin sign-off (`git commit -s`).
+
 ## License
 
 [Apache-2.0](LICENSE).
