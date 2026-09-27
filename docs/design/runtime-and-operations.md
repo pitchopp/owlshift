@@ -1,0 +1,209 @@
+# Owlshift — runtime & operations
+
+Status: draft, 2026-09-27. Owlshift ships as one native binary that runs as a light background service on each machine, with a CLI and a local web UI on top; Docker is for servers and optional sandboxing only.
+
+## How it runs
+
+One process per machine, `owlshift daemon`, started by the operating system's service manager, serves every adopted project; it runs no model itself.
+
+**Every cycle** (about 60 seconds, configurable):
+
+1. One query per tracker for tickets changed since the last cursor, one per forge for PR and check changes.
+2. A comparison with the local store: an answer posted, a ticket ready, a blocker cleared, a PR merged or red.
+3. Nothing to do: it waits for the next cycle, using no CPU and zero tokens. Its memory footprint is expected in the tens of megabytes, to be measured.
+
+**When there is work:**
+
+1. It creates a worktree and writes the brief.
+2. It spawns the harness CLI (`claude -p …` or `codex exec …`) as a child process, inside a process group on macOS and Linux and a Job Object on Windows, so the whole process tree can be stopped.
+3. It streams the harness output to a per-run log file and waits.
+4. It validates `result.json`, checks isolation, and hands the result to the Writer.
+
+**Harness authentication is the CLI's own.** The child process inherits the user's normal CLI configuration, so a run consumes the user's own Claude or ChatGPT subscription, exactly as if they had typed the command. Owlshift never asks for, stores or passes a model API key; a user who prefers API billing configures it in the CLI itself, and Owlshift does not need to know.
+
+**Around it:**
+
+- **Single instance.** A lock allows one daemon per machine; a newer binary asks the running one to drain and exit.
+- **Control channel.** A Unix socket (macOS, Linux) or a named pipe (Windows) serves the CLI, the web UI and later the app.
+- **Usage limits.** When a CLI reports that the subscription's usage limit is reached, the daemon records the reset time it reports, pauses that harness until then, and routes roles to their fallback. The interrupted run resumes from its checkpoint after the reset.
+- **Sleep.** A sleeping machine freezes the daemon; on wake it catches up. A run cut off mid-way loses nothing: its lease expires and the ticket resumes from the last pushed checkpoint.
+- **Keep awake, optional.** While a run is active, a power assertion (the mechanism behind `caffeinate` on macOS) prevents idle sleep; released when runs end.
+- **Webhooks** are an optional speed-up on a server with a public address; polling always works.
+
+## Platforms
+
+Native binary on every developer machine; Windows goes through WSL2 first; Docker is for servers and optional sandboxing, never the desktop default.
+
+| Platform | Support | Background service | Notes |
+| --- | --- | --- | --- |
+| macOS | First class from v0 | A user LaunchAgent, label `dev.owlshift.daemon` | Minimum macOS version to set (D12) |
+| Linux | First class from v0: CI and servers | A systemd unit (user on desktops, system on servers) | Also the Docker image base |
+| Windows | Through WSL2 from v1, running as Linux | systemd inside WSL, or a logon task that starts it | Native Windows later, on demand |
+
+**Why WSL2 first on Windows.** The risk is not Owlshift's own code but what it launches: project tooling (Makefiles, bash scripts) rarely runs on native Windows, and native support of each harness CLI and its sandbox must be checked one by one. Native Windows adds Job Objects for process trees, paths over 260 characters in worktrees, files locked while open, and antivirus slowing git.
+
+**Why not Docker on desktops.**
+
+- Docker Desktop runs a permanent Linux VM that reserves gigabytes of memory, against tens of megabytes for the daemon, and must be running for Owlshift to work.
+- Worktrees, git operations and dependency installs are markedly slower through the VM's shared folders.
+- Harness CLIs are logged in to the user's subscription on the host (on macOS, in the Keychain); a container would need copied tokens.
+- Many projects already use Docker: an agent in a container would need Docker-in-Docker or the host's Docker socket, which is root-equivalent access.
+- No notifications, tray icon, keep-awake or real browser from a container.
+- Docker Desktop requires a paid subscription in companies above 250 employees or USD 10 million revenue, a brake for an open-source tool.
+
+**Where Docker fits.**
+
+1. **Server mode:** an official image and a compose file for a Linux server, where there is no VM overhead. The harness CLIs are logged in inside the server once, as on any machine.
+2. **Optional sandbox per project:** each run in a disposable container, a layer of defence on top of the harnesses' own sandboxes, worth it for public repositories.
+
+## Install, lifecycle & uninstall
+
+Four commands cover the whole life of an install, and uninstalling removes exactly what was installed, because background services that outlive their binary are the classic failure of this kind of tool.
+
+```bash
+brew install owlshift        # or cargo install, or the Linux install script
+owlshift init                # in each repository to adopt
+owlshift start --at-login    # plain `start` runs for this session only
+owlshift uninstall --purge   # --purge also removes history and worktrees
+```
+
+Prerequisites: git, and at least one harness CLI installed and logged in (`claude`, `codex`). Owlshift reuses that login, so the user's own subscription.
+
+**Against lingering services:**
+
+1. **Start at login is opt-in.** `start` alone runs for the session; `start --at-login` installs the service and says so.
+2. **An install manifest** lists every service file, data directory, worktree and keychain entry Owlshift creates; `uninstall` removes exactly that list. `--purge` never touches repositories or tickets.
+3. **A self-healing launcher.** The service starts a thin launcher that first checks the binary still exists; if not, it removes its own service definition and exits instead of failing in a loop.
+4. **Visible and findable.** A stable label (`launchctl list | grep owlshift`), shown in macOS Login Items; `owlshift doctor` lists any leftover and offers to clean it.
+5. **One instance.** A lock prevents two daemons, including an old and a new version, from running at once.
+
+**Where files live.** Platform-standard directories: Application Support on macOS, the XDG directories on Linux. Worktrees live under Owlshift's data directory, one per project and ticket, never inside the user's checkout. Tracker and forge secrets live in the system keychain: macOS Keychain, Secret Service on Linux, Credential Manager on Windows. Model credentials stay with each harness CLI.
+
+With the Tauri app (v4), start at login should go through the operating system's app login-item mechanism, so deleting the app removes it; to verify when the app is built.
+
+## Updates & versions
+
+One update path per install method, a restart that never loses work, and a version number on every format that outlives a binary.
+
+**The binary.**
+
+- Installed by a package manager: `brew upgrade owlshift`. Installed by hand: `owlshift self-update`, which downloads a signed release and verifies its checksum. `self-update` refuses on a package-managed install and points to the package manager, so the two never fight.
+- The service points to a stable path (`/opt/homebrew/bin/owlshift`), never to a versioned directory, so an upgrade cannot break it.
+- Graceful restart: stop dispatching, let running roles finish or checkpoint, exit; the service manager starts the new binary. Safe because state lives in the tracker, git and SQLite.
+- Rollback: the previous version stays installable (`brew install owlshift@0.4`), and the local store is backed up before each migration.
+- Semantic versioning; releases are tagged, signed and carry a changelog.
+
+**Formats that outlive a binary.**
+
+| Format | Protection |
+| --- | --- |
+| Project file | `requires = ">=0.4"`: a teammate with an older binary gets a clear error |
+| Local store (SQLite) | Migrated at start, backed up first |
+| Claims, artifacts, marked comments | Carry a format version; a runner refuses a ticket written by a newer incompatible version and says "upgrade" |
+| Brief and `result.json` | Versioned contract between the runner and every role prompt |
+
+**Harness CLIs update themselves, silently.** A flag can disappear between two days (`codex review` stopped accepting `-m`), and so can the wording of a usage-limit message. So every run records the harness version; `owlshift doctor` flags a version never tested; a nightly CI job runs the harness contract tests against the latest CLI releases, so a breaking change is caught upstream of users.
+
+## Configuration
+
+Configuration is plain text in two files plus the keychain; every screen that edits it later writes to those same files, which stay the reviewable record.
+
+**`owlshift init`** detects the stack (`package.json`, `pyproject.toml`, `Makefile`, `Cargo.toml`…), connects the tracker (OAuth where offered, else a token), stores tracker and forge secrets in the system keychain, writes a commented project file, and registers the project with the daemon. It checks that the harness CLIs are logged in; it never asks for a model API key.
+
+| Layer | Where | Holds |
+| --- | --- | --- |
+| Floor | Built into the binary | What no configuration can loosen ([architecture](architecture.md), section 8) |
+| Project file `owlshift.toml` | Committed in the repository | Tracker and state mapping, admission gesture, gate commands, resources and zones, pipeline and plan approval, role prompt overrides in `.owlshift/roles/`, tiers mapped to models, policy additions, caps |
+| Personal file | The user's config directory, never committed | Identity on tracker and forge, installed harnesses and their fallbacks, concurrent runs, usage caps, an optional dollar budget for API-billed harnesses, keep-awake, notifications |
+| Ticket labels | The tracker | One ticket's variant, tier, or exclusion |
+
+Precedence: the floor wins, then the project, then the personal file, which may lower caps and budgets but never loosen project policy. `owlshift config show` prints the effective value of every key and the file it comes from.
+
+```toml
+# owlshift.toml
+requires = ">=0.1"
+
+[tracker]
+kind = "linear"
+team = "LOC"
+admit = { label = "agent" }
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+
+[stack]
+gate = ["make lint", "make test"]
+resources = { migrations = "backend/*/migrations/**" }
+
+[pipeline]
+default = "standard"
+plan_approval = "on-fork"   # always | on-fork | never
+
+[models]
+deep     = { claude = "claude-opus-5-5" }
+standard = { claude = "claude-sonnet-5", codex = "gpt-5.6-sol" }
+fast     = { claude = "claude-haiku-4-5" }
+
+[policy]
+always_human = ["billing", "auth"]   # adds to the floor, never removes
+```
+
+## Observability & the local web UI
+
+Every action is a recorded event, readable from the CLI from v0 and from a local web UI from v2; the tray app of v4 wraps that same UI instead of rebuilding it.
+
+**Events and logs.** Each scan, decision, dispatch, run start and end, usage, gate and tracker write is a structured event in the local store. Each run's full harness output is captured to its own log file. On the ticket, comments give the human-readable trace.
+
+| Command | Answers |
+| --- | --- |
+| `owlshift status` | What runs, what waits for me, usage today and when each harness's limit resets |
+| `owlshift logs --follow` | The live event stream |
+| `owlshift logs PROJ-123` | Everything about one ticket, runs included |
+| `owlshift why PROJ-123` | Why a ticket is not starting: a blocker, a held zone, a cap, a harness at its limit |
+| `owlshift pause`, `resume` | Stop or restart dispatch; running roles finish |
+| `owlshift retry`, `cancel` | Act on one run |
+| `owlshift doctor` | Capabilities, harness versions and logins, leftovers |
+
+`why` is the most useful of them: a scheduler that cannot explain a wait looks broken.
+
+**The local web UI (v2)** is served by the daemon on `127.0.0.1` only, protected by a per-install token so no website open in the browser can drive it. It is identical on every platform and reachable on a server through an SSH tunnel.
+
+- **Overview:** tickets ready, running, waiting for a human, in review, and what blocks what.
+- **Ticket:** the stage timeline, each run with its live log, usage and result, the questions and answers.
+- **Orchestrator:** scans, decisions, errors, adapter health (tracker reachable, harness logged in, usage limit reached), usage per harness.
+- **Config:** the effective configuration with the origin of each value and validation errors; an edit writes to the file.
+- **Controls:** pause, resume, retry or cancel a run, release a claim.
+
+**The tray app (v4)** is a Tauri shell around the same UI, adding the menu-bar icon, native notifications and the login item.
+
+**Telemetry:** none sent anywhere. An OpenTelemetry export can be switched on by a team for its own collector.
+
+## Testing strategy
+
+Almost everything is tested without network or tokens; the parts that touch the operating system or a live service are thin and tested on every platform.
+
+| Layer | How | When |
+| --- | --- | --- |
+| Core logic: scheduler, state machine, policy, answer routing | Unit tests on pure functions | Every commit |
+| Scenarios S1 to S17 | End to end on the Markdown tracker, a local bare git remote and a **fake harness** (a script that writes a prepared `result.json`, with optional delays, failures and usage-limit messages) | Every commit, in seconds |
+| Tracker and forge adapters | Recorded HTTP fixtures, plus a conformance suite every adapter must pass | Every commit |
+| Live services | A sandbox tracker workspace and a test GitHub repository | Nightly |
+| Harness CLIs | Contract tests with a tiny real prompt against the latest CLI releases, on the maintainer's subscription | Nightly |
+| Operating-system integration | Service install and uninstall leave nothing behind (checked against the manifest); a process tree is fully stopped; an expired lease is taken over | Every commit, on macOS, Linux and Windows runners |
+| Real use | v1 on the first adopter's backlog | Continuous |
+
+The fake harness is the keystone: it makes the needs-input loop, re-asks, crashes and usage-limit fallbacks reproducible without consuming a subscription.
+
+## Prior art
+
+Owlshift combines three well-established patterns rather than inventing one: poll far and run locally like a CI runner, serve a local web UI like Syncthing, and pair a daemon with a CLI and a tray app like Tailscale or Ollama.
+
+| Tool | What it shares with Owlshift |
+| --- | --- |
+| GitHub Actions self-hosted runner | Polls a remote service and runs jobs locally; `svc.sh install` and `svc.sh uninstall` manage a launchd, systemd or Windows service |
+| GitLab Runner | The same model: `gitlab-runner install`, `start`, `stop`, `uninstall` |
+| Tailscale | A daemon (`tailscaled`), a CLI talking to it through a local API, a menu-bar app |
+| Ollama | A local server on `localhost:11434`, a CLI over HTTP, a menu-bar app that starts it |
+| Syncthing | One Go binary, a web UI on `localhost:8384` protected by an API key, tray apps wrapping that UI |
+| Vibe Kanban, Sortie | Category peers: a local web UI; a single binary with SQLite |
+| GitButler | A Rust and Tauri desktop developer tool |
+
+The known weak spot of the pattern, services left behind after uninstall, shows up with `brew services` and with a runner folder deleted before `svc.sh uninstall`; the lifecycle section above is designed against it. These descriptions come from each tool's public documentation and were not re-checked for this draft.
