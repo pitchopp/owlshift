@@ -70,6 +70,23 @@ pub enum Role {
     Rebase,
 }
 
+impl Role {
+    /// The name this role serializes as, and the stem of its prompt file
+    /// under `roles/` (`Role::Build` names `roles/build.md`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intake => "intake",
+            Self::Resolver => "resolver",
+            Self::AnswerCheck => "answer_check",
+            Self::Design => "design",
+            Self::DesignReview => "design_review",
+            Self::Build => "build",
+            Self::Verify => "verify",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
 /// A model tier; the configuration maps each tier to a model per harness.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -137,6 +154,27 @@ mod tests {
             assert_eq!(position(stage), index, "{stage:?}");
         }
         assert!(Stage::ALL.is_sorted_by(|a, b| a < b));
+    }
+
+    #[test]
+    fn role_as_str_matches_the_serde_name() {
+        for role in [
+            Role::Intake,
+            Role::Resolver,
+            Role::AnswerCheck,
+            Role::Design,
+            Role::DesignReview,
+            Role::Build,
+            Role::Verify,
+            Role::Rebase,
+        ] {
+            let serialized = serde_json::to_value(role).expect("Role always serializes");
+            assert_eq!(
+                serialized,
+                serde_json::Value::String(role.as_str().to_owned()),
+                "{role:?}"
+            );
+        }
     }
 
     #[test]

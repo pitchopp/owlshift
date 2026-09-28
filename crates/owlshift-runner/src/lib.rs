@@ -7,6 +7,7 @@ pub mod config;
 pub mod doctor;
 pub mod executor;
 pub mod forge;
+pub mod roles;
 pub mod system;
 pub mod tracker;
 pub mod writer;
