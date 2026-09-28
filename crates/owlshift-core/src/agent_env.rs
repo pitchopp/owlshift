@@ -268,7 +268,12 @@ mod tests {
 
     #[test]
     fn declared_credentials_and_git_settings_are_refused_in_any_case() {
-        for name in ["GITHUB_TOKEN", "gh_token", "Gh_Enterprise_Token", "ssh_auth_sock"] {
+        for name in [
+            "GITHUB_TOKEN",
+            "gh_token",
+            "Gh_Enterprise_Token",
+            "ssh_auth_sock",
+        ] {
             assert_eq!(
                 agent_environment(Vec::new(), &[name]),
                 Err(AgentEnvError::Floor(FloorViolation::CredentialVariables(
@@ -277,7 +282,12 @@ mod tests {
                 "{name}"
             );
         }
-        for name in ["GIT_DIR", "git_ssh_command", "Git_Askpass", "git_config_count"] {
+        for name in [
+            "GIT_DIR",
+            "git_ssh_command",
+            "Git_Askpass",
+            "git_config_count",
+        ] {
             assert_eq!(
                 agent_environment(Vec::new(), &[name]),
                 Err(AgentEnvError::Reserved(name.to_owned())),
@@ -297,7 +307,10 @@ mod tests {
             let vars = env(pairs);
             check_agent_variables(vars.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())))
         };
-        assert_eq!(check(&[("GH_TOKEN", NO_CREDENTIAL), ("PATH", "/bin")]), Ok(()));
+        assert_eq!(
+            check(&[("GH_TOKEN", NO_CREDENTIAL), ("PATH", "/bin")]),
+            Ok(())
+        );
         assert_eq!(
             check(&[
                 ("GH_TOKEN", "gho_x"),

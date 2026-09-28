@@ -178,7 +178,10 @@ fn the_check_finds_every_planted_credential_in_the_host_environment() {
         "AWS_SECRET_ACCESS_KEY",
         "SSH_AUTH_SOCK",
     ] {
-        assert!(names.iter().any(|n| n == credential), "{credential}: {names:?}");
+        assert!(
+            names.iter().any(|n| n == credential),
+            "{credential}: {names:?}"
+        );
     }
     let found = |finding: CredentialFinding| findings.contains(&finding);
     assert!(
@@ -267,11 +270,7 @@ fn credentials_in_the_repository_configuration_are_reported_redacted() {
 fn helper_print_the_environment() {
     if std::env::args().any(|arg| arg == "--exact") {
         for (name, value) in std::env::vars_os() {
-            println!(
-                "ENV {}={}",
-                name.to_string_lossy(),
-                value.to_string_lossy()
-            );
+            println!("ENV {}={}", name.to_string_lossy(), value.to_string_lossy());
         }
     }
 }

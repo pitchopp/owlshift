@@ -54,7 +54,9 @@ impl AgentEnv {
     /// Gives `command` exactly these variables. It replaces the command's
     /// whole environment, including anything set on it before.
     pub fn apply(&self, command: &mut Command) {
-        command.env_clear().envs(self.vars.iter().map(|(n, v)| (n, v)));
+        command
+            .env_clear()
+            .envs(self.vars.iter().map(|(n, v)| (n, v)));
     }
 
     /// [`check_environment`] with these variables.
@@ -133,7 +135,10 @@ pub fn check_environment(
 
     let search_path = vars
         .iter()
-        .find(|(name, _)| name.to_str().is_some_and(|n| n.eq_ignore_ascii_case("PATH")))
+        .find(|(name, _)| {
+            name.to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case("PATH"))
+        })
         .map_or_else(OsString::new, |(_, value)| value.clone());
     let probe = |program: &Path, args: &[&str], input: &[u8]| {
         let mut command = Command::new(program);
@@ -213,9 +218,10 @@ fn failed(probe: &'static str, error: &RunError) -> CredentialFinding {
 
 /// Whether `git credential fill` printed a non-empty password.
 fn holds_password(stdout: &[u8]) -> bool {
-    stdout
-        .split(|&byte| byte == b'\n')
-        .any(|line| line.strip_prefix(b"password=").is_some_and(|rest| !rest.trim_ascii().is_empty()))
+    stdout.split(|&byte| byte == b'\n').any(|line| {
+        line.strip_prefix(b"password=")
+            .is_some_and(|rest| !rest.trim_ascii().is_empty())
+    })
 }
 
 /// Whether `gh auth token` printed a token other than the placeholder.
@@ -286,7 +292,10 @@ mod tests {
             "url.https://tok@github.com/.insteadof",
         ] {
             assert!(has_userinfo(url), "{url}");
-            assert!(!redact(url).contains("secret") && !redact(url).contains("tok@"), "{url}");
+            assert!(
+                !redact(url).contains("secret") && !redact(url).contains("tok@"),
+                "{url}"
+            );
         }
         assert_eq!(
             redact("url.https://tok@github.com/.insteadof"),
@@ -324,7 +333,9 @@ mod tests {
 
     #[test]
     fn only_a_real_password_or_login_counts() {
-        assert!(holds_password(b"protocol=https\nhost=h\nusername=u\npassword=p\n"));
+        assert!(holds_password(
+            b"protocol=https\nhost=h\nusername=u\npassword=p\n"
+        ));
         assert!(!holds_password(b"protocol=https\nhost=h\npassword=\n"));
         assert!(!holds_password(b""));
         let gh = |code, stdout: &str| Captured {
@@ -344,7 +355,9 @@ mod tests {
         let run = transcript.finish(Some(0), Vec::new());
         assert_eq!(
             mcp_findings(&run),
-            Some(CredentialFinding::McpServers(vec!["claude.ai Linear".into()]))
+            Some(CredentialFinding::McpServers(vec![
+                "claude.ai Linear".into()
+            ]))
         );
         let run = claude::Transcript::default().finish(Some(0), Vec::new());
         assert_eq!(mcp_findings(&run), None);
