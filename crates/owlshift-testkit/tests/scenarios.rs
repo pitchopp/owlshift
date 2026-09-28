@@ -158,13 +158,17 @@ fn an_agent_switching_branch_is_quarantined() {
     );
 }
 
+/// The bound covers the whole scenario, git setup and isolation checks
+/// included, which take over 20 s on Windows with the other scenarios running
+/// alongside. It stays far from the harness's own 120 s, so a tree left
+/// running until the harness ends still fails the test.
 #[test]
 fn a_run_past_its_deadline_is_stopped_and_fails() {
     let started = Instant::now();
     play_on_smoke(
         "deadline",
         r#"
-        description = "The build would take 30 s; the executor stops it at its 1 s deadline, a failed run."
+        description = "The build would take 120 s; the executor stops it at its 1 s deadline, a failed run."
         ticket = "DEMO-1"
         start = "2026-09-28T09:00:00Z"
         timeout_ms = 1000
@@ -173,12 +177,12 @@ fn a_run_past_its_deadline_is_stopped_and_fails() {
         dispatch = true
 
         [[step]]
-        run = { delay_ms = 30000, result = "results/build-done.json" }
+        run = { delay_ms = 120000, result = "results/build-done.json" }
         expect = { event = "run_failed", stage = "build", failed_runs = 1 }
         "#,
     );
     assert!(
-        started.elapsed() < Duration::from_secs(15),
+        started.elapsed() < Duration::from_secs(60),
         "the run was not stopped at its deadline: {:?}",
         started.elapsed()
     );
