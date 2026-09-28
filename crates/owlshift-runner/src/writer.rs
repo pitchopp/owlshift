@@ -363,7 +363,8 @@ impl<'a> Writer<'a> {
         commit: &CommitId,
         branch: &Branch,
     ) -> Result<Pushed, WriteError> {
-        floor::check_action(Action::PushBranch, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        floor::check_action(Action::PushBranch, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         // The adapter builds the arguments; the runner's git runs them, so a
         // test bench's hermetic setup applies to the push too.
         let command = push_command(Path::new("git"), worktree, remote, commit, branch)

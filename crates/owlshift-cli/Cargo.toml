@@ -14,9 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 owlshift-runner.workspace = true
+owlshift-adapters.workspace = true
 owlshift-contracts.workspace = true
 owlshift-platform.workspace = true
 clap.workspace = true
+# Hidden input for the secrets `owlshift init` asks for on a terminal.
+rpassword.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

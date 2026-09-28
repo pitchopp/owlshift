@@ -252,7 +252,12 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
     }
     git.run(&checkout, &["worktree", "prune"]).map_err(failed)?;
 
-    let head = ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"];
+    let head = [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ];
     let remote_ref = match git.run(&checkout, &head) {
         Ok(name) => name,
         Err(_) => {
@@ -265,7 +270,9 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
     let branch = remote_ref
         .strip_prefix("origin/")
         .filter(|branch| !branch.is_empty())
-        .ok_or_else(|| format!("origin's default branch is {remote_ref:?}, not a branch of origin"))?
+        .ok_or_else(|| {
+            format!("origin's default branch is {remote_ref:?}, not a branch of origin")
+        })?
         .to_owned();
     Ok(Base { remote_ref, branch })
 }
@@ -317,7 +324,10 @@ mod tests {
         fs::create_dir_all(dirs.root()).unwrap();
         assert_eq!(dirs.unverified().unwrap(), None);
         dirs.mark_unverified("run r1 of OWL-1").unwrap();
-        assert_eq!(dirs.unverified().unwrap().as_deref(), Some("run r1 of OWL-1"));
+        assert_eq!(
+            dirs.unverified().unwrap().as_deref(),
+            Some("run r1 of OWL-1")
+        );
         dirs.clear_unverified().unwrap();
         dirs.clear_unverified().unwrap();
         assert_eq!(dirs.unverified().unwrap(), None);
@@ -338,6 +348,9 @@ mod tests {
                 "{name} is not removed"
             );
         }
-        assert!(envs.contains(&(OsStr::new("GIT_SSH_COMMAND"), Some(OsStr::new("ssh -i key")))));
+        assert!(envs.contains(&(
+            OsStr::new("GIT_SSH_COMMAND"),
+            Some(OsStr::new("ssh -i key"))
+        )));
     }
 }

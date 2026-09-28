@@ -166,7 +166,10 @@ impl Harness for Replies {
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
         let current = self.current.borrow();
-        current.as_ref().expect("a command first").drive(run, child, log)
+        current
+            .as_ref()
+            .expect("a command first")
+            .drive(run, child, log)
     }
 }
 
@@ -304,12 +307,17 @@ impl Bench {
 
     fn events(&self) -> Vec<Event> {
         let text = fs::read_to_string(EventLog::in_dir(&self.data).path()).unwrap_or_default();
-        text.lines().map(|line| Event::parse(line).unwrap()).collect()
+        text.lines()
+            .map(|line| Event::parse(line).unwrap())
+            .collect()
     }
 
     fn remote_branch(&self) -> Option<String> {
         self.env
-            .run(&self.remote.bare, &["rev-parse", "--verify", "--quiet", BRANCH])
+            .run(
+                &self.remote.bare,
+                &["rev-parse", "--verify", "--quiet", BRANCH],
+            )
             .ok()
             .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
     }
@@ -375,7 +383,14 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
     use EventKind::*;
     assert_eq!(
         kinds(&events),
-        [Dispatch, RunStarted, RunEnded, TrackerWrite, TrackerWrite, TrackerWrite]
+        [
+            Dispatch,
+            RunStarted,
+            RunEnded,
+            TrackerWrite,
+            TrackerWrite,
+            TrackerWrite
+        ]
     );
     for event in &events {
         assert!(
@@ -387,7 +402,11 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
     // The work happened under the data directory, not in the person's
     // checkout, which kept its HEAD and branch.
     let dirs = bench.dirs();
-    assert!(dirs.worktree(&TicketId::new(TICKET).unwrap()).join("GREETING.md").is_file());
+    assert!(
+        dirs.worktree(&TicketId::new(TICKET).unwrap())
+            .join("GREETING.md")
+            .is_file()
+    );
     assert!(!bench.remote.checkout.join("GREETING.md").exists());
     assert_eq!(bench.person(), person);
     assert_eq!(dirs.unverified().unwrap(), None);
@@ -424,13 +443,21 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
     let brief =
         Brief::parse(&fs::read_to_string(Path::new(run_dir).join("brief.json")).unwrap()).unwrap();
     let failure = brief.gate_failure.expect("the fix run knows why");
-    assert_eq!(failure.command.as_deref(), Some("git grep -q Hello -- GREETING.md"));
+    assert_eq!(
+        failure.command.as_deref(),
+        Some("git grep -q Hello -- GREETING.md")
+    );
     let checkpoint = brief.checkpoint.expect("the fix run resumes from the plan");
     assert_eq!(checkpoint.plan.unwrap().as_str(), ".owlshift/run/plan.md");
 }
 
+/// How a case prepares its bench and gives its replies.
+type Setup = Box<dyn Fn(&Bench) -> Vec<Reply>>;
+/// Whether a case stopped as it should.
+type Check = fn(&Stop) -> bool;
+
 /// Every way a run stops short of a delivery: nothing reaches the ticket,
-/// and nothing but a refused push or a moved branch reaches the remote.
+/// and the remote's branch moves only when the push itself went through.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
     let questions = r#"{"format":1,"status":"questions","summary":"One choice is yours.",
@@ -438,8 +465,7 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
     let blocked = r#"{"format":1,"status":"blocked","summary":"The gate needs network."}"#;
     let reset: jiff::Timestamp = "2026-09-29T15:00:00Z".parse().unwrap();
 
-    type Check = fn(&Stop) -> bool;
-    let cases: Vec<(&str, Box<dyn Fn(&Bench) -> Vec<Reply>>, Check, Option<EventKind>)> = vec![
+    let cases: Vec<(&str, Setup, Check, Option<EventKind>)> = vec![
         (
             "questions",
             Box::new(move |b| vec![b.reply(None, Some(questions))]),
@@ -449,7 +475,15 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
         (
             "blocked",
             Box::new(move |b| vec![b.reply(None, Some(blocked))]),
-            |s| matches!(s, Stop::Parked { reason: ParkReason::Blocked, .. }),
+            |s| {
+                matches!(
+                    s,
+                    Stop::Parked {
+                        reason: ParkReason::Blocked,
+                        ..
+                    }
+                )
+            },
             Some(EventKind::Decision),
         ),
         (
@@ -471,7 +505,15 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
                     .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
                 vec![reply]
             }),
-            |s| matches!(s, Stop::Parked { reason: ParkReason::IsolationBreach, .. }),
+            |s| {
+                matches!(
+                    s,
+                    Stop::Parked {
+                        reason: ParkReason::IsolationBreach,
+                        ..
+                    }
+                )
+            },
             Some(EventKind::Decision),
         ),
         (
@@ -490,11 +532,17 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
             Box::new(|b| {
                 // Someone else's commit is already on the ticket's branch.
                 let checkout = &b.remote.checkout;
-                b.env.run(checkout, &["switch", "--quiet", "-c", BRANCH]).unwrap();
+                b.env
+                    .run(checkout, &["switch", "--quiet", "-c", BRANCH])
+                    .unwrap();
                 fs::write(checkout.join("OTHER.md"), "other\n").unwrap();
                 b.env.run(checkout, &["add", "OTHER.md"]).unwrap();
-                b.env.run(checkout, &["commit", "--quiet", "-m", "Other"]).unwrap();
-                b.env.run(checkout, &["push", "--quiet", "origin", BRANCH]).unwrap();
+                b.env
+                    .run(checkout, &["commit", "--quiet", "-m", "Other"])
+                    .unwrap();
+                b.env
+                    .run(checkout, &["push", "--quiet", "origin", BRANCH])
+                    .unwrap();
                 b.env.run(checkout, &["switch", "--quiet", "main"]).unwrap();
                 vec![b.reply(Some("Hello"), Some(DONE))]
             }),
@@ -521,7 +569,11 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
             Err(stop) => stop,
         };
         assert!(expected(&stop), "{name}: {stop:?}\n{printed}");
-        assert!(bench.comments().is_empty(), "{name}: {:?}", bench.comments());
+        assert!(
+            bench.comments().is_empty(),
+            "{name}: {:?}",
+            bench.comments()
+        );
         assert_eq!(
             kinds(&bench.events()).last().copied(),
             last,

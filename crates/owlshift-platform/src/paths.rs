@@ -35,7 +35,10 @@ pub fn personal_config_file() -> Option<PathBuf> {
 /// `None` when there is no override and the platform reports no data
 /// directory.
 pub fn data_dir() -> Option<PathBuf> {
-    resolve_data(std::env::var_os("OWLSHIFT_DATA_DIR"), dirs::data_local_dir())
+    resolve_data(
+        std::env::var_os("OWLSHIFT_DATA_DIR"),
+        dirs::data_local_dir(),
+    )
 }
 
 /// `override_dir`: `OWLSHIFT_CONFIG_DIR` as read from the environment.

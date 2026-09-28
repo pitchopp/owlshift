@@ -250,7 +250,10 @@ pub fn print(
         }
         if let Some(file) = file.as_mut() {
             file.read_to_end(&mut pending)?;
-            let complete = pending.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            let complete = pending
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |i| i + 1);
             let lines: Vec<u8> = pending.drain(..complete).collect();
             for raw in lines.split(|b| *b == b'\n').filter(|raw| !raw.is_empty()) {
                 line_number += 1;
@@ -349,21 +352,30 @@ mod tests {
         let printed = print(log.path(), None, &mut out, &mut errors, None).unwrap();
         assert_eq!(printed, 2);
         let out = String::from_utf8(out).unwrap();
-        assert_eq!(out, format!("{}\n{}\n", format_line(&first), format_line(&second)));
+        assert_eq!(
+            out,
+            format!("{}\n{}\n", format_line(&first), format_line(&second))
+        );
         let errors = String::from_utf8(errors).unwrap();
         assert!(errors.contains("line 2 is not an event"), "{errors}");
 
         let mut only = Vec::new();
         let id = TicketId::new("OWL-2").unwrap();
         print(log.path(), Some(&id), &mut only, &mut Vec::new(), None).unwrap();
-        assert_eq!(String::from_utf8(only).unwrap(), format!("{}\n", format_line(&second)));
+        assert_eq!(
+            String::from_utf8(only).unwrap(),
+            format!("{}\n", format_line(&second))
+        );
     }
 
     #[test]
     fn a_missing_log_prints_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(EVENTS_FILE);
-        assert_eq!(print(&path, None, &mut Vec::new(), &mut Vec::new(), None).unwrap(), 0);
+        assert_eq!(
+            print(&path, None, &mut Vec::new(), &mut Vec::new(), None).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -395,7 +407,10 @@ mod tests {
         };
         let printed = print(log.path(), None, &mut out, &mut Vec::new(), Some(follow)).unwrap();
         assert_eq!(printed, 1);
-        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", format_line(&later)));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n", format_line(&later))
+        );
     }
 
     #[test]

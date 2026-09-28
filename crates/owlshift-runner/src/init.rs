@@ -255,13 +255,19 @@ mod tests {
     #[test]
     fn the_template_parses_for_either_tracker_with_or_without_a_gate() {
         let quoted = r#"sh -c "echo \"hi\"" \ done"#;
-        let linear =
-            project_file(&options(TrackerKind::Linear, Some("OWL"), &["cargo test", quoted]))
-                .unwrap();
+        let linear = project_file(&options(
+            TrackerKind::Linear,
+            Some("OWL"),
+            &["cargo test", quoted],
+        ))
+        .unwrap();
         let config = ProjectConfig::parse(&linear).unwrap();
         assert_eq!(config.tracker.team.as_deref(), Some("OWL"));
         assert_eq!(config.stack.gate, ["cargo test", quoted]);
-        assert!(linear.lines().filter(|l| l.starts_with('#')).count() > 10, "{linear}");
+        assert!(
+            linear.lines().filter(|l| l.starts_with('#')).count() > 10,
+            "{linear}"
+        );
 
         let markdown = project_file(&options(TrackerKind::Markdown, None, &[])).unwrap();
         let config = ProjectConfig::parse(&markdown).unwrap();
@@ -275,8 +281,14 @@ mod tests {
     #[test]
     fn an_existing_project_file_is_kept() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(write_project_file(dir.path(), "a = 1\n").unwrap(), Written::Created);
-        assert_eq!(write_project_file(dir.path(), "b = 2\n").unwrap(), Written::Kept);
+        assert_eq!(
+            write_project_file(dir.path(), "a = 1\n").unwrap(),
+            Written::Created
+        );
+        assert_eq!(
+            write_project_file(dir.path(), "b = 2\n").unwrap(),
+            Written::Kept
+        );
         let text = std::fs::read_to_string(dir.path().join(PROJECT_FILE)).unwrap();
         assert_eq!(text, "a = 1\n");
     }
@@ -304,7 +316,10 @@ mod tests {
         assert_eq!(report.kept, [GITHUB_TOKEN]);
         assert!(report.missing.is_empty());
         // Stored trimmed, and absent from everything a person is shown.
-        assert_eq!(keychain.read(LINEAR_ACCOUNT).unwrap().unwrap().expose(), SENTINEL);
+        assert_eq!(
+            keychain.read(LINEAR_ACCOUNT).unwrap().unwrap().expose(),
+            SENTINEL
+        );
         let shown = format!("{report:?} {} {}", LINEAR_KEY, GITHUB_TOKEN);
         assert!(!shown.contains("SENTINEL"), "{shown}");
 

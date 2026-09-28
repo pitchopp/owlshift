@@ -49,8 +49,7 @@ use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use crate::agent_env::AgentEnv;
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
-    DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport,
-    RunSpec,
+    DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport, RunSpec,
 };
 use crate::project::{self, ProjectDirs};
 use crate::writer::{DeliveryReport, Gate, Writer};
@@ -95,9 +94,11 @@ pub fn check_origin(url: &str) -> Result<Repo, String> {
         .or_else(|| url.strip_prefix("http://"))
         .map(|rest| rest.split('/').next().unwrap_or_default());
     if authority.is_some_and(|authority| authority.contains('@')) {
-        return Err("the URL of the remote `origin` carries a credential: use SSH or a git \
+        return Err(
+            "the URL of the remote `origin` carries a credential: use SSH or a git \
                     credential helper instead, so no token is written in a URL"
-            .to_owned());
+                .to_owned(),
+        );
     }
     Repo::from_github_remote(url).map_err(|_| {
         "the remote `origin` is not a github.com repository: `owlshift do` delivers to GitHub only"
@@ -487,7 +488,16 @@ impl OnDemand<'_> {
                 _ => break report,
             }
         };
-        self.deliver(ticket, &found, &worktree, &head, &base_branch, report, gathered, sink)
+        self.deliver(
+            ticket,
+            &found,
+            &worktree,
+            &head,
+            &base_branch,
+            report,
+            gathered,
+            sink,
+        )
     }
 
     /// The build brief of one run.
@@ -566,7 +576,8 @@ impl OnDemand<'_> {
             .and_then(|commit| CommitId::new(commit).ok())
             .ok_or_else(|| Stop::Delivery("the gate's commit is unknown".to_owned()))?;
         let writer = Writer::new(self.tracker);
-        let delivery = |what: &str, error: &dyn fmt::Display| Stop::Delivery(format!("{what}: {error}"));
+        let delivery =
+            |what: &str, error: &dyn fmt::Display| Stop::Delivery(format!("{what}: {error}"));
 
         let pushed = writer
             .push_branch(&self.executor.git, worktree, "origin", &commit, head)
@@ -811,7 +822,10 @@ fn usage_data(usage: &Usage) -> Data {
     data([
         ("input_tokens", json!(usage.input_tokens)),
         ("output_tokens", json!(usage.output_tokens)),
-        ("cache_read_input_tokens", json!(usage.cache_read_input_tokens)),
+        (
+            "cache_read_input_tokens",
+            json!(usage.cache_read_input_tokens),
+        ),
         (
             "cache_creation_input_tokens",
             json!(usage.cache_creation_input_tokens),
@@ -849,20 +863,32 @@ mod tests {
         assert_eq!(repo.to_string(), "pitchopp/owlshift");
         assert!(check_origin("https://github.com/pitchopp/owlshift").is_ok());
         for (url, says) in [
-            ("https://ghp_SECRET@github.com/o/r.git", "carries a credential"),
-            ("https://user:pass@github.com/o/r.git", "carries a credential"),
+            (
+                "https://ghp_SECRET@github.com/o/r.git",
+                "carries a credential",
+            ),
+            (
+                "https://user:pass@github.com/o/r.git",
+                "carries a credential",
+            ),
             ("https://gitlab.com/o/r.git", "not a github.com repository"),
             ("/srv/git/r.git", "not a github.com repository"),
         ] {
             let error = check_origin(url).unwrap_err();
             assert!(error.contains(says), "{url}: {error}");
-            assert!(!error.contains("SECRET") && !error.contains("pass"), "{error}");
+            assert!(
+                !error.contains("SECRET") && !error.contains("pass"),
+                "{error}"
+            );
         }
     }
 
     #[test]
     fn branches_carry_the_ticket_id_in_lower_case() {
-        assert_eq!(branch_for(&TicketId::new("OWL-12").unwrap()), "owlshift/owl-12");
+        assert_eq!(
+            branch_for(&TicketId::new("OWL-12").unwrap()),
+            "owlshift/owl-12"
+        );
     }
 
     #[test]
@@ -880,8 +906,16 @@ mod tests {
         };
         let marked = "[owlshift] DELIVERY\n\nDone.\n\n<!-- owlshift:{\"format\":1,\"kind\":\"DELIVERY\",\"ticket\":\"OWL-1\"} -->\n";
         let cases = [
-            (TrackerAuthor::Account(decider.clone()), "Go.", Relation::Decider),
-            (TrackerAuthor::Account(decider.clone()), marked, Relation::Owlshift),
+            (
+                TrackerAuthor::Account(decider.clone()),
+                "Go.",
+                Relation::Decider,
+            ),
+            (
+                TrackerAuthor::Account(decider.clone()),
+                marked,
+                Relation::Owlshift,
+            ),
             (
                 TrackerAuthor::Account(Person {
                     id: "u2".into(),
@@ -890,10 +924,18 @@ mod tests {
                 "I am the decider.",
                 Relation::Other,
             ),
-            (TrackerAuthor::Other { name: "bot".into() }, "Hi.", Relation::Other),
+            (
+                TrackerAuthor::Other { name: "bot".into() },
+                "Hi.",
+                Relation::Other,
+            ),
         ];
         for (author, body, relation) in cases {
-            assert_eq!(comment_author(&comment(author, body), &decider).relation, relation, "{body}");
+            assert_eq!(
+                comment_author(&comment(author, body), &decider).relation,
+                relation,
+                "{body}"
+            );
         }
     }
 
