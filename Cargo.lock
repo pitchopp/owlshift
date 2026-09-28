@@ -1455,6 +1455,7 @@ dependencies = [
  "owlshift-adapters",
  "owlshift-contracts",
  "owlshift-core",
+ "owlshift-runner",
  "serde",
  "tempfile",
  "toml",

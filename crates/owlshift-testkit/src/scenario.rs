@@ -9,13 +9,15 @@
 //!
 //! # The stand-in driver
 //!
-//! No executor (OWL-15) and no writer (OWL-18) exist yet, so the runner
-//! drives the ticket itself, and only as far as the scenarios need: it keeps
-//! the core state in memory from Ready, writes the brief, launches the fake
-//! harness in the ticket's worktree, maps the run's outcome onto a core
-//! event, posts the questions comment, sets the visible stage and pushes the
-//! branch. It is a stand-in: those tickets replace it, and the scenario files
-//! stay. What it leaves out on purpose:
+//! Roles run through the real executor (`owlshift_runner::executor`), on the
+//! fake harness: worktree, brief, agent environment, process tree, deadline
+//! (`timeout_ms`, 60 s by default), result validation and isolation check.
+//! No writer (OWL-18) exists yet, so the runner drives the rest itself, and
+//! only as far as the scenarios need: it keeps the core state in memory from
+//! Ready, builds the brief from the tracker, maps the run's outcome onto a
+//! core event, posts the questions comment, sets the visible stage and
+//! pushes the branch. That part is a stand-in: the writer replaces it, and
+//! the scenario files stay. What it leaves out on purpose:
 //!
 //! - the brief's thread carries every tracker comment as a plain `comment`
 //!   entry, the runner's own QUESTIONS comment included, where the executor
@@ -30,10 +32,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -51,15 +52,18 @@ use owlshift_contracts::result::{self, RunResult};
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
+use owlshift_runner::agent_env::AgentEnv;
+use owlshift_runner::executor::{Executor, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 
 use crate::git::{GitEnv, Remote, seed};
-use crate::reply::{OWN_FAILURE, Reply, usage_limit};
+use crate::harness::FakeHarness;
+use crate::reply::{OWN_FAILURE, Reply};
 
 /// The author name of the runner's own comments.
 pub const OWLSHIFT_AUTHOR: &str = "owlshift";
 
-/// Where a role writes its result, relative to the worktree.
-const RESULT_PATH: &str = ".owlshift/result.json";
+/// The executor's deadline for a run, unless the scenario sets one.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A scenario file.
 #[derive(Debug, Deserialize)]
@@ -69,6 +73,9 @@ pub struct Scenario {
     pub ticket: TicketId,
     /// The virtual time the scenario starts at; step `n` is `n` minutes later.
     pub start: Timestamp,
+    /// The executor's deadline for each run, in milliseconds of real time;
+    /// 60 000 by default.
+    pub timeout_ms: Option<u64>,
     #[serde(rename = "step")]
     pub steps: Vec<Step>,
 }
@@ -274,14 +281,14 @@ struct Driver {
     pipeline: Pipeline,
     /// The project's gate (`stack.gate`), carried in every brief.
     gate: Vec<String>,
+    executor: Executor,
     id: TicketId,
     branch: String,
     state: TicketState,
     now: Timestamp,
     runs: u32,
-    worktree: Option<PathBuf>,
     last_brief: Option<Brief>,
-    last_output: Option<Output>,
+    last_run: Option<RunReport>,
 }
 
 impl Driver {
@@ -309,7 +316,17 @@ impl Driver {
         // The on-demand run of P1: the ticket starts at Ready.
         let state = TicketState::restore(Status::Active(Stage::Ready), 0, 0, 0)
             .map_err(|e| e.to_string())?;
+        let runner_git = git.clone();
+        let executor = Executor {
+            git: Git::with_setup("git", move |command| runner_git.apply(command)),
+            agent: AgentEnv::new(git.agent_parent(), &[]).map_err(|e| e.to_string())?,
+            forge_hosts: Vec::new(),
+            timeout: scenario
+                .timeout_ms
+                .map_or(DEFAULT_TIMEOUT, Duration::from_millis),
+        };
         Ok(Self {
+            executor,
             scenario: name.to_owned(),
             fixture: fixture.to_owned(),
             fake_harness: fake_harness.to_owned(),
@@ -322,9 +339,8 @@ impl Driver {
             state,
             now: scenario.start,
             runs: 0,
-            worktree: None,
             last_brief: None,
-            last_output: None,
+            last_run: None,
             tmp,
             git,
             remote,
@@ -333,7 +349,7 @@ impl Driver {
 
     /// Does one action; returns the core event it produced, if any.
     fn step(&mut self, action: &Action<'_>) -> Result<Option<Event>, String> {
-        self.last_output = None;
+        self.last_run = None;
         match action {
             Action::Dispatch => {
                 self.apply(Event::Dispatched)?;
@@ -375,7 +391,8 @@ impl Driver {
             .map_err(|e| e.to_string())
     }
 
-    /// Runs the current stage's role on the fake harness.
+    /// Runs the current stage's role through the executor, on the fake
+    /// harness.
     fn run(&mut self, reply: &Reply) -> Result<Event, String> {
         let Status::Active(stage) = self.state.status() else {
             return Err(format!(
@@ -389,42 +406,40 @@ impl Driver {
         self.runs += 1;
         let dir = self.tmp.path().join("runs").join(self.runs.to_string());
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let worktree = self.worktree()?;
+        let worktree = self.worktree();
 
         let brief = self.brief(role)?;
-        let brief_path = dir.join("brief.json");
-        write(&brief_path, &brief.render())?;
         let mut reply = reply.clone();
         reply.result = reply.result.map(|path| self.fixture.join(path));
+        reply.date = Some(self.now);
         let reply_path = dir.join("reply.toml");
         write(&reply_path, &reply.render())?;
-        let result_file = worktree.join(RESULT_PATH);
-        match fs::remove_file(&result_file) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(format!("{}: {e}", result_file.display()));
-            }
-            _ => {}
-        }
 
-        let mut command = Command::new(&self.fake_harness);
-        command
-            .arg("--brief")
-            .arg(&brief_path)
-            .arg("--reply")
-            .arg(&reply_path)
-            .current_dir(&worktree)
-            .stdin(Stdio::null());
-        self.git.at(self.now).apply(&mut command);
-        let output = command
-            .output()
-            .map_err(|e| format!("{}: {e}", self.fake_harness.display()))?;
+        let spec = RunSpec {
+            main: &self.remote.checkout,
+            worktree: &worktree,
+            branch: &self.branch,
+            base: "origin/main",
+            run_dir: &dir,
+            brief: &brief,
+        };
+        let harness = FakeHarness {
+            program: self.fake_harness.clone(),
+            reply: reply_path,
+        };
+        let report = self
+            .executor
+            .run(&spec, &harness)
+            .map_err(|e| e.to_string())?;
         self.last_brief = Some(brief);
-        self.last_output = Some(output.clone());
-        if output.status.code() == Some(OWN_FAILURE) {
+        let own_failure = report.exit_code == Some(OWN_FAILURE);
+        let outcome = outcome(&report.outcome);
+        self.last_run = Some(report);
+        if own_failure {
             return Err("the fake harness could not do what the reply says".to_owned());
         }
 
-        let (event, result) = outcome(&output, &result_file)?;
+        let (event, result) = outcome?;
         self.apply(event)?;
         if let (Event::Questions, Some(result)) = (event, &result) {
             let body = self.questions_comment(result)?;
@@ -439,30 +454,10 @@ impl Driver {
         Ok(event)
     }
 
-    /// The ticket's worktree, on its own branch from `origin/main`, created
-    /// at its first run.
-    fn worktree(&mut self) -> Result<PathBuf, String> {
-        if let Some(worktree) = &self.worktree {
-            return Ok(worktree.clone());
-        }
-        let relative = format!("../worktrees/{}", self.id);
-        self.git
-            .run(
-                &self.remote.checkout,
-                &[
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    "-b",
-                    &self.branch,
-                    &relative,
-                    "origin/main",
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        let worktree = self.tmp.path().join("worktrees").join(self.id.as_str());
-        self.worktree = Some(worktree.clone());
-        Ok(worktree)
+    /// The ticket's worktree, beside the main checkout; the executor creates
+    /// it at the first run, on the ticket's branch from `origin/main`.
+    fn worktree(&self) -> PathBuf {
+        self.tmp.path().join("worktrees").join(self.id.as_str())
     }
 
     fn brief(&self, role: Role) -> Result<Brief, String> {
@@ -666,35 +661,36 @@ impl Driver {
         Ok(())
     }
 
-    /// The last run's exit status and output, for an error message.
+    /// The last run's outcome, exit status and output, for an error message.
     fn run_output(&self) -> Option<String> {
-        self.last_output.as_ref().map(|output| {
+        self.last_run.as_ref().map(|report| {
+            let log = |path: &Path| {
+                fs::read(path).map_or_else(
+                    |e| format!("({}: {e})", path.display()),
+                    |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+                )
+            };
             format!(
-                "fake harness exit status: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                "outcome: {:?}\nfake harness exit code: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                report.outcome,
+                report.exit_code,
+                log(&report.stdout_log),
+                log(&report.stderr_log)
             )
         })
     }
 }
 
-/// The core event a run's outcome maps onto, and its result when it left a
-/// valid one. A usage limit is an interruption; a non-zero exit, a missing or
-/// invalid `result.json`, or a `failed` status is a failed run: an exit
-/// status alone is never proof of success.
-fn outcome(output: &Output, result_file: &Path) -> Result<(Event, Option<RunResult>), String> {
-    if usage_limit(&String::from_utf8_lossy(&output.stderr)).is_some() {
-        return Ok((Event::Interrupted, None));
-    }
-    if !output.status.success() {
-        return Ok((Event::RunFailed, None));
-    }
-    let Some(result) = fs::read_to_string(result_file)
-        .ok()
-        .and_then(|text| RunResult::parse(&text).ok())
-    else {
-        return Ok((Event::RunFailed, None));
+/// The core event the executor's outcome maps onto, and the result when the
+/// run left a valid one. A usage limit is an interruption; a failed run, or
+/// a result with status `failed`, is a failed run; a breach of isolation is
+/// a quarantine.
+fn outcome(outcome: &Outcome) -> Result<(Event, Option<RunResult>), String> {
+    let result = match outcome {
+        Outcome::Finished { result, .. } => result,
+        Outcome::UsageLimit { .. } => return Ok((Event::Interrupted, None)),
+        Outcome::Failed(_) => return Ok((Event::RunFailed, None)),
+        Outcome::Quarantined(_) => return Ok((Event::Quarantined, None)),
     };
     let event = match result.status {
         result::Status::Done => Event::Completed,
@@ -707,7 +703,7 @@ fn outcome(output: &Output, result_file: &Path) -> Result<(Event, Option<RunResu
             ));
         }
     };
-    Ok((event, Some(result)))
+    Ok((event, Some(result.clone())))
 }
 
 fn same(field: &str, expected: impl fmt::Display, found: impl fmt::Display) -> Result<(), String> {

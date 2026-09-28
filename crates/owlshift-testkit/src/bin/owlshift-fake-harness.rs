@@ -51,14 +51,26 @@ fn play(args: &Args) -> Result<i32, String> {
 
     thread::sleep(Duration::from_millis(reply.delay_ms));
 
+    if let Some(branch) = &reply.switch_branch {
+        git(&["switch", "--quiet", "-c", branch], None)?;
+    }
     for (path, content) in &reply.files {
         write(&worktree.join(path.as_str()), content.as_bytes())?;
     }
     if let Some(message) = &reply.commit {
         let mut add = vec!["add", "--"];
         add.extend(reply.files.keys().map(RelativePath::as_str));
-        git(&add)?;
-        git(&["commit", "--quiet", "-m", message])?;
+        git(&add, None)?;
+        let date = reply
+            .date
+            .map(|date| format!("{} +0000", date.as_second()));
+        git(&["commit", "--quiet", "-m", message], date.as_deref())?;
+    }
+    if !reply.main_checkout.is_empty() {
+        let main = main_checkout(&worktree)?;
+        for (path, content) in &reply.main_checkout {
+            write(&main.join(path.as_str()), content.as_bytes())?;
+        }
     }
 
     if let Some(prepared) = &reply.result {
@@ -90,16 +102,35 @@ fn write(path: &Path, content: &[u8]) -> Result<(), String> {
 }
 
 /// Runs git in the worktree, with the environment the runner gave this
-/// process.
-fn git(args: &[&str]) -> Result<(), String> {
-    let status = Command::new("git")
-        .args(args)
-        .stdin(Stdio::null())
-        .status()
-        .map_err(|e| format!("git: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("git {} failed with {status}", args.join(" ")))
+/// process, and `date` as the author and committer date when given.
+fn git(args: &[&str], date: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut command = Command::new("git");
+    command.args(args).stdin(Stdio::null());
+    if let Some(date) = date {
+        command
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date);
     }
+    let output = command.output().map_err(|e| format!("git: {e}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "git {} failed with {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// The main checkout: the folder holding the repository's common git
+/// directory, which git names relative to the worktree or in full.
+fn main_checkout(worktree: &Path) -> Result<PathBuf, String> {
+    let common = git(&["rev-parse", "--git-common-dir"], None)?;
+    let common = worktree.join(String::from_utf8_lossy(&common).trim());
+    common
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("{} has no parent folder", common.display()))
 }

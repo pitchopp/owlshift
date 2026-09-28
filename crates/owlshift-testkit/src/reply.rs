@@ -1,10 +1,13 @@
 //! What the fake harness does in one run: its reply file, in TOML.
 //!
-//! The fake harness acts in this order: it waits (`delay_ms`); writes files
-//! (`files`) and commits them (`commit`); copies a prepared `result.json`,
-//! valid or not, to the brief's result path (`result`); prints `stdout` and
-//! `stderr`, then the usage-limit line if `usage_limit` is set; and exits
-//! with `exit_code`, 0 by default or 1 with a usage limit.
+//! The fake harness acts in this order: it waits (`delay_ms`); creates and
+//! switches to another branch (`switch_branch`); writes files (`files`) and
+//! commits them (`commit`, dated `date`); writes files in the main checkout
+//! (`main_checkout`); copies a prepared `result.json`, valid or not, to the
+//! brief's result path (`result`); prints `stdout` and `stderr`, then the
+//! usage-limit line if `usage_limit` is set; and exits with `exit_code`, 0
+//! by default or 1 with a usage limit. `switch_branch` and `main_checkout`
+//! break isolation on purpose.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,6 +37,19 @@ pub struct Reply {
     /// The message of a commit of those files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// The commit's author and committer date. The scenario runner sets it
+    /// to the step's virtual time, so commit ids are reproducible: the agent
+    /// environment passes no `GIT_*` variable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<Timestamp>,
+    /// A branch to create and switch the worktree to, first: an isolation
+    /// breach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_branch: Option<String>,
+    /// Files to write in the main checkout, the one the worktree belongs to,
+    /// by path relative to it: an isolation breach.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub main_checkout: BTreeMap<RelativePath, String>,
     /// A prepared result file, copied byte for byte to the brief's result
     /// path. In a scenario it is relative to the scenario's fixture folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +92,13 @@ impl Reply {
         }
         if self.commit.is_some() && self.files.is_empty() {
             return Err("invalid reply: `commit` needs `files` to commit".to_owned());
+        }
+        if self
+            .switch_branch
+            .as_ref()
+            .is_some_and(|branch| branch.is_empty() || branch.starts_with('-'))
+        {
+            return Err("invalid reply: `switch_branch` is not a branch name".to_owned());
         }
         if self.usage_limit.is_some() && self.result.is_some() {
             return Err(
@@ -122,6 +145,7 @@ mod tests {
             "[files]\n\"../outside.md\" = \"x\"\n",
             "commit = \"Nothing to commit\"\n",
             "exit_code = 2\n",
+            "switch_branch = \"--orphan\"\n",
             "result = \"done.json\"\nusage_limit = \"2026-09-28T15:00:00Z\"\n",
         ] {
             assert!(Reply::parse(refused).is_err(), "{refused}");
