@@ -1,0 +1,32 @@
+{
+  "recorded": "2026-09-28 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
+        "variables": {
+          "id": "OWL-11"
+        }
+      },
+      "status": 401,
+      "response": {
+        "errors": [
+          {
+            "extensions": {
+              "code": "AUTHENTICATION_ERROR",
+              "http": {
+                "status": 401
+              },
+              "meta": {},
+              "statusCode": 401,
+              "type": "authentication error",
+              "userError": true,
+              "userPresentableMessage": "You need to authenticate to access this operation."
+            },
+            "message": "Authentication required, not authenticated"
+          }
+        ]
+      }
+    }
+  ]
+}

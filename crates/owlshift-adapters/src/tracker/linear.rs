@@ -522,6 +522,34 @@ mod tests {
         );
     }
 
+    /// Answers with prepared bodies, in order.
+    struct Canned(std::sync::Mutex<Vec<&'static str>>);
+
+    impl Transport for Canned {
+        fn send(&self, _: &Value) -> Result<Response, String> {
+            Ok(answer(200, self.0.lock().unwrap().remove(0)))
+        }
+    }
+
+    fn tracker(bodies: Vec<&'static str>) -> LinearTracker {
+        LinearTracker::with_transport(Canned(std::sync::Mutex::new(bodies)))
+    }
+
+    #[test]
+    fn what_the_adapter_cannot_represent_is_refused_not_truncated() {
+        let id = TicketId::new("OWL-1").unwrap();
+        let many_labels = r#"{"data":{"issue":{"identifier":"OWL-1","title":"t","description":null,
+            "priority":0,"assignee":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}"#;
+        assert!(tracker(vec![many_labels]).ticket(&id).is_err());
+
+        let stuck = r#"{"data":{"issue":{"comments":{"nodes":[],
+            "pageInfo":{"hasNextPage":true,"endCursor":"c1"}}}}}"#;
+        assert!(tracker(vec![stuck, stuck]).comments(&id).is_err());
+
+        let refused = r#"{"data":{"commentCreate":{"success":false,"comment":null}}}"#;
+        assert!(tracker(vec![refused]).post_comment(&id, "x").is_err());
+    }
+
     #[test]
     fn the_key_never_shows_in_debug_output() {
         let key = ApiKey::new("lin_api_do_not_print");
