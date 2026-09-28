@@ -95,7 +95,7 @@ Beside the crates: `roles/` (default role prompts in Markdown, versioned with th
 
 Six contracts are written, versioned and schema-checked before any logic, because every component and every future adapter talks through them.
 
-1. **Brief** (runner to role): format version, role, the ticket (text from anyone but the decider quoted as data), the decider, the numbered question-and-answer thread with authors marked, the checkpoint (plan, ledger), resources and zones, the project rules injected for those zones, permitted actions, and where to write the result.
+1. **Brief** (runner to role): format version, role, the ticket (text from anyone but the decider quoted as data), the decider, the numbered question-and-answer thread with authors marked, the checkpoint (plan, ledger), resources and zones, the project rules injected for those zones, permitted actions, the project's gate commands (from `stack.gate`, so a role never reads the project config or guesses the gate from the repository; OWL-37), and where to write the result.
 2. **`result.json`** (role to runner): validated against its JSON Schema, unknown fields rejected, an exit code never trusted in its place.
 3. **Project and personal config**: TOML, with published JSON Schemas so editors complete and check them.
 4. **Events**: timestamp, project, ticket, run, kind, data; the one stream behind logs, `why`, the UI and usage reports.

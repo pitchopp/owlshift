@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "role": "build",
   "project": "owlshift",
   "ticket": {
@@ -70,5 +70,6 @@
     }
   ],
   "permissions": { "level": "write_worktree", "network": false, "browser": false },
+  "gate": ["cargo fmt --all -- --check", "cargo test --workspace"],
   "result_path": ".owlshift/result.json"
 }
