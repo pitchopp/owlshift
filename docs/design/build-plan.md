@@ -204,6 +204,12 @@ Everything runs in the foreground; `resume` arrives in P2, `watch` in P3, the ba
 - **Opening.** `find_open_pull_request` looks for an open pull request from the branch of this repository into the base, so a resumed delivery does not open a second one; `open_pull_request` passes the runner's title and body verbatim. Draft pull requests are optional: a private repository on a free plan has none.
 - **Tests.** Fixtures recorded read-only on `pitchopp/owlshift`, in `crates/owlshift-adapters/tests/fixtures/github/`; the answer to `createPullRequest` is made up in the schema's shape and flagged, since recording it would open a pull request. An ignored live test pushes, opens, finds and reads a pull request on a disposable repository named by `OWLSHIFT_LIVE_GITHUB`, then closes it and deletes the branch.
 
+**The delivery report** (OWL-18), in `owlshift-runner::writer`, is the Writer's first write: a `[owlshift] DELIVERY` comment on the ticket once its pull request is open.
+
+- **Content.** The pull request and its head commit; the complete check set (OWL-17) with its verdict, every check and the forge's merge state; the project gate, as a value OWL-16 fills (until then, "not run by Owlshift"); the decisions taken without a human; what remains for a human, derived from the rest: review and merge, unfinished or failing checks, a conflict, proposed follow-ups that nothing files yet. A check set that could not be read, or that belongs to another commit than the head, is said so; the report still goes out.
+- **Writing.** The Writer asks the floor before posting. When the ticket's newest delivery report already has exactly the same body, it returns that comment instead of posting, so a retried delivery does not post twice; a newer state is a new report. Text from a model or the forge is flattened to one line, and a check link is kept only for a plain `https://` URL, so neither can forge the header or the footer nor break the layout.
+- **Live check, 2026-09-28.** `crates/owlshift-runner/tests/writer_live.rs`, run by hand, read the check set of [#25](https://github.com/pitchopp/owlshift/pull/25) and posted its report on OWL-18 through the runner's own credential openers ([comment](https://linear.app/owlshift/issue/OWL-18/post-the-delivery-report-on-the-ticket#comment-f65e55c5)). Linear stored the body verbatim, the HTML-comment footer included, so `MarkedComment::parse` read it back with its footer, and the retry posted nothing. Whether Linear's editor shows the footer was not checked. This validates the ticket's acceptance before `owlshift do` exists; OWL-20 wires the Writer into it.
+
 ## P0 tasks & exit gate
 
 Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its blockers recorded as relations.
@@ -227,7 +233,7 @@ Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its bl
 - [ ] OWL-15 · Executor: worktree, brief, spawn, process-tree stop, result validation, isolation check
 - [ ] OWL-16 · Gate commands from the project config before delivery
 - [ ] OWL-17 · GitHub forge adapter: push the branch, open the PR, read the complete check set
-- [ ] OWL-18 · Writer: delivery report on the ticket
+- [x] OWL-18 · Writer: delivery report on the ticket (2026-09-28, [#25](https://github.com/pitchopp/owlshift/pull/25))
 - [x] OWL-19 · Default build role prompt (2026-09-28, [#13](https://github.com/pitchopp/owlshift/pull/13))
 - [ ] OWL-20 · CLI: `init`, `do`, `logs`
 

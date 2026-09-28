@@ -13,8 +13,8 @@ pub const LINEAR_ACCOUNT: &str = "linear";
 
 /// The Linear adapter, with its API key read from `keychain`.
 ///
-/// No command calls it yet: `owlshift do` (OWL-20) and the writer (OWL-18)
-/// will, and `owlshift init` (OWL-20) will store the key.
+/// No command calls it yet: `owlshift do` (OWL-20) will, and hand the adapter
+/// to the [writer](crate::writer); `owlshift init` (OWL-20) will store the key.
 pub fn linear(keychain: &Keychain) -> Result<LinearTracker, String> {
     match keychain.read(LINEAR_ACCOUNT) {
         Ok(Some(key)) => Ok(LinearTracker::new(ApiKey::new(key.expose()))),
