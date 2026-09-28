@@ -21,7 +21,18 @@
 //!   `refs/stash`); remote-tracking refs are left out, a fetch being
 //!   harmless.
 //! - **Expected branch**: the worktree's HEAD is still the run's branch,
-//!   and its commit descends from the one the run started from.
+//!   and its commit descends from the one the run started from or, for a
+//!   rebase ([`Snapshot::take_rebase`]), from the new base, resolved to a
+//!   commit before the run.
+//!
+//! Runs in flight at the same time move their own branches, so
+//! [`Snapshot::check_among`] is told which ([`Concurrent`]) once it has read
+//! the refs: a running run's branch is left out, that run's own check
+//! guarding it, and an ended run's branch must still be at the commit its
+//! own check verified ([`Checked::tip`]). Everything else is checked as for
+//! a run alone, and a breach there quarantines every run that sees it: the
+//! check cannot tell which run did it. [`Snapshot::check`] is the check of a
+//! run alone, told of no other run.
 //!
 //! A check that cannot run counts as a violation. Nothing is written: git
 //! runs with `--no-optional-locks`, and `hash-object` without `-w`.
@@ -32,7 +43,7 @@
 //! (`assume-unchanged`, `skip-worktree`) hiding an edit go unseen; confining
 //! the agent is the operating system's job.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -53,6 +64,33 @@ pub struct Snapshot {
     main: MainState,
     /// The worktree's commit when the run started.
     start: String,
+    /// For a rebase, the new base, as the commit it was before the run.
+    onto: Option<String>,
+}
+
+/// The other runs in flight at any time since a snapshot, as the scheduler
+/// knows them when [`Snapshot::check_among`] asks, after reading the refs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Concurrent {
+    /// The branches of runs still in flight. A change to one is left out:
+    /// that run's own check guards its branch.
+    pub running: BTreeSet<String>,
+    /// The branches of runs that ended since the snapshot, each with the
+    /// commit its own check verified ([`Checked::tip`]). Unless the branch
+    /// is running again, it must still be there.
+    pub ended: BTreeMap<String, String>,
+}
+
+/// What [`Snapshot::check_among`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checked {
+    /// Everything the run changed that it had to leave alone; empty when
+    /// isolation held.
+    pub violations: Vec<Violation>,
+    /// The commit the run's branch was at when checked, whatever the
+    /// verdict; `None` when the worktree was not on the branch or the check
+    /// could not read it.
+    pub tip: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,15 +148,22 @@ pub enum Violation {
     /// Shared git files that changed, relative to the common directory.
     SharedGitFiles(Vec<String>),
     /// Refs other than the run's branch that were created, moved or
-    /// deleted.
+    /// deleted, outside what concurrent runs may change.
     Refs(Vec<String>),
     /// The worktree is no longer on the run's branch.
     Branch {
         expected: String,
         found: Option<String>,
     },
-    /// The branch no longer descends from the run's start commit.
-    History { start: String, end: String },
+    /// The branch descends neither from the run's start commit nor, for a
+    /// rebase, from its new base.
+    History {
+        start: String,
+        end: String,
+        /// The rebase's new base; `None` for a run that may only add to its
+        /// branch.
+        onto: Option<String>,
+    },
     /// A check could not run, so a change cannot be ruled out.
     CheckFailed(String),
 }
@@ -144,9 +189,22 @@ impl fmt::Display for Violation {
                 "the worktree is on {}, not {expected}",
                 found.as_deref().unwrap_or("no branch")
             ),
-            Self::History { start, end } => write!(
+            Self::History {
+                start,
+                end,
+                onto: None,
+            } => write!(
                 f,
                 "the branch is at {end}, which does not descend from the run's start {start}"
+            ),
+            Self::History {
+                start,
+                end,
+                onto: Some(onto),
+            } => write!(
+                f,
+                "the branch is at {end}, which descends neither from the run's start {start} \
+                 nor from its new base {onto}"
             ),
             Self::CheckFailed(reason) => write!(f, "the isolation check could not run: {reason}"),
         }
@@ -186,69 +244,130 @@ impl From<GitError> for SnapshotError {
 
 impl Snapshot {
     /// Records the state of `main` and the worktree's commit, before a run
-    /// on `branch`.
+    /// on `branch` that may only add to its history.
     pub fn take(
         git: &Git,
         main: &Path,
         worktree: &Path,
         branch: &str,
     ) -> Result<Self, SnapshotError> {
+        Self::take_with(git, main, worktree, branch, None)
+    }
+
+    /// Records the same before a run that rebases `branch` onto `onto`:
+    /// after the run, the branch may descend from `onto` instead of from its
+    /// start. `onto` is resolved to a commit now, so that nothing the run
+    /// does to a ref, a remote-tracking one included, can move it; the
+    /// caller gives the base it resolved after its own fetch.
+    pub fn take_rebase(
+        git: &Git,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+        onto: &str,
+    ) -> Result<Self, SnapshotError> {
+        Self::take_with(git, main, worktree, branch, Some(onto))
+    }
+
+    fn take_with(
+        git: &Git,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+        onto: Option<&str>,
+    ) -> Result<Self, SnapshotError> {
         let main = MainState::read(git, main, branch)?;
         let start = trimmed(&git.run(worktree, &["rev-parse", "--verify", "HEAD"])?);
-        Ok(Self { main, start })
+        let onto = onto
+            .map(|onto| {
+                let commit = format!("{onto}^{{commit}}");
+                git.run(
+                    worktree,
+                    &["rev-parse", "--verify", "--end-of-options", commit.as_str()],
+                )
+                .map(|resolved| trimmed(&resolved))
+                .map_err(|e| SnapshotError(format!("the new base {onto:?}: {e}")))
+            })
+            .transpose()?;
+        Ok(Self { main, start, onto })
     }
 
-    /// Everything the run changed that it had to leave alone; empty when
-    /// isolation held.
+    /// Everything a run alone changed that it had to leave alone; empty
+    /// when isolation held. It is [`Snapshot::check_among`] told of no other
+    /// run, kept as one path so that both stay the same check.
     pub fn check(&self, git: &Git, main: &Path, worktree: &Path, branch: &str) -> Vec<Violation> {
+        self.check_among(git, main, worktree, branch, &Concurrent::default)
+            .violations
+    }
+
+    /// Checks a run among others in flight at the same time. `concurrent`
+    /// is asked once, after the refs are read: a run registered before it
+    /// created its branch is then known, even when it started during the
+    /// check.
+    pub fn check_among(
+        &self,
+        git: &Git,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+        concurrent: &dyn Fn() -> Concurrent,
+    ) -> Checked {
         let mut violations = match MainState::read(git, main, branch) {
-            Ok(after) => self.main.compare(&after),
+            Ok(after) => self.main.compare(&after, &concurrent()),
             Err(error) => vec![Violation::CheckFailed(error.to_string())],
         };
-        if let Err(error) = self.check_branch(git, worktree, branch, &mut violations) {
-            violations.push(Violation::CheckFailed(error.to_string()));
-        }
-        violations
+        let tip = self
+            .check_branch(git, worktree, branch, &mut violations)
+            .unwrap_or_else(|error| {
+                violations.push(Violation::CheckFailed(error.to_string()));
+                None
+            });
+        Checked { violations, tip }
     }
 
+    /// Checks that the worktree is on the run's branch and that its history
+    /// is one the run may leave; returns the branch's commit when the
+    /// worktree is on it.
     fn check_branch(
         &self,
         git: &Git,
         worktree: &Path,
         branch: &str,
         violations: &mut Vec<Violation>,
-    ) -> Result<(), SnapshotError> {
+    ) -> Result<Option<String>, SnapshotError> {
         let expected = format!("refs/heads/{branch}");
         let found = symbolic_head(git, worktree)?;
         if found.as_deref() != Some(expected.as_str()) {
             violations.push(Violation::Branch { expected, found });
-            return Ok(());
+            return Ok(None);
         }
         let end = trimmed(&git.run(worktree, &["rev-parse", "--verify", "HEAD"])?);
-        let ancestry = git.output(
-            worktree,
-            &[
-                "merge-base",
-                "--is-ancestor",
-                self.start.as_str(),
-                end.as_str(),
-            ],
-            None,
-        )?;
-        match ancestry.status.code() {
-            Some(0) => Ok(()),
-            Some(1) => {
-                violations.push(Violation::History {
-                    start: self.start.clone(),
-                    end,
-                });
-                Ok(())
-            }
-            _ => Err(SnapshotError(format!(
-                "git merge-base failed with {}",
-                ancestry.status
-            ))),
+        let accepted = is_ancestor(git, worktree, &self.start, &end)?
+            || match &self.onto {
+                Some(onto) => is_ancestor(git, worktree, onto, &end)?,
+                None => false,
+            };
+        if !accepted {
+            violations.push(Violation::History {
+                start: self.start.clone(),
+                end: end.clone(),
+                onto: self.onto.clone(),
+            });
         }
+        Ok(Some(end))
+    }
+}
+
+/// Whether `end` is `ancestor` or descends from it.
+fn is_ancestor(git: &Git, dir: &Path, ancestor: &str, end: &str) -> Result<bool, SnapshotError> {
+    let ancestry = git.output(dir, &["merge-base", "--is-ancestor", ancestor, end], None)?;
+    match ancestry.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(SnapshotError(format!(
+            "git merge-base failed with {}",
+            ancestry.status
+        ))),
     }
 }
 
@@ -307,7 +426,7 @@ impl MainState {
         })
     }
 
-    fn compare(&self, after: &Self) -> Vec<Violation> {
+    fn compare(&self, after: &Self, concurrent: &Concurrent) -> Vec<Violation> {
         let mut violations = Vec::new();
         if self.head != after.head {
             violations.push(Violation::MainHead);
@@ -329,14 +448,35 @@ impl MainState {
         if !shared.is_empty() {
             violations.push(Violation::SharedGitFiles(shared));
         }
-        let refs: Vec<String> = changed(&self.refs, &after.refs)
-            .into_iter()
-            .cloned()
-            .collect();
+        let refs = self.changed_refs(after, concurrent);
         if !refs.is_empty() {
             violations.push(Violation::Refs(refs));
         }
         violations
+    }
+
+    /// The refs that changed, but concurrent runs' branches: a running
+    /// run's branch is left out, and an ended run's branch counts when it is
+    /// not at its tip, whether it changed since the snapshot or not.
+    fn changed_refs(&self, after: &Self, concurrent: &Concurrent) -> Vec<String> {
+        let concurrent_branch = |name: &str| {
+            name.strip_prefix("refs/heads/").is_some_and(|branch| {
+                concurrent.running.contains(branch) || concurrent.ended.contains_key(branch)
+            })
+        };
+        let mut refs: Vec<String> = changed(&self.refs, &after.refs)
+            .into_iter()
+            .filter(|name| !concurrent_branch(name))
+            .cloned()
+            .collect();
+        for (branch, tip) in &concurrent.ended {
+            let name = format!("refs/heads/{branch}");
+            if !concurrent.running.contains(branch) && after.refs.get(&name) != Some(tip) {
+                refs.push(name);
+            }
+        }
+        refs.sort();
+        refs
     }
 }
 
