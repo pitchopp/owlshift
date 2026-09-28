@@ -230,7 +230,13 @@ mod tests {
         assert_eq!(stdout(git(&["rev-parse", "--git-dir"])), ".git\n");
         // Every setting comes from the fixture's file or the repository's.
         for line in stdout(git(&["config", "--list", "--show-origin"])).lines() {
-            let origin = line.split('\t').next().unwrap_or_default();
+            // Git quotes a path holding backslashes, as on Windows:
+            // `file:"C:\\Users\\…\\owlshift-test.gitconfig"`.
+            let origin = line
+                .split('\t')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('"');
             assert!(
                 origin == "file:.git/config" || origin.ends_with(FIXTURE_CONFIG),
                 "{line}"
