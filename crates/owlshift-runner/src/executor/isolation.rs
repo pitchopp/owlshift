@@ -26,10 +26,11 @@
 //!   commit before the run.
 //!
 //! Runs in flight at the same time move their own branches, so
-//! [`Snapshot::check_among`] is told which ([`Concurrent`]) once it has read
-//! the refs: a running run's branch is left out, that run's own check
-//! guarding it, and an ended run's branch must still be at the commit its
-//! own check verified ([`Checked::tip`]). Everything else is checked as for
+//! [`Snapshot::check_among`] is told which ([`Concurrent`]), just before and
+//! just after it reads the refs: a branch running in either answer is left
+//! out, that run's own check guarding it, and a branch that had already
+//! ended in the first answer must still be at the commit its own check
+//! verified ([`Checked::tip`]). Everything else is checked as for
 //! a run alone, and a breach there quarantines every run that sees it: the
 //! check cannot tell which run did it. [`Snapshot::check`] is the check of a
 //! run alone, told of no other run.
@@ -69,15 +70,17 @@ pub struct Snapshot {
 }
 
 /// The other runs in flight at any time since a snapshot, as the scheduler
-/// knows them when [`Snapshot::check_among`] asks, after reading the refs.
+/// knows them when [`Snapshot::check_among`] asks: just before and just
+/// after it reads the refs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Concurrent {
     /// The branches of runs still in flight. A change to one is left out:
     /// that run's own check guards its branch.
     pub running: BTreeSet<String>,
     /// The branches of runs that ended since the snapshot, each with the
-    /// commit its own check verified ([`Checked::tip`]). Unless the branch
-    /// is running again, it must still be there.
+    /// commit its own check verified ([`Checked::tip`]). A branch that had
+    /// already ended before the refs were read, and did not run again
+    /// since, must still be there.
     pub ended: BTreeMap<String, String>,
 }
 
@@ -301,9 +304,11 @@ impl Snapshot {
     }
 
     /// Checks a run among others in flight at the same time. `concurrent`
-    /// is asked once, after the refs are read: a run registered before it
-    /// created its branch is then known, even when it started during the
-    /// check.
+    /// is asked twice, just before and just after the refs are read. The
+    /// second answer knows a run registered before it created its branch,
+    /// even when it started during the check; the first tells a run that
+    /// had already ended from one that ended during the check, after its
+    /// branch was read.
     pub fn check_among(
         &self,
         git: &Git,
@@ -312,8 +317,9 @@ impl Snapshot {
         branch: &str,
         concurrent: &dyn Fn() -> Concurrent,
     ) -> Checked {
+        let earlier = concurrent();
         let mut violations = match MainState::read(git, main, branch) {
-            Ok(after) => self.main.compare(&after, &concurrent()),
+            Ok(after) => self.main.compare(&after, &earlier, &concurrent()),
             Err(error) => vec![Violation::CheckFailed(error.to_string())],
         };
         let tip = self
@@ -426,7 +432,7 @@ impl MainState {
         })
     }
 
-    fn compare(&self, after: &Self, concurrent: &Concurrent) -> Vec<Violation> {
+    fn compare(&self, after: &Self, earlier: &Concurrent, later: &Concurrent) -> Vec<Violation> {
         let mut violations = Vec::new();
         if self.head != after.head {
             violations.push(Violation::MainHead);
@@ -448,30 +454,41 @@ impl MainState {
         if !shared.is_empty() {
             violations.push(Violation::SharedGitFiles(shared));
         }
-        let refs = self.changed_refs(after, concurrent);
+        let refs = self.changed_refs(after, earlier, later);
         if !refs.is_empty() {
             violations.push(Violation::Refs(refs));
         }
         violations
     }
 
-    /// The refs that changed, but concurrent runs' branches: a running
-    /// run's branch is left out, and an ended run's branch counts when it is
-    /// not at its tip, whether it changed since the snapshot or not.
-    fn changed_refs(&self, after: &Self, concurrent: &Concurrent) -> Vec<String> {
-        let concurrent_branch = |name: &str| {
-            name.strip_prefix("refs/heads/").is_some_and(|branch| {
-                concurrent.running.contains(branch) || concurrent.ended.contains_key(branch)
-            })
+    /// The refs that changed, but concurrent runs' branches, known from the
+    /// scheduler's answers just before (`earlier`) and just after (`later`)
+    /// the refs were read. A branch running in either answer is left out,
+    /// and so is one that ran again between them (its tip changed) or that
+    /// only the later answer knows: the refs may hold it at any point of
+    /// that run. A branch that had already ended in the earlier answer
+    /// counts when it is not at its tip, whether it changed since the
+    /// snapshot or not.
+    fn changed_refs(&self, after: &Self, earlier: &Concurrent, later: &Concurrent) -> Vec<String> {
+        let known = |branch: &str| {
+            [earlier, later]
+                .iter()
+                .any(|answer| answer.running.contains(branch) || answer.ended.contains_key(branch))
         };
         let mut refs: Vec<String> = changed(&self.refs, &after.refs)
             .into_iter()
-            .filter(|name| !concurrent_branch(name))
+            .filter(|name| !name.strip_prefix("refs/heads/").is_some_and(known))
             .cloned()
             .collect();
-        for (branch, tip) in &concurrent.ended {
+        for (branch, tip) in &earlier.ended {
+            let settled = !earlier.running.contains(branch)
+                && !later.running.contains(branch)
+                && later
+                    .ended
+                    .get(branch)
+                    .is_none_or(|later_tip| later_tip == tip);
             let name = format!("refs/heads/{branch}");
-            if !concurrent.running.contains(branch) && after.refs.get(&name) != Some(tip) {
+            if settled && after.refs.get(&name) != Some(tip) {
                 refs.push(name);
             }
         }

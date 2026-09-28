@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
@@ -270,47 +269,35 @@ fn a_rebase_run_may_land_on_its_new_base_and_nowhere_else() {
 fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
     const SECOND: &str = "owlshift/T-2";
     const THIRD: &str = "owlshift/T-3";
+    const FOURTH: &str = "owlshift/T-4";
     let f = Fixture::new();
     // Branches are created from a commit, as the executor does: from a
     // remote-tracking name, git would write their upstream into the shared
     // configuration.
     let base = f.commit(&f.main, "origin/main");
-    f.main_git(&[
-        "worktree",
-        "add",
-        "--quiet",
-        "-b",
-        SECOND,
-        "../worktree-2",
-        &base,
-    ]);
+    let add = |branch: &str, path: &str| {
+        f.main_git(&["worktree", "add", "--quiet", "-b", branch, path, &base]);
+    };
+    add(SECOND, "../worktree-2");
+    add(FOURTH, "../worktree-4");
     f.main_git(&["branch", "owlshift/T-9", &base]);
     let second = f.worktree.with_file_name("worktree-2");
+    let fourth = f.worktree.with_file_name("worktree-4");
 
-    // The scheduler's view of the runs in flight, and a third run that
-    // starts while the first run's check reads the refs: it registers, then
-    // creates its branch, just before git lists them.
+    // The scheduler's view of the runs in flight, and what happens while a
+    // check reads the refs: done once, just before git lists them.
     let registry = Arc::new(Mutex::new(Concurrent::default()));
-    let starting = Arc::new(AtomicBool::new(false));
+    type Action = Box<dyn FnOnce() + Send>;
+    let during_read: Arc<Mutex<Option<Action>>> = Arc::default();
     let git = {
-        let (env, main) = (f.env.clone(), f.main.clone());
-        let (registry, starting, base) = (registry.clone(), starting.clone(), base.clone());
+        let (env, during_read) = (f.env.clone(), during_read.clone());
         Git::with_setup("git", move |command| {
             env.apply(command);
-            if command.get_args().any(|arg| arg == "for-each-ref")
-                && starting.swap(false, Ordering::SeqCst)
-            {
-                registry.lock().unwrap().running.insert(THIRD.to_owned());
-                let add = [
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    "-b",
-                    THIRD,
-                    "../worktree-3",
-                    &base,
-                ];
-                env.run(&main, &add).unwrap();
+            if command.get_args().any(|arg| arg == "for-each-ref") {
+                let action = during_read.lock().unwrap().take();
+                if let Some(action) = action {
+                    action();
+                }
             }
         })
     };
@@ -334,15 +321,46 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
         .ended
         .insert(SECOND.to_owned(), tip);
 
-    // Then the first run's check, during which the third run starts.
-    starting.store(true, Ordering::SeqCst);
+    // Then the first run's check. While it reads the refs, a third run
+    // starts (it registers, then creates its branch) and the fourth run
+    // ends: its check reports a last commit that lands after the read, so
+    // the refs read hold its branch below that tip.
+    f.commit_file(&fourth, "NOTE.md", "last\n");
+    let last = f.commit(&fourth, "HEAD");
+    f.env
+        .run(&fourth, &["reset", "--quiet", "--hard", "HEAD~1"])
+        .unwrap();
+    registry.lock().unwrap().running.insert(FOURTH.to_owned());
+    *during_read.lock().unwrap() = Some(Box::new({
+        let (env, main, registry) = (f.env.clone(), f.main.clone(), registry.clone());
+        let (base, last) = (base.clone(), last.clone());
+        move || {
+            let mut registry = registry.lock().unwrap();
+            registry.running.insert(THIRD.to_owned());
+            let add = [
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                THIRD,
+                "../worktree-3",
+                &base,
+            ];
+            env.run(&main, &add).unwrap();
+            registry.running.remove(FOURTH);
+            registry.ended.insert(FOURTH.to_owned(), last);
+        }
+    }));
     let scheduler = || registry.lock().unwrap().clone();
     let checked = first.check_among(&git, &f.main, &f.worktree, BRANCH, &scheduler);
     assert!(
-        !starting.load(Ordering::SeqCst),
-        "the third run did not start during the check"
+        during_read.lock().unwrap().is_none(),
+        "nothing happened while the check read the refs"
     );
     assert_eq!(checked.violations, []);
+    f.env
+        .run(&fourth, &["reset", "--quiet", "--hard", &last])
+        .unwrap();
 
     // Told of no other run, as a run alone is, the same check finds the
     // other runs' branches.
@@ -351,6 +369,7 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
         [Violation::Refs(vec![
             format!("refs/heads/{SECOND}"),
             format!("refs/heads/{THIRD}"),
+            format!("refs/heads/{FOURTH}"),
         ])]
     );
 
