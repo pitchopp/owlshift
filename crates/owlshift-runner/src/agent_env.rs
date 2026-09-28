@@ -21,9 +21,9 @@ use owlshift_core::agent_env::{
     AgentEnvError, NO_CREDENTIAL, agent_environment, check_agent_variables,
 };
 use owlshift_core::floor::FloorViolation;
-use owlshift_platform::process::find_executable_in;
+use owlshift_platform::process::{Captured, RunError, find_executable_in, run_command};
 
-use crate::system::{Captured, PROBE_TIMEOUT, RunError, run_command};
+use crate::system::PROBE_TIMEOUT;
 
 /// The environment an agent process gets: see [`owlshift_core::agent_env`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,14 +140,14 @@ pub fn check_environment(
                 .is_some_and(|n| n.eq_ignore_ascii_case("PATH"))
         })
         .map_or_else(OsString::new, |(_, value)| value.clone());
-    let probe = |program: &Path, args: &[&str], input: &[u8]| {
+    let probe = |program: &Path, args: &[&str], input: Option<&[u8]>| {
         let mut command = Command::new(program);
         command
             .args(args)
             .current_dir(workdir)
             .env_clear()
             .envs(vars.iter().map(|(n, v)| (n, v)));
-        run_command(command, input, PROBE_TIMEOUT)
+        run_command(&mut command, input, PROBE_TIMEOUT)
     };
 
     match find_executable_in("git", &search_path) {
@@ -158,7 +158,7 @@ pub fn check_environment(
         Some(git) => {
             for host in forge_hosts {
                 let request = format!("protocol=https\nhost={host}\n\n");
-                match probe(&git, &["credential", "fill"], request.as_bytes()) {
+                match probe(&git, &["credential", "fill"], Some(request.as_bytes())) {
                     Ok(captured) if holds_password(&captured.stdout) => {
                         findings.push(CredentialFinding::GitCredential {
                             host: (*host).to_owned(),
@@ -169,7 +169,7 @@ pub fn check_environment(
                 }
             }
             let args = ["config", "-z", "--get-regexp", CREDENTIAL_SETTINGS];
-            match probe(&git, &args, b"") {
+            match probe(&git, &args, None) {
                 Ok(captured) if captured.code == Some(0) => findings.extend(
                     credential_settings(&captured.stdout)
                         .into_iter()
@@ -188,7 +188,7 @@ pub fn check_environment(
 
     if let Some(gh) = find_executable_in("gh", &search_path) {
         for host in forge_hosts {
-            match probe(&gh, &["auth", "token", "--hostname", host], b"") {
+            match probe(&gh, &["auth", "token", "--hostname", host], None) {
                 Ok(captured) if holds_gh_login(&captured) => {
                     findings.push(CredentialFinding::GhLogin {
                         host: (*host).to_owned(),
