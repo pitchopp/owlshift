@@ -65,6 +65,11 @@ pub fn find_executable_in(name: &str, search_path: impl AsRef<OsStr>) -> Option<
 /// Runs a program with no input and captures its output, giving up at the
 /// deadline.
 ///
+/// The program runs in the C locale (`LC_ALL=C`, `LANGUAGE` empty), so its
+/// messages are the English ones the callers match on, such as git's "not a
+/// git repository" or the harness status phrases of live check C8, whatever
+/// the user's own locale.
+///
 /// At the deadline the program is killed. A process it started may still
 /// hold its output open; the readers are then left behind rather than waited
 /// on, so the call never outlives `timeout` by more than a poll interval.
@@ -75,16 +80,9 @@ pub fn run(
     timeout: Duration,
 ) -> Result<Captured, RunError> {
     let deadline = Instant::now() + timeout;
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    let mut child = command.spawn().map_err(RunError::Io)?;
+    let mut child = probe_command(program, args, cwd)
+        .spawn()
+        .map_err(RunError::Io)?;
     let stdout = read_capped(child.stdout.take());
     let stderr = read_capped(child.stderr.take());
 
@@ -115,6 +113,22 @@ pub fn run(
         stdout: receive(stdout)?,
         stderr: receive(stderr)?,
     })
+}
+
+/// The command [`run`] spawns: no input, captured output, the C locale.
+fn probe_command(program: &Path, args: &[&str], cwd: Option<&Path>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    command
 }
 
 /// Reads a stream to its end on its own thread, keeping the first
@@ -224,6 +238,14 @@ mod tests {
         let outcome = helper("helper_leave_a_pipe_holder", Duration::from_secs(2));
         assert!(matches!(outcome, Err(RunError::TimedOut)), "{outcome:?}");
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn probes_run_in_the_c_locale() {
+        let command = probe_command(Path::new("git"), &["--version"], None);
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))));
+        assert!(envs.contains(&(OsStr::new("LANGUAGE"), Some(OsStr::new("")))));
     }
 
     #[test]
