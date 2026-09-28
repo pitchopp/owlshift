@@ -1,0 +1,71 @@
+# The P0 exit-gate scenario, played by crates/owlshift-testkit/tests/scenarios.rs.
+# Its fixture folder is smoke/: the project in repo/, prepared results in results/.
+
+description = """
+DEMO-1 on the trivial pipeline, from dispatch to Deliver: a usage limit after a
+delay (an interruption, not a failure), a crash (failure 1 of 2), a question
+round answered by the decider, the build committed and pushed, an invalid
+result at Verify (failure 1 of 2 there), then Verify done."""
+ticket = "DEMO-1"
+start = "2026-09-28T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build", waiting = "none", tracker_stage = "In Progress" }
+
+[[step]]
+run = { delay_ms = 50, usage_limit = "2026-09-28T14:00:00Z" }
+expect = { event = "interrupted", stage = "build", failed_runs = 0, branch_pushed = false }
+
+[[step]]
+run = { stderr = "fatal: out of memory\n", exit_code = 101 }
+expect = { event = "run_failed", stage = "build", failed_runs = 1 }
+
+[[step]]
+run = { result = "results/questions.json" }
+[step.expect]
+event = "questions"
+stage = "build"
+waiting = "needs_input"
+round = 1
+failed_runs = 1
+tracker_stage = "Needs Input"
+comments = 1
+branch_pushed = false
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] QUESTIONS · round 1"
+contains = [
+  "**Q1** (scope) Which language should the greeting use?",
+  "Recommendation: English",
+  '<!-- owlshift:{"format":1,"kind":"QUESTIONS","ticket":"DEMO-1","round":1} -->',
+]
+
+[[step]]
+comment = { author = "maintainer", body = "Q1: English.\n" }
+expect = { event = "none", comments = 2, last_comment = { author = "maintainer", first_line = "Q1: English." } }
+
+[[step]]
+answer = "answered"
+expect = { event = "answered", stage = "build", waiting = "none", round = 1, failed_runs = 1, tracker_stage = "In Progress" }
+
+[[step]]
+[step.run]
+files = { "GREETING.md" = "Hello, reader.\n" }
+commit = "Add a greeting"
+result = "results/build-done.json"
+[step.expect]
+event = "completed"
+stage = "verify"
+failed_runs = 0
+brief_thread = ["owlshift", "decider"]
+branch_pushed = true
+branch_files = { "GREETING.md" = "Hello, reader.\n" }
+
+[[step]]
+run = { result = "results/invalid.json" }
+expect = { event = "run_failed", stage = "verify", failed_runs = 1 }
+
+[[step]]
+run = { result = "results/verify-done.json" }
+expect = { event = "completed", stage = "deliver", waiting = "none", failed_runs = 0, comments = 2 }

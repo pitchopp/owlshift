@@ -55,18 +55,19 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
 
 ## Repository & workspace layout
 
-One repository, a Cargo workspace of six crates split along the design's boundaries, so the pure core never depends on I/O.
+One repository, a Cargo workspace of six shipped crates split along the design's boundaries, so the pure core never depends on I/O, plus one test-only crate.
 
 | Crate | Holds | Depends on |
 | --- | --- | --- |
 | `owlshift-core` | Ticket, pipeline, stage, gate, resource; state machine; scheduler; policy. Pure functions, no I/O | `serde` and `schemars`, for derives only (the shared vocabulary) |
 | `owlshift-contracts` | Brief, `result.json`, project and personal config, events, git ref layout, format versions; JSON Schemas generated from the types | core |
-| `owlshift-adapters` | Tracker (Linear, plus a test tracker), forge (GitHub), harness (Claude Code, fake; Codex in P5), notifier; each behind a trait with declared capabilities | contracts |
+| `owlshift-adapters` | Tracker (Linear, plus the Markdown test tracker), forge (GitHub), harness (Claude Code; Codex in P5), notifier; each behind a trait with declared capabilities | contracts |
 | `owlshift-platform` | Service install and uninstall, process groups and Job Objects, keychain, platform directories, keep-awake | nothing |
 | `owlshift-runner` | Daemon loop, executor (worktrees, spawning, isolation check), writer, local store (SQLite) | all of the above |
 | `owlshift-cli` | The `owlshift` binary | runner |
+| `owlshift-testkit` | Test only, never published and never a dependency of a shipped crate: the fake harness program, hermetic git and the bare-remote fixture, the scenario format and runner, and the scenario tests. It is a crate of its own because Cargo gives a binary's path only to the integration tests of its own package | core, contracts, adapters |
 
-Beside the crates: `roles/` (default role prompts in Markdown, versioned with the contract), `schemas/` (generated JSON Schemas), `tests/scenarios/` (S1 to S17 with fixtures), `fixtures/fake-harness/`, `docs/`.
+Beside the crates: `roles/` (default role prompts in Markdown, versioned with the contract), `schemas/` (generated JSON Schemas), `tests/scenarios/` (S1 to S17 with their fixtures, played by the testkit), `docs/`.
 
 **Git through the `git` CLI**, not a library: worktrees, pushes and credential helpers then behave exactly as in the user's own terminal. **Harnesses through their own CLI**, never through a model API: the user's subscription login is what runs. Library choices (async runtime, HTTP client, SQLite binding, CLI parser, keychain access) are made at implementation time against current documentation.
 
@@ -133,7 +134,19 @@ Everything runs in the foreground; `resume` arrives in P2, `watch` in P3, the ba
 - **Adapters.** No adapter exists yet, so doctor only names the configured tracker, with a warning. Capability contracts come once three implementations exist (principle 8).
 - **Output and exit status.** A failed check prints how to fix it and makes the exit status 1. Warnings do not.
 
-**The test tracker** (published as the Markdown tracker in P9) keeps one folder per ticket in the repository: `tickets/PROJ-1/ticket.md` with a front matter (stage, priority, assignee, labels, blocked_by) and the description, and `tickets/PROJ-1/comments/` with one file per comment, named by timestamp and author. Answering a question is adding a file; everything stays diffable in git.
+**The test tracker** (published as the Markdown tracker in P9) keeps one folder per ticket in the repository: `tickets/PROJ-1/ticket.md` with a front matter and the description, and `tickets/PROJ-1/comments/` with one file per comment, named by timestamp and author. Answering a question is adding a file; everything stays diffable in git. The format, as built in P0 (OWL-11):
+
+- `ticket.md` opens with a TOML front matter between two `+++` lines, then the description. Keys: `title`, `author`, `stage` (the visible stage: a state name as mapped under `[tracker].states`), `priority` (`urgent`, `high`, `medium`, `low` or `unset`, the default), `assignee` (optional: the decider), `labels` and `blocked_by` (ticket ids), both empty by default. An unknown key is refused. TOML keeps the project to one configuration language; the choice is revisited before the tracker is published in P9, where YAML front matter is the wider convention.
+- A comment is `comments/<YYYYMMDDTHHMMSSZ>-<author>.md`: the UTC time in ISO 8601 basic format, which has no colon (Windows refuses one in a file name) and sorts in time order, then the author (ASCII letters, digits, `_` and `-`). The body is the file's content. Posting never overwrites a file: a second comment by the same author in the same second is refused.
+- Changing the visible stage rewrites the `stage` line of the front matter and nothing else, a one-line diff.
+- A malformed file is refused with an error that names it.
+
+**The test bench** (OWL-11) lives in `owlshift-testkit` and plays a ticket end to end without a model, a network or a tracker account.
+
+- **The fake harness**, `owlshift-fake-harness --brief <brief.json> --reply <reply.toml>`, runs in the worktree like a real harness. The reply says what to do, in this order: wait (`delay_ms`); write files (`files`) and commit them (`commit`); copy a prepared `result.json`, valid or not, to the brief's result path (`result`); print (`stdout`, `stderr`), or report a usage limit (`usage_limit`, a reset time: it prints `owlshift-fake-harness: usage limit reached · resets <time>` on stderr and writes no result); exit (`exit_code`: 0 by default, 1 with a usage limit). It is a compiled program, not a script, so it behaves the same on the three platforms.
+- **A scenario** is a TOML file in `tests/scenarios/` with a fixture folder beside it: the project repository, seeded as `main` into a local bare remote, and the prepared results. Its steps are `dispatch`, `run` (a reply for the fake harness), `comment` (a person comments) and `answer` (the answer check's verdict: only `answered` until the answer-check role arrives in P2). Any step can carry expectations on the core state (stage, waiting, round, failed runs), the tracker (visible stage, comments) and the remote (branch pushed, file contents); a failed expectation names the scenario, the step, the expected and the found value. Time is virtual, the scenario's start plus one minute per step, so a run is reproducible to the byte.
+- **A stand-in driver** plays the executor (OWL-15) and the writer (OWL-18) until they exist, and only as far as the scenarios need: it writes the brief, launches the fake harness, maps the outcome onto a core event, posts the questions comment, sets the visible stage and pushes the branch. Those tickets replace it; the scenario files stay.
+- **Git is hermetic.** Every git command the bench runs, the fake harness included, starts with no inherited `GIT_*` variable, `GIT_CONFIG_NOSYSTEM=1`, `HOME` and `XDG_CONFIG_HOME` in the fixture's folder, and `GIT_CONFIG_GLOBAL` pointing to a file the fixture writes: identity, no signing, `core.autocrlf=false`, and empty ignore and attributes files and hooks folder of its own. The host's configuration (signing, hooks, ignore rules, line-ending conversion) never reaches a test. Author and committer dates come from the virtual clock, so commit ids are reproducible too. Check: `git::tests::git_reads_only_the_fixture_configuration`, in `owlshift-testkit`, gives git a hostile environment (`GIT_DIR`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) and a hostile home (a global configuration, an ignore file of `*`, attributes with `eol=crlf`). It then requires every configuration entry to come from the fixture's file or the repository's own, and no host ignore rule or attribute to apply. It passed on ubuntu, macOS and Windows in CI on 2026-09-28 ([run 36407077420](https://github.com/pitchopp/owlshift/actions/runs/36407077420)). On Windows, then, no entry of Git for Windows' own system configuration was read. Git for Windows prints a configuration file's path in quotes when the path holds backslashes; the first run of the check failed on that quote alone.
 
 ## P0 tasks & exit gate
 
