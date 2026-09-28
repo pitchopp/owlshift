@@ -11,14 +11,15 @@ use super::git::Git;
 use super::{BRIEF_PATH, ExecutorError, RUN_DIR, RunSpec};
 
 /// Creates the ticket's worktree on its branch, or checks that the one
-/// found is: on the branch, at the commit the branch points to in the main
-/// checkout's repository.
+/// found is: the root of a linked worktree of the main checkout's
+/// repository, on the branch, at the commit the branch points to there.
 pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
     check_spec(git, spec)?;
     let head_ref = format!("refs/heads/{}", spec.branch);
     let worktree_error = |e: super::GitError| ExecutorError::Worktree(e.to_string());
 
     if fs::symlink_metadata(spec.worktree).is_ok() {
+        check_linked(git, spec)?;
         let head = git
             .output(spec.worktree, &["symbolic-ref", "-q", "HEAD"], None)
             .map_err(worktree_error)?;
@@ -46,7 +47,7 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
             .map_err(worktree_error)?;
         if here != there {
             return Err(ExecutorError::Worktree(format!(
-                "{} is not a worktree of {}",
+                "{} is not at the commit {head_ref} has in {}",
                 spec.worktree.display(),
                 spec.main.display()
             )));
@@ -89,6 +90,41 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
     }
     git.run(spec.main, &args).map_err(worktree_error)?;
     Ok(())
+}
+
+/// Requires an existing worktree to be one the isolation check protects
+/// against: the root of a linked worktree of the main checkout's
+/// repository. Its common git directory must be the main checkout's, so a
+/// separate clone is refused; its top level must be its own path and not
+/// the main checkout's, so the main checkout itself, or a folder inside
+/// either, is refused too. Paths are compared once resolved, links
+/// included.
+fn check_linked(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
+    let resolved = |dir: &Path, args: &[&str]| -> Result<PathBuf, ExecutorError> {
+        let printed = git
+            .run(dir, args)
+            .map_err(|e| ExecutorError::Worktree(e.to_string()))?;
+        canonical(&dir.join(String::from_utf8_lossy(&printed).trim()))
+    };
+    let common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    let top = ["rev-parse", "--path-format=absolute", "--show-toplevel"];
+    let worktree_top = resolved(spec.worktree, &top)?;
+    let linked = resolved(spec.worktree, &common)? == resolved(spec.main, &common)?
+        && worktree_top != resolved(spec.main, &top)?
+        && worktree_top == canonical(spec.worktree)?;
+    if linked {
+        Ok(())
+    } else {
+        Err(ExecutorError::Worktree(format!(
+            "{} is not a linked worktree of {}",
+            spec.worktree.display(),
+            spec.main.display()
+        )))
+    }
+}
+
+fn canonical(path: &Path) -> Result<PathBuf, ExecutorError> {
+    fs::canonicalize(path).map_err(|e| ExecutorError::Worktree(format!("{}: {e}", path.display())))
 }
 
 /// Refuses a branch name git would not take as is (an option, a name it

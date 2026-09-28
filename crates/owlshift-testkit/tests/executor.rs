@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -105,9 +105,14 @@ impl Bench {
     }
 
     fn run(&self) -> ExecutorError {
+        self.run_in(&self.worktree)
+    }
+
+    /// A run whose worktree is `worktree`.
+    fn run_in(&self, worktree: &Path) -> ExecutorError {
         let spec = RunSpec {
             main: &self.main,
-            worktree: &self.worktree,
+            worktree,
             branch: BRANCH,
             base: "origin/main",
             run_dir: &self.tmp.path().join("run"),
@@ -168,6 +173,47 @@ fn a_worktree_on_another_branch_refuses_the_run() {
         matches!(&error, ExecutorError::Worktree(reason) if reason.contains("refs/heads/other")),
         "{error:?}"
     );
+}
+
+fn not_linked(error: &ExecutorError) -> bool {
+    matches!(error, ExecutorError::Worktree(reason) if reason.contains("is not a linked worktree"))
+}
+
+/// A clone of the same remote, on the ticket's branch at the commit the
+/// branch has in the main checkout: another repository, whose shared git
+/// files the isolation check would not watch.
+#[test]
+fn a_separate_clone_is_not_the_tickets_worktree() {
+    let bench = Bench::new();
+    bench
+        .env
+        .run(&bench.main, &["branch", BRANCH, "origin/main"])
+        .unwrap();
+    bench
+        .env
+        .run(
+            bench.tmp.path(),
+            &["clone", "--quiet", "remote.git", "worktree"],
+        )
+        .unwrap();
+    bench
+        .env
+        .run(&bench.worktree, &["switch", "--quiet", "-c", BRANCH])
+        .unwrap();
+    let error = bench.run();
+    assert!(not_linked(&error), "{error:?}");
+}
+
+/// The main checkout itself, on the ticket's branch.
+#[test]
+fn the_main_checkout_is_not_the_tickets_worktree() {
+    let bench = Bench::new();
+    bench
+        .env
+        .run(&bench.main, &["switch", "--quiet", "-c", BRANCH])
+        .unwrap();
+    let error = bench.run_in(&bench.main);
+    assert!(not_linked(&error), "{error:?}");
 }
 
 #[cfg(unix)]
