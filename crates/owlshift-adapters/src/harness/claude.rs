@@ -62,13 +62,48 @@ const POLL: Duration = Duration::from_millis(20);
 /// no server was loaded.
 const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
 
-/// The tools removed from every run because they act on the user's claude.ai
-/// account, outside the run's worktree and budget: `RemoteTrigger` lists,
-/// creates and runs cloud agents there. Checked live (OWL-42): Claude Code
-/// offers it under both permission modes and neither asks before a call, so
-/// only removing it keeps it out of reach. This lists the tools checked so
-/// far, not every tool that might reach beyond the run.
-const ACCOUNT_TOOLS: &[&str] = &["RemoteTrigger"];
+/// The tools removed from every run because a call can act outside the run's
+/// worktree and budget. Checked live with Claude Code 2.1.283 (OWL-42 and
+/// OWL-46, recorded under check C1 in `docs/design/build-plan.md`): each is
+/// offered under both permission modes, and none that was called asked
+/// first, so only removing it keeps it out of reach.
+///
+/// - `RemoteTrigger` lists, creates and runs cloud agents on the user's
+///   claude.ai account.
+/// - `PushNotification` notifies the user's terminal and, with Remote
+///   Control connected, their phone.
+/// - `DesignSync` reads and writes the user's claude.ai/design projects.
+/// - `Workflow` runs subagents in the background, and the CLI carries a path
+///   that launches a workflow in a cloud session; not run, so denied by
+///   default.
+/// - `CronCreate` can persist a job to `.claude/scheduled_tasks.json`, a
+///   schedule meant to outlive the run; `CronDelete` and `CronList` act on
+///   the same jobs.
+/// - `SendMessage` messages, and `ListAgents` lists, the user's other Claude
+///   sessions on this machine, in the cloud and over Remote Control.
+/// - `EnterWorktree` creates a worktree and branch under the main checkout's
+///   `.claude/worktrees/` and moves the session there; `ExitWorktree` leaves
+///   or removes it.
+/// - `Agent` (listed as `Task` in the `init` event) creates such a worktree
+///   with `isolation: "worktree"` and launches a cloud agent with `"remote"`;
+///   the second was not tried.
+///
+/// `Monitor` and `ScheduleWakeup` stay: a monitor has Bash's permission and
+/// lives in the run's process tree, and a wakeup dies with the process.
+const BEYOND_RUN_TOOLS: &[&str] = &[
+    "RemoteTrigger",
+    "PushNotification",
+    "DesignSync",
+    "Workflow",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "SendMessage",
+    "ListAgents",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Agent",
+];
 
 /// The tools removed from a run that has no network access.
 const NETWORK_TOOLS: &[&str] = &["WebFetch", "WebSearch"];
@@ -160,12 +195,15 @@ impl std::error::Error for CommandError {}
 ///   confined to the directory: the executor's isolation check covers its
 ///   writes, and the agent environment leaves it no credential.
 ///
-/// The account tools are always removed and, without network access, the web
-/// tools too, all in one `--disallowedTools` flag; Bash, when allowed, can
-/// still reach the network. The worktree's own project settings
+/// The tools that reach beyond the run are always removed and, without network
+/// access, the web tools too, all in one `--disallowedTools` flag; Bash, when
+/// allowed, can still reach the network. The worktree's own project settings
 /// (`.claude/settings.json`) still apply, since C1's guardrail keeps the
-/// `project` and `local` sources; an allow rule given with `--settings` did not
-/// bring a removed tool back (OWL-42).
+/// `project` and `local` sources, and their allow rules count once the
+/// worktree is trusted, which a linked worktree is when its main checkout is.
+/// Neither an allow rule given with `--settings` (OWL-42) nor one in a trusted
+/// worktree's project settings (OWL-46, observed on the tools a run without a
+/// login offers) brought a removed tool back.
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
     if request.permissions.browser {
         return Err(CommandError::Unsupported("a browser"));
@@ -195,7 +233,7 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
         }
     }
     command.args(["--permission-prompts", "none"]);
-    command.arg("--disallowedTools").args(ACCOUNT_TOOLS);
+    command.arg("--disallowedTools").args(BEYOND_RUN_TOOLS);
     if !request.permissions.network {
         command.args(NETWORK_TOOLS);
     }
@@ -784,15 +822,24 @@ mod tests {
         args(request).join(" ")
     }
 
+    /// The removed tools as they appear on the command line; which tools
+    /// belong there is pinned by the contract tests, not here.
+    fn denied() -> String {
+        BEYOND_RUN_TOOLS.join(" ")
+    }
+
     #[test]
     fn a_read_only_run_may_write_only_its_result_file() {
         let request = request(PermissionLevel::ReadOnly);
         assert_eq!(
             joined(&request),
-            "-p --output-format stream-json --verbose \
-             --permission-mode dontAsk --allowedTools Edit(./.owlshift/result.json) \
-             --permission-prompts none --disallowedTools RemoteTrigger \
-             --setting-sources project,local --strict-mcp-config --no-session-persistence"
+            format!(
+                "-p --output-format stream-json --verbose \
+                 --permission-mode dontAsk --allowedTools Edit(./.owlshift/result.json) \
+                 --permission-prompts none --disallowedTools {} \
+                 --setting-sources project,local --strict-mcp-config --no-session-persistence",
+                denied()
+            )
         );
         let command = command(Path::new("claude"), &request).unwrap();
         assert_eq!(command.get_current_dir(), Some(Path::new("/work")));
@@ -808,11 +855,14 @@ mod tests {
         request.max_budget_usd = Some(2.5);
         assert_eq!(
             joined(&request),
-            "-p --output-format stream-json --verbose --model haiku --effort xhigh \
-             --permission-mode acceptEdits --allowedTools Bash \
-             --permission-prompts none --disallowedTools RemoteTrigger WebFetch WebSearch \
-             --json-schema {\"type\":\"object\"} --max-budget-usd 2.5 \
-             --setting-sources project,local --strict-mcp-config --no-session-persistence"
+            format!(
+                "-p --output-format stream-json --verbose --model haiku --effort xhigh \
+                 --permission-mode acceptEdits --allowedTools Bash \
+                 --permission-prompts none --disallowedTools {} WebFetch WebSearch \
+                 --json-schema {{\"type\":\"object\"}} --max-budget-usd 2.5 \
+                 --setting-sources project,local --strict-mcp-config --no-session-persistence",
+                denied()
+            )
         );
     }
 
