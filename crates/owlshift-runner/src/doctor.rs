@@ -6,8 +6,9 @@
 //! C8 in `docs/design/build-plan.md`).
 
 use std::fmt;
+use std::path::Path;
 
-use owlshift_adapters::harness::{self, Login};
+use owlshift_adapters::harness::{self, Login, tested};
 use owlshift_adapters::tracker::Capability;
 use owlshift_adapters::tracker::linear::LinearTracker;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
@@ -15,7 +16,7 @@ use owlshift_contracts::Harness;
 use owlshift_contracts::config::TrackerKind;
 
 use crate::config::{Effective, FileState, exit_text};
-use crate::system::{RunError, System, version_of};
+use crate::system::{RunError, System, exact_version_of, version_of};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -139,16 +140,26 @@ fn harness_check(system: &dyn System, harness: Harness) -> Check {
             Some(harness::install_hint(harness)),
         );
     };
-    let version = match system.run(&path, &["--version"], None) {
-        Ok(out) if out.code == Some(0) => version_of(&out.stdout),
-        _ => None,
-    }
-    .unwrap_or_else(|| "version unknown".to_owned());
-    let found = format!("{version} ({})", path.display());
+    let (version, exact) = match system.run(&path, &["--version"], None) {
+        Ok(out) if out.code == Some(0) => (version_of(&out.stdout), exact_version_of(&out.stdout)),
+        _ => (None, None),
+    };
+    let found = format!(
+        "{} ({})",
+        version.as_deref().unwrap_or("version unknown"),
+        path.display()
+    );
+    let mut result = login_check(system, harness, &path, &found);
+    flag_untested(&mut result, harness, exact.as_deref());
+    result
+}
+
+fn login_check(system: &dyn System, harness: Harness, path: &Path, found: &str) -> Check {
+    let program = harness::program(harness);
 
     let status_args = harness::login_status_args(harness);
     let status_command = format!("{program} {}", status_args.join(" "));
-    let (login, why) = match system.run(&path, status_args, None) {
+    let (login, why) = match system.run(path, status_args, None) {
         Ok(out) => (
             harness::parse_login(harness, out.code, &out.stdout, &out.stderr),
             "gave an answer Owlshift does not know",
@@ -178,6 +189,35 @@ fn harness_check(system: &dyn System, harness: Harness) -> Check {
             detail: format!("{found}, login state unknown: `{status_command}` {why}"),
             fix: Some(format!("run `{status_command}` yourself to see why")),
         },
+    }
+}
+
+/// Warns on a harness version Owlshift was not tested with, or could not
+/// read: the CLI may have changed a flag or a message under the user
+/// (`docs/design/runtime-and-operations.md`, "Updates & versions"). Never a
+/// failure, since an untested version may well work; a failed check keeps
+/// its status and its fix.
+fn flag_untested(check: &mut Check, harness: Harness, version: Option<&str>) {
+    if version.is_some_and(|version| tested::is_tested(harness, version)) {
+        return;
+    }
+    let tested = tested::tested_versions(harness);
+    if tested.is_empty() {
+        check
+            .detail
+            .push_str("; no version tested with Owlshift yet");
+    } else {
+        check.detail.push_str("; version not tested with Owlshift");
+    }
+    if check.status == Status::Ok {
+        check.status = Status::Warn;
+        if !tested.is_empty() {
+            check.fix = Some(format!(
+                "Owlshift is tested with {} {}; if a run misbehaves, install a tested version",
+                harness::program(harness),
+                tested.join(", ")
+            ));
+        }
     }
 }
 
@@ -406,6 +446,87 @@ mod tests {
             ["run `claude auth status --json` yourself to see why"]
         );
         assert!(!shown.contains("ada@example.com"), "{shown}");
+    }
+
+    fn line<'a>(report: &'a Report, subject: &str) -> &'a Check {
+        report
+            .checks
+            .iter()
+            .find(|check| check.subject == subject)
+            .unwrap()
+    }
+
+    fn logged_in(system: FakeSystem) -> FakeSystem {
+        system
+            .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""))
+            .answer(CODEX_STATUS, Answer::Exit(0, "", CODEX_API_KEY))
+    }
+
+    #[test]
+    fn an_untested_or_unreadable_version_warns_without_failing() {
+        let fix = "Owlshift is tested with claude 2.1.283; \
+                   if a run misbehaves, install a tested version";
+        for answer in [
+            Answer::Exit(0, "9.9.9 (Claude Code)\n", ""),
+            Answer::Exit(0, "2.1.283-beta.1 (Claude Code)\n", ""),
+            Answer::TimedOut,
+        ] {
+            let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+                .answer("claude --version", answer);
+            let report = run(&system, &no_config());
+            let claude = line(&report, "claude");
+            assert!(report.ready(), "{report}");
+            assert_eq!(claude.status, Status::Warn, "{report}");
+            assert!(
+                claude
+                    .detail
+                    .ends_with("logged in (claude.ai, max plan); version not tested with Owlshift"),
+                "{report}"
+            );
+            assert_eq!(claude.fix.as_deref(), Some(fix));
+        }
+    }
+
+    #[test]
+    fn a_tested_version_is_quiet_and_codex_has_none_yet() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let report = run(&system, &no_config());
+        let claude = line(&report, "claude");
+        assert_eq!(claude.status, Status::Ok, "{report}");
+        assert!(!claude.detail.contains("tested"), "{report}");
+        assert_eq!(claude.fix, None);
+
+        // Codex has no contract tests, so no version of it is tested.
+        let codex = line(&report, "codex");
+        assert!(report.ready(), "{report}");
+        assert_eq!(codex.status, Status::Warn);
+        assert_eq!(
+            codex.detail,
+            "0.154.0 (/fake/bin/codex), logged in (API key); no version tested with Owlshift yet"
+        );
+        assert_eq!(codex.fix, None);
+    }
+
+    #[test]
+    fn a_failure_at_an_untested_version_keeps_its_fix() {
+        let system = with_harnesses(with_git(FakeSystem::default()))
+            .answer(
+                "claude --version",
+                Answer::Exit(0, "9.9.9 (Claude Code)\n", ""),
+            )
+            .answer(
+                CLAUDE_STATUS,
+                Answer::Exit(1, r#"{"loggedIn": false, "authMethod": "none"}"#, ""),
+            )
+            .answer(CODEX_STATUS, Answer::Exit(0, "", CODEX_API_KEY));
+        let report = run(&system, &no_config());
+        let claude = line(&report, "claude");
+        assert_eq!(claude.status, Status::Fail);
+        assert_eq!(
+            claude.detail,
+            "9.9.9 (/fake/bin/claude), not logged in; version not tested with Owlshift"
+        );
+        assert_eq!(fixes(&report, "claude"), ["run `claude auth login`"]);
     }
 
     #[test]

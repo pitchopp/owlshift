@@ -18,6 +18,8 @@ use jiff::Timestamp;
 use owlshift_adapters::harness::claude::{
     Billing, EXIT_GRACE, Failure, Outcome, RateLimitStatus, Run, Transcript, drive,
 };
+use owlshift_adapters::harness::tested::is_tested;
+use owlshift_contracts::Harness;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -122,6 +124,32 @@ fn usage_limit() {
             window: Some("five_hour".into()),
         }
     );
+}
+
+/// Every recorded fixture carries a version listed in `harness/tested.rs`,
+/// so re-recording with a new release cannot leave the list `owlshift
+/// doctor` reads behind. The constructed fixture proves nothing about a
+/// release and is skipped.
+#[test]
+fn recorded_versions_are_listed_as_tested() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
+    let mut recorded = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if name == "usage_limit.jsonl" {
+            continue;
+        }
+        let version = replay(&name, 0)
+            .harness_version
+            .unwrap_or_else(|| panic!("{name} records no Claude Code version"));
+        assert!(
+            is_tested(Harness::Claude, &version),
+            "{name} was recorded with Claude Code {version}: once the contract tests \
+             pass on it, add it to crates/owlshift-adapters/src/harness/tested.rs"
+        );
+        recorded += 1;
+    }
+    assert!(recorded > 0, "no recorded fixture found");
 }
 
 /// Runs one of the helpers below in a fresh copy of this test binary, as the
