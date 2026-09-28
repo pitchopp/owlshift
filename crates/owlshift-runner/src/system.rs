@@ -1,9 +1,14 @@
 //! The runner's view of the host: finding programs and running them. Behind
 //! a trait so that checks can be tested without the real CLIs installed.
 
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use owlshift_platform::process::OUTPUT_CAP;
 pub use owlshift_platform::process::{Captured, RunError};
 
 /// How long a probe such as `git --version` may take. C8 measured about
@@ -28,6 +33,89 @@ impl System for HostSystem {
     fn run(&self, program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<Captured, RunError> {
         owlshift_platform::process::run(program, args, cwd, PROBE_TIMEOUT)
     }
+}
+
+/// Runs a command the caller prepared (program, arguments, directory,
+/// environment), writes `input` on its standard input and captures its
+/// output, each stream up to [`OUTPUT_CAP`] bytes. At the deadline the
+/// command is killed; a process it started that still holds the output open
+/// is left behind rather than waited on.
+///
+/// The same work as `owlshift_platform::process::run`, which takes neither
+/// an environment nor input; fold the two together once that module's
+/// process work (OWL-31) has landed.
+pub(crate) fn run_command(
+    mut command: Command,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Captured, RunError> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(RunError::Io)?;
+    let stdout = read_capped(child.stdout.take());
+    let stderr = read_capped(child.stderr.take());
+    if let Some(mut stdin) = child.stdin.take() {
+        // A program that exits without reading its input closes the pipe;
+        // its exit status and output tell the rest.
+        let _ = stdin.write_all(input);
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                // Best effort: the child may have exited in between.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::TimedOut);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Io(error));
+            }
+        }
+    };
+    let receive = |stream: Receiver<Vec<u8>>| {
+        stream
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| RunError::TimedOut)
+    };
+    Ok(Captured {
+        code: status.code(),
+        stdout: receive(stdout)?,
+        stderr: receive(stderr)?,
+    })
+}
+
+/// Reads a stream to its end on its own thread, keeping the first
+/// [`OUTPUT_CAP`] bytes, and sends them once the stream closes.
+fn read_capped(stream: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        if let Some(mut stream) = stream {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let room = OUTPUT_CAP - kept.len();
+                        kept.extend_from_slice(&buffer[..n.min(room)]);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        // The receiver is gone when the run timed out: nothing to report.
+        let _ = sender.send(kept);
+    });
+    receiver
 }
 
 /// The first version number in a program's `--version` output, rebuilt from
