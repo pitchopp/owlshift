@@ -7,3 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[dependencies]
+dirs.workspace = true
+which.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile.workspace = true
