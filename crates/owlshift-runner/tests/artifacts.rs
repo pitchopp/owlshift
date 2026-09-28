@@ -1,5 +1,6 @@
 //! The runner reads the artifacts named in `result.json` and fails on one
-//! that leaves the worktree through a symbolic link, naming its field.
+//! that leaves the worktree through a symbolic link, or that is too large,
+//! naming its field.
 
 use std::fs;
 use std::path::Path;
@@ -7,7 +8,7 @@ use std::path::Path;
 use owlshift_contracts::ids::RelativePath;
 use owlshift_contracts::result::Artifacts;
 use owlshift_platform::confined::{ConfinedError, Refusal};
-use owlshift_runner::artifact::read_artifacts;
+use owlshift_runner::artifact::{MAX_ARTIFACT_BYTES, read_artifacts};
 
 fn path(path: &str) -> Option<RelativePath> {
     Some(RelativePath::new(path).unwrap())
@@ -95,6 +96,32 @@ fn the_refused_field_is_the_one_named() {
         error.to_string(),
         "artifact `report`: `report.md` does not exist"
     );
+}
+
+#[test]
+fn an_artifact_over_the_limit_fails_the_run_naming_its_field() {
+    let wt = tempfile::tempdir().unwrap();
+    let limit = usize::try_from(MAX_ARTIFACT_BYTES).unwrap();
+    fs::write(wt.path().join("plan.md"), vec![b'x'; limit]).unwrap();
+    fs::write(wt.path().join("report.md"), vec![b'x'; limit + 1]).unwrap();
+    let artifacts = Artifacts {
+        plan: path("plan.md"),
+        report: path("report.md"),
+        ..Artifacts::default()
+    };
+    let error = read_artifacts(wt.path(), &artifacts).unwrap_err();
+    assert_eq!(error.field, "report");
+    assert_eq!(
+        error.to_string(),
+        "artifact `report`: `report.md` is larger than 1048576 bytes"
+    );
+
+    let at_limit = Artifacts {
+        plan: path("plan.md"),
+        ..Artifacts::default()
+    };
+    let contents = read_artifacts(wt.path(), &at_limit).unwrap();
+    assert_eq!(contents.plan.map(|plan| plan.len()), Some(limit));
 }
 
 /// Creates a symbolic link to a file. On Windows this needs Developer Mode or
