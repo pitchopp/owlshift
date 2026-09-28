@@ -156,11 +156,11 @@ Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its bl
 - [x] OWL-5 · Set up the Owlshift Linear workspace: team `OWL`, states including Needs Input and Triage, labels, one project per step (2026-09-27)
 - [x] OWL-6 · Run checks C1, C3, C6 and C7 (Claude part) and record the results (2026-09-28)
 - [x] OWL-7 · Settle decision D10 (contribution terms: DCO, 2026-09-28); add the contribution guide
-- [ ] OWL-8 · Cargo workspace with the six crates; CI matrix on macOS, Linux and Windows (format, lint, tests)
-- [ ] OWL-9 · Write the contracts and generate their JSON Schemas
-- [ ] OWL-10 · Core: model, state machine, scheduler skeleton, policy floor, with unit tests
-- [ ] OWL-11 · Fake harness, test tracker, local bare remote and scenario runner; one scenario end to end
-- [ ] OWL-12 · CLI: `--version`, `doctor`, `config show`
+- [x] OWL-8 · Cargo workspace with the six crates; CI matrix on macOS, Linux and Windows (format, lint, tests) (2026-09-27)
+- [x] OWL-9 · Write the contracts and generate their JSON Schemas (2026-09-28)
+- [x] OWL-10 · Core: model, state machine, scheduler skeleton, policy floor, with unit tests (2026-09-28)
+- [x] OWL-11 · Fake harness, test tracker, local bare remote and scenario runner; one scenario end to end (2026-09-28)
+- [x] OWL-12 · CLI: `--version`, `doctor`, `config show` (2026-09-28)
 
 **Exit gate.** CI green on the three platforms; one scenario runs end to end with the fake harness and the test tracker; `owlshift doctor` reports the maintainer's machine correctly.
 
