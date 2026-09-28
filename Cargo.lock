@@ -584,6 +584,8 @@ dependencies = [
  "owlshift-contracts",
  "owlshift-core",
  "owlshift-platform",
+ "semver",
+ "tempfile",
 ]
 
 [[package]]
