@@ -1,0 +1,51 @@
+{
+  "recorded": "2026-09-28 on pitchopp/owlshift, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query RepositoryId($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }",
+        "variables": {
+          "name": "owlshift",
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "id": "R_kgDOUu6rWA"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "mutation OpenPullRequest($input: CreatePullRequestInput!) { createPullRequest(input: $input) { pullRequest { number url state headRefOid } } }",
+        "variables": {
+          "input": {
+            "baseRefName": "main",
+            "body": "Runner-written body.\n\n- one\n- two\n",
+            "draft": false,
+            "headRefName": "owlshift-fixture-no-such-branch",
+            "repositoryId": "R_kgDOUu6rWA",
+            "title": "Fixture pull request"
+          }
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "createPullRequest": {
+            "pullRequest": {
+              "headRefOid": "0000000000000000000000000000000000000000",
+              "number": 9999,
+              "state": "OPEN",
+              "url": "https://github.com/pitchopp/owlshift/pull/9999"
+            }
+          }
+        }
+      },
+      "synthesized": "not sent: a write, answered in the shape of GitHub's schema"
+    }
+  ]
+}

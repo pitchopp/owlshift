@@ -1,0 +1,23 @@
+{
+  "recorded": "2026-09-28 on pitchopp/owlshift, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Checks($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } } } } } } } } } }",
+        "variables": {
+          "after": null,
+          "first": 100,
+          "name": "owlshift",
+          "number": 16,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 401,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest",
+        "message": "Bad credentials",
+        "status": "401"
+      }
+    }
+  ]
+}

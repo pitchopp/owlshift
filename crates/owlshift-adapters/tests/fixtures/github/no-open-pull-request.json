@@ -1,0 +1,27 @@
+{
+  "recorded": "2026-09-28 on pitchopp/owlshift, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query OpenPullRequests($owner: String!, $name: String!, $head: String!, $base: String!) { repository(owner: $owner, name: $name) { pullRequests(headRefName: $head, baseRefName: $base, states: [OPEN], first: 10) { totalCount nodes { number url state headRefOid headRepository { nameWithOwner } } } } }",
+        "variables": {
+          "base": "main",
+          "head": "owlshift-fixture-no-such-branch",
+          "name": "owlshift",
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequests": {
+              "nodes": [],
+              "totalCount": 0
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,13 +1,13 @@
-//! Recorded Linear exchanges: replaying them in tests, and recording them
+//! Recorded GraphQL exchanges: replaying them in tests, and recording them
 //! again against the live API.
 //!
-//! A fixture is a JSON file under `tests/fixtures/linear/`: the exchanges one
+//! A fixture is a JSON file under `tests/fixtures/<adapter>/`: the exchanges one
 //! test makes, in order, each holding the request body, the HTTP status and
-//! the response body. Headers are never recorded, so no fixture holds the API
-//! key. Recording pseudonymizes every Linear account (`id`, `displayName`)
-//! and reads no e-mail address at all.
+//! the response body. Headers are never recorded, so no fixture holds a
+//! credential. Recording pseudonymizes every Linear account (`id`,
+//! `displayName`) and reads no e-mail address at all.
 //!
-//! To record again, run the ignored recorder tests with the key in
+//! To record the Linear fixtures again, run the ignored recorder tests with the key in
 //! `LINEAR_API_KEY`, or in a dotenv file named by `LINEAR_ENV_FILE` (never
 //! on the command line): `cargo test -p owlshift-adapters -- --ignored
 //! record_`. Only
@@ -25,7 +25,8 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use owlshift_adapters::tracker::linear::{ApiKey, HttpTransport, Response, Transport};
+use owlshift_adapters::graphql::{Response, Transport};
+use owlshift_adapters::tracker::linear::{ApiKey, HttpTransport};
 
 /// One request and its answer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,12 +46,20 @@ pub struct Fixture {
     pub exchanges: Vec<Exchange>,
 }
 
+/// The Linear fixtures.
 pub fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/linear")
+    fixtures("linear")
 }
 
-pub fn load(name: &str) -> Fixture {
-    let path = fixtures_dir().join(name);
+/// The fixtures of one adapter.
+pub fn fixtures(adapter: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(adapter)
+}
+
+pub fn load(dir: &std::path::Path, name: &str) -> Fixture {
+    let path = dir.join(name);
     let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
@@ -65,10 +74,16 @@ pub struct Replay {
 }
 
 impl Replay {
+    /// A Linear fixture.
     pub fn new(name: &str) -> Self {
+        Self::of(&fixtures_dir(), name)
+    }
+
+    /// A fixture in `dir`.
+    pub fn of(dir: &std::path::Path, name: &str) -> Self {
         Self {
             name: name.to_owned(),
-            left: Arc::new(Mutex::new(load(name).exchanges.into())),
+            left: Arc::new(Mutex::new(load(dir, name).exchanges.into())),
         }
     }
 
@@ -117,6 +132,22 @@ pub fn live_key() -> ApiKey {
     ApiKey::new(key.trim())
 }
 
+/// The GitHub token for recording and the live test:
+/// `OWLSHIFT_GITHUB_TOKEN`, or else the token of the `gh` login. Both are run
+/// by hand, by the maintainer, never by CI.
+pub fn github_token() -> owlshift_adapters::forge::github::Token {
+    use owlshift_adapters::forge::github::Token;
+    if let Ok(token) = std::env::var("OWLSHIFT_GITHUB_TOKEN") {
+        return Token::new(token);
+    }
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .expect("a GitHub token in OWLSHIFT_GITHUB_TOKEN, or a logged-in `gh`");
+    assert!(output.status.success(), "`gh auth token` failed");
+    Token::new(String::from_utf8(output.stdout).unwrap().trim())
+}
+
 /// Sends one request to the live API outside any recording.
 pub fn live_query(key: &ApiKey, query: &str) -> Value {
     let response = HttpTransport::new(key.clone())
@@ -142,10 +173,16 @@ pub fn assert_owlshift_workspace(key: &ApiKey) {
 /// without writing to Linear, flagged exchange by exchange.
 #[derive(Clone)]
 pub struct Recorder {
-    live: Arc<HttpTransport>,
+    live: Arc<dyn Transport + Send + Sync>,
+    dir: PathBuf,
     log: Arc<Mutex<Vec<Exchange>>>,
     synthesize: Option<Synthesize>,
+    make_up: Option<MakeUp>,
 }
+
+/// Makes up the answer to a request that must not reach the live API, such
+/// as a write, with a note saying why.
+type MakeUp = Arc<dyn Fn(&Value) -> Option<(Value, String)> + Send + Sync>;
 
 #[derive(Clone)]
 struct Synthesize {
@@ -155,12 +192,30 @@ struct Synthesize {
 }
 
 impl Recorder {
+    /// Records Linear exchanges.
     pub fn new(key: &ApiKey) -> Self {
+        Self::over(HttpTransport::new(key.clone()), fixtures_dir())
+    }
+
+    /// Records the exchanges of `live` into fixtures in `dir`.
+    pub fn over(live: impl Transport + Send + Sync + 'static, dir: PathBuf) -> Self {
         Self {
-            live: Arc::new(HttpTransport::new(key.clone())),
+            live: Arc::new(live),
+            dir,
             log: Arc::default(),
             synthesize: None,
+            make_up: None,
         }
+    }
+
+    /// Answers with `make_up` instead of the live API whenever it returns an
+    /// answer, flagging the exchange with its note.
+    pub fn making_up(
+        mut self,
+        make_up: impl Fn(&Value) -> Option<(Value, String)> + Send + Sync + 'static,
+    ) -> Self {
+        self.make_up = Some(Arc::new(make_up));
+        self
     }
 
     /// Makes up the comments posted on `issue`, attributed to the key's own
@@ -187,11 +242,19 @@ impl Recorder {
             exchanges,
         };
         let text = serde_json::to_string_pretty(&fixture).unwrap() + "\n";
-        fs::create_dir_all(fixtures_dir()).unwrap();
-        fs::write(fixtures_dir().join(name), text).unwrap();
+        fs::create_dir_all(&self.dir).unwrap();
+        fs::write(self.dir.join(name), text).unwrap();
     }
 
     fn made_up(&self, request: &Value) -> Option<Exchange> {
+        if let Some((response, note)) = self.make_up.as_ref().and_then(|f| f(request)) {
+            return Some(Exchange {
+                request: request.clone(),
+                status: 200,
+                response,
+                synthesized: Some(note),
+            });
+        }
         let synthesize = self.synthesize.as_ref()?;
         let variables = &request["variables"];
         let query = request["query"].as_str().unwrap_or_default();
