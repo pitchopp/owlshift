@@ -534,6 +534,8 @@ name = "owlshift-adapters"
 version = "0.0.0"
 dependencies = [
  "owlshift-contracts",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
