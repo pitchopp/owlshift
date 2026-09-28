@@ -687,8 +687,10 @@ name = "owlshift-platform"
 version = "0.0.0"
 dependencies = [
  "dirs",
+ "rustix",
  "tempfile",
  "which",
+ "windows-sys",
 ]
 
 [[package]]
