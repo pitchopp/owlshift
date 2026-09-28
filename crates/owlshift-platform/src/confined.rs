@@ -6,18 +6,36 @@
 //! publish. [`read_confined`] refuses every link from the root down, even one
 //! that points back inside: there is no resolution logic to get wrong.
 //!
+//! A hard link is the same trap without a link to see: `plan.md` made a second
+//! name of `~/.ssh/id_rsa` is a regular file in the worktree. Where the other
+//! names are cannot be known without searching the whole volume, so a file
+//! with more than one name is refused, wherever they are. A checkout, and the
+//! tools that write artifacts, create files with a single name.
+//!
 //! Resolution and read are one walk. Each level is opened relative to the
 //! handle of the level above, never through a path looked up again, and is
 //! checked on that handle. A level swapped for a link after it was opened
 //! therefore cannot redirect the read.
 //!
 //! - Unix: `openat` with `O_NOFOLLOW` for each level, then `fstat` on the
-//!   opened file, which must be a regular file. `O_NONBLOCK` keeps the open of
-//!   a FIFO from waiting for a writer.
+//!   opened file, which must be a regular file with a link count of 1.
+//!   `O_NONBLOCK` keeps the open of a FIFO from waiting for a writer.
 //! - Windows: `NtCreateFile` relative to the parent handle with
 //!   `FILE_OPEN_REPARSE_POINT` for each level; a name-surrogate reparse point
 //!   (symbolic link, junction) is refused. No handle allows delete sharing, so
-//!   a level cannot be renamed while the walk holds it.
+//!   a level cannot be renamed while the walk holds it. The file's link count,
+//!   from `GetFileInformationByHandle`, must be 1.
+//!
+//! The link count is read on the handle the bytes are then read from, so the
+//! file checked is the file read, and it must be exactly 1: a file deleted
+//! after it was opened has none. The count can still change between the open
+//! and the check. A process that removes the inside name of a hard link to an
+//! outside file in that window leaves a count of 1, and the outside content is
+//! read. The reader cannot close that window; the runner does, by stopping the
+//! run's whole process tree before it reads the artifacts (OWL-15), so no
+//! process of the run is left to act. Known limits: a process that escaped
+//! that tree, and a network or FUSE mount that supports hard links but
+//! reports a count of 1.
 //!
 //! The root's ancestors may be links (macOS reaches temporary directories
 //! through `/var`): the system resolves them once, when the root is opened.
@@ -27,9 +45,6 @@
 //! or grows to hold, more than the limit before the reader sees its end is
 //! refused without being read to the end, however large, sparse or endless it
 //! is.
-//!
-//! Hard links are not detected: a hard link is a file of the worktree in its
-//! own right.
 
 use std::error::Error;
 use std::fmt;
@@ -50,6 +65,10 @@ pub enum Refusal {
     NotARegularFile(&'static str),
     /// The file holds more than the limit, in bytes, the read was given.
     TooLarge(u64),
+    /// The file has this many names (hard links), more than one.
+    HardLink(u64),
+    /// The file has no name left: it was deleted after it was opened.
+    Unlinked,
 }
 
 impl fmt::Display for Refusal {
@@ -60,6 +79,11 @@ impl fmt::Display for Refusal {
             Self::NotFound => f.write_str("does not exist"),
             Self::NotARegularFile(kind) => write!(f, "is a {kind}, not a regular file"),
             Self::TooLarge(limit) => write!(f, "is larger than {limit} bytes"),
+            Self::HardLink(links) => write!(
+                f,
+                "has {links} names (hard links); an artifact must be a file of its own"
+            ),
+            Self::Unlinked => f.write_str("was deleted while it was being read"),
         }
     }
 }
@@ -136,14 +160,14 @@ pub fn read_confined(root: &Path, relative: &str, limit: u64) -> Result<Vec<u8>,
     walk(root, relative, limit, &mut |_| {})
 }
 
-/// The walk behind [`read_confined`]. `after_level` runs once each directory
-/// level is open, with the part of the path it names, so tests can change the
-/// tree mid-walk.
+/// The walk behind [`read_confined`]. `after_open` runs once each directory
+/// level, and then the file, is open, with the part of the path it names, so
+/// tests can change the tree mid-walk.
 fn walk(
     root: &Path,
     relative: &str,
     limit: u64,
-    after_level: &mut dyn FnMut(&str),
+    after_open: &mut dyn FnMut(&str),
 ) -> Result<Vec<u8>, ConfinedError> {
     let segments = segments(relative)?;
     let root = normalize_root(root)?;
@@ -153,7 +177,16 @@ fn walk(
         segments: &segments,
         limit,
     };
-    sys::walk(&walk, after_level)
+    sys::walk(&walk, after_open)
+}
+
+/// Why a regular file with `links` names is refused: every count but 1.
+fn link_refusal(links: u64) -> Option<Refusal> {
+    match links {
+        0 => Some(Refusal::Unlinked),
+        1 => None,
+        links => Some(Refusal::HardLink(links)),
+    }
 }
 
 /// Reads `reader` to its end, or stops once it has read more than `limit`
@@ -254,7 +287,7 @@ mod sys {
     use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, fstat, open, openat, statat};
     use rustix::io::Errno;
 
-    use super::{ConfinedError, Refusal, Walk};
+    use super::{ConfinedError, Refusal, Walk, link_refusal};
 
     const DIRECTORY: OFlags = OFlags::RDONLY
         .union(OFlags::DIRECTORY)
@@ -268,7 +301,7 @@ mod sys {
 
     pub(super) fn walk(
         walk: &Walk<'_>,
-        after_level: &mut dyn FnMut(&str),
+        after_open: &mut dyn FnMut(&str),
     ) -> Result<Vec<u8>, ConfinedError> {
         let mut dir =
             open(walk.root, DIRECTORY, Mode::empty()).map_err(|error| root_error(walk, error))?;
@@ -277,15 +310,24 @@ mod sys {
         for (index, name) in walk.segments[..last].iter().enumerate() {
             dir = openat(&dir, *name, DIRECTORY, Mode::empty())
                 .map_err(|error| entry_error(walk, &dir, index, error, true))?;
-            after_level(&walk.at(index));
+            after_open(&walk.at(index));
         }
 
         let file = openat(&dir, walk.segments[last], FILE, Mode::empty())
             .map_err(|error| entry_error(walk, &dir, last, error, false))?;
+        after_open(&walk.at(last));
         let stat = fstat(&file).map_err(|error| walk.io(error.into()))?;
         match FileType::from_raw_mode(stat.st_mode) {
             FileType::RegularFile => {}
             other => return Err(walk.refused(last, Refusal::NotARegularFile(kind(other)))),
+        }
+        #[allow(
+            clippy::useless_conversion,
+            reason = "`st_nlink` is u16 on macOS and u32 on Linux aarch64, u64 elsewhere"
+        )]
+        let links = u64::from(stat.st_nlink);
+        if let Some(reason) = link_refusal(links) {
+            return Err(walk.refused(last, reason));
         }
         walk.read(File::from(file))
     }
@@ -360,13 +402,13 @@ mod sys {
         HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_TRAVERSE, SYNCHRONIZE,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, GetFileInformationByHandle, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    use super::{ConfinedError, Refusal, Walk};
+    use super::{ConfinedError, Refusal, Walk, link_refusal};
 
     const DIRECTORY_ACCESS: u32 =
         FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
@@ -374,7 +416,7 @@ mod sys {
 
     pub(super) fn walk(
         walk: &Walk<'_>,
-        after_level: &mut dyn FnMut(&str),
+        after_open: &mut dyn FnMut(&str),
     ) -> Result<Vec<u8>, ConfinedError> {
         // The root is opened by path, which resolves its ancestors; the
         // reparse-point flag stops at the root itself if it is a link.
@@ -416,7 +458,7 @@ mod sys {
                 return Err(walk.refused(index, Refusal::NotADirectory));
             }
             levels.push(dir);
-            after_level(&walk.at(index));
+            after_open(&walk.at(index));
         }
 
         let parent = levels.last().expect("the root is always there");
@@ -427,6 +469,7 @@ mod sys {
             FILE_SHARE_READ,
         )
         .map_err(|error| entry_error(walk, last, error))?;
+        after_open(&walk.at(last));
         let file_type = file.metadata().map_err(|error| walk.io(error))?.file_type();
         if file_type.is_symlink() {
             return Err(walk.refused(last, Refusal::SymbolicLink));
@@ -437,7 +480,24 @@ mod sys {
         if !file_type.is_file() {
             return Err(walk.refused(last, Refusal::NotARegularFile("special file")));
         }
+        let links = link_count(&file).map_err(|error| walk.io(error))?;
+        if let Some(reason) = link_refusal(u64::from(links)) {
+            return Err(walk.refused(last, reason));
+        }
         walk.read(file)
+    }
+
+    /// The number of names (hard links) of the open `file`. The standard
+    /// library reads it too, but exposes it only behind the unstable
+    /// `windows_by_handle` feature.
+    fn link_count(file: &File) -> io::Result<u32> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` is an open handle for the whole call, and `info` is
+        // a live local the call only writes.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.nNumberOfLinks)
     }
 
     fn entry_error(walk: &Walk<'_>, index: usize, error: io::Error) -> ConfinedError {
@@ -568,7 +628,9 @@ mod tests {
 
         let mut swapped = false;
         let bytes = walk(&wt, "docs/plan.md", u64::MAX, &mut |at| {
-            assert_eq!(at, "docs");
+            if at != "docs" {
+                return;
+            }
             fs::rename(wt.join("docs"), wt.join("docs.orig")).unwrap();
             std::os::unix::fs::symlink(&outside, wt.join("docs")).unwrap();
             swapped = true;
@@ -576,6 +638,34 @@ mod tests {
         .unwrap();
         assert!(swapped);
         assert_eq!(bytes, b"inside");
+    }
+
+    /// A file deleted after the walk opened it has no name left, and is
+    /// refused rather than read through the handle.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_deleted_after_it_was_opened_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let wt = base.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join("plan.md"), b"inside").unwrap();
+
+        let error = walk(&wt, "plan.md", u64::MAX, &mut |at| {
+            assert_eq!(at, "plan.md");
+            fs::remove_file(wt.join("plan.md")).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "`plan.md` was deleted while it was being read"
+        );
+        assert!(matches!(
+            error,
+            super::ConfinedError::Refused {
+                reason: super::Refusal::Unlinked,
+                ..
+            }
+        ));
     }
 
     /// A directory the walk holds cannot be renamed, so it cannot be swapped
@@ -589,7 +679,10 @@ mod tests {
         fs::write(wt.join("docs/plan.md"), b"inside").unwrap();
 
         let mut renamed = None;
-        let bytes = walk(&wt, "docs/plan.md", u64::MAX, &mut |_| {
+        let bytes = walk(&wt, "docs/plan.md", u64::MAX, &mut |at| {
+            if at != "docs" {
+                return;
+            }
             renamed = Some(fs::rename(wt.join("docs"), wt.join("docs.moved")).is_ok());
         })
         .unwrap();

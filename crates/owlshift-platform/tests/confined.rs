@@ -1,5 +1,5 @@
-//! `read_confined` refuses every symbolic link from the root down and reads
-//! a plain file byte for byte.
+//! `read_confined` refuses every symbolic link from the root down and any
+//! file with a second name, and reads a plain file byte for byte.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -179,6 +179,34 @@ fn symlink_pointing_inside_is_refused_too() {
     assert_eq!(
         refused_at(read(&f.wt, "plan.md")),
         ("plan.md".to_owned(), Refusal::SymbolicLink)
+    );
+}
+
+/// A hard link needs no privilege on any of the three systems, and the
+/// fixture keeps both names on one volume.
+#[test]
+fn hard_link_to_an_outside_file_is_refused() {
+    let f = fixture();
+    fs::hard_link(f.outside.join("secret.txt"), f.wt.join("plan.md")).unwrap();
+    let error = read(&f.wt, "plan.md").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "`plan.md` has 2 names (hard links); an artifact must be a file of its own"
+    );
+    assert_eq!(
+        refused_at(Err(error)),
+        ("plan.md".to_owned(), Refusal::HardLink(2))
+    );
+}
+
+#[test]
+fn hard_link_inside_is_refused_too() {
+    let f = fixture();
+    fs::write(f.wt.join("real.md"), INSIDE).unwrap();
+    fs::hard_link(f.wt.join("real.md"), f.wt.join("plan.md")).unwrap();
+    assert_eq!(
+        refused_at(read(&f.wt, "plan.md")),
+        ("plan.md".to_owned(), Refusal::HardLink(2))
     );
 }
 
