@@ -15,6 +15,10 @@
 //!
 //! gh ships on the CI runners and is required there; elsewhere a missing gh
 //! only skips its part, with a message.
+//!
+//! The agent environment is checked bare (`without_confinement`, behind the
+//! `testkit` feature): this is the environment layer, which must hold on its
+//! own; the sandbox wrapped around it (OWL-41) is checked in the test bench.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -206,7 +210,9 @@ fn the_check_finds_every_planted_credential_in_the_host_environment() {
 #[test]
 fn an_agent_reaches_none_of_them() {
     let host = host();
-    let agent = AgentEnv::new(host.parent.clone(), &[]).unwrap();
+    let agent = AgentEnv::new(host.parent.clone(), &[])
+        .unwrap()
+        .without_confinement();
     // Part of the check: gh is asked, and answers with the placeholder.
     gh_installed(agent.vars());
     assert_eq!(agent.check(&host.clean, FORGE), []);
@@ -245,7 +251,9 @@ fn an_agent_reaches_none_of_them() {
 #[test]
 fn credentials_in_the_repository_configuration_are_reported_redacted() {
     let host = host();
-    let agent = AgentEnv::new(host.parent.clone(), &[]).unwrap();
+    let agent = AgentEnv::new(host.parent.clone(), &[])
+        .unwrap()
+        .without_confinement();
     let findings = agent.check(&host.leaky, FORGE);
     let keys: Vec<String> = findings
         .iter()

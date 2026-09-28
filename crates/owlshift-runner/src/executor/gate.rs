@@ -30,7 +30,7 @@ use owlshift_contracts::brief::GateFailure;
 
 use super::git::Git;
 use super::watch;
-use crate::agent_env::AgentEnv;
+use crate::agent_env::{AgentEnv, RunPaths};
 
 /// A gate deadline for callers without a reason to pick another.
 pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -68,13 +68,14 @@ impl GateReport {
     }
 }
 
-/// Runs the gate in `worktree`; see the module documentation. Whatever goes
+/// Runs the gate in the worktree of `paths`, each command confined to them
+/// as the run was (OWL-41); see the module documentation. Whatever goes
 /// wrong, the runner's side included, is a failure: a gate that could not be
 /// run never passes.
 pub(crate) fn run(
     git: &Git,
     agent: &AgentEnv,
-    worktree: &Path,
+    paths: &RunPaths,
     commands: &[String],
     timeout: Duration,
     log_path: &Path,
@@ -87,15 +88,7 @@ pub(crate) fn run(
         log: log_path.to_owned(),
         failure: None,
     };
-    let checked = check_and_run(
-        &git,
-        agent,
-        worktree,
-        commands,
-        timeout,
-        deadline,
-        &mut report,
-    );
+    let checked = check_and_run(&git, agent, paths, commands, timeout, deadline, &mut report);
     report.failure = checked.err();
     report
 }
@@ -103,12 +96,13 @@ pub(crate) fn run(
 fn check_and_run(
     git: &Git,
     agent: &AgentEnv,
-    worktree: &Path,
+    paths: &RunPaths,
     commands: &[String],
     timeout: Duration,
     deadline: Instant,
     report: &mut GateReport,
 ) -> Result<(), GateFailure> {
+    let worktree = paths.workdir.as_path();
     let mut log = File::create(&report.log).map_err(|e| {
         around(format!(
             "the runner could not write the gate log {}: {e}",
@@ -123,7 +117,7 @@ fn check_and_run(
             "uncommitted changes before the gate, which runs on the last commit: {dirty}"
         )));
     }
-    run_commands(agent, worktree, commands, timeout, deadline, &mut log)?;
+    run_commands(agent, paths, commands, timeout, deadline, &mut log)?;
     let dirty = uncommitted(git, worktree)?;
     if !dirty.is_empty() {
         return Err(around(format!("the gate changed files: {dirty}")));
@@ -208,7 +202,7 @@ fn agent_git_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// Runs the commands in order until the first failure, sharing one deadline.
 fn run_commands(
     agent: &AgentEnv,
-    worktree: &Path,
+    paths: &RunPaths,
     commands: &[String],
     timeout: Duration,
     deadline: Instant,
@@ -234,7 +228,7 @@ fn run_commands(
                 Tail::default(),
             ));
         }
-        let ran = run_one(agent, worktree, command, deadline, log);
+        let ran = run_one(agent, paths, command, deadline, log);
         let status = match &ran.end {
             End::Exited(status) => status.to_string(),
             End::TimedOut => "stopped at the deadline".to_owned(),
@@ -280,9 +274,10 @@ struct Ran {
     log_error: Option<String>,
 }
 
-/// Runs one command as the root of a process tree, its standard output and
-/// standard error on one pipe, copied whole to `log`.
-fn run_one(agent: &AgentEnv, worktree: &Path, line: &str, deadline: Instant, log: &File) -> Ran {
+/// Runs one command as the root of a process tree, inside the sandbox of
+/// `paths`, its standard output and standard error on one pipe, copied whole
+/// to `log`. A command that cannot be confined does not run.
+fn run_one(agent: &AgentEnv, paths: &RunPaths, line: &str, deadline: Instant, log: &File) -> Ran {
     let error = |message: String| Ran {
         end: End::Error(message),
         tail: Tail::default(),
@@ -297,13 +292,11 @@ fn run_one(agent: &AgentEnv, worktree: &Path, line: &str, deadline: Instant, log
         (Ok(log), Ok(stdout)) => (log, stdout),
         (Err(e), _) | (_, Err(e)) => return error(format!("could not share the output: {e}")),
     };
-    let mut command = shell(line, agent);
-    agent.apply(&mut command);
-    command
-        .current_dir(worktree)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(writer);
+    let mut command = match agent.confine(shell(line, agent), paths) {
+        Ok(command) => command,
+        Err(e) => return error(format!("could not be confined: {e}")),
+    };
+    command.stdin(Stdio::null()).stdout(stdout).stderr(writer);
     let remaining = deadline.saturating_duration_since(Instant::now());
     let spawned = watch::spawn(&mut command, remaining);
     // The command holds the pipe's write ends: dropping it leaves them to
@@ -447,8 +440,19 @@ fn tail_text(bytes: &[u8], truncated: bool) -> (String, bool) {
 mod tests {
     use super::*;
 
+    /// The agent environment of these tests, bare: they check the gate's own
+    /// rules; the sandbox's are checked below and in the test bench.
     fn agent() -> AgentEnv {
-        AgentEnv::new(std::env::vars_os(), &[]).unwrap()
+        AgentEnv::new(std::env::vars_os(), &[])
+            .unwrap()
+            .without_confinement()
+    }
+
+    fn paths(dir: &Path) -> RunPaths {
+        RunPaths {
+            workdir: dir.to_owned(),
+            ..RunPaths::default()
+        }
     }
 
     fn gate(commands: &[String], timeout: Duration) -> (Result<(), GateFailure>, String) {
@@ -457,7 +461,7 @@ mod tests {
         let mut log = File::create(&log_path).unwrap();
         let outcome = run_commands(
             &agent(),
-            dir.path(),
+            &paths(dir.path()),
             commands,
             timeout,
             Instant::now() + timeout,
@@ -612,5 +616,210 @@ mod tests {
 
         let (text, truncated) = tail_text(b"short", false);
         assert_eq!((text.as_str(), truncated), ("short", false));
+    }
+
+    /// Runs one command as a gate, with this agent, in `paths`, within a
+    /// deadline: a command held by a prompt fails as stopped, not as refused.
+    fn gate_with(agent: &AgentEnv, paths: &RunPaths, line: &str) -> Result<(), GateFailure> {
+        let log_dir = tempfile::tempdir().unwrap();
+        let mut log = File::create(log_dir.path().join(GATE_LOG)).unwrap();
+        let timeout = Duration::from_secs(30);
+        run_commands(
+            agent,
+            paths,
+            &[line.to_owned()],
+            timeout,
+            Instant::now() + timeout,
+            &mut log,
+        )
+    }
+
+    /// Whether agent runs can be confined here. Where they cannot, the test
+    /// is skipped with a message, unless `OWLSHIFT_REQUIRE_CONFINEMENT` is
+    /// set, as on a CI leg that must prove the sandbox.
+    #[cfg(unix)]
+    fn sandbox_or_skip() -> bool {
+        match owlshift_platform::sandbox::available() {
+            Ok(()) => true,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("OWLSHIFT_REQUIRE_CONFINEMENT").is_none(),
+                    "confinement is required here, but: {error}"
+                );
+                eprintln!("skipped: agent runs cannot be confined here: {error}");
+                false
+            }
+        }
+    }
+
+    /// A refusal by the sandbox: the command ran and failed, in time.
+    #[cfg(unix)]
+    fn refused(outcome: Result<(), GateFailure>, what: &str) {
+        let failure = outcome.expect_err(what);
+        assert!(
+            failure.reason.starts_with("exit status"),
+            "{what}: {}",
+            failure.reason
+        );
+        assert!(!failure.output.contains("FAKE_owl41"), "{what}");
+    }
+
+    /// OWL-41's acceptance on the gate path: planted fake secrets in a home,
+    /// a gh token file and a sibling project's `.env`, are read bare and not
+    /// confined; a write into the home never reaches it; the worktree stays
+    /// writable. On Linux the runner's own process and the session bus are
+    /// out of sight too; on a macOS CI runner, so is the item of a throwaway
+    /// keychain.
+    #[cfg(unix)]
+    #[test]
+    fn a_confined_gate_command_reaches_no_planted_secret() {
+        if !sandbox_or_skip() {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let worktree = base.path().join("worktree");
+        std::fs::create_dir_all(home.join(".config/gh")).unwrap();
+        std::fs::create_dir_all(home.join("other-project")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let token = home.join(".config/gh/hosts.yml");
+        let env_file = home.join("other-project/.env");
+        std::fs::write(
+            &token,
+            "example.invalid:\n    oauth_token: gho_FAKE_owl41\n",
+        )
+        .unwrap();
+        std::fs::write(&env_file, "API_KEY=FAKE_owl41\n").unwrap();
+
+        let parent = std::env::vars_os()
+            .filter(|(name, _)| name != "HOME")
+            .chain([("HOME".into(), home.clone().into_os_string())]);
+        let confined = AgentEnv::new(parent, &[]).unwrap();
+        let bare = confined.clone().without_confinement();
+        let paths = paths(&worktree);
+
+        for file in [&token, &env_file] {
+            let line = format!("cat '{}'", file.display());
+            gate_with(&bare, &paths, &line).expect("the bare control reads it");
+            refused(gate_with(&confined, &paths, &line), &line);
+        }
+
+        let zshrc = home.join(".zshrc");
+        let _ = gate_with(
+            &confined,
+            &paths,
+            &format!("echo planted >> '{}'", zshrc.display()),
+        );
+        assert!(!zshrc.exists(), "a confined write reached the home");
+
+        gate_with(&confined, &paths, "echo ok > written.txt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("written.txt")).unwrap(),
+            "ok\n"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let runner = format!("test -e /proc/{}", std::process::id());
+            gate_with(&bare, &paths, &runner).expect("the bare control sees the runner");
+            refused(
+                gate_with(&confined, &paths, &runner),
+                "the runner's process",
+            );
+            let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+            let run_user = format!("/run/user/{}", String::from_utf8_lossy(&uid.stdout).trim());
+            if std::path::Path::new(&run_user).is_dir() {
+                refused(
+                    gate_with(&confined, &paths, &format!("test -e {run_user}")),
+                    "the session bus folder",
+                );
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("CI").is_some() {
+            keychain::a_throwaway_keychain_item_is_out_of_reach(
+                &confined,
+                &bare,
+                &paths,
+                base.path(),
+            );
+        }
+    }
+
+    /// The keychain half, on CI only: a throwaway keychain, never on the
+    /// search list, created unlocked and without auto-lock, so its reads
+    /// cannot prompt; deleted afterwards whatever happens. It stays off the
+    /// maintainer's machine, where no automated run may risk a Keychain
+    /// dialog.
+    #[cfg(target_os = "macos")]
+    mod keychain {
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+
+        use super::{AgentEnv, RunPaths, gate_with, refused};
+
+        struct Throwaway(PathBuf);
+
+        impl Drop for Throwaway {
+            fn drop(&mut self) {
+                let _ = Command::new("/usr/bin/security")
+                    .arg("delete-keychain")
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+
+        fn security(args: &[&str], keychain: &Path) {
+            let status = Command::new("/usr/bin/security")
+                .args(args)
+                .arg(keychain)
+                .status()
+                .unwrap();
+            assert!(status.success(), "security {args:?}");
+        }
+
+        pub(super) fn a_throwaway_keychain_item_is_out_of_reach(
+            confined: &AgentEnv,
+            bare: &AgentEnv,
+            paths: &RunPaths,
+            base: &Path,
+        ) {
+            let path = base.join("probe.keychain-db");
+            security(&["create-keychain", "-p", "owl41"], &path);
+            let keychain = Throwaway(path);
+            security(&["set-keychain-settings"], &keychain.0);
+            security(&["unlock-keychain", "-p", "owl41"], &keychain.0);
+            security(
+                &[
+                    "add-generic-password",
+                    "-s",
+                    "owlshift-owl41",
+                    "-a",
+                    "probe",
+                    "-w",
+                    "FAKE_owl41",
+                ],
+                &keychain.0,
+            );
+            let line = format!(
+                "/usr/bin/security find-generic-password -s owlshift-owl41 -w '{}' > /dev/null",
+                keychain.0.display()
+            );
+            security(&["unlock-keychain", "-p", "owl41"], &keychain.0);
+            gate_with(bare, paths, &line).expect("the bare control reads the item");
+            refused(gate_with(confined, paths, &line), "the keychain item");
+        }
+    }
+
+    /// Native Windows has no sandbox: a confined gate command is refused, and
+    /// says to use WSL2.
+    #[cfg(windows)]
+    #[test]
+    fn a_confined_gate_command_is_refused_on_native_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let confined = AgentEnv::new(std::env::vars_os(), &[]).unwrap();
+        let failure = gate_with(&confined, &paths(dir.path()), "echo hi").unwrap_err();
+        assert!(failure.reason.contains("WSL2"), "{}", failure.reason);
     }
 }

@@ -21,6 +21,39 @@ fn smoke() {
     }
 }
 
+/// OWL-41: the smoke scenario with the fake harness and the gate inside the
+/// OS sandbox, as agent runs are. A legitimate build still commits and is
+/// pushed. The other scenarios run bare: they check the pipeline and the
+/// isolation check, which the sandbox would pre-empt. Skipped, with a
+/// message, where agents cannot be confined, unless
+/// `OWLSHIFT_REQUIRE_CONFINEMENT` is set.
+#[test]
+fn smoke_confined() {
+    let parent = std::env::vars_os();
+    if let Err(error) = owlshift_runner::agent_env::AgentEnv::new(parent, &[])
+        .unwrap()
+        .sandbox_ready()
+    {
+        assert!(
+            std::env::var_os("OWLSHIFT_REQUIRE_CONFINEMENT").is_none(),
+            "confinement is required here, but: {error}"
+        );
+        eprintln!("skipped: agent runs cannot be confined here: {error}");
+        return;
+    }
+    let path = scenarios().join("smoke.toml");
+    let input = std::fs::read_to_string(&path).unwrap();
+    let input = format!("confined = true\n{input}");
+    if let Err(error) = play_str(
+        "smoke-confined",
+        &input,
+        &path.with_extension(""),
+        fake_harness(),
+    ) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-16's acceptance: the gate fails first and passes after a fix run.
 #[test]
 fn gate() {

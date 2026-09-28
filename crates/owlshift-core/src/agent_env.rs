@@ -8,9 +8,10 @@
 //! and gh without a credential. Each override rests on a live check recorded
 //! in the build plan (results, "OWL-22").
 //!
-//! This closes what an agent reaches without going around Owlshift. It does
-//! not stop a process that goes looking in the operator's files or keychain:
-//! that takes confinement by the operating system.
+//! This closes what an agent reaches without going around Owlshift. A process
+//! that goes looking in the operator's files or keychain is stopped by the
+//! operating system's sandbox the runner wraps every agent run in (OWL-41,
+//! `owlshift_platform::sandbox`).
 //!
 //! The runner reads its own environment, applies the result to the command
 //! it spawns and probes it (`owlshift_runner::agent_env`).
@@ -127,6 +128,10 @@ pub enum AgentEnvError {
     /// A declared variable that would change how git or gh authenticate: a
     /// `GIT_` name or an override.
     Reserved(String),
+    /// A declared variable that makes the dynamic loader load code, such as
+    /// `LD_PRELOAD` or a `DYLD_` name: the sandbox program would load it
+    /// before the sandbox applies (OWL-41).
+    Loader(String),
 }
 
 impl fmt::Display for AgentEnvError {
@@ -138,9 +143,18 @@ impl fmt::Display for AgentEnvError {
                 "{name} cannot be passed to an agent: Owlshift sets how git and gh \
                  authenticate there"
             ),
+            Self::Loader(name) => write!(
+                f,
+                "{name} cannot be passed to an agent: it makes the dynamic loader load \
+                 code into the sandbox program before the sandbox applies"
+            ),
         }
     }
 }
+
+/// Names that make the dynamic loader load code into a program: they never
+/// reach an agent. Every `DYLD_` name is refused too.
+pub const LOADER_VARIABLES: &[&str] = &["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"];
 
 impl std::error::Error for AgentEnvError {}
 
@@ -158,6 +172,9 @@ pub fn agent_environment(
     floor::check_agent_environment(declared.iter().copied()).map_err(AgentEnvError::Floor)?;
     if let Some(name) = declared.iter().find(|name| is_reserved(name)) {
         return Err(AgentEnvError::Reserved((*name).to_owned()));
+    }
+    if let Some(name) = declared.iter().find(|name| is_loader(name)) {
+        return Err(AgentEnvError::Loader((*name).to_owned()));
     }
     let mut vars = BTreeMap::new();
     for (name, value) in parent {
@@ -204,6 +221,13 @@ fn is_reserved(name: &str) -> bool {
         || OVERRIDES
             .iter()
             .any(|(overridden, _)| overridden.eq_ignore_ascii_case(name))
+}
+
+fn is_loader(name: &str) -> bool {
+    starts_with_ignore_case(name, "DYLD_")
+        || LOADER_VARIABLES
+            .iter()
+            .any(|loader| loader.eq_ignore_ascii_case(name))
 }
 
 fn starts_with_ignore_case(name: &str, prefix: &str) -> bool {
@@ -299,6 +323,18 @@ mod tests {
             "GIT_ASKPASS cannot be passed to an agent: Owlshift sets how git and gh \
              authenticate there"
         );
+        for name in [
+            "LD_PRELOAD",
+            "ld_library_path",
+            "DYLD_INSERT_LIBRARIES",
+            "dyld_x",
+        ] {
+            assert_eq!(
+                agent_environment(Vec::new(), &[name]),
+                Err(AgentEnvError::Loader(name.to_owned())),
+                "{name}"
+            );
+        }
     }
 
     #[test]
