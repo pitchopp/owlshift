@@ -9,9 +9,11 @@
 //! it stops a run by stopping the child's process group, which ends
 //! [`drive`] too.
 //!
-//! Owlshift never passes a credential: the child inherits the caller's
-//! environment, so `claude` runs on whatever login the user configured,
-//! normally their subscription (architecture principle 9).
+//! Owlshift never passes a credential, and this adapter sets no variable: the
+//! executor gives the child the agent environment of
+//! `owlshift_core::agent_env`, which keeps what `claude` needs to find the
+//! login the user configured, normally their subscription (architecture
+//! principle 9), and no tracker, forge or cloud credential.
 //!
 //! Every CLI behaviour relied on here was checked live and is recorded in
 //! `docs/design/build-plan.md`, under checks C1 and C7 and the OWL-14
@@ -55,7 +57,9 @@ const POLL: Duration = Duration::from_millis(20);
 /// The flags of check C1's guardrail finding: no user settings (hooks,
 /// plugins, user `CLAUDE.md`) and no MCP server but those passed explicitly,
 /// so the user's own connectors (tracker, chat, mail) never reach an agent.
-/// OWL-22 completes this with what lies outside Claude Code.
+/// The agent environment (`owlshift_core::agent_env`) covers what lies
+/// outside Claude Code, and [`Run::mcp_servers`] lets the executor check that
+/// no server was loaded.
 const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
 
 /// The tools removed from a run that has no network access.
@@ -145,7 +149,8 @@ impl std::error::Error for CommandError {}
 ///   would ask (Bash, writes), plus one allow rule for the result file;
 /// - write in worktree: `--permission-mode acceptEdits`, which confines the
 ///   file tools to the working directory, plus Bash. Bash itself is not
-///   confined: the executor's isolation check and OWL-22 cover that side.
+///   confined to the directory: the executor's isolation check covers its
+///   writes, and the agent environment leaves it no credential.
 ///
 /// Without network access, the web tools are removed; Bash, when allowed,
 /// can still reach the network. The worktree's own project settings
@@ -231,6 +236,10 @@ pub struct Run {
     /// The main model, as the CLI resolved it.
     pub model: Option<String>,
     pub billing: Billing,
+    /// The MCP servers the CLI listed in its `init` event, by name, whatever
+    /// their status: a server that failed to start is listed too. C1's
+    /// guardrail flags leave none; empty as well when no `init` came.
+    pub mcp_servers: Vec<String>,
     /// The tools the permission mode refused, one entry per refusal.
     pub permission_denials: Vec<String>,
     /// The final answer, when the request carried a JSON Schema.
@@ -502,6 +511,7 @@ pub struct Transcript {
     harness_version: Option<String>,
     model: Option<String>,
     billing: Option<Billing>,
+    mcp_servers: Vec<String>,
     rate_limit: Option<RateLimit>,
     /// The latest rejection, cleared by a later report that allows again.
     rejection: Option<RateLimit>,
@@ -560,6 +570,16 @@ impl Transcript {
             Some("ANTHROPIC_API_KEY") => Billing::ApiKey,
             _ => Billing::Unknown,
         });
+        // Live shape (OWL-22): `[{"name":…,"status":"failed","source":"dynamic"}]`.
+        self.mcp_servers = event["mcp_servers"]
+            .as_array()
+            .map(|servers| {
+                servers
+                    .iter()
+                    .map(|server| str_field(server, "name").unwrap_or("unnamed").to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     fn rate_limit_event(&mut self, event: &Value) {
@@ -639,6 +659,7 @@ impl Transcript {
             harness_version: self.harness_version,
             model: self.model,
             billing: self.billing.unwrap_or(Billing::Unknown),
+            mcp_servers: self.mcp_servers,
             permission_denials,
             structured_output,
             malformed_lines: self.malformed_lines,
@@ -915,6 +936,20 @@ mod tests {
             }
         );
         assert_eq!(run.usage.unwrap().output_tokens, 3);
+    }
+
+    #[test]
+    fn the_mcp_servers_of_the_init_event_are_reported() {
+        // As in the recorded runs, made with C1's guardrail flags.
+        let init = r#"{"type":"system","subtype":"init","mcp_servers":[],"apiKeySource":"none"}"#;
+        assert!(replay(&[init, OK], Some(0)).mcp_servers.is_empty());
+        // The shape of a live run given one server that failed to start
+        // (OWL-22); a server without a name is still counted.
+        let init = r#"{"type":"system","subtype":"init","mcp_servers":[{"name":"owlshift-probe","status":"failed","source":"dynamic"},{"status":"connected"}]}"#;
+        assert_eq!(
+            replay(&[init, OK], Some(0)).mcp_servers,
+            ["owlshift-probe", "unnamed"]
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ pub use tree::ProcessTree;
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -86,11 +86,40 @@ pub fn run(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<Captured, RunError> {
+    run_command(&mut probe_command(program, args, cwd), None, timeout)
+}
+
+/// Runs a command the caller prepared (program, arguments, directory,
+/// environment) as [`run`] runs a probe: output captured, the whole tree
+/// stopped at the deadline. `input`, when given, is written on the command's
+/// standard input from a thread of its own, which is then closed; without
+/// it, the command gets no input. The standard streams set on `command` are
+/// replaced.
+pub fn run_command(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Captured, RunError> {
     let deadline = Instant::now() + timeout;
-    let (mut child, tree) =
-        ProcessTree::spawn(&mut probe_command(program, args, cwd)).map_err(RunError::Io)?;
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (mut child, tree) = ProcessTree::spawn(command).map_err(RunError::Io)?;
     let stdout = read_capped(child.stdout.take());
     let stderr = read_capped(child.stderr.take());
+    if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
+        let input = input.to_vec();
+        thread::spawn(move || {
+            // A program that exits without reading its input closes the
+            // pipe; its exit status and output tell the rest.
+            let _ = stdin.write_all(&input);
+        });
+    }
 
     let status = loop {
         match child.try_wait() {
@@ -140,16 +169,10 @@ fn stop(child: &mut Child, tree: &ProcessTree) {
     }
 }
 
-/// The command [`run`] spawns: no input, captured output, the C locale.
+/// The command [`run`] spawns, in the C locale.
 fn probe_command(program: &Path, args: &[&str], cwd: Option<&Path>) -> Command {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("LANGUAGE", "")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args).env("LC_ALL", "C").env("LANGUAGE", "");
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }

@@ -59,8 +59,9 @@ pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), Floor
 
 /// Environment variables that carry a model, tracker, forge or cloud
 /// credential. No agent receives one, even when a project declares it for its
-/// gate. A guardrail, not a proof: the executor also starts agents from an
-/// empty environment plus the declared variables.
+/// gate. A guardrail, not a proof: agents also start from an empty
+/// environment plus a few inherited and the declared variables
+/// ([`crate::agent_env`]).
 pub const CREDENTIAL_VARIABLES: &[&str] = &[
     // Model providers: Owlshift never handles a model API key.
     "ANTHROPIC_API_KEY",
@@ -94,9 +95,11 @@ pub const CREDENTIAL_VARIABLES: &[&str] = &[
     "AZURE_CLIENT_CERTIFICATE_PATH",
 ];
 
-/// Checks the names of the variables an agent would receive. Names compare
-/// ASCII case-insensitively, as on Windows. Every credential variable found is
-/// reported; none is dropped silently.
+/// Checks the names of the variables an agent would receive, such as those a
+/// project declares for its gate. Names compare ASCII case-insensitively, as
+/// on Windows. Every credential variable found is reported; none is dropped
+/// silently. A whole agent environment, whose gh token variables hold a
+/// placeholder, is checked with [`crate::agent_env::check_agent_variables`].
 pub fn check_agent_environment<'a>(
     names: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), FloorViolation> {
