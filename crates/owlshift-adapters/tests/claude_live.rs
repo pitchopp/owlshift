@@ -5,10 +5,17 @@
 //! ```sh
 //! OWLSHIFT_LIVE_CLAUDE=1 cargo test -p owlshift-adapters --test claude_live -- --ignored
 //! ```
+//!
+//! It also fails when the live CLI reports a `claude_code_version` outside
+//! [`owlshift_adapters::harness::tested`]: unlike `owlshift doctor`, which
+//! only warns, this is the run that actually exercises the CLI, so a silent
+//! self-update should not pass quietly.
 
 use std::path::Path;
 
 use owlshift_adapters::harness::claude::{Billing, Effort, Outcome, Request, command, drive};
+use owlshift_adapters::harness::tested;
+use owlshift_contracts::Harness;
 use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::ids::RelativePath;
 
@@ -44,6 +51,21 @@ fn a_tiny_real_run_completes_on_the_users_login() {
     let mut lines = 0;
     let run = drive(&mut child, prompt, |_| lines += 1).unwrap();
 
+    // Checked first: a silent CLI self-update is the most likely reason any
+    // assertion below would fail, and this is the one that names it instead
+    // of leaving a flag- or message-shaped failure to puzzle out.
+    let harness_version = run
+        .harness_version
+        .as_deref()
+        .expect("the init event reports claude_code_version");
+    assert!(
+        tested::is_tested(Harness::Claude, harness_version),
+        "the installed Claude Code is {harness_version}, not in the tested list \
+         ({:?}); once the contract tests pass on it, add it to \
+         crates/owlshift-adapters/src/harness/tested.rs",
+        tested::tested_versions(Harness::Claude)
+    );
+
     assert!(
         matches!(run.outcome, Outcome::Completed { .. }),
         "{:?}\nstderr: {}",
@@ -55,7 +77,6 @@ fn a_tiny_real_run_completes_on_the_users_login() {
         Billing::Subscription,
         "the run used an API key"
     );
-    assert!(run.harness_version.is_some());
     assert!(run.usage.unwrap().output_tokens > 0);
     assert!(
         run.rate_limit.is_some(),
