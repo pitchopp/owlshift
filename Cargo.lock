@@ -641,9 +641,12 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 name = "owlshift-adapters"
 version = "0.0.0"
 dependencies = [
+ "jiff",
  "owlshift-contracts",
  "serde",
  "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

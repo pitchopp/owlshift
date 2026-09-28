@@ -17,4 +17,4 @@ pub mod result;
 pub mod schema;
 
 pub use format::ContractError;
-pub use owlshift_core::vocab::{Harness, PlanApproval, Role, Stage, Tier, Variant};
+pub use owlshift_core::vocab::{Harness, PlanApproval, Priority, Role, Stage, Tier, Variant};
