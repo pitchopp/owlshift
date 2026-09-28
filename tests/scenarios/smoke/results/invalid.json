@@ -1,0 +1,6 @@
+{
+  "format": 1,
+  "status": "questions",
+  "summary": "Valid JSON that breaks a rule of result.json: status questions, and no question.",
+  "questions": []
+}

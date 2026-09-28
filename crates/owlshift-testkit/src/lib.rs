@@ -13,3 +13,4 @@
 
 pub mod git;
 pub mod reply;
+pub mod scenario;

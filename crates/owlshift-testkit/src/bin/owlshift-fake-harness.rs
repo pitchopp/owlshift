@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 use owlshift_contracts::brief::Brief;
 use owlshift_contracts::ids::RelativePath;
-use owlshift_testkit::reply::{Reply, usage_limit_line};
+use owlshift_testkit::reply::{OWN_FAILURE, Reply, usage_limit_line};
 
 /// Plays one scripted run in the current directory, the worktree.
 #[derive(Parser)]
@@ -36,7 +36,7 @@ fn main() {
         Ok(code) => code,
         Err(error) => {
             eprintln!("owlshift-fake-harness: {error}");
-            2
+            OWN_FAILURE
         }
     };
     // Best effort: nothing is left to report a failed flush to.

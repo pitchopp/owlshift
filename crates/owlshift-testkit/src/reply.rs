@@ -13,6 +13,11 @@ use jiff::Timestamp;
 use owlshift_contracts::ids::RelativePath;
 use serde::{Deserialize, Serialize};
 
+/// The exit status of the fake harness when it cannot do what it was told:
+/// an unreadable brief or reply, or a failed step. A scenario treats it as a
+/// broken bench, never as a failed run.
+pub const OWN_FAILURE: i32 = 2;
+
 /// The start of the line that reports a usage limit, on standard error.
 pub const USAGE_LIMIT_PREFIX: &str = "owlshift-fake-harness: usage limit reached · resets ";
 
@@ -61,8 +66,14 @@ impl Reply {
         toml::to_string(self).expect("a reply always serializes to TOML")
     }
 
-    /// Refuses a reply that contradicts itself.
+    /// Refuses a reply that contradicts itself, or that asks for exit status
+    /// 2, which is the fake harness's own failure.
     pub fn validate(&self) -> Result<(), String> {
+        if self.exit_code == Some(OWN_FAILURE) {
+            return Err(format!(
+                "invalid reply: exit status {OWN_FAILURE} is kept for the fake harness's own failures"
+            ));
+        }
         if self.commit.is_some() && self.files.is_empty() {
             return Err("invalid reply: `commit` needs `files` to commit".to_owned());
         }
@@ -110,6 +121,7 @@ mod tests {
             "delay = 20\n",
             "[files]\n\"../outside.md\" = \"x\"\n",
             "commit = \"Nothing to commit\"\n",
+            "exit_code = 2\n",
             "result = \"done.json\"\nusage_limit = \"2026-09-28T15:00:00Z\"\n",
         ] {
             assert!(Reply::parse(refused).is_err(), "{refused}");
