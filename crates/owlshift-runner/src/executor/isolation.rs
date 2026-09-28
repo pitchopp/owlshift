@@ -61,13 +61,27 @@ struct MainState {
     head: Option<String>,
     /// The checked-out branch; `None` when HEAD is detached.
     branch: Option<String>,
-    /// `git status` entries by path: the record and the file's state.
-    entries: BTreeMap<Vec<u8>, (Vec<u8>, Content)>,
+    /// `git status` entries by path.
+    entries: BTreeMap<Vec<u8>, Entry>,
     /// The shared git files, by path relative to the common directory.
     shared: BTreeMap<String, Content>,
     /// Every ref but the run's branch and remote-tracking refs, with its
     /// object.
     refs: BTreeMap<String, String>,
+}
+
+/// One `git status` record, and the path it is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatusRecord {
+    path: Vec<u8>,
+    record: Vec<u8>,
+}
+
+/// A `git status` entry of the main checkout: its record and its file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    record: Vec<u8>,
+    content: Content,
 }
 
 /// The state of one file.
@@ -114,9 +128,15 @@ impl fmt::Display for Violation {
         match self {
             Self::MainHead => f.write_str("the main checkout's HEAD moved"),
             Self::MainBranch => f.write_str("the main checkout changed branch"),
-            Self::MainFiles(paths) => write!(f, "files changed in the main checkout: {}", names(paths)),
+            Self::MainFiles(paths) => {
+                write!(f, "files changed in the main checkout: {}", names(paths))
+            }
             Self::SharedGitFiles(paths) => {
-                write!(f, "the repository's shared git files changed: {}", names(paths))
+                write!(
+                    f,
+                    "the repository's shared git files changed: {}",
+                    names(paths)
+                )
             }
             Self::Refs(refs) => write!(f, "refs changed outside the run's branch: {}", names(refs)),
             Self::Branch { expected, found } => write!(
@@ -167,7 +187,12 @@ impl From<GitError> for SnapshotError {
 impl Snapshot {
     /// Records the state of `main` and the worktree's commit, before a run
     /// on `branch`.
-    pub fn take(git: &Git, main: &Path, worktree: &Path, branch: &str) -> Result<Self, SnapshotError> {
+    pub fn take(
+        git: &Git,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<Self, SnapshotError> {
         let main = MainState::read(git, main, branch)?;
         let start = trimmed(&git.run(worktree, &["rev-parse", "--verify", "HEAD"])?);
         Ok(Self { main, start })
@@ -202,7 +227,12 @@ impl Snapshot {
         let end = trimmed(&git.run(worktree, &["rev-parse", "--verify", "HEAD"])?);
         let ancestry = git.output(
             worktree,
-            &["merge-base", "--is-ancestor", self.start.as_str(), end.as_str()],
+            &[
+                "merge-base",
+                "--is-ancestor",
+                self.start.as_str(),
+                end.as_str(),
+            ],
             None,
         )?;
         match ancestry.status.code() {
@@ -228,7 +258,12 @@ impl MainState {
         let head = match head.status.code() {
             Some(0) => Some(trimmed(&head.stdout)),
             Some(1) => None,
-            _ => return Err(SnapshotError(format!("git rev-parse HEAD failed with {}", head.status))),
+            _ => {
+                return Err(SnapshotError(format!(
+                    "git rev-parse HEAD failed with {}",
+                    head.status
+                )));
+            }
         };
         let branch_now = symbolic_head(git, main)?;
 
@@ -287,11 +322,17 @@ impl MainState {
         if !files.is_empty() {
             violations.push(Violation::MainFiles(files));
         }
-        let shared: Vec<String> = changed(&self.shared, &after.shared).into_iter().cloned().collect();
+        let shared: Vec<String> = changed(&self.shared, &after.shared)
+            .into_iter()
+            .cloned()
+            .collect();
         if !shared.is_empty() {
             violations.push(Violation::SharedGitFiles(shared));
         }
-        let refs: Vec<String> = changed(&self.refs, &after.refs).into_iter().cloned().collect();
+        let refs: Vec<String> = changed(&self.refs, &after.refs)
+            .into_iter()
+            .cloned()
+            .collect();
         if !refs.is_empty() {
             violations.push(Violation::Refs(refs));
         }
@@ -333,10 +374,10 @@ fn trimmed(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_owned()
 }
 
-/// Splits `git status --porcelain=v2 -z` output into `(path, record)`
-/// pairs. A rename or copy record carries its original path as the next
-/// field, kept in its record.
-fn status_records(output: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+/// Splits `git status --porcelain=v2 -z` output into its records. A rename
+/// or copy record carries its original path as the next field, kept in its
+/// record.
+fn status_records(output: &[u8]) -> Result<Vec<StatusRecord>, String> {
     let mut fields = output.split(|&byte| byte == 0);
     let mut records = Vec::new();
     while let Some(field) = fields.next() {
@@ -345,7 +386,12 @@ fn status_records(output: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
                 .splitn(spaces + 1, |&byte| byte == b' ')
                 .nth(spaces)
                 .filter(|path| !path.is_empty())
-                .ok_or_else(|| format!("unexpected status record {:?}", String::from_utf8_lossy(field)))
+                .ok_or_else(|| {
+                    format!(
+                        "unexpected status record {:?}",
+                        String::from_utf8_lossy(field)
+                    )
+                })
         };
         let (path, record) = match field.first() {
             None => continue,
@@ -353,6 +399,7 @@ fn status_records(output: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
             Some(b'2') => {
                 let original = fields
                     .next()
+                    .filter(|original| !original.is_empty())
                     .ok_or("a rename record without its original path")?;
                 let mut record = field.to_vec();
                 record.push(0);
@@ -368,7 +415,10 @@ fn status_records(output: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
                 ));
             }
         };
-        records.push((path.to_vec(), record));
+        records.push(StatusRecord {
+            path: path.to_vec(),
+            record,
+        });
     }
     Ok(records)
 }
@@ -378,11 +428,11 @@ fn status_records(output: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
 fn contents(
     git: &Git,
     main: &Path,
-    records: Vec<(Vec<u8>, Vec<u8>)>,
-) -> Result<BTreeMap<Vec<u8>, (Vec<u8>, Content)>, SnapshotError> {
+    records: Vec<StatusRecord>,
+) -> Result<BTreeMap<Vec<u8>, Entry>, SnapshotError> {
     let mut entries = BTreeMap::new();
     let mut to_hash = Vec::new();
-    for (path, record) in records {
+    for StatusRecord { path, record } in records {
         let content = if path.ends_with(b"/") {
             Content::Dir
         } else {
@@ -409,7 +459,7 @@ fn contents(
                 }
             }
         };
-        entries.insert(path, (record, content));
+        entries.insert(path, Entry { record, content });
     }
     if to_hash.is_empty() {
         return Ok(entries);
@@ -441,8 +491,8 @@ fn contents(
         )));
     }
     for (path, id) in to_hash.iter().zip(ids) {
-        if let Some((_, content)) = entries.get_mut(path) {
-            *content = Content::File(id.to_vec());
+        if let Some(entry) = entries.get_mut(path) {
+            entry.content = Content::File(id.to_vec());
         }
     }
     Ok(entries)
@@ -464,11 +514,7 @@ fn path_of(bytes: &[u8]) -> PathBuf {
 
 /// Records `name` under `common`, and everything below it for a
 /// directory, without following links.
-fn shared_files(
-    common: &Path,
-    name: &str,
-    out: &mut BTreeMap<String, Content>,
-) -> io::Result<()> {
+fn shared_files(common: &Path, name: &str, out: &mut BTreeMap<String, Content>) -> io::Result<()> {
     let path = common.join(name);
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
@@ -519,14 +565,21 @@ mod tests {
         let records = status_records(output).unwrap();
         let paths: Vec<String> = records
             .iter()
-            .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
+            .map(|record| String::from_utf8_lossy(&record.path).into_owned())
             .collect();
         assert_eq!(
             paths,
-            ["a file.txt", "new name.md", "both.rs", "new dir/n.txt", "target/", ".env"]
+            [
+                "a file.txt",
+                "new name.md",
+                "both.rs",
+                "new dir/n.txt",
+                "target/",
+                ".env"
+            ]
         );
         // The original path belongs to the rename's record.
-        assert!(records[1].1.ends_with(b"\0old name.md"));
+        assert!(records[1].record.ends_with(b"\0old name.md"));
 
         assert!(status_records(b"2 R. N... 100644 100644 100644 b b R100 new.md\0").is_err());
         assert!(status_records(b"# branch.oid abc\0").is_err());

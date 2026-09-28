@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use owlshift_adapters::harness::claude::Effort;
 use owlshift_contracts::Role;
-use owlshift_contracts::brief::{Author, Brief, PermissionLevel, Permissions, Relation, TicketBrief};
+use owlshift_contracts::brief::{
+    Author, Brief, PermissionLevel, Permissions, Relation, TicketBrief,
+};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::result::Status;

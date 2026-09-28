@@ -92,7 +92,9 @@ impl HarnessEnd {
 pub enum HarnessStatus {
     Completed,
     /// The subscription's usage limit stopped the run.
-    UsageLimit { resets_at: Option<Timestamp> },
+    UsageLimit {
+        resets_at: Option<Timestamp>,
+    },
     /// An error, a crash, a non-zero exit: the reason.
     Failed(String),
 }
@@ -127,8 +129,16 @@ pub fn drive_plain(child: &mut Child, log: &mut RunLog) -> io::Result<PlainRun> 
         )
     };
     let (sender, chunks) = mpsc::channel();
-    pump(child.stdout.take().ok_or_else(not_piped)?, sender.clone(), Chunk::Stdout);
-    pump(child.stderr.take().ok_or_else(not_piped)?, sender, Chunk::Stderr);
+    pump(
+        child.stdout.take().ok_or_else(not_piped)?,
+        sender.clone(),
+        Chunk::Stdout,
+    );
+    pump(
+        child.stderr.take().ok_or_else(not_piped)?,
+        sender,
+        Chunk::Stderr,
+    );
 
     let mut stderr = Vec::new();
     let mut exited_at = None;
@@ -158,11 +168,7 @@ pub fn drive_plain(child: &mut Child, log: &mut RunLog) -> io::Result<PlainRun> 
 }
 
 /// Reads a stream to its end on its own thread, sending what it reads.
-fn pump(
-    mut stream: impl Read + Send + 'static,
-    sender: Sender<Chunk>,
-    wrap: fn(Vec<u8>) -> Chunk,
-) {
+fn pump(mut stream: impl Read + Send + 'static, sender: Sender<Chunk>, wrap: fn(Vec<u8>) -> Chunk) {
     thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         loop {
@@ -251,7 +257,9 @@ fn claude_end(run: claude::Run) -> HarnessEnd {
 fn describe(failure: &claude::Failure) -> String {
     match failure {
         claude::Failure::NoResult => "Claude Code left no final record".to_owned(),
-        claude::Failure::MalformedResult => "Claude Code's final record has no error flag".to_owned(),
+        claude::Failure::MalformedResult => {
+            "Claude Code's final record has no error flag".to_owned()
+        }
         claude::Failure::Signal => "a signal ended Claude Code".to_owned(),
         claude::Failure::PromptNotDelivered => "the prompt could not be sent".to_owned(),
         claude::Failure::Error {
@@ -319,7 +327,10 @@ mod tests {
             1,
         ));
         assert!(
-            matches!(limited.status, HarnessStatus::UsageLimit { resets_at: Some(_) }),
+            matches!(
+                limited.status,
+                HarnessStatus::UsageLimit { resets_at: Some(_) }
+            ),
             "{limited:?}"
         );
 

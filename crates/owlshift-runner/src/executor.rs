@@ -136,7 +136,7 @@ pub enum Outcome {
     /// The harness completed and the role left a valid `result.json`, with
     /// the artifacts it names.
     Finished {
-        result: RunResult,
+        result: Box<RunResult>,
         artifacts: ArtifactContents,
     },
     /// The harness reached its usage limit: an interruption, resumed after
@@ -230,7 +230,11 @@ fn list(items: &[impl fmt::Display]) -> String {
 
 impl Executor {
     /// Runs one role on `harness`. See the module documentation.
-    pub fn run(&self, spec: &RunSpec<'_>, harness: &dyn Harness) -> Result<RunReport, ExecutorError> {
+    pub fn run(
+        &self,
+        spec: &RunSpec<'_>,
+        harness: &dyn Harness,
+    ) -> Result<RunReport, ExecutorError> {
         let started = Instant::now();
         worktree::prepare(&self.git, spec)?;
         let mut brief = spec.brief.clone();
@@ -343,7 +347,10 @@ fn read_result(worktree: &Path, branch: &str) -> Outcome {
         Err(reason) => return Outcome::Failed(Failure::InvalidResult(reason)),
     };
     match read_artifacts(worktree, &result.artifacts) {
-        Ok(artifacts) => Outcome::Finished { result, artifacts },
+        Ok(artifacts) => Outcome::Finished {
+            result: Box::new(result),
+            artifacts,
+        },
         Err(error) => Outcome::Failed(Failure::Artifact(error)),
     }
 }

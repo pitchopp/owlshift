@@ -41,7 +41,10 @@ impl Harness for FakeHarness {
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
         let run = drive_plain(child, log)?;
-        let status = match (usage_limit(&String::from_utf8_lossy(&run.stderr)), run.exit_code) {
+        let status = match (
+            usage_limit(&String::from_utf8_lossy(&run.stderr)),
+            run.exit_code,
+        ) {
             (Some(reset), _) => HarnessStatus::UsageLimit {
                 resets_at: Some(reset),
             },

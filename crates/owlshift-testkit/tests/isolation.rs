@@ -37,7 +37,15 @@ impl Fixture {
         let remote = seed(&env, tmp.path(), &project).unwrap();
         env.run(
             &remote.checkout,
-            &["worktree", "add", "--quiet", "-b", BRANCH, "../worktree", "origin/main"],
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                BRANCH,
+                "../worktree",
+                "origin/main",
+            ],
         )
         .unwrap();
         let runner = env.clone();
@@ -89,9 +97,8 @@ fn a_runs_own_work_passes_and_every_breach_is_found() {
 
     // The main checkout: a tracked edit, then a second edit that changes the
     // content alone, an untracked file, an ignored one, a rename.
-    let edit = |text: &'static str| {
-        move |f: &Fixture| fs::write(f.main.join("README.md"), text).unwrap()
-    };
+    let edit =
+        |text: &'static str| move |f: &Fixture| fs::write(f.main.join("README.md"), text).unwrap();
     assert_eq!(f.around(edit("edited\n")), [files(&["README.md"])]);
     assert_eq!(f.around(edit("edited again\n")), [files(&["README.md"])]);
     assert_eq!(

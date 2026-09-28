@@ -61,9 +61,7 @@ fn play(args: &Args) -> Result<i32, String> {
         let mut add = vec!["add", "--"];
         add.extend(reply.files.keys().map(RelativePath::as_str));
         git(&add, None)?;
-        let date = reply
-            .date
-            .map(|date| format!("{} +0000", date.as_second()));
+        let date = reply.date.map(|date| format!("{} +0000", date.as_second()));
         git(&["commit", "--quiet", "-m", message], date.as_deref())?;
     }
     if !reply.main_checkout.is_empty() {

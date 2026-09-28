@@ -34,7 +34,15 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
             .run(spec.worktree, &["rev-parse", "HEAD"])
             .map_err(worktree_error)?;
         let there = git
-            .run(spec.main, &["rev-parse", "--verify", "--end-of-options", head_ref.as_str()])
+            .run(
+                spec.main,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    head_ref.as_str(),
+                ],
+            )
             .map_err(worktree_error)?;
         if here != there {
             return Err(ExecutorError::Worktree(format!(

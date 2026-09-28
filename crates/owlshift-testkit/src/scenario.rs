@@ -703,7 +703,7 @@ fn outcome(outcome: &Outcome) -> Result<(Event, Option<RunResult>), String> {
             ));
         }
     };
-    Ok((event, Some(result.clone())))
+    Ok((event, Some(RunResult::clone(result))))
 }
 
 fn same(field: &str, expected: impl fmt::Display, found: impl fmt::Display) -> Result<(), String> {

@@ -11,7 +11,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use owlshift_contracts::Role;
-use owlshift_contracts::brief::{Author, Brief, PermissionLevel, Permissions, Relation, TicketBrief};
+use owlshift_contracts::brief::{
+    Author, Brief, PermissionLevel, Permissions, Relation, TicketBrief,
+};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_runner::agent_env::{AgentEnv, CredentialFinding};
@@ -150,7 +152,15 @@ fn a_worktree_on_another_branch_refuses_the_run() {
         .env
         .run(
             &bench.main,
-            &["worktree", "add", "--quiet", "-b", "other", "../worktree", "origin/main"],
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "other",
+                "../worktree",
+                "origin/main",
+            ],
         )
         .unwrap();
     let error = bench.run();
@@ -171,7 +181,11 @@ fn no_run_file_is_written_through_a_link() {
     assert!(matches!(bench.run(), ExecutorError::Command(_)));
     let run_dir = bench.worktree.join(".owlshift/run");
     let brief = run_dir.join("brief.json");
-    assert!(fs::read_to_string(&brief).unwrap().contains(".owlshift/run/result.json"));
+    assert!(
+        fs::read_to_string(&brief)
+            .unwrap()
+            .contains(".owlshift/run/result.json")
+    );
 
     // A brief left as a link by an earlier run is replaced, not followed.
     let outside = bench.tmp.path().join("outside.txt");
@@ -180,7 +194,12 @@ fn no_run_file_is_written_through_a_link() {
     symlink(&outside, &brief).unwrap();
     assert!(matches!(bench.run(), ExecutorError::Command(_)));
     assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
-    assert!(!fs::symlink_metadata(&brief).unwrap().file_type().is_symlink());
+    assert!(
+        !fs::symlink_metadata(&brief)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 
     // A run directory that is a link is refused.
     let elsewhere = bench.tmp.path().join("elsewhere");
