@@ -12,6 +12,8 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::Role;
+
 /// The format version of the brief.
 pub const BRIEF_FORMAT: u32 = 2;
 /// The format version of `result.json`.
@@ -186,4 +188,143 @@ pub(crate) fn render_json<T: serde::Serialize>(value: &T) -> String {
         serde_json::to_string_pretty(value).expect("contract types always serialize to JSON");
     out.push('\n');
     out
+}
+
+/// The `+++`-delimited TOML front matter atop a role prompt file: the role it
+/// was written for, and the brief/result format versions it names.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleFrontMatter {
+    role: Role,
+    brief_format: u32,
+    result_format: u32,
+}
+
+/// Splits a role prompt's `+++` TOML front matter from the body handed to the
+/// model, without its leading blank line — the same `+++` convention as
+/// `owlshift_adapters::tracker::markdown`'s ticket front matter. TOML allows
+/// either LF or CRLF line endings, so a checkout that turns line endings into
+/// CRLF needs no separate handling here.
+fn split_front_matter(input: &str) -> Result<(&str, &str), ContractError> {
+    const CONTRACT: &str = "role prompt";
+    let mut lines = input.split_inclusive('\n');
+    let first = lines.next().unwrap_or_default();
+    if first.trim_end() != "+++" {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            "the prompt does not open with a `+++` line",
+        ));
+    }
+    let mut offset = first.len();
+    for line in lines {
+        if line.trim_end() == "+++" {
+            let front = &input[first.len()..offset];
+            let body = &input[offset + line.len()..];
+            return Ok((front, body.trim_start_matches(['\r', '\n'])));
+        }
+        offset += line.len();
+    }
+    Err(ContractError::invalid(
+        CONTRACT,
+        "the prompt's front matter is not closed by a `+++` line",
+    ))
+}
+
+/// Strips a role prompt file's `+++` front matter and returns the prompt text
+/// handed to the model.
+///
+/// The front matter names the role and the brief/result format versions the
+/// prompt was written for. A value that does not match `expected_role` or
+/// this binary's [`BRIEF_FORMAT`]/[`RESULT_FORMAT`] is refused, so a role
+/// file written for a stale contract fails loudly instead of silently
+/// confusing the agent.
+pub fn strip_role_front_matter(expected_role: Role, input: &str) -> Result<String, ContractError> {
+    const CONTRACT: &str = "role prompt";
+    let (front, body) = split_front_matter(input)?;
+    let front_matter: RoleFrontMatter =
+        toml::from_str(front).map_err(|source| ContractError::Toml {
+            contract: CONTRACT,
+            source,
+        })?;
+    if front_matter.role != expected_role {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            format!(
+                "the front matter names role {:?}, expected {:?}",
+                front_matter.role, expected_role
+            ),
+        ));
+    }
+    if front_matter.brief_format != BRIEF_FORMAT {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            format!(
+                "the front matter names brief_format {}, this binary writes {BRIEF_FORMAT}",
+                front_matter.brief_format
+            ),
+        ));
+    }
+    if front_matter.result_format != RESULT_FORMAT {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            format!(
+                "the front matter names result_format {}, this binary writes {RESULT_FORMAT}",
+                front_matter.result_format
+            ),
+        ));
+    }
+    Ok(body.to_owned())
+}
+
+#[cfg(test)]
+mod role_prompt_tests {
+    use super::*;
+
+    const VALID: &str =
+        "+++\nrole = \"build\"\nbrief_format = 2\nresult_format = 1\n+++\n\n# Build\n\nDo it.\n";
+
+    #[test]
+    fn strip_role_front_matter_returns_the_body() {
+        let body = strip_role_front_matter(Role::Build, VALID).expect("valid front matter");
+        assert_eq!(body, "# Build\n\nDo it.\n");
+    }
+
+    #[test]
+    fn strip_role_front_matter_refuses_a_mismatched_brief_format() {
+        let input = VALID.replace("brief_format = 2", "brief_format = 99");
+        let err = strip_role_front_matter(Role::Build, &input).unwrap_err();
+        assert!(err.to_string().contains("brief_format"), "{err}");
+    }
+
+    #[test]
+    fn strip_role_front_matter_refuses_a_mismatched_result_format() {
+        let input = VALID.replace("result_format = 1", "result_format = 99");
+        let err = strip_role_front_matter(Role::Build, &input).unwrap_err();
+        assert!(err.to_string().contains("result_format"), "{err}");
+    }
+
+    #[test]
+    fn strip_role_front_matter_refuses_a_mismatched_role() {
+        let err = strip_role_front_matter(Role::Design, VALID).unwrap_err();
+        assert!(err.to_string().contains("Design"), "{err}");
+    }
+
+    #[test]
+    fn strip_role_front_matter_refuses_a_missing_opening_delimiter() {
+        let err = strip_role_front_matter(Role::Build, "# Build\n").unwrap_err();
+        assert!(err.to_string().contains("open"), "{err}");
+    }
+
+    #[test]
+    fn strip_role_front_matter_refuses_an_unclosed_front_matter() {
+        let err = strip_role_front_matter(Role::Build, "+++\nrole = \"build\"\n").unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn strip_role_front_matter_refuses_an_unknown_key() {
+        let input = VALID.replace("result_format = 1", "result_format = 1\nextra = true");
+        let err = strip_role_front_matter(Role::Build, &input).unwrap_err();
+        assert!(matches!(err, ContractError::Toml { .. }), "{err}");
+    }
 }

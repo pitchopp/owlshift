@@ -7,11 +7,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use owlshift_contracts::Role;
-use owlshift_contracts::format::{BRIEF_FORMAT, RESULT_FORMAT};
+use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::result::RunResult;
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
-use serde::Deserialize;
 use serde_json::Value;
 
 /// The line budget of the build prompt, which the harness re-reads every run.
@@ -38,33 +37,13 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "result_path",
 ];
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FrontMatter {
-    role: Role,
-    brief_format: u32,
-    result_format: u32,
-}
-
-struct Prompt {
-    front_matter: FrontMatter,
-    text: String,
-}
-
-fn build_prompt() -> Prompt {
+/// Reads `roles/build.md`, with its line endings normalized to LF (a
+/// checkout may turn them into CRLF); the tests below assume LF.
+fn build_prompt() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../roles/build.md");
-    // A checkout may turn line endings into CRLF; the tests assume LF.
-    let text = fs::read_to_string(&path)
+    fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-        .replace("\r\n", "\n");
-    let rest = text
-        .strip_prefix("+++\n")
-        .expect("the prompt starts with a +++ TOML front matter");
-    let (toml_text, _) = rest
-        .split_once("\n+++\n")
-        .expect("the front matter ends with +++");
-    let front_matter = toml::from_str(toml_text).expect("the front matter is valid");
-    Prompt { front_matter, text }
+        .replace("\r\n", "\n")
 }
 
 /// Whether the prompt names `word` as code (`` `word` ``) or as a JSON string
@@ -173,15 +152,12 @@ fn names_and_values(node: &Value, out: &mut BTreeSet<String>) {
 
 #[test]
 fn build_front_matter_matches_the_contract_formats() {
-    let front_matter = build_prompt().front_matter;
-    assert_eq!(front_matter.role, Role::Build);
-    assert_eq!(front_matter.brief_format, BRIEF_FORMAT, "brief_format");
-    assert_eq!(front_matter.result_format, RESULT_FORMAT, "result_format");
+    strip_role_front_matter(Role::Build, &build_prompt()).unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[test]
 fn build_prompt_stays_short() {
-    let lines = build_prompt().text.lines().count();
+    let lines = build_prompt().lines().count();
     assert!(
         lines <= BUILD_MAX_LINES,
         "roles/build.md has {lines} lines; the budget is {BUILD_MAX_LINES}"
@@ -190,7 +166,7 @@ fn build_prompt_stays_short() {
 
 #[test]
 fn build_prompt_names_every_result_field_and_value() {
-    let text = build_prompt().text;
+    let text = build_prompt();
     let mut expected = BTreeSet::new();
     names_and_values(&generated("result"), &mut expected);
     let missing: Vec<_> = expected.iter().filter(|w| !names(&text, w)).collect();
@@ -202,7 +178,7 @@ fn build_prompt_names_every_result_field_and_value() {
 
 #[test]
 fn build_prompt_names_every_floor_category() {
-    let text = build_prompt().text;
+    let text = build_prompt();
     let missing: Vec<_> = FloorCategory::ALL
         .iter()
         .map(|c| c.token())
@@ -216,7 +192,7 @@ fn build_prompt_names_every_floor_category() {
 
 #[test]
 fn build_example_result_parses() {
-    let text = build_prompt().text;
+    let text = build_prompt();
     let blocks: Vec<&str> = text
         .split("```json\n")
         .skip(1)
@@ -230,7 +206,7 @@ fn build_example_result_parses() {
 
 #[test]
 fn build_brief_fields_exist() {
-    let text = build_prompt().text;
+    let text = build_prompt();
     let brief = generated("brief");
     for field in BUILD_BRIEF_FIELDS {
         let path: Vec<&str> = field.split('.').collect();
@@ -272,7 +248,7 @@ fn build_brief_fields_exist() {
 /// never sends the role to the project config for commands to run.
 #[test]
 fn build_gate_comes_from_the_brief() {
-    let text = build_prompt().text;
+    let text = build_prompt();
     for word in ["owlshift.toml", "stack.gate", "[stack]"] {
         assert!(
             !text.contains(word),
@@ -287,7 +263,7 @@ fn build_gate_comes_from_the_brief() {
 /// the role reads what it needs from the brief. File names are skipped.
 #[test]
 fn build_dotted_fields_exist() {
-    let text = build_prompt().text;
+    let text = build_prompt();
     let schemas: Vec<Value> = ["brief", "result"].into_iter().map(generated).collect();
     let dotted = text
         .split('`')
