@@ -10,8 +10,10 @@
 //! Code prints the account's e-mail address and organisation.
 //!
 //! Running a role is each harness's own module: [`claude`] for Claude Code.
+//! The versions each harness was tested with are in [`tested`].
 
 pub mod claude;
+pub mod tested;
 
 use serde::Deserialize;
 

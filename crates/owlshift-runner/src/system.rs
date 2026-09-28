@@ -37,9 +37,24 @@ impl System for HostSystem {
 /// `codex-cli 0.154.0` give `2.54.0`, `2.1.283` and `0.154.0`.
 pub(crate) fn version_of(output: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(output);
-    let token = text
-        .split_whitespace()
-        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))?;
+    Some(rebuild(version_token(&text)?))
+}
+
+/// [`version_of`], only when the version holds nothing but digits and dots:
+/// `2.1.283-beta.1` gives `None`, since it is not the release `2.1.283`.
+pub(crate) fn exact_version_of(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let token = version_token(&text)?;
+    let version = rebuild(token);
+    (version == token).then_some(version)
+}
+
+fn version_token(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+fn rebuild(token: &str) -> String {
     let mut version = String::new();
     for part in token.split('.') {
         let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
@@ -54,7 +69,7 @@ pub(crate) fn version_of(output: &[u8]) -> Option<String> {
             break;
         }
     }
-    Some(version)
+    version
 }
 
 #[cfg(test)]
@@ -145,5 +160,15 @@ mod tests {
             Some("123")
         );
         assert_eq!(version_of(b"no version here"), None);
+    }
+
+    #[test]
+    fn an_exact_version_has_no_suffix() {
+        assert_eq!(
+            exact_version_of(b"2.1.283 (Claude Code)\n").as_deref(),
+            Some("2.1.283")
+        );
+        assert_eq!(exact_version_of(b"2.1.283-beta.1 (Claude Code)\n"), None);
+        assert_eq!(exact_version_of(b"no version here"), None);
     }
 }
