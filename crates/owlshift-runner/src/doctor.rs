@@ -8,6 +8,9 @@
 use std::fmt;
 
 use owlshift_adapters::harness::{self, Login};
+use owlshift_adapters::tracker::Capability;
+use owlshift_adapters::tracker::linear::LinearTracker;
+use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::Harness;
 use owlshift_contracts::config::TrackerKind;
 
@@ -207,9 +210,12 @@ fn file_check<T>(subject: &str, state: &FileState<T>) -> Check {
     }
 }
 
-/// No tracker adapter exists yet (the first arrives in P1), and no
-/// capability contract is written before three adapters exist (principle 8),
-/// so the configured tracker can only be named.
+/// The configured tracker's adapter and the capabilities it declares
+/// (architecture section 6). A required capability this build does not
+/// implement yet is a warning, not a failure: `owlshift do` needs only to
+/// read tickets and comments, and refusing a project is `init`'s job. The
+/// check reads the adapter's constants: it opens neither the tracker nor the
+/// keychain.
 fn tracker_check(config: &Effective) -> Check {
     const SUBJECT: &str = "tracker";
     let FileState::Loaded { config, .. } = &config.project else {
@@ -220,16 +226,32 @@ fn tracker_check(config: &Effective) -> Check {
             None,
         );
     };
-    let kind = match config.tracker.kind {
-        TrackerKind::Linear => "linear",
-        TrackerKind::Markdown => "markdown",
+    let (kind, declared) = match config.tracker.kind {
+        TrackerKind::Linear => ("linear", LinearTracker::CAPABILITIES),
+        TrackerKind::Markdown => ("markdown", MarkdownTracker::CAPABILITIES),
     };
-    check(
-        SUBJECT,
-        Status::Warn,
-        format!("`{kind}` is configured, and this build has no tracker adapter yet"),
-        None,
-    )
+    let list = |capabilities: &[Capability]| {
+        capabilities
+            .iter()
+            .map(|c| c.describe())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let missing: Vec<Capability> = Capability::ALL
+        .into_iter()
+        .filter(|c| c.required() && !declared.contains(c))
+        .collect();
+    let detail = format!("`{kind}`: {}", list(declared));
+    if missing.is_empty() {
+        check(SUBJECT, Status::Ok, detail, None)
+    } else {
+        check(
+            SUBJECT,
+            Status::Warn,
+            format!("{detail}; not built yet: {}", list(&missing)),
+            None,
+        )
+    }
 }
 
 impl fmt::Display for Report {
@@ -421,5 +443,41 @@ mod tests {
 
         assert!(report.ready(), "{report}");
         assert!(report.checks.iter().all(|check| check.subject != "codex"));
+    }
+
+    #[test]
+    fn the_tracker_line_names_what_the_adapter_does_and_does_not_do_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("owlshift.toml");
+        std::fs::write(
+            &project,
+            r#"requires = ">=0.0"
+[tracker]
+kind = "linear"
+team = "OWL"
+admit = "delegation"
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+[stack]
+gate = ["cargo test"]
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+[models]
+[policy]
+always_human = []
+"#,
+        )
+        .unwrap();
+        let config = Effective {
+            project: FileState::load(project, owlshift_contracts::config::ProjectConfig::parse),
+            personal: FileState::NotApplicable("no configuration directory".into()),
+        };
+        let tracker = tracker_check(&config);
+        assert_eq!(tracker.status, Status::Warn);
+        assert_eq!(
+            tracker.detail,
+            "`linear`: read a ticket, read and post comments; \
+             not built yet: list admitted tickets, visible stage"
+        );
     }
 }

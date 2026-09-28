@@ -1,0 +1,41 @@
+{
+  "recorded": "2026-09-28 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
+        "variables": {
+          "id": "OWL-11"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "assignee": {
+              "displayName": "person-1",
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
+            "description": "**Why.** The fake harness is the keystone of testing ([runtime & operations](<https://github.com/pitchopp/owlshift/blob/main/docs/design/runtime-and-operations.md>), \"Testing strategy\"): it makes the question loop, crashes and usage limits reproducible without consuming a subscription.\n\n**Scope:**\n\n* Fake harness: a script that writes a prepared `result.json`, with optional delays, failures and usage-limit messages.\n* Test tracker: one folder per ticket in the repository ([build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"CLI surface\").\n* A local bare git remote fixture.\n* A scenario runner that plays a scenario file end to end.\n\n**Acceptance.** One scenario runs end to end in CI on the three platforms.",
+            "identifier": "OWL-11",
+            "labels": {
+              "nodes": [
+                {
+                  "name": "Feature"
+                },
+                {
+                  "name": "Core"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false
+              }
+            },
+            "priority": 2,
+            "title": "Build the test harness: fake harness, test tracker, local bare remote, scenario runner"
+          }
+        }
+      }
+    }
+  ]
+}

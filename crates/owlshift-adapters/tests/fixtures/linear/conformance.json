@@ -1,0 +1,233 @@
+{
+  "recorded": "2026-09-28 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
+        "variables": {
+          "id": "OWL-13"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "assignee": {
+              "displayName": "person-1",
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
+            "description": "**Why.** P1 works real tickets from Owlshift's own Linear workspace.\n\n**Scope:**\n\n* Read a ticket: title, description, priority, assignee, labels, comments with author and last-edit time.\n* Post a comment.\n* Declare the adapter's capabilities ([architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 6).\n* The API key comes from the system keychain.\n\n**Acceptance.** Recorded HTTP fixtures, plus a first tracker conformance suite the adapter passes.",
+            "identifier": "OWL-13",
+            "labels": {
+              "nodes": [
+                {
+                  "name": "Feature"
+                },
+                {
+                  "name": "Adapters"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false
+              }
+            },
+            "priority": 3,
+            "title": "Add the Linear tracker adapter: read a ticket and post a comment"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
+        "variables": {
+          "id": "OWL-99999"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": null,
+        "errors": [
+          {
+            "extensions": {
+              "code": "INPUT_ERROR",
+              "statusCode": 400,
+              "type": "invalid input",
+              "userError": true,
+              "userPresentableMessage": "Could not find referenced Issue."
+            },
+            "locations": [
+              {
+                "column": 30,
+                "line": 1
+              }
+            ],
+            "message": "Entity not found: Issue",
+            "path": [
+              "issue"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 50,
+          "id": "OWL-13"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 50,
+          "id": "OWL-99999"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": null,
+        "errors": [
+          {
+            "extensions": {
+              "code": "INPUT_ERROR",
+              "statusCode": 400,
+              "type": "invalid input",
+              "userError": true,
+              "userPresentableMessage": "Could not find referenced Issue."
+            },
+            "locations": [
+              {
+                "column": 62,
+                "line": 1
+              }
+            ],
+            "message": "Entity not found: Issue",
+            "path": [
+              "issue"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } } }",
+        "variables": {
+          "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
+          "issueId": "OWL-99999"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": null,
+        "errors": [
+          {
+            "extensions": {
+              "code": "INPUT_ERROR",
+              "statusCode": 400,
+              "type": "invalid input",
+              "userError": true,
+              "userPresentableMessage": "Issue 'OWL-99999' not found."
+            },
+            "locations": [
+              {
+                "column": 59,
+                "line": 1
+              }
+            ],
+            "message": "issue not found",
+            "path": [
+              "commentCreate"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } } }",
+        "variables": {
+          "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
+          "issueId": "OWL-13"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "commentCreate": {
+            "comment": {
+              "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
+              "botActor": null,
+              "createdAt": "2026-09-28T13:15:04.851Z",
+              "editedAt": null,
+              "externalUser": null,
+              "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
+              "user": {
+                "displayName": "person-1",
+                "id": "00000000-0000-4000-8000-000000000001"
+              }
+            },
+            "success": true
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 50,
+          "id": "OWL-13"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "comments": {
+              "nodes": [
+                {
+                  "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
+                  "botActor": null,
+                  "createdAt": "2026-09-28T13:15:04.851Z",
+                  "editedAt": null,
+                  "externalUser": null,
+                  "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
+                  "user": {
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

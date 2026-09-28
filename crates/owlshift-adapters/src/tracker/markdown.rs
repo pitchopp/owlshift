@@ -20,6 +20,8 @@ use serde::Deserialize;
 use owlshift_contracts::Priority;
 use owlshift_contracts::ids::TicketId;
 
+use crate::tracker::{self as shared, Capability, ErrorKind};
+
 /// A ticket as its `ticket.md` gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ticket {
@@ -227,6 +229,87 @@ impl MarkdownTracker {
     fn comments_dir(&self, id: &TicketId) -> PathBuf {
         self.tickets.join(id.as_str()).join("comments")
     }
+}
+
+/// The runner's side of the Markdown tracker. The inherent methods above
+/// serve the test bench, which sets comment authors and times itself; the
+/// runner posts as [`MarkdownTracker::AGENT`] at the current time.
+///
+/// The inherent types carry more than the shared ones (the author, the stage,
+/// blocked-by). They converge when the trait carries the visible stage (P2)
+/// and blocked-by relations; until then the conversion lives only here.
+impl shared::Tracker for MarkdownTracker {
+    fn capabilities(&self) -> &'static [Capability] {
+        Self::CAPABILITIES
+    }
+
+    fn ticket(&self, id: &TicketId) -> Result<shared::Ticket, shared::Error> {
+        self.require_ticket(id)?;
+        let ticket = MarkdownTracker::ticket(self, id).map_err(other)?;
+        Ok(shared::Ticket {
+            id: ticket.id,
+            title: ticket.title,
+            description: ticket.description,
+            priority: ticket.priority,
+            assignee: ticket.assignee.map(|name| shared::Person {
+                id: name.clone(),
+                name,
+            }),
+            labels: ticket.labels,
+        })
+    }
+
+    fn comments(&self, id: &TicketId) -> Result<Vec<shared::Comment>, shared::Error> {
+        self.require_ticket(id)?;
+        let comments = MarkdownTracker::comments(self, id).map_err(other)?;
+        Ok(comments.into_iter().map(shared_comment).collect())
+    }
+
+    fn post_comment(&self, id: &TicketId, body: &str) -> Result<shared::Comment, shared::Error> {
+        self.require_ticket(id)?;
+        MarkdownTracker::post_comment(self, id, Self::AGENT, Timestamp::now(), body)
+            .map(shared_comment)
+            .map_err(other)
+    }
+}
+
+impl MarkdownTracker {
+    /// What the Markdown tracker implements through [`shared::Tracker`].
+    pub const CAPABILITIES: &'static [Capability] = &[Capability::ReadTicket, Capability::Comments];
+
+    /// The author of the comments the runner posts.
+    pub const AGENT: &'static str = "owlshift";
+
+    fn require_ticket(&self, id: &TicketId) -> Result<(), shared::Error> {
+        let path = self.ticket_file(id);
+        if path.is_file() {
+            Ok(())
+        } else {
+            Err(shared::Error::new(
+                ErrorKind::NotFound,
+                format!("{}: no such ticket", path.display()),
+            ))
+        }
+    }
+}
+
+/// A comment file as a shared comment. Comment files are never edited (build
+/// plan, "The test tracker"), so the last edit is the creation time.
+fn shared_comment(comment: Comment) -> shared::Comment {
+    shared::Comment {
+        id: format!("{}-{}", comment.at.strftime(TIME_FORMAT), comment.author),
+        author: shared::Author::Account(shared::Person {
+            id: comment.author.clone(),
+            name: comment.author,
+        }),
+        created_at: comment.at,
+        edited_at: None,
+        body: comment.body,
+    }
+}
+
+fn other(error: TrackerError) -> shared::Error {
+    shared::Error::new(ErrorKind::Other, error.to_string())
 }
 
 /// The time part of a comment's file name, in UTC.

@@ -1,0 +1,79 @@
+{
+  "recorded": "2026-09-28 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 1,
+          "id": "OWL-11"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "comments": {
+              "nodes": [
+                {
+                  "body": "Merged into main as 1c57f49 (PR #7, squash).",
+                  "botActor": null,
+                  "createdAt": "2026-09-28T10:14:51.909Z",
+                  "editedAt": null,
+                  "externalUser": null,
+                  "id": "ed8e53d4-2827-451e-9504-964016ee00b1",
+                  "user": {
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "ed8e53d4-2827-451e-9504-964016ee00b1",
+                "hasNextPage": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": "ed8e53d4-2827-451e-9504-964016ee00b1",
+          "first": 1,
+          "id": "OWL-11"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "comments": {
+              "nodes": [
+                {
+                  "body": "Pull request opened: https://github.com/pitchopp/owlshift/pull/7 (CI green on ubuntu, macOS and Windows).",
+                  "botActor": null,
+                  "createdAt": "2026-09-28T10:11:07.757Z",
+                  "editedAt": null,
+                  "externalUser": null,
+                  "id": "f006bf77-ac01-4615-a444-c59671caea15",
+                  "user": {
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "f006bf77-ac01-4615-a444-c59671caea15",
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

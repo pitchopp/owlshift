@@ -10,12 +10,23 @@ publish.workspace = true
 
 [dependencies]
 dirs.workspace = true
+keyring-core.workspace = true
 which.workspace = true
 
+# The system keychain takes one credential store per platform:
+# apple-native on macOS, zbus-secret-service on other Unix systems,
+# windows-native on Windows.
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store.workspace = true
+
 [target.'cfg(windows)'.dependencies]
+windows-native-keyring-store.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
