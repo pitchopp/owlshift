@@ -1,8 +1,12 @@
 //! Git with none of the host's configuration, and a project seeded into a
 //! local bare remote.
 //!
-//! Every git command the bench runs, and the fake harness it launches, goes
-//! through [`GitEnv::apply`].
+//! Every git command the bench runs goes through [`GitEnv::apply`]. The
+//! fake harness is launched by the executor with the agent environment,
+//! which drops every `GIT_*` variable: built from [`GitEnv::agent_parent`],
+//! it finds the same configuration as git's global one in the bench's home
+//! (`$XDG_CONFIG_HOME/git/config`). Its git also reads the host's system
+//! configuration, whose keys that matter here the bench's file overrides.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -27,10 +31,13 @@ pub struct GitEnv {
 impl GitEnv {
     /// Writes the configuration into `home`, created if missing: an identity,
     /// no signing, no line-ending conversion, and ignore and attributes files
-    /// and a hooks folder of its own, all empty.
+    /// and a hooks folder of its own, all empty. It is written twice: as the
+    /// file [`GitEnv::apply`] names, and where git looks for its global
+    /// configuration under `XDG_CONFIG_HOME`, for the agent's git.
     pub fn create(home: PathBuf) -> Result<Self, GitError> {
         let io = |error: std::io::Error| GitError(format!("{}: {error}", home.display()));
         fs::create_dir_all(home.join("hooks")).map_err(io)?;
+        fs::create_dir_all(home.join("git")).map_err(io)?;
         fs::write(home.join("ignore"), "").map_err(io)?;
         fs::write(home.join("attributes"), "").map_err(io)?;
         let config = format!(
@@ -43,8 +50,29 @@ impl GitEnv {
             config_path(&home.join("attributes")),
             config_path(&home.join("hooks")),
         );
-        fs::write(home.join(FIXTURE_CONFIG), config).map_err(io)?;
+        fs::write(home.join(FIXTURE_CONFIG), &config).map_err(io)?;
+        fs::write(home.join("git").join("config"), &config).map_err(io)?;
         Ok(Self { home, date: None })
+    }
+
+    /// The runner's environment as the bench stands it in, for building the
+    /// agent environment: this process's variables with every `GIT_*` one
+    /// removed, and the home and configuration folder in the bench's home.
+    pub fn agent_parent(&self) -> Vec<(OsString, OsString)> {
+        let replaced = ["HOME", "XDG_CONFIG_HOME", "LC_ALL", "LANGUAGE"];
+        let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| {
+                let name = name.to_string_lossy().to_ascii_uppercase();
+                !name.starts_with("GIT_") && !replaced.contains(&name.as_str())
+            })
+            .collect();
+        vars.extend([
+            ("HOME".into(), self.home.clone().into_os_string()),
+            ("XDG_CONFIG_HOME".into(), self.home.clone().into_os_string()),
+            ("LC_ALL".into(), "C".into()),
+            ("LANGUAGE".into(), OsString::new()),
+        ]);
+        vars
     }
 
     /// The same environment, committing at `at`.

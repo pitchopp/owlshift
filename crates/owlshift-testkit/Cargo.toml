@@ -13,6 +13,7 @@ publish = false
 owlshift-core.workspace = true
 owlshift-contracts.workspace = true
 owlshift-adapters.workspace = true
+owlshift-runner.workspace = true
 clap.workspace = true
 jiff.workspace = true
 serde.workspace = true
