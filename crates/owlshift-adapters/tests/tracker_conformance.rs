@@ -22,7 +22,9 @@ struct Case {
     title: &'static str,
     description_start: &'static str,
     priority: Priority,
-    assignee: Option<Person>,
+    /// Whether it has an assignee. Who it is differs between a live run and
+    /// its pseudonymized recording, so the suite checks presence only.
+    assigned: bool,
     labels: &'static [&'static str],
     /// A ticket that does not exist.
     missing: TicketId,
@@ -52,7 +54,12 @@ fn check(tracker: &dyn Tracker, case: &Case) {
         ticket.description
     );
     assert_eq!(ticket.priority, case.priority);
-    assert_eq!(ticket.assignee, case.assignee);
+    assert_eq!(
+        ticket.assignee.is_some(),
+        case.assigned,
+        "{:?}",
+        ticket.assignee
+    );
     assert_eq!(ticket.labels, case.labels);
 
     let missing = tracker.ticket(&case.missing).unwrap_err();
@@ -122,15 +129,21 @@ fn the_markdown_tracker_conforms() {
         title: "Add a greeting",
         description_start: "Say hello",
         priority: Priority::Medium,
-        assignee: Some(Person {
-            id: "maintainer".to_owned(),
-            name: "maintainer".to_owned(),
-        }),
+        assigned: true,
         labels: &["Feature", "Docs"],
         missing: id("DEMO-404"),
         body: BODY,
     };
-    check(&MarkdownTracker::new(root.path()), &case);
+    let tracker = MarkdownTracker::new(root.path());
+    check(&tracker, &case);
+    let maintainer = Person {
+        id: "maintainer".to_owned(),
+        name: "maintainer".to_owned(),
+    };
+    assert_eq!(
+        Tracker::ticket(&tracker, &case.existing).unwrap().assignee,
+        Some(maintainer)
+    );
 }
 
 fn linear_case() -> Case {
@@ -139,7 +152,7 @@ fn linear_case() -> Case {
         title: "Add the Linear tracker adapter: read a ticket and post a comment",
         description_start: "**Why.**",
         priority: Priority::Medium,
-        assignee: None,
+        assigned: true,
         labels: &["Feature", "Adapters"],
         missing: id("OWL-99999"),
         body: BODY,
@@ -161,27 +174,36 @@ fn the_linear_tracker_conforms() {
 /// Records the Linear conformance fixture by running the suite against the
 /// live API. The suite posts a comment on OWL-13: it is sent only when
 /// `OWLSHIFT_RECORD_WRITES=OWL-13`; otherwise it is made up and flagged.
+/// What was recorded is written even when the suite fails, so a failed run
+/// never needs a second write to be understood.
 #[test]
 #[ignore = "records against the live Linear API"]
 fn record_conformance_fixture() {
     let key = support::live_key();
     support::assert_owlshift_workspace(&key);
     let case = linear_case();
-    let writes = std::env::var("OWLSHIFT_RECORD_WRITES").ok();
-    let recorder = if writes.as_deref() == Some(case.existing.as_str()) {
+    let writes =
+        std::env::var("OWLSHIFT_RECORD_WRITES").ok().as_deref() == Some(case.existing.as_str());
+    let recorder = if writes {
         Recorder::new(&key)
     } else {
         Recorder::new(&key).synthesizing_posts_on(&key, case.existing.as_str())
     };
-    check(&LinearTracker::with_transport(recorder.clone()), &case);
-    let how = match writes {
-        Some(_) => "recorded live",
-        None => "recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
+    let tracker = LinearTracker::with_transport(recorder.clone());
+    // After a panic only the recorder's log is read, never the tracker.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&tracker, &case)));
+    let how = if writes {
+        "recorded live"
+    } else {
+        "recorded live, except the comment posted on OWL-13, made up (see `synthesized`)"
     };
     recorder.write(
         LINEAR_FIXTURE,
         &format!("{} on the Owlshift workspace, {how}", today()),
     );
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 fn today() -> String {
