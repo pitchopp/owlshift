@@ -3,7 +3,7 @@
 //! standing in for GitHub's git side, and the real GitHub adapter over a fake
 //! transport standing in for its API.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -30,7 +30,7 @@ use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
 };
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
-use owlshift_runner::project::ProjectDirs;
+use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 use owlshift_testkit::harness::FakeHarness;
 use owlshift_testkit::reply::Reply;
@@ -129,21 +129,30 @@ impl Transport for Shared {
     }
 }
 
-/// The fake harness, one reply per run in order. With `leave_plan`, the
-/// first run also leaves a plan and a ledger, as the build role does.
+/// What an agent does in its worktree beyond what a reply says, just before
+/// its first run: the bench plays it in this process.
+type Agent = Box<dyn FnOnce(&Path)>;
+
+/// The build role leaving a plan and a ledger.
+fn leave_plan(worktree: &Path) {
+    let dir = worktree.join(RUN_DIR);
+    fs::write(dir.join("plan.md"), "1. Add the greeting.\n").unwrap();
+    fs::write(dir.join("ledger.json"), "{\"steps\":[]}\n").unwrap();
+}
+
+/// The fake harness, one reply per run in order, with what the agent does
+/// first.
 struct Replies {
     program: PathBuf,
     replies: RefCell<VecDeque<PathBuf>>,
     current: RefCell<Option<FakeHarness>>,
-    leave_plan: Cell<bool>,
+    first: RefCell<Option<Agent>>,
 }
 
 impl Harness for Replies {
     fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
-        if self.leave_plan.replace(false) {
-            let dir = run.worktree.join(RUN_DIR);
-            fs::write(dir.join("plan.md"), "1. Add the greeting.\n")?;
-            fs::write(dir.join("ledger.json"), "{\"steps\":[]}\n")?;
+        if let Some(agent) = self.first.borrow_mut().take() {
+            agent(run.worktree);
         }
         let reply = self
             .replies
@@ -261,7 +270,7 @@ impl Bench {
 
     /// Runs `owlshift do DEMO-1` with one reply per run; returns its outcome
     /// and what it printed.
-    fn run(&self, replies: Vec<Reply>, leave_plan: bool) -> (Result<Delivered, Stop>, String) {
+    fn run(&self, replies: Vec<Reply>, first: Option<Agent>) -> (Result<Delivered, Stop>, String) {
         let replies = replies
             .into_iter()
             .map(|reply| {
@@ -275,7 +284,7 @@ impl Bench {
             program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
             replies: RefCell::new(replies),
             current: RefCell::new(None),
-            leave_plan: Cell::new(leave_plan),
+            first: RefCell::new(first),
         };
         let env = self.env.clone();
         let executor = on_demand::executor(
@@ -350,7 +359,7 @@ fn kinds(events: &[Event]) -> Vec<EventKind> {
 fn a_ticket_becomes_a_pull_request_with_its_report() {
     let bench = Bench::new(true);
     let person = bench.person();
-    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], false);
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
     let delivered = outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(delivered.opened);
     assert_eq!(delivered.pull_request.number, 1);
@@ -413,7 +422,7 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
 
     // Again: the checkout is fetched, the push is up to date, and the pull
     // request and its report are found, not made twice.
-    let (again, printed) = bench.run(vec![bench.reply(None, Some(DONE))], false);
+    let (again, printed) = bench.run(vec![bench.reply(None, Some(DONE))], None);
     let again = again.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(!again.opened);
     assert_eq!(bench.github.created.lock().unwrap().len(), 1);
@@ -430,7 +439,7 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
         bench.reply(Some("Helo"), Some(DONE)),
         bench.reply(Some("Hello"), Some(DONE)),
     ];
-    let (outcome, printed) = bench.run(replies, true);
+    let (outcome, printed) = bench.run(replies, Some(Box::new(leave_plan)));
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
 
     let started: Vec<Event> = bench
@@ -563,7 +572,7 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
         let bench = Bench::new(true);
         let replies = replies(&bench);
         let pushed_before = bench.remote_branch();
-        let (outcome, printed) = bench.run(replies, false);
+        let (outcome, printed) = bench.run(replies, None);
         let stop = match outcome {
             Ok(delivered) => panic!("{name}: delivered {delivered:?}\n{printed}"),
             Err(stop) => stop,
@@ -587,7 +596,7 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
 
     // A ticket without a decider is refused before anything runs.
     let bench = Bench::new(false);
-    let (outcome, _) = bench.run(Vec::new(), false);
+    let (outcome, _) = bench.run(Vec::new(), None);
     assert!(
         matches!(&outcome, Err(Stop::Refused(reason)) if reason.contains("no assignee")),
         "{outcome:?}"
@@ -604,14 +613,125 @@ fn a_quarantined_run_keeps_the_project_refused() {
     reply
         .main_checkout
         .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
-    let (outcome, _) = bench.run(vec![reply], false);
+    let (outcome, _) = bench.run(vec![reply], None);
     assert!(matches!(outcome, Err(Stop::Parked { .. })), "{outcome:?}");
     let marker = bench.dirs().unverified().unwrap().expect("a marker");
     assert!(marker.contains("broke isolation"), "{marker}");
 
-    let (again, _) = bench.run(Vec::new(), false);
+    let (again, _) = bench.run(Vec::new(), None);
     let Err(stop @ Stop::Unverified { .. }) = again else {
         panic!("{again:?}");
     };
     assert!(stop.to_string().contains("delete"), "{stop}");
+}
+
+/// Copies a folder, byte for byte.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// An agent that points its worktree's `.git` at a git directory of its own:
+/// the checkout's, copied, with a `pre-push` hook that writes `fired` and
+/// the configuration that makes git run it. Git in the worktree then works
+/// as before, so the executor's isolation check sees nothing.
+fn redirect_git_link(evil: PathBuf, fired: PathBuf) -> Agent {
+    Box::new(move |worktree: &Path| {
+        let link = fs::read_to_string(worktree.join(".git")).unwrap();
+        let admin = PathBuf::from(link.trim().strip_prefix("gitdir:").unwrap().trim());
+        let admin = if admin.is_relative() {
+            worktree.join(admin)
+        } else {
+            admin
+        };
+        let common = admin.join(fs::read_to_string(admin.join("commondir")).unwrap().trim());
+        let evil_common = evil.join("common");
+        copy_dir(&common, &evil_common);
+        let hooks = evil.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-push");
+        let fired = fired.to_string_lossy().replace('\\', "/");
+        fs::write(&hook, format!("#!/bin/sh\necho ran > '{fired}'\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let hooks_path = hooks.to_string_lossy().replace('\\', "/");
+        let mut config = fs::read_to_string(evil_common.join("config")).unwrap();
+        config.push_str(&format!("[core]\n\thooksPath = {hooks_path}\n"));
+        fs::write(evil_common.join("config"), config).unwrap();
+        let evil_admin = evil.join("admin");
+        copy_dir(&admin, &evil_admin);
+        fs::write(
+            evil_admin.join("commondir"),
+            format!("{}\n", evil_common.display()),
+        )
+        .unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", evil_admin.display()),
+        )
+        .unwrap();
+    })
+}
+
+/// The runner never runs git with the person's credentials where the agent
+/// could redirect it: a run whose worktree's `.git` leads elsewhere is a
+/// breach, its hook never runs, and nothing is pushed.
+#[test]
+fn an_agent_that_redirects_its_git_link_gets_no_hook_and_no_push() {
+    let bench = Bench::new(true);
+    let evil = bench.tmp.path().join("evil");
+    let fired = bench.tmp.path().join("hook-fired");
+    let agent = redirect_git_link(evil, fired.clone());
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], Some(agent));
+    match &outcome {
+        Err(Stop::Parked {
+            reason: ParkReason::IsolationBreach,
+            detail,
+        }) => assert!(
+            detail.contains("the worktree's .git link was changed"),
+            "{detail}"
+        ),
+        other => panic!("{other:?}\n{printed}"),
+    }
+    assert!(!fired.exists(), "the planted hook ran");
+    assert_eq!(bench.remote_branch(), None);
+    assert!(bench.github.created.lock().unwrap().is_empty());
+    assert!(bench.comments().is_empty());
+    let marker = bench.dirs().unverified().unwrap().expect("a marker");
+    assert!(marker.contains(".git link"), "{marker}");
+}
+
+/// A project that changes its default branch gets its new base at the next
+/// fetch.
+#[test]
+fn the_checkout_follows_the_forges_default_branch() {
+    let bench = Bench::new(true);
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let url = bench.remote.bare.to_string_lossy().into_owned();
+    let base = project::sync_checkout(&git, &bench.dirs(), &url).unwrap();
+    assert_eq!(base.remote_ref, "origin/main");
+
+    let bare = &bench.remote.bare;
+    bench.env.run(bare, &["branch", "trunk", "main"]).unwrap();
+    bench
+        .env
+        .run(bare, &["symbolic-ref", "HEAD", "refs/heads/trunk"])
+        .unwrap();
+    let base = project::sync_checkout(&git, &bench.dirs(), &url).unwrap();
+    assert_eq!(
+        (base.remote_ref.as_str(), base.branch.as_str()),
+        ("origin/trunk", "trunk")
+    );
 }

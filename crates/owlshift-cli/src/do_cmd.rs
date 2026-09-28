@@ -53,6 +53,9 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
     if !config.is_valid() {
         return fail("the personal configuration is invalid: see `owlshift config show`");
     }
+    if let Err(error) = on_demand::check_team(project, &ticket) {
+        return fail(&error);
+    }
     let root = project_file.parent().unwrap_or(project_file);
     let git = project::runner_git();
     let remote_url = match project::origin_url(&git, root) {

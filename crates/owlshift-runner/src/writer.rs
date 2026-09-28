@@ -11,9 +11,11 @@
 //! request is open, so the person sees what was delivered without a
 //! terminal (principle 1). There is no merge.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
 use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push};
@@ -349,28 +351,45 @@ impl<'a> Writer<'a> {
         Self { tracker }
     }
 
-    /// Pushes exactly `commit` to `branch` on `remote`, from `worktree`,
-    /// with the runner's own git and the person's own git credentials: the
-    /// commit the gate passed on, never whatever the branch points to by
-    /// then. A plain push, never a force: the remote refuses anything but
-    /// creating the branch or moving it forward
-    /// (`owlshift_adapters::forge::push`).
+    /// Pushes exactly `commit` to `branch` on `remote`, with the runner's own
+    /// git and the person's own git credentials: the commit the gate passed
+    /// on, never whatever the branch points to by then. A plain push, never
+    /// a force: the remote refuses anything but creating the branch or
+    /// moving it forward (`owlshift_adapters::forge::push`).
+    ///
+    /// `checkout` is the dedicated checkout, never a ticket's worktree: an
+    /// agent owns every file of its worktree, `.git` included, and could
+    /// point it at a git directory whose hooks or configuration run code
+    /// with the person's credentials. The worktree's commits are in the
+    /// checkout's object store. No hook runs either way: `--no-verify` skips
+    /// `pre-push`, and `core.hooksPath` names a folder that does not exist,
+    /// so no other hook (`reference-transaction`) is found; the file-system
+    /// monitor is off.
     pub fn push_branch(
         &self,
         git: &Git,
-        worktree: &Path,
+        checkout: &Path,
         remote: &str,
         commit: &CommitId,
         branch: &Branch,
     ) -> Result<Pushed, WriteError> {
         floor::check_action(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
-        // The adapter builds the arguments; the runner's git runs them, so a
-        // test bench's hermetic setup applies to the push too.
-        let command = push_command(Path::new("git"), worktree, remote, commit, branch)
+        // The adapter builds the push; the runner's git runs it, so a test
+        // bench's hermetic setup applies to the push too.
+        let command = push_command(Path::new("git"), checkout, remote, commit, branch)
             .map_err(WriteError::Push)?;
-        let args: Vec<&OsStr> = command.get_args().collect();
-        let output = git.output(worktree, &args, None).map_err(|error| {
+        let mut pushed = command.get_args();
+        let mut args: Vec<OsString> = vec![
+            "-c".into(),
+            hooks_nowhere().into(),
+            "-c".into(),
+            "core.fsmonitor=false".into(),
+        ];
+        args.extend(pushed.next().map(OsStr::to_owned));
+        args.push("--no-verify".into());
+        args.extend(pushed.map(OsStr::to_owned));
+        let output = git.output(checkout, &args, None).map_err(|error| {
             WriteError::Push(PushError::Failed {
                 message: error.to_string(),
             })
@@ -450,6 +469,24 @@ fn is_delivery(body: &str) -> bool {
         MarkedComment::parse(body),
         Ok(Some(MarkedComment { header, .. })) if header.kind == MarkerKind::Delivery
     )
+}
+
+/// `core.hooksPath=<folder>` for a folder that does not exist, named by this
+/// process and the time, so nothing can have been planted there: git finds
+/// no hook in it.
+fn hooks_nowhere() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let base =
+        std::env::temp_dir().join(format!("owlshift-no-hooks-{}-{nanos}", std::process::id()));
+    let mut folder = base.clone();
+    let mut n = 1;
+    while fs::symlink_metadata(&folder).is_ok() {
+        n += 1;
+        folder = PathBuf::from(format!("{}-{n}", base.display()));
+    }
+    format!("core.hooksPath={}", folder.display())
 }
 
 /// The ticket's pull request, and whether this call opened it.

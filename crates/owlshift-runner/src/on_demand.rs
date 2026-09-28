@@ -37,7 +37,7 @@ use owlshift_contracts::brief::{
     TicketBrief,
 };
 use owlshift_contracts::comment::MarkedComment;
-use owlshift_contracts::config::ProjectConfig;
+use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
@@ -104,6 +104,26 @@ pub fn check_origin(url: &str) -> Result<Repo, String> {
         "the remote `origin` is not a github.com repository: `owlshift do` delivers to GitHub only"
             .to_owned()
     })
+}
+
+/// Refuses a ticket of another team than the project's, before anything is
+/// read: on Linear, a ticket id starts with its team's key (`OWL` in
+/// `OWL-12`), and `owlshift do LOC-12` in an OWL project would otherwise
+/// build another team's ticket and report there. The key is compared
+/// without regard to case, as Linear reads identifiers.
+pub fn check_team(config: &ProjectConfig, ticket: &TicketId) -> Result<(), String> {
+    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
+        return Ok(());
+    };
+    let key = ticket.as_str().rsplit_once('-').map(|(key, _)| key);
+    if key.is_some_and(|key| key.eq_ignore_ascii_case(team)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{ticket} is not a ticket of team {team}, the project's `tracker.team`: \
+             `owlshift do` runs this project's tickets only"
+        ))
+    }
 }
 
 /// The core event a run's outcome maps onto (the table of
@@ -302,6 +322,7 @@ impl OnDemand<'_> {
     /// Runs `ticket` to a delivered pull request; see the module
     /// documentation.
     pub fn run(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
+        check_team(self.config, ticket).map_err(Stop::Refused)?;
         let _lock = match self.dirs.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return Err(Stop::Busy(self.dirs.root().to_owned())),
@@ -330,6 +351,22 @@ impl OnDemand<'_> {
         let git = &self.executor.git;
         let base =
             project::sync_checkout(git, self.dirs, self.remote_url).map_err(Stop::Refused)?;
+        let checkout = self.dirs.checkout();
+        let worktree = self.dirs.worktree(ticket);
+        // A worktree kept from an earlier `do` is trusted only while its
+        // `.git` still links it to the checkout.
+        if fs::symlink_metadata(&worktree).is_ok()
+            && let Err(reason) = project::check_worktree_link(&checkout, &worktree)
+        {
+            let text = format!("The worktree of {ticket} was changed between runs: {reason}\n");
+            self.dirs
+                .mark_unverified(&text)
+                .map_err(|e| refused("the project's marker", e))?;
+            return Err(Stop::Unverified {
+                marker: self.dirs.unverified_file(),
+                text,
+            });
+        }
         let branch = branch_for(ticket);
         let head = Branch::new(&branch).map_err(|e| refused("the ticket's branch", e))?;
         let base_branch = Branch::new(&base.branch).map_err(|e| refused("the base branch", e))?;
@@ -339,8 +376,6 @@ impl OnDemand<'_> {
             .forge
             .find_open_pull_request(&head, &base_branch)
             .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
-        let checkout = self.dirs.checkout();
-        let worktree = self.dirs.worktree(ticket);
         sink.emit(
             ticket,
             None,
@@ -419,25 +454,45 @@ impl OnDemand<'_> {
                     return Err(refused("the run could not start", error));
                 }
             };
-            let marked = match &report.outcome {
+            // The executor's check does not see the worktree's own `.git`:
+            // a link the run redirected is a breach too, found before the
+            // runner trusts anything git says in the worktree.
+            let link = project::check_worktree_link(&checkout, &worktree).err();
+            let mut breaches: Vec<String> = match &report.outcome {
                 Outcome::Quarantined(violations) => {
-                    let lines: Vec<String> = violations.iter().map(|v| format!("- {v}")).collect();
-                    self.dirs.mark_unverified(&format!(
-                        "Run {run} of {ticket} broke isolation:\n{}\n",
-                        lines.join("\n")
-                    ))
+                    violations.iter().map(ToString::to_string).collect()
                 }
-                _ => self.dirs.clear_unverified(),
+                _ => Vec::new(),
+            };
+            breaches.extend(link.clone());
+            let marked = if breaches.is_empty() {
+                self.dirs.clear_unverified()
+            } else {
+                let lines: Vec<String> = breaches.iter().map(|b| format!("- {b}")).collect();
+                self.dirs.mark_unverified(&format!(
+                    "Run {run} of {ticket} broke isolation:\n{}\n",
+                    lines.join("\n")
+                ))
             };
             marked.map_err(|e| refused("the project's marker", e))?;
-            sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
+            let mut ended = run_ended(&report);
+            if let Some(link) = &link {
+                ended.insert("outcome".to_owned(), json!("quarantined"));
+                ended.insert("reason".to_owned(), json!(breaches.join("; ")));
+                ended.insert("link".to_owned(), json!(link));
+            }
+            sink.emit(ticket, Some(&run), EventKind::RunEnded, ended);
             if let Some(usage) = &report.usage {
                 sink.emit(ticket, Some(&run), EventKind::Usage, usage_data(usage));
             }
             if let Some(gate) = &report.gate {
                 gathered.gate_failure = gate.failure.clone();
             }
-            let (event, result) = core_event(&report.outcome);
+            let (event, result) = if breaches.is_empty() {
+                core_event(&report.outcome)
+            } else {
+                (Event::Quarantined, None)
+            };
             if let Some(result) = result {
                 gather(&mut gathered.decisions, &result.decisions);
                 gather(&mut gathered.followups, &result.followups);
@@ -445,7 +500,11 @@ impl OnDemand<'_> {
             match state.apply(pipeline, event) {
                 Ok(Transition::To(next)) => state = next,
                 Ok(Transition::Parked { reason, .. }) => {
-                    let detail = park_detail(&report.outcome);
+                    let detail = if breaches.is_empty() {
+                        park_detail(&report.outcome)
+                    } else {
+                        breaches.join("; ")
+                    };
                     sink.emit(
                         ticket,
                         Some(&run),
@@ -488,16 +547,7 @@ impl OnDemand<'_> {
                 _ => break report,
             }
         };
-        self.deliver(
-            ticket,
-            &found,
-            &worktree,
-            &head,
-            &base_branch,
-            report,
-            gathered,
-            sink,
-        )
+        self.deliver(ticket, &found, &head, &base_branch, report, gathered, sink)
     }
 
     /// The build brief of one run.
@@ -551,13 +601,13 @@ impl OnDemand<'_> {
         }
     }
 
-    /// Delivers a Build `done` whose gate passed.
+    /// Delivers a Build `done` whose gate passed. The push leaves from the
+    /// dedicated checkout, never from the worktree (`Writer::push_branch`).
     #[allow(clippy::too_many_arguments)]
     fn deliver(
         &self,
         ticket: &TicketId,
         found: &Ticket,
-        worktree: &Path,
         head: &Branch,
         base: &Branch,
         report: RunReport,
@@ -579,8 +629,9 @@ impl OnDemand<'_> {
         let delivery =
             |what: &str, error: &dyn fmt::Display| Stop::Delivery(format!("{what}: {error}"));
 
+        let checkout = self.dirs.checkout();
         let pushed = writer
-            .push_branch(&self.executor.git, worktree, "origin", &commit, head)
+            .push_branch(&self.executor.git, &checkout, "origin", &commit, head)
             .map_err(|e| delivery("pushing the branch", &e))?;
         sink.emit(
             ticket,
@@ -888,6 +939,35 @@ mod tests {
         assert_eq!(
             branch_for(&TicketId::new("OWL-12").unwrap()),
             "owlshift/owl-12"
+        );
+    }
+
+    #[test]
+    fn a_linear_project_runs_its_own_teams_tickets_only() {
+        let config = |kind: &str, team: &str| {
+            ProjectConfig::parse(&format!(
+                "requires = \">=0.0\"\n[tracker]\nkind = \"{kind}\"\n{team}admit = \"delegation\"\n\
+                 states = {{ ready = \"a\", working = \"b\", needs_input = \"c\", review = \"d\" }}\n\
+                 [stack]\ngate = []\n[pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n\
+                 [models]\n[policy]\nalways_human = []\n"
+            ))
+            .unwrap()
+        };
+        let ticket = |id: &str| TicketId::new(id).unwrap();
+        let owl = config("linear", "team = \"OWL\"\n");
+        assert_eq!(check_team(&owl, &ticket("OWL-12")), Ok(()));
+        assert_eq!(check_team(&owl, &ticket("owl-12")), Ok(()));
+        for other in ["LOC-12", "OWLS-1", "OWL12"] {
+            let error = check_team(&owl, &ticket(other)).unwrap_err();
+            assert!(
+                error.contains("not a ticket of team OWL"),
+                "{other}: {error}"
+            );
+        }
+        // The Markdown tracker's tickets live in the project itself.
+        assert_eq!(
+            check_team(&config("markdown", ""), &ticket("LOC-12")),
+            Ok(())
         );
     }
 

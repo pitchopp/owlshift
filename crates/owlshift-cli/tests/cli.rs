@@ -364,6 +364,23 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
         "{}",
         stderr(&output)
     );
+
+    // A Linear project runs its own team's tickets only.
+    let linear = tempfile::tempdir().unwrap();
+    git_init(linear.path());
+    let init = ["init", "--team", "OWL", "--skip-secrets"];
+    assert!(
+        owlshift(linear.path(), config_dir.path(), &init)
+            .status
+            .success()
+    );
+    let output = owlshift(linear.path(), config_dir.path(), &["do", "LOC-12"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("LOC-12 is not a ticket of team OWL"),
+        "{}",
+        stderr(&output)
+    );
     assert!(!config_dir.path().join("data").exists());
 }
 
