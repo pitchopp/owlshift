@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Role;
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
-use crate::ids::{QuestionId, TicketId};
+use crate::ids::{QuestionId, RelativePath, TicketId};
 use crate::result::{Question, check_question_order};
 
 const CONTRACT: &str = "brief";
@@ -43,7 +43,7 @@ pub struct Brief {
     pub rules: Vec<Rule>,
     pub permissions: Permissions,
     /// Where the role writes `result.json`, relative to the worktree.
-    pub result_path: String,
+    pub result_path: RelativePath,
 }
 
 /// The ticket as read from the tracker.
@@ -111,9 +111,9 @@ pub enum ThreadEntry {
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
+    pub plan: Option<RelativePath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ledger: Option<String>,
+    pub ledger: Option<RelativePath>,
 }
 
 /// A project rule injected into the brief.

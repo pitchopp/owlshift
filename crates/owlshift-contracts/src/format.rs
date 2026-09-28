@@ -21,7 +21,7 @@ pub const EVENT_FORMAT: u32 = 1;
 /// The format version of a claim (`claim.json` on a claim ref).
 pub const CLAIM_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).
-pub const TICKET_STATE_FORMAT: u32 = 1;
+pub const TICKET_STATE_FORMAT: u32 = 2;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

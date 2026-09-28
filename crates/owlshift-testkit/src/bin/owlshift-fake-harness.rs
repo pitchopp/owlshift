@@ -62,10 +62,8 @@ fn play(args: &Args) -> Result<i32, String> {
     }
 
     if let Some(prepared) = &reply.result {
-        let result_path =
-            RelativePath::new(brief.result_path.as_str()).map_err(|e| e.to_string())?;
         let content = fs::read(prepared).map_err(|e| format!("{}: {e}", prepared.display()))?;
-        write(&worktree.join(result_path.as_str()), &content)?;
+        write(&worktree.join(brief.result_path.as_str()), &content)?;
     }
 
     if let Some(text) = &reply.stdout {

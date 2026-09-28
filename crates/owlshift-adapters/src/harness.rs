@@ -8,6 +8,10 @@
 //! verdict, a fixed list of known values gives the method, and the command's
 //! output is never echoed, since Codex prints part of an API key and Claude
 //! Code prints the account's e-mail address and organisation.
+//!
+//! Running a role is each harness's own module: [`claude`] for Claude Code.
+
+pub mod claude;
 
 use serde::Deserialize;
 
