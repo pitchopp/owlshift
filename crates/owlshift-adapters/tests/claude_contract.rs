@@ -2,9 +2,9 @@
 //! replayed through the adapter, with no model and no login.
 //!
 //! The fixtures in `fixtures/claude/` were recorded on 2026-09-28 with Claude
-//! Code 2.1.283 (see `docs/design/build-plan.md`, OWL-14 results), then
-//! scrubbed: session and message ids, timestamps and paths replaced, the
-//! user's skills, plugins and agents removed. Each test states the exit
+//! Code 2.1.283 (see `docs/design/build-plan.md`, OWL-14 and OWL-42 results),
+//! then scrubbed: session, message and tool-use ids, timestamps and paths
+//! replaced, the user's skills, plugins and agents removed. Each test states the exit
 //! status and standard error the run had, since both decide the outcome.
 //! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
 //! limit on purpose (C7's open item). It follows the shapes C7 logged.
@@ -16,10 +16,14 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use owlshift_adapters::harness::claude::{
-    Billing, EXIT_GRACE, Failure, Outcome, RateLimitStatus, Run, Transcript, drive,
+    Billing, EXIT_GRACE, Failure, Outcome, RateLimitStatus, Request, Run, Transcript, command,
+    drive,
 };
 use owlshift_adapters::harness::tested::is_tested;
 use owlshift_contracts::Harness;
+use owlshift_contracts::brief::{PermissionLevel, Permissions};
+use owlshift_contracts::ids::RelativePath;
+use serde_json::{Value, json};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -123,6 +127,102 @@ fn usage_limit() {
             resets_at: Some(Timestamp::from_second(1790613600).unwrap()),
             window: Some("five_hour".into()),
         }
+    );
+}
+
+/// The events of a fixture, read as raw JSON: `Run` carries neither the
+/// `init` tool list nor the tool calls, so what is read here pins the
+/// recording, not the adapter's parsing.
+fn recorded_events(name: &str) -> Vec<Value> {
+    std::fs::read_to_string(fixture(name))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn offered_tools(name: &str) -> Vec<String> {
+    let events = recorded_events(name);
+    let init = events
+        .iter()
+        .find(|event| event["type"] == "system" && event["subtype"] == "init")
+        .unwrap_or_else(|| panic!("{name} has no init event"));
+    serde_json::from_value(init["tools"].clone()).unwrap()
+}
+
+/// `RemoteTrigger` lists, creates and runs cloud agents on the user's
+/// claude.ai account, and was offered and callable under both permission
+/// modes (OWL-42). Every launch removes it, in its one `--disallowedTools`
+/// flag. `remote_trigger_denied.jsonl` was recorded with that argv (write in
+/// worktree, no network, a JSON Schema) plus a `--settings` allow rule for
+/// `RemoteTrigger`, the model being asked to call it: the tool was not offered
+/// and not called. `success.jsonl`, recorded without the flag, was offered
+/// it. Exit 0, empty stderr.
+#[test]
+fn remote_trigger_is_denied_on_every_launch() {
+    for level in [PermissionLevel::ReadOnly, PermissionLevel::WriteWorktree] {
+        for network in [true, false] {
+            let request = Request {
+                workdir: PathBuf::from("/work"),
+                model: None,
+                effort: None,
+                permissions: Permissions {
+                    level,
+                    network,
+                    browser: false,
+                },
+                result_path: RelativePath::new(".owlshift/result.json").unwrap(),
+                json_schema: Some(r#"{"type":"object"}"#.into()),
+                max_budget_usd: None,
+            };
+            let args: Vec<String> = command(Path::new("claude"), &request)
+                .unwrap()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let flags: Vec<usize> = (0..args.len())
+                .filter(|&at| args[at] == "--disallowedTools")
+                .collect();
+            let case = format!("{level:?}, network {network}: {args:?}");
+            // One flag: whether a second one would add to the first or
+            // replace it was not checked.
+            assert_eq!(flags.len(), 1, "{case}");
+            let denied: Vec<&str> = args[flags[0] + 1..]
+                .iter()
+                .take_while(|arg| !arg.starts_with("--"))
+                .map(String::as_str)
+                .collect();
+            assert!(denied.contains(&"RemoteTrigger"), "{case}");
+            assert_eq!(denied.contains(&"WebFetch"), !network, "{case}");
+        }
+    }
+
+    assert!(offered_tools("success.jsonl").contains(&"RemoteTrigger".to_owned()));
+    let offered = offered_tools("remote_trigger_denied.jsonl");
+    assert!(
+        !offered.contains(&"RemoteTrigger".to_owned()),
+        "{offered:?}"
+    );
+    let called: Vec<Value> = recorded_events("remote_trigger_denied.jsonl")
+        .iter()
+        .filter(|event| event["type"] == "assistant")
+        .filter_map(|event| event["message"]["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == "tool_use")
+        .map(|block| block["name"].clone())
+        .collect();
+    assert_eq!(called, [json!("StructuredOutput")]);
+
+    let run = replay("remote_trigger_denied.jsonl", 0);
+    assert!(
+        matches!(run.outcome, Outcome::Completed { .. }),
+        "{:?}",
+        run.outcome
+    );
+    assert!(run.permission_denials.is_empty());
+    assert_eq!(
+        run.structured_output,
+        Some(json!({"answer": "RemoteTrigger tool is not available in this environment."}))
     );
 }
 
