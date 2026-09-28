@@ -1,0 +1,119 @@
+# Throwaway live checks for OWL-41 (confining agent runs). Runs only on
+# pushes to the OWL-41 branch; removed before the pull request. Every secret
+# is fake and made here.
+name: owl41-probe
+
+on:
+  push:
+    branches: [sghirma/owl-41-confine-agent-runs-at-the-os-level]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: System
+        run: |
+          uname -a
+          . /etc/os-release && echo "$PRETTY_NAME"
+          echo "HOME=$HOME XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unset}"
+          id
+          ls -la /run/user || true
+          cat /sys/kernel/security/lsm || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces 2>&1 || true
+          ls /etc/apparmor.d | grep -i -E 'bwrap|unpriv|userns' || echo "no bwrap or userns AppArmor profile"
+      - name: Unprivileged user namespace without bwrap
+        run: unshare -Ur true && echo "unshare -Ur: ok" || echo "unshare -Ur: failed ($?)"
+      - name: bwrap as shipped
+        run: |
+          if command -v bwrap; then bwrap --version; else echo "bwrap not installed on the image"; fi
+      - name: Install bwrap
+        run: |
+          command -v bwrap || { sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap; }
+          bwrap --version
+          ls /etc/apparmor.d | grep -i -E 'bwrap|unpriv|userns' || echo "no bwrap or userns AppArmor profile"
+      - name: Plant fake secrets and a repository with a linked worktree
+        run: |
+          mkdir -p "$HOME/.config/gh" "$HOME/other-project" "$HOME/toolchain" "$HOME/owl41"
+          printf 'example.invalid:\n    oauth_token: gho_FAKE_owl41\n' > "$HOME/.config/gh/hosts.yml"
+          echo 'API_KEY=FAKE_owl41' > "$HOME/other-project/.env"
+          echo tool > "$HOME/toolchain/bin.txt"
+          cd "$HOME/owl41"
+          git init -q -b main main && cd main
+          git -c user.name=p -c user.email=p@example.invalid commit -q --allow-empty -m init
+          git worktree add -q -b owl41 "$HOME/owl41/wt"
+          mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+      - name: Confined probe
+        run: |
+          RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          cat > "$HOME/owl41/probe.sh" <<'EOF'
+          #!/bin/sh
+          cat "$HOME/.config/gh/hosts.yml" >/dev/null 2>&1; echo "  gh token file: exit $?"
+          cat "$HOME/other-project/.env" >/dev/null 2>&1; echo "  sibling .env: exit $?"
+          cat "$HOME/toolchain/bin.txt" >/dev/null 2>&1; echo "  allowed toolchain file: exit $?"
+          ls "$HOME" 2>&1 | tr '\n' ' '; echo "<- home listing"
+          ls -A "$RUNTIME" 2>&1 | tr '\n' ' '; echo "<- runtime dir listing"
+          echo x > "$HOME/planted.txt" 2>/dev/null; echo "  write in the home: exit $?"
+          cd "$HOME/owl41/wt" && echo hi > f.txt && git add f.txt && git -c user.name=p -c user.email=p@example.invalid commit -q -m f && echo "  commit in the linked worktree: ok" || echo "  commit in the linked worktree: failed"
+          EOF
+          chmod +x "$HOME/owl41/probe.sh"
+          echo "unconfined:"; RUNTIME="$RUNTIME" "$HOME/owl41/probe.sh"
+          git -C "$HOME/owl41/wt" reset -q --hard HEAD~1
+          echo "bwrap:"
+          bwrap --ro-bind / / --dev /dev --proc /proc \
+            --tmpfs "$HOME" \
+            --ro-bind "$HOME/toolchain" "$HOME/toolchain" \
+            --ro-bind "$HOME/owl41/probe.sh" "$HOME/owl41/probe.sh" \
+            --bind "$HOME/owl41/wt" "$HOME/owl41/wt" \
+            --bind "$HOME/owl41/main/.git" "$HOME/owl41/main/.git" \
+            --tmpfs /run/user \
+            --die-with-parent \
+            --setenv RUNTIME "$RUNTIME" \
+            -- "$HOME/owl41/probe.sh"
+          echo "bwrap exit: $?"
+          ls "$HOME"
+          git -C "$HOME/owl41/wt" log --oneline -1
+      - name: bwrap and a process group kill
+        run: |
+          setsid sh -c 'bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent -- sleep 300 & echo $! > /tmp/bw.pid; wait' &
+          sleep 2
+          PGID=$(ps -o pgid= -p "$(cat /tmp/bw.pid)" | tr -d ' ')
+          echo "group $PGID:"; ps -o pid,pgid,comm -g "$PGID"
+          kill -KILL -- "-$PGID"; sleep 1
+          pgrep -a -f 'sleep 300' && echo "a sleep survived the group kill" || echo "no process left after the group kill"
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - name: System
+        run: |
+          sw_vers
+          ls -la /usr/bin/sandbox-exec
+          security list-keychains -d user
+      - name: Throwaway keychain and a confined read
+        run: |
+          D="$RUNNER_TEMP/owl41"; mkdir -p "$D/kc" "$D/home/.config/gh"
+          printf 'example.invalid:\n    oauth_token: gho_FAKE_owl41\n' > "$D/home/.config/gh/hosts.yml"
+          KC="$D/kc/probe.keychain-db"
+          security create-keychain -p owl41 "$KC"
+          security set-keychain-settings "$KC"
+          security unlock-keychain -p owl41 "$KC"
+          security add-generic-password -s owl41-probe -a probe -w FAKE_owl41 "$KC"
+          security list-keychains -d user
+          cat > "$D/deny.sb" <<EOF
+          (version 1)
+          (allow default)
+          (deny file-read-data file-read-xattr (subpath "$D/home"))
+          (deny file-read* file-write* (subpath "$D/kc"))
+          (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc"))
+          EOF
+          probe() {
+            cat "$D/home/.config/gh/hosts.yml" >/dev/null 2>&1; echo "  token file: exit $?"
+            security find-generic-password -s owl41-probe -w "$KC" 2>&1 | sed 's/FAKE_owl41/<fake>/'; echo "  keychain item: exit ${PIPESTATUS[0]}"
+          }
+          echo "unconfined:"; probe
+          export -f probe 2>/dev/null || true
+          echo "confined:"; sandbox-exec -f "$D/deny.sb" /bin/bash -c "$(declare -f probe); D='$D' KC='$KC' probe"
+          security delete-keychain "$KC"
