@@ -319,13 +319,23 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(3)),
+        parse(|v| v["format"] = json!(4)),
         "upgrade Owlshift",
     );
     rejects(
         "format 1, before the brief carried the gate",
         parse(|v| v["format"] = json!(1)),
         "unknown format 1",
+    );
+    rejects(
+        "format 2, before the brief carried the gate failure",
+        parse(|v| v["format"] = json!(2)),
+        "unknown format 2",
+    );
+    rejects(
+        "unknown field in the gate failure",
+        parse(|v| v["gate_failure"]["exit_code"] = json!(1)),
+        "unknown field `exit_code`",
     );
     rejects(
         "missing gate",

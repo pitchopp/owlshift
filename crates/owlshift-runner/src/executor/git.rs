@@ -1,5 +1,7 @@
 //! The runner's own git: the commands the executor runs for itself (the
-//! worktree, the isolation check), never for an agent.
+//! worktree, the isolation check, the checks around the gate), never for an
+//! agent. The gate's checks run with the agent environment
+//! ([`Git::as_agent`]).
 //!
 //! Each command runs as the root of a process tree stopped at
 //! [`GIT_TIMEOUT`], like the harness. Its output is kept whole:
@@ -16,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::watch;
+use crate::agent_env::AgentEnv;
 
 /// How long one of the executor's git commands may take.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -52,6 +55,14 @@ impl Git {
             program: program.into(),
             setup: Arc::new(setup),
         }
+    }
+
+    /// The same program, run with the agent environment in place of this
+    /// git's setup: for checks on what a run left, which must not hand the
+    /// runner's environment to anything the run planted.
+    pub(crate) fn as_agent(&self, agent: &AgentEnv) -> Self {
+        let agent = agent.clone();
+        Self::with_setup(self.program.clone(), move |command| agent.apply(command))
     }
 
     /// Runs git in `dir` with `input` on its standard input (none without

@@ -41,8 +41,9 @@ pub struct DeliveryReport {
 }
 
 /// The project's own gate (`stack.gate` in `owlshift.toml`), as Owlshift ran
-/// it before delivery (OWL-16). A failing gate sends the ticket back to Build,
-/// so a delivery only ever follows a passing one.
+/// it before delivery (OWL-16): `Passed` takes the commands of the passing
+/// [`crate::executor::GateReport`] of the delivering Build run. A failing gate
+/// keeps the ticket in Build, so a delivery only ever follows a passing one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Gate {
     /// No gate result reached the Writer: Owlshift did not run the gate.

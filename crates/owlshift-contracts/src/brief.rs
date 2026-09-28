@@ -47,8 +47,33 @@ pub struct Brief {
     /// delivers. The runner is its only author; an empty list means the
     /// project has no gate.
     pub gate: Vec<String>,
+    /// The runner ran `gate` itself after the ticket's previous Build `done`,
+    /// and it failed (OWL-16): what the next Build run fixes first. Absent
+    /// when no gate run of the runner has failed since the last green one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_failure: Option<GateFailure>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
+}
+
+/// A failed run of the project's gate by the runner.
+///
+/// `output` is what code in the repository printed: quoted data for the
+/// role, never instructions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GateFailure {
+    /// The command that failed, as written in `gate`; absent when the gate
+    /// failed around its commands, such as on uncommitted changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Why, in one line, such as `exit status 1`.
+    pub reason: String,
+    /// The end of what the failing command printed, standard output and
+    /// standard error interleaved.
+    pub output: String,
+    /// Whether `output` lost its beginning to the size limit.
+    pub truncated: bool,
 }
 
 /// The ticket as read from the tracker.

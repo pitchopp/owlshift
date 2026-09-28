@@ -1,5 +1,5 @@
 //! The scenarios of `tests/scenarios/`, played on the fake harness, and
-//! short ones on the smoke fixture for the executor's guardrails.
+//! short ones on their fixtures for the executor's guardrails and the gate.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -19,6 +19,80 @@ fn smoke() {
     if let Err(error) = play(&scenarios().join("smoke.toml"), fake_harness()) {
         panic!("{error}");
     }
+}
+
+/// OWL-16's acceptance: the gate fails first and passes after a fix run.
+#[test]
+fn gate() {
+    if let Err(error) = play(&scenarios().join("gate.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
+/// Plays a scenario given as text on the gate fixture.
+fn play_on_gate(name: &str, scenario: &str) {
+    if let Err(error) = play_str(name, scenario, &scenarios().join("gate"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
+#[test]
+fn the_gate_runs_on_the_last_commit_only() {
+    play_on_gate(
+        "gate-uncommitted",
+        r#"
+        description = "The build reports done with its greeting left uncommitted: the gate runs on the last commit, so it fails without running."
+        ticket = "DEMO-2"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n" }, result = "results/build-done.json" }
+        expect = { event = "run_failed", stage = "build", gate_failure = "uncommitted changes before the gate", branch_pushed = false }
+        "#,
+    );
+}
+
+#[test]
+fn a_gate_that_commits_fails() {
+    play_on_gate(
+        "gate-commits",
+        r#"
+        description = "The gate passes but commits: it no longer vouches for the commit the run delivers."
+        ticket = "DEMO-2"
+        start = "2026-09-28T09:00:00Z"
+        gate = ["git commit -q --allow-empty -m moved"]
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n" }, commit = "Add a greeting", result = "results/build-done.json" }
+        expect = { event = "run_failed", stage = "build", gate_failure = "the gate moved HEAD", branch_pushed = false }
+        "#,
+    );
+}
+
+#[test]
+fn a_gate_breaking_isolation_is_quarantined() {
+    play_on_gate(
+        "gate-breach",
+        r#"
+        description = "The gate creates a branch in the shared repository, then fails: the breach wins, quarantined and parked."
+        ticket = "DEMO-2"
+        start = "2026-09-28T09:00:00Z"
+        gate = ["git branch planted && exit 1"]
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n" }, commit = "Add a greeting", result = "results/build-done.json" }
+        expect = { event = "quarantined", waiting = "parked", branch_pushed = false }
+        "#,
+    );
 }
 
 #[test]
