@@ -118,6 +118,17 @@ impl DeliveryReport {
                 remains.push("Read the checks on the pull request: Owlshift could not.".to_owned());
                 return format!("**Checks:** could not be read: {}", flatten(&error.message));
             }
+            Ok(set) if set.pull_request != self.pull_request.number => {
+                let read = format!("#{}", set.pull_request);
+                let ours = format!("#{}", self.pull_request.number);
+                remains.push(format!(
+                    "Read the checks of {ours} on the pull request: the set Owlshift read \
+                     belongs to {read}."
+                ));
+                return format!(
+                    "**Checks:** not shown: they were read for pull request {read}, not {ours}."
+                );
+            }
             Ok(set) if set.head != self.pull_request.head => {
                 let read = code(short(&set.head));
                 remains.push(format!(
@@ -552,6 +563,18 @@ Merge state reported by the forge: `CLEAN`.
                 }),
                 "**Checks:** not shown: they were read for `fffffff`, not for the head `3e368b2`.",
                 "- Read the checks of `3e368b2` on the pull request",
+            ),
+            (
+                // Another pull request on the same head commit.
+                Ok(CheckSet {
+                    pull_request: 24,
+                    ..set(
+                        Mergeable::Mergeable,
+                        vec![check("ci", Passed, "SUCCESS", false)],
+                    )
+                }),
+                "**Checks:** not shown: they were read for pull request #24, not #23.",
+                "- Read the checks of #23 on the pull request: the set Owlshift read belongs to #24.",
             ),
             (
                 Err(forge::Error::new(
