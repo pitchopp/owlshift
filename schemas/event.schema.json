@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift event",
+  "description": "One recorded event.",
+  "type": "object",
+  "properties": {
+    "at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "description": "Kind-specific details.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "kind": {
+      "$ref": "#/$defs/EventKind"
+    },
+    "project": {
+      "description": "The project's name.",
+      "type": "string"
+    },
+    "run": {
+      "description": "The run concerned; absent for events outside a run.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ticket": {
+      "description": "The ticket concerned; absent for events about no single ticket, such as\na scan.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TicketId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "at",
+    "project",
+    "kind",
+    "data"
+  ],
+  "$defs": {
+    "EventKind": {
+      "description": "What happened.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "run_started",
+            "run_ended",
+            "ticket_admitted",
+            "answer_posted",
+            "pr_merged",
+            "check_failed"
+          ]
+        },
+        {
+          "description": "The tracker and the forge were polled.",
+          "type": "string",
+          "const": "scan"
+        },
+        {
+          "description": "The scheduler or the policy decided something.",
+          "type": "string",
+          "const": "decision"
+        },
+        {
+          "description": "A ticket was claimed and a run dispatched.",
+          "type": "string",
+          "const": "dispatch"
+        },
+        {
+          "description": "Usage measured for a run, or a usage limit reported by a harness.",
+          "type": "string",
+          "const": "usage"
+        },
+        {
+          "description": "A gate opened or closed.",
+          "type": "string",
+          "const": "gate"
+        },
+        {
+          "description": "The writer wrote to the tracker or the forge.",
+          "type": "string",
+          "const": "tracker_write"
+        }
+      ]
+    },
+    "TicketId": {
+      "description": "A tracker's ticket identifier, safe as a git ref component and a file name.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    }
+  }
+}

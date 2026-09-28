@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "status": "questions",
+  "summary": "Plan drafted; two choices need the decider.",
+  "questions": [
+    {
+      "id": "Q1",
+      "category": "scope",
+      "context": "The ticket asks for X; the code already does Y in module Z.",
+      "text": "Extend Y, or build X separately?",
+      "options": ["Extend Y", "Build X separately"],
+      "recommendation": "Extend Y"
+    }
+  ],
+  "decisions": [
+    { "question": "Test framework", "decision": "Reuse the existing one", "basis": "Project convention" }
+  ],
+  "followups": [],
+  "artifacts": { "plan": "plan.md", "ledger": "ledger.json" },
+  "pr": null
+}

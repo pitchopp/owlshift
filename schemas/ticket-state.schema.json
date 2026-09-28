@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket state",
+  "description": "Where a ticket stands in its pipeline.",
+  "type": "object",
+  "properties": {
+    "failed_runs": {
+      "description": "Failed runs in the current stage.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "reasks": {
+      "description": "Re-asks in the current round.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "round": {
+      "description": "Question rounds asked so far; re-asks do not count.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "stage": {
+      "$ref": "#/$defs/Stage"
+    },
+    "waiting": {
+      "description": "Why the ticket waits, if it does.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Waiting"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "stage",
+    "round",
+    "reasks",
+    "failed_runs"
+  ],
+  "$defs": {
+    "Stage": {
+      "description": "A stage of the pipeline, or `ready` for an admitted ticket not yet started.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "ready",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "deliver",
+        "watch"
+      ]
+    },
+    "Waiting": {
+      "description": "Why a ticket waits.",
+      "oneOf": [
+        {
+          "description": "Questions wait for the decider.",
+          "type": "string",
+          "const": "needs_input"
+        },
+        {
+          "description": "The ticket was parked; a human restarts it.",
+          "type": "string",
+          "const": "parked"
+        }
+      ]
+    }
+  }
+}

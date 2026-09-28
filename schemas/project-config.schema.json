@@ -1,0 +1,264 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift project configuration (owlshift.toml)",
+  "description": "The project file, `owlshift.toml`, committed in the repository.",
+  "type": "object",
+  "properties": {
+    "models": {
+      "$ref": "#/$defs/Models"
+    },
+    "pipeline": {
+      "$ref": "#/$defs/Pipeline"
+    },
+    "policy": {
+      "$ref": "#/$defs/Policy"
+    },
+    "requires": {
+      "description": "The Owlshift versions that can read this file: a semantic version\nrequirement such as `>=0.4`.",
+      "type": "string"
+    },
+    "stack": {
+      "$ref": "#/$defs/Stack"
+    },
+    "tracker": {
+      "$ref": "#/$defs/Tracker"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "requires",
+    "tracker",
+    "stack",
+    "pipeline",
+    "models",
+    "policy"
+  ],
+  "$defs": {
+    "Admit": {
+      "description": "The admission gesture: delegating the ticket to Owlshift, a label, or a\nstate.",
+      "oneOf": [
+        {
+          "description": "The ticket is delegated to Owlshift's agent identity.",
+          "type": "string",
+          "const": "delegation"
+        },
+        {
+          "description": "The ticket carries this label.",
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "label"
+          ]
+        },
+        {
+          "description": "The ticket is in this state.",
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "Models": {
+      "description": "The model for each tier, per harness.",
+      "type": "object",
+      "properties": {
+        "deep": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TierModels"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fast": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TierModels"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "standard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TierModels"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Pipeline": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/Variant"
+        },
+        "plan_approval": {
+          "$ref": "#/$defs/PlanApproval"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "default",
+        "plan_approval"
+      ]
+    },
+    "PlanApproval": {
+      "description": "When a human approves the plan before Build.",
+      "type": "string",
+      "enum": [
+        "always",
+        "on-fork",
+        "never"
+      ]
+    },
+    "Policy": {
+      "type": "object",
+      "properties": {
+        "always_human": {
+          "description": "Question categories always decided by a human, added to the floor.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "always_human"
+      ]
+    },
+    "Stack": {
+      "type": "object",
+      "properties": {
+        "gate": {
+          "description": "The project's full gate, run before delivery.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resources": {
+          "description": "Named resources and the path globs they cover.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "gate"
+      ]
+    },
+    "States": {
+      "type": "object",
+      "properties": {
+        "needs_input": {
+          "type": "string"
+        },
+        "ready": {
+          "type": "string"
+        },
+        "review": {
+          "type": "string"
+        },
+        "working": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ready",
+        "working",
+        "needs_input",
+        "review"
+      ]
+    },
+    "TierModels": {
+      "type": "object",
+      "properties": {
+        "claude": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "codex": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Tracker": {
+      "description": "The tracker and how Owlshift maps onto it.",
+      "type": "object",
+      "properties": {
+        "admit": {
+          "description": "The gesture by which a person admits a ticket to the queue.",
+          "$ref": "#/$defs/Admit"
+        },
+        "kind": {
+          "$ref": "#/$defs/TrackerKind"
+        },
+        "states": {
+          "description": "The tracker states that show a ticket's visible stage.",
+          "$ref": "#/$defs/States"
+        },
+        "team": {
+          "description": "The tracker's team key; required for Linear.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "admit",
+        "states"
+      ]
+    },
+    "TrackerKind": {
+      "type": "string",
+      "enum": [
+        "linear",
+        "markdown"
+      ]
+    },
+    "Variant": {
+      "description": "A pipeline variant.",
+      "type": "string",
+      "enum": [
+        "trivial",
+        "standard",
+        "risky"
+      ]
+    }
+  }
+}

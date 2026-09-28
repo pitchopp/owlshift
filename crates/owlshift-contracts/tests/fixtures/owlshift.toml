@@ -1,0 +1,24 @@
+# owlshift.toml
+requires = ">=0.1"
+
+[tracker]
+kind = "linear"
+team = "LOC"
+admit = { label = "agent" }
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+
+[stack]
+gate = ["make lint", "make test"]
+resources = { migrations = "backend/*/migrations/**" }
+
+[pipeline]
+default = "standard"
+plan_approval = "on-fork"   # always | on-fork | never
+
+[models]
+deep     = { claude = "claude-opus-5-5" }
+standard = { claude = "claude-sonnet-5", codex = "gpt-5.6-sol" }
+fast     = { claude = "claude-haiku-4-5" }
+
+[policy]
+always_human = ["billing", "auth"]   # adds to the floor, never removes

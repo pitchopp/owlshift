@@ -51,7 +51,7 @@ One repository, a Cargo workspace of six crates split along the design's boundar
 
 | Crate | Holds | Depends on |
 | --- | --- | --- |
-| `owlshift-core` | Ticket, pipeline, stage, gate, resource; state machine; scheduler; policy. Pure functions, no I/O | nothing |
+| `owlshift-core` | Ticket, pipeline, stage, gate, resource; state machine; scheduler; policy. Pure functions, no I/O | `serde` and `schemars`, for derives only (the shared vocabulary) |
 | `owlshift-contracts` | Brief, `result.json`, project and personal config, events, git ref layout, format versions; JSON Schemas generated from the types | core |
 | `owlshift-adapters` | Tracker (Linear, plus a test tracker), forge (GitHub), harness (Claude Code, fake; Codex in P5), notifier; each behind a trait with declared capabilities | contracts |
 | `owlshift-platform` | Service install and uninstall, process groups and Job Objects, keychain, platform directories, keep-awake | nothing |
@@ -75,7 +75,9 @@ Six contracts are written, versioned and schema-checked before any logic, becaus
 5. **Git ref layout**: `refs/owlshift/claims/<ticket>` holds the lease (holder machine, operator, expiry, format); `refs/owlshift/tickets/<ticket>` points to a commit whose tree holds the stage, plan, ledger, questions and findings.
 6. **Marked comments**: a first line such as `[owlshift] QUESTIONS · round 2`, plus a machine-readable footer where the tracker can hide it; exact form checked per tracker.
 
-A first cut of `result.json`, to be refined while writing the schema:
+The contracts live in `owlshift-contracts`; their JSON Schemas are generated into `schemas/`, and a test fails when a committed schema drifts from the types (`OWLSHIFT_UPDATE_SCHEMAS=1` rewrites them). The first cut of `result.json` below still parses unchanged; the reference is now [`schemas/result.schema.json`](../../schemas/result.schema.json). Refinements made while writing it (OWL-9): question ids are `Q1` to `Qn` in order; `status: questions` needs at least one question; `pr` is allowed only with `status: done`; a follow-up carries `title`, `why`, `evidence`, `source` (`agent`, `reviewer` or `ci`), `done_when` and `blocked_by_parent`; `artifacts` may name `plan`, `ledger`, `findings` and `report`. A document with a newer `format` is refused with an "upgrade" error.
+
+The first cut:
 
 ```json
 {

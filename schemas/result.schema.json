@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift result.json",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "description": "Paths, relative to the worktree, of the artifacts the run left.",
+      "$ref": "#/$defs/Artifacts",
+      "default": {}
+    },
+    "decisions": {
+      "description": "Decisions taken without a human, each reversible and logged on the\nticket.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Decision"
+      }
+    },
+    "followups": {
+      "description": "Follow-up tickets proposed to a human; never admitted automatically.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Followup"
+      }
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "pr": {
+      "description": "The pull request to open; only with `status: done`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PullRequest"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "questions": {
+      "description": "Questions for the decider, numbered Q1..Qn; at least one when `status`\nis `questions`.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Question"
+      }
+    },
+    "status": {
+      "$ref": "#/$defs/Status"
+    },
+    "summary": {
+      "description": "One or two sentences on what the run did.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "questions"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "questions": {
+            "minItems": 1
+          }
+        },
+        "required": [
+          "questions"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pr": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "pr"
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "done"
+          }
+        }
+      }
+    }
+  ],
+  "required": [
+    "format",
+    "status",
+    "summary"
+  ],
+  "$defs": {
+    "Artifacts": {
+      "description": "Artifacts left by the run, as paths relative to the worktree. Their\ncontent formats are defined by the roles that write them.",
+      "type": "object",
+      "properties": {
+        "findings": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ledger": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "report": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Decision": {
+      "description": "A decision the role took on its own.",
+      "type": "object",
+      "properties": {
+        "basis": {
+          "description": "What the decision rests on: the ticket, the code, the docs, a fact.",
+          "type": "string"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question",
+        "decision",
+        "basis"
+      ]
+    },
+    "Followup": {
+      "description": "A follow-up ticket proposed to a human.",
+      "type": "object",
+      "properties": {
+        "blocked_by_parent": {
+          "description": "Whether the follow-up waits for the current ticket to be done.",
+          "type": "boolean",
+          "default": false
+        },
+        "done_when": {
+          "description": "When the follow-up counts as done.",
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/FollowupSource"
+        },
+        "title": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "why",
+        "source",
+        "done_when"
+      ]
+    },
+    "FollowupSource": {
+      "description": "Who found the follow-up.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "reviewer",
+        "ci"
+      ]
+    },
+    "PullRequest": {
+      "description": "The pull request the runner opens for a finished ticket.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "title",
+        "body"
+      ]
+    },
+    "Question": {
+      "description": "A question for the decider, understandable without any transcript.",
+      "type": "object",
+      "properties": {
+        "category": {
+          "description": "What the question is about, such as `scope` or `security`.",
+          "type": "string"
+        },
+        "context": {
+          "description": "What the reader needs to know to answer.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/QuestionId"
+        },
+        "options": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "recommendation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "context",
+        "text"
+      ]
+    },
+    "QuestionId": {
+      "description": "A question's identifier within a round: Q1, Q2, and so on.",
+      "type": "string",
+      "pattern": "^Q[1-9][0-9]*$"
+    },
+    "Status": {
+      "description": "How a run ended.",
+      "type": "string",
+      "enum": [
+        "done",
+        "questions",
+        "blocked",
+        "premise_false",
+        "failed"
+      ]
+    }
+  }
+}

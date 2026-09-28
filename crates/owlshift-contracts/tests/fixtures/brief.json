@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "role": "build",
+  "project": "owlshift",
+  "ticket": {
+    "id": "OWL-42",
+    "title": "Add the logs command",
+    "url": "https://linear.app/owlshift/issue/OWL-42",
+    "labels": ["agent", "cli"],
+    "author": { "name": "Ada", "relation": "decider" },
+    "description": "Print the events of one ticket, oldest first."
+  },
+  "decider": "Ada",
+  "thread": [
+    {
+      "type": "questions",
+      "round": 1,
+      "at": "2026-09-28T09:00:00Z",
+      "questions": [
+        {
+          "id": "Q1",
+          "category": "scope",
+          "context": "Events live in the local store; run logs are separate files.",
+          "text": "Should `logs` include each run's full harness output?",
+          "options": ["Events only", "Events and run logs"],
+          "recommendation": "Events only"
+        },
+        {
+          "id": "Q2",
+          "category": "ux",
+          "context": "Other commands print local times.",
+          "text": "Local time or UTC?"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "at": "2026-09-28T10:12:00Z",
+      "author": { "name": "Ada", "relation": "decider" },
+      "body": "Q1: events only."
+    },
+    {
+      "type": "reask",
+      "round": 1,
+      "at": "2026-09-28T10:30:00Z",
+      "questions": [
+        {
+          "id": "Q2",
+          "category": "ux",
+          "context": "Other commands print local times.",
+          "text": "Local time or UTC?"
+        }
+      ]
+    },
+    {
+      "type": "comment",
+      "at": "2026-09-28T11:00:00Z",
+      "author": { "name": "Grace", "relation": "other" },
+      "body": "UTC is easier to grep."
+    }
+  ],
+  "checkpoint": { "plan": ".owlshift/plan.md", "ledger": ".owlshift/ledger.json" },
+  "zones": ["crates/owlshift-cli"],
+  "resources": [],
+  "rules": [
+    {
+      "applies_to": ["crates/owlshift-cli"],
+      "source": "AGENTS.md",
+      "text": "Everything in this repository is written in English."
+    }
+  ],
+  "permissions": { "level": "write_worktree", "network": false, "browser": false },
+  "result_path": ".owlshift/result.json"
+}
