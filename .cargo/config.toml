@@ -1,0 +1,4 @@
+# Shortcuts for working on Owlshift. See CONTRIBUTING.md, "Development".
+[alias]
+# `cargo owl doctor` builds the CLI if needed and runs `owlshift doctor`.
+owl = "run -q -p owlshift-cli --"
