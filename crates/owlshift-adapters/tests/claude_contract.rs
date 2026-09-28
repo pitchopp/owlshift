@@ -252,5 +252,11 @@ fn drive_does_not_wait_for_a_process_holding_the_output_open() {
         "{:?}",
         run.outcome
     );
-    assert!(started.elapsed() < EXIT_GRACE + Duration::from_secs(3));
+    // The grandchild holds stdout and stderr open for 10 s. The helper exits
+    // right after starting it, so one grace period plus the helper's start-up
+    // is the bound; a second grace period spent on stderr or the prompt
+    // would reach it.
+    let elapsed = started.elapsed();
+    assert!(elapsed >= EXIT_GRACE, "{elapsed:?}");
+    assert!(elapsed < 2 * EXIT_GRACE, "{elapsed:?}");
 }

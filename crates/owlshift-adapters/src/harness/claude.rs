@@ -101,6 +101,11 @@ pub struct Request {
     /// A JSON Schema for the final answer, returned in
     /// [`Run::structured_output`].
     pub json_schema: Option<String>,
+    /// A dollar cap on the run, passed as `--max-budget-usd`. It only means
+    /// something for a CLI configured for API billing; whether to set it
+    /// (the billing mode, the personal file's `budget_usd`) is the
+    /// executor's decision, not this adapter's.
+    pub max_budget_usd: Option<f64>,
 }
 
 /// Why a request cannot be turned into a command.
@@ -110,6 +115,8 @@ pub enum CommandError {
     ResultPath(String),
     /// The request asks for something this adapter does not provide.
     Unsupported(&'static str),
+    /// The budget is negative or not a number.
+    Budget(String),
 }
 
 impl fmt::Display for CommandError {
@@ -121,6 +128,7 @@ impl fmt::Display for CommandError {
                  segments of ASCII letters, digits, `.`, `_` and `-`, with no `.` segment"
             ),
             Self::Unsupported(what) => write!(f, "the Claude Code harness does not provide {what}"),
+            Self::Budget(budget) => write!(f, "budget {budget} is not a dollar amount"),
         }
     }
 }
@@ -148,6 +156,11 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
         return Err(CommandError::Unsupported("a browser"));
     }
     let result_path = permission_rule_path(&request.result_path)?;
+    if let Some(budget) = request.max_budget_usd
+        && !(budget.is_finite() && budget >= 0.0)
+    {
+        return Err(CommandError::Budget(budget.to_string()));
+    }
 
     let mut command = Command::new(program);
     command.args(["-p", "--output-format", "stream-json", "--verbose"]);
@@ -172,6 +185,9 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
     }
     if let Some(schema) = &request.json_schema {
         command.args(["--json-schema", schema]);
+    }
+    if let Some(budget) = request.max_budget_usd {
+        command.arg("--max-budget-usd").arg(budget.to_string());
     }
     command.args(GUARDRAIL_ARGS);
     command.arg("--no-session-persistence");
@@ -382,9 +398,13 @@ pub fn drive(child: &mut Child, prompt: &str, mut on_line: impl FnMut(&[u8])) ->
         }
     }
     let status = child.wait()?;
-    let stderr = stderr.recv_timeout(EXIT_GRACE).unwrap_or_default();
+    // One grace period in all, counted from the exit: what the loop used is
+    // not given again to the other streams.
+    let deadline = exited_at.unwrap_or_else(Instant::now) + EXIT_GRACE;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let stderr = stderr.recv_timeout(remaining()).unwrap_or_default();
     let mut run = transcript.finish(status.code(), stderr);
-    let delivered = matches!(prompt_sent.recv_timeout(EXIT_GRACE), Ok(Ok(())));
+    let delivered = matches!(prompt_sent.recv_timeout(remaining()), Ok(Ok(())));
     if !delivered && matches!(run.outcome, Outcome::Completed { .. }) {
         run.outcome = Outcome::Failed(Failure::PromptNotDelivered);
     }
@@ -716,6 +736,7 @@ mod tests {
             },
             result_path: RelativePath::new(".owlshift/result.json").unwrap(),
             json_schema: None,
+            max_budget_usd: None,
         }
     }
 
@@ -752,12 +773,13 @@ mod tests {
         request.effort = Some(Effort::Xhigh);
         request.permissions.network = false;
         request.json_schema = Some(r#"{"type":"object"}"#.into());
+        request.max_budget_usd = Some(2.5);
         assert_eq!(
             joined(&request),
             "-p --output-format stream-json --verbose --model haiku --effort xhigh \
              --permission-mode acceptEdits --allowedTools Bash \
              --permission-prompts none --disallowedTools WebFetch WebSearch \
-             --json-schema {\"type\":\"object\"} \
+             --json-schema {\"type\":\"object\"} --max-budget-usd 2.5 \
              --setting-sources project,local --strict-mcp-config --no-session-persistence"
         );
     }
@@ -769,6 +791,12 @@ mod tests {
             request.result_path = RelativePath::new(path).unwrap();
             let refused = command(Path::new("claude"), &request).unwrap_err();
             assert_eq!(refused, CommandError::ResultPath(path.into()), "{path}");
+        }
+        for budget in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut request = request(PermissionLevel::WriteWorktree);
+            request.max_budget_usd = Some(budget);
+            let refused = command(Path::new("claude"), &request).unwrap_err();
+            assert!(matches!(refused, CommandError::Budget(_)), "{budget}");
         }
         let mut request = request(PermissionLevel::WriteWorktree);
         request.permissions.browser = true;
