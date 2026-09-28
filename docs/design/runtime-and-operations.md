@@ -183,7 +183,7 @@ Almost everything is tested without network or tokens; the parts that touch the 
 | Layer | How | When |
 | --- | --- | --- |
 | Core logic: scheduler, state machine, policy, answer routing | Unit tests on pure functions | Every commit |
-| Scenarios S1 to S17 | End to end on the Markdown tracker, a local bare git remote and a **fake harness** (a script that writes a prepared `result.json`, with optional delays, failures and usage-limit messages) | Every commit, in seconds |
+| Scenarios S1 to S17 | End to end on the Markdown tracker, a local bare git remote and a **fake harness** (a small test program that writes a prepared `result.json`, with optional delays, failures and usage-limit messages; see the [build plan](build-plan.md#cli-surface-for-p0-and-p1)) | Every commit, in seconds |
 | Tracker and forge adapters | Recorded HTTP fixtures, plus a conformance suite every adapter must pass | Every commit |
 | Live services | A sandbox tracker workspace and a test GitHub repository | Nightly |
 | Harness CLIs | Contract tests with a tiny real prompt against the latest CLI releases, on the maintainer's subscription | Nightly |
