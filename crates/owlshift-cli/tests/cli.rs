@@ -1,5 +1,6 @@
-//! The `owlshift` binary, end to end. Only `git` is needed on the host: no
-//! test runs `doctor`, whose answer depends on the harness CLIs installed.
+//! The `owlshift` binary, end to end. Only `git` is needed on the host: the
+//! one test that runs `doctor` gives it a fake `git` and interrupts it before
+//! it looks at the harness CLIs installed.
 
 use std::fs;
 use std::path::Path;
@@ -138,4 +139,111 @@ fn personal_config_file_is_read_from_the_override_directory() {
         .find(|line| line.starts_with("personal file:"))
         .unwrap_or_default();
     assert!(!personal_line.contains("not found at"), "{shown}");
+}
+
+/// The acceptance criterion for OWL-43: Ctrl-C on `doctor` while a probe
+/// hangs stops the probe and the process it started, although the probe runs
+/// in a process group of its own, out of the terminal's reach; and the CLI
+/// ends promptly, killed by the signal it received.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_on_doctor_stops_a_hung_probe_and_its_child() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const SIGINT: i32 = 2;
+
+    // A `git` whose `--version` starts a long-lived child, records both
+    // pids, and waits on the child; anything else answers as git does
+    // outside a repository, so loading the configuration does not hang.
+    let bin = tempfile::tempdir().unwrap();
+    let pids = bin.path().join("pids");
+    let git = bin.path().join("git");
+    fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then\n\
+             \x20 sleep 30 &\n\
+             \x20 echo \"$$ $!\" > '{pids}.tmp'\n\
+             \x20 mv '{pids}.tmp' '{pids}'\n\
+             \x20 wait\n\
+             fi\n\
+             echo 'fatal: not a git repository' >&2\n\
+             exit 128\n",
+            pids = pids.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut owlshift = Command::new(env!("CARGO_BIN_EXE_owlshift"))
+        .arg("doctor")
+        .current_dir(config_dir.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("HOME", config_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("OWLSHIFT_CONFIG_DIR", config_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let probe_started = Instant::now() + Duration::from_secs(10);
+    while !pids.exists() {
+        if let Some(status) = owlshift.try_wait().unwrap() {
+            panic!("owlshift ended before its probe started: {status}");
+        }
+        assert!(Instant::now() < probe_started, "the probe never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pids: Vec<u32> = fs::read_to_string(&pids)
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+
+    let interrupted = Command::new("kill")
+        .args(["-INT", &owlshift.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(interrupted.success());
+
+    // Promptly: well before the probe's own ten-second deadline.
+    let ended = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = owlshift.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= ended {
+            let _ = owlshift.kill();
+            panic!("owlshift still running 5 s after SIGINT");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), Some(SIGINT), "{status}");
+
+    // Killed processes take a moment to be gone: an orphan is reaped by the
+    // system.
+    let settled = Instant::now() + Duration::from_secs(5);
+    while pids.iter().any(|&pid| is_alive(pid)) {
+        assert!(Instant::now() < settled, "still running: {pids:?}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether a process is still running; a zombie is not.
+#[cfg(unix)]
+fn is_alive(pid: u32) -> bool {
+    let ps = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&ps.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
 }

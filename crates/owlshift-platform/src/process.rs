@@ -3,10 +3,14 @@
 //!
 //! [`run`] is for short probes such as `git --version`: a run that has not
 //! finished by its deadline is stopped with every process it started, never
-//! waited on. [`ProcessTree`] is the mechanism, shared with the executor.
+//! waited on. [`ProcessTree`] is the mechanism, shared with the executor;
+//! [`stop_trees_on_signal`] stops the live trees when the process is told to
+//! end.
 
+mod signals;
 mod tree;
 
+pub use signals::stop_trees_on_signal;
 pub use tree::ProcessTree;
 
 use std::ffi::OsStr;
