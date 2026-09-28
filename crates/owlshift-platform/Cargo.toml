@@ -18,6 +18,7 @@ which.workspace = true
 # windows-native on Windows.
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
+signal-hook.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store.workspace = true

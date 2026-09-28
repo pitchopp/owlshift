@@ -16,10 +16,17 @@ use std::process::{Child, Command};
 ///
 /// Dropping it stops nothing: a caller that gives up on a tree must call
 /// [`ProcessTree::kill`] first, or the tree keeps running.
+///
+/// On Unix the tree is live from its spawn until this handle is dropped: a
+/// process that called [`stop_trees_on_signal`] stops it when told to end.
+///
+/// [`stop_trees_on_signal`]: super::stop_trees_on_signal
 #[derive(Debug)]
 pub struct ProcessTree {
     #[cfg(unix)]
     group: rustix::process::Pid,
+    #[cfg(unix)]
+    _live: super::signals::Registration,
     #[cfg(windows)]
     job: std::os::windows::io::OwnedHandle,
 }
@@ -47,7 +54,11 @@ impl ProcessTree {
 }
 
 #[cfg(unix)]
+pub(super) use imp::kill_group;
+
+#[cfg(unix)]
 mod imp {
+    use super::super::signals;
     use super::ProcessTree;
     use rustix::io::Errno;
     use rustix::process::{Pid, Signal, kill_process_group};
@@ -59,9 +70,12 @@ mod imp {
         // A group id of 0 makes the child the leader of a new group whose id
         // is its own pid.
         command.process_group(0);
-        let child = command.spawn()?;
-        let group = Pid::from_child(&child);
-        Ok((child, ProcessTree { group }))
+        let (child, group, live) = signals::register(|| command.spawn())?;
+        Ok((child, ProcessTree { group, _live: live }))
+    }
+
+    pub(super) fn kill(tree: &ProcessTree) -> io::Result<()> {
+        kill_group(tree.group)
     }
 
     /// Sends `SIGKILL` to the group.
@@ -69,9 +83,10 @@ mod imp {
     /// The group id stays reserved while the root is unreaped or any member
     /// is alive. Once the root is reaped and the group is empty, the number
     /// could in theory be reused by an unrelated group after the pid space
-    /// wraps around; callers stop a tree while its run is still theirs.
-    pub(super) fn kill(tree: &ProcessTree) -> io::Result<()> {
-        match kill_process_group(tree.group, Signal::KILL) {
+    /// wraps around; callers stop a tree while its run is still theirs, and
+    /// the signal thread only while its handle is.
+    pub(in crate::process) fn kill_group(group: Pid) -> io::Result<()> {
+        match kill_process_group(group, Signal::KILL) {
             // No process left in the group.
             Ok(()) | Err(Errno::SRCH) => Ok(()),
             // macOS answers EPERM for a group left with only zombies, such as
