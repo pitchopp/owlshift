@@ -22,6 +22,12 @@ CI adds `--locked` to the clippy and test steps, so a change to a `Cargo.toml` m
 
 `owlshift-core` performs no I/O. `crates/owlshift-core/clippy.toml` lists the standard library's file, network, process, environment, standard-stream and clock entry points, and the clippy step fails on any use of them in that crate.
 
+### Day-to-day loop
+
+- `cargo owl <command>` runs the CLI from source, rebuilding only what changed: `cargo owl doctor`, `cargo owl config show`. The alias lives in `.cargo/config.toml`.
+- [bacon](https://dystroy.org/bacon/) re-runs a job on every save (`cargo install --locked bacon`). The jobs are in `bacon.toml`: `bacon` checks that the workspace compiles, `bacon test` runs the tests, `bacon clippy-all` runs the CI lint, and `bacon owl -- doctor` re-runs a CLI command.
+- `cargo install --path crates/owlshift-cli --locked` installs the `owlshift` binary in `~/.cargo/bin` to use it as a command; run it again after pulling to update.
+
 ## Branches and pull requests
 
 - One issue per pull request. Put the issue ID in the branch name: `owl-12-short-title`.
