@@ -1,0 +1,345 @@
+//! A harness as the executor drives it.
+//!
+//! The split follows the harness contract (architecture, section 6): a
+//! harness builds the command of one run and reads its output; the
+//! executor gives the command its directory, its environment and its
+//! streams, spawns it in a process tree of its own, logs it, stops it and
+//! judges the result. [`ClaudeHarness`] drives Claude Code through
+//! `owlshift_adapters::harness::claude`; a harness with no driver of its own
+//! can use [`drive_plain`].
+
+use std::error::Error;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use jiff::Timestamp;
+
+use owlshift_adapters::harness::claude::{self, EXIT_GRACE, Effort, STDERR_CAP, Usage};
+use owlshift_contracts::brief::Brief;
+
+use super::{BRIEF_PATH, RunLog};
+use crate::agent_env::{CredentialFinding, mcp_findings};
+
+/// Why a harness could not build its command; the adapter's own error type
+/// stays reachable through downcasting.
+pub type HarnessError = Box<dyn Error + Send + Sync + 'static>;
+
+/// What a harness knows of the run it builds and drives.
+#[derive(Clone, Copy, Debug)]
+pub struct HarnessRun<'a> {
+    /// The ticket's worktree: the run's working directory.
+    pub worktree: &'a Path,
+    /// The brief as written, its `result_path` set by the executor.
+    pub brief: &'a Brief,
+    /// The brief's file, inside the worktree.
+    pub brief_file: &'a Path,
+}
+
+/// A harness CLI, or a stand-in for one.
+pub trait Harness {
+    /// The command of one run: its program and arguments. The executor then
+    /// sets its working directory to the worktree, replaces its whole
+    /// environment with the agent's, and pipes its three standard streams.
+    fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError>;
+
+    /// Reads the spawned child's output to its end, passing every byte to
+    /// `log` as it comes, and says how the run ended. The executor stops the
+    /// child's process tree at the deadline, which closes its output: this
+    /// must then return.
+    fn drive(
+        &self,
+        run: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd>;
+}
+
+/// What a harness reported at the end of a run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarnessEnd {
+    /// The exit code; `None` when a signal ended the process.
+    pub exit_code: Option<i32>,
+    pub status: HarnessStatus,
+    /// Credentials the harness loaded, such as MCP servers: they fail the
+    /// run.
+    pub findings: Vec<CredentialFinding>,
+    pub usage: Option<Usage>,
+    pub model: Option<String>,
+    pub harness_version: Option<String>,
+}
+
+impl HarnessEnd {
+    /// An end with nothing reported beyond the exit code and the status.
+    pub fn new(exit_code: Option<i32>, status: HarnessStatus) -> Self {
+        Self {
+            exit_code,
+            status,
+            findings: Vec::new(),
+            usage: None,
+            model: None,
+            harness_version: None,
+        }
+    }
+}
+
+/// How the harness process ended, as the harness itself tells: the role's
+/// own answer is still its `result.json`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HarnessStatus {
+    Completed,
+    /// The subscription's usage limit stopped the run.
+    UsageLimit { resets_at: Option<Timestamp> },
+    /// An error, a crash, a non-zero exit: the reason.
+    Failed(String),
+}
+
+/// How long [`drive_plain`] waits between two looks at the child.
+const POLL: Duration = Duration::from_millis(20);
+
+/// What [`drive_plain`] saw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlainRun {
+    /// The exit code; `None` when a signal ended the process.
+    pub exit_code: Option<i32>,
+    /// Standard error, up to the adapter's `STDERR_CAP` bytes.
+    pub stderr: Vec<u8>,
+}
+
+enum Chunk {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+/// Drives a child that needs no input: closes its standard input, logs its
+/// output as it comes and waits for it. Like the Claude Code adapter's
+/// `drive`, it returns at most `EXIT_GRACE` after the child exits, even if
+/// a process the child started still holds its output open.
+pub fn drive_plain(child: &mut Child, log: &mut RunLog) -> io::Result<PlainRun> {
+    drop(child.stdin.take());
+    let not_piped = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the harness child needs piped output streams",
+        )
+    };
+    let (sender, chunks) = mpsc::channel();
+    pump(child.stdout.take().ok_or_else(not_piped)?, sender.clone(), Chunk::Stdout);
+    pump(child.stderr.take().ok_or_else(not_piped)?, sender, Chunk::Stderr);
+
+    let mut stderr = Vec::new();
+    let mut exited_at = None;
+    loop {
+        match chunks.recv_timeout(POLL) {
+            Ok(Chunk::Stdout(bytes)) => log.stdout(&bytes),
+            Ok(Chunk::Stderr(bytes)) => {
+                log.stderr(&bytes);
+                let room = STDERR_CAP - stderr.len();
+                stderr.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if exited_at.is_none() && child.try_wait()?.is_some() {
+            exited_at = Some(Instant::now());
+        }
+        if exited_at.is_some_and(|at| at.elapsed() >= EXIT_GRACE) {
+            break;
+        }
+    }
+    let status = child.wait()?;
+    Ok(PlainRun {
+        exit_code: status.code(),
+        stderr,
+    })
+}
+
+/// Reads a stream to its end on its own thread, sending what it reads.
+fn pump(
+    mut stream: impl Read + Send + 'static,
+    sender: Sender<Chunk>,
+    wrap: fn(Vec<u8>) -> Chunk,
+) {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                // A read error ends the stream as its end would.
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sender.send(wrap(buffer[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Claude Code, run with `claude -p` on the user's own login.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaudeHarness {
+    /// The `claude` program.
+    pub program: PathBuf,
+    /// The role's prompt; the executor adds where the brief is.
+    pub prompt: String,
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    /// A dollar cap, only for a CLI configured for API billing.
+    pub max_budget_usd: Option<f64>,
+}
+
+impl Harness for ClaudeHarness {
+    fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        let request = claude::Request {
+            workdir: run.worktree.to_owned(),
+            model: self.model.clone(),
+            effort: self.effort,
+            permissions: run.brief.permissions.clone(),
+            result_path: run.brief.result_path.clone(),
+            json_schema: None,
+            max_budget_usd: self.max_budget_usd,
+        };
+        Ok(claude::command(&self.program, &request)?)
+    }
+
+    fn drive(
+        &self,
+        _run: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        let run = claude::drive(child, &prompt_with_brief(&self.prompt), |line| {
+            log.stdout(line);
+        })?;
+        log.stderr(&run.stderr);
+        Ok(claude_end(run))
+    }
+}
+
+/// The role's prompt, then where its brief is.
+pub fn prompt_with_brief(prompt: &str) -> String {
+    format!(
+        "{}\n\nThe brief of this run is the file `{BRIEF_PATH}` in the working directory.\n",
+        prompt.trim_end()
+    )
+}
+
+/// What a Claude Code run reported, as the executor reads it: an MCP server
+/// in its `init` event is a credential finding.
+fn claude_end(run: claude::Run) -> HarnessEnd {
+    let status = match &run.outcome {
+        claude::Outcome::Completed { .. } => HarnessStatus::Completed,
+        claude::Outcome::UsageLimit { resets_at, .. } => HarnessStatus::UsageLimit {
+            resets_at: *resets_at,
+        },
+        claude::Outcome::Failed(failure) => HarnessStatus::Failed(describe(failure)),
+    };
+    HarnessEnd {
+        exit_code: run.exit_code,
+        status,
+        findings: mcp_findings(&run).into_iter().collect(),
+        usage: run.usage,
+        model: run.model,
+        harness_version: run.harness_version,
+    }
+}
+
+fn describe(failure: &claude::Failure) -> String {
+    match failure {
+        claude::Failure::NoResult => "Claude Code left no final record".to_owned(),
+        claude::Failure::MalformedResult => "Claude Code's final record has no error flag".to_owned(),
+        claude::Failure::Signal => "a signal ended Claude Code".to_owned(),
+        claude::Failure::PromptNotDelivered => "the prompt could not be sent".to_owned(),
+        claude::Failure::Error {
+            exit_code,
+            api_error_status,
+            terminal_reason,
+            kind,
+            ..
+        } => {
+            let mut text = format!("Claude Code reported an error (exit code {exit_code:?}");
+            if let Some(status) = api_error_status {
+                text.push_str(&format!(", API status {status}"));
+            }
+            if let Some(reason) = terminal_reason {
+                text.push_str(&format!(", {reason}"));
+            }
+            if let Some(kind) = kind {
+                text.push_str(&format!(", {kind}"));
+            }
+            text.push(')');
+            text
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(lines: &[&str], exit_code: i32) -> claude::Run {
+        let mut transcript = claude::Transcript::default();
+        for line in lines {
+            transcript.feed(line.as_bytes());
+        }
+        transcript.finish(Some(exit_code), Vec::new())
+    }
+
+    const INIT: &str = r#"{"type":"system","subtype":"init","claude_code_version":"2.1.283","model":"claude-haiku","apiKeySource":"none","mcp_servers":[]}"#;
+    const DONE: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
+
+    #[test]
+    fn a_claude_run_is_read_as_the_executor_needs_it() {
+        let end = claude_end(run(&[INIT, DONE], 0));
+        assert_eq!(end.status, HarnessStatus::Completed);
+        assert_eq!(end.findings, []);
+        assert_eq!(end.harness_version.as_deref(), Some("2.1.283"));
+
+        let failed = claude_end(run(
+            &[
+                INIT,
+                r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":404,"terminal_reason":"api_error","result":"x"}"#,
+            ],
+            1,
+        ));
+        let HarnessStatus::Failed(reason) = failed.status else {
+            panic!("{failed:?}");
+        };
+        assert!(reason.contains("API status 404"), "{reason}");
+
+        let limited = claude_end(run(
+            &[
+                INIT,
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1790000000,"rateLimitType":"five_hour"}}"#,
+            ],
+            1,
+        ));
+        assert!(
+            matches!(limited.status, HarnessStatus::UsageLimit { resets_at: Some(_) }),
+            "{limited:?}"
+        );
+
+        // An MCP server in `init` is a finding, even on a completed run.
+        let init = r#"{"type":"system","subtype":"init","mcp_servers":[{"name":"claude.ai Linear","status":"connected"}]}"#;
+        let loaded = claude_end(run(&[init, DONE], 0));
+        assert_eq!(
+            loaded.findings,
+            [CredentialFinding::McpServers(vec![
+                "claude.ai Linear".into()
+            ])]
+        );
+    }
+
+    #[test]
+    fn the_prompt_ends_with_where_the_brief_is() {
+        assert_eq!(
+            prompt_with_brief("# Build\n\nDo it.\n\n"),
+            "# Build\n\nDo it.\n\nThe brief of this run is the file `.owlshift/run/brief.json` \
+             in the working directory.\n"
+        );
+    }
+}

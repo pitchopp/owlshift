@@ -13,6 +13,7 @@ owlshift-core.workspace = true
 owlshift-contracts.workspace = true
 owlshift-adapters.workspace = true
 owlshift-platform.workspace = true
+jiff.workspace = true
 semver.workspace = true
 
 [dev-dependencies]

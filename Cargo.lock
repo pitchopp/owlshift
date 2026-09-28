@@ -1437,6 +1437,7 @@ dependencies = [
 name = "owlshift-runner"
 version = "0.0.0"
 dependencies = [
+ "jiff",
  "owlshift-adapters",
  "owlshift-contracts",
  "owlshift-core",

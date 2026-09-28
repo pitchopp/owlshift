@@ -5,6 +5,7 @@ pub mod agent_env;
 pub mod artifact;
 pub mod config;
 pub mod doctor;
+pub mod executor;
 pub mod forge;
 pub mod system;
 pub mod tracker;
