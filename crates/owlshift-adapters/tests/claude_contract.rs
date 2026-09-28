@@ -2,9 +2,10 @@
 //! replayed through the adapter, with no model and no login.
 //!
 //! The fixtures in `fixtures/claude/` were recorded on 2026-09-28 with Claude
-//! Code 2.1.283 (see `docs/design/build-plan.md`, OWL-14 and OWL-42 results),
-//! then scrubbed: session, message and tool-use ids, timestamps and paths
-//! replaced, the user's skills, plugins and agents removed. Each test states the exit
+//! Code 2.1.283 (see `docs/design/build-plan.md`, OWL-14 and OWL-46 results),
+//! then scrubbed: session, message and tool-use ids, timestamps, paths and
+//! thinking signatures replaced, the user's skills, plugins and agents and the
+//! local paths of the `init` event removed. Each test states the exit
 //! status and standard error the run had, since both decide the outcome.
 //! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
 //! limit on purpose (C7's open item). It follows the shapes C7 logged.
@@ -150,16 +151,43 @@ fn offered_tools(name: &str) -> Vec<String> {
     serde_json::from_value(init["tools"].clone()).unwrap()
 }
 
-/// `RemoteTrigger` lists, creates and runs cloud agents on the user's
-/// claude.ai account, and was offered and callable under both permission
-/// modes (OWL-42). Every launch removes it, in its one `--disallowedTools`
-/// flag. `remote_trigger_denied.jsonl` was recorded with that argv (write in
-/// worktree, no network, a JSON Schema) plus a `--settings` allow rule for
-/// `RemoteTrigger`, the model being asked to call it: the tool was not offered
-/// and not called. `success.jsonl`, recorded without the flag, was offered
-/// it. Exit 0, empty stderr.
+/// The tools whose calls can act outside the run: on the user's claude.ai
+/// account or design projects, their devices, their other sessions, a
+/// schedule outliving the run, another worktree (OWL-42, OWL-46). `init`
+/// lists the `Agent` tool as `Task`.
+const BEYOND_RUN_TOOLS: [&str; 12] = [
+    "RemoteTrigger",
+    "PushNotification",
+    "DesignSync",
+    "Workflow",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "SendMessage",
+    "ListAgents",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Agent",
+];
+
+fn sorted<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut names: Vec<&str> = names.into_iter().collect();
+    names.sort_unstable();
+    names
+}
+
+/// Every launch removes the tools that reach beyond the run, in its one
+/// `--disallowedTools` flag, with the web tools when the run has no network.
+/// `beyond_run_tools_denied.jsonl` was recorded with that argv (write in
+/// worktree, no network, a JSON Schema) plus, for the recording only, one
+/// `--settings` carrying an allow rule for each of those tools and a hook
+/// letting only `ToolSearch` and `StructuredOutput` through; the model was
+/// asked to load every deferred one with `ToolSearch`. None was offered,
+/// `ToolSearch` found none, and the model called nothing else.
+/// `success.jsonl`, recorded without the flag, was offered all of them. Exit
+/// 0, empty stderr.
 #[test]
-fn remote_trigger_is_denied_on_every_launch() {
+fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
     for level in [PermissionLevel::ReadOnly, PermissionLevel::WriteWorktree] {
         for network in [true, false] {
             let request = Request {
@@ -192,38 +220,58 @@ fn remote_trigger_is_denied_on_every_launch() {
                 .take_while(|arg| !arg.starts_with("--"))
                 .map(String::as_str)
                 .collect();
-            assert!(denied.contains(&"RemoteTrigger"), "{case}");
-            assert_eq!(denied.contains(&"WebFetch"), !network, "{case}");
+            let mut expected = BEYOND_RUN_TOOLS.to_vec();
+            if !network {
+                expected.extend(["WebFetch", "WebSearch"]);
+            }
+            assert_eq!(sorted(denied), sorted(expected), "{case}");
         }
     }
 
-    assert!(offered_tools("success.jsonl").contains(&"RemoteTrigger".to_owned()));
-    let offered = offered_tools("remote_trigger_denied.jsonl");
-    assert!(
-        !offered.contains(&"RemoteTrigger".to_owned()),
-        "{offered:?}"
-    );
-    let called: Vec<Value> = recorded_events("remote_trigger_denied.jsonl")
+    // The `init` event names the `Agent` tool `Task`.
+    let in_init = |tool: &str| (if tool == "Agent" { "Task" } else { tool }).to_owned();
+    let offered = offered_tools("success.jsonl");
+    for tool in BEYOND_RUN_TOOLS {
+        assert!(offered.contains(&in_init(tool)), "{tool}: {offered:?}");
+    }
+    let name = "beyond_run_tools_denied.jsonl";
+    let offered = offered_tools(name);
+    for tool in BEYOND_RUN_TOOLS {
+        assert!(!offered.contains(&in_init(tool)), "{tool}: {offered:?}");
+    }
+
+    let events = recorded_events(name);
+    let calls: Vec<&Value> = events
         .iter()
         .filter(|event| event["type"] == "assistant")
         .filter_map(|event| event["message"]["content"].as_array())
         .flatten()
         .filter(|block| block["type"] == "tool_use")
-        .map(|block| block["name"].clone())
         .collect();
-    assert_eq!(called, [json!("StructuredOutput")]);
+    let called: Vec<&Value> = calls.iter().map(|block| &block["name"]).collect();
+    assert_eq!(called, [&json!("ToolSearch"), &json!("StructuredOutput")]);
+    let query = calls[0]["input"]["query"].as_str().unwrap();
+    let searched = query.strip_prefix("select:").unwrap().split(',');
+    let deferred = BEYOND_RUN_TOOLS.into_iter().filter(|tool| *tool != "Agent");
+    assert_eq!(sorted(searched), sorted(deferred));
+    let found: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "user")
+        .filter_map(|event| event["message"]["content"].as_array())
+        .flatten()
+        .filter(|block| block["tool_use_id"].is_string())
+        .map(|block| &block["content"])
+        .collect();
+    assert_eq!(found[0], &json!("No matching deferred tools found"));
 
-    let run = replay("remote_trigger_denied.jsonl", 0);
+    let run = replay(name, 0);
     assert!(
         matches!(run.outcome, Outcome::Completed { .. }),
         "{:?}",
         run.outcome
     );
     assert!(run.permission_denials.is_empty());
-    assert_eq!(
-        run.structured_output,
-        Some(json!({"answer": "RemoteTrigger tool is not available in this environment."}))
-    );
+    assert_eq!(run.structured_output, Some(json!({"loaded": []})));
 }
 
 /// Every recorded fixture carries a version listed in `harness/tested.rs`,
