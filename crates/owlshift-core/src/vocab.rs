@@ -23,6 +23,37 @@ pub enum Stage {
     Watch,
 }
 
+// The declaration order above is the pipeline's order, so `Ord` sorts stages
+// the way a ticket goes through them. (A doc comment on `Stage` itself would
+// change the committed JSON Schemas.)
+impl Stage {
+    /// Every stage, in pipeline order.
+    pub const ALL: [Self; 8] = [
+        Self::Intake,
+        Self::Ready,
+        Self::Design,
+        Self::DesignReview,
+        Self::Build,
+        Self::Verify,
+        Self::Deliver,
+        Self::Watch,
+    ];
+}
+
+/// A ticket's priority, as the tracker reports it. `Ord` sorts the most urgent
+/// first; a ticket without a priority comes last.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Urgent,
+    High,
+    Medium,
+    Low,
+    Unset,
+}
+
 /// What a run executes: a stage's role, or one of the runner's helper roles.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -80,4 +111,53 @@ pub enum PlanApproval {
     Always,
     OnFork,
     Never,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_all_lists_every_stage_in_pipeline_order() {
+        // The match has no wildcard: a new stage fails to compile here until
+        // it is given its position, and the assertion then requires it in ALL.
+        fn position(stage: Stage) -> usize {
+            match stage {
+                Stage::Intake => 0,
+                Stage::Ready => 1,
+                Stage::Design => 2,
+                Stage::DesignReview => 3,
+                Stage::Build => 4,
+                Stage::Verify => 5,
+                Stage::Deliver => 6,
+                Stage::Watch => 7,
+            }
+        }
+        for (index, stage) in Stage::ALL.into_iter().enumerate() {
+            assert_eq!(position(stage), index, "{stage:?}");
+        }
+        assert!(Stage::ALL.is_sorted_by(|a, b| a < b));
+    }
+
+    #[test]
+    fn priority_sorts_the_most_urgent_first_and_unset_last() {
+        let mut priorities = [
+            Priority::Unset,
+            Priority::Low,
+            Priority::Urgent,
+            Priority::Medium,
+            Priority::High,
+        ];
+        priorities.sort();
+        assert_eq!(
+            priorities,
+            [
+                Priority::Urgent,
+                Priority::High,
+                Priority::Medium,
+                Priority::Low,
+                Priority::Unset,
+            ]
+        );
+    }
 }
