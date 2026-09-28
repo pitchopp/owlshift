@@ -62,6 +62,14 @@ const POLL: Duration = Duration::from_millis(20);
 /// no server was loaded.
 const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
 
+/// The tools removed from every run because they act on the user's claude.ai
+/// account, outside the run's worktree and budget: `RemoteTrigger` lists,
+/// creates and runs cloud agents there. Checked live (OWL-42): Claude Code
+/// offers it under both permission modes and neither asks before a call, so
+/// only removing it keeps it out of reach. This lists the tools checked so
+/// far, not every tool that might reach beyond the run.
+const ACCOUNT_TOOLS: &[&str] = &["RemoteTrigger"];
+
 /// The tools removed from a run that has no network access.
 const NETWORK_TOOLS: &[&str] = &["WebFetch", "WebSearch"];
 
@@ -152,10 +160,12 @@ impl std::error::Error for CommandError {}
 ///   confined to the directory: the executor's isolation check covers its
 ///   writes, and the agent environment leaves it no credential.
 ///
-/// Without network access, the web tools are removed; Bash, when allowed,
-/// can still reach the network. The worktree's own project settings
+/// The account tools are always removed and, without network access, the web
+/// tools too, all in one `--disallowedTools` flag; Bash, when allowed, can
+/// still reach the network. The worktree's own project settings
 /// (`.claude/settings.json`) still apply, since C1's guardrail keeps the
-/// `project` and `local` sources.
+/// `project` and `local` sources; an allow rule given with `--settings` did not
+/// bring a removed tool back (OWL-42).
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
     if request.permissions.browser {
         return Err(CommandError::Unsupported("a browser"));
@@ -185,8 +195,9 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
         }
     }
     command.args(["--permission-prompts", "none"]);
+    command.arg("--disallowedTools").args(ACCOUNT_TOOLS);
     if !request.permissions.network {
-        command.arg("--disallowedTools").args(NETWORK_TOOLS);
+        command.args(NETWORK_TOOLS);
     }
     if let Some(schema) = &request.json_schema {
         command.args(["--json-schema", schema]);
@@ -780,7 +791,7 @@ mod tests {
             joined(&request),
             "-p --output-format stream-json --verbose \
              --permission-mode dontAsk --allowedTools Edit(./.owlshift/result.json) \
-             --permission-prompts none \
+             --permission-prompts none --disallowedTools RemoteTrigger \
              --setting-sources project,local --strict-mcp-config --no-session-persistence"
         );
         let command = command(Path::new("claude"), &request).unwrap();
@@ -799,7 +810,7 @@ mod tests {
             joined(&request),
             "-p --output-format stream-json --verbose --model haiku --effort xhigh \
              --permission-mode acceptEdits --allowedTools Bash \
-             --permission-prompts none --disallowedTools WebFetch WebSearch \
+             --permission-prompts none --disallowedTools RemoteTrigger WebFetch WebSearch \
              --json-schema {\"type\":\"object\"} --max-budget-usd 2.5 \
              --setting-sources project,local --strict-mcp-config --no-session-persistence"
         );
