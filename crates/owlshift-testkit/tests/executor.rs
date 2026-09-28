@@ -63,6 +63,7 @@ impl Bench {
             agent: AgentEnv::new(env.agent_parent(), &[]).unwrap(),
             forge_hosts: Vec::new(),
             timeout: Duration::from_secs(60),
+            gate_timeout: Duration::from_secs(60),
         };
         let author = Author {
             name: "maintainer".into(),
@@ -92,6 +93,7 @@ impl Bench {
                 browser: false,
             },
             gate: Vec::new(),
+            gate_failure: None,
             result_path: RelativePath::new("result.json").unwrap(),
         };
         Self {

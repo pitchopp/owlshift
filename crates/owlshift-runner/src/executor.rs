@@ -20,6 +20,11 @@
 //! finding, the first snapshot, the command) is an [`ExecutorError`]:
 //! nothing ran.
 //!
+//! A Build run that finishes with `done` is not taken at its word either:
+//! the executor then runs the project's gate itself ([`gate`], OWL-16), and
+//! checks isolation again after it. A red gate makes the run
+//! [`Failure::Gate`]; a gate that breaks isolation quarantines it.
+//!
 //! # Layout
 //!
 //! The run's own files live in the worktree under [`RUN_DIR`], which a
@@ -29,6 +34,7 @@
 //! executor never writes there through a symbolic link. The log files and a
 //! copy of the brief go to the caller's run directory, outside the worktree.
 
+pub mod gate;
 mod git;
 pub mod harness;
 pub mod isolation;
@@ -45,14 +51,16 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 
 use owlshift_adapters::harness::claude::Usage;
-use owlshift_contracts::brief::Brief;
+use owlshift_contracts::Role;
+use owlshift_contracts::brief::{Brief, GateFailure};
 use owlshift_contracts::ids::RelativePath;
-use owlshift_contracts::result::RunResult;
+use owlshift_contracts::result::{self, RunResult};
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 
 use crate::agent_env::{AgentEnv, CredentialFinding};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
 
+pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
 pub use git::{Git, GitError};
 pub use harness::{Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus};
 pub use isolation::Violation;
@@ -84,6 +92,9 @@ pub struct Executor {
     pub forge_hosts: Vec<String>,
     /// How long a run may take before its whole process tree is stopped.
     pub timeout: Duration,
+    /// How long the project's gate commands may take together, after a
+    /// Build `done`; [`DEFAULT_GATE_TIMEOUT`] unless the caller has a reason.
+    pub gate_timeout: Duration,
 }
 
 /// One run: where, on which branch, and with which brief.
@@ -128,6 +139,10 @@ pub struct RunReport {
     pub stderr_log: PathBuf,
     /// The first error writing a log file: the run went on without it.
     pub log_error: Option<String>,
+    /// The project's gate, when the executor ran it: after a Build `done`
+    /// that broke no isolation. Its commands and commit fill the delivery
+    /// report's gate when it passed.
+    pub gate: Option<GateReport>,
 }
 
 /// How a run ended.
@@ -168,6 +183,9 @@ pub enum Failure {
     InvalidResult(String),
     /// An artifact the result names was refused.
     Artifact(ArtifactError),
+    /// The role reported `done`, and the project's gate, run by the
+    /// executor, failed: what the next Build run is given to fix.
+    Gate(Box<GateFailure>),
 }
 
 impl fmt::Display for Failure {
@@ -180,6 +198,12 @@ impl fmt::Display for Failure {
             Self::NoResult => write!(f, "the role left no {RESULT_PATH}"),
             Self::InvalidResult(reason) => write!(f, "{RESULT_PATH} was refused: {reason}"),
             Self::Artifact(error) => error.fmt(f),
+            Self::Gate(failure) => match &failure.command {
+                Some(command) => {
+                    write!(f, "the project gate failed: {command}: {}", failure.reason)
+                }
+                None => write!(f, "the project gate failed: {}", failure.reason),
+            },
         }
     }
 }
@@ -281,7 +305,27 @@ impl Executor {
         let _ = child.wait();
 
         let violations = before.check(&self.git, spec.main, spec.worktree, spec.branch);
-        let (outcome, end) = decide(violations, timed_out, driven, spec);
+        let (mut outcome, end) = decide(violations, timed_out, driven, spec);
+        let mut gate = None;
+        if brief.role == Role::Build && is_done(&outcome) {
+            let report = gate::run(
+                &self.git,
+                &self.agent,
+                spec.worktree,
+                &brief.gate,
+                self.gate_timeout,
+                &spec.run_dir.join(gate::GATE_LOG),
+            );
+            // The gate ran code the run wrote: isolation is checked again,
+            // and a breach wins over the gate's own verdict.
+            let violations = before.check(&self.git, spec.main, spec.worktree, spec.branch);
+            if !violations.is_empty() {
+                outcome = Outcome::Quarantined(violations);
+            } else if let Some(failure) = &report.failure {
+                outcome = Outcome::Failed(Failure::Gate(Box::new(failure.clone())));
+            }
+            gate = Some(report);
+        }
         Ok(RunReport {
             outcome,
             exit_code: end.as_ref().and_then(|end| end.exit_code),
@@ -292,8 +336,14 @@ impl Executor {
             stdout_log: log.stdout_path,
             stderr_log: log.stderr_path,
             log_error: log.error,
+            gate,
         })
     }
+}
+
+/// Whether the role finished with `done`.
+fn is_done(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Finished { result, .. } if result.status == result::Status::Done)
 }
 
 /// The outcome, in order of precedence: a violation, the deadline, a

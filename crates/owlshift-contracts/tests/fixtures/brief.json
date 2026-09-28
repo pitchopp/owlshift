@@ -1,5 +1,5 @@
 {
-  "format": 2,
+  "format": 3,
   "role": "build",
   "project": "owlshift",
   "ticket": {
@@ -71,5 +71,11 @@
   ],
   "permissions": { "level": "write_worktree", "network": false, "browser": false },
   "gate": ["cargo fmt --all -- --check", "cargo test --workspace"],
+  "gate_failure": {
+    "command": "cargo test --workspace",
+    "reason": "exit status 101",
+    "output": "test logs::prints_oldest_first ... FAILED\n",
+    "truncated": false
+  },
   "result_path": ".owlshift/result.json"
 }

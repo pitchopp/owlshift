@@ -16,7 +16,9 @@
 //! only as far as the scenarios need: it keeps the core state in memory from
 //! Ready, builds the brief from the tracker, maps the run's outcome onto a
 //! core event, posts the questions comment, sets the visible stage and
-//! pushes the branch. That part is a stand-in: the writer replaces it, and
+//! pushes the branch. It keeps the latest failure of the gate the executor
+//! runs after a Build `done`, and hands it to the next Build brief. That
+//! part is a stand-in: the writer replaces it, and
 //! the scenario files stay. What it leaves out on purpose:
 //!
 //! - the brief's thread carries every tracker comment as a plain `comment`
@@ -42,7 +44,7 @@ use tempfile::TempDir;
 
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::brief::{
-    Author, Brief, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
+    Author, Brief, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::{Footer, Header, MarkerKind};
 use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
@@ -53,7 +55,7 @@ use owlshift_contracts::{Role, Stage};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
-use owlshift_runner::executor::{Executor, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
+use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 
 use crate::git::{GitEnv, Remote, seed};
 use crate::harness::FakeHarness;
@@ -73,9 +75,12 @@ pub struct Scenario {
     pub ticket: TicketId,
     /// The virtual time the scenario starts at; step `n` is `n` minutes later.
     pub start: Timestamp,
-    /// The executor's deadline for each run, in milliseconds of real time;
-    /// 60 000 by default.
+    /// The executor's deadline for each run, and for the gate after a Build
+    /// `done`, in milliseconds of real time; 60 000 by default.
     pub timeout_ms: Option<u64>,
+    /// The project's gate for this scenario, in place of the fixture's
+    /// `stack.gate`: a bench convenience, so short scenarios share a fixture.
+    pub gate: Option<Vec<String>>,
     #[serde(rename = "step")]
     pub steps: Vec<Step>,
 }
@@ -135,6 +140,14 @@ pub struct Expect {
     pub branch_files: BTreeMap<String, String>,
     /// The authors' relations in the thread of the last brief, in order.
     pub brief_thread: Option<Vec<Relation>>,
+    /// The gate failure of the step's run: `none`, or a text its command,
+    /// reason or output contains.
+    pub gate_failure: Option<String>,
+    /// The gate failure the last brief carried: `none`, or a text its
+    /// command, reason or output contains.
+    pub brief_gate_failure: Option<String>,
+    /// The commands of the gate the step's run passed.
+    pub gate_passed: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,6 +294,9 @@ struct Driver {
     pipeline: Pipeline,
     /// The project's gate (`stack.gate`), carried in every brief.
     gate: Vec<String>,
+    /// The latest failure of the gate the executor ran, for the next Build
+    /// brief; a passing gate clears it, other outcomes leave it.
+    gate_failure: Option<GateFailure>,
     executor: Executor,
     id: TicketId,
     branch: String,
@@ -317,13 +333,15 @@ impl Driver {
         let state = TicketState::restore(Status::Active(Stage::Ready), 0, 0, 0)
             .map_err(|e| e.to_string())?;
         let runner_git = git.clone();
+        let timeout = scenario
+            .timeout_ms
+            .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner_git.apply(command)),
             agent: AgentEnv::new(git.agent_parent(), &[]).map_err(|e| e.to_string())?,
             forge_hosts: Vec::new(),
-            timeout: scenario
-                .timeout_ms
-                .map_or(DEFAULT_TIMEOUT, Duration::from_millis),
+            timeout,
+            gate_timeout: timeout,
         };
         Ok(Self {
             executor,
@@ -333,7 +351,8 @@ impl Driver {
             tracker: MarkdownTracker::new(&remote.checkout),
             states: config.tracker.states,
             pipeline: Pipeline::new(config.pipeline.default),
-            gate: config.stack.gate,
+            gate: scenario.gate.clone().unwrap_or(config.stack.gate),
+            gate_failure: None,
             branch: format!("owlshift/{}", scenario.ticket),
             id: scenario.ticket.clone(),
             state,
@@ -432,6 +451,9 @@ impl Driver {
             .run(&spec, &harness)
             .map_err(|e| e.to_string())?;
         self.last_brief = Some(brief);
+        if let Some(gate) = &report.gate {
+            self.gate_failure = gate.failure.clone();
+        }
         let own_failure = report.exit_code == Some(OWN_FAILURE);
         let outcome = outcome(&report.outcome);
         self.last_run = Some(report);
@@ -515,6 +537,11 @@ impl Driver {
                 browser: false,
             },
             gate: self.gate.clone(),
+            gate_failure: if role == Role::Build {
+                self.gate_failure.clone()
+            } else {
+                None
+            },
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
         })
@@ -658,6 +685,38 @@ impl Driver {
                 .collect();
             same("brief_thread", names(expected), names(&found))?;
         }
+        if let Some(expected) = &expect.gate_failure {
+            let found = self
+                .last_run
+                .as_ref()
+                .and_then(|report| match &report.outcome {
+                    Outcome::Failed(Failure::Gate(failure)) => Some(failure.as_ref()),
+                    _ => None,
+                });
+            gate_failure_is("gate_failure", expected, found)?;
+        }
+        if let Some(expected) = &expect.brief_gate_failure {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            gate_failure_is("brief_gate_failure", expected, brief.gate_failure.as_ref())?;
+        }
+        if let Some(expected) = &expect.gate_passed {
+            let gate = self
+                .last_run
+                .as_ref()
+                .and_then(|report| report.gate.as_ref())
+                .ok_or("expected a gate run, found none")?;
+            if let Some(failure) = &gate.failure {
+                return Err(format!("expected the gate to pass, found {failure:?}"));
+            }
+            same(
+                "gate_passed",
+                format!("{expected:?}"),
+                format!("{:?}", gate.commands),
+            )?;
+        }
         Ok(())
     }
 
@@ -704,6 +763,32 @@ fn outcome(outcome: &Outcome) -> Result<(Event, Option<RunResult>), String> {
         }
     };
     Ok((event, Some(RunResult::clone(result))))
+}
+
+/// Checks a gate failure against `none` or a text it contains.
+fn gate_failure_is(field: &str, expected: &str, found: Option<&GateFailure>) -> Result<(), String> {
+    match (expected, found) {
+        ("none", None) => Ok(()),
+        ("none", Some(failure)) => Err(format!("expected {field} none, found {failure:?}")),
+        (_, None) => Err(format!(
+            "expected {field} containing {expected:?}, found none"
+        )),
+        (_, Some(failure)) => {
+            let text = format!(
+                "{} {} {}",
+                failure.command.as_deref().unwrap_or_default(),
+                failure.reason,
+                failure.output
+            );
+            if text.contains(expected) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected {field} containing {expected:?}, found {failure:?}"
+                ))
+            }
+        }
+    }
 }
 
 fn same(field: &str, expected: impl fmt::Display, found: impl fmt::Display) -> Result<(), String> {

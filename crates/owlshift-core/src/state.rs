@@ -84,7 +84,7 @@ impl Status {
 /// | The answer check found every question answered | `Answered` |
 /// | The answer check found questions left open (they are re-asked) | `Incomplete` |
 /// | The decider asked a counter-question (answered in the thread) | `CounterQuestion` |
-/// | A run returned `failed` or no valid `result.json`, whatever its exit code | `RunFailed` |
+/// | A run returned `failed` or no valid `result.json`, whatever its exit code; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A human restarted a parked ticket | `Restarted` |

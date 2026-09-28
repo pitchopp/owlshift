@@ -1,0 +1,43 @@
+# OWL-16's acceptance scenario, played by crates/owlshift-testkit/tests/scenarios.rs.
+# Its fixture folder is gate/: the project in repo/, whose gate greps GREETING.md
+# for Hello, and a prepared result in results/.
+
+description = """
+DEMO-2: the build commits a greeting with a typo and reports done. The executor
+runs the project's gate itself, which fails: a failed run, still at Build, nothing
+pushed. The next Build brief carries the failure; the fix run commits the right
+greeting, the gate passes, and the ticket moves to Verify with the branch pushed."""
+ticket = "DEMO-2"
+start = "2026-09-28T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+[step.run]
+files = { "GREETING.md" = "Helo, reader.\n" }
+commit = "Add a greeting"
+result = "results/build-done.json"
+[step.expect]
+event = "run_failed"
+stage = "build"
+failed_runs = 1
+gate_failure = "exit status 1"
+brief_gate_failure = "none"
+branch_pushed = false
+
+[[step]]
+[step.run]
+files = { "GREETING.md" = "Hello, reader.\n" }
+commit = "Fix the greeting"
+result = "results/build-done.json"
+[step.expect]
+event = "completed"
+stage = "verify"
+failed_runs = 0
+brief_gate_failure = "git grep -q Hello -- GREETING.md"
+gate_failure = "none"
+gate_passed = ["git grep -q Hello -- GREETING.md"]
+branch_pushed = true
+branch_files = { "GREETING.md" = "Hello, reader.\n" }

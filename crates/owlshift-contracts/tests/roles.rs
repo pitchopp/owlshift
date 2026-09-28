@@ -34,6 +34,9 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "permissions.network",
     "permissions.browser",
     "gate",
+    "gate_failure.command",
+    "gate_failure.reason",
+    "gate_failure.output",
     "result_path",
 ];
 

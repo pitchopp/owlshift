@@ -53,6 +53,7 @@ fn a_real_role_runs_through_the_executor() {
         agent: AgentEnv::from_runner(&[]).unwrap(),
         forge_hosts: vec!["github.com".into()],
         timeout: Duration::from_secs(300),
+        gate_timeout: Duration::from_secs(300),
     };
     let harness = ClaudeHarness {
         // Found on the PATH.
@@ -90,6 +91,7 @@ fn a_real_role_runs_through_the_executor() {
             browser: false,
         },
         gate: Vec::new(),
+        gate_failure: None,
         result_path: RelativePath::new("result.json").unwrap(),
     };
     let spec = RunSpec {
