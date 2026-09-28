@@ -11,7 +11,7 @@ use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
 use owlshift_contracts::event::Event;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Claim, TicketState, claim_ref, ticket_ref};
+use owlshift_contracts::refs::{Claim, PersistedState, claim_ref, ticket_ref};
 use owlshift_contracts::result::{RunResult, Status};
 use serde_json::{Value, json};
 
@@ -99,7 +99,11 @@ fn every_contract_round_trips() {
     round_trip("brief.json", Brief::parse, Brief::render);
     round_trip("event.json", Event::parse, Event::render);
     round_trip("claim.json", Claim::parse, Claim::render);
-    round_trip("ticket-state.json", TicketState::parse, TicketState::render);
+    round_trip(
+        "ticket-state.json",
+        PersistedState::parse,
+        PersistedState::render,
+    );
     round_trip("footer.json", Footer::parse_payload, |f| {
         serde_json::to_string(f).unwrap()
     });
@@ -356,7 +360,7 @@ fn event_claim_and_state_rejections() {
         "upgrade Owlshift",
     );
 
-    let state = |edit: fn(&mut Value)| TicketState::parse(&edited("ticket-state.json", edit));
+    let state = |edit: fn(&mut Value)| PersistedState::parse(&edited("ticket-state.json", edit));
     rejects(
         "unknown stage",
         state(|v| v["stage"] = json!("qa")),

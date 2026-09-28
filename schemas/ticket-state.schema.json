@@ -13,7 +13,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "reasks": {
       "description": "Re-asks in the current round.",
@@ -28,6 +28,7 @@
       "minimum": 0
     },
     "stage": {
+      "description": "The stage the ticket works, returns to after its answers, or is parked at.",
       "$ref": "#/$defs/Stage"
     },
     "waiting": {
@@ -77,6 +78,11 @@
           "description": "The ticket was parked; a human restarts it.",
           "type": "string",
           "const": "parked"
+        },
+        {
+          "description": "Parked while questions waited; a restart goes back to waiting for them.",
+          "type": "string",
+          "const": "parked_awaiting_input"
         }
       ]
     }

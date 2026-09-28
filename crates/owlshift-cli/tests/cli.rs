@@ -58,7 +58,7 @@ fn version_lists_the_format_versions() {
         concat!(
             "owlshift ",
             env!("CARGO_PKG_VERSION"),
-            "\nformats: brief 1, result 1, event 1, claim 1, ticket state 1, comment footer 1\n"
+            "\nformats: brief 1, result 1, event 1, claim 1, ticket state 2, comment footer 1\n"
         )
     );
 }

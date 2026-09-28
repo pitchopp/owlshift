@@ -6,7 +6,7 @@ use crate::brief::Brief;
 use crate::comment::Footer;
 use crate::config::{PersonalConfig, ProjectConfig};
 use crate::event::Event;
-use crate::refs::{Claim, TicketState};
+use crate::refs::{Claim, PersistedState};
 use crate::result::RunResult;
 
 /// Every published schema, by file stem: `schemas/<stem>.schema.json`.
@@ -18,7 +18,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("personal-config", schema::<PersonalConfig>()),
         ("event", schema::<Event>()),
         ("claim", schema::<Claim>()),
-        ("ticket-state", schema::<TicketState>()),
+        ("ticket-state", schema::<PersistedState>()),
         ("comment-footer", schema::<Footer>()),
     ]
 }
