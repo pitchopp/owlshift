@@ -322,6 +322,18 @@ fn brief_rejections() {
         parse(|v| v["format"] = json!(3)),
         "upgrade Owlshift",
     );
+    rejects(
+        "format 1, before the brief carried the gate",
+        parse(|v| v["format"] = json!(1)),
+        "unknown format 1",
+    );
+    rejects(
+        "missing gate",
+        parse(|v| {
+            v.as_object_mut().unwrap().remove("gate");
+        }),
+        "missing field `gate`",
+    );
     // The checkpoint's paths and the result path come from the runner, but
     // are checked the same way as a model's artifact paths (OWL-25).
     for path in BAD_PATHS {

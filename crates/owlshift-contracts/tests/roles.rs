@@ -34,6 +34,7 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "permissions.level",
     "permissions.network",
     "permissions.browser",
+    "gate",
     "result_path",
 ];
 
@@ -267,16 +268,27 @@ fn build_brief_fields_exist() {
     }
 }
 
+/// The gate reaches the role in its brief, written by the runner: the prompt
+/// never sends the role to the project config for commands to run.
+#[test]
+fn build_gate_comes_from_the_brief() {
+    let text = build_prompt().text;
+    for word in ["owlshift.toml", "stack.gate", "[stack]"] {
+        assert!(
+            !text.contains(word),
+            "roles/build.md names {word}; the gate comes from the brief's `gate`"
+        );
+    }
+}
+
 /// Every dotted path the prompt writes as code, such as `checkpoint.plan` or
-/// `stack.gate`, exists in the brief, `result.json` or the project config,
-/// from their root or from one of their definitions. File names are skipped.
+/// `author.relation`, exists in the brief or `result.json`, from their root or
+/// from one of their definitions. The project config is left out on purpose:
+/// the role reads what it needs from the brief. File names are skipped.
 #[test]
 fn build_dotted_fields_exist() {
     let text = build_prompt().text;
-    let schemas: Vec<Value> = ["brief", "result", "project-config"]
-        .into_iter()
-        .map(generated)
-        .collect();
+    let schemas: Vec<Value> = ["brief", "result"].into_iter().map(generated).collect();
     let dotted = text
         .split('`')
         .skip(1)

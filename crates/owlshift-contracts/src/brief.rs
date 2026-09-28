@@ -42,6 +42,11 @@ pub struct Brief {
     #[serde(default)]
     pub rules: Vec<Rule>,
     pub permissions: Permissions,
+    /// The project's full gate, from `stack.gate` in its configuration: the
+    /// commands a role runs, in order, from the worktree root, before it
+    /// delivers. The runner is its only author; an empty list means the
+    /// project has no gate.
+    pub gate: Vec<String>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
 }

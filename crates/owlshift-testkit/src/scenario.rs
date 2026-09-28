@@ -272,6 +272,8 @@ struct Driver {
     tracker: MarkdownTracker,
     states: States,
     pipeline: Pipeline,
+    /// The project's gate (`stack.gate`), carried in every brief.
+    gate: Vec<String>,
     id: TicketId,
     branch: String,
     state: TicketState,
@@ -314,6 +316,7 @@ impl Driver {
             tracker: MarkdownTracker::new(&remote.checkout),
             states: config.tracker.states,
             pipeline: Pipeline::new(config.pipeline.default),
+            gate: config.stack.gate,
             branch: format!("owlshift/{}", scenario.ticket),
             id: scenario.ticket.clone(),
             state,
@@ -516,6 +519,7 @@ impl Driver {
                 network: false,
                 browser: false,
             },
+            gate: self.gate.clone(),
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
         })
