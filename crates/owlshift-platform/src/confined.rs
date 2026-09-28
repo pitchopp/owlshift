@@ -23,12 +23,17 @@
 //! through `/var`): the system resolves them once, when the root is opened.
 //! The root itself must be a real directory.
 //!
+//! The read stops one byte past a limit the caller gives: a file that holds,
+//! or grows to hold, more than the limit before the reader sees its end is
+//! refused without being read to the end, however large, sparse or endless it
+//! is.
+//!
 //! Hard links are not detected: a hard link is a file of the worktree in its
 //! own right.
 
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 /// Why an entry, or the root, was refused.
@@ -43,6 +48,8 @@ pub enum Refusal {
     /// The final entry is not a regular file; the kind is named
     /// (`"directory"`, `"FIFO"`, `"character device"`, ...).
     NotARegularFile(&'static str),
+    /// The file holds more than the limit, in bytes, the read was given.
+    TooLarge(u64),
 }
 
 impl fmt::Display for Refusal {
@@ -52,6 +59,7 @@ impl fmt::Display for Refusal {
             Self::NotADirectory => f.write_str("is not a directory"),
             Self::NotFound => f.write_str("does not exist"),
             Self::NotARegularFile(kind) => write!(f, "is a {kind}, not a regular file"),
+            Self::TooLarge(limit) => write!(f, "is larger than {limit} bytes"),
         }
     }
 }
@@ -120,8 +128,12 @@ impl Error for ConfinedError {
 /// Reads the regular file at `relative` inside the directory `root`, refusing
 /// any symbolic link on the way. `relative` is `/`-separated; `.` segments are
 /// skipped.
-pub fn read_confined(root: &Path, relative: &str) -> Result<Vec<u8>, ConfinedError> {
-    walk(root, relative, &mut |_| {})
+///
+/// A file holding more than `limit` bytes is refused with
+/// [`Refusal::TooLarge`] after reading at most `limit + 1` of them. The limit
+/// is a memory budget the caller chooses; `u64::MAX` sets no limit.
+pub fn read_confined(root: &Path, relative: &str, limit: u64) -> Result<Vec<u8>, ConfinedError> {
+    walk(root, relative, limit, &mut |_| {})
 }
 
 /// The walk behind [`read_confined`]. `after_level` runs once each directory
@@ -130,6 +142,7 @@ pub fn read_confined(root: &Path, relative: &str) -> Result<Vec<u8>, ConfinedErr
 fn walk(
     root: &Path,
     relative: &str,
+    limit: u64,
     after_level: &mut dyn FnMut(&str),
 ) -> Result<Vec<u8>, ConfinedError> {
     let segments = segments(relative)?;
@@ -138,8 +151,20 @@ fn walk(
         root: &root,
         relative,
         segments: &segments,
+        limit,
     };
     sys::walk(&walk, after_level)
+}
+
+/// Reads `reader` to its end, or stops once it has read more than `limit`
+/// bytes: `None` then. Never reads more than `limit + 1` bytes, and sizes its
+/// buffer from what it read, never from what the file claims to hold.
+fn read_capped(reader: impl Read, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
 /// The segments of a plain relative path, `.` segments left out.
@@ -181,6 +206,8 @@ struct Walk<'a> {
     relative: &'a str,
     /// Never empty: the last one names the file.
     segments: &'a [&'a str],
+    /// The most bytes the file may hold.
+    limit: u64,
 }
 
 impl Walk<'_> {
@@ -210,12 +237,18 @@ impl Walk<'_> {
             source,
         }
     }
+
+    /// Reads the opened final file within the limit.
+    fn read(&self, file: impl Read) -> Result<Vec<u8>, ConfinedError> {
+        read_capped(file, self.limit)
+            .map_err(|error| self.io(error))?
+            .ok_or_else(|| self.refused(self.segments.len() - 1, Refusal::TooLarge(self.limit)))
+    }
 }
 
 #[cfg(unix)]
 mod sys {
     use std::fs::File;
-    use std::io::Read;
     use std::os::fd::OwnedFd;
 
     use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, fstat, open, openat, statat};
@@ -254,11 +287,7 @@ mod sys {
             FileType::RegularFile => {}
             other => return Err(walk.refused(last, Refusal::NotARegularFile(kind(other)))),
         }
-        let mut bytes = Vec::new();
-        File::from(file)
-            .read_to_end(&mut bytes)
-            .map_err(|error| walk.io(error))?;
-        Ok(bytes)
+        walk.read(File::from(file))
     }
 
     /// Names what refused the root; the open's own error when nothing is
@@ -318,7 +347,7 @@ mod sys {
 #[cfg(windows)]
 mod sys {
     use std::fs::{File, OpenOptions};
-    use std::io::{self, Read};
+    use std::io;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr;
@@ -391,7 +420,7 @@ mod sys {
         }
 
         let parent = levels.last().expect("the root is always there");
-        let mut file = open_relative(
+        let file = open_relative(
             parent,
             walk.segments[last],
             FILE_GENERIC_READ,
@@ -408,10 +437,7 @@ mod sys {
         if !file_type.is_file() {
             return Err(walk.refused(last, Refusal::NotARegularFile("special file")));
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|error| walk.io(error))?;
-        Ok(bytes)
+        walk.read(file)
     }
 
     fn entry_error(walk: &Walk<'_>, index: usize, error: io::Error) -> ConfinedError {
@@ -480,8 +506,51 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Read};
 
-    use super::walk;
+    use super::{read_capped, walk};
+
+    /// A reader that counts the bytes taken from it.
+    struct Counting<R> {
+        inner: R,
+        read: u64,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    /// An endless source, like a file that keeps growing, is refused after
+    /// `limit + 1` bytes: the read never goes further.
+    #[test]
+    fn an_endless_source_is_refused_after_one_byte_past_the_limit() {
+        let mut source = Counting {
+            inner: io::repeat(b'x'),
+            read: 0,
+        };
+        assert_eq!(read_capped(&mut source, 1024).unwrap(), None);
+        assert_eq!(source.read, 1025);
+    }
+
+    #[test]
+    fn a_source_at_the_limit_is_read_whole() {
+        assert_eq!(
+            read_capped(&b"sixteen bytes..."[..], 16)
+                .unwrap()
+                .as_deref(),
+            Some(&b"sixteen bytes..."[..])
+        );
+        assert_eq!(read_capped(&b""[..], 0).unwrap(), Some(Vec::new()));
+        assert_eq!(read_capped(&b"x"[..], 0).unwrap(), None);
+        assert_eq!(
+            read_capped(&b"no limit"[..], u64::MAX).unwrap().as_deref(),
+            Some(&b"no limit"[..])
+        );
+    }
 
     /// A directory swapped for a link to an outside one after the walk opened
     /// it does not redirect the read: the next level is looked up in the
@@ -498,7 +567,7 @@ mod tests {
         fs::write(outside.join("plan.md"), b"outside").unwrap();
 
         let mut swapped = false;
-        let bytes = walk(&wt, "docs/plan.md", &mut |at| {
+        let bytes = walk(&wt, "docs/plan.md", u64::MAX, &mut |at| {
             assert_eq!(at, "docs");
             fs::rename(wt.join("docs"), wt.join("docs.orig")).unwrap();
             std::os::unix::fs::symlink(&outside, wt.join("docs")).unwrap();
@@ -520,7 +589,7 @@ mod tests {
         fs::write(wt.join("docs/plan.md"), b"inside").unwrap();
 
         let mut renamed = None;
-        let bytes = walk(&wt, "docs/plan.md", &mut |_| {
+        let bytes = walk(&wt, "docs/plan.md", u64::MAX, &mut |_| {
             renamed = Some(fs::rename(wt.join("docs"), wt.join("docs.moved")).is_ok());
         })
         .unwrap();

@@ -87,6 +87,11 @@ fn junction(target: &Path, link: &Path) {
     assert!(status.success(), "mklink /J failed");
 }
 
+/// Reads with a limit no test file comes near.
+fn read(root: &Path, relative: &str) -> Result<Vec<u8>, ConfinedError> {
+    read_confined(root, relative, 1 << 20)
+}
+
 fn refused_at(result: Result<Vec<u8>, ConfinedError>) -> (String, Refusal) {
     match result {
         Err(ConfinedError::Refused { at, reason, .. }) => (at, reason),
@@ -101,12 +106,24 @@ fn plain_files_read_byte_for_byte() {
     fs::create_dir_all(f.wt.join("docs/deep")).unwrap();
     fs::write(f.wt.join("docs/deep/plan.md"), INSIDE).unwrap();
 
-    assert_eq!(read_confined(&f.wt, "plan.md").unwrap(), INSIDE);
-    assert_eq!(read_confined(&f.wt, "docs/deep/plan.md").unwrap(), INSIDE);
+    assert_eq!(read(&f.wt, "plan.md").unwrap(), INSIDE);
+    assert_eq!(read(&f.wt, "docs/deep/plan.md").unwrap(), INSIDE);
+    assert_eq!(read(&f.wt, "./docs/./deep/plan.md").unwrap(), INSIDE);
+}
+
+#[test]
+fn a_file_over_the_limit_is_refused_and_one_at_it_reads() {
+    let f = fixture();
+    fs::write(f.wt.join("plan.md"), [b'x'; 17]).unwrap();
+    fs::write(f.wt.join("exact.md"), [b'x'; 16]).unwrap();
+
+    let error = read_confined(&f.wt, "plan.md", 16).unwrap_err();
+    assert_eq!(error.to_string(), "`plan.md` is larger than 16 bytes");
     assert_eq!(
-        read_confined(&f.wt, "./docs/./deep/plan.md").unwrap(),
-        INSIDE
+        refused_at(Err(error)),
+        ("plan.md".to_owned(), Refusal::TooLarge(16))
     );
+    assert_eq!(read_confined(&f.wt, "exact.md", 16).unwrap(), [b'x'; 16]);
 }
 
 #[test]
@@ -118,10 +135,7 @@ fn root_reached_through_an_aliased_ancestor_reads() {
     let alias = f.base.path().join("alias");
     dir_alias(&real, &alias);
 
-    assert_eq!(
-        read_confined(&alias.join("wt"), "docs/plan.md").unwrap(),
-        INSIDE
-    );
+    assert_eq!(read(&alias.join("wt"), "docs/plan.md").unwrap(), INSIDE);
 }
 
 #[test]
@@ -130,7 +144,7 @@ fn symlink_to_an_outside_file_is_refused() {
     if !symlink_file(&f.outside.join("secret.txt"), &f.wt.join("plan.md")) {
         return;
     }
-    let error = read_confined(&f.wt, "plan.md").unwrap_err();
+    let error = read(&f.wt, "plan.md").unwrap_err();
     assert_eq!(error.to_string(), "`plan.md` is a symbolic link");
     assert_eq!(
         refused_at(Err(error)),
@@ -144,7 +158,7 @@ fn symlinked_parent_directory_is_refused() {
     if !symlink_dir(&f.outside, &f.wt.join("docs")) {
         return;
     }
-    let error = read_confined(&f.wt, "docs/secret.txt").unwrap_err();
+    let error = read(&f.wt, "docs/secret.txt").unwrap_err();
     assert_eq!(
         error.to_string(),
         "`docs/secret.txt`: `docs` is a symbolic link"
@@ -163,7 +177,7 @@ fn symlink_pointing_inside_is_refused_too() {
         return;
     }
     assert_eq!(
-        refused_at(read_confined(&f.wt, "plan.md")),
+        refused_at(read(&f.wt, "plan.md")),
         ("plan.md".to_owned(), Refusal::SymbolicLink)
     );
 }
@@ -174,7 +188,7 @@ fn junction_parent_is_refused() {
     let f = fixture();
     junction(&f.outside, &f.wt.join("docs"));
     assert_eq!(
-        refused_at(read_confined(&f.wt, "docs/secret.txt")),
+        refused_at(read(&f.wt, "docs/secret.txt")),
         ("docs".to_owned(), Refusal::SymbolicLink)
     );
 }
@@ -182,14 +196,14 @@ fn junction_parent_is_refused() {
 #[test]
 fn missing_entries_are_refused() {
     let f = fixture();
-    let error = read_confined(&f.wt, "plan.md").unwrap_err();
+    let error = read(&f.wt, "plan.md").unwrap_err();
     assert_eq!(error.to_string(), "`plan.md` does not exist");
     assert_eq!(
         refused_at(Err(error)),
         ("plan.md".to_owned(), Refusal::NotFound)
     );
     assert_eq!(
-        refused_at(read_confined(&f.wt, "docs/plan.md")),
+        refused_at(read(&f.wt, "docs/plan.md")),
         ("docs".to_owned(), Refusal::NotFound)
     );
 }
@@ -200,11 +214,11 @@ fn a_directory_is_not_a_file() {
     fs::create_dir(f.wt.join("docs")).unwrap();
     fs::write(f.wt.join("a.txt"), INSIDE).unwrap();
     assert_eq!(
-        refused_at(read_confined(&f.wt, "docs")),
+        refused_at(read(&f.wt, "docs")),
         ("docs".to_owned(), Refusal::NotARegularFile("directory"))
     );
     assert_eq!(
-        refused_at(read_confined(&f.wt, "a.txt/plan.md")),
+        refused_at(read(&f.wt, "a.txt/plan.md")),
         ("a.txt".to_owned(), Refusal::NotADirectory)
     );
 }
@@ -223,7 +237,7 @@ fn a_fifo_is_refused_without_blocking() {
     // thread so a regression fails here instead of hanging the suite.
     let (sender, receiver) = std::sync::mpsc::channel();
     let wt = f.wt.clone();
-    std::thread::spawn(move || sender.send(read_confined(&wt, "plan.md")));
+    std::thread::spawn(move || sender.send(read(&wt, "plan.md")));
     let result = receiver
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("opening a FIFO blocked");
@@ -237,7 +251,7 @@ fn a_fifo_is_refused_without_blocking() {
 #[test]
 fn a_device_is_refused() {
     assert_eq!(
-        refused_at(read_confined(Path::new("/dev"), "null")),
+        refused_at(read(Path::new("/dev"), "null")),
         (
             "null".to_owned(),
             Refusal::NotARegularFile("character device")
@@ -253,7 +267,7 @@ fn a_root_that_is_an_alias_is_refused_however_it_is_spelled() {
     dir_alias(&f.wt, &link);
 
     for root in [link.clone(), link.join(""), link.join(".")] {
-        match read_confined(&root, "plan.md") {
+        match read(&root, "plan.md") {
             Err(ConfinedError::Root {
                 reason: Refusal::SymbolicLink,
                 ..
@@ -262,7 +276,7 @@ fn a_root_that_is_an_alias_is_refused_however_it_is_spelled() {
         }
     }
     assert!(matches!(
-        read_confined(&f.wt.join(".."), "wt/plan.md"),
+        read(&f.wt.join(".."), "wt/plan.md"),
         Err(ConfinedError::InvalidRoot { .. })
     ));
 }
@@ -285,7 +299,7 @@ fn paths_that_are_not_plain_relative_paths_are_refused() {
     ] {
         assert!(
             matches!(
-                read_confined(&f.wt, relative),
+                read(&f.wt, relative),
                 Err(ConfinedError::InvalidPath { .. })
             ),
             "{relative:?} was not refused"

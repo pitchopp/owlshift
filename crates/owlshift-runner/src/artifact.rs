@@ -3,7 +3,9 @@
 //! The contract already refuses absolute paths and `..`; it cannot see the
 //! file system, so a role could still name a symbolic link that leads out of
 //! its worktree. Every artifact is read through
-//! [`read_confined`], which refuses any symbolic link on the way.
+//! [`read_confined`], which refuses any symbolic link on the way, and stops
+//! reading past [`MAX_ARTIFACT_BYTES`] so that a huge, sparse or growing file
+//! cannot exhaust the runner's memory or keep it reading.
 
 use std::error::Error;
 use std::fmt;
@@ -12,6 +14,11 @@ use std::path::Path;
 use owlshift_contracts::ids::RelativePath;
 use owlshift_contracts::result::Artifacts;
 use owlshift_platform::confined::{ConfinedError, read_confined};
+
+/// The most bytes an artifact may hold: 1 MiB. Artifacts are text a model
+/// writes (a plan, a ledger, findings, a report), far below this; a larger
+/// one fails the run.
+pub const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024;
 
 /// The contents of the artifacts a run named; `None` for one it did not name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -52,7 +59,7 @@ pub fn read_artifacts(
     let read = |field, path: &Option<RelativePath>| {
         path.as_ref()
             .map(|path| {
-                read_confined(worktree, path.as_str())
+                read_confined(worktree, path.as_str(), MAX_ARTIFACT_BYTES)
                     .map_err(|source| ArtifactError { field, source })
             })
             .transpose()
