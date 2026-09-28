@@ -6,18 +6,30 @@
 //! publish. [`read_confined`] refuses every link from the root down, even one
 //! that points back inside: there is no resolution logic to get wrong.
 //!
+//! A hard link is the same trap without a link to see: `plan.md` made a second
+//! name of `~/.ssh/id_rsa` is a regular file in the worktree. Where the other
+//! names are cannot be known without searching the whole volume, so a file
+//! with more than one name is refused, wherever they are. A checkout, and the
+//! tools that write artifacts, create files with a single name.
+//!
 //! Resolution and read are one walk. Each level is opened relative to the
 //! handle of the level above, never through a path looked up again, and is
 //! checked on that handle. A level swapped for a link after it was opened
 //! therefore cannot redirect the read.
 //!
 //! - Unix: `openat` with `O_NOFOLLOW` for each level, then `fstat` on the
-//!   opened file, which must be a regular file. `O_NONBLOCK` keeps the open of
-//!   a FIFO from waiting for a writer.
+//!   opened file, which must be a regular file with a link count of 1.
+//!   `O_NONBLOCK` keeps the open of a FIFO from waiting for a writer.
 //! - Windows: `NtCreateFile` relative to the parent handle with
 //!   `FILE_OPEN_REPARSE_POINT` for each level; a name-surrogate reparse point
 //!   (symbolic link, junction) is refused. No handle allows delete sharing, so
-//!   a level cannot be renamed while the walk holds it.
+//!   a level cannot be renamed while the walk holds it. The file's link count,
+//!   from `GetFileInformationByHandle`, must be 1.
+//!
+//! The link count is read on the handle the bytes are then read from, so the
+//! file checked is the file read. It is the count the file system reports: a
+//! network or FUSE mount that supports hard links but reports a count of 1
+//! defeats the check.
 //!
 //! The root's ancestors may be links (macOS reaches temporary directories
 //! through `/var`): the system resolves them once, when the root is opened.
@@ -27,9 +39,6 @@
 //! or grows to hold, more than the limit before the reader sees its end is
 //! refused without being read to the end, however large, sparse or endless it
 //! is.
-//!
-//! Hard links are not detected: a hard link is a file of the worktree in its
-//! own right.
 
 use std::error::Error;
 use std::fmt;
@@ -50,6 +59,8 @@ pub enum Refusal {
     NotARegularFile(&'static str),
     /// The file holds more than the limit, in bytes, the read was given.
     TooLarge(u64),
+    /// The file has this many names (hard links), more than one.
+    HardLink(u64),
 }
 
 impl fmt::Display for Refusal {
@@ -60,6 +71,10 @@ impl fmt::Display for Refusal {
             Self::NotFound => f.write_str("does not exist"),
             Self::NotARegularFile(kind) => write!(f, "is a {kind}, not a regular file"),
             Self::TooLarge(limit) => write!(f, "is larger than {limit} bytes"),
+            Self::HardLink(links) => write!(
+                f,
+                "has {links} names (hard links); an artifact must be a file of its own"
+            ),
         }
     }
 }
@@ -287,6 +302,14 @@ mod sys {
             FileType::RegularFile => {}
             other => return Err(walk.refused(last, Refusal::NotARegularFile(kind(other)))),
         }
+        if stat.st_nlink > 1 {
+            #[allow(
+                clippy::useless_conversion,
+                reason = "`st_nlink` is u16 on macOS and u32 on Linux aarch64, u64 elsewhere"
+            )]
+            let links = u64::from(stat.st_nlink);
+            return Err(walk.refused(last, Refusal::HardLink(links)));
+        }
         walk.read(File::from(file))
     }
 
@@ -360,9 +383,9 @@ mod sys {
         HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_TRAVERSE, SYNCHRONIZE,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, GetFileInformationByHandle, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -437,7 +460,24 @@ mod sys {
         if !file_type.is_file() {
             return Err(walk.refused(last, Refusal::NotARegularFile("special file")));
         }
+        let links = link_count(&file).map_err(|error| walk.io(error))?;
+        if links > 1 {
+            return Err(walk.refused(last, Refusal::HardLink(u64::from(links))));
+        }
         walk.read(file)
+    }
+
+    /// The number of names (hard links) of the open `file`. The standard
+    /// library reads it too, but exposes it only behind the unstable
+    /// `windows_by_handle` feature.
+    fn link_count(file: &File) -> io::Result<u32> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` is an open handle for the whole call, and `info` is
+        // a live local the call only writes.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.nNumberOfLinks)
     }
 
     fn entry_error(walk: &Walk<'_>, index: usize, error: io::Error) -> ConfinedError {

@@ -2,8 +2,9 @@
 //!
 //! The contract already refuses absolute paths and `..`; it cannot see the
 //! file system, so a role could still name a symbolic link that leads out of
-//! its worktree. Every artifact is read through
-//! [`read_confined`], which refuses any symbolic link on the way, and stops
+//! its worktree, or a hard link to a file outside it. Every artifact is read
+//! through [`read_confined`], which refuses any symbolic link on the way and
+//! any file with a second name, and stops
 //! reading past [`MAX_ARTIFACT_BYTES`] so that a huge, sparse or growing file
 //! cannot exhaust the runner's memory or keep it reading.
 
