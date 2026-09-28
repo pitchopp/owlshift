@@ -67,19 +67,31 @@ pub const CREDENTIAL_VARIABLES: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
     // Tracker.
     "LINEAR_API_KEY",
+    "JIRA_API_TOKEN",
+    "ATLASSIAN_API_TOKEN",
     // Forge.
     "GITHUB_TOKEN",
     "GH_TOKEN",
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    "GITLAB_PRIVATE_TOKEN",
+    "CI_JOB_TOKEN",
+    "GITEA_TOKEN",
+    "BITBUCKET_TOKEN",
+    "BITBUCKET_APP_PASSWORD",
+    "SSH_AUTH_SOCK",
     // Cloud.
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
 ];
 
 /// Checks the names of the variables an agent would receive. Names compare
@@ -164,13 +176,11 @@ pub(crate) fn normalize(category: &str) -> String {
         .join("_")
 }
 
-/// Whether a normalized category is a normalized token, or a longer form of
-/// it: `scope_change` matches `scope`, `legal_wording` matches `legal`.
+/// Whether a normalized category is a normalized token, or contains it as a
+/// whole-word run anywhere in it: `scope_change` matches `scope`,
+/// `legal_wording` matches `legal`, `risk_of_data_loss` matches `data_loss`.
 pub(crate) fn matches_token(category: &str, token: &str) -> bool {
-    !token.is_empty()
-        && category
-            .strip_prefix(token)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+    !token.is_empty() && format!("_{category}_").contains(&format!("_{token}_"))
 }
 
 /// An action or a set-up the floor refuses.
@@ -252,10 +262,19 @@ mod tests {
             );
         }
         assert_eq!(
-            check_agent_environment(["DATABASE_URL", "github_token", "PATH", "Openai_Api_Key"]),
+            check_agent_environment([
+                "DATABASE_URL",
+                "github_token",
+                "PATH",
+                "Openai_Api_Key",
+                "gitlab_token",
+                "SSH_AUTH_SOCK",
+            ]),
             Err(FloorViolation::CredentialVariables(vec![
                 "github_token".to_owned(),
                 "Openai_Api_Key".to_owned(),
+                "gitlab_token".to_owned(),
+                "SSH_AUTH_SOCK".to_owned(),
             ]))
         );
         assert_eq!(
@@ -281,6 +300,8 @@ mod tests {
             "irreversible external actions",
             "scope_change",
             "  Scope Changes ",
+            "risk_of_data_loss",
+            "possible security issue",
         ];
         for spelling in spellings {
             assert!(is_floor_category(spelling), "{spelling:?}");
