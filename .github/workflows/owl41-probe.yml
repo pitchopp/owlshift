@@ -14,27 +14,6 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - name: System
-        run: |
-          uname -a
-          . /etc/os-release && echo "$PRETTY_NAME"
-          echo "HOME=$HOME XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unset}"
-          id
-          ls -la /run/user || true
-          cat /sys/kernel/security/lsm || true
-          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces 2>&1 || true
-          ls /etc/apparmor.d | grep -i -E 'bwrap|unpriv|userns' || echo "no bwrap or userns AppArmor profile"
-      - name: Unprivileged user namespace without bwrap
-        run: |
-          unshare -Ur true && echo "unshare -Ur: ok" || echo "unshare -Ur: failed ($?)"
-      - name: bwrap as shipped
-        run: |
-          if command -v bwrap; then bwrap --version; else echo "bwrap not installed on the image"; fi
-      - name: Install bwrap
-        run: |
-          command -v bwrap || { sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap; }
-          bwrap --version
-          ls /etc/apparmor.d | grep -i -E 'bwrap|unpriv|userns' || echo "no bwrap or userns AppArmor profile"
       - name: Plant fake secrets and a repository with a linked worktree
         run: |
           mkdir -p "$HOME/.config/gh" "$HOME/other-project" "$HOME/toolchain" "$HOME/owl41"
@@ -45,24 +24,82 @@ jobs:
           git init -q -b main main && cd main
           git -c user.name=p -c user.email=p@example.invalid commit -q --allow-empty -m init
           git worktree add -q -b owl41 "$HOME/owl41/wt"
-          mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
-      - name: Confined probe
-        run: |
-          RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
           cat > "$HOME/owl41/probe.sh" <<'EOF'
           #!/bin/sh
           cat "$HOME/.config/gh/hosts.yml" >/dev/null 2>&1; echo "  gh token file: exit $?"
           cat "$HOME/other-project/.env" >/dev/null 2>&1; echo "  sibling .env: exit $?"
           cat "$HOME/toolchain/bin.txt" >/dev/null 2>&1; echo "  allowed toolchain file: exit $?"
-          ls "$HOME" 2>&1 | tr '\n' ' '; echo "<- home listing"
-          ls -A "$RUNTIME" 2>&1 | tr '\n' ' '; echo "<- runtime dir listing"
+          ls "$HOME" >/dev/null 2>&1; echo "  list the home: exit $?"
+          python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.connect('$BUS')" 2>/dev/null; echo "  connect to the session bus socket: exit $?"
           echo x > "$HOME/planted.txt" 2>/dev/null; echo "  write in the home: exit $?"
-          cd "$HOME/owl41/wt" && echo hi > f.txt && git add f.txt && git -c user.name=p -c user.email=p@example.invalid commit -q -m f && echo "  commit in the linked worktree: ok" || echo "  commit in the linked worktree: failed"
+          echo x > "$HOME/owl41/wt/written.txt" 2>/dev/null; echo "  write in the worktree: exit $?"
+          cd "$HOME/owl41/wt" && git add written.txt && git -c user.name=p -c user.email=p@example.invalid commit -q -m f && echo "  commit in the linked worktree: ok" || echo "  commit in the linked worktree: failed"
           EOF
           chmod +x "$HOME/owl41/probe.sh"
-          echo "unconfined:"; RUNTIME="$RUNTIME" "$HOME/owl41/probe.sh"
+          echo "BUS=$XDG_RUNTIME_DIR/bus" >> "$GITHUB_ENV"
+      - name: Unconfined
+        run: |
+          "$HOME/owl41/probe.sh"
           git -C "$HOME/owl41/wt" reset -q --hard HEAD~1
-          echo "bwrap:"
+      - name: Landlock
+        run: |
+          cat > /tmp/ll.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <linux/types.h>
+          #include <sys/syscall.h>
+          #include <sys/prctl.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <stdio.h>
+          #include <string.h>
+          struct ruleset_attr { __u64 fs; __u64 net; __u64 scoped; };
+          struct path_beneath { __u64 allowed; __s32 fd; } __attribute__((packed));
+          /* ll DIR... -- COMMAND ARGS: everything is denied but the DIRs. */
+          int main(int argc, char **argv) {
+            int abi = syscall(SYS_landlock_create_ruleset, NULL, 0, 1);
+            fprintf(stderr, "landlock ABI %d\n", abi);
+            if (abi < 1) return 90;
+            __u64 fs = (1ULL << 13) - 1;
+            if (abi >= 2) fs |= 1ULL << 13;
+            if (abi >= 3) fs |= 1ULL << 14;
+            if (abi >= 5) fs |= 1ULL << 15;
+            struct ruleset_attr attr = { fs, 0, abi >= 6 ? 1 : 0 };
+            size_t size = abi >= 6 ? 24 : (abi >= 4 ? 16 : 8);
+            int rs = syscall(SYS_landlock_create_ruleset, &attr, size, 0);
+            if (rs < 0) { perror("create_ruleset"); return 91; }
+            int i = 1;
+            for (; i < argc && strcmp(argv[i], "--"); i++) {
+              struct path_beneath pb = { fs, open(argv[i], O_PATH | O_CLOEXEC) };
+              if (pb.fd < 0) { perror(argv[i]); return 92; }
+              if (syscall(SYS_landlock_add_rule, rs, 1, &pb, 0)) { perror("add_rule"); return 93; }
+              close(pb.fd);
+            }
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) { perror("no_new_privs"); return 94; }
+            if (syscall(SYS_landlock_restrict_self, rs, 0)) { perror("restrict_self"); return 95; }
+            execvp(argv[i + 1], argv + i + 1);
+            perror("exec");
+            return 96;
+          }
+          EOF
+          gcc -O2 -o /tmp/ll /tmp/ll.c
+          /tmp/ll /usr /bin /lib /lib64 /etc /proc /dev /tmp "$HOME/toolchain" "$HOME/owl41" -- "$HOME/owl41/probe.sh"
+          git -C "$HOME/owl41/wt" reset -q --hard HEAD~1 || true
+      - name: bwrap as installed from the archive
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap >/dev/null
+          bwrap --version
+          bwrap --ro-bind / / --dev /dev true && echo "bwrap: ok" || echo "bwrap: failed ($?)"
+      - name: bwrap with an AppArmor profile granting it user namespaces
+        run: |
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
           bwrap --ro-bind / / --dev /dev --proc /proc \
             --tmpfs "$HOME" \
             --ro-bind "$HOME/toolchain" "$HOME/toolchain" \
@@ -71,50 +108,16 @@ jobs:
             --bind "$HOME/owl41/main/.git" "$HOME/owl41/main/.git" \
             --tmpfs /run/user \
             --die-with-parent \
-            --setenv RUNTIME "$RUNTIME" \
             -- "$HOME/owl41/probe.sh"
           echo "bwrap exit: $?"
-          ls "$HOME"
+          ls -A "$HOME"
           git -C "$HOME/owl41/wt" log --oneline -1
       - name: bwrap and a process group kill
         run: |
-          setsid sh -c 'bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent -- sleep 300 & echo $! > /tmp/bw.pid; wait' &
+          setsid sh -c 'bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent -- sh -c "sleep 300 & sleep 301" & echo $! > /tmp/bw.pid; wait' &
           sleep 2
           PGID=$(ps -o pgid= -p "$(cat /tmp/bw.pid)" | tr -d ' ')
-          echo "group $PGID:"; ps -o pid,pgid,comm -g "$PGID"
-          kill -KILL -- "-$PGID"; sleep 1
-          pgrep -a -f 'sleep 300' && echo "a sleep survived the group kill" || echo "no process left after the group kill"
-
-  macos:
-    runs-on: macos-latest
-    steps:
-      - name: System
-        run: |
-          sw_vers
-          ls -la /usr/bin/sandbox-exec
-          security list-keychains -d user
-      - name: Throwaway keychain and a confined read
-        run: |
-          D="$RUNNER_TEMP/owl41"; mkdir -p "$D/kc" "$D/home/.config/gh"
-          printf 'example.invalid:\n    oauth_token: gho_FAKE_owl41\n' > "$D/home/.config/gh/hosts.yml"
-          KC="$D/kc/probe.keychain-db"
-          security create-keychain -p owl41 "$KC"
-          security set-keychain-settings "$KC"
-          security unlock-keychain -p owl41 "$KC"
-          security add-generic-password -s owl41-probe -a probe -w FAKE_owl41 "$KC"
-          security list-keychains -d user
-          cat > "$D/deny.sb" <<EOF
-          (version 1)
-          (allow default)
-          (deny file-read-data file-read-xattr (subpath "$D/home"))
-          (deny file-read* file-write* (subpath "$D/kc"))
-          (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc"))
-          EOF
-          probe() {
-            cat "$D/home/.config/gh/hosts.yml" >/dev/null 2>&1; echo "  token file: exit $?"
-            security find-generic-password -s owl41-probe -w "$KC" 2>&1 | sed 's/FAKE_owl41/<fake>/'; echo "  keychain item: exit ${PIPESTATUS[0]}"
-          }
-          echo "unconfined:"; probe
-          export -f probe 2>/dev/null || true
-          echo "confined:"; sandbox-exec -f "$D/deny.sb" /bin/bash -c "$(declare -f probe); D='$D' KC='$KC' probe"
-          security delete-keychain "$KC"
+          ps -o pid,pgid,comm -g "$PGID"
+          kill -KILL -- "-$PGID"
+          sleep 1
+          if pgrep -a -f 'sleep 30[01]'; then echo "a process survived the group kill"; else echo "no process left after the group kill"; fi
