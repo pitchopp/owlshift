@@ -17,8 +17,9 @@ pub const GITHUB_ACCOUNT: &str = "github";
 
 /// The GitHub adapter for `repo`, with its token read from `keychain`.
 ///
-/// No command calls it yet: `owlshift do` (OWL-20) and the writer (OWL-18)
-/// will, and `owlshift init` (OWL-20) will store the token.
+/// No command calls it yet: `owlshift do` (OWL-20) will, to open the pull
+/// request and read the check set the [writer](crate::writer) reports;
+/// `owlshift init` (OWL-20) will store the token.
 pub fn github(keychain: &Keychain, repo: Repo) -> Result<GitHubForge, String> {
     match keychain.read(GITHUB_ACCOUNT) {
         Ok(Some(token)) => Ok(GitHubForge::new(Token::new(token.expose()), repo)),

@@ -8,3 +8,4 @@ pub mod doctor;
 pub mod forge;
 pub mod system;
 pub mod tracker;
+pub mod writer;
