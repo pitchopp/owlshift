@@ -17,7 +17,10 @@ fn fixture(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    // A checkout may turn line endings into CRLF; the tests assume LF.
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 fn committed_schema(stem: &str) -> Value {
@@ -122,4 +125,32 @@ fn result_schema_carries_the_expressible_rules() {
     out_of_order["questions"] = json!([question("Q2")]);
     assert!(validator.is_valid(&out_of_order));
     assert!(owlshift_contracts::result::RunResult::parse(&out_of_order.to_string()).is_err());
+
+    // The artifact path pattern agrees with the Rust check.
+    for path in [
+        "plan.md",
+        ".owlshift/plan.md",
+        "./plan.md",
+        "..plan/x",
+        "a/.../b",
+        "",
+        "/etc/passwd",
+        "../x",
+        "a/../b",
+        "a/..",
+        "a//b",
+        "a/",
+        "C:/x",
+        "\\\\server\\share",
+        "a\\b",
+        "a:b",
+    ] {
+        let mut result = base("done");
+        result["artifacts"] = json!({ "plan": path });
+        assert_eq!(
+            validator.is_valid(&result),
+            owlshift_contracts::ids::RelativePath::new(path).is_ok(),
+            "schema and type disagree on {path:?}"
+        );
+    }
 }

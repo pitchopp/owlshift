@@ -109,31 +109,47 @@
   ],
   "$defs": {
     "Artifacts": {
-      "description": "Artifacts left by the run, as paths relative to the worktree. Their\ncontent formats are defined by the roles that write them.",
+      "description": "Artifacts left by the run, as paths relative to the worktree that cannot\nleave it. Their content formats are defined by the roles that write them.",
       "type": "object",
       "properties": {
         "findings": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativePath"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "ledger": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativePath"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "plan": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativePath"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "report": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativePath"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -273,6 +289,11 @@
       "description": "A question's identifier within a round: Q1, Q2, and so on.",
       "type": "string",
       "pattern": "^Q[1-9][0-9]*$"
+    },
+    "RelativePath": {
+      "description": "A path relative to the worktree: '/'-separated segments, none empty or '..', with no backslash or colon.",
+      "type": "string",
+      "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
     },
     "Status": {
       "description": "How a run ended.",

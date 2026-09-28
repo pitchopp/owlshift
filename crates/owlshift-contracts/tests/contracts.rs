@@ -15,11 +15,38 @@ use owlshift_contracts::refs::{Claim, TicketState, claim_ref, ticket_ref};
 use owlshift_contracts::result::{RunResult, Status};
 use serde_json::{Value, json};
 
+/// Artifact paths that could leave the worktree, on any platform.
+const BAD_PATHS: [&str; 13] = [
+    "",
+    "/etc/passwd",
+    "../../secrets",
+    "plans/../../x",
+    "plans/..",
+    "a//b",
+    "a/",
+    "C:/Windows",
+    "C:plan.md",
+    "\\\\server\\share\\x",
+    "\\Windows",
+    "plans\\..\\..\\x",
+    "plan.md:stream",
+];
+const GOOD_PATHS: [&str; 5] = [
+    "plan.md",
+    ".owlshift/plan.md",
+    "./plan.md",
+    "..plan/notes.md",
+    "a/.../b",
+];
+
 fn fixture(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    // A checkout may turn line endings into CRLF; the tests assume LF.
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 /// Parses, renders, parses again, and requires the two values to be equal.
@@ -179,6 +206,20 @@ fn result_rejections() {
             ..
         })
     ));
+    // Artifact paths come from a model: they must stay inside the worktree.
+    for path in BAD_PATHS {
+        let input = edited("result-sample.json", |v| {
+            v["artifacts"]["plan"] = json!(path)
+        });
+        rejects(path, RunResult::parse(&input), "invalid relative path");
+    }
+    for path in GOOD_PATHS {
+        let input = edited("result-sample.json", |v| {
+            v["artifacts"]["report"] = json!(path)
+        });
+        let result = RunResult::parse(&input).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(result.artifacts.report.unwrap().as_str(), path);
+    }
     // Deserializing the type directly still refuses another format.
     let direct = serde_json::from_str::<RunResult>(&newer).unwrap_err();
     assert!(direct.to_string().contains("upgrade Owlshift"));
@@ -234,6 +275,33 @@ fn brief_rejections() {
             v["thread"][2]["questions"].as_array_mut().unwrap().push(q);
         }),
         "repeated or out of order",
+    );
+    rejects(
+        "re-ask of a question the round did not ask",
+        parse(|v| v["thread"][2]["questions"][0]["id"] = json!("Q3")),
+        "was not asked in that round",
+    );
+    rejects(
+        "re-ask of a round that does not exist",
+        parse(|v| v["thread"][2]["round"] = json!(2)),
+        "not earlier in the thread",
+    );
+    rejects(
+        "re-ask before its round",
+        parse(|v| {
+            let thread = v["thread"].as_array_mut().unwrap();
+            let reask = thread.remove(2);
+            thread.insert(0, reask);
+        }),
+        "not earlier in the thread",
+    );
+    rejects(
+        "rounds not increasing",
+        parse(|v| {
+            let round = v["thread"][0].clone();
+            v["thread"].as_array_mut().unwrap().push(round);
+        }),
+        "round 1 comes after round 1",
     );
     rejects(
         "bad relation",

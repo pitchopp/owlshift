@@ -1,5 +1,6 @@
 //! The brief: everything the runner hands a role for one run.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use jiff::Timestamp;
@@ -156,9 +157,12 @@ impl Brief {
         format::render_json(self)
     }
 
-    /// Checks the rules the types alone do not carry: a round's questions are
-    /// Q1..Qn, and a re-ask names distinct questions in order.
+    /// Checks the rules the types alone do not carry: rounds increase through
+    /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
+    /// order, distinct questions of an earlier round.
     pub fn validate(&self) -> Result<(), ContractError> {
+        // The number of questions of each round seen so far.
+        let mut rounds: BTreeMap<NonZeroU32, usize> = BTreeMap::new();
         for entry in &self.thread {
             match entry {
                 ThreadEntry::Questions {
@@ -170,7 +174,16 @@ impl Brief {
                             format!("round {round} has no question"),
                         ));
                     }
+                    if let Some((last, _)) = rounds.last_key_value()
+                        && last >= round
+                    {
+                        return Err(ContractError::invalid(
+                            CONTRACT,
+                            format!("round {round} comes after round {last}"),
+                        ));
+                    }
                     check_question_order(CONTRACT, questions)?;
+                    rounds.insert(*round, questions.len());
                 }
                 ThreadEntry::Reask {
                     round, questions, ..
@@ -181,8 +194,23 @@ impl Brief {
                             format!("re-ask of round {round} has no question"),
                         ));
                     }
+                    let Some(&asked) = rounds.get(round) else {
+                        return Err(ContractError::invalid(
+                            CONTRACT,
+                            format!("re-ask of round {round}, which is not earlier in the thread"),
+                        ));
+                    };
                     let mut previous: Option<&QuestionId> = None;
                     for question in questions {
+                        if usize::try_from(question.id.number()).map_or(true, |n| n > asked) {
+                            return Err(ContractError::invalid(
+                                CONTRACT,
+                                format!(
+                                    "re-ask of round {round}: question {} was not asked in that round",
+                                    question.id
+                                ),
+                            ));
+                        }
                         if previous.is_some_and(|p| p.number() >= question.id.number()) {
                             return Err(ContractError::invalid(
                                 CONTRACT,

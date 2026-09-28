@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::format::{self, ContractError, Format, RESULT_FORMAT};
-use crate::ids::QuestionId;
+use crate::ids::{QuestionId, RelativePath};
 
 const CONTRACT: &str = "result.json";
 
@@ -102,19 +102,19 @@ pub enum FollowupSource {
     Ci,
 }
 
-/// Artifacts left by the run, as paths relative to the worktree. Their
-/// content formats are defined by the roles that write them.
+/// Artifacts left by the run, as paths relative to the worktree that cannot
+/// leave it. Their content formats are defined by the roles that write them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Artifacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
+    pub plan: Option<RelativePath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ledger: Option<String>,
+    pub ledger: Option<RelativePath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub findings: Option<String>,
+    pub findings: Option<RelativePath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub report: Option<String>,
+    pub report: Option<RelativePath>,
 }
 
 /// The pull request the runner opens for a finished ticket.

@@ -1,4 +1,4 @@
-//! Validated identifiers carried by several contracts.
+//! Validated identifiers and paths carried by several contracts.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub const TICKET_ID_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$";
 /// The JSON Schema pattern of a [`QuestionId`].
 pub const QUESTION_ID_PATTERN: &str = "^Q[1-9][0-9]*$";
+/// The JSON Schema pattern of a [`RelativePath`]: `/`-separated segments,
+/// none empty or `..`, and no backslash or colon anywhere.
+pub const RELATIVE_PATH_PATTERN: &str = r"^(?:[^/\\:.][^/\\:]*|\.(?:[^/\\:.][^/\\:]*)?|\.\.[^/\\:]+)(?:/(?:[^/\\:.][^/\\:]*|\.(?:[^/\\:.][^/\\:]*)?|\.\.[^/\\:]+))*$";
 
 /// A tracker's ticket identifier, safe to use as a git ref component and a
 /// file name: an ASCII letter or digit, then up to 63 letters, digits, `_` or
@@ -71,6 +74,37 @@ impl QuestionId {
     /// The question's number: 1 for `Q1`.
     pub fn number(&self) -> u32 {
         self.0[1..].parse().expect("validated at construction")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A path relative to the worktree, from untrusted input, that cannot leave
+/// it: `/`-separated segments, none empty or `..`. A backslash or a colon is
+/// refused anywhere, which also rules out absolute, drive-prefixed and UNC
+/// paths on every platform.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RelativePath(String);
+
+impl RelativePath {
+    pub fn new(path: impl Into<String>) -> Result<Self, IdError> {
+        let path = path.into();
+        let valid = !path.contains(['\\', ':'])
+            && path
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "..");
+        if valid {
+            Ok(Self(path))
+        } else {
+            Err(IdError {
+                kind: "relative path",
+                value: path,
+                pattern: RELATIVE_PATH_PATTERN,
+            })
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -144,4 +178,9 @@ string_id!(
     QuestionId,
     QUESTION_ID_PATTERN,
     "A question's identifier within a round: Q1, Q2, and so on."
+);
+string_id!(
+    RelativePath,
+    RELATIVE_PATH_PATTERN,
+    "A path relative to the worktree: '/'-separated segments, none empty or '..', with no backslash or colon."
 );
