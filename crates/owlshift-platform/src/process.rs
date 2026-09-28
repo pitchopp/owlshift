@@ -50,7 +50,7 @@ impl Captured {
 /// Why a program gave no result.
 #[derive(Debug)]
 pub enum RunError {
-    /// It could not be started or watched.
+    /// It could not be started or watched, or its output could not be read.
     Io(io::Error),
     /// It, or a process holding its output open, outlived the deadline.
     TimedOut,
@@ -158,10 +158,11 @@ pub fn run_command(
             }
         }
     };
-    let receive = |stream: Receiver<Vec<u8>>| {
+    let receive = |stream: Receiver<io::Result<Vec<u8>>>| {
         stream
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| RunError::TimedOut)
+            .map_err(|_| RunError::TimedOut)?
+            .map_err(RunError::Io)
     };
     let output = receive(stdout).and_then(|stdout| Ok((stdout, receive(stderr)?)));
     match output {
@@ -171,7 +172,8 @@ pub fn run_command(
             stderr,
         }),
         Err(error) => {
-            // The program is gone, but a process it started holds the output.
+            // The program is gone, but a process it started holds the output,
+            // or the output could not be read whole: never a partial result.
             stop(&mut child, &tree);
             Err(error)
         }
@@ -203,11 +205,16 @@ fn probe_command(program: &Path, args: &[&str], cwd: Option<&Path>) -> Command {
 }
 
 /// Reads a stream to its end on its own thread, keeping the first `cap`
-/// bytes, and sends them once the stream closes.
-fn read_capped(stream: Option<impl Read + Send + 'static>, cap: usize) -> Receiver<Vec<u8>> {
+/// bytes, and sends them once the stream closes, or sends the error that
+/// stopped the reading: what was read before it is not a whole output.
+fn read_capped(
+    stream: Option<impl Read + Send + 'static>,
+    cap: usize,
+) -> Receiver<io::Result<Vec<u8>>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut kept = Vec::new();
+        let mut outcome = Ok(());
         if let Some(mut stream) = stream {
             let mut buffer = [0u8; 8192];
             loop {
@@ -218,12 +225,15 @@ fn read_capped(stream: Option<impl Read + Send + 'static>, cap: usize) -> Receiv
                         kept.extend_from_slice(&buffer[..n.min(room)]);
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
                 }
             }
         }
         // The receiver is gone when the run timed out: nothing to report.
-        let _ = sender.send(kept);
+        let _ = sender.send(outcome.map(|()| kept));
     });
     receiver
 }
@@ -388,6 +398,27 @@ mod tests {
         let captured = helper("helper_flood", None, Duration::from_secs(30)).unwrap();
         assert_eq!(captured.code, Some(0));
         assert_eq!(captured.stdout.len(), OUTPUT_CAP);
+    }
+
+    /// A stream that gives some bytes, then fails.
+    struct Failing(bool);
+
+    impl Read for Failing {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if std::mem::replace(&mut self.0, true) {
+                Err(io::Error::other("broken"))
+            } else {
+                buffer[..4].copy_from_slice(b"part");
+                Ok(4)
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_error_is_reported_not_a_partial_output() {
+        let read = read_capped(Some(Failing(false)), usize::MAX);
+        let outcome = read.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(outcome.unwrap_err().to_string(), "broken");
     }
 
     #[test]
