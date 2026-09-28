@@ -231,8 +231,9 @@ impl DeliveryReport {
         }
         let merge_state = flatten(&set.merge_state);
         if !merge_state.is_empty() {
+            // A blank line, or Markdown folds it into the last list item.
             section.push_str(&format!(
-                "\nMerge state reported by the forge: {}.",
+                "\n\nMerge state reported by the forge: {}.",
                 code(&merge_state)
             ));
         }
@@ -482,6 +483,7 @@ Posts the delivery report on the ticket.
 **Checks:** green: all 2 checks passed and the pull request has no conflict.
 - `test (ubuntu)`: passed (`SUCCESS`), required, [details](https://github.com/pitchopp/owlshift/runs/13)
 - `lint`: passed (`SKIPPED`), [details](https://github.com/pitchopp/owlshift/runs/4)
+
 Merge state reported by the forge: `CLEAN`.
 
 **Project gate:** passed: `cargo fmt --check`, `cargo test`.
