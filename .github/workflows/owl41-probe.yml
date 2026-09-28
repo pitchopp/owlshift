@@ -25,7 +25,8 @@ jobs:
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces 2>&1 || true
           ls /etc/apparmor.d | grep -i -E 'bwrap|unpriv|userns' || echo "no bwrap or userns AppArmor profile"
       - name: Unprivileged user namespace without bwrap
-        run: unshare -Ur true && echo "unshare -Ur: ok" || echo "unshare -Ur: failed ($?)"
+        run: |
+          unshare -Ur true && echo "unshare -Ur: ok" || echo "unshare -Ur: failed ($?)"
       - name: bwrap as shipped
         run: |
           if command -v bwrap; then bwrap --version; else echo "bwrap not installed on the image"; fi
