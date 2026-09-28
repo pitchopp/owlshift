@@ -60,7 +60,13 @@ impl Drop for Cleanup<'_> {
             let status = Command::new("git")
                 .arg("-C")
                 .arg(self.checkout)
-                .args(["push", "--quiet", "origin", "--delete", self.branch.as_str()])
+                .args([
+                    "push",
+                    "--quiet",
+                    "origin",
+                    "--delete",
+                    self.branch.as_str(),
+                ])
                 .status();
             eprintln!("deleting {}: {status:?}", self.branch);
         }
@@ -80,7 +86,9 @@ fn delivers_a_branch_as_a_pull_request_on_a_test_repository() {
     let dir = tempfile::tempdir().unwrap();
     let checkout = dir.path().join("checkout");
     let status = Command::new("git")
-        .args(["clone", "--quiet", "--depth", "1", "--branch", "main", &remote])
+        .args([
+            "clone", "--quiet", "--depth", "1", "--branch", "main", &remote,
+        ])
         .arg(&checkout)
         .status()
         .unwrap();

@@ -33,11 +33,11 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-pub use crate::graphql::{Response, Transport};
 use crate::forge::{
     Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId, Error, ErrorKind,
     Mergeable, PrState, PullRequest, Repo,
 };
+pub use crate::graphql::{Response, Transport};
 
 /// GitHub's GraphQL endpoint.
 pub const ENDPOINT: &str = "https://api.github.com/graphql";
@@ -374,7 +374,10 @@ fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
             _ => ErrorKind::Other,
         };
         let code = error.kind.as_deref().unwrap_or("no type");
-        return Err(Error::new(kind, format!("GitHub: {code}: {}", error.message)));
+        return Err(Error::new(
+            kind,
+            format!("GitHub: {code}: {}", error.message),
+        ));
     }
     if response.status != 200 {
         let message = envelope.message.unwrap_or_default();
@@ -716,10 +719,16 @@ mod tests {
         let unprocessable = r#"{"data":{"createPullRequest":null},"errors":[{"type":"UNPROCESSABLE","message":"A pull request already exists"}]}"#;
         let e = error(200, unprocessable);
         assert_eq!(e.kind, ErrorKind::Other);
-        assert_eq!(e.message, "GitHub: UNPROCESSABLE: A pull request already exists");
+        assert_eq!(
+            e.message,
+            "GitHub: UNPROCESSABLE: A pull request already exists"
+        );
         let limited = error(403, r#"{"message":"API rate limit exceeded"}"#);
         assert_eq!(limited.kind, ErrorKind::Other);
-        assert!(limited.message.contains("403 API rate limit exceeded"), "{limited}");
+        assert!(
+            limited.message.contains("403 API rate limit exceeded"),
+            "{limited}"
+        );
         assert_eq!(error(502, "<html>").kind, ErrorKind::Other);
         assert_eq!(error(200, r#"{"data":null}"#).kind, ErrorKind::Other);
     }
@@ -745,7 +754,11 @@ mod tests {
             ("REQUESTED", None, Pending),
             ("PENDING", None, Pending),
         ] {
-            assert_eq!(check_run_state(status, conclusion), expected, "{status} {conclusion:?}");
+            assert_eq!(
+                check_run_state(status, conclusion),
+                expected,
+                "{status} {conclusion:?}"
+            );
         }
         for (state, expected) in [
             ("SUCCESS", Passed),
@@ -838,15 +851,30 @@ mod tests {
         let e = check(vec![page(HEAD, OTHER, 1, RUN, None)]).unwrap_err();
         assert_eq!(e.kind, ErrorKind::HeadMoved, "{e}");
         // The head moves between pages.
-        let e = check(vec![page(HEAD, HEAD, 2, RUN, Some("c1")), page(OTHER, OTHER, 2, RUN, None)])
-            .unwrap_err();
+        let e = check(vec![
+            page(HEAD, HEAD, 2, RUN, Some("c1")),
+            page(OTHER, OTHER, 2, RUN, None),
+        ])
+        .unwrap_err();
         assert_eq!(e.kind, ErrorKind::HeadMoved, "{e}");
         // Fewer checks than GitHub counts.
         assert!(check(vec![page(HEAD, HEAD, 3, RUN, None)]).is_err());
         // The total changes between pages.
-        assert!(check(vec![page(HEAD, HEAD, 2, RUN, Some("c1")), page(HEAD, HEAD, 3, RUN, None)]).is_err());
+        assert!(
+            check(vec![
+                page(HEAD, HEAD, 2, RUN, Some("c1")),
+                page(HEAD, HEAD, 3, RUN, None)
+            ])
+            .is_err()
+        );
         // The cursor does not advance.
-        assert!(check(vec![page(HEAD, HEAD, 3, RUN, Some("c1")), page(HEAD, HEAD, 3, RUN, Some("c1"))]).is_err());
+        assert!(
+            check(vec![
+                page(HEAD, HEAD, 3, RUN, Some("c1")),
+                page(HEAD, HEAD, 3, RUN, Some("c1"))
+            ])
+            .is_err()
+        );
         // A kind of check the adapter cannot read.
         let unknown = r#"{"__typename":"SomethingNew","name":"x"}"#;
         assert!(check(vec![page(HEAD, HEAD, 1, unknown, None)]).is_err());
@@ -866,7 +894,9 @@ mod tests {
     }
 
     fn open_page(nodes: &str, total: u64) -> String {
-        format!(r#"{{"data":{{"repository":{{"pullRequests":{{"totalCount":{total},"nodes":[{nodes}]}}}}}}}}"#)
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequests":{{"totalCount":{total},"nodes":[{nodes}]}}}}}}}}"#
+        )
     }
 
     fn pr_node(number: u64, repo: &str) -> String {
@@ -884,15 +914,22 @@ mod tests {
 
         let fork = pr_node(3, "someone/owlshift");
         assert_eq!(find(open_page(&fork, 1)).unwrap(), None);
-        let found = find(open_page(&format!("{fork},{}", pr_node(4, "pitchopp/owlshift")), 2))
-            .unwrap()
-            .unwrap();
+        let found = find(open_page(
+            &format!("{fork},{}", pr_node(4, "pitchopp/owlshift")),
+            2,
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(found.number, 4);
         assert_eq!(found.state, PrState::Open);
         let deleted_fork = r#"{"number":5,"url":"u","state":"OPEN","headRefOid":"36f0557116ea73f9b0805980e83b360e23b99940","headRepository":null}"#;
         assert_eq!(find(open_page(deleted_fork, 1)).unwrap(), None);
 
-        let two = format!("{},{}", pr_node(4, "pitchopp/owlshift"), pr_node(5, "pitchopp/owlshift"));
+        let two = format!(
+            "{},{}",
+            pr_node(4, "pitchopp/owlshift"),
+            pr_node(5, "pitchopp/owlshift")
+        );
         assert!(find(open_page(&two, 2)).is_err());
         assert!(find(open_page(&pr_node(4, "pitchopp/owlshift"), 11)).is_err());
     }

@@ -86,12 +86,15 @@ pub fn read_push(branch: &Branch, output: &Output) -> Result<Pushed, PushError> 
     let target = format!("refs/heads/{branch}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     // `<flag>\t<from>:<to>\t<summary>`; Git for Windows ends lines with CRLF.
-    let line = stdout.lines().map(|l| l.trim_end_matches('\r')).find_map(|line| {
-        let mut fields = line.splitn(3, '\t');
-        let flag = fields.next()?;
-        let (_, to) = fields.next()?.split_once(':')?;
-        (to == target && flag.chars().count() == 1).then(|| (flag, fields.next().unwrap_or("")))
-    });
+    let line = stdout
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .find_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let flag = fields.next()?;
+            let (_, to) = fields.next()?.split_once(':')?;
+            (to == target && flag.chars().count() == 1).then(|| (flag, fields.next().unwrap_or("")))
+        });
     match line {
         Some(("!", summary)) => Err(PushError::Rejected {
             reason: summary.trim().to_owned(),
@@ -187,7 +190,12 @@ mod tests {
 
     #[test]
     fn the_flag_decides_and_the_text_does_not() {
-        let read = |code, flag, summary| read_push(&branch(), &output(code, &porcelain(flag, summary, "\n"), ""));
+        let read = |code, flag, summary| {
+            read_push(
+                &branch(),
+                &output(code, &porcelain(flag, summary, "\n"), ""),
+            )
+        };
         assert_eq!(read(0, "*", "[new branch]"), Ok(Pushed::Created));
         assert_eq!(read(0, " ", "aaa..bbb"), Ok(Pushed::FastForward));
         assert_eq!(read(0, "=", "[up to date]"), Ok(Pushed::UpToDate));
@@ -198,8 +206,14 @@ mod tests {
             })
         );
         // A success flag with a failed exit (a hook, a second ref) is no verdict.
-        assert!(matches!(read(1, "*", "[new branch]"), Err(PushError::Failed { .. })));
-        assert!(matches!(read(0, "+", "aaa...bbb (forced update)"), Err(PushError::Failed { .. })));
+        assert!(matches!(
+            read(1, "*", "[new branch]"),
+            Err(PushError::Failed { .. })
+        ));
+        assert!(matches!(
+            read(0, "+", "aaa...bbb (forced update)"),
+            Err(PushError::Failed { .. })
+        ));
     }
 
     #[test]
@@ -230,7 +244,10 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("Authentication failed"), "{text}");
         assert!(text.contains("https://github.com/o/r.git/"), "{text}");
-        assert!(!text.contains("ghp_secret") && !text.contains("user:"), "{text}");
+        assert!(
+            !text.contains("ghp_secret") && !text.contains("user:"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -244,15 +261,28 @@ mod tests {
     #[test]
     fn the_command_pushes_the_exact_commit_and_refuses_an_option_as_remote() {
         let commit = CommitId::new(OID).unwrap();
-        let command =
-            push_command(Path::new("git"), Path::new("."), "origin", &commit, &branch()).unwrap();
+        let command = push_command(
+            Path::new("git"),
+            Path::new("."),
+            "origin",
+            &commit,
+            &branch(),
+        )
+        .unwrap();
         let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy()).collect();
         assert_eq!(
             args,
-            ["push", "--porcelain", "origin", &format!("{OID}:refs/heads/owl-17")]
+            [
+                "push",
+                "--porcelain",
+                "origin",
+                &format!("{OID}:refs/heads/owl-17")
+            ]
         );
         for bad in ["", "--mirror"] {
-            assert!(push_command(Path::new("git"), Path::new("."), bad, &commit, &branch()).is_err());
+            assert!(
+                push_command(Path::new("git"), Path::new("."), bad, &commit, &branch()).is_err()
+            );
         }
     }
 }

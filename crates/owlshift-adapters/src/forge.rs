@@ -67,7 +67,11 @@ pub struct Repo {
 impl Repo {
     /// Parses `owner/name`.
     pub fn parse(text: &str) -> Result<Self, Error> {
-        let invalid = || invalid(format!("{text:?} is not a repository of the form owner/name"));
+        let invalid = || {
+            invalid(format!(
+                "{text:?} is not a repository of the form owner/name"
+            ))
+        };
         let (owner, name) = text.split_once('/').ok_or_else(invalid)?;
         let valid = |part: &str| {
             !part.is_empty()
@@ -126,9 +130,9 @@ pub struct Branch(String);
 impl Branch {
     pub fn new(name: impl Into<String>) -> Result<Self, Error> {
         let name = name.into();
-        let bad_component = name.split('/').any(|part| {
-            part.is_empty() || part.starts_with('.') || part.ends_with(".lock")
-        });
+        let bad_component = name
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"));
         let bad_char = name.chars().any(|c| {
             c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
         });
@@ -374,8 +378,14 @@ mod tests {
         use CheckState::*;
         use Mergeable::{Conflicting, Unknown};
         let open = |m, c: &[CheckState]| set(PrState::Open, m, c).verdict();
-        assert_eq!(open(Mergeable::Mergeable, &[Passed, Passed]), Verdict::Green);
-        assert_eq!(open(Mergeable::Mergeable, &[Passed, Pending]), Verdict::Pending);
+        assert_eq!(
+            open(Mergeable::Mergeable, &[Passed, Passed]),
+            Verdict::Green
+        );
+        assert_eq!(
+            open(Mergeable::Mergeable, &[Passed, Pending]),
+            Verdict::Pending
+        );
         assert_eq!(open(Unknown, &[Passed]), Verdict::Pending);
         // A failure wins over a check still running.
         assert_eq!(open(Mergeable::Mergeable, &[Pending, Failed]), Verdict::Red);

@@ -77,7 +77,10 @@ fn new_pull_request<'a>(head: &'a Branch, base: &'a Branch) -> NewPullRequest<'a
 #[test]
 fn reads_every_check_of_a_pull_request_across_pages() {
     let replay = Replay::of(&dir(), CHECKS);
-    let set = forge(&replay).with_check_page(1).checks(PR_16, &head()).unwrap();
+    let set = forge(&replay)
+        .with_check_page(1)
+        .checks(PR_16, &head())
+        .unwrap();
     replay.assert_done();
     assert_eq!(set.head, head());
     assert_eq!(set.state, PrState::Merged);
@@ -124,7 +127,11 @@ fn opens_a_pull_request_with_the_runners_body_verbatim() {
     // The replay checked the request, body included, against the recording.
     replay.assert_done();
     assert_eq!(pr.state, PrState::Open);
-    assert!(pr.url.ends_with(&format!("/pull/{}", pr.number)), "{}", pr.url);
+    assert!(
+        pr.url.ends_with(&format!("/pull/{}", pr.number)),
+        "{}",
+        pr.url
+    );
     let fixture = support::load(&dir(), OPEN);
     assert_eq!(
         fixture.exchanges[1].request["variables"]["input"]["body"],

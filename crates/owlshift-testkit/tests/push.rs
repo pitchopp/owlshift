@@ -80,9 +80,15 @@ fn a_branch_is_created_moved_forward_and_never_rewound() {
     assert_eq!(bench.push("origin", &first, &branch), Ok(Pushed::Created));
     assert_eq!(bench.remote_branch(&branch), first.as_str());
     assert_eq!(bench.push("origin", &first, &branch), Ok(Pushed::UpToDate));
-    assert_eq!(bench.push("origin", &second, &branch), Ok(Pushed::FastForward));
+    assert_eq!(
+        bench.push("origin", &second, &branch),
+        Ok(Pushed::FastForward)
+    );
     let rejected = bench.push("origin", &first, &branch).unwrap_err();
-    assert!(matches!(rejected, PushError::Rejected { .. }), "{rejected:?}");
+    assert!(
+        matches!(rejected, PushError::Rejected { .. }),
+        "{rejected:?}"
+    );
     assert_eq!(bench.remote_branch(&branch), second.as_str());
 }
 
