@@ -41,6 +41,12 @@ impl std::error::Error for RoleLoadError {
     }
 }
 
+/// The default build role prompt, `roles/build.md`, as this binary was built
+/// with it: what `owlshift do` hands Claude Code, once
+/// [`format::strip_role_front_matter`] has checked and removed its front
+/// matter.
+pub const BUILD_ROLE: &str = include_str!("../../../roles/build.md");
+
 /// Reads `<roles_dir>/<role>.md` and strips its front matter, per
 /// [`owlshift_contracts::format::strip_role_front_matter`].
 pub fn load_role_prompt(roles_dir: &Path, role: Role) -> Result<String, RoleLoadError> {
@@ -75,6 +81,12 @@ mod tests {
         fs::write(dir.path().join("build.md"), valid()).expect("write");
         let prompt = load_role_prompt(dir.path(), Role::Build).expect("load");
         assert_eq!(prompt, "# Build\n\nDo it.\n");
+    }
+
+    #[test]
+    fn the_built_in_build_prompt_matches_this_binarys_contracts() {
+        let prompt = format::strip_role_front_matter(Role::Build, BUILD_ROLE).expect("strips");
+        assert!(prompt.trim_start().starts_with("# Build"), "{prompt}");
     }
 
     #[test]

@@ -23,18 +23,43 @@ pub fn personal_config_file() -> Option<PathBuf> {
     resolve(std::env::var_os("OWLSHIFT_CONFIG_DIR"), dirs::config_dir())
 }
 
+/// Owlshift's data directory: the dedicated clones, worktrees and run logs of
+/// `owlshift do`, and the event log. That is `owlshift` in the user's local
+/// data directory: `~/Library/Application Support` on macOS,
+/// `$XDG_DATA_HOME` or `~/.local/share` on Linux, `%LOCALAPPDATA%` on
+/// Windows.
+///
+/// `OWLSHIFT_DATA_DIR`, when set to a non-empty absolute path, is used as is
+/// instead, on every platform, by the same rule as `OWLSHIFT_CONFIG_DIR`.
+///
+/// `None` when there is no override and the platform reports no data
+/// directory.
+pub fn data_dir() -> Option<PathBuf> {
+    resolve_data(std::env::var_os("OWLSHIFT_DATA_DIR"), dirs::data_local_dir())
+}
+
 /// `override_dir`: `OWLSHIFT_CONFIG_DIR` as read from the environment.
 /// Unset, empty or relative means "no override". `config_dir`: the
 /// platform's parent configuration directory, as `dirs::config_dir()`
 /// reports it.
 fn resolve(override_dir: Option<OsString>, config_dir: Option<PathBuf>) -> Option<PathBuf> {
-    let overridden = override_dir
-        .map(PathBuf::from)
-        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute());
-    match overridden {
+    match absolute(override_dir) {
         Some(dir) => Some(dir.join("config.toml")),
         None => config_dir.map(|dir| dir.join("owlshift").join("config.toml")),
     }
+}
+
+/// `override_dir`: `OWLSHIFT_DATA_DIR`; `data_dir`: the platform's local data
+/// directory, as `dirs::data_local_dir()` reports it.
+fn resolve_data(override_dir: Option<OsString>, data_dir: Option<PathBuf>) -> Option<PathBuf> {
+    absolute(override_dir).or_else(|| data_dir.map(|dir| dir.join("owlshift")))
+}
+
+/// An override that counts: set, non-empty and absolute.
+fn absolute(value: Option<OsString>) -> Option<PathBuf> {
+    value
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())
 }
 
 #[cfg(test)]
@@ -112,5 +137,26 @@ mod tests {
     #[test]
     fn override_relative_with_no_config_dir_is_none() {
         assert_eq!(resolve(Some(OsString::from("relative")), None), None);
+    }
+
+    #[test]
+    fn the_data_directory_follows_the_same_override_rule() {
+        let (over, local) = if cfg!(windows) {
+            (r"C:\owlshift-data", r"C:\Users\test\AppData\Local")
+        } else {
+            ("/tmp/owlshift-data", "/home/test/.local/share")
+        };
+        let local = PathBuf::from(local);
+        assert_eq!(
+            resolve_data(Some(over.into()), Some(local.clone())),
+            Some(PathBuf::from(over))
+        );
+        for ignored in [None, Some(OsString::new()), Some("relative".into())] {
+            assert_eq!(
+                resolve_data(ignored, Some(local.clone())),
+                Some(local.join("owlshift"))
+            );
+        }
+        assert_eq!(resolve_data(None, None), None);
     }
 }

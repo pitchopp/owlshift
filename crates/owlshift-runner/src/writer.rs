@@ -2,15 +2,23 @@
 //! (architecture section 5, step 4). It asks the policy floor before each
 //! write ([`floor::check_action`]).
 //!
-//! This build has one write, the delivery report: a marked
-//! `[owlshift] DELIVERY` comment on the ticket once its pull request is open,
-//! so the person sees what was delivered without a terminal (principle 1).
-//! `owlshift do` (OWL-20) opens the adapters and calls it.
+//! This build has three writes, all made by `owlshift do` (OWL-20) once a
+//! Build run is done and the runner's own run of the project gate passed:
+//! pushing the gated commit to the ticket's branch
+//! ([`Writer::push_branch`]), opening the ticket's pull request, or finding
+//! the one already open ([`Writer::open_pull_request`]), and the delivery
+//! report: a marked `[owlshift] DELIVERY` comment on the ticket once its pull
+//! request is open, so the person sees what was delivered without a
+//! terminal (principle 1). There is no merge.
 
+use std::ffi::OsStr;
 use std::fmt;
+use std::path::Path;
 
+use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
+use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push};
 use owlshift_adapters::forge::{
-    self, CheckSet, CheckState, Mergeable, PrState, PullRequest, Verdict,
+    self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
 use owlshift_adapters::tracker::{Comment, Error as TrackerError, Tracker};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
@@ -18,6 +26,8 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::result::{Decision, Followup};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
+
+use crate::executor::Git;
 
 /// What the delivery report says about one ticket.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +349,72 @@ impl<'a> Writer<'a> {
         Self { tracker }
     }
 
+    /// Pushes exactly `commit` to `branch` on `remote`, from `worktree`,
+    /// with the runner's own git and the person's own git credentials: the
+    /// commit the gate passed on, never whatever the branch points to by
+    /// then. A plain push, never a force: the remote refuses anything but
+    /// creating the branch or moving it forward
+    /// (`owlshift_adapters::forge::push`).
+    pub fn push_branch(
+        &self,
+        git: &Git,
+        worktree: &Path,
+        remote: &str,
+        commit: &CommitId,
+        branch: &Branch,
+    ) -> Result<Pushed, WriteError> {
+        floor::check_action(Action::PushBranch, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        // The adapter builds the arguments; the runner's git runs them, so a
+        // test bench's hermetic setup applies to the push too.
+        let command = push_command(Path::new("git"), worktree, remote, commit, branch)
+            .map_err(WriteError::Push)?;
+        let args: Vec<&OsStr> = command.get_args().collect();
+        let output = git.output(worktree, &args, None).map_err(|error| {
+            WriteError::Push(PushError::Failed {
+                message: error.to_string(),
+            })
+        })?;
+        read_push(branch, &output).map_err(WriteError::Push)
+    }
+
+    /// Opens the pull request of `head` into `base` with the run's title and
+    /// body, or returns the one already open, so a second delivery of the
+    /// same ticket never opens a second pull request. An open one keeps its
+    /// title and body.
+    pub fn open_pull_request(
+        &self,
+        forge: &GitHubForge,
+        head: &Branch,
+        base: &Branch,
+        title: &str,
+        body: &str,
+    ) -> Result<OpenedPullRequest, WriteError> {
+        floor::check_action(Action::OpenPullRequest, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        if let Some(pull_request) = forge
+            .find_open_pull_request(head, base)
+            .map_err(WriteError::Forge)?
+        {
+            return Ok(OpenedPullRequest {
+                pull_request,
+                opened: false,
+            });
+        }
+        let pull_request = forge
+            .open_pull_request(NewPullRequest {
+                head,
+                base,
+                title,
+                body,
+                draft: false,
+            })
+            .map_err(WriteError::Forge)?;
+        Ok(OpenedPullRequest {
+            pull_request,
+            opened: true,
+        })
+    }
+
     /// Posts the delivery report on its ticket and returns the comment.
     ///
     /// When the ticket's newest delivery report already has exactly this
@@ -375,6 +451,14 @@ fn is_delivery(body: &str) -> bool {
     )
 }
 
+/// The ticket's pull request, and whether this call opened it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedPullRequest {
+    pub pull_request: PullRequest,
+    /// `false` when it was already open.
+    pub opened: bool,
+}
+
 /// A write the Writer did not make.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteError {
@@ -382,6 +466,10 @@ pub enum WriteError {
     Floor(FloorViolation),
     /// The tracker failed.
     Tracker(TrackerError),
+    /// The forge failed.
+    Forge(forge::Error),
+    /// The push did not land.
+    Push(PushError),
 }
 
 impl fmt::Display for WriteError {
@@ -389,6 +477,8 @@ impl fmt::Display for WriteError {
         match self {
             Self::Floor(violation) => write!(f, "refused by the policy floor: {violation}"),
             Self::Tracker(error) => write!(f, "tracker: {error}"),
+            Self::Forge(error) => write!(f, "forge: {error}"),
+            Self::Push(error) => error.fmt(f),
         }
     }
 }

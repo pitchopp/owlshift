@@ -10,22 +10,24 @@ use owlshift_adapters::forge::github::{GitHubForge, Token};
 use owlshift_platform::keychain::{Keychain, SERVICE};
 
 /// The keychain account, under [`SERVICE`], that holds the GitHub token: one
-/// token per machine for now. A fine-grained token needs pull requests
-/// (write), checks and commit statuses (read) and metadata (read) on the
-/// project's repository; the output of `gh auth token` also works.
+/// token per machine for now. [`GITHUB_TOKEN_HELP`] says what it needs.
 pub const GITHUB_ACCOUNT: &str = "github";
 
-/// The GitHub adapter for `repo`, with its token read from `keychain`.
-///
-/// No command calls it yet: `owlshift do` (OWL-20) will, to open the pull
-/// request and read the check set the [writer](crate::writer) reports;
-/// `owlshift init` (OWL-20) will store the token.
+/// What the GitHub token must allow, as `owlshift init` tells its user.
+pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (write), checks, \
+     commit statuses and metadata (read) on the project's repository; the output of \
+     `gh auth token` also works";
+
+/// The GitHub adapter for `repo`, with its token read from `keychain`:
+/// `owlshift do` opens the pull request and reads the check set the
+/// [writer](crate::writer) reports with it; `owlshift init` stores the
+/// token.
 pub fn github(keychain: &Keychain, repo: Repo) -> Result<GitHubForge, String> {
     match keychain.read(GITHUB_ACCOUNT) {
         Ok(Some(token)) => Ok(GitHubForge::new(Token::new(token.expose()), repo)),
         Ok(None) => Err(format!(
-            "no GitHub token in the system keychain: store one under service \
-             `{SERVICE}`, account `{GITHUB_ACCOUNT}`"
+            "no GitHub token in the system keychain: run `owlshift init` in a terminal, or \
+             store one under service `{SERVICE}`, account `{GITHUB_ACCOUNT}`"
         )),
         Err(error) => Err(error.to_string()),
     }
