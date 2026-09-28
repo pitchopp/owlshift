@@ -12,15 +12,18 @@ use std::process::{Command, Output};
 /// personal `config.toml` directly (`owlshift_platform::paths`) — this
 /// redirects the personal file deterministically on every platform,
 /// including Windows, where `dirs::config_dir()` reads the OS known-folder
-/// API and ignores environment variables. `HOME` is set too, but only to
-/// isolate the real `git rev-parse` subprocess this binary shells out to
-/// from the host's own `~/.gitconfig`; it plays no part in resolving the
-/// personal configuration file anymore.
+/// API and ignores environment variables. `HOME` and `XDG_CONFIG_HOME` are
+/// set too, but only to isolate the real `git rev-parse` subprocess this
+/// binary shells out to from the host's own git configuration — git reads
+/// `$XDG_CONFIG_HOME/git/config` independently of `HOME`, so both are needed
+/// for that isolation; neither plays a part in resolving the personal
+/// configuration file anymore.
 fn owlshift(dir: &Path, config_dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_owlshift"))
         .args(args)
         .current_dir(dir)
         .env("HOME", config_dir)
+        .env("XDG_CONFIG_HOME", config_dir)
         .env("OWLSHIFT_CONFIG_DIR", config_dir)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
