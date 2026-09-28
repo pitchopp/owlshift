@@ -46,7 +46,7 @@ use owlshift_contracts::brief::{
 use owlshift_contracts::comment::{Footer, Header, MarkerKind};
 use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::result::{self, RunResult};
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::pipeline::Pipeline;
@@ -516,7 +516,8 @@ impl Driver {
                 network: false,
                 browser: false,
             },
-            result_path: RESULT_PATH.to_owned(),
+            result_path: RelativePath::new(RESULT_PATH)
+                .expect("RESULT_PATH is a valid relative path"),
         })
     }
 

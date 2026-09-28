@@ -41,7 +41,7 @@
     },
     "result_path": {
       "description": "Where the role writes `result.json`, relative to the worktree.",
-      "type": "string"
+      "$ref": "#/$defs/RelativePath"
     },
     "role": {
       "$ref": "#/$defs/Role"
@@ -107,15 +107,23 @@
       "type": "object",
       "properties": {
         "ledger": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativePath"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "plan": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativePath"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -203,6 +211,11 @@
         "owlshift",
         "other"
       ]
+    },
+    "RelativePath": {
+      "description": "A path relative to the worktree: '/'-separated segments, none empty or '..', with no backslash or colon.",
+      "type": "string",
+      "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
     },
     "Role": {
       "description": "What a run executes: a stage's role, or one of the runner's helper roles.",
