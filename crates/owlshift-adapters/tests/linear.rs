@@ -36,7 +36,11 @@ fn reads_an_assigned_ticket() {
         .unwrap();
     replay.assert_done();
     assert_eq!(ticket.id, owl_11());
-    assert!(ticket.title.starts_with("Build the test harness"), "{}", ticket.title);
+    assert!(
+        ticket.title.starts_with("Build the test harness"),
+        "{}",
+        ticket.title
+    );
     assert!(!ticket.description.is_empty());
     assert_eq!(ticket.priority, Priority::High);
     assert_eq!(ticket.assignee, Some(maintainer()));
@@ -104,7 +108,9 @@ fn assert_no_real_account(value: &serde_json::Value, path: &std::path::Path) {
             }
             map.values().for_each(|v| assert_no_real_account(v, path));
         }
-        serde_json::Value::Array(items) => items.iter().for_each(|v| assert_no_real_account(v, path)),
+        serde_json::Value::Array(items) => {
+            items.iter().for_each(|v| assert_no_real_account(v, path))
+        }
         _ => {}
     }
 }
@@ -116,7 +122,10 @@ fn assert_no_real_account(value: &serde_json::Value, path: &std::path::Path) {
 fn record_read_fixtures() {
     let key = support::live_key();
     support::assert_owlshift_workspace(&key);
-    let recorded = format!("{} on the Owlshift workspace, recorded live", jiff::Zoned::now().date());
+    let recorded = format!(
+        "{} on the Owlshift workspace, recorded live",
+        jiff::Zoned::now().date()
+    );
 
     let recorder = Recorder::new(&key);
     LinearTracker::with_transport(recorder.clone())

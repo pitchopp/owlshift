@@ -141,7 +141,10 @@ mod tests {
 
         keychain.store("linear", &Secret::new("first")).unwrap();
         keychain.store("linear", &Secret::new("second")).unwrap();
-        assert_eq!(keychain.read("linear").unwrap(), Some(Secret::new("second")));
+        assert_eq!(
+            keychain.read("linear").unwrap(),
+            Some(Secret::new("second"))
+        );
         assert_eq!(keychain.read("github").unwrap(), None);
 
         assert!(keychain.delete("linear").unwrap());

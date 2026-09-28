@@ -74,13 +74,21 @@ fn check(tracker: &dyn Tracker, case: &Case) {
 
     let posted = tracker.post_comment(&case.existing, case.body).unwrap();
     assert_eq!(posted.body, case.body);
-    assert!(matches!(posted.author, Author::Account(_)), "{:?}", posted.author);
+    assert!(
+        matches!(posted.author, Author::Account(_)),
+        "{:?}",
+        posted.author
+    );
     assert_eq!(posted.edited_at, None);
 
     let after = tracker.comments(&case.existing).unwrap();
     assert_eq!(after.len(), before.len() + 1);
     assert_eq!(after[..before.len()], before[..]);
-    assert_eq!(after.last(), Some(&posted), "the posted comment reads back, last");
+    assert_eq!(
+        after.last(),
+        Some(&posted),
+        "the posted comment reads back, last"
+    );
 }
 
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
@@ -98,8 +106,16 @@ fn the_markdown_tracker_conforms() {
          Say hello in the README.\n",
     )
     .unwrap();
-    fs::write(dir.join("comments/20260927T090000Z-reporter.md"), "First.\n").unwrap();
-    fs::write(dir.join("comments/20260927T100000Z-maintainer.md"), "Second.\n").unwrap();
+    fs::write(
+        dir.join("comments/20260927T090000Z-reporter.md"),
+        "First.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("comments/20260927T100000Z-maintainer.md"),
+        "Second.\n",
+    )
+    .unwrap();
 
     let case = Case {
         existing: id("DEMO-1"),
@@ -135,7 +151,10 @@ const LINEAR_FIXTURE: &str = "conformance.json";
 #[test]
 fn the_linear_tracker_conforms() {
     let replay = Replay::new(LINEAR_FIXTURE);
-    check(&LinearTracker::with_transport(replay.clone()), &linear_case());
+    check(
+        &LinearTracker::with_transport(replay.clone()),
+        &linear_case(),
+    );
     replay.assert_done();
 }
 
@@ -159,7 +178,10 @@ fn record_conformance_fixture() {
         Some(_) => "recorded live",
         None => "recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
     };
-    recorder.write(LINEAR_FIXTURE, &format!("{} on the Owlshift workspace, {how}", today()));
+    recorder.write(
+        LINEAR_FIXTURE,
+        &format!("{} on the Owlshift workspace, {how}", today()),
+    );
 }
 
 fn today() -> String {

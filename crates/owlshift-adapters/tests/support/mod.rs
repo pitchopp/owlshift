@@ -75,14 +75,19 @@ impl Replay {
     /// Fails unless every recorded exchange was used.
     pub fn assert_done(&self) {
         let left = self.left.lock().unwrap().len();
-        assert_eq!(left, 0, "{}: {left} recorded exchanges were not used", self.name);
+        assert_eq!(
+            left, 0,
+            "{}: {left} recorded exchanges were not used",
+            self.name
+        );
     }
 }
 
 impl Transport for Replay {
     fn send(&self, request: &Value) -> Result<Response, String> {
         let next = self.left.lock().unwrap().pop_front();
-        let next = next.unwrap_or_else(|| panic!("{}: no recorded exchange left for {request}", self.name));
+        let next = next
+            .unwrap_or_else(|| panic!("{}: no recorded exchange left for {request}", self.name));
         assert_eq!(
             request, &next.request,
             "{}: the request differs from the recorded one; record the fixture again",
@@ -221,7 +226,8 @@ impl Transport for Recorder {
                 if let Some(s) = &self.synthesize {
                     let query = request["query"].as_str().unwrap_or_default();
                     assert!(
-                        !(query.starts_with("mutation") && request["variables"]["issueId"] == s.issue),
+                        !(query.starts_with("mutation")
+                            && request["variables"]["issueId"] == s.issue),
                         "refusing to write to {} without OWLSHIFT_RECORD_WRITES",
                         s.issue
                     );
@@ -276,7 +282,10 @@ fn pseudonymize(value: &mut Value, people: &mut BTreeMap<String, usize>) {
             if let Some(id) = account {
                 let next = people.len() + 1;
                 let n = *people.entry(id).or_insert(next);
-                map.insert("id".to_owned(), json!(format!("00000000-0000-4000-8000-{n:012}")));
+                map.insert(
+                    "id".to_owned(),
+                    json!(format!("00000000-0000-4000-8000-{n:012}")),
+                );
                 map.insert("displayName".to_owned(), json!(format!("person-{n}")));
             }
             for inner in map.values_mut() {

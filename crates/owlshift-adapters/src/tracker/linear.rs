@@ -196,7 +196,8 @@ impl Tracker for LinearTracker {
         let mut comments = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let variables = json!({ "id": id.as_str(), "first": self.comment_page, "after": after });
+            let variables =
+                json!({ "id": id.as_str(), "first": self.comment_page, "after": after });
             let data: CommentsData = self.call(COMMENTS_QUERY, variables)?;
             let page = data.issue.comments;
             comments.extend(page.nodes.into_iter().map(LinearComment::into_comment));
@@ -221,7 +222,9 @@ impl Tracker for LinearTracker {
                 success: true,
                 comment: Some(comment),
             } => Ok(comment.into_comment()),
-            _ => Err(invalid(format!("Linear did not create the comment on {id}"))),
+            _ => Err(invalid(format!(
+                "Linear did not create the comment on {id}"
+            ))),
         }
     }
 }
@@ -467,14 +470,18 @@ mod tests {
         let error = decode::<Value>(&answer(400, ratelimited)).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Other);
         assert_eq!(error.message, "Linear: RATELIMITED: Rate limit exceeded");
-        let other_input_error = r#"{"errors":[{"message":"Title is too long","extensions":{"code":"INPUT_ERROR"}}]}"#;
+        let other_input_error =
+            r#"{"errors":[{"message":"Title is too long","extensions":{"code":"INPUT_ERROR"}}]}"#;
         assert_eq!(error_kind(200, other_input_error), ErrorKind::Other);
     }
 
     #[test]
     fn answers_that_are_not_graphql_are_errors() {
         assert_eq!(error_kind(401, "Unauthorized"), ErrorKind::Unauthorized);
-        assert_eq!(error_kind(502, "<html>Bad gateway</html>"), ErrorKind::Other);
+        assert_eq!(
+            error_kind(502, "<html>Bad gateway</html>"),
+            ErrorKind::Other
+        );
         assert_eq!(error_kind(500, r#"{"data":null}"#), ErrorKind::Other);
         assert_eq!(error_kind(200, r#"{"data":null}"#), ErrorKind::Other);
     }
@@ -513,7 +520,9 @@ mod tests {
             other("GitHub")
         );
         assert_eq!(
-            comment(None, None, Some("Slack user")).into_comment().author,
+            comment(None, None, Some("Slack user"))
+                .into_comment()
+                .author,
             other("Slack user")
         );
         assert_eq!(
