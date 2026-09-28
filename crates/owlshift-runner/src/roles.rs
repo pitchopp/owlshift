@@ -59,13 +59,20 @@ pub fn load_role_prompt(roles_dir: &Path, role: Role) -> Result<String, RoleLoad
 mod tests {
     use super::*;
 
-    const VALID: &str =
-        "+++\nrole = \"build\"\nbrief_format = 2\nresult_format = 1\n+++\n\n# Build\n\nDo it.\n";
+    use owlshift_contracts::format::{BRIEF_FORMAT, RESULT_FORMAT};
+
+    /// A well-formed role prompt file, built from this binary's own format
+    /// constants so it never drifts from them.
+    fn valid() -> String {
+        format!(
+            "+++\nrole = \"build\"\nbrief_format = {BRIEF_FORMAT}\nresult_format = {RESULT_FORMAT}\n+++\n\n# Build\n\nDo it.\n"
+        )
+    }
 
     #[test]
     fn loads_and_strips_a_role_prompt() {
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("build.md"), VALID).expect("write");
+        fs::write(dir.path().join("build.md"), valid()).expect("write");
         let prompt = load_role_prompt(dir.path(), Role::Build).expect("load");
         assert_eq!(prompt, "# Build\n\nDo it.\n");
     }
@@ -80,7 +87,10 @@ mod tests {
     #[test]
     fn refuses_a_mismatched_format() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let input = VALID.replace("brief_format = 2", "brief_format = 99");
+        let input = valid().replace(
+            &format!("brief_format = {BRIEF_FORMAT}"),
+            &format!("brief_format = {}", BRIEF_FORMAT + 1),
+        );
         fs::write(dir.path().join("build.md"), input).expect("write");
         let err = load_role_prompt(dir.path(), Role::Build).unwrap_err();
         assert!(matches!(err, RoleLoadError::Contract { .. }), "{err}");

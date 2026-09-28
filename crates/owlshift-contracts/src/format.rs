@@ -280,32 +280,43 @@ pub fn strip_role_front_matter(expected_role: Role, input: &str) -> Result<Strin
 mod role_prompt_tests {
     use super::*;
 
-    const VALID: &str =
-        "+++\nrole = \"build\"\nbrief_format = 2\nresult_format = 1\n+++\n\n# Build\n\nDo it.\n";
+    /// A well-formed role prompt file, built from this binary's own format
+    /// constants so it never drifts from them.
+    fn valid() -> String {
+        format!(
+            "+++\nrole = \"build\"\nbrief_format = {BRIEF_FORMAT}\nresult_format = {RESULT_FORMAT}\n+++\n\n# Build\n\nDo it.\n"
+        )
+    }
 
     #[test]
     fn strip_role_front_matter_returns_the_body() {
-        let body = strip_role_front_matter(Role::Build, VALID).expect("valid front matter");
+        let body = strip_role_front_matter(Role::Build, &valid()).expect("valid front matter");
         assert_eq!(body, "# Build\n\nDo it.\n");
     }
 
     #[test]
     fn strip_role_front_matter_refuses_a_mismatched_brief_format() {
-        let input = VALID.replace("brief_format = 2", "brief_format = 99");
+        let input = valid().replace(
+            &format!("brief_format = {BRIEF_FORMAT}"),
+            &format!("brief_format = {}", BRIEF_FORMAT + 1),
+        );
         let err = strip_role_front_matter(Role::Build, &input).unwrap_err();
         assert!(err.to_string().contains("brief_format"), "{err}");
     }
 
     #[test]
     fn strip_role_front_matter_refuses_a_mismatched_result_format() {
-        let input = VALID.replace("result_format = 1", "result_format = 99");
+        let input = valid().replace(
+            &format!("result_format = {RESULT_FORMAT}"),
+            &format!("result_format = {}", RESULT_FORMAT + 1),
+        );
         let err = strip_role_front_matter(Role::Build, &input).unwrap_err();
         assert!(err.to_string().contains("result_format"), "{err}");
     }
 
     #[test]
     fn strip_role_front_matter_refuses_a_mismatched_role() {
-        let err = strip_role_front_matter(Role::Design, VALID).unwrap_err();
+        let err = strip_role_front_matter(Role::Design, &valid()).unwrap_err();
         assert!(err.to_string().contains("Design"), "{err}");
     }
 
@@ -323,7 +334,10 @@ mod role_prompt_tests {
 
     #[test]
     fn strip_role_front_matter_refuses_an_unknown_key() {
-        let input = VALID.replace("result_format = 1", "result_format = 1\nextra = true");
+        let input = valid().replace(
+            &format!("result_format = {RESULT_FORMAT}"),
+            &format!("result_format = {RESULT_FORMAT}\nextra = true"),
+        );
         let err = strip_role_front_matter(Role::Build, &input).unwrap_err();
         assert!(matches!(err, ContractError::Toml { .. }), "{err}");
     }
