@@ -12,3 +12,4 @@
 //! depends on it. See "The test bench" in `docs/design/build-plan.md`.
 
 pub mod git;
+pub mod reply;
