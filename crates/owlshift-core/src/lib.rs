@@ -5,3 +5,5 @@
 //! network, processes, environment, standard streams or clock. Callers pass in
 //! what the core needs to know, including the current time. The rule is
 //! enforced by `clippy.toml` in this crate's directory.
+
+pub mod vocab;

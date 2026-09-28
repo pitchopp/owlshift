@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "at": "2026-09-28T09:00:00.250Z",
+  "project": "owlshift",
+  "ticket": "OWL-42",
+  "run": "01J8Z4K7Q2",
+  "kind": "run_ended",
+  "data": { "status": "questions", "harness": "claude", "exit_code": 0 }
+}

@@ -1,0 +1,4 @@
+# Test fixtures and generated schemas are compared byte for byte: keep LF on
+# every platform, whatever core.autocrlf says.
+crates/owlshift-contracts/tests/fixtures/** text eol=lf
+schemas/*.json text eol=lf

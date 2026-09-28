@@ -7,3 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+# Derive-only: the shared vocabulary serializes and describes itself as a JSON
+# Schema. Nothing here performs I/O.
+[dependencies]
+schemars.workspace = true
+serde.workspace = true

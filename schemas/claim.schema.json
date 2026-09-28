@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift claim",
+  "description": "A runner's lease on a ticket.",
+  "type": "object",
+  "properties": {
+    "expires_at": {
+      "description": "When the lease may be taken over if not renewed.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "machine": {
+      "description": "The machine the holding runner runs on.",
+      "type": "string"
+    },
+    "operator": {
+      "description": "The person operating that runner.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "machine",
+    "operator",
+    "expires_at"
+  ]
+}

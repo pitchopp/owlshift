@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift personal configuration",
+  "description": "The personal file, in the user's configuration directory, never committed.",
+  "type": "object",
+  "properties": {
+    "concurrent_runs": {
+      "description": "How many runs this machine runs at once.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
+    "harnesses": {
+      "description": "The installed harnesses.",
+      "$ref": "#/$defs/Harnesses",
+      "default": {}
+    },
+    "identity": {
+      "$ref": "#/$defs/Identity",
+      "default": {}
+    },
+    "keep_awake": {
+      "description": "Whether to keep the machine awake while runs are in flight.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "requires": {
+      "description": "The Owlshift versions that can read this file: a semantic version\nrequirement such as `>=0.4`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Harness": {
+      "description": "A harness: a vendor CLI that runs one role headless.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex"
+      ]
+    },
+    "HarnessSettings": {
+      "type": "object",
+      "properties": {
+        "budget_usd": {
+          "description": "A dollar budget, only for a harness configured for API billing.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        },
+        "fallback": {
+          "description": "The harness to use when this one is at its usage limit.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Harness"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Harnesses": {
+      "type": "object",
+      "properties": {
+        "claude": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HarnessSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "codex": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HarnessSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Identity": {
+      "description": "The user's accounts on the tracker and the forge.",
+      "type": "object",
+      "properties": {
+        "forge": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tracker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# Personal configuration, never committed.
+requires = ">=0.1"
+concurrent_runs = 2
+keep_awake = true
+
+[identity]
+tracker = "ada@example.com"
+forge = "ada"
+
+[harnesses.claude]
+fallback = "codex"
+
+[harnesses.codex]
+fallback = "claude"
+budget_usd = 20.0
