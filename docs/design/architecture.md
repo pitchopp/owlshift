@@ -208,10 +208,10 @@ The floor is code a project cannot configure away: no agent merges, deploys, cha
 
 **The floor.**
 
-- No merge, deploy or infrastructure change (environment variables, feature flags, DNS, CI settings) without an explicit human approval recorded on the ticket.
+- Owlshift never merges: neither an agent nor the Writer, approval or not; a human merges. No deploy or infrastructure change (environment variables, feature flags, DNS, CI settings) without an explicit human approval recorded on the ticket.
 - Owlshift never handles model API keys: harness authentication stays in each CLI's own configuration.
 - Agents hold no tracker, forge or cloud credentials; the Writer is their only holder. A worktree receives only the variables the stack profile declares for the project's own gate.
-- The always-human gate categories (security, data loss, money, legal wording, irreversible external actions, scope changes) can be extended, never removed.
+- The always-human gate categories (security, data loss, money, legal wording, irreversible external actions, scope changes) can be extended, never removed. A question names its category with a token: `security`, `data_loss`, `money`, `legal`, `irreversible` or `scope`. A category that contains a token as whole words, such as `scope_change` or `risk of data loss`, counts as that token, and a question with no category goes to a human.
 - After every run the Executor checks isolation: main checkout untouched, diff inside the worktree, expected branch. A violation quarantines the run and parks the ticket.
 - A run without a valid `result.json` is a failure, whatever its exit code.
 
