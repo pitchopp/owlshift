@@ -1,5 +1,7 @@
-//! A process tree stopped at its deadline by a thread of its own: the one
-//! mechanism behind the harness run and the executor's own git commands.
+//! A process tree stopped at its deadline by a thread of its own, for the
+//! runs whose output is streamed rather than captured: the harness run and
+//! the gate's commands. The executor's own git commands are captured by
+//! `owlshift_platform::process::run_command` (see `git.rs`).
 
 use std::io;
 use std::process::{Child, Command};

@@ -3,7 +3,8 @@
 //!
 //! [`run`] is for short probes such as `git --version`: a run that has not
 //! finished by its deadline is stopped with every process it started, never
-//! waited on. [`ProcessTree`] is the mechanism, shared with the executor;
+//! waited on. [`run_command`] runs a command the caller prepared the same
+//! way, keeping as much of its output as the caller asks for. [`ProcessTree`] is the mechanism, shared with the executor;
 //! [`stop_trees_on_signal`] stops the live trees when the process is told to
 //! end.
 
@@ -22,7 +23,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The most bytes kept from each output stream; the rest is read and dropped.
+/// The most bytes [`run`] keeps from each output stream; the rest is read and
+/// dropped.
 pub const OUTPUT_CAP: usize = 64 * 1024;
 
 const POLL: Duration = Duration::from_millis(10);
@@ -32,10 +34,17 @@ const POLL: Duration = Duration::from_millis(10);
 pub struct Captured {
     /// The exit code; `None` when a signal ended the program.
     pub code: Option<i32>,
-    /// Standard output, up to [`OUTPUT_CAP`] bytes.
+    /// Standard output, up to the run's output cap.
     pub stdout: Vec<u8>,
-    /// Standard error, up to [`OUTPUT_CAP`] bytes.
+    /// Standard error, up to the run's output cap.
     pub stderr: Vec<u8>,
+}
+
+impl Captured {
+    /// Whether the program exited with status 0.
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
 }
 
 /// Why a program gave no result.
@@ -90,7 +99,12 @@ pub fn run(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<Captured, RunError> {
-    run_command(&mut probe_command(program, args, cwd), None, timeout)
+    run_command(
+        &mut probe_command(program, args, cwd),
+        None,
+        timeout,
+        OUTPUT_CAP,
+    )
 }
 
 /// Runs a command the caller prepared (program, arguments, directory,
@@ -99,10 +113,15 @@ pub fn run(
 /// standard input from a thread of its own, which is then closed; without
 /// it, the command gets no input. The standard streams set on `command` are
 /// replaced.
+///
+/// Each output stream is read to its end and its first `output_cap` bytes
+/// are kept: [`OUTPUT_CAP`] for a probe, `usize::MAX` for output that must be
+/// read whole, such as a large repository's `git status`.
 pub fn run_command(
     command: &mut Command,
     input: Option<&[u8]>,
     timeout: Duration,
+    output_cap: usize,
 ) -> Result<Captured, RunError> {
     let deadline = Instant::now() + timeout;
     command
@@ -114,8 +133,8 @@ pub fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (mut child, tree) = ProcessTree::spawn(command).map_err(RunError::Io)?;
-    let stdout = read_capped(child.stdout.take());
-    let stderr = read_capped(child.stderr.take());
+    let stdout = read_capped(child.stdout.take(), output_cap);
+    let stderr = read_capped(child.stderr.take(), output_cap);
     if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
         let input = input.to_vec();
         thread::spawn(move || {
@@ -183,9 +202,9 @@ fn probe_command(program: &Path, args: &[&str], cwd: Option<&Path>) -> Command {
     command
 }
 
-/// Reads a stream to its end on its own thread, keeping the first
-/// [`OUTPUT_CAP`] bytes, and sends them once the stream closes.
-fn read_capped(stream: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
+/// Reads a stream to its end on its own thread, keeping the first `cap`
+/// bytes, and sends them once the stream closes.
+fn read_capped(stream: Option<impl Read + Send + 'static>, cap: usize) -> Receiver<Vec<u8>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut kept = Vec::new();
@@ -195,7 +214,7 @@ fn read_capped(stream: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> 
                 match stream.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let room = OUTPUT_CAP - kept.len();
+                        let room = cap - kept.len();
                         kept.extend_from_slice(&buffer[..n.min(room)]);
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -213,22 +232,29 @@ fn read_capped(stream: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> 
 mod tests {
     use super::*;
 
-    /// Runs one of the helper tests below in a fresh copy of this test binary.
+    /// Runs one of the helper tests below in a fresh copy of this test binary,
+    /// as a probe.
     fn helper(name: &str, cwd: Option<&Path>, timeout: Duration) -> Result<Captured, RunError> {
+        helper_capped(name, cwd, timeout, OUTPUT_CAP)
+    }
+
+    /// [`helper`], keeping `cap` bytes of each output stream.
+    fn helper_capped(
+        name: &str,
+        cwd: Option<&Path>,
+        timeout: Duration,
+        cap: usize,
+    ) -> Result<Captured, RunError> {
         let exe = std::env::current_exe().unwrap();
         let test = format!("process::tests::{name}");
-        run(
-            &exe,
-            &[
-                "--exact",
-                &test,
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ],
-            cwd,
-            timeout,
-        )
+        let args = [
+            "--exact",
+            &test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        run_command(&mut probe_command(&exe, &args, cwd), None, timeout, cap)
     }
 
     /// The helpers act only when run alone by [`helper`], never in a plain
@@ -362,6 +388,16 @@ mod tests {
         let captured = helper("helper_flood", None, Duration::from_secs(30)).unwrap();
         assert_eq!(captured.code, Some(0));
         assert_eq!(captured.stdout.len(), OUTPUT_CAP);
+    }
+
+    #[test]
+    fn output_is_read_whole_without_a_cap() {
+        let timeout = Duration::from_secs(30);
+        let captured = helper_capped("helper_flood", None, timeout, usize::MAX).unwrap();
+        assert!(captured.success());
+        // The whole flood, among the test harness's own lines.
+        let flood = captured.stdout.iter().filter(|&&byte| byte == b'x').count();
+        assert_eq!(flood, 1024 * 1024);
     }
 
     #[test]

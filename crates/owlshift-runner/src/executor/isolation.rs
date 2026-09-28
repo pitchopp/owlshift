@@ -51,6 +51,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::git::{Git, GitError};
+use crate::config::exit_text;
 
 /// The most bytes read from one shared git file; a larger one is compared
 /// by its size and first bytes.
@@ -367,12 +368,12 @@ impl Snapshot {
 /// Whether `end` is `ancestor` or descends from it.
 fn is_ancestor(git: &Git, dir: &Path, ancestor: &str, end: &str) -> Result<bool, SnapshotError> {
     let ancestry = git.output(dir, &["merge-base", "--is-ancestor", ancestor, end], None)?;
-    match ancestry.status.code() {
+    match ancestry.code {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => Err(SnapshotError(format!(
+        code => Err(SnapshotError(format!(
             "git merge-base failed with {}",
-            ancestry.status
+            exit_text(code)
         ))),
     }
 }
@@ -380,13 +381,13 @@ fn is_ancestor(git: &Git, dir: &Path, ancestor: &str, end: &str) -> Result<bool,
 impl MainState {
     fn read(git: &Git, main: &Path, branch: &str) -> Result<Self, SnapshotError> {
         let head = git.output(main, &["rev-parse", "-q", "--verify", "HEAD"], None)?;
-        let head = match head.status.code() {
+        let head = match head.code {
             Some(0) => Some(trimmed(&head.stdout)),
             Some(1) => None,
-            _ => {
+            code => {
                 return Err(SnapshotError(format!(
                     "git rev-parse HEAD failed with {}",
-                    head.status
+                    exit_text(code)
                 )));
             }
         };
@@ -515,13 +516,13 @@ fn changed<'a, K: Ord, V: PartialEq>(
 /// The branch HEAD names in `dir`; `None` when it is detached.
 fn symbolic_head(git: &Git, dir: &Path) -> Result<Option<String>, SnapshotError> {
     let head = git.output(dir, &["symbolic-ref", "-q", "HEAD"], None)?;
-    match head.status.code() {
+    match head.code {
         Some(0) => Ok(Some(trimmed(&head.stdout))),
         Some(1) => Ok(None),
-        _ => Err(SnapshotError(format!(
+        code => Err(SnapshotError(format!(
             "git symbolic-ref HEAD in {} failed with {}: {}",
             dir.display(),
-            head.status,
+            exit_text(code),
             String::from_utf8_lossy(&head.stderr).trim()
         ))),
     }
@@ -628,10 +629,10 @@ fn contents(
         &["hash-object", "--no-filters", "--stdin-paths"],
         Some(&input),
     )?;
-    if !hashed.status.success() {
+    if !hashed.success() {
         return Err(SnapshotError(format!(
             "git hash-object failed with {}: {}",
-            hashed.status,
+            exit_text(hashed.code),
             String::from_utf8_lossy(&hashed.stderr).trim()
         )));
     }

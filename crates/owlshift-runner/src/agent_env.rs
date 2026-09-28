@@ -21,7 +21,7 @@ use owlshift_core::agent_env::{
     AgentEnvError, NO_CREDENTIAL, agent_environment, check_agent_variables,
 };
 use owlshift_core::floor::FloorViolation;
-use owlshift_platform::process::{Captured, RunError, find_executable_in, run_command};
+use owlshift_platform::process::{Captured, OUTPUT_CAP, RunError, find_executable_in, run_command};
 
 use crate::system::PROBE_TIMEOUT;
 
@@ -147,7 +147,7 @@ pub fn check_environment(
             .current_dir(workdir)
             .env_clear()
             .envs(vars.iter().map(|(n, v)| (n, v)));
-        run_command(&mut command, input, PROBE_TIMEOUT)
+        run_command(&mut command, input, PROBE_TIMEOUT, OUTPUT_CAP)
     };
 
     match find_executable_in("git", &search_path) {
