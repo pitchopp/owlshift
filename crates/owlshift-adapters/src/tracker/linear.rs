@@ -2,9 +2,8 @@
 //! personal API key that the runner reads from the system keychain.
 //!
 //! The adapter talks through a [`Transport`], one GraphQL request at a time:
-//! [`HttpTransport`] in production, a replay of recorded exchanges in tests.
-//! An exchange is the request body, the HTTP status and the response body:
-//! never a header, so a recording cannot hold the key.
+//! [`HttpTransport`] in production, a replay of recorded exchanges in tests
+//! (see [`crate::graphql`]).
 //!
 //! What the adapter relies on was checked live on the Owlshift workspace on
 //! 2026-09-28 (OWL-13; build plan, check C4):
@@ -36,6 +35,7 @@ use serde_json::{Value, json};
 use owlshift_contracts::Priority;
 use owlshift_contracts::ids::TicketId;
 
+pub use crate::graphql::{Response, Transport};
 use crate::tracker::{Author, Capability, Comment, Error, ErrorKind, Person, Ticket, Tracker};
 
 /// Linear's GraphQL endpoint.
@@ -58,20 +58,6 @@ impl fmt::Debug for ApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ApiKey(<redacted>)")
     }
-}
-
-/// An HTTP answer: its status and its body.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Response {
-    pub status: u16,
-    pub body: String,
-}
-
-/// Sends one GraphQL request to Linear.
-pub trait Transport {
-    /// Posts `request`, a GraphQL request body (`query` and `variables`).
-    /// `Err` means no HTTP answer at all: network, TLS or timeout.
-    fn send(&self, request: &Value) -> Result<Response, String>;
 }
 
 /// The production transport: HTTPS to [`ENDPOINT`] with the API key.
