@@ -16,8 +16,9 @@
 //! | Gate | [`gate`]; an open gate is [`state::Status::NeedsInput`] |
 //! | Resource | [`resource`] |
 //! | Scheduler | [`schedule`] |
-//! | Policy floor | [`floor`] |
+//! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
 
+pub mod agent_env;
 pub mod floor;
 pub mod gate;
 pub mod pipeline;
