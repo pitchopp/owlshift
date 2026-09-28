@@ -234,14 +234,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(PROJECT_FILE), PROJECT).unwrap();
         let personal = dir.path().join("personal.toml");
-        let effective = Effective::load(&repository(dir.path()), dir.path(), Some(personal.clone()));
+        let effective =
+            Effective::load(&repository(dir.path()), dir.path(), Some(personal.clone()));
 
         assert!(effective.is_valid());
         assert!(matches!(&effective.personal, FileState::Absent(p) if *p == personal));
         let shown = effective.to_string();
         let origin = dir.path().join(PROJECT_FILE);
         assert!(
-            shown.contains(&format!("tracker.kind = \"linear\"  ({})", origin.display())),
+            shown.contains(&format!(
+                "tracker.kind = \"linear\"  ({})",
+                origin.display()
+            )),
             "{shown}"
         );
         assert!(shown.contains("not found at"), "{shown}");
@@ -265,7 +269,11 @@ mod tests {
     fn outside_a_repository_there_is_no_project() {
         let git_says_no = FakeSystem::default().install("git").answer(
             "git rev-parse --show-toplevel",
-            Answer::Exit(128, "", "fatal: not a git repository (or any of the parent directories): .git\n"),
+            Answer::Exit(
+                128,
+                "",
+                "fatal: not a git repository (or any of the parent directories): .git\n",
+            ),
         );
         let effective = Effective::load(&git_says_no, Path::new("/tmp"), None);
         assert!(matches!(effective.project, FileState::NotApplicable(_)));

@@ -77,7 +77,7 @@ Prerequisites: git, and at least one harness CLI installed and logged in (`claud
 4. **Visible and findable.** A stable label (`launchctl list | grep owlshift`), shown in macOS Login Items; `owlshift doctor` lists any leftover and offers to clean it.
 5. **One instance.** A lock prevents two daemons, including an old and a new version, from running at once.
 
-**Where files live.** Platform-standard directories: Application Support on macOS, the XDG directories on Linux. Worktrees live under Owlshift's data directory, one per project and ticket, never inside the user's checkout. Tracker and forge secrets live in the system keychain: macOS Keychain, Secret Service on Linux, Credential Manager on Windows. Model credentials stay with each harness CLI.
+**Where files live.** Platform-standard directories: Application Support on macOS, the XDG directories on Linux. The personal configuration file is `owlshift/config.toml` in the user's configuration directory: `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or `~/.config` on Linux, `%APPDATA%` on Windows (OWL-12). Worktrees live under Owlshift's data directory, one per project and ticket, never inside the user's checkout. Tracker and forge secrets live in the system keychain: macOS Keychain, Secret Service on Linux, Credential Manager on Windows. Model credentials stay with each harness CLI.
 
 With the Tauri app (P11), start at login should go through the operating system's app login-item mechanism, so deleting the app removes it; to verify when the app is built.
 

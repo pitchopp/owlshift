@@ -77,7 +77,12 @@ fn git(system: &dyn System) -> Check {
     const SUBJECT: &str = "git";
     const INSTALL: &str = "install git: https://git-scm.com/downloads";
     let Some(path) = system.locate("git") else {
-        return check(SUBJECT, Status::Fail, "not found on the PATH", Some(INSTALL));
+        return check(
+            SUBJECT,
+            Status::Fail,
+            "not found on the PATH",
+            Some(INSTALL),
+        );
     };
     match system.run(&path, &["--version"], None) {
         Ok(out) if out.code == Some(0) => match version_of(&out.stdout) {
@@ -184,7 +189,9 @@ fn file_check<T>(subject: &str, state: &FileState<T>) -> Check {
             format!("not found at {}", path.display()),
             None,
         ),
-        FileState::NotApplicable(reason) => check(subject, Status::Info, format!("none ({reason})"), None),
+        FileState::NotApplicable(reason) => {
+            check(subject, Status::Info, format!("none ({reason})"), None)
+        }
         FileState::Unavailable(reason) => check(
             subject,
             Status::Fail,
@@ -276,17 +283,24 @@ mod tests {
     }
 
     fn with_git(system: FakeSystem) -> FakeSystem {
-        system
-            .install("git")
-            .answer("git --version", Answer::Exit(0, "git version 2.54.0 (Apple Git-157)\n", ""))
+        system.install("git").answer(
+            "git --version",
+            Answer::Exit(0, "git version 2.54.0 (Apple Git-157)\n", ""),
+        )
     }
 
     fn with_harnesses(system: FakeSystem) -> FakeSystem {
         system
             .install("claude")
             .install("codex")
-            .answer("claude --version", Answer::Exit(0, "2.1.283 (Claude Code)\n", ""))
-            .answer("codex --version", Answer::Exit(0, "codex-cli 0.154.0\n", ""))
+            .answer(
+                "claude --version",
+                Answer::Exit(0, "2.1.283 (Claude Code)\n", ""),
+            )
+            .answer(
+                "codex --version",
+                Answer::Exit(0, "codex-cli 0.154.0\n", ""),
+            )
     }
 
     fn fixes(report: &Report, subject: &str) -> Vec<String> {
@@ -308,10 +322,23 @@ mod tests {
 
         assert!(report.ready(), "{shown}");
         assert!(shown.contains("2.54.0 (/fake/bin/git)"), "{shown}");
-        assert!(shown.contains("2.1.283 (/fake/bin/claude), logged in (claude.ai, max plan)"), "{shown}");
-        assert!(shown.contains("0.154.0 (/fake/bin/codex), logged in (API key)"), "{shown}");
+        assert!(
+            shown.contains("2.1.283 (/fake/bin/claude), logged in (claude.ai, max plan)"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("0.154.0 (/fake/bin/codex), logged in (API key)"),
+            "{shown}"
+        );
         // Defense in depth: `Login` holds only fixed labels, by construction.
-        for private in ["ada@", "example.com", "0f0e0d0c", "Organization", "sk-dummy", "0fake"] {
+        for private in [
+            "ada@",
+            "example.com",
+            "0f0e0d0c",
+            "Organization",
+            "sk-dummy",
+            "0fake",
+        ] {
             assert!(!shown.contains(private), "{private} leaked:\n{shown}");
         }
     }
@@ -320,12 +347,18 @@ mod tests {
     fn missing_and_logged_out_harnesses_say_how_to_fix_them() {
         let system = with_git(FakeSystem::default())
             .install("codex")
-            .answer("codex --version", Answer::Exit(0, "codex-cli 0.154.0\n", ""))
+            .answer(
+                "codex --version",
+                Answer::Exit(0, "codex-cli 0.154.0\n", ""),
+            )
             .answer(CODEX_STATUS, Answer::Exit(1, "", "Not logged in\n"));
         let report = run(&system, &no_config());
 
         assert!(!report.ready());
-        assert_eq!(fixes(&report, "claude"), [harness::install_hint(Harness::Claude)]);
+        assert_eq!(
+            fixes(&report, "claude"),
+            [harness::install_hint(Harness::Claude)]
+        );
         assert_eq!(fixes(&report, "codex"), ["run `codex login`"]);
         assert!(report.to_string().contains("Not ready: 2 problems to fix."));
     }
@@ -334,13 +367,22 @@ mod tests {
     fn an_undeterminable_login_fails_without_echoing_the_answer() {
         let system = with_harnesses(with_git(FakeSystem::default()))
             .answer(CLAUDE_STATUS, Answer::TimedOut)
-            .answer(CODEX_STATUS, Answer::Exit(0, "", "Signed in as ada@example.com\n"));
+            .answer(
+                CODEX_STATUS,
+                Answer::Exit(0, "", "Signed in as ada@example.com\n"),
+            );
         let report = run(&system, &no_config());
         let shown = report.to_string();
 
         assert!(!report.ready());
-        assert!(shown.contains("`claude auth status --json` did not answer in time"), "{shown}");
-        assert_eq!(fixes(&report, "claude"), ["run `claude auth status --json` yourself to see why"]);
+        assert!(
+            shown.contains("`claude auth status --json` did not answer in time"),
+            "{shown}"
+        );
+        assert_eq!(
+            fixes(&report, "claude"),
+            ["run `claude auth status --json` yourself to see why"]
+        );
         assert!(!shown.contains("ada@example.com"), "{shown}");
     }
 
@@ -348,9 +390,15 @@ mod tests {
     fn a_missing_git_fails() {
         let system = with_harnesses(FakeSystem::default())
             .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""))
-            .answer(CODEX_STATUS, Answer::Exit(0, "", "Logged in using ChatGPT\n"));
+            .answer(
+                CODEX_STATUS,
+                Answer::Exit(0, "", "Logged in using ChatGPT\n"),
+            );
         let report = run(&system, &no_config());
-        assert_eq!(fixes(&report, "git"), ["install git: https://git-scm.com/downloads"]);
+        assert_eq!(
+            fixes(&report, "git"),
+            ["install git: https://git-scm.com/downloads"]
+        );
     }
 
     #[test]
@@ -364,7 +412,10 @@ mod tests {
         };
         let system = with_git(FakeSystem::default())
             .install("claude")
-            .answer("claude --version", Answer::Exit(0, "2.1.283 (Claude Code)\n", ""))
+            .answer(
+                "claude --version",
+                Answer::Exit(0, "2.1.283 (Claude Code)\n", ""),
+            )
             .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""));
         let report = run(&system, &config);
 

@@ -277,7 +277,9 @@ pub fn check_requires(input: &str, current: &Version) -> Result<(), ContractErro
     match peek_requires(input)? {
         Some(requires) if !requires.matches(current) => Err(ContractError::invalid(
             CONFIGURATION,
-            format!("it requires Owlshift {requires}; this is Owlshift {current}: upgrade Owlshift"),
+            format!(
+                "it requires Owlshift {requires}; this is Owlshift {current}: upgrade Owlshift"
+            ),
         )),
         _ => Ok(()),
     }

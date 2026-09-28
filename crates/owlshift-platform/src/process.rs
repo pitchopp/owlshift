@@ -153,7 +153,13 @@ mod tests {
         let test = format!("process::tests::{name}");
         run(
             &exe,
-            &["--exact", &test, "--ignored", "--nocapture", "--test-threads=1"],
+            &[
+                "--exact",
+                &test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
             None,
             timeout,
         )
@@ -177,6 +183,10 @@ mod tests {
 
     #[test]
     #[ignore = "helper, run by the tests below"]
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the grandchild must outlive this process"
+    )]
     fn helper_leave_a_pipe_holder() {
         if helper_requested() {
             // A grandchild inherits this process's output and outlives it.

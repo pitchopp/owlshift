@@ -170,7 +170,8 @@ mod tests {
             }
         );
         assert_eq!(claude(1, CLAUDE_LOGGED_OUT), Login::LoggedOut);
-        let api_key = r#"{"loggedIn": true, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}"#;
+        let api_key =
+            r#"{"loggedIn": true, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}"#;
         assert_eq!(
             claude(0, api_key),
             Login::LoggedIn {

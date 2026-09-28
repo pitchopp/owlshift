@@ -126,6 +126,13 @@ Everything runs in the foreground; `resume` arrives in P2, `watch` in P3, the ba
 | `owlshift do TICKET` | P1 | Runs one ticket to a verified PR, in the foreground |
 | `owlshift logs [TICKET] [--follow]` | P1 | Events and run logs |
 
+**What `doctor` checks, as built in P0 (OWL-12).**
+
+- **Harnesses.** The ones declared under `[harnesses]` in the personal file are checked; when none are declared, both `claude` and `codex` are. Each must be on the `PATH` and logged in, following the rules of check C8.
+- **Configuration files.** The project file is `owlshift.toml` at the root of the git repository holding the current directory. The personal file's location is given in [runtime & operations](runtime-and-operations.md#install-lifecycle--uninstall).
+- **Adapters.** No adapter exists yet, so doctor only names the configured tracker, with a warning. Capability contracts come once three implementations exist (principle 8).
+- **Output and exit status.** A failed check prints how to fix it and makes the exit status 1. Warnings do not.
+
 **The test tracker** (published as the Markdown tracker in P9) keeps one folder per ticket in the repository: `tickets/PROJ-1/ticket.md` with a front matter (stage, priority, assignee, labels, blocked_by) and the description, and `tickets/PROJ-1/comments/` with one file per comment, named by timestamp and author. Answering a question is adding a file; everything stays diffable in git.
 
 ## P0 tasks & exit gate
