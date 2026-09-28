@@ -230,7 +230,7 @@ Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its bl
 
 - [x] OWL-13 · Linear tracker adapter: read a ticket, post a comment, with recorded fixtures and a conformance suite (2026-09-28, [#16](https://github.com/pitchopp/owlshift/pull/16))
 - [x] OWL-14 · Claude Code harness adapter: headless run on the user's login, model, effort, permission level, usage capture (2026-09-28, [#15](https://github.com/pitchopp/owlshift/pull/15))
-- [ ] OWL-15 · Executor: worktree, brief, spawn, process-tree stop, result validation, isolation check
+- [x] OWL-15 · Executor: worktree, brief, spawn, process-tree stop, result validation, isolation check (2026-09-28, [#29](https://github.com/pitchopp/owlshift/pull/29))
 - [ ] OWL-16 · Gate commands from the project config before delivery
 - [ ] OWL-17 · GitHub forge adapter: push the branch, open the PR, read the complete check set
 - [ ] OWL-18 · Writer: delivery report on the ticket
