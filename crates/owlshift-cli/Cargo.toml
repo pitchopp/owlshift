@@ -14,3 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 owlshift-runner.workspace = true
+owlshift-contracts.workspace = true
+owlshift-platform.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

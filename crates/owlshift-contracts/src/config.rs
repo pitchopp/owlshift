@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use schemars::JsonSchema;
-use semver::VersionReq;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 use crate::format::ContractError;
@@ -263,7 +263,114 @@ pub fn peek_requires(input: &str) -> Result<Option<VersionReq>, ContractError> {
     toml::from_str::<Peek>(input)
         .map(|peek| peek.requires)
         .map_err(|source| ContractError::Toml {
-            contract: "configuration",
+            contract: CONFIGURATION,
             source,
         })
+}
+
+const CONFIGURATION: &str = "configuration";
+
+/// Checks a configuration file's `requires` against the running Owlshift
+/// version. Call it before the strict parse: a file written for a newer
+/// Owlshift is then refused with "upgrade", not with an unknown key.
+pub fn check_requires(input: &str, current: &Version) -> Result<(), ContractError> {
+    match peek_requires(input)? {
+        Some(requires) if !requires.matches(current) => Err(ContractError::invalid(
+            CONFIGURATION,
+            format!(
+                "it requires Owlshift {requires}; this is Owlshift {current}: upgrade Owlshift"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Every key a configuration file sets, as a dotted path and its value in
+/// TOML syntax, in key order.
+///
+/// It reads the document as written, so a value the parser would fill in by
+/// default never shows up as coming from the file. An empty table, such as
+/// `[harnesses.claude]` with no settings, is kept as `{}`: declaring it is a
+/// setting. A key that is not a bare TOML key is quoted.
+pub fn entries(input: &str) -> Result<Vec<(String, String)>, ContractError> {
+    let table: toml::Table = toml::from_str(input).map_err(|source| ContractError::Toml {
+        contract: CONFIGURATION,
+        source,
+    })?;
+    let mut out = Vec::new();
+    flatten("", &table, &mut out);
+    Ok(out)
+}
+
+fn flatten(prefix: &str, table: &toml::Table, out: &mut Vec<(String, String)>) {
+    for (key, value) in table {
+        let path = if prefix.is_empty() {
+            key_segment(key)
+        } else {
+            format!("{prefix}.{}", key_segment(key))
+        };
+        match value {
+            toml::Value::Table(inner) if !inner.is_empty() => flatten(&path, inner, out),
+            toml::Value::Table(_) => out.push((path, "{}".to_owned())),
+            other => out.push((path, other.to_string())),
+        }
+    }
+}
+
+fn key_segment(key: &str) -> String {
+    let bare = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if bare {
+        key.to_owned()
+    } else {
+        toml::Value::String(key.to_owned()).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_is_checked_against_the_running_version() {
+        let current = Version::new(0, 4, 2);
+        assert!(check_requires("requires = \">=0.4\"", &current).is_ok());
+        assert!(check_requires("keep_awake = true", &current).is_ok());
+        let error = check_requires("requires = \">=0.5\"\nnew_key = 1", &current)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires Owlshift >=0.5"), "{error}");
+        assert!(
+            error.contains("this is Owlshift 0.4.2: upgrade Owlshift"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn entries_list_what_the_file_says() {
+        let input = r#"
+            requires = ">=0.1"
+            [stack]
+            gate = ["make lint", "make test"]
+            resources = { "db.migrations" = "backend/**" }
+            [harnesses.claude]
+            [harnesses.codex]
+            budget_usd = 20.0
+        "#;
+        let actual = entries(input).unwrap();
+        let actual: Vec<(&str, &str)> = actual
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let expected = [
+            ("harnesses.claude", "{}"),
+            ("harnesses.codex.budget_usd", "20.0"),
+            ("requires", "\">=0.1\""),
+            ("stack.gate", "[\"make lint\", \"make test\"]"),
+            ("stack.resources.\"db.migrations\"", "\"backend/**\""),
+        ];
+        assert_eq!(actual, expected);
+    }
 }
