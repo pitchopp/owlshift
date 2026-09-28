@@ -322,6 +322,25 @@ fn brief_rejections() {
         parse(|v| v["format"] = json!(3)),
         "upgrade Owlshift",
     );
+    // The checkpoint's paths and the result path come from the runner, but
+    // are checked the same way as a model's artifact paths (OWL-25).
+    for path in BAD_PATHS {
+        let input = edited("brief.json", |v| v["checkpoint"]["plan"] = json!(path));
+        rejects(path, Brief::parse(&input), "invalid relative path");
+    }
+    for path in BAD_PATHS {
+        let input = edited("brief.json", |v| v["checkpoint"]["ledger"] = json!(path));
+        rejects(path, Brief::parse(&input), "invalid relative path");
+    }
+    for path in BAD_PATHS {
+        let input = edited("brief.json", |v| v["result_path"] = json!(path));
+        rejects(path, Brief::parse(&input), "invalid relative path");
+    }
+    for path in GOOD_PATHS {
+        let input = edited("brief.json", |v| v["result_path"] = json!(path));
+        let result = Brief::parse(&input).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(result.result_path.as_str(), path);
+    }
 }
 
 #[test]
