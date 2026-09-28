@@ -121,3 +121,25 @@ jobs:
           kill -KILL -- "-$PGID"
           sleep 1
           if pgrep -a -f 'sleep 30[01]'; then echo "a process survived the group kill"; else echo "no process left after the group kill"; fi
+      - name: bwrap --unshare-pid hides host PIDs and still gets reaped
+        run: |
+          # A marker process the confined run must NOT see, and whose environ it must not read.
+          setsid sh -c 'MARKER_SECRET=owl41-runner-secret sleep 400' &
+          MARKER=$!
+          echo "marker host pid: $MARKER"
+          echo "unconfined can read the marker environ:"; tr '\0' '\n' < /proc/$MARKER/environ | grep -c MARKER_SECRET || true
+          echo "--- inside bwrap --unshare-pid --proc /proc ---"
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid --die-with-parent -- sh -c '
+            echo "  visible pids: $(ls /proc | grep -c "^[0-9]")"
+            echo "  can I see the marker pid '"$MARKER"'? $(test -e /proc/'"$MARKER"' && echo yes || echo no)"
+            cat /proc/'"$MARKER"'/environ >/dev/null 2>&1; echo "  read marker environ: exit $?"
+          '
+          echo "--- reaping a --unshare-pid tree via the host process group ---"
+          setsid sh -c 'bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid --die-with-parent -- sh -c "sleep 300 & sleep 301 & wait" & echo $! > /tmp/bw2.pid; wait' &
+          sleep 2
+          PGID=$(ps -o pgid= -p "$(cat /tmp/bw2.pid)" | tr -d ' ')
+          echo "group before kill:"; ps -o pid,pgid,comm -g "$PGID" || true
+          kill -KILL -- "-$PGID"
+          sleep 1
+          if pgrep -a -f 'sleep 30[01]'; then echo "a process survived the group kill (unshare-pid)"; else echo "no process left after the group kill (unshare-pid)"; fi
+          kill -KILL "$MARKER" 2>/dev/null || true
