@@ -4,5 +4,6 @@
 pub mod artifact;
 pub mod config;
 pub mod doctor;
+pub mod forge;
 pub mod system;
 pub mod tracker;

@@ -1,0 +1,41 @@
+{
+  "recorded": "2026-09-28 on pitchopp/owlshift, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Checks($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } } } } } } } } } }",
+        "variables": {
+          "after": null,
+          "first": 100,
+          "name": "owlshift",
+          "number": 999999,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequest": null
+          }
+        },
+        "errors": [
+          {
+            "locations": [
+              {
+                "column": 135,
+                "line": 1
+              }
+            ],
+            "message": "Could not resolve to a PullRequest with the number of 999999.",
+            "path": [
+              "repository",
+              "pullRequest"
+            ],
+            "type": "NOT_FOUND"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,257 @@
+{
+  "recorded": "2026-09-28 on pitchopp/owlshift, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Checks($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } } } } } } } } } }",
+        "variables": {
+          "after": null,
+          "first": 1,
+          "name": "owlshift",
+          "number": 16,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "36f0557116ea73f9b0805980e83b360e23b99940",
+                      "statusCheckRollup": {
+                        "contexts": {
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "conclusion": "SUCCESS",
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108948335412",
+                              "isRequired": false,
+                              "name": "check (ubuntu-latest)",
+                              "status": "COMPLETED"
+                            }
+                          ],
+                          "pageInfo": {
+                            "endCursor": "MQ",
+                            "hasNextPage": true
+                          },
+                          "totalCount": 4
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "headRefOid": "36f0557116ea73f9b0805980e83b360e23b99940",
+              "mergeStateStatus": "UNKNOWN",
+              "mergeable": "UNKNOWN",
+              "state": "MERGED"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Checks($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } } } } } } } } } }",
+        "variables": {
+          "after": "MQ",
+          "first": 1,
+          "name": "owlshift",
+          "number": 16,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "36f0557116ea73f9b0805980e83b360e23b99940",
+                      "statusCheckRollup": {
+                        "contexts": {
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "conclusion": "SUCCESS",
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108948335445",
+                              "isRequired": false,
+                              "name": "check (macos-latest)",
+                              "status": "COMPLETED"
+                            }
+                          ],
+                          "pageInfo": {
+                            "endCursor": "Mg",
+                            "hasNextPage": true
+                          },
+                          "totalCount": 4
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "headRefOid": "36f0557116ea73f9b0805980e83b360e23b99940",
+              "mergeStateStatus": "UNKNOWN",
+              "mergeable": "UNKNOWN",
+              "state": "MERGED"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Checks($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } } } } } } } } } }",
+        "variables": {
+          "after": "Mg",
+          "first": 1,
+          "name": "owlshift",
+          "number": 16,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "36f0557116ea73f9b0805980e83b360e23b99940",
+                      "statusCheckRollup": {
+                        "contexts": {
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "conclusion": "SUCCESS",
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108948335120",
+                              "isRequired": false,
+                              "name": "check (windows-latest)",
+                              "status": "COMPLETED"
+                            }
+                          ],
+                          "pageInfo": {
+                            "endCursor": "Mw",
+                            "hasNextPage": true
+                          },
+                          "totalCount": 4
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "headRefOid": "36f0557116ea73f9b0805980e83b360e23b99940",
+              "mergeStateStatus": "UNKNOWN",
+              "mergeable": "UNKNOWN",
+              "state": "MERGED"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Checks($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } } } } } } } } } }",
+        "variables": {
+          "after": "Mw",
+          "first": 1,
+          "name": "owlshift",
+          "number": 16,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "36f0557116ea73f9b0805980e83b360e23b99940",
+                      "statusCheckRollup": {
+                        "contexts": {
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "conclusion": "SUCCESS",
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108950329804",
+                              "isRequired": false,
+                              "name": "ci",
+                              "status": "COMPLETED"
+                            }
+                          ],
+                          "pageInfo": {
+                            "endCursor": "NA",
+                            "hasNextPage": false
+                          },
+                          "totalCount": 4
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "headRefOid": "36f0557116ea73f9b0805980e83b360e23b99940",
+              "mergeStateStatus": "UNKNOWN",
+              "mergeable": "UNKNOWN",
+              "state": "MERGED"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
