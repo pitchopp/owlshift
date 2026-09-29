@@ -288,7 +288,10 @@ fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
     let deferred = BEYOND_RUN_TOOLS.into_iter().filter(|tool| *tool != "Agent");
     assert_eq!(sorted(searched), sorted(deferred));
     let found = tool_results(&events);
-    assert_eq!(found[0]["content"], json!("No matching deferred tools found"));
+    assert_eq!(
+        found[0]["content"],
+        json!("No matching deferred tools found")
+    );
 
     let run = replay(name, 0);
     assert!(
@@ -415,7 +418,10 @@ fn repository_settings_cannot_widen_a_role_on_every_launch() {
         json!("/work/.owlshift/run/result.json")
     );
     let created = results[0]["content"].as_str().unwrap();
-    assert!(created.starts_with("File created successfully"), "{created}");
+    assert!(
+        created.starts_with("File created successfully"),
+        "{created}"
+    );
     for (call, result) in calls[1..].iter().zip(&results[1..]) {
         let tool = call["name"].as_str().unwrap();
         let denied = format!("Permission to use {tool} has been denied");
