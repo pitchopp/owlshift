@@ -1,0 +1,24 @@
+# Temporary (OWL-72): runs the AppContainer probe on windows-latest once.
+# Removed before the pull request; approved as a temporary CI change on
+# 2026-09-29, per the CI-settings floor of architecture section 8.
+name: OWL-72 probe
+
+on:
+  push:
+    branches: [sghirma/owl-72-confine-windows-agent-runs-to-their-folders-with-an]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Run the probe
+        run: cargo run --release --manifest-path owl72-probe/Cargo.toml
