@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(unix)]
+pub use owlshift_platform::process::SentinelStatus;
 pub use owlshift_platform::process::{Captured, RunError};
 use owlshift_platform::sandbox::SandboxError;
 
@@ -23,6 +25,12 @@ pub trait System {
     /// Whether a file is there; it is only looked at, never read.
     fn is_file(&self, path: &Path) -> bool {
         path.is_file()
+    }
+    /// Whether the sentinel still protects the live process trees from a
+    /// hard kill of Owlshift (OWL-86, OWL-88).
+    #[cfg(unix)]
+    fn sentinel(&self) -> SentinelStatus {
+        owlshift_platform::process::sentinel_status()
     }
 }
 
@@ -102,12 +110,22 @@ pub(crate) mod fake {
         sandbox: Option<SandboxError>,
         /// Files that are not there; every other one is.
         absent: Vec<PathBuf>,
+        /// How the sentinel is; `None`: it runs.
+        #[cfg(unix)]
+        sentinel: Option<SentinelStatus>,
     }
 
     impl FakeSystem {
         /// Agent runs cannot be confined, for this reason.
         pub(crate) fn no_sandbox(mut self, error: SandboxError) -> Self {
             self.sandbox = Some(error);
+            self
+        }
+
+        /// The sentinel is so.
+        #[cfg(unix)]
+        pub(crate) fn sentinel_is(mut self, status: SentinelStatus) -> Self {
+            self.sentinel = Some(status);
             self
         }
 
@@ -166,6 +184,13 @@ pub(crate) mod fake {
 
         fn is_file(&self, path: &Path) -> bool {
             !self.absent.iter().any(|absent| absent == path)
+        }
+
+        #[cfg(unix)]
+        fn sentinel(&self) -> SentinelStatus {
+            self.sentinel
+                .clone()
+                .unwrap_or(SentinelStatus::Running { pid: 4242 })
         }
     }
 }

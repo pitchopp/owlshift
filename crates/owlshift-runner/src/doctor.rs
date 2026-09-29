@@ -17,6 +17,8 @@ use owlshift_contracts::config::TrackerKind;
 
 use crate::config::{Effective, FileState, exit_text};
 use crate::executor::harness::claude_login_command;
+#[cfg(unix)]
+use crate::system::SentinelStatus;
 use crate::system::{RunError, System, exact_version_of, version_of};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +67,8 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
             .map(|harness| harness_check(system, *harness)),
     );
     checks.push(sandbox_check(system));
+    #[cfg(unix)]
+    checks.push(sentinel_check(&system.sentinel()));
     if harnesses.contains(&Harness::Claude) {
         checks.push(agent_login_check(
             system,
@@ -149,6 +153,41 @@ fn sandbox_check(system: &dyn System) -> Check {
             detail: "agent runs cannot be confined here, so none is started".to_owned(),
             fix: Some(error.to_string()),
         },
+    }
+}
+
+/// Whether the sentinel of this very command runs, the process that stops
+/// the probes and agent runs Owlshift started when Owlshift is killed
+/// outright (OWL-86). A warning, never a failure: it is a best effort, not a
+/// guardrail, and it is never restarted (OWL-88).
+#[cfg(unix)]
+fn sentinel_check(status: &SentinelStatus) -> Check {
+    const SUBJECT: &str = "sentinel";
+    const UNPROTECTED: &str =
+        "a hard kill of Owlshift would leave the processes it started running";
+    const FIND: &str = "look for what ends the `/bin/sh` process whose command line ends in \
+                        `owlshift-sentinel`";
+    match status {
+        SentinelStatus::Running { pid } => check(
+            SUBJECT,
+            Status::Ok,
+            format!(
+                "running (pid {pid}): a hard kill of Owlshift stops, best effort, the processes it started"
+            ),
+            None,
+        ),
+        SentinelStatus::Ended(how) => check(
+            SUBJECT,
+            Status::Warn,
+            format!("ended ({how}): {UNPROTECTED}"),
+            Some(FIND),
+        ),
+        SentinelStatus::NotRunning => check(
+            SUBJECT,
+            Status::Warn,
+            format!("not running, it could not start: {UNPROTECTED}"),
+            Some("check that `/bin/sh` runs; the error is printed above"),
+        ),
     }
 }
 
@@ -500,6 +539,41 @@ mod tests {
             "{fix}"
         );
         assert!(fix.contains("setting up uid map"), "{fix}");
+    }
+
+    /// OWL-88: a sentinel that ended or never started is a warning that says
+    /// what is lost, never a failure; a running one is quiet.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_or_ended_sentinel_warns_without_failing() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let running = run(&ready(), &no_config());
+        let sentinel = line(&running, "sentinel");
+        assert_eq!(sentinel.status, Status::Ok, "{running}");
+        assert!(
+            sentinel.detail.starts_with("running (pid 4242)"),
+            "{running}"
+        );
+
+        for (status, detail, fix) in [
+            (
+                SentinelStatus::Ended("signal: 9 (SIGKILL)".into()),
+                "ended (signal: 9 (SIGKILL)): a hard kill of Owlshift would leave",
+                "`owlshift-sentinel`",
+            ),
+            (
+                SentinelStatus::NotRunning,
+                "not running, it could not start: a hard kill of Owlshift would leave",
+                "check that `/bin/sh` runs",
+            ),
+        ] {
+            let report = run(&ready().sentinel_is(status), &no_config());
+            let sentinel = line(&report, "sentinel");
+            assert!(report.ready(), "{report}");
+            assert_eq!(sentinel.status, Status::Warn, "{report}");
+            assert!(sentinel.detail.starts_with(detail), "{report}");
+            assert!(sentinel.fix.as_deref().unwrap().contains(fix), "{report}");
+        }
     }
 
     /// Without the login made for agent runs, the machine is not ready, and
