@@ -128,12 +128,17 @@ impl AgentEnv {
     /// [`AgentEnv::for_project`] builds it, confined, with Claude Code
     /// pointed at the login made for agent runs
     /// ([`paths::claude_agent_login_dir`]): the sandbox closes the Keychain,
-    /// where the operator's own login lives on macOS.
+    /// where the operator's own login lives on macOS. Claude Code's inbox for
+    /// the user's other sessions is switched off ([`claude::PEER_INBOX_ENV`],
+    /// OWL-65), whatever the runner's environment and the declared variables
+    /// say. Only this constructor sets either variable.
     pub fn from_runner(declared: &[&str], allowed: &[&str]) -> Result<Self, AgentEnvError> {
         let mut env = Self::for_project(std::env::vars_os(), declared, allowed)?;
         if let Some(dir) = paths::claude_agent_login_dir() {
             env.set("CLAUDE_CONFIG_DIR", dir.into_os_string());
         }
+        let (name, value) = claude::PEER_INBOX_ENV;
+        env.set(name, value.into());
         Ok(env)
     }
 
