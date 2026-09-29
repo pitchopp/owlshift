@@ -16,6 +16,8 @@ pub mod push;
 
 use std::fmt;
 
+use owlshift_contracts::ids::is_repository_part;
+
 /// A row of the forge line in architecture section 6.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Capability {
@@ -73,15 +75,7 @@ impl Repo {
             ))
         };
         let (owner, name) = text.split_once('/').ok_or_else(invalid)?;
-        let valid = |part: &str| {
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        };
-        if !valid(owner) || !valid(name) {
+        if !is_repository_part(owner) || !is_repository_part(name) {
             return Err(invalid());
         }
         Ok(Self {
@@ -92,15 +86,20 @@ impl Repo {
 
     /// The repository a GitHub remote URL points to: `git@github.com:o/r.git`,
     /// `ssh://git@github.com/o/r.git` or `https://github.com/o/r.git`, with or
-    /// without the `.git` suffix. Any other host is refused.
+    /// without the `.git` suffix. Any other host is refused. In an https URL
+    /// the user info is read inside the authority only, so an `@` in the
+    /// path (`https://example.invalid/@github.com/o/r`) does not make another
+    /// host pass for github.com.
     pub fn from_github_remote(url: &str) -> Result<Self, Error> {
         let path = url
             .strip_prefix("git@github.com:")
             .or_else(|| url.strip_prefix("ssh://git@github.com/"))
             .or_else(|| {
-                let rest = url.strip_prefix("https://")?;
-                let rest = rest.split_once('@').map_or(rest, |(_, host)| host);
-                rest.strip_prefix("github.com/")
+                let (authority, path) = url.strip_prefix("https://")?.split_once('/')?;
+                let host = authority
+                    .rsplit_once('@')
+                    .map_or(authority, |(_, host)| host);
+                (host == "github.com").then_some(path)
             })
             .ok_or_else(|| invalid("the remote is not a github.com repository"))?;
         let path = path.trim_end_matches('/');
@@ -415,19 +414,17 @@ mod tests {
         ] {
             assert_eq!(Repo::from_github_remote(url).unwrap(), repo, "{url}");
         }
+        for bad in ["owlshift", "a/b/c", "../x", "o/", "o/n n"] {
+            assert!(Repo::parse(bad).is_err(), "{bad}");
+        }
         for bad in [
-            "owlshift",
-            "a/b/c",
-            "../x",
-            "o/",
-            "o/n n",
             "https://gitlab.com/o/n.git",
             "git@example.com:o/n.git",
+            "https://github.com.example.invalid/o/n.git",
+            // An `@` in the path is not user info: the host is example.invalid.
+            "https://example.invalid/@github.com/o/n.git",
         ] {
-            let error = Repo::parse(bad)
-                .and_then(|_| Repo::from_github_remote(bad))
-                .unwrap_err();
-            assert!(!error.message.is_empty(), "{bad}");
+            assert!(Repo::from_github_remote(bad).is_err(), "{bad}");
         }
     }
 

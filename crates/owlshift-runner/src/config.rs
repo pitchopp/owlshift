@@ -11,11 +11,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ContractError;
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, check_requires, entries};
 use semver::Version;
 
 use crate::system::System;
+use crate::{on_demand, project};
 
 /// This binary's version.
 pub const OWLSHIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -102,36 +104,53 @@ impl Effective {
             None => FileState::NotApplicable("this system has no configuration directory".into()),
         };
         let mut effective = Self { project, personal };
-        effective.check_gate_env();
+        effective.check_gate_env(system);
         effective
     }
 
-    /// The names the operator lets a project pass to its agents, the
-    /// personal `allow_gate_env`: none without a personal file, `None` when
-    /// the personal file is unknown or invalid.
-    pub fn allowed_gate_env(&self) -> Option<Vec<&str>> {
+    /// The names the operator lets a project of `repository` pass to its
+    /// agents: the personal `allow_gate_env`, and that of the repository's
+    /// entry under `repositories` (OWL-75). None without a personal file,
+    /// `None` when the personal file is unknown or invalid. `owlshift do`
+    /// passes the repository it runs, so the agent environment is built for
+    /// that one, whatever the load saw.
+    pub fn allowed_gate_env(&self, repository: Option<&Repo>) -> Option<Vec<&str>> {
+        let key = repository.map(repository_key);
         match &self.personal {
-            FileState::Loaded { config, .. } => Some(config.allow_gate_env_names()),
+            FileState::Loaded { config, .. } => Some(config.allow_gate_env_names(key.as_deref())),
             FileState::Absent(_) | FileState::NotApplicable(_) => Some(Vec::new()),
             FileState::Unavailable(_) | FileState::Invalid { .. } => None,
         }
     }
 
     /// Refuses, as invalid, a project that declares for its gate a variable
-    /// the operator does not allow (OWL-63). With the personal file unknown
-    /// or invalid, the configuration is invalid already and the project is
-    /// left as it is.
-    fn check_gate_env(&mut self) {
+    /// the operator does not allow (OWL-63), for this repository (OWL-75).
+    /// The repository is read from the checkout's `origin`, only when the
+    /// project declares a name; with none known, only the machine-wide names
+    /// apply, and the refusal says why. With the personal file unknown or
+    /// invalid, the configuration is invalid already and the project is left
+    /// as it is.
+    fn check_gate_env(&mut self, system: &dyn System) {
         let FileState::Loaded { path, config, .. } = &self.project else {
             return;
         };
-        let Some(allowed) = self.allowed_gate_env() else {
+        if config.stack.gate_env.is_empty() {
+            return;
+        }
+        let repository = origin_repo(system, path.parent().unwrap_or(path));
+        let Some(allowed) = self.allowed_gate_env(repository.as_ref().ok()) else {
             return;
         };
+        // The file passed `check_names` when parsed: only a name the
+        // operator does not allow fails here, so the note always fits.
         if let Err(error) = config.check_gate_env(&allowed) {
+            let note = match &repository {
+                Ok(repo) => format!("this repository is {}", repository_key(repo)),
+                Err(reason) => format!("names scoped to a repository do not apply: {reason}"),
+            };
             self.project = FileState::Invalid {
                 path: path.clone(),
-                error: error.to_string(),
+                error: format!("{error}; {note}"),
             };
         }
     }
@@ -170,6 +189,29 @@ fn project_root(system: &dyn System, cwd: &Path) -> Result<Option<PathBuf>, Stri
         "`git rev-parse --show-toplevel` failed ({}): {first_line}",
         exit_text(captured.code)
     ))
+}
+
+/// The key of `repo` under the personal `repositories`, as the data
+/// directory places it: `github.com/<owner>/<name>`.
+fn repository_key(repo: &Repo) -> String {
+    format!("github.com/{repo}")
+}
+
+/// The GitHub repository of the `origin` remote of the checkout at `root`,
+/// read as `owlshift do` reads it ([`project::origin_text`],
+/// [`on_demand::check_origin`]). The remote lives in the checkout's git
+/// configuration, which the committed project file cannot set.
+fn origin_repo(system: &dyn System, root: &Path) -> Result<Repo, String> {
+    let git = system
+        .locate("git")
+        .ok_or_else(|| "git is not on the PATH".to_owned())?;
+    let captured = system
+        .run(&git, &["remote", "get-url", "origin"], Some(root))
+        .map_err(|error| format!("`git remote get-url origin`: {error}"))?;
+    if captured.code != Some(0) {
+        return Err("the repository has no remote `origin`".to_owned());
+    }
+    on_demand::check_origin(&project::origin_text(captured.stdout)?)
 }
 
 #[cfg(unix)]
@@ -253,12 +295,20 @@ mod tests {
         always_human = []
     "#;
 
-    /// A repository whose `git rev-parse` answers with `root`.
+    /// A repository whose `git rev-parse` answers with `root`, cloned from
+    /// `acme/api` on GitHub.
     fn repository(root: &Path) -> FakeSystem {
+        repository_from(root, Answer::Exit(0, "git@github.com:acme/api.git\n", ""))
+    }
+
+    /// A repository at `root` whose `git remote get-url origin` answers
+    /// `origin`.
+    fn repository_from(root: &Path, origin: Answer) -> FakeSystem {
         let stdout: &'static str = Box::leak(format!("{}\n", root.display()).into_boxed_str());
         FakeSystem::default()
             .install("git")
             .answer("git rev-parse --show-toplevel", Answer::Exit(0, stdout, ""))
+            .answer("git remote get-url origin", origin)
     }
 
     #[test]
@@ -329,6 +379,68 @@ mod tests {
         // An invalid personal file makes the configuration invalid on its own.
         fs::write(&personal, "allow_gate_env = \"DATABASE_URL\"\n").unwrap();
         assert!(!load().is_valid());
+    }
+
+    /// OWL-75's acceptance: a name the operator allows for one repository
+    /// is refused, when the configuration is loaded, in a checkout of
+    /// another, and in one whose repository is unknown.
+    #[test]
+    fn a_name_allowed_for_one_repository_is_refused_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaring = PROJECT.replace(
+            "gate = [\"cargo test\"]",
+            "gate = [\"cargo test\"]\ngate_env = [\"DATABASE_URL\"]",
+        );
+        fs::write(dir.path().join(PROJECT_FILE), declaring).unwrap();
+        let personal = dir.path().join("personal.toml");
+        fs::write(
+            &personal,
+            "[repositories.\"github.com/acme/api\"]\nallow_gate_env = [\"DATABASE_URL\"]\n",
+        )
+        .unwrap();
+        let load = |origin| {
+            let system = repository_from(dir.path(), origin);
+            Effective::load(&system, dir.path(), Some(personal.clone()))
+        };
+        let refusal = |effective: Effective| match effective.project {
+            FileState::Invalid { error, .. } => error,
+            _ => panic!("{effective}"),
+        };
+
+        let effective = load(Answer::Exit(0, "git@github.com:acme/api.git\n", ""));
+        assert!(effective.is_valid(), "{effective}");
+        let api = Repo::parse("acme/api").unwrap();
+        let web = Repo::parse("acme/web").unwrap();
+        assert_eq!(
+            effective.allowed_gate_env(Some(&api)),
+            Some(vec!["DATABASE_URL"])
+        );
+        assert_eq!(effective.allowed_gate_env(Some(&web)), Some(vec![]));
+        assert_eq!(effective.allowed_gate_env(None), Some(vec![]));
+
+        let error = refusal(load(Answer::Exit(
+            0,
+            "https://github.com/acme/web.git\n",
+            "",
+        )));
+        assert!(
+            error.starts_with("invalid owlshift.toml: stack.gate_env: DATABASE_URL may not reach")
+                && error.ends_with("; this repository is github.com/acme/web"),
+            "{error}"
+        );
+
+        let error = refusal(load(Answer::Exit(
+            2,
+            "",
+            "error: No such remote 'origin'\n",
+        )));
+        assert!(
+            error.ends_with(
+                "; names scoped to a repository do not apply: the repository has no remote \
+                 `origin`"
+            ),
+            "{error}"
+        );
     }
 
     #[test]

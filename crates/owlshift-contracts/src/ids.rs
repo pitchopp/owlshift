@@ -112,6 +112,18 @@ impl RelativePath {
     }
 }
 
+/// Whether `part` can be the owner or the name of a forge repository
+/// (`owner/name`): not empty, not `.` or `..`, and only ASCII letters,
+/// digits, `-`, `_` and `.`.
+pub fn is_repository_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// An identifier that does not match its pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdError {

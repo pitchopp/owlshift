@@ -399,7 +399,7 @@ impl OnDemand<'_> {
         // The rules come from the base commit, after the fetch, never from
         // the ticket's branch, which agents write; every run of this `do`
         // gets the same.
-        let rules = rules::project_rules(git, &checkout, &base)
+        let rules = rules::project_rules(git, &checkout, &base, &self.config.stack)
             .map_err(|e| refused("the project's rules", e))?;
         sink.emit(
             ticket,
@@ -962,6 +962,10 @@ mod tests {
                 "carries a credential",
             ),
             ("https://gitlab.com/o/r.git", "not a github.com repository"),
+            (
+                "https://example.invalid/@github.com/o/r.git",
+                "not a github.com repository",
+            ),
             ("/srv/git/r.git", "not a github.com repository"),
         ] {
             let error = check_origin(url).unwrap_err();

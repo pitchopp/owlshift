@@ -172,6 +172,16 @@
             "type": "string"
           },
           "default": {}
+        },
+        "rules": {
+          "description": "The files whose text reaches agents as the project's rules, paths\nfrom the repository's root with `/` between folders, in order. Each is\nread at the base commit, taken whole, and must exist there; a blank\nfile gives no rule. Files only, at most 32, and 64 KiB for all of them\ntogether. Left out, the rules are the root `AGENTS.md` when the base\ncommit has one; `[]` gives no rule.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false,

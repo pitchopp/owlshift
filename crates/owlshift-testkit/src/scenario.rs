@@ -365,9 +365,22 @@ impl Driver {
         }
         .transpose()
         .map_err(|e| format!("{}: {e}", personal_path.display()))?;
+        // The remote is a local bare repository, not a GitHub one: names
+        // scoped to a repository could never apply, so they are refused
+        // rather than ignored.
+        if personal
+            .as_ref()
+            .is_some_and(|p| !p.repositories.is_empty())
+        {
+            return Err(format!(
+                "{}: a scenario's repository is not on GitHub, so `repositories` cannot apply: \
+                 use the machine-wide `allow_gate_env`",
+                personal_path.display()
+            ));
+        }
         let allowed = personal
             .as_ref()
-            .map(PersonalConfig::allow_gate_env_names)
+            .map(|personal| personal.allow_gate_env_names(None))
             .unwrap_or_default();
         config
             .check_gate_env(&allowed)

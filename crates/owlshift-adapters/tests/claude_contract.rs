@@ -366,6 +366,51 @@ fn messages_from_other_sessions_are_refused_on_every_launch() {
     );
 }
 
+/// The agent environment switches the inbox itself off, under the refuse
+/// flag: `AgentEnv::from_runner` sets `PEER_INBOX_ENV` (OWL-65). The two
+/// fixtures are a matched pair, recorded on 2026-09-29 with Claude Code
+/// 2.1.283, unconfined, the write-in-worktree argv with network as
+/// `command` builds it, plus `--model haiku --effort low`, in the agent
+/// environment of `from_runner` as it was before this variable, with a
+/// made-up claude.ai login and a local stand-in for the model (reached
+/// through `ANTHROPIC_BASE_URL`) that played one Bash call. Only the
+/// variable differs: `peer_inbox_open.jsonl` ran without it and its `init`
+/// names a socket, `peer_inbox_switched_off.jsonl` ran with it and names
+/// none. Each run completed. Exit 0, empty stderr, for both.
+#[test]
+fn the_agent_environment_switches_the_peer_inbox_off() {
+    // The variable the recording was made with.
+    assert_eq!(
+        owlshift_adapters::harness::claude::PEER_INBOX_ENV,
+        ("CLAUDE_CODE_HARBOR_KITE", "0")
+    );
+    let init = |name: &str| {
+        recorded_events(name)
+            .into_iter()
+            .find(|event| event["type"] == "system" && event["subtype"] == "init")
+            .unwrap_or_else(|| panic!("{name} has no init event"))
+    };
+    for (name, socket) in [
+        ("peer_inbox_open.jsonl", true),
+        ("peer_inbox_switched_off.jsonl", false),
+    ] {
+        let init = init(name);
+        assert_eq!(init["claude_code_version"], "2.1.283", "{name}");
+        assert_eq!(
+            init.get("messaging_socket_path").is_some(),
+            socket,
+            "{name}: {init}"
+        );
+        assert_eq!(
+            replay(name, 0).outcome,
+            Outcome::Completed {
+                text: "DONE".into()
+            },
+            "{name}"
+        );
+    }
+}
+
 /// Every launch loads no settings file: `--setting-sources` with an empty
 /// value leaves out the user's settings and the worktree's
 /// `.claude/settings.json` and `.claude/settings.local.json`, while
