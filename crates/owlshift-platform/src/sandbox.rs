@@ -12,16 +12,10 @@
 //!   the agent's `PATH`, with a private `/tmp`, an empty `/run/user`, its own
 //!   PID namespace and `/proc`, and the policy's folders bound back in.
 //! - Native Windows: no confinement, so [`available`] refuses and agent runs
-//!   there are refused; WSL2 runs the Linux sandbox (decision D9). Native
-//!   confinement is set aside (decided 2026-09-29, build plan). What remains
-//!   is test-only, and slated for removal (OWL-89): given a launcher,
-//!   [`wrap`] and [`wrap_line`] return a command that runs `owlshift-launch`,
-//!   which the runner starts inside the run's Job Object and which creates
-//!   the program itself with `CreateProcessW`, so the program is in that job
-//!   too. It applies nothing of the policy. A shipped build has no launcher;
-//!   only a test sets one (`use_built_launcher`), and [`wrap`] refuses like
-//!   [`available`].
-//! - Anything else: [`SandboxError::Unsupported`].
+//!   there are refused, [`wrap`] as [`available`], with
+//!   [`SandboxError::Unsupported`]; WSL2 runs the Linux sandbox (decision
+//!   D9). Native confinement is set aside (decided 2026-09-29, build plan).
+//! - Anything else: [`SandboxError::Unsupported`] too.
 //!
 //! The policy is the same on both systems. The home is neither read nor
 //! written, but for the folders the policy names; nothing is written outside
@@ -97,9 +91,6 @@ pub enum SandboxError {
     },
     /// A path that cannot be given to the sandbox as is.
     Path(PathBuf),
-    /// A program the Windows launcher does not start: a batch file, or a
-    /// name that holds a file stream.
-    BatchFile(PathBuf),
 }
 
 impl fmt::Display for SandboxError {
@@ -127,13 +118,6 @@ impl fmt::Display for SandboxError {
                 f,
                 "{} cannot be given to the sandbox: it is not valid UTF-8",
                 path.display()
-            ),
-            Self::BatchFile(program) => write!(
-                f,
-                "{} is a batch file, or names a file stream: the Windows launcher starts \
-                 programs itself and does not start these, since cmd.exe would read their \
-                 arguments again",
-                program.display()
             ),
         }
     }
@@ -176,159 +160,6 @@ where
 /// trial run under it succeeds. The error says what to fix.
 pub fn available() -> Result<(), SandboxError> {
     imp::available()
-}
-
-/// [`wrap`] for a program that reads its command line its own way, such as
-/// `cmd.exe`: `line` follows the program's name verbatim, where [`wrap`]
-/// would quote each argument as std's `Command` does. Native Windows only.
-#[cfg(windows)]
-pub fn wrap_line(policy: &Policy, program: &OsStr, line: &OsStr) -> Result<Command, SandboxError> {
-    imp::wrap_line(policy, program, line)
-}
-
-/// The launcher's file name, next to the `owlshift` program.
-#[cfg(all(windows, any(test, feature = "testkit")))]
-const LAUNCHER: &str = "owlshift-launch.exe";
-
-/// The launcher [`wrap`] starts on Windows. A shipped build has none: the
-/// launcher is test-only, and slated for removal (OWL-89), since native
-/// confinement is set aside.
-#[cfg(all(windows, not(any(test, feature = "testkit"))))]
-fn launcher() -> Option<PathBuf> {
-    None
-}
-
-/// The launcher a test set on this thread, if any.
-#[cfg(all(windows, any(test, feature = "testkit")))]
-fn launcher() -> Option<PathBuf> {
-    BUILT_LAUNCHER.with(|launcher| launcher.borrow().clone())
-}
-
-#[cfg(all(windows, any(test, feature = "testkit")))]
-thread_local! {
-    static BUILT_LAUNCHER: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Test only: makes [`wrap`] and [`wrap_line`] start the launcher Cargo
-/// built in the workspace's target folder, on this thread, until the guard
-/// is dropped. Commands are built on the test's own thread, so a test that
-/// sets it never changes what a test running beside it sees. It exists only
-/// in test builds and with the `testkit` feature, which no shipped crate
-/// enables, and it confines nothing: `available` still refuses.
-///
-/// # Panics
-///
-/// When the launcher is not built: `cargo test --workspace` builds it with
-/// `owlshift-cli`'s binaries, a test run of one package alone does not.
-#[cfg(all(windows, any(test, feature = "testkit")))]
-pub fn use_built_launcher() -> LauncherGuard {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let mut dir = exe
-        .parent()
-        .expect("the test binary is in a folder")
-        .to_owned();
-    // Cargo puts test binaries in `deps`, and the workspace's binaries one
-    // level up.
-    if dir.file_name().is_some_and(|name| name == "deps") {
-        dir.pop();
-    }
-    let path = dir.join(LAUNCHER);
-    assert!(
-        path.is_file(),
-        "{} is not built: run `cargo build -p owlshift-cli --bin owlshift-launch` first, \
-         or `cargo test --workspace`, which builds it",
-        path.display()
-    );
-    let previous = BUILT_LAUNCHER.with(|launcher| launcher.replace(Some(path)));
-    LauncherGuard { previous }
-}
-
-/// Restores the launcher that was set before [`use_built_launcher`] when
-/// dropped.
-#[cfg(all(windows, any(test, feature = "testkit")))]
-#[must_use = "the launcher is unset when the guard is dropped"]
-pub struct LauncherGuard {
-    previous: Option<PathBuf>,
-}
-
-#[cfg(all(windows, any(test, feature = "testkit")))]
-impl Drop for LauncherGuard {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        BUILT_LAUNCHER.with(|launcher| *launcher.borrow_mut() = previous);
-    }
-}
-
-/// Whether Windows would run `program` through `cmd.exe`: its file name,
-/// once the trailing dots and spaces Windows ignores are dropped, ends in
-/// `.bat` or `.cmd` in any letter case, or holds a `:`, which names a file
-/// stream (`x.bat::$DATA`). `cmd.exe` reads the arguments of a batch file
-/// again, by rules of its own; std's `Command` guards that case with its own
-/// escaping, the launcher does not, so it starts neither.
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "the launcher runs on Windows; tested everywhere")
-)]
-pub(crate) fn is_batch_file(program: &OsStr) -> bool {
-    let program = program.to_string_lossy();
-    let mut name = program.rsplit(['/', '\\']).next().unwrap_or_default();
-    // A drive-relative name, such as `C:x.bat`, keeps its drive.
-    if name.len() == program.len() {
-        let mut chars = name.chars();
-        if chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next() == Some(':') {
-            name = &name[2..];
-        }
-    }
-    let name = name.trim_end_matches(['.', ' ']).to_ascii_lowercase();
-    name.contains(':') || name.ends_with(".bat") || name.ends_with(".cmd")
-}
-
-/// The rest of a Windows command line after the program's name: `args`
-/// quoted as std's `Command` quotes a regular argument, one space apart,
-/// for a program that splits its command line by the Microsoft C runtime's
-/// rules. An argument is quoted when it is empty or holds a space or a tab;
-/// a quote inside it is escaped with a backslash, and the backslashes
-/// before a quote, or before the closing quote, are doubled. The units are
-/// UTF-16, as `CreateProcessW` takes them.
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "the launcher runs on Windows; tested everywhere")
-)]
-fn command_line<A: AsRef<[u16]>>(args: impl IntoIterator<Item = A>) -> Vec<u16> {
-    const QUOTE: u16 = b'"' as u16;
-    const BACKSLASH: u16 = b'\\' as u16;
-    let mut line = Vec::new();
-    for (index, arg) in args.into_iter().enumerate() {
-        let arg = arg.as_ref();
-        if index > 0 {
-            line.push(u16::from(b' '));
-        }
-        let quote = arg.is_empty()
-            || arg
-                .iter()
-                .any(|&unit| unit == u16::from(b' ') || unit == u16::from(b'\t'));
-        if quote {
-            line.push(QUOTE);
-        }
-        let mut backslashes = 0;
-        for &unit in arg {
-            if unit == BACKSLASH {
-                backslashes += 1;
-            } else {
-                if unit == QUOTE {
-                    line.extend(std::iter::repeat_n(BACKSLASH, backslashes + 1));
-                }
-                backslashes = 0;
-            }
-            line.push(unit);
-        }
-        if quote {
-            line.extend(std::iter::repeat_n(BACKSLASH, backslashes));
-            line.push(QUOTE);
-        }
-    }
-    line
 }
 
 /// `path` as the system resolves it: its longest existing part made real,
@@ -777,57 +608,9 @@ mod imp {
     }
 }
 
-#[cfg(windows)]
-mod imp {
-    use std::ffi::{OsStr, OsString};
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::process::Command;
-
-    use super::{Policy, SandboxError, command_line, is_batch_file, launcher};
-
-    pub(super) fn wrap<I, S>(
-        policy: &Policy,
-        program: &OsStr,
-        args: I,
-    ) -> Result<Command, SandboxError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let args: Vec<Vec<u16>> = args
-            .into_iter()
-            .map(|arg| arg.as_ref().encode_wide().collect())
-            .collect();
-        wrap_line(policy, program, &OsString::from_wide(&command_line(&args)))
-    }
-
-    /// The launcher's command: `owlshift-launch -- PROGRAM LINE`, in the
-    /// policy's working directory, and nothing else of the policy yet. The
-    /// options before `--` are unused: native confinement is set aside. The
-    /// working directory is not made real: `canonicalize` gives a `\\?\`
-    /// path on Windows, which `cmd.exe` cannot run in.
-    pub(super) fn wrap_line(
-        policy: &Policy,
-        program: &OsStr,
-        line: &OsStr,
-    ) -> Result<Command, SandboxError> {
-        let launcher = launcher().ok_or(SandboxError::Unsupported)?;
-        if is_batch_file(program) {
-            return Err(SandboxError::BatchFile(program.into()));
-        }
-        let mut command = Command::new(launcher);
-        command.arg("--").arg(program).arg(line);
-        command.current_dir(&policy.workdir);
-        Ok(command)
-    }
-
-    pub(super) fn available() -> Result<(), SandboxError> {
-        // Native confinement is set aside (build plan, 2026-09-29): refused.
-        Err(SandboxError::Unsupported)
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+/// Native Windows and any other system: nothing is confined, so both refuse.
+/// Native confinement on Windows is set aside (build plan, 2026-09-29).
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use std::ffi::OsStr;
     use std::process::Command;
@@ -1057,77 +840,7 @@ mod tests {
     fn native_windows_refuses_to_confine() {
         assert_eq!(available(), Err(SandboxError::Unsupported));
         let error = wrap(&policy(), OsStr::new("cmd"), ["/c", "echo"]).unwrap_err();
+        assert_eq!(error, SandboxError::Unsupported);
         assert!(error.to_string().contains("WSL2"), "{error}");
-    }
-
-    /// The launcher's line quotes each argument as std's `Command` does, so
-    /// the program reads back the arguments it was given (OWL-71).
-    #[test]
-    fn arguments_are_quoted_as_std_quotes_them() {
-        let quoted = |args: &[&str]| {
-            let args: Vec<Vec<u16>> = args
-                .iter()
-                .map(|arg| arg.encode_utf16().collect())
-                .collect();
-            String::from_utf16(&command_line(&args)).unwrap()
-        };
-        let cases: [(&[&str], &str); 9] = [
-            (&["a"], "a"),
-            (&["a b"], r#""a b""#),
-            (&[""], r#""""#),
-            (&["a\"b"], r#"a\"b"#),
-            (&[r"a\b"], r"a\b"),
-            (&[r#"a\"b"#], r#"a\\\"b"#),
-            (&[r"a b\"], r#""a b\\""#),
-            (&["a\tb"], "\"a\tb\""),
-            (&["x", "", "y z"], r#"x "" "y z""#),
-        ];
-        for (args, line) in cases {
-            assert_eq!(quoted(args), line, "{args:?}");
-        }
-    }
-
-    #[test]
-    fn batch_files_and_file_streams_are_recognised() {
-        for program in [
-            "x.cmd",
-            r"C:\tools\X.BAT",
-            "x.cmd.",
-            "x.cmd ",
-            r"C:\x\a.bat::$DATA",
-            "C:x.bat",
-            "dir/run.Cmd",
-        ] {
-            assert!(is_batch_file(OsStr::new(program)), "{program}");
-        }
-        for program in [
-            "x.exe",
-            "cmd",
-            r"C:\Windows\system32\cmd.exe",
-            "C:x.exe",
-            "bat",
-        ] {
-            assert!(!is_batch_file(OsStr::new(program)), "{program}");
-        }
-    }
-
-    /// With a launcher, the command runs it with the program and its line,
-    /// in the working directory, and nothing else of the policy (OWL-71); a
-    /// batch file is refused before anything runs.
-    #[cfg(windows)]
-    #[test]
-    fn the_launcher_gets_the_program_and_its_line_and_nothing_else() {
-        let _launcher = use_built_launcher();
-        let command = wrap(&policy(), OsStr::new("git"), ["log", "a b"]).unwrap();
-        assert_eq!(
-            Path::new(command.get_program()).file_name(),
-            Some(OsStr::new(LAUNCHER))
-        );
-        let args: Vec<&OsStr> = command.get_args().collect();
-        assert_eq!(args, ["--", "git", "log \"a b\""]);
-        assert_eq!(command.get_current_dir(), Some(Path::new("/home/op/wt")));
-
-        let error = wrap(&policy(), OsStr::new("npm.cmd"), ["test"]).unwrap_err();
-        assert_eq!(error, SandboxError::BatchFile("npm.cmd".into()));
     }
 }
