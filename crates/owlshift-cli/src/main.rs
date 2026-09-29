@@ -67,8 +67,9 @@ fn long_version() -> String {
 }
 
 fn main() -> ExitCode {
-    // Before any probe or run starts: each runs in a process group of its
-    // own, out of reach of the terminal's Ctrl-C, so Owlshift stops it itself.
+    // Before any probe or run starts: on Unix each runs in a process group of
+    // its own, out of reach of the terminal's Ctrl-C, and on Windows one that
+    // ignores Ctrl-C would outlive Owlshift, so Owlshift stops them itself.
     if let Err(error) = owlshift_platform::process::stop_trees_on_signal() {
         eprintln!("owlshift: cannot watch for Ctrl-C, a running probe would outlive it: {error}");
     }

@@ -32,3 +32,7 @@ rpassword.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# The Windows Ctrl-C test sends a console Ctrl-C (OWL-47).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true

@@ -1,134 +1,150 @@
 //! Stopping every live process tree when the process is told to end.
 //!
-//! A tree's root runs in a process group of its own, so the signals a
+//! On Unix a tree's root runs in a process group of its own, so the signals a
 //! terminal sends to its foreground group (Ctrl-C, Ctrl-\, a closed
 //! terminal) reach Owlshift but not the trees it started, which would keep
-//! running with nobody left to stop them. [`stop_trees_on_signal`] makes
-//! Owlshift stop them first.
+//! running with nobody left to stop them. On Windows a tree's root shares
+//! Owlshift's console and gets its Ctrl-C too, but a process that ignores
+//! Ctrl-C, and its children, keep running once Owlshift has ended (checked
+//! live, see `docs/design/runtime-and-operations.md`). [`stop_trees_on_signal`]
+//! makes Owlshift stop them first.
 //!
 //! A tree is live from [`ProcessTree::spawn`] until its handle is dropped:
-//! every tree registers its process group here, under the lock the signal
-//! thread takes, so a signal handled at any moment finds either no process or
-//! a registered group.
-//!
-//! On Windows there is nothing to forward. A tree's root is created without
-//! `CREATE_NEW_PROCESS_GROUP` and without a console of its own, so it shares
-//! Owlshift's console and console process group, and gets the console's
-//! Ctrl-C itself like every process attached to that console; the Job Object
-//! plays no part in console events. This follows the Win32 documentation of
-//! the process creation flags and of `GenerateConsoleCtrlEvent`; it was not
-//! checked live (no Windows host, 2026-09-28). A process that ignores Ctrl-C
-//! keeps running there, as it did before trees had a job of their own.
+//! every tree registers what stops it here (its process group, its Job
+//! Object), under the lock the handler takes, so an event handled at any
+//! moment finds either no process or a registered tree.
 //!
 //! [`ProcessTree::spawn`]: super::ProcessTree::spawn
 
 use std::io;
+use std::process::Child;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// Makes SIGINT (Ctrl-C), SIGQUIT (Ctrl-\), SIGTERM and SIGHUP (a closed
-/// terminal) stop every live [`ProcessTree`] before the process ends, as the
-/// signal's default action ends it: a shell sees the process killed by that
-/// signal.
+/// Makes the process stop every live [`ProcessTree`] before it ends, when
+/// told to end: on Unix on SIGINT (Ctrl-C), SIGQUIT (Ctrl-\), SIGTERM and
+/// SIGHUP (a closed terminal), on Windows on Ctrl-C and Ctrl-Break from the
+/// console. The process then ends as the event's default action ends it: a
+/// shell sees it killed by the signal, or ended by Ctrl-C
+/// (`STATUS_CONTROL_C_EXIT`).
 ///
 /// The trees are stopped as [`ProcessTree::kill`] stops them, each one best
-/// effort. The work runs on a thread of its own, started here: the signal
-/// handler only wakes it, so it may take locks.
+/// effort. On Unix the work runs on a thread of its own, started here: the
+/// signal handler only wakes it, so it may take locks. On Windows the system
+/// runs the console handler on a thread of its own already.
 ///
 /// Call it early, before the first tree is spawned. Once it succeeded, later
-/// calls do nothing; after a failure, it can be called again. On Windows it
-/// does nothing and succeeds (see the module documentation).
+/// calls do nothing; after a failure, it can be called again.
 ///
 /// It installs one process-wide policy, fit for a command that should end
-/// on these signals. Every tree is registered whether or not it is called.
+/// on these events. Every tree is registered whether or not it is called.
+///
+/// On Windows a process started with Ctrl-C turned off (`start /b`, for one)
+/// keeps it off, and so do the trees it starts: Ctrl-C then ends neither,
+/// Ctrl-Break still ends both.
 ///
 /// [`ProcessTree`]: super::ProcessTree
 /// [`ProcessTree::kill`]: super::ProcessTree::kill
 pub fn stop_trees_on_signal() -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        unix::install()
+    let mut installed = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner);
+    if *installed {
+        return Ok(());
     }
-    #[cfg(windows)]
-    {
-        Ok(())
+    imp::install()?;
+    *installed = true;
+    Ok(())
+}
+
+/// Whether the policy is installed.
+static INSTALLED: Mutex<bool> = Mutex::new(false);
+
+/// What stops a live tree: its process group.
+#[cfg(unix)]
+pub(super) type Stopper = rustix::process::Pid;
+
+/// What stops a live tree: its Job Object, shared with the tree's handle so
+/// that it stays open while registered.
+#[cfg(windows)]
+pub(super) type Stopper = std::sync::Arc<std::os::windows::io::OwnedHandle>;
+
+/// The live trees, each under the id of its [`Registration`].
+struct Live {
+    next: u64,
+    trees: Vec<(u64, Stopper)>,
+}
+
+static LIVE: Mutex<Live> = Mutex::new(Live {
+    next: 0,
+    trees: Vec::new(),
+});
+
+/// The live trees. A panic cannot leave them half-updated, so a poisoned
+/// lock is used as is: the handler must still find every tree.
+fn live() -> MutexGuard<'static, Live> {
+    LIVE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A live tree's entry; dropping it removes the entry.
+#[derive(Debug)]
+pub(super) struct Registration {
+    id: u64,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        live().trees.retain(|(id, _)| *id != self.id);
     }
 }
 
-#[cfg(unix)]
-pub(super) use unix::{Registration, register};
+/// Spawns a tree's root with `spawn` and registers what stops the tree,
+/// taken from the new child by `stopper`, under the lock the handler takes.
+///
+/// Holding the lock across the spawn means an event is handled either before
+/// (the process ends and the spawn never happens) or after the tree is
+/// registered, never in between: on Windows, never while a child created
+/// suspended is outside any registered job. The cost is that trees are
+/// spawned one at a time across threads: on Unix for the few milliseconds a
+/// spawn takes, on Windows also while the new child is placed in its job and
+/// its thread is found in a snapshot of the system's threads and resumed.
+pub(super) fn register(
+    spawn: impl FnOnce() -> io::Result<Child>,
+    stopper: impl FnOnce(&Child) -> Stopper,
+) -> io::Result<(Child, Registration)> {
+    let mut live = live();
+    let child = spawn()?;
+    let id = live.next;
+    live.next += 1;
+    live.trees.push((id, stopper(&child)));
+    Ok((child, Registration { id }))
+}
+
+/// Stops every live tree, then returns the lock, which the caller keeps
+/// until the process is gone: no tree starts from now on, and a thread that
+/// sees its tree stopped blocks when it drops the tree's handle, so it cannot
+/// end the process first.
+fn stop_every_tree() -> MutexGuard<'static, Live> {
+    let live = live();
+    for (_, stopper) in &live.trees {
+        // Best effort: a tree that cannot be stopped must not spare the
+        // ones after it.
+        #[cfg(unix)]
+        let _ = super::tree::kill_group(*stopper);
+        #[cfg(windows)]
+        let _ = super::tree::terminate_job(stopper);
+    }
+    live
+}
 
 #[cfg(unix)]
-mod unix {
+mod imp {
     use std::io;
-    use std::process::Child;
     use std::sync::mpsc;
-    use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::thread;
 
-    use rustix::process::Pid;
     use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
     use signal_hook::iterator::Signals;
     use signal_hook::low_level::emulate_default_handler;
 
-    use super::super::tree::kill_group;
-
-    /// The process groups of the live trees, each under the id of its
-    /// [`Registration`].
-    struct Live {
-        next: u64,
-        groups: Vec<(u64, Pid)>,
-    }
-
-    static LIVE: Mutex<Live> = Mutex::new(Live {
-        next: 0,
-        groups: Vec::new(),
-    });
-
-    /// Whether the signal thread is watching.
-    static INSTALLED: Mutex<bool> = Mutex::new(false);
-
-    /// The live trees. A panic cannot leave them half-updated, so a poisoned
-    /// lock is used as is: the signal thread must still find every group.
-    fn live() -> MutexGuard<'static, Live> {
-        LIVE.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// A live tree's entry; dropping it removes the entry.
-    #[derive(Debug)]
-    pub(in crate::process) struct Registration {
-        id: u64,
-    }
-
-    impl Drop for Registration {
-        fn drop(&mut self) {
-            live().groups.retain(|&(id, _)| id != self.id);
-        }
-    }
-
-    /// Spawns a tree's root with `spawn` and registers its process group,
-    /// whose id is the root's pid, under the lock the signal thread takes.
-    ///
-    /// Holding the lock across the spawn means a signal is handled either
-    /// before (the process ends and the spawn never happens) or after the
-    /// group is registered, never in between. The cost is that trees are
-    /// spawned one at a time across threads, for the few milliseconds a spawn
-    /// takes.
-    pub(in crate::process) fn register(
-        spawn: impl FnOnce() -> io::Result<Child>,
-    ) -> io::Result<(Child, Pid, Registration)> {
-        let mut live = live();
-        let child = spawn()?;
-        let group = Pid::from_child(&child);
-        let id = live.next;
-        live.next += 1;
-        live.groups.push((id, group));
-        Ok((child, group, Registration { id }))
-    }
-
     pub(super) fn install() -> io::Result<()> {
-        let mut installed = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner);
-        if *installed {
-            return Ok(());
-        }
         // The signals are registered on the thread that waits for them, once
         // it runs: registered and then dropped, they would be ignored from
         // then on (signal-hook-registry does not restore the default action).
@@ -150,46 +166,90 @@ mod unix {
             )?;
         registered
             .recv()
-            .map_err(|_| io::Error::other("the signal thread ended before it was ready"))??;
-        *installed = true;
-        Ok(())
+            .map_err(|_| io::Error::other("the signal thread ended before it was ready"))?
     }
 
     /// Stops every live tree, then ends the process as `signal` would have.
     fn end(signal: i32) -> ! {
-        // Kept locked until the process is gone: no tree starts from now on.
-        let live = live();
-        for &(_, group) in &live.groups {
-            // Best effort: a group that cannot be stopped must not spare
-            // the ones after it.
-            let _ = kill_group(group);
-        }
+        let _live = super::stop_every_tree();
         let _ = emulate_default_handler(signal);
         // Not reached: the default action of these signals ends the
         // process.
         std::process::exit(128 + signal)
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::process::ProcessTree;
-        use std::process::Command;
+#[cfg(windows)]
+mod imp {
+    use std::io;
 
-        fn registered(group: Pid) -> bool {
-            live().groups.iter().any(|&(_, g)| g == group)
+    use windows_sys::Win32::Foundation::STATUS_CONTROL_C_EXIT;
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::Threading::ExitProcess;
+    use windows_sys::core::BOOL;
+
+    pub(super) fn install() -> io::Result<()> {
+        // SAFETY: `on_console_event` has the signature of a handler routine
+        // and lives as long as the process.
+        if unsafe { SetConsoleCtrlHandler(Some(on_console_event), 1) } == 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
 
-        #[test]
-        fn a_tree_is_registered_until_its_handle_is_dropped() {
-            let (mut child, tree) = ProcessTree::spawn(&mut Command::new("true")).unwrap();
-            let group = Pid::from_child(&child);
-            assert!(registered(group));
-            child.wait().unwrap();
-            // Reaped, yet still the caller's: registered until dropped.
-            assert!(registered(group));
-            drop(tree);
-            assert!(!registered(group));
+    /// Runs on a thread the system starts for each console event.
+    ///
+    /// A closed console is left to the next handler: the system ends every
+    /// process attached to the console then, the trees' included.
+    unsafe extern "system" fn on_console_event(event: u32) -> BOOL {
+        match event {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => end(),
+            _ => 0,
         }
+    }
+
+    /// Stops every live tree, then ends the process as the default handler
+    /// does for a console event; like it, without flushing what Rust still
+    /// holds of the standard output.
+    fn end() -> ! {
+        let _live = super::stop_every_tree();
+        // SAFETY: no pointer argument.
+        unsafe { ExitProcess(STATUS_CONTROL_C_EXIT as u32) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::ProcessTree;
+    use std::process::Command;
+
+    fn registered(id: u64) -> bool {
+        live().trees.iter().any(|(entry, _)| *entry == id)
+    }
+
+    /// A program that exits at once.
+    fn quick() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit"]);
+            command
+        } else {
+            Command::new("true")
+        }
+    }
+
+    #[test]
+    fn a_tree_is_registered_until_its_handle_is_dropped() {
+        let (mut child, tree) = ProcessTree::spawn(&mut quick()).unwrap();
+        let id = tree.registration().id;
+        assert!(registered(id));
+        child.wait().unwrap();
+        // Reaped, yet still the caller's: registered until dropped.
+        assert!(registered(id));
+        drop(tree);
+        assert!(!registered(id));
     }
 }

@@ -1,6 +1,6 @@
 //! The `owlshift` binary, end to end. Only `git` is needed on the host: the
-//! one test that runs `doctor` gives it a fake `git` and interrupts it before
-//! it looks at the harness CLIs installed.
+//! tests that run `doctor` give it a fake `git` and interrupt it before it
+//! looks at the harness CLIs installed.
 
 use std::fs;
 use std::path::Path;
@@ -269,6 +269,373 @@ fn is_alive(pid: u32) -> bool {
     let state = String::from_utf8_lossy(&ps.stdout);
     let state = state.trim();
     !state.is_empty() && !state.starts_with('Z')
+}
+
+/// The acceptance criterion for OWL-47: on Windows, a console Ctrl-C on
+/// `doctor` while its git probe hangs stops the probe and the process it
+/// started, although both ignore Ctrl-C; and the CLI ends promptly, as Ctrl-C
+/// ends a console program.
+#[cfg(windows)]
+#[test]
+fn ctrl_c_on_doctor_stops_a_probe_that_ignores_it_and_its_child() {
+    windows_ctrl_c::interrupt_doctor();
+}
+
+/// Helper, run in a console of its own by `interrupt_doctor`.
+#[cfg(windows)]
+#[test]
+#[ignore = "helper, run by the Windows Ctrl-C test"]
+fn helper_interrupt_doctor() {
+    if windows_ctrl_c::helper_requested() {
+        windows_ctrl_c::interrupt_in_this_console();
+    }
+}
+
+/// Helper, run as `git --version` by the batch file `interrupt_doctor`
+/// writes.
+#[cfg(windows)]
+#[test]
+#[ignore = "helper, run by the Windows Ctrl-C test"]
+fn helper_hung_git() {
+    if windows_ctrl_c::helper_requested() {
+        windows_ctrl_c::hang_with_a_child();
+    }
+}
+
+/// Helper, the child `helper_hung_git` starts.
+#[cfg(windows)]
+#[test]
+#[ignore = "helper, run by the Windows Ctrl-C test"]
+fn helper_sleep() {
+    if windows_ctrl_c::helper_requested() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+
+/// A real console Ctrl-C on `owlshift doctor`, on Windows.
+///
+/// Ctrl-C reaches every process attached to a console, so it cannot be sent
+/// from the test process, whose console the test runner and the other tests
+/// share. The test starts a copy of itself in a new console with no window,
+/// the driver, which runs `owlshift doctor` there, sends that console a
+/// Ctrl-C (`GenerateConsoleCtrlEvent`) once the probe has started, and stays
+/// attached to it, as the user's shell does, while it watches the probe.
+#[cfg(windows)]
+mod windows_ctrl_c {
+    use std::fs::{self, File};
+    use std::io;
+    use std::os::windows::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::STATUS_CONTROL_C_EXIT;
+    use windows_sys::Win32::System::Console::{
+        CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    /// The folder holding the fake `git`, for the driver.
+    const BIN: &str = "OWLSHIFT_TEST_BIN";
+    /// The personal configuration folder, for the driver.
+    const CONFIG_DIR: &str = "OWLSHIFT_TEST_CONFIG_DIR";
+    /// Where the hung probe writes its pid and its child's.
+    const PIDS: &str = "OWLSHIFT_TEST_PIDS";
+
+    /// The helpers act only when run alone, never in a plain
+    /// `cargo test -- --ignored`.
+    pub(super) fn helper_requested() -> bool {
+        std::env::args().any(|arg| arg == "--exact")
+    }
+
+    fn helper(name: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            name,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        command
+    }
+
+    fn var(name: &str) -> PathBuf {
+        std::env::var_os(name)
+            .unwrap_or_else(|| panic!("{name} is not set"))
+            .into()
+    }
+
+    /// The pids the hung probe wrote, its own then its child's.
+    fn read_pids(pids: &Path) -> Vec<u32> {
+        fs::read_to_string(pids)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect()
+    }
+
+    pub(super) fn interrupt_doctor() {
+        let bin = tempfile::tempdir().unwrap();
+        let pids = bin.path().join("pids");
+        // This binary cannot answer `git --version` itself, since the test
+        // harness rejects the option: a batch file, the form npm installs a
+        // CLI in, starts the hung probe for `--version` and answers anything
+        // else as git does outside a repository, so loading the
+        // configuration does not hang.
+        let exe = std::env::current_exe().unwrap();
+        fs::write(
+            bin.path().join("git.cmd"),
+            format!(
+                "@echo off\r\n\
+                 if not \"%~1\"==\"--version\" goto other\r\n\
+                 \"{exe}\" --exact helper_hung_git --ignored --nocapture --test-threads=1\r\n\
+                 exit /b %errorlevel%\r\n\
+                 :other\r\n\
+                 echo fatal: not a git repository 1>&2\r\n\
+                 exit /b 128\r\n",
+                exe = exe.display()
+            ),
+        )
+        .unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let log = bin.path().join("driver.log");
+        let mut driver = helper("helper_interrupt_doctor");
+        driver
+            .env(BIN, bin.path())
+            .env(CONFIG_DIR, config_dir.path())
+            .env(PIDS, &pids)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(File::create(&log).unwrap())
+            .stderr(File::create(bin.path().join("driver.err")).unwrap());
+        let mut driver = driver.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = driver.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                // With `owlshift` and the probe, if still there.
+                stop(&[driver.id()]);
+                break driver.wait().unwrap();
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let report = format!(
+            "driver {status}\n--- stdout\n{}\n--- stderr\n{}",
+            fs::read_to_string(&log).unwrap_or_default(),
+            fs::read_to_string(bin.path().join("driver.err")).unwrap_or_default()
+        );
+        eprintln!("{report}");
+        if !status.success() {
+            // The driver stops what it started; this is for a driver that
+            // did not get that far.
+            stop(&read_pids(&pids));
+            panic!("{report}");
+        }
+    }
+
+    /// Stops what a failed run left, best effort.
+    fn stop(pids: &[u32]) {
+        for pid in pids {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    static CTRL_C_SEEN: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn note_ctrl_c(event: u32) -> windows_sys::core::BOOL {
+        if event == CTRL_C_EVENT {
+            CTRL_C_SEEN.store(true, Ordering::SeqCst);
+        }
+        // Handled: the driver outlives the Ctrl-C it sends.
+        1
+    }
+
+    /// The driver: runs `owlshift doctor` in this console, sends the console
+    /// a Ctrl-C once the probe has started, checks how `owlshift` ended, and
+    /// that the probe and its child are gone within 5 s.
+    pub(super) fn interrupt_in_this_console() {
+        let bin = var(BIN);
+        let config_dir = var(CONFIG_DIR);
+        let pids = var(PIDS);
+
+        // Ctrl-C is processed here and in the processes started from here,
+        // whatever this process inherited: a parent can turn it off for its
+        // descendants.
+        // SAFETY: no handler routine is passed.
+        let enabled = unsafe { SetConsoleCtrlHandler(None, 0) };
+        assert_ne!(enabled, 0, "{}", io::Error::last_os_error());
+
+        let system_root = var("SystemRoot");
+        let path = std::env::join_paths([
+            bin.clone(),
+            system_root.join("System32"),
+            system_root.clone(),
+        ])
+        .unwrap();
+        let mut owlshift = Command::new(env!("CARGO_BIN_EXE_owlshift"))
+            .arg("doctor")
+            .current_dir(&config_dir)
+            .env("PATH", path)
+            .env("HOME", &config_dir)
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("OWLSHIFT_CONFIG_DIR", &config_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Once `owlshift` runs: this process survives its own Ctrl-C and
+        // records it, proving the console got one.
+        // SAFETY: `note_ctrl_c` has the signature of a handler routine and
+        // stays valid for the life of the process.
+        let noted = unsafe { SetConsoleCtrlHandler(Some(note_ctrl_c), 1) };
+        assert_ne!(noted, 0, "{}", io::Error::last_os_error());
+
+        let probe_started = Instant::now() + Duration::from_secs(10);
+        while !pids.exists() {
+            if let Some(status) = owlshift.try_wait().unwrap() {
+                panic!("owlshift ended before its probe started: {status}");
+            }
+            assert!(Instant::now() < probe_started, "the probe never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        println!("probe: {}", fs::read_to_string(&pids).unwrap());
+        let started = read_pids(&pids);
+        assert_eq!(started.len(), 2, "{started:?}");
+        // So that a probe gone for another reason is never taken for one the
+        // Ctrl-C stopped.
+        let early: Vec<u32> = started
+            .iter()
+            .copied()
+            .filter(|&pid| !is_alive(pid))
+            .collect();
+        if !early.is_empty() {
+            let _ = owlshift.kill();
+            stop(&started);
+            panic!("gone before the Ctrl-C: {early:?} of the probe and its child {started:?}");
+        }
+
+        let sent = Instant::now();
+        // SAFETY: no pointer argument; group 0 is every process attached to
+        // this console.
+        let generated = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) };
+        assert_ne!(generated, 0, "{}", io::Error::last_os_error());
+
+        // Promptly: well before the probe's own ten-second deadline.
+        let status = loop {
+            if let Some(status) = owlshift.try_wait().unwrap() {
+                break status;
+            }
+            if sent.elapsed() >= Duration::from_secs(5) {
+                let _ = owlshift.kill();
+                stop(&started);
+                panic!(
+                    "owlshift still running 5 s after Ctrl-C (seen by the driver: {})",
+                    CTRL_C_SEEN.load(Ordering::SeqCst)
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let ended = sent.elapsed();
+        // The driver's own handler runs on a thread of its own, maybe later.
+        while !CTRL_C_SEEN.load(Ordering::SeqCst) && sent.elapsed() < ended + Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let seen = CTRL_C_SEEN.load(Ordering::SeqCst);
+        println!(
+            "owlshift ended {ended:?} after Ctrl-C: {status}; Ctrl-C seen by the driver: {seen}"
+        );
+
+        // A process ends asynchronously once stopped.
+        let mut gone = [None, None];
+        while gone.iter().any(Option::is_none) && sent.elapsed() < ended + Duration::from_secs(5) {
+            for (at, &pid) in gone.iter_mut().zip(&started) {
+                if at.is_none() && !is_alive(pid) {
+                    *at = Some(sent.elapsed());
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        println!(
+            "after Ctrl-C, gone: probe {:?}, child {:?}",
+            gone[0], gone[1]
+        );
+        let alive: Vec<u32> = started
+            .iter()
+            .copied()
+            .filter(|&pid| is_alive(pid))
+            .collect();
+        stop(&alive);
+
+        assert!(seen, "the console got no Ctrl-C");
+        assert_eq!(
+            status.code().map(|code| code as u32),
+            Some(STATUS_CONTROL_C_EXIT as u32),
+            "{status}"
+        );
+        assert!(
+            alive.is_empty(),
+            "still running 5 s after owlshift ended: {alive:?} of the probe and its child {started:?}"
+        );
+    }
+
+    /// The hung probe: ignores Ctrl-C, which the child it then starts
+    /// inherits, records both pids and waits on the child.
+    pub(super) fn hang_with_a_child() {
+        // SAFETY: no handler routine is passed.
+        let ignored = unsafe { SetConsoleCtrlHandler(None, 1) };
+        assert_ne!(ignored, 0, "{}", io::Error::last_os_error());
+        let mut child = helper("helper_sleep").spawn().unwrap();
+        let pids = var(PIDS);
+        let staged = pids.with_extension("tmp");
+        fs::write(&staged, format!("{} {}", std::process::id(), child.id())).unwrap();
+        fs::rename(&staged, &pids).unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Whether a process is still running.
+    fn is_alive(pid: u32) -> bool {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        // SAFETY: no pointer argument.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw.is_null() {
+            // The only expected failure: no process has this id any more.
+            let error = io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(ERROR_INVALID_PARAMETER as i32),
+                "{error}"
+            );
+            return false;
+        }
+        // SAFETY: the call succeeded, so `raw` is a new handle owned here.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        // SAFETY: `process` is open for the duration of the call.
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+            WAIT_TIMEOUT => true,
+            WAIT_OBJECT_0 => false,
+            other => panic!("wait returned {other}: {}", io::Error::last_os_error()),
+        }
+    }
 }
 
 #[test]
