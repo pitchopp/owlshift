@@ -9,6 +9,8 @@
 //! can use [`drive_plain`].
 
 use std::error::Error;
+use std::fmt;
+use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -20,9 +22,10 @@ use jiff::Timestamp;
 
 use owlshift_adapters::harness::claude::{self, EXIT_GRACE, Effort, STDERR_CAP, Usage};
 use owlshift_contracts::brief::Brief;
+use owlshift_platform::process::find_executable_in;
 
 use super::{BRIEF_PATH, RunLog};
-use crate::agent_env::{CredentialFinding, mcp_findings};
+use crate::agent_env::{AgentEnv, CredentialFinding, mcp_findings};
 
 /// Why a harness could not build its command; the adapter's own error type
 /// stays reachable through downcasting.
@@ -56,6 +59,76 @@ pub trait Harness {
         child: &mut Child,
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd>;
+
+    /// What the harness needs inside the sandbox besides the worktree and
+    /// the repository's git folder, or why it cannot run confined, such as
+    /// no login made for agent runs (OWL-41). Nothing more by default.
+    fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        let _ = agent;
+        Ok(SandboxNeeds::default())
+    }
+}
+
+/// What a harness needs inside the sandbox.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SandboxNeeds {
+    /// Folders read, such as where the harness is installed.
+    pub readable: Vec<PathBuf>,
+    /// Folders read and written, such as the harness's login folder.
+    pub writable: Vec<PathBuf>,
+}
+
+/// Claude Code has no login for agent runs in its folder: the run is refused
+/// with the command that makes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoAgentLogin {
+    /// The login folder, `CLAUDE_CONFIG_DIR` of the agent; `None` when the
+    /// agent has none.
+    pub dir: Option<PathBuf>,
+}
+
+impl fmt::Display for NoAgentLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.dir {
+            None => f.write_str(
+                "agent runs are confined, and the agent environment names no Claude Code \
+                 login folder (CLAUDE_CONFIG_DIR)",
+            ),
+            Some(dir) => write!(
+                f,
+                "Claude Code has no login for agent runs in {}. Agent runs are confined and \
+                 cannot reach the Keychain, so they use a second login of your own account, \
+                 which you make once and can revoke at any time: {}",
+                dir.display(),
+                claude_login_command(dir)
+            ),
+        }
+    }
+}
+
+impl Error for NoAgentLogin {}
+
+/// The command that makes Claude Code's login for agent runs in `dir`,
+/// written for a POSIX shell. On macOS it runs `claude auth login` with the
+/// Keychain closed, as agent runs have it, so the login is written to
+/// `dir/.credentials.json`, the CLI's plain-text store, where confined runs
+/// read it. Owlshift never reads, copies or moves that login.
+pub fn claude_login_command(dir: &Path) -> String {
+    let dir = shell_quote(&dir.to_string_lossy());
+    if cfg!(target_os = "macos") {
+        format!(
+            "CLAUDE_CONFIG_DIR={dir} /usr/bin/sandbox-exec -p '(version 1)(allow default)\
+             (deny mach-lookup (global-name \"com.apple.SecurityServer\") \
+             (global-name \"com.apple.securityd.xpc\"))' claude auth login"
+        )
+    } else {
+        format!("CLAUDE_CONFIG_DIR={dir} claude auth login")
+    }
+}
+
+/// `text` quoted for a POSIX shell.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// What a harness reported at the end of a run.
@@ -224,6 +297,42 @@ impl Harness for ClaudeHarness {
         log.stderr(&run.stderr);
         Ok(claude_end(run))
     }
+
+    /// The folders `claude` is installed in (the one on the `PATH` and the
+    /// one its link leads to), read; and, confined, the login made for
+    /// agent runs, read and written, since the CLI refreshes its token
+    /// there. Its absence refuses the run: only whether the login file
+    /// exists is looked at, never its content.
+    fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        let mut needs = SandboxNeeds::default();
+        let program = if self.program.is_absolute() {
+            Some(self.program.clone())
+        } else {
+            find_executable_in(
+                &self.program.to_string_lossy(),
+                agent.var("PATH").unwrap_or_default(),
+            )
+        };
+        if let Some(program) = program {
+            needs
+                .readable
+                .extend(program.parent().map(Path::to_path_buf));
+            if let Ok(real) = fs::canonicalize(&program) {
+                needs.readable.extend(real.parent().map(Path::to_path_buf));
+            }
+        }
+        if agent.is_confined() {
+            let dir = agent
+                .var("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .ok_or(NoAgentLogin { dir: None })?;
+            if !dir.join(".credentials.json").is_file() {
+                return Err(NoAgentLogin { dir: Some(dir) }.into());
+            }
+            needs.writable.push(dir);
+        }
+        Ok(needs)
+    }
 }
 
 /// The role's prompt, then where its brief is.
@@ -287,6 +396,8 @@ fn describe(failure: &claude::Failure) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
     fn run(lines: &[&str], exit_code: i32) -> claude::Run {
@@ -343,6 +454,55 @@ mod tests {
                 "claude.ai Linear".into()
             ])]
         );
+    }
+
+    fn claude() -> ClaudeHarness {
+        ClaudeHarness {
+            program: PathBuf::from("claude"),
+            prompt: String::new(),
+            model: None,
+            effort: None,
+            max_budget_usd: None,
+        }
+    }
+
+    /// A confined run needs the login made for agent runs, and is refused,
+    /// with the command that makes it, when there is none; the login file is
+    /// only looked for. The bench's bare runs need no login.
+    #[test]
+    fn a_confined_claude_run_needs_its_own_login() {
+        let login = tempfile::tempdir().unwrap();
+        let parent = [
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (
+                OsString::from("CLAUDE_CONFIG_DIR"),
+                login.path().as_os_str().to_owned(),
+            ),
+        ];
+        let agent = AgentEnv::new(parent.clone(), &[]).unwrap();
+        let refused = claude().sandbox_needs(&agent).unwrap_err();
+        let text = refused.to_string();
+        assert!(text.contains("no login for agent runs"), "{text}");
+        assert!(text.contains("claude auth login"), "{text}");
+        assert!(text.contains("CLAUDE_CONFIG_DIR='"), "{text}");
+
+        std::fs::write(login.path().join(".credentials.json"), "").unwrap();
+        let needs = claude().sandbox_needs(&agent).unwrap();
+        assert_eq!(needs.writable, [login.path().to_path_buf()]);
+
+        let bare = AgentEnv::new(parent, &[]).unwrap().without_confinement();
+        std::fs::remove_file(login.path().join(".credentials.json")).unwrap();
+        assert!(claude().sandbox_needs(&bare).unwrap().writable.is_empty());
+    }
+
+    #[test]
+    fn the_login_command_quotes_its_folder() {
+        let command = claude_login_command(Path::new("/tmp/it's here"));
+        assert!(
+            command.starts_with("CLAUDE_CONFIG_DIR='/tmp/it'\\''s here' "),
+            "{command}"
+        );
+        assert!(command.ends_with("claude auth login"), "{command}");
     }
 
     #[test]

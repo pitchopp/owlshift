@@ -6,7 +6,7 @@
 //! C8 in `docs/design/build-plan.md`).
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use owlshift_adapters::harness::{self, Login, tested};
 use owlshift_adapters::tracker::Capability;
@@ -16,6 +16,7 @@ use owlshift_contracts::Harness;
 use owlshift_contracts::config::TrackerKind;
 
 use crate::config::{Effective, FileState, exit_text};
+use crate::executor::harness::claude_login_command;
 use crate::system::{RunError, System, exact_version_of, version_of};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,11 +58,19 @@ impl Report {
 /// Runs every check against the host and the loaded configuration.
 pub fn run(system: &dyn System, config: &Effective) -> Report {
     let mut checks = vec![git(system)];
+    let harnesses = required_harnesses(config);
     checks.extend(
-        required_harnesses(config)
-            .into_iter()
-            .map(|harness| harness_check(system, harness)),
+        harnesses
+            .iter()
+            .map(|harness| harness_check(system, *harness)),
     );
+    checks.push(sandbox_check(system));
+    if harnesses.contains(&Harness::Claude) {
+        checks.push(agent_login_check(
+            system,
+            owlshift_platform::paths::claude_agent_login_dir(),
+        ));
+    }
     checks.push(file_check("project config", &config.project));
     checks.push(file_check("personal config", &config.personal));
     checks.push(tracker_check(config));
@@ -115,6 +124,60 @@ fn git(system: &dyn System) -> Check {
             format!("`git --version`: {error}"),
             Some(INSTALL),
         ),
+    }
+}
+
+/// Whether agent runs can be confined (OWL-41): without it, `owlshift do`
+/// refuses to start one. The fix is the sandbox's own: install bwrap, allow
+/// it user namespaces, or use WSL2.
+fn sandbox_check(system: &dyn System) -> Check {
+    const SUBJECT: &str = "sandbox";
+    match system.sandbox() {
+        Ok(()) => check(
+            SUBJECT,
+            Status::Ok,
+            if cfg!(target_os = "macos") {
+                "agent runs are confined with sandbox-exec"
+            } else {
+                "agent runs are confined with bwrap"
+            },
+            None,
+        ),
+        Err(error) => Check {
+            subject: SUBJECT.to_owned(),
+            status: Status::Fail,
+            detail: "agent runs cannot be confined here, so none is started".to_owned(),
+            fix: Some(error.to_string()),
+        },
+    }
+}
+
+/// Whether Claude Code has the login agent runs use: confined, they cannot
+/// reach the Keychain, so they use a second login of the operator's account,
+/// made once in its own folder. Only whether its file is there is looked at.
+fn agent_login_check(system: &dyn System, dir: Option<PathBuf>) -> Check {
+    const SUBJECT: &str = "claude agent login";
+    let Some(dir) = dir else {
+        return check(
+            SUBJECT,
+            Status::Fail,
+            "no configuration directory to keep it in",
+            Some("set OWLSHIFT_CONFIG_DIR to an absolute path"),
+        );
+    };
+    if system.is_file(&dir.join(".credentials.json")) {
+        check(SUBJECT, Status::Ok, dir.display().to_string(), None)
+    } else {
+        Check {
+            subject: SUBJECT.to_owned(),
+            status: Status::Fail,
+            detail: format!(
+                "none in {}: agent runs cannot reach the Keychain, so they use a second \
+                 login of your account, which you can revoke at any time",
+                dir.display()
+            ),
+            fix: Some(claude_login_command(&dir)),
+        }
     }
 }
 
@@ -328,6 +391,7 @@ mod tests {
 
     use super::*;
     use crate::system::fake::{Answer, FakeSystem};
+    use owlshift_platform::sandbox::SandboxError;
 
     const CLAUDE_STATUS: &str = "claude auth status --json";
     const CODEX_STATUS: &str = "codex login status";
@@ -403,6 +467,57 @@ mod tests {
         ] {
             assert!(!shown.contains(private), "{private} leaked:\n{shown}");
         }
+    }
+
+    /// A machine where agent runs cannot be confined is not ready, and the
+    /// fix names what to do: install bwrap, or let it create user
+    /// namespaces with the AppArmor profile.
+    #[test]
+    fn a_missing_or_blocked_sandbox_is_not_ready() {
+        let ready = || {
+            with_harnesses(with_git(FakeSystem::default()))
+                .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""))
+                .answer(CODEX_STATUS, Answer::Exit(0, "", CODEX_API_KEY))
+        };
+        let missing = run(
+            &ready().no_sandbox(SandboxError::Missing { program: "bwrap" }),
+            &no_config(),
+        );
+        assert!(!missing.ready());
+        assert!(fixes(&missing, "sandbox")[0].contains("apt install bubblewrap"));
+
+        let blocked = run(
+            &ready().no_sandbox(SandboxError::Blocked {
+                program: "bwrap",
+                reason: "setting up uid map: Permission denied".into(),
+            }),
+            &no_config(),
+        );
+        assert!(!blocked.ready());
+        let fix = &fixes(&blocked, "sandbox")[0];
+        assert!(
+            fix.contains("apparmor_parser -r /etc/apparmor.d/bwrap"),
+            "{fix}"
+        );
+        assert!(fix.contains("setting up uid map"), "{fix}");
+    }
+
+    /// Without the login made for agent runs, the machine is not ready, and
+    /// the fix is the command that makes it; its file is only looked for.
+    #[test]
+    fn a_missing_agent_login_says_how_to_make_it() {
+        let dir = PathBuf::from("/home/ada/owlshift/agent-login/claude");
+        let system = with_harnesses(with_git(FakeSystem::default()))
+            .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""))
+            .absent(dir.join(".credentials.json"));
+        let check = agent_login_check(&system, Some(dir.clone()));
+        assert_eq!(check.status, Status::Fail);
+        let fix = check.fix.unwrap();
+        assert!(fix.contains("claude auth login"), "{fix}");
+        assert!(fix.contains(&*dir.to_string_lossy()), "{fix}");
+
+        let present = with_git(FakeSystem::default());
+        assert_eq!(agent_login_check(&present, Some(dir)).status, Status::Ok);
     }
 
     #[test]

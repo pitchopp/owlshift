@@ -17,6 +17,17 @@ jiff.workspace = true
 semver.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-
-[dev-dependencies]
+# Each run's own temporary folder, private to the user and removed with the
+# run (OWL-41).
 tempfile.workspace = true
+
+[features]
+# Test only: `AgentEnv::without_confinement`, for the test bench and this
+# crate's integration tests. No shipped crate enables it (OWL-41).
+testkit = []
+
+# They check the agent environment itself, bare, so they need the feature;
+# `cargo test --workspace` has it through the test bench.
+[[test]]
+name = "agent_credentials"
+required-features = ["testkit"]

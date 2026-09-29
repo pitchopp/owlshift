@@ -57,12 +57,12 @@ use owlshift_contracts::ids::RelativePath;
 use owlshift_contracts::result::{self, RunResult};
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 
-use crate::agent_env::{AgentEnv, CredentialFinding};
+use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
 
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
 pub use git::{Git, GitError};
-pub use harness::{Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus};
+pub use harness::{Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus, SandboxNeeds};
 pub use isolation::Violation;
 
 /// The directory of the run's own files, relative to the worktree.
@@ -260,6 +260,11 @@ impl Executor {
         harness: &dyn Harness,
     ) -> Result<RunReport, ExecutorError> {
         let started = Instant::now();
+        // An agent that cannot be confined never starts, before anything is
+        // written (OWL-41).
+        self.agent
+            .sandbox_ready()
+            .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
         worktree::prepare(&self.git, spec)?;
         let mut brief = spec.brief.clone();
         brief.result_path =
@@ -286,13 +291,31 @@ impl Executor {
             brief: &brief,
             brief_file: &brief_file,
         };
-        let mut command = harness.command(&context).map_err(ExecutorError::Command)?;
+        let needs = harness
+            .sandbox_needs(&self.agent)
+            .map_err(ExecutorError::Command)?;
+        // The run's own temporary folder: private to the user, removed when
+        // `run` returns, after every process of the run is stopped.
+        let temp = tempfile::Builder::new()
+            .prefix("owlshift-run-")
+            .tempdir()
+            .map_err(|source| ExecutorError::RunDir {
+                path: std::env::temp_dir(),
+                source,
+            })?;
+        let mut paths = self.run_paths(spec)?;
+        let inner = harness.command(&context).map_err(ExecutorError::Command)?;
+        paths.readable = needs.readable;
+        paths.writable = needs.writable;
+        paths.temp = Some(temp.path().to_owned());
+        let mut command = self
+            .agent
+            .confine(inner, &paths)
+            .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
         command
-            .current_dir(spec.worktree)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        self.agent.apply(&mut command);
         let (mut child, tree, watchdog) =
             watch::spawn(&mut command, self.timeout).map_err(ExecutorError::Spawn)?;
         let driven = harness.drive(&context, &mut child, &mut log);
@@ -308,10 +331,16 @@ impl Executor {
         let (mut outcome, end) = decide(violations, timed_out, driven, spec);
         let mut gate = None;
         if brief.role == Role::Build && is_done(&outcome) {
+            // The gate runs the code the run wrote, confined as the run was,
+            // without the harness's own folders.
             let report = gate::run(
                 &self.git,
                 &self.agent,
-                spec.worktree,
+                &RunPaths {
+                    readable: Vec::new(),
+                    writable: Vec::new(),
+                    ..paths
+                },
                 &brief.gate,
                 self.gate_timeout,
                 &spec.run_dir.join(gate::GATE_LOG),
@@ -337,6 +366,30 @@ impl Executor {
             stderr_log: log.stderr_path,
             log_error: log.error,
             gate,
+        })
+    }
+}
+
+impl Executor {
+    /// What the sandbox opens for this run: the worktree, the repository's
+    /// common git folder, as the runner's git reports it; and what it
+    /// closes: the run directory, which holds the logs.
+    fn run_paths(&self, spec: &RunSpec<'_>) -> Result<RunPaths, ExecutorError> {
+        let printed = self
+            .git
+            .run(
+                spec.worktree,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .map_err(|e| ExecutorError::Worktree(e.to_string()))?;
+        let git_dir = PathBuf::from(String::from_utf8_lossy(&printed).trim());
+        Ok(RunPaths {
+            workdir: spec.worktree.to_owned(),
+            git_dir: Some(git_dir),
+            readable: Vec::new(),
+            writable: Vec::new(),
+            hidden: vec![spec.run_dir.to_owned()],
+            temp: None,
         })
     }
 }

@@ -13,7 +13,9 @@ publish = false
 owlshift-core.workspace = true
 owlshift-contracts.workspace = true
 owlshift-adapters.workspace = true
-owlshift-runner.workspace = true
+# The bench runs the fake harness and the isolation scenarios bare, through
+# the test-only `AgentEnv::without_confinement` (OWL-41).
+owlshift-runner = { workspace = true, features = ["testkit"] }
 clap.workspace = true
 jiff.workspace = true
 serde.workspace = true

@@ -342,6 +342,17 @@ impl OnDemand<'_> {
             }
             Err(error) => return Err(refused("the project's marker", error)),
         }
+        // What the executor would refuse at the spawn is refused before
+        // anything is cloned or read: a machine where agents cannot be
+        // confined, or a harness with no login made for agent runs (OWL-41);
+        // the message says what to install or which command to run once.
+        self.executor
+            .agent
+            .sandbox_ready()
+            .map_err(|e| Stop::Refused(e.to_string()))?;
+        self.harness
+            .sandbox_needs(&self.executor.agent)
+            .map_err(|e| Stop::Refused(e.to_string()))?;
         let found = self
             .tracker
             .ticket(ticket)

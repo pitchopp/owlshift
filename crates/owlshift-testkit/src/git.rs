@@ -75,6 +75,17 @@ impl GitEnv {
         vars
     }
 
+    /// The files git's configuration in the bench's home names, which a
+    /// confined agent's git reads: the ignore and attributes files and the
+    /// hooks folder. The configuration itself, under `XDG_CONFIG_HOME`, is
+    /// opened by the sandbox's own policy.
+    pub fn agent_readable(&self) -> Vec<PathBuf> {
+        ["ignore", "attributes", "hooks"]
+            .into_iter()
+            .map(|name| self.home.join(name))
+            .collect()
+    }
+
     /// The same environment, committing at `at`.
     pub fn at(&self, at: Timestamp) -> Self {
         Self {

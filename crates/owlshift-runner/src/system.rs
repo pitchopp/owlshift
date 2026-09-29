@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use owlshift_platform::process::{Captured, RunError};
+use owlshift_platform::sandbox::SandboxError;
 
 /// How long a probe such as `git --version` may take. C8 measured about
 /// 0.1 s for the harness status commands.
@@ -15,6 +16,14 @@ pub trait System {
     fn locate(&self, program: &str) -> Option<PathBuf>;
     /// Runs a program with no input, within [`PROBE_TIMEOUT`].
     fn run(&self, program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<Captured, RunError>;
+    /// Whether agent runs can be confined here (OWL-41).
+    fn sandbox(&self) -> Result<(), SandboxError> {
+        owlshift_platform::sandbox::available()
+    }
+    /// Whether a file is there; it is only looked at, never read.
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
 }
 
 /// The machine Owlshift runs on.
@@ -89,9 +98,25 @@ pub(crate) mod fake {
     pub(crate) struct FakeSystem {
         located: HashMap<String, PathBuf>,
         answers: HashMap<String, Answer>,
+        /// Why agent runs cannot be confined; `None`: they can.
+        sandbox: Option<SandboxError>,
+        /// Files that are not there; every other one is.
+        absent: Vec<PathBuf>,
     }
 
     impl FakeSystem {
+        /// Agent runs cannot be confined, for this reason.
+        pub(crate) fn no_sandbox(mut self, error: SandboxError) -> Self {
+            self.sandbox = Some(error);
+            self
+        }
+
+        /// A file that is not there.
+        pub(crate) fn absent(mut self, path: PathBuf) -> Self {
+            self.absent.push(path);
+            self
+        }
+
         /// Puts a program on the fake `PATH`.
         pub(crate) fn install(mut self, program: &str) -> Self {
             self.located.insert(
@@ -133,6 +158,14 @@ pub(crate) mod fake {
                 Some(Answer::TimedOut) => Err(RunError::TimedOut),
                 None => panic!("unscripted command: {command}"),
             }
+        }
+
+        fn sandbox(&self) -> Result<(), SandboxError> {
+            self.sandbox.clone().map_or(Ok(()), Err)
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            !self.absent.iter().any(|absent| absent == path)
         }
     }
 }

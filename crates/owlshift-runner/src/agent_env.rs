@@ -1,19 +1,31 @@
-//! Spawning agents with the environment of [`owlshift_core::agent_env`], and
-//! checking that no credential is left within their reach (OWL-22).
+//! Spawning agents with the environment of [`owlshift_core::agent_env`],
+//! inside the operating system's sandbox (OWL-41), and checking that no
+//! credential is left within their reach (OWL-22).
 //!
 //! For the executor (OWL-15): before a run, [`AgentEnv::from_runner`] builds
-//! the environment and [`AgentEnv::check`] probes it in the worktree, and a
-//! finding stops the run before it starts; the harness command is spawned
-//! after [`AgentEnv::apply`]. After the run, [`mcp_findings`] reads the MCP
-//! servers the harness reported loading.
+//! the environment, [`AgentEnv::sandbox_ready`] refuses a machine where
+//! agents cannot be confined, and [`AgentEnv::check`] probes, from inside the
+//! sandbox, what the agent could still reach in the worktree; a finding stops
+//! the run before it starts. The harness command, and each gate command, is
+//! spawned as [`AgentEnv::confine`] returns it: wrapped in the sandbox, with
+//! exactly the agent's variables. After the run, [`mcp_findings`] reads the
+//! MCP servers the harness reported loading.
+//!
+//! The sandbox leaves the home unreadable but for the folders a run needs
+//! ([`AgentEnv::policy`]), writes nowhere but the worktree, the repository's
+//! git folder (not its hooks or configuration), the harness's own login
+//! folder and the run's own temporary folder, closes the temporary folders
+//! the user's other processes share, and closes the system credential store.
+//! An agent environment is always confined: the only way out is
+//! `without_confinement`, compiled for the test bench alone.
 //!
 //! The probes run git and gh as the agent would, with its environment and in
 //! its directory. They never keep, log or display a secret: a finding names a
 //! variable, a host or a redacted setting, never a value.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use owlshift_adapters::harness::claude;
@@ -21,29 +33,108 @@ use owlshift_core::agent_env::{
     AgentEnvError, NO_CREDENTIAL, agent_environment, check_agent_variables,
 };
 use owlshift_core::floor::FloorViolation;
-use owlshift_platform::process::{Captured, OUTPUT_CAP, RunError, find_executable_in, run_command};
+use owlshift_platform::paths;
+use owlshift_platform::process::{Captured, OUTPUT_CAP, find_executable_in, run_command};
+use owlshift_platform::sandbox::{self, Policy, SandboxError};
 
 use crate::system::PROBE_TIMEOUT;
 
-/// The environment an agent process gets: see [`owlshift_core::agent_env`].
+/// The environment an agent process gets, and the sandbox it runs in: see
+/// the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentEnv {
     vars: Vec<(OsString, OsString)>,
+    /// Whether every command spawned for the agent is confined. Always true
+    /// outside the test bench.
+    confined: bool,
 }
+
+/// The paths of one run the sandbox opens, besides what every agent gets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunPaths {
+    /// The worktree: the working directory, read and written.
+    pub workdir: PathBuf,
+    /// The repository's common git folder, read and written, but for its
+    /// hooks and configuration: a commit writes objects and refs there.
+    pub git_dir: Option<PathBuf>,
+    /// More folders read, such as the harness's install folder.
+    pub readable: Vec<PathBuf>,
+    /// More folders read and written, such as the harness's login folder.
+    pub writable: Vec<PathBuf>,
+    /// Paths neither read nor written, such as the runner's run folder.
+    pub hidden: Vec<PathBuf>,
+    /// The run's own temporary folder, made by the runner and removed with
+    /// the run: the only temporary folder the agent writes, which `TMPDIR`,
+    /// `TMP` and `TEMP` name. `None`: no temporary folder is written.
+    pub temp: Option<PathBuf>,
+}
+
+/// The variables that name a temporary folder.
+const TEMP_VARIABLES: &[&str] = &["TMPDIR", "TMP", "TEMP"];
+
+/// Credential files and folders under the home, closed even when a folder
+/// that holds them is opened. Paths are relative to the home.
+const HIDDEN_IN_HOME: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".gnupg",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".config/gh",
+    ".config/gcloud",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".local/share/keyrings",
+];
+
+/// Tool-chain folders under the home an agent reads: installed compilers and
+/// their package caches, never their credentials ([`HIDDEN_IN_HOME`]). The
+/// folders of the agent's `PATH` under the home are read too.
+const TOOL_CHAINS: &[&str] = &[".rustup", ".cargo/bin", ".cargo/registry", ".cargo/git"];
 
 impl AgentEnv {
     /// The agent environment built from `parent`, with the variables named in
-    /// `declared` (the project's, for its gate).
+    /// `declared` (the project's, for its gate). It is confined.
     pub fn new(
         parent: impl IntoIterator<Item = (OsString, OsString)>,
         declared: &[&str],
     ) -> Result<Self, AgentEnvError> {
-        agent_environment(parent, declared).map(|vars| Self { vars })
+        agent_environment(parent, declared).map(|vars| Self {
+            vars,
+            confined: true,
+        })
     }
 
-    /// The agent environment built from the runner's own.
+    /// The agent environment built from the runner's own, confined, with
+    /// Claude Code pointed at the login made for agent runs
+    /// ([`paths::claude_agent_login_dir`]): the sandbox closes the Keychain,
+    /// where the operator's own login lives on macOS.
     pub fn from_runner(declared: &[&str]) -> Result<Self, AgentEnvError> {
-        Self::new(std::env::vars_os(), declared)
+        let mut env = Self::new(std::env::vars_os(), declared)?;
+        if let Some(dir) = paths::claude_agent_login_dir() {
+            env.set("CLAUDE_CONFIG_DIR", dir.into_os_string());
+        }
+        Ok(env)
+    }
+
+    /// The same environment, with nothing confined: the test bench's way to
+    /// run the fake harness and the isolation scenarios bare. It exists only
+    /// in test builds and with the `testkit` feature, which no shipped crate
+    /// enables.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn without_confinement(mut self) -> Self {
+        self.confined = false;
+        self
+    }
+
+    /// Whether commands spawned for the agent are confined.
+    pub fn is_confined(&self) -> bool {
+        self.confined
     }
 
     /// The variables, sorted by name.
@@ -51,17 +142,198 @@ impl AgentEnv {
         &self.vars
     }
 
+    /// The value of a variable, its name compared ASCII case-insensitively.
+    pub fn var(&self, name: &str) -> Option<&OsStr> {
+        self.vars
+            .iter()
+            .find(|(n, _)| n.to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    /// Sets a variable, replacing one of the same name in any letter case.
+    fn set(&mut self, name: &str, value: OsString) {
+        self.vars
+            .retain(|(n, _)| !n.to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)));
+        self.vars.push((OsString::from(name), value));
+        self.vars.sort();
+    }
+
     /// Gives `command` exactly these variables. It replaces the command's
-    /// whole environment, including anything set on it before.
+    /// whole environment, including anything set on it before. It confines
+    /// nothing: agent commands are spawned as [`AgentEnv::confine`] returns
+    /// them.
     pub fn apply(&self, command: &mut Command) {
         command
             .env_clear()
             .envs(self.vars.iter().map(|(n, v)| (n, v)));
     }
 
-    /// [`check_environment`] with these variables.
+    /// Whether agents can be confined on this machine; a confined
+    /// environment where they cannot refuses to run anything. The error says
+    /// what to fix: install bwrap, allow it user namespaces, or use WSL2 on
+    /// Windows.
+    pub fn sandbox_ready(&self) -> Result<(), SandboxError> {
+        if self.confined {
+            sandbox::available()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The sandbox for a run: see the module documentation.
+    ///
+    /// Opened in the home: git's own configuration, the tool chains
+    /// ([`TOOL_CHAINS`]) and the folders of the agent's `PATH` under it,
+    /// never the home itself; then the run's own paths. Closed wherever
+    /// they are: the credential files of [`HIDDEN_IN_HOME`] and the run's
+    /// hidden paths.
+    pub fn policy(&self, run: &RunPaths) -> Policy {
+        let home = self
+            .var("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute());
+        let config_home = self
+            .var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .or_else(|| home.as_ref().map(|home| home.join(".config")));
+
+        let mut readable = Vec::new();
+        let mut hidden = Vec::new();
+        if let Some(home) = &home {
+            readable.push(home.join(".gitconfig"));
+            readable.extend(TOOL_CHAINS.iter().map(|dir| home.join(dir)));
+            if let Some(path) = self.var("PATH") {
+                readable.extend(
+                    std::env::split_paths(path)
+                        .filter(|dir| dir.is_absolute() && dir.starts_with(home) && dir != home),
+                );
+            }
+            hidden.extend(HIDDEN_IN_HOME.iter().map(|path| home.join(path)));
+        }
+        if let Some(config_home) = &config_home {
+            readable.push(config_home.join("git"));
+            hidden.push(config_home.join("git").join("credentials"));
+        }
+        readable.extend(run.readable.iter().cloned());
+        hidden.extend(run.hidden.iter().cloned());
+
+        let mut writable = vec![run.workdir.clone()];
+        let mut protected = Vec::new();
+        if let Some(git_dir) = &run.git_dir {
+            writable.push(git_dir.clone());
+            protected.extend(
+                ["hooks", "config", "config.worktree", "info"]
+                    .iter()
+                    .map(|name| git_dir.join(name)),
+            );
+        }
+        writable.extend(run.writable.iter().cloned());
+
+        // The temporary folders the runner inherited are shared with the
+        // user's other processes: closed, never opened. Only the run's own
+        // folder is written.
+        let mut closed: Vec<PathBuf> = TEMP_VARIABLES
+            .iter()
+            .filter_map(|name| self.var(name).map(PathBuf::from))
+            .chain([std::env::temp_dir()])
+            .filter(|dir| dir.is_absolute() && dir.parent().is_some())
+            .collect();
+        closed.sort();
+        closed.dedup();
+
+        Policy {
+            home,
+            closed,
+            readable,
+            writable,
+            protected,
+            hidden,
+            temp: run.temp.iter().cloned().collect(),
+            workdir: run.workdir.clone(),
+        }
+    }
+
+    /// The command to spawn for `inner`, an agent command built with its
+    /// program and arguments only: wrapped in the sandbox of `run`, in the
+    /// run's working directory, with exactly the agent's variables. The
+    /// caller then sets its standard streams. `inner`'s own directory,
+    /// environment and streams are not carried over.
+    ///
+    /// Without confinement (the test bench), `inner` itself comes back, with
+    /// the agent's variables.
+    pub fn confine(&self, inner: Command, run: &RunPaths) -> Result<Command, SandboxError> {
+        let mut command = if self.confined {
+            sandbox::wrap(&self.policy(run), inner.get_program(), inner.get_args())?
+        } else {
+            let mut inner = inner;
+            inner.current_dir(&run.workdir);
+            inner
+        };
+        self.apply(&mut command);
+        // The temporary folder is the run's own, never the one inherited.
+        match &run.temp {
+            Some(dir) => {
+                for name in TEMP_VARIABLES {
+                    command.env(name, dir);
+                }
+            }
+            None if self.confined => {
+                for name in TEMP_VARIABLES {
+                    command.env_remove(name);
+                }
+            }
+            None => {}
+        }
+        Ok(command)
+    }
+
+    /// [`check_environment`] with these variables, each probe run as the
+    /// agent would run it: inside the sandbox, when confined, so a finding
+    /// means a credential the agent could still reach.
     pub fn check(&self, workdir: &Path, forge_hosts: &[&str]) -> Vec<CredentialFinding> {
-        check_environment(&self.vars, workdir, forge_hosts)
+        if !self.confined {
+            return check_environment(&self.vars, workdir, forge_hosts);
+        }
+        let git_dir = match self.git_common_dir(workdir) {
+            Ok(dir) => dir,
+            Err(reason) => {
+                return vec![CredentialFinding::ProbeFailed {
+                    probe: "git rev-parse",
+                    reason,
+                }];
+            }
+        };
+        let run = RunPaths {
+            workdir: workdir.to_owned(),
+            git_dir: Some(git_dir),
+            ..RunPaths::default()
+        };
+        probe_environment(&self.vars, forge_hosts, &|program, args| {
+            let mut inner = Command::new(program);
+            inner.args(args);
+            self.confine(inner, &run).map_err(|error| error.to_string())
+        })
+    }
+
+    /// The common git folder of the repository `workdir` belongs to, as the
+    /// agent's git reports it.
+    fn git_common_dir(&self, workdir: &Path) -> Result<PathBuf, String> {
+        let search_path = self.var("PATH").unwrap_or_default();
+        let git = find_executable_in("git", search_path)
+            .ok_or_else(|| "git is not on the agent's PATH".to_owned())?;
+        let mut command = Command::new(git);
+        command
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .current_dir(workdir);
+        self.apply(&mut command);
+        let captured = run_command(&mut command, None, PROBE_TIMEOUT, OUTPUT_CAP)
+            .map_err(|error| error.to_string())?;
+        if captured.code != Some(0) {
+            return Err(format!("it exited with status {:?}", captured.code));
+        }
+        let dir = String::from_utf8_lossy(&captured.stdout).trim().to_owned();
+        Ok(PathBuf::from(dir))
     }
 }
 
@@ -127,6 +399,28 @@ pub fn check_environment(
     workdir: &Path,
     forge_hosts: &[&str],
 ) -> Vec<CredentialFinding> {
+    probe_environment(vars, forge_hosts, &|program, args| {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .current_dir(workdir)
+            .env_clear()
+            .envs(vars.iter().map(|(n, v)| (n, v)));
+        Ok(command)
+    })
+}
+
+/// Builds a probe's command from a program and its arguments, or says why
+/// it cannot.
+type BuildProbe<'a> = &'a dyn Fn(&Path, &[&str]) -> Result<Command, String>;
+
+/// The probes of [`check_environment`], each command built by `build` from
+/// a program and its arguments: bare, or inside the sandbox.
+fn probe_environment(
+    vars: &[(OsString, OsString)],
+    forge_hosts: &[&str],
+    build: BuildProbe<'_>,
+) -> Vec<CredentialFinding> {
     let mut findings = Vec::new();
     let pairs = vars.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str()));
     if let Err(FloorViolation::CredentialVariables(names)) = check_agent_variables(pairs) {
@@ -141,13 +435,9 @@ pub fn check_environment(
         })
         .map_or_else(OsString::new, |(_, value)| value.clone());
     let probe = |program: &Path, args: &[&str], input: Option<&[u8]>| {
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(workdir)
-            .env_clear()
-            .envs(vars.iter().map(|(n, v)| (n, v)));
+        let mut command = build(program, args)?;
         run_command(&mut command, input, PROBE_TIMEOUT, OUTPUT_CAP)
+            .map_err(|error| error.to_string())
     };
 
     match find_executable_in("git", &search_path) {
@@ -209,10 +499,10 @@ pub fn mcp_findings(run: &claude::Run) -> Option<CredentialFinding> {
     (!run.mcp_servers.is_empty()).then(|| CredentialFinding::McpServers(run.mcp_servers.clone()))
 }
 
-fn failed(probe: &'static str, error: &RunError) -> CredentialFinding {
+fn failed(probe: &'static str, reason: &str) -> CredentialFinding {
     CredentialFinding::ProbeFailed {
         probe,
-        reason: error.to_string(),
+        reason: reason.to_owned(),
     }
 }
 
@@ -361,6 +651,108 @@ mod tests {
         );
         let run = claude::Transcript::default().finish(Some(0), Vec::new());
         assert_eq!(mcp_findings(&run), None);
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> AgentEnv {
+        let parent = pairs
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        AgentEnv::new(parent, &[]).unwrap()
+    }
+
+    #[test]
+    fn an_agent_environment_is_confined_unless_the_bench_says_otherwise() {
+        let agent = env(&[("PATH", "/bin")]);
+        assert!(agent.is_confined());
+        assert!(!agent.without_confinement().is_confined());
+    }
+
+    /// The home is opened only where a run needs it, never whole, and the
+    /// credential files stay closed even inside an opened folder.
+    #[cfg(unix)]
+    #[test]
+    fn the_policy_opens_what_a_run_needs_and_nothing_of_the_home_itself() {
+        let agent = env(&[
+            ("HOME", "/home/op"),
+            ("PATH", "/home/op/.cargo/bin:/home/op:relative:/usr/bin"),
+            ("TMPDIR", "/tmp/op"),
+        ]);
+        let run = RunPaths {
+            workdir: "/srv/wt".into(),
+            git_dir: Some("/srv/repo/.git".into()),
+            readable: vec!["/opt/claude".into()],
+            writable: vec!["/home/op/login".into()],
+            hidden: vec!["/srv/run".into()],
+            temp: Some("/srv/run-temp".into()),
+        };
+        let policy = agent.policy(&run);
+        let has = |list: &[PathBuf], path: &str| list.iter().any(|p| p == Path::new(path));
+        assert_eq!(policy.home.as_deref(), Some(Path::new("/home/op")));
+        // The PATH entry that is the home itself, and a relative one, open
+        // nothing.
+        assert!(!has(&policy.readable, "/home/op"));
+        assert!(!has(&policy.readable, "relative"));
+        for path in [
+            "/home/op/.cargo/bin",
+            "/home/op/.gitconfig",
+            "/home/op/.config/git",
+            "/opt/claude",
+        ] {
+            assert!(has(&policy.readable, path), "{path}: {:?}", policy.readable);
+        }
+        assert_eq!(
+            policy.writable,
+            [
+                PathBuf::from("/srv/wt"),
+                "/srv/repo/.git".into(),
+                "/home/op/login".into()
+            ]
+        );
+        for name in ["hooks", "config", "config.worktree", "info"] {
+            assert!(
+                has(&policy.protected, &format!("/srv/repo/.git/{name}")),
+                "{name}"
+            );
+        }
+        for path in [
+            "/home/op/.ssh",
+            "/home/op/.config/gh",
+            "/home/op/.cargo/credentials.toml",
+            "/home/op/.config/git/credentials",
+            "/srv/run",
+        ] {
+            assert!(has(&policy.hidden, path), "{path}");
+        }
+        // The inherited temporary folder is closed; the run's own is the
+        // only one written.
+        assert!(has(&policy.closed, "/tmp/op"), "{:?}", policy.closed);
+        assert!(has(&policy.closed, &std::env::temp_dir().to_string_lossy()));
+        assert_eq!(policy.temp, [PathBuf::from("/srv/run-temp")]);
+        assert!(!has(&policy.writable, "/tmp/op"));
+        assert_eq!(policy.workdir, Path::new("/srv/wt"));
+    }
+
+    /// The shipped binary never turns confinement off: the switch is
+    /// compiled for the test bench alone, and the CLI's code never names it.
+    #[test]
+    fn the_cli_never_turns_confinement_off() {
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../owlshift-cli/src");
+        let mut stack = vec![cli];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(
+                        !text.contains("without_confinement"),
+                        "{} turns confinement off",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

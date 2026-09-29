@@ -83,6 +83,12 @@ pub struct Scenario {
     /// The project's gate for this scenario, in place of the fixture's
     /// `stack.gate`: a bench convenience, so short scenarios share a fixture.
     pub gate: Option<Vec<String>>,
+    /// Whether the fake harness and the gate run inside the OS sandbox, as
+    /// agent runs do (OWL-41). Off by default: the scenarios check the
+    /// pipeline and the isolation check, a separate layer, and the sandbox
+    /// would stop the writes the isolation scenarios make on purpose.
+    #[serde(default)]
+    pub confined: bool,
     #[serde(rename = "step")]
     pub steps: Vec<Step>,
 }
@@ -338,9 +344,15 @@ impl Driver {
         let timeout = scenario
             .timeout_ms
             .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
+        let agent = AgentEnv::new(git.agent_parent(), &[]).map_err(|e| e.to_string())?;
+        let agent = if scenario.confined {
+            agent
+        } else {
+            agent.without_confinement()
+        };
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner_git.apply(command)),
-            agent: AgentEnv::new(git.agent_parent(), &[]).map_err(|e| e.to_string())?,
+            agent,
             forge_hosts: Vec::new(),
             timeout,
             gate_timeout: timeout,
@@ -433,7 +445,10 @@ impl Driver {
         let mut reply = reply.clone();
         reply.result = reply.result.map(|path| self.fixture.join(path));
         reply.date = Some(self.now);
-        let reply_path = dir.join("reply.toml");
+        // Outside the run directory, which a confined run cannot read.
+        let replies = self.tmp.path().join("replies").join(self.runs.to_string());
+        fs::create_dir_all(&replies).map_err(|e| format!("{}: {e}", replies.display()))?;
+        let reply_path = replies.join("reply.toml");
         write(&reply_path, &reply.render())?;
 
         let spec = RunSpec {
@@ -447,6 +462,7 @@ impl Driver {
         let harness = FakeHarness {
             program: self.fake_harness.clone(),
             reply: reply_path,
+            readable: self.git.agent_readable(),
         };
         let report = self
             .executor

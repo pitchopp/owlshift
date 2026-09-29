@@ -29,6 +29,7 @@ use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_core::state::ParkReason;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{EventLog, EventSink};
+use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
 };
@@ -165,6 +166,8 @@ impl Harness for Replies {
         let harness = FakeHarness {
             program: self.program.clone(),
             reply,
+            // The bench runs `do` bare: see `Bench::run`.
+            readable: Vec::new(),
         };
         let command = harness.command(run);
         *self.current.borrow_mut() = Some(harness);
@@ -301,7 +304,14 @@ impl Bench {
         let env = self.env.clone();
         let executor = on_demand::executor(
             Git::with_setup("git", move |command| env.apply(command)),
-            AgentEnv::new(self.env.agent_parent(), &[]).unwrap(),
+            // Bare, as the scenarios' isolation tests run: what `do` does
+            // around the executor is under test here, and a breaking agent
+            // must reach the checkout and its own `.git`, which the sandbox
+            // closes. Confinement has its own tests (OWL-41), and native
+            // Windows refuses confined runs.
+            AgentEnv::new(self.env.agent_parent(), &[])
+                .unwrap()
+                .without_confinement(),
         );
         let config_text = fs::read_to_string(self.remote.checkout.join("owlshift.toml")).unwrap();
         let config = ProjectConfig::parse(&config_text).unwrap();
@@ -746,4 +756,55 @@ fn the_checkout_follows_the_forges_default_branch() {
         (base.remote_ref.as_str(), base.branch.as_str()),
         ("origin/trunk", "trunk")
     );
+}
+
+/// A confined `do` whose agent cannot run, because this machine cannot
+/// confine agents or Claude Code has no login for agent runs, is refused
+/// before anything is cloned, read or recorded. Which of the two depends on
+/// the machine: native Windows and a Linux without bwrap fail the first.
+#[test]
+fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
+    let bench = Bench::new(true);
+    let env = bench.env.clone();
+    // Confined, and with no Claude Code login folder named, whatever the
+    // host's own variables say.
+    let parent = bench
+        .env
+        .agent_parent()
+        .into_iter()
+        .filter(|(name, _)| name != "CLAUDE_CONFIG_DIR");
+    let executor = on_demand::executor(
+        Git::with_setup("git", move |command| env.apply(command)),
+        AgentEnv::new(parent, &[]).unwrap(),
+    );
+    let harness = ClaudeHarness {
+        program: PathBuf::from("claude"),
+        prompt: "# Build".to_owned(),
+        model: None,
+        effort: None,
+        max_budget_usd: None,
+    };
+    let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
+    let config = ProjectConfig::parse(&config_text).unwrap();
+    let tracker = MarkdownTracker::new(&bench.remote.checkout);
+    let forge =
+        GitHubForge::with_transport(Shared(bench.github.clone()), Repo::parse(REPO).unwrap());
+    let dirs = bench.dirs();
+    let remote_url = bench.remote.bare.to_string_lossy().into_owned();
+    let on_demand = OnDemand {
+        executor: &executor,
+        tracker: &tracker,
+        forge: &forge,
+        harness: &harness,
+        remote_url: &remote_url,
+        config: &config,
+        dirs: &dirs,
+        head_wait: Duration::ZERO,
+    };
+    let mut out = Vec::new();
+    let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
+    let outcome = on_demand.run(&TicketId::new(TICKET).unwrap(), &mut sink);
+    assert!(matches!(outcome, Err(Stop::Refused(_))), "{outcome:?}");
+    assert!(!dirs.checkout().exists(), "nothing is cloned");
+    assert!(bench.events().is_empty());
 }
