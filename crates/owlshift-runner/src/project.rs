@@ -29,6 +29,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ids::TicketId;
@@ -208,11 +209,24 @@ fn component(name: &str) -> String {
 /// knows it after a fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Base {
-    /// The remote-tracking name, such as `origin/main`.
+    /// The remote-tracking name, such as `origin/main`, for messages and
+    /// events only: a run can move a remote-tracking ref (OWL-51), so a later
+    /// step is given `commit`, never this name.
     pub remote_ref: String,
     /// The branch on the forge, such as `main`: the pull request's base.
     pub branch: String,
+    /// The commit `refs/remotes/origin/<branch>` points to right after the
+    /// fetch, resolved once through that full name: what new branches start
+    /// from and what the project's rules are read at.
+    pub commit: String,
 }
+
+/// How long the first clone of a project may take (OWL-60): a large
+/// repository's whole history crosses the network once, and can outlive the
+/// runner git's 120 s deadline on a slow link. The fetch of a later `do` is
+/// incremental and keeps the short deadline, so a stalled network still stops
+/// it fast.
+pub const CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Brings the dedicated checkout up to date: clones `remote_url` into it the
 /// first time, and otherwise points its `origin` at `remote_url`, fetches,
@@ -220,12 +234,23 @@ pub struct Base {
 /// again, since a project can change it. Worktrees whose folder was removed
 /// are forgotten. Returns `origin`'s default branch, which a clone records
 /// as `refs/remotes/origin/HEAD` (checked with git 2.54 and on GitHub on
-/// 2026-09-29) and `git remote set-head origin --auto` refreshes.
+/// 2026-09-29) and `git remote set-head origin --auto` refreshes, with the
+/// commit it points to after the fetch.
 ///
-/// Every command runs under the runner git's own deadline, 120 s at the
-/// time of writing: a first clone of a very large repository can outlive
-/// it (a known limit, OWL-60).
+/// The first clone runs under [`CLONE_TIMEOUT`]; every other command runs
+/// under the runner git's own deadline, 120 s.
 pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<Base, String> {
+    sync_checkout_within(git, dirs, remote_url, CLONE_TIMEOUT)
+}
+
+/// [`sync_checkout`] with `clone_timeout` as the first clone's deadline: for
+/// a test that cannot wait [`CLONE_TIMEOUT`].
+pub fn sync_checkout_within(
+    git: &Git,
+    dirs: &ProjectDirs,
+    remote_url: &str,
+    clone_timeout: Duration,
+) -> Result<Base, String> {
     let checkout = dirs.checkout();
     let failed = |e: crate::executor::GitError| e.to_string();
     if fs::symlink_metadata(&checkout).is_err() {
@@ -237,13 +262,17 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
             remote_url.as_ref(),
             "checkout".as_ref(),
         ];
-        git.run(dirs.root(), &args).map_err(|e| {
-            format!(
-                "could not clone the project into {}: {}",
-                checkout.display(),
-                e.detail
-            )
-        })?;
+        git.run_within(dirs.root(), &args, clone_timeout)
+            .map_err(|e| {
+                // A clone stopped part-way must not pass for a usable
+                // checkout on the next run.
+                let _ = fs::remove_dir_all(&checkout);
+                format!(
+                    "could not clone the project into {}: {}",
+                    checkout.display(),
+                    e.detail
+                )
+            })?;
     } else {
         let args: [&OsStr; 4] = [
             "remote".as_ref(),
@@ -264,13 +293,16 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
     }
     git.run(&checkout, &["worktree", "prune"]).map_err(failed)?;
 
+    // The full name: `--short` would answer `remotes/origin/main` when a
+    // local branch `origin/main` exists (git 2.54, 2026-09-29). One level
+    // only: `set-head` has just written it.
     let head = [
         "symbolic-ref",
         "--quiet",
-        "--short",
+        "--no-recurse",
         "refs/remotes/origin/HEAD",
     ];
-    let remote_ref = match git.run(&checkout, &head) {
+    let target = match git.run(&checkout, &head) {
         Ok(name) => name,
         // A clone of a repository without a default branch records none.
         Err(_) => {
@@ -278,15 +310,45 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
             git.run(&checkout, &head).map_err(failed)?
         }
     };
-    let remote_ref = String::from_utf8_lossy(&remote_ref).trim().to_owned();
-    let branch = remote_ref
-        .strip_prefix("origin/")
+    let target = String::from_utf8_lossy(&target).trim().to_owned();
+    let branch = target
+        .strip_prefix("refs/remotes/origin/")
         .filter(|branch| !branch.is_empty())
-        .ok_or_else(|| {
-            format!("origin's default branch is {remote_ref:?}, not a branch of origin")
-        })?
+        .ok_or_else(|| format!("origin's default branch is {target:?}, not a branch of origin"))?
         .to_owned();
-    Ok(Base { remote_ref, branch })
+    // Resolved now, right after the fetch reset every remote-tracking ref a
+    // run could have moved, and by its full name, which no local branch
+    // shadows (OWL-51). A run can also make that ref symbolic, pointing at
+    // another branch of origin: the fetch keeps such a ref, and git follows
+    // it (git 2.54, 2026-09-29), so it is refused.
+    let symbolic = git
+        .output(
+            &checkout,
+            &["symbolic-ref", "--quiet", target.as_str()],
+            None,
+        )
+        .map_err(failed)?
+        .success();
+    if symbolic {
+        return Err(format!(
+            "{target} in {} is a symbolic ref, not a branch fetched from origin; \
+             remove it with `git update-ref --no-deref -d {target}` there and run again",
+            checkout.display()
+        ));
+    }
+    let full = format!("{target}^{{commit}}");
+    let commit = git
+        .run(
+            &checkout,
+            &["rev-parse", "--verify", "--end-of-options", full.as_str()],
+        )
+        .map_err(|e| format!("origin's default branch {target} does not resolve: {e}"))?;
+    let commit = String::from_utf8_lossy(&commit).trim().to_owned();
+    Ok(Base {
+        remote_ref: format!("origin/{branch}"),
+        branch,
+        commit,
+    })
 }
 
 /// `git remote set-head origin --auto`: asks the forge for its default
@@ -328,8 +390,37 @@ mod tests {
         }
     }
 
+    /// The lock is checked in a fresh copy of this test binary, running
+    /// [`helper_one_do_at_a_time_per_project`] alone. In this process, other
+    /// tests fork children (`git`, `sh`), and a child forked while the lock
+    /// is held keeps it until it execs (see [`ProjectDirs::lock`]): the
+    /// released lock then looked held (seen once on macOS on 2026-09-29).
+    /// Alone, nothing forks.
     #[test]
     fn one_do_at_a_time_per_project() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "project::tests::helper_one_do_at_a_time_per_project",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_one_do_at_a_time_per_project() {
+        if !std::env::args().any(|arg| arg == "--exact") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dirs = ProjectDirs::new(dir.path(), &Repo::parse("demo/project").unwrap());
         let held = dirs.lock().unwrap().expect("the first lock is free");

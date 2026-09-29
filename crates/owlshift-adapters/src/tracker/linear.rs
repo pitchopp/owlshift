@@ -21,6 +21,17 @@
 //!   answers HTTP 401 with code `AUTHENTICATION_ERROR`.
 //! - `commentCreate` accepts an issue identifier such as `OWL-13`.
 //!
+//! Checked live on 2026-09-29 (OWL-62), by schema introspection and a read of
+//! the workspace's issues:
+//!
+//! - `Issue.creator` is the account that created the issue, null when that
+//!   account was deleted or an integration or system process created it; the
+//!   issue's `botActor` or `externalUserCreator` then names it. OWL-1 to OWL-4,
+//!   made by Linear's onboarding, have a null creator and the bot actor
+//!   `Linear` (type `workflow`); every other issue has a creator, and those
+//!   read (the 50 most recent, OWL-11, OWL-13) have the account of the
+//!   personal API key and no bot actor.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -175,6 +186,7 @@ impl Tracker for LinearTracker {
             priority: priority(issue.priority)?,
             assignee: issue.assignee.map(User::into_person),
             labels: issue.labels.nodes.into_iter().map(|l| l.name).collect(),
+            author: author(issue.creator, issue.bot_actor, issue.external_user_creator),
         })
     }
 
@@ -225,6 +237,7 @@ macro_rules! comment_fields {
 
 const TICKET_QUERY: &str = "query Ticket($id: String!) { issue(id: $id) { \
     identifier title description priority assignee { id displayName } \
+    creator { id displayName } botActor { name } externalUserCreator { name } \
     labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
 
 const COMMENTS_QUERY: &str = concat!(
@@ -334,6 +347,9 @@ struct Issue {
     description: Option<String>,
     priority: f64,
     assignee: Option<User>,
+    creator: Option<User>,
+    bot_actor: Option<Named>,
+    external_user_creator: Option<Named>,
     labels: Connection<Label>,
 }
 
@@ -378,6 +394,23 @@ struct Named {
     name: Option<String>,
 }
 
+/// Who wrote an issue or a comment. It is an account only when Linear names
+/// an account and nothing else: a bot or an external user alongside it means
+/// an integration acted, and what it carried is not the account's own text,
+/// so the author is then that bot or external user. The recorded answers
+/// never set both; the rule fails closed if Linear ever does. Nobody named
+/// (a deleted account) is [`Author::unknown`].
+fn author(user: Option<User>, bot: Option<Named>, external: Option<Named>) -> Author {
+    match (user, bot, external) {
+        (Some(user), None, None) => Author::Account(user.into_person()),
+        (user, bot, external) => bot
+            .and_then(|b| b.name)
+            .or_else(|| external.and_then(|e| e.name))
+            .or_else(|| user.map(|u| u.display_name))
+            .map_or_else(Author::unknown, |name| Author::Other { name }),
+    }
+}
+
 #[derive(Deserialize)]
 struct CommentsData {
     issue: IssueComments,
@@ -402,17 +435,9 @@ struct LinearComment {
 
 impl LinearComment {
     fn into_comment(self) -> Comment {
-        let author = match (self.user, self.bot_actor, self.external_user) {
-            (Some(user), _, _) => Author::Account(user.into_person()),
-            (None, Some(Named { name: Some(name) }), _)
-            | (None, _, Some(Named { name: Some(name) })) => Author::Other { name },
-            _ => Author::Other {
-                name: "unknown".to_owned(),
-            },
-        };
         Comment {
             id: self.id,
-            author,
+            author: author(self.user, self.bot_actor, self.external_user),
             created_at: self.created_at,
             edited_at: self.edited_at,
             body: self.body,
@@ -534,7 +559,8 @@ mod tests {
     fn what_the_adapter_cannot_represent_is_refused_not_truncated() {
         let id = TicketId::new("OWL-1").unwrap();
         let many_labels = r#"{"data":{"issue":{"identifier":"OWL-1","title":"t","description":null,
-            "priority":0,"assignee":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}"#;
+            "priority":0,"assignee":null,"creator":null,"botActor":null,
+            "externalUserCreator":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}"#;
         assert!(tracker(vec![many_labels]).ticket(&id).is_err());
 
         let stuck = r#"{"data":{"issue":{"comments":{"nodes":[],
@@ -543,6 +569,50 @@ mod tests {
 
         let refused = r#"{"data":{"commentCreate":{"success":false,"comment":null}}}"#;
         assert!(tracker(vec![refused]).post_comment(&id, "x").is_err());
+    }
+
+    /// OWL-1 as Linear gave it on 2026-09-29, made by its onboarding
+    /// workflow: no creator, a bot actor.
+    #[test]
+    fn a_ticket_made_by_a_bot_is_attributed_to_the_bot() {
+        let owl_1 = r#"{"data":{"issue":{"identifier":"OWL-1","title":"t","description":null,
+            "priority":0,"assignee":null,"creator":null,"botActor":{"name":"Linear"},
+            "externalUserCreator":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}"#;
+        let ticket = tracker(vec![owl_1])
+            .ticket(&TicketId::new("OWL-1").unwrap())
+            .unwrap();
+        assert_eq!(
+            ticket.author,
+            Author::Other {
+                name: "Linear".to_owned()
+            }
+        );
+    }
+
+    /// An account is the author only when Linear names nothing else beside
+    /// it: an integration acting for an account never reads as the account.
+    #[test]
+    fn an_account_beside_a_bot_or_an_external_user_is_not_the_author() {
+        let user = || {
+            Some(User {
+                id: "u1".to_owned(),
+                display_name: "person-1".to_owned(),
+            })
+        };
+        let named = |name: Option<&str>| {
+            Some(Named {
+                name: name.map(str::to_owned),
+            })
+        };
+        let other = |name: &str| Author::Other {
+            name: name.to_owned(),
+        };
+        assert_eq!(author(user(), named(Some("Slack")), None), other("Slack"));
+        assert_eq!(
+            author(user(), None, named(Some("Customer"))),
+            other("Customer")
+        );
+        assert_eq!(author(user(), named(None), None), other("person-1"));
     }
 
     #[test]

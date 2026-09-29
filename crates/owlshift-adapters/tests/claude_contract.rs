@@ -11,6 +11,8 @@
 //! status and standard error the run had, since both decide the outcome.
 //! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
 //! limit on purpose (C7's open item). It follows the shapes C7 logged.
+//! `repo_settings_ignored.jsonl` was recorded with the real CLI and a local
+//! stand-in for the model, which played scripted tool calls (OWL-53).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -224,6 +226,17 @@ fn tool_calls(events: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+/// The tool results of a recording, in order.
+fn tool_results(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .filter(|event| event["type"] == "user")
+        .filter_map(|event| event["message"]["content"].as_array())
+        .flatten()
+        .filter(|block| block["tool_use_id"].is_string())
+        .collect()
+}
+
 /// Every launch removes the tools that reach beyond the run, in its one
 /// `--disallowedTools` flag, with the web tools when the run has no network.
 /// `beyond_run_tools_denied.jsonl` was recorded with that argv (write in
@@ -274,15 +287,11 @@ fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
     let searched = query.strip_prefix("select:").unwrap().split(',');
     let deferred = BEYOND_RUN_TOOLS.into_iter().filter(|tool| *tool != "Agent");
     assert_eq!(sorted(searched), sorted(deferred));
-    let found: Vec<&Value> = events
-        .iter()
-        .filter(|event| event["type"] == "user")
-        .filter_map(|event| event["message"]["content"].as_array())
-        .flatten()
-        .filter(|block| block["tool_use_id"].is_string())
-        .map(|block| &block["content"])
-        .collect();
-    assert_eq!(found[0], &json!("No matching deferred tools found"));
+    let found = tool_results(&events);
+    assert_eq!(
+        found[0]["content"],
+        json!("No matching deferred tools found")
+    );
 
     let run = replay(name, 0);
     assert!(
@@ -355,6 +364,78 @@ fn messages_from_other_sessions_are_refused_on_every_launch() {
             text: "NONE".into()
         }
     );
+}
+
+/// Every launch loads no settings file: `--setting-sources` with an empty
+/// value leaves out the user's settings and the worktree's
+/// `.claude/settings.json` and `.claude/settings.local.json`, while
+/// `--settings` and managed settings still apply. Under `project,local`, a
+/// trusted worktree's allow rule, in either file, let a read-only role run
+/// Bash and Write, and a repository hook answering `allow` did so even in an
+/// untrusted one (build plan, OWL-53).
+///
+/// The command line is the guard. `repo_settings_ignored.jsonl` records what
+/// the CLI did with it: the read-only argv, in a trusted linked worktree
+/// whose two settings files allowed Bash, Write and Edit and held hooks, one
+/// of them approving every call. A local stand-in for the model, reached
+/// with a made-up API key (hence `apiKeySource`), played three calls: Write
+/// to the result file, Bash, Write to another file. The first succeeded, the
+/// other two were denied, and no hook ran, where the same repository under
+/// `project,local` had all three succeed and its `SessionStart` hooks
+/// reported in the stream. Exit 0, empty stderr.
+#[test]
+fn repository_settings_cannot_widen_a_role_on_every_launch() {
+    for (level, network, args) in every_launch() {
+        let flags = positions(&args, "--setting-sources");
+        let case = format!("{level:?}, network {network}: {args:?}");
+        assert_eq!(flags.len(), 1, "{case}");
+        assert_eq!(args[flags[0] + 1], "", "{case}");
+    }
+
+    let name = "repo_settings_ignored.jsonl";
+    let events = recorded_events(name);
+    let hooks: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "system"
+                && event["subtype"]
+                    .as_str()
+                    .is_some_and(|subtype| subtype.starts_with("hook_"))
+        })
+        .collect();
+    assert!(hooks.is_empty(), "{hooks:?}");
+
+    let calls = tool_calls(&events);
+    let called: Vec<&Value> = calls.iter().map(|block| &block["name"]).collect();
+    assert_eq!(called, [&json!("Write"), &json!("Bash"), &json!("Write")]);
+    let results = tool_results(&events);
+    assert_eq!(results.len(), calls.len());
+    for (call, result) in calls.iter().zip(&results) {
+        assert_eq!(result["tool_use_id"], call["id"]);
+    }
+    assert_eq!(
+        calls[0]["input"]["file_path"],
+        json!("/work/.owlshift/run/result.json")
+    );
+    let created = results[0]["content"].as_str().unwrap();
+    assert!(
+        created.starts_with("File created successfully"),
+        "{created}"
+    );
+    for (call, result) in calls[1..].iter().zip(&results[1..]) {
+        let tool = call["name"].as_str().unwrap();
+        let denied = format!("Permission to use {tool} has been denied");
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with(&denied), "{content}");
+    }
+
+    let run = replay(name, 0);
+    assert!(
+        matches!(run.outcome, Outcome::Completed { .. }),
+        "{:?}",
+        run.outcome
+    );
+    assert_eq!(run.permission_denials, ["Bash", "Write"]);
 }
 
 /// Every recorded fixture carries a version listed in `harness/tested.rs`,

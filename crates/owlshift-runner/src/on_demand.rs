@@ -409,6 +409,7 @@ impl OnDemand<'_> {
                 ("title", json!(found.title)),
                 ("branch", json!(branch)),
                 ("base", json!(base.remote_ref)),
+                ("base_commit", json!(base.commit)),
                 ("worktree", path(&worktree)),
                 ("checkout", path(&checkout)),
                 ("pull_request", json!(open.map(|pr| pr.number))),
@@ -462,7 +463,9 @@ impl OnDemand<'_> {
                 main: &checkout,
                 worktree: &worktree,
                 branch: &branch,
-                base: &base.remote_ref,
+                // The commit resolved after the fetch, not the name: a run
+                // can move a remote-tracking ref (OWL-51).
+                base: &base.commit,
                 run_dir: &run_dir,
                 brief: &brief,
             };
@@ -597,12 +600,7 @@ impl OnDemand<'_> {
                 title: ticket.title.clone(),
                 url: None,
                 labels: ticket.labels.clone(),
-                // The adapters do not read who wrote a ticket yet: its text
-                // is a request, not instructions.
-                author: Author {
-                    name: "unknown".to_owned(),
-                    relation: Relation::Other,
-                },
+                author: account_author(&ticket.author, decider),
                 description: ticket.description.clone(),
             },
             decider: decider.name.clone(),
@@ -770,18 +768,38 @@ impl OnDemand<'_> {
 /// quoted as data. A marker only ever demotes: the decider's text that
 /// looks like one reads as data.
 fn comment_author(comment: &Comment, decider: &Person) -> Author {
-    let (name, account) = match &comment.author {
-        TrackerAuthor::Account(person) => (person.name.clone(), Some(person.id.as_str())),
-        TrackerAuthor::Other { name } => (name.clone(), None),
-    };
-    let relation = if matches!(MarkedComment::parse(&comment.body), Ok(Some(_))) {
-        Relation::Owlshift
-    } else if account == Some(decider.id.as_str()) {
-        Relation::Decider
+    let author = account_author(&comment.author, decider);
+    if matches!(MarkedComment::parse(&comment.body), Ok(Some(_))) {
+        Author {
+            relation: Relation::Owlshift,
+            ..author
+        }
     } else {
-        Relation::Other
-    };
-    Author { name, relation }
+        author
+    }
+}
+
+/// A ticket's or a comment's author as the brief shows it: the decider when
+/// it is the assignee's account, matched by its identifier and never its name
+/// (an empty identifier matches nothing), so the text reads as instructions;
+/// anyone else, or an author the tracker cannot name, is quoted as data. For
+/// a ticket, the author is its creator: an edit of the description by
+/// someone else after its creation is not seen.
+fn account_author(author: &TrackerAuthor, decider: &Person) -> Author {
+    match author {
+        TrackerAuthor::Account(person) => Author {
+            name: person.name.clone(),
+            relation: if !person.id.trim().is_empty() && person.id == decider.id {
+                Relation::Decider
+            } else {
+                Relation::Other
+            },
+        },
+        TrackerAuthor::Other { name } => Author {
+            name: name.clone(),
+            relation: Relation::Other,
+        },
+    }
 }
 
 /// The plan and ledger a previous run left in the worktree, so the next run
@@ -1038,6 +1056,25 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// The thread test above pins the account match, shared by tickets and
+    /// comments; an author the tracker cannot name and an empty identifier,
+    /// which the Markdown front matter accepts, never make the decider.
+    #[test]
+    fn an_unnamed_or_blank_author_is_never_the_decider() {
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let unknown = account_author(&TrackerAuthor::unknown(), &decider);
+        assert_eq!(unknown.relation, Relation::Other);
+        let nobody = Person {
+            id: String::new(),
+            name: String::new(),
+        };
+        let blank = account_author(&TrackerAuthor::Account(nobody.clone()), &nobody);
+        assert_eq!(blank.relation, Relation::Other);
     }
 
     #[test]

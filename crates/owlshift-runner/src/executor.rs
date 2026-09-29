@@ -26,7 +26,9 @@
 //! A Build run that finishes with `done` is not taken at its word either:
 //! the executor then runs the project's gate itself ([`gate`], OWL-16), and
 //! checks isolation again after it. A red gate makes the run
-//! [`Failure::Gate`]; a gate that breaks isolation quarantines it.
+//! [`Failure::Gate`]; a gate that breaks isolation quarantines it. The gate
+//! makes the file-system checks itself before its own git runs, and stops
+//! there on a violation (OWL-64).
 //!
 //! # Layout
 //!
@@ -116,7 +118,10 @@ pub struct RunSpec<'a> {
     pub worktree: &'a Path,
     /// The ticket's branch, checked out in the worktree.
     pub branch: &'a str,
-    /// What a new branch starts from, such as `origin/main`.
+    /// What a new branch starts from: a commit, or a name resolved to one
+    /// when the branch is created. The isolation check leaves remote-tracking
+    /// refs out, so an earlier run can move `origin/main`: `owlshift do`
+    /// passes the commit it resolved right after its fetch (OWL-51).
     pub base: &'a str,
     /// Where the run's log files and a copy of its brief go, outside the
     /// worktree; created if missing.
@@ -350,14 +355,12 @@ impl Executor {
                 &brief.gate,
                 self.gate_timeout,
                 &spec.run_dir.join(gate::GATE_LOG),
+                &|| before.check_files(spec.worktree),
             );
-            // The gate ran code the run wrote: isolation is checked again,
-            // and a breach wins over the gate's own verdict.
-            let violations = before.check(&self.git, spec.main, spec.worktree, spec.branch);
-            if !violations.is_empty() {
-                outcome = Outcome::Quarantined(violations);
-            } else if let Some(failure) = &report.failure {
-                outcome = Outcome::Failed(Failure::Gate(Box::new(failure.clone())));
+            if let Some(after_gate) = after_gate(&report, || {
+                before.check(&self.git, spec.main, spec.worktree, spec.branch)
+            }) {
+                outcome = after_gate;
             }
             gate = Some(report);
         }
@@ -403,6 +406,26 @@ impl Executor {
 /// Whether the role finished with `done`.
 fn is_done(outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::Finished { result, .. } if result.status == result::Status::Done)
+}
+
+/// What the gate makes of a Build `done`; `None` leaves it as it was. The
+/// gate ran code the run wrote, so isolation counts first: a breach the gate
+/// found before its own git quarantines the run as it is, with no more git;
+/// otherwise `check` checks isolation again, and a violation there wins over
+/// the gate's own verdict.
+fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Option<Outcome> {
+    if !report.breach.is_empty() {
+        return Some(Outcome::Quarantined(report.breach.clone()));
+    }
+    let violations = check();
+    if !violations.is_empty() {
+        Some(Outcome::Quarantined(violations))
+    } else {
+        report
+            .failure
+            .as_ref()
+            .map(|failure| Outcome::Failed(Failure::Gate(Box::new(failure.clone()))))
+    }
 }
 
 /// The outcome, in order of precedence: a violation, the deadline, a
@@ -550,5 +573,37 @@ mod tests {
         let unknown = br#"{"format":1,"status":"done","summary":"s","extra":1}"#;
         assert!(validate_result(unknown, "owlshift/T-1").is_err());
         assert!(validate_result(b"\xff", "owlshift/T-1").is_err());
+    }
+
+    /// A breach the gate found quarantines the run without the second
+    /// check, over the failure it also carries; a violation the second check
+    /// finds wins over a red gate; a red gate alone fails the run.
+    #[test]
+    fn isolation_wins_over_the_gate_verdict() {
+        let failure = GateFailure {
+            command: None,
+            reason: "red".to_owned(),
+            output: String::new(),
+            truncated: false,
+        };
+        let report = |breach: Vec<Violation>, failure: Option<GateFailure>| GateReport {
+            commands: Vec::new(),
+            commit: None,
+            log: PathBuf::new(),
+            failure,
+            breach,
+        };
+        let link = Violation::WorktreeLink("redirected".to_owned());
+        let breached = report(vec![link.clone()], Some(failure.clone()));
+        let outcome = after_gate(&breached, || panic!("no more git after a breach"));
+        assert!(matches!(outcome, Some(Outcome::Quarantined(v)) if v == [link.clone()]));
+
+        let red = report(Vec::new(), Some(failure));
+        let outcome = after_gate(&red, || vec![Violation::MainHead]);
+        assert!(matches!(outcome, Some(Outcome::Quarantined(v)) if v == [Violation::MainHead]));
+        let outcome = after_gate(&red, Vec::new);
+        assert!(matches!(outcome, Some(Outcome::Failed(Failure::Gate(f))) if f.reason == "red"));
+
+        assert!(after_gate(&report(Vec::new(), None), Vec::new).is_none());
     }
 }

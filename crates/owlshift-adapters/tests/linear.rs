@@ -44,6 +44,7 @@ fn reads_an_assigned_ticket() {
     assert!(!ticket.description.is_empty());
     assert_eq!(ticket.priority, Priority::High);
     assert_eq!(ticket.assignee, Some(maintainer()));
+    assert_eq!(ticket.author, Author::Account(maintainer()));
     assert!(!ticket.labels.is_empty());
 }
 

@@ -1,9 +1,9 @@
 {
-  "recorded": "2026-09-28 on the Owlshift workspace, recorded live",
+  "recorded": "2026-09-29 on the Owlshift workspace, recorded live",
   "exchanges": [
     {
       "request": {
-        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
+        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
         "variables": {
           "id": "OWL-11"
         }

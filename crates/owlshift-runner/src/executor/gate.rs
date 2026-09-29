@@ -11,6 +11,16 @@
 //! monitor hook off, so nothing the run planted in the repository's
 //! configuration runs with the runner's environment.
 //!
+//! That git runs outside the sandbox, so before it runs, before the commands
+//! and again after them, the caller's guard checks the worktree's `.git` link
+//! and the repository's shared git files on the file system (OWL-64; the
+//! checks of [`super::isolation`], OWL-59): a clean filter a gate command
+//! planted would otherwise run in the gate's `git status`. A guard that finds
+//! a violation stops the gate there, before any more git, and the report
+//! carries it as a [`GateReport::breach`], which quarantines the run. The
+//! status check ignores submodules, so a gitlink planted in the index does
+//! not start git in a folder whose configuration nothing checked.
+//!
 //! Every command's output, standard output and standard error interleaved,
 //! goes whole to the gate log in the caller's run directory; a failure keeps
 //! the last [`OUTPUT_TAIL`] bytes for the next Build run's brief. The gate
@@ -29,6 +39,7 @@ use std::time::{Duration, Instant};
 use owlshift_contracts::brief::GateFailure;
 
 use super::git::Git;
+use super::isolation::Violation;
 use super::watch;
 use crate::agent_env::{AgentEnv, RunPaths};
 
@@ -58,20 +69,43 @@ pub struct GateReport {
     pub commit: Option<String>,
     /// The gate log.
     pub log: PathBuf,
-    /// Why the gate failed; `None` when it passed.
+    /// Why the gate failed; `None` when it passed. A breach is a failure
+    /// too, so that no reader of this field takes a breached gate for a
+    /// passing one.
     pub failure: Option<GateFailure>,
+    /// What the guard found before the gate's own git: the run broke
+    /// isolation and is quarantined, whatever the failure says. Empty when
+    /// the guard found nothing.
+    pub breach: Vec<Violation>,
 }
 
 impl GateReport {
     pub fn passed(&self) -> bool {
-        self.failure.is_none()
+        self.failure.is_none() && self.breach.is_empty()
+    }
+}
+
+/// The checks the gate makes before its own git runs, on the file system
+/// alone: every isolation violation they find, empty when none.
+pub(crate) type Guard<'a> = &'a dyn Fn() -> Vec<Violation>;
+
+/// Why the gate stopped short of passing.
+enum Stop {
+    Failed(GateFailure),
+    Breach(Vec<Violation>),
+}
+
+impl From<GateFailure> for Stop {
+    fn from(failure: GateFailure) -> Self {
+        Self::Failed(failure)
     }
 }
 
 /// Runs the gate in the worktree of `paths`, each command confined to them
-/// as the run was (OWL-41); see the module documentation. Whatever goes
-/// wrong, the runner's side included, is a failure: a gate that could not be
-/// run never passes.
+/// as the run was (OWL-41), with `guard` checked before each of the gate's
+/// own git steps; see the module documentation. Whatever goes wrong, the
+/// runner's side included, is a failure: a gate that could not be run never
+/// passes. A violation the guard finds is a breach, and a failure as well.
 pub(crate) fn run(
     git: &Git,
     agent: &AgentEnv,
@@ -79,6 +113,7 @@ pub(crate) fn run(
     commands: &[String],
     timeout: Duration,
     log_path: &Path,
+    guard: Guard<'_>,
 ) -> GateReport {
     let deadline = Instant::now() + timeout;
     let git = git.as_agent(agent);
@@ -87,9 +122,29 @@ pub(crate) fn run(
         commit: None,
         log: log_path.to_owned(),
         failure: None,
+        breach: Vec::new(),
     };
-    let checked = check_and_run(&git, agent, paths, commands, timeout, deadline, &mut report);
-    report.failure = checked.err();
+    let checked = check_and_run(
+        &git,
+        agent,
+        paths,
+        commands,
+        (timeout, deadline),
+        guard,
+        &mut report,
+    );
+    match checked {
+        Ok(()) => {}
+        Err(Stop::Failed(failure)) => report.failure = Some(failure),
+        Err(Stop::Breach(violations)) => {
+            let reasons: Vec<String> = violations.iter().map(ToString::to_string).collect();
+            report.failure = Some(around(format!(
+                "the gate broke isolation, found before its own git ran: {}",
+                reasons.join("; ")
+            )));
+            report.breach = violations;
+        }
+    }
     report
 }
 
@@ -98,10 +153,10 @@ fn check_and_run(
     agent: &AgentEnv,
     paths: &RunPaths,
     commands: &[String],
-    timeout: Duration,
-    deadline: Instant,
+    (timeout, deadline): (Duration, Instant),
+    guard: Guard<'_>,
     report: &mut GateReport,
-) -> Result<(), GateFailure> {
+) -> Result<(), Stop> {
     let worktree = paths.workdir.as_path();
     let mut log = File::create(&report.log).map_err(|e| {
         around(format!(
@@ -109,26 +164,43 @@ fn check_and_run(
             report.log.display()
         ))
     })?;
+    // The caller checked isolation just before, with nothing run since; the
+    // gate checks anyway, so that its own git never rests on the caller.
+    guarded(guard, &mut log)?;
     let before = head(git, worktree)?;
     report.commit = Some(before.clone());
     let dirty = uncommitted(git, worktree)?;
     if !dirty.is_empty() {
         return Err(around(format!(
             "uncommitted changes before the gate, which runs on the last commit: {dirty}"
-        )));
+        ))
+        .into());
     }
     run_commands(agent, paths, commands, timeout, deadline, &mut log)?;
+    // The commands wrote what the sandbox let them, the repository's git
+    // folder included: nothing they planted may run in the gate's git.
+    guarded(guard, &mut log)?;
     let dirty = uncommitted(git, worktree)?;
     if !dirty.is_empty() {
-        return Err(around(format!("the gate changed files: {dirty}")));
+        return Err(around(format!("the gate changed files: {dirty}")).into());
     }
     let after = head(git, worktree)?;
     if after != before {
-        return Err(around(format!(
-            "the gate moved HEAD from {before} to {after}"
-        )));
+        return Err(around(format!("the gate moved HEAD from {before} to {after}")).into());
     }
     Ok(())
+}
+
+/// Runs the guard; a violation stops the gate, with a line in its log.
+fn guarded(guard: Guard<'_>, log: &mut File) -> Result<(), Stop> {
+    let violations = guard();
+    if violations.is_empty() {
+        return Ok(());
+    }
+    for violation in &violations {
+        let _ = writeln!(log, "[isolation broken, no more git runs: {violation}]");
+    }
+    Err(Stop::Breach(violations))
 }
 
 /// A failure around the commands, with no command or output of its own.
@@ -153,7 +225,9 @@ fn head(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
 }
 
 /// The worktree's uncommitted paths, tracked or not, as a short list; empty
-/// when it is clean. Ignored files do not count.
+/// when it is clean. Ignored files do not count, and neither do submodules:
+/// git would look into one with its own git, reading configuration the
+/// guard does not check.
 fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
     let out = git
         .run(
@@ -164,6 +238,7 @@ fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
                 "-z",
                 "--untracked-files=all",
                 "--no-renames",
+                "--ignore-submodules=all",
             ]),
         )
         .map_err(|e| {
@@ -987,5 +1062,161 @@ mod tests {
         let confined = AgentEnv::new(std::env::vars_os(), &[]).unwrap();
         let failure = gate_with(&confined, &paths(dir.path()), "echo hi").unwrap_err();
         assert!(failure.reason.contains("WSL2"), "{}", failure.reason);
+    }
+
+    /// OWL-64: what a gate command plants for git to run never runs in the
+    /// gate's own git. Each test ends with a control: a plain `git status`
+    /// run afterwards does run what was planted.
+    #[cfg(unix)]
+    mod planted {
+        use super::*;
+        use crate::executor::isolation::Snapshot;
+
+        /// A checkout whose `a.txt` names the `owl` filter, and a worktree of
+        /// it on `owl-1`, snapshotted as a run's would be.
+        struct Repo {
+            base: tempfile::TempDir,
+            worktree: PathBuf,
+            marker: PathBuf,
+            snapshot: Snapshot,
+        }
+
+        /// The test's own git, away from the operator's configuration.
+        fn git_in(dir: &Path, args: &[&str]) -> Vec<u8> {
+            let out = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=owl",
+                    "-c",
+                    "user.email=owl@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            out.stdout
+        }
+
+        fn repo() -> Repo {
+            let base = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(base.path()).unwrap();
+            let main = root.join("main");
+            std::fs::create_dir(&main).unwrap();
+            git_in(&main, &["init", "-q"]);
+            std::fs::write(main.join("a.txt"), "a\n").unwrap();
+            std::fs::write(main.join(".gitattributes"), "a.txt filter=owl\n").unwrap();
+            git_in(&main, &["add", "a.txt", ".gitattributes"]);
+            git_in(&main, &["commit", "-q", "-m", "start"]);
+            git_in(
+                &main,
+                &["worktree", "add", "-q", "-b", "owl-1", "../worktree"],
+            );
+            let worktree = root.join("worktree");
+            let snapshot = Snapshot::take(&Git::new("git"), &main, &worktree, "owl-1").unwrap();
+            Repo {
+                marker: root.join("marker"),
+                base,
+                worktree,
+                snapshot,
+            }
+        }
+
+        impl Repo {
+            fn gate(&self, command: &str) -> GateReport {
+                run(
+                    &Git::new("git"),
+                    &agent(),
+                    &paths(&self.worktree),
+                    &[command.to_owned()],
+                    Duration::from_secs(60),
+                    &self.base.path().join(GATE_LOG),
+                    &|| self.snapshot.check_files(&self.worktree),
+                )
+            }
+
+            /// A command that has git touch the marker, for `filter.owl.clean`.
+            fn touch_marker(&self) -> String {
+                format!("touch '{}'; cat", self.marker.display())
+            }
+
+            fn log(&self) -> String {
+                std::fs::read_to_string(self.base.path().join(GATE_LOG)).unwrap()
+            }
+        }
+
+        /// The acceptance: a clean filter planted in the shared config is
+        /// caught before the gate's `git status`, and never runs. The file
+        /// keeps its size and gets another time, so that git must run the
+        /// filter to compare it.
+        #[test]
+        fn a_planted_clean_filter_never_runs() {
+            let repo = repo();
+            let report = repo.gate(&format!(
+                "git config filter.owl.clean \"{}\" && touch -t 200001010000 a.txt",
+                repo.touch_marker()
+            ));
+            assert!(
+                matches!(report.breach.as_slice(), [Violation::SharedGitFiles(files)] if files == &["config"]),
+                "{report:?}"
+            );
+            assert!(!report.passed());
+            assert!(report.log.exists() && repo.log().contains("isolation broken"));
+            assert!(!repo.marker.exists(), "the gate's git ran the filter");
+
+            git_in(&repo.worktree, &["status", "--porcelain"]);
+            assert!(repo.marker.exists(), "the control never ran the filter");
+        }
+
+        /// A `.git` link redirected by a gate command stops the gate as well.
+        #[test]
+        fn a_redirected_link_stops_the_gate() {
+            let repo = repo();
+            let other = repo.base.path().join("other");
+            std::fs::create_dir(&other).unwrap();
+            git_in(&other, &["init", "-q"]);
+            let report = repo.gate(&format!(
+                "printf 'gitdir: {}\\n' > .git",
+                other.join(".git").display()
+            ));
+            assert!(
+                matches!(report.breach.as_slice(), [Violation::WorktreeLink(_)]),
+                "{report:?}"
+            );
+            assert!(!report.passed());
+        }
+
+        /// A gitlink planted in the worktree's index, over a repository
+        /// holding its own filter, is not looked into by the gate's status:
+        /// nothing checks that repository's configuration.
+        #[test]
+        fn a_planted_submodule_is_not_looked_into() {
+            let repo = repo();
+            // The command builds a repository with its own filter in the
+            // worktree, stages it as a gitlink, and gives its file another
+            // time. Adding the file runs the filter once: the marker goes.
+            let report = repo.gate(&format!(
+                "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 && \
+                 git init -q sub && cd sub && git config filter.owl.clean \"{marker}\" && \
+                 printf 'f filter=owl\\n' > .gitattributes && printf 'f\\n' > f && \
+                 git add f .gitattributes && \
+                 git -c user.name=owl -c user.email=owl@example.invalid \
+                 -c commit.gpgsign=false commit -q -m sub && rm -f '{path}' && cd .. && \
+                 git update-index --add --cacheinfo \"160000,$(git -C sub rev-parse HEAD),sub\" && \
+                 touch -t 200001010000 sub/f",
+                marker = repo.touch_marker(),
+                path = repo.marker.display(),
+            ));
+            assert!(report.breach.is_empty(), "{report:?}");
+            let command_failed = report.failure.as_ref().is_some_and(|f| f.command.is_some());
+            assert!(!command_failed, "{report:?}");
+            assert!(!repo.marker.exists(), "the gate's git ran the filter");
+
+            git_in(&repo.worktree, &["status", "--porcelain"]);
+            assert!(repo.marker.exists(), "the control never ran the filter");
+        }
     }
 }

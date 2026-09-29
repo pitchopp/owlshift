@@ -16,6 +16,8 @@ owlshift-adapters.workspace = true
 # The bench runs the fake harness and the isolation scenarios bare, through
 # the test-only `AgentEnv::without_confinement` (OWL-41).
 owlshift-runner = { workspace = true, features = ["testkit"] }
+# `gh::warm_up` starts gh with a deadline.
+owlshift-platform.workspace = true
 clap.workspace = true
 jiff.workspace = true
 serde.workspace = true
