@@ -13,13 +13,13 @@
 //! does not pass quietly either. The lists only grow: a version tested once
 //! stays tested after newer fixtures replace its recordings.
 //!
-//! Matching is exact: a patch release can drop a flag, so `2.1.284` is not
-//! covered by `2.1.283`.
+//! Matching is exact: a patch release can drop a flag, so `2.1.285` is not
+//! covered by `2.1.284`.
 
 use owlshift_contracts::Harness;
 
 /// Claude Code releases the contract fixtures were recorded with.
-const CLAUDE: &[&str] = &["2.1.283"];
+const CLAUDE: &[&str] = &["2.1.283", "2.1.284"];
 
 /// Codex has no contract tests yet, so no version is tested. C8 ran its login
 /// status command on 0.154.0, which says nothing about how it runs a role.
@@ -45,7 +45,8 @@ mod tests {
     #[test]
     fn matching_is_exact() {
         assert!(is_tested(Harness::Claude, "2.1.283"));
-        for other in ["2.1.284", "2.1", "2.1.2830", "2.1.283-beta.1", ""] {
+        assert!(is_tested(Harness::Claude, "2.1.284"));
+        for other in ["2.1.285", "2.1", "2.1.2830", "2.1.283-beta.1", ""] {
             assert!(!is_tested(Harness::Claude, other), "{other}");
         }
         assert!(!is_tested(Harness::Codex, "0.154.0"));

@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn an_untested_or_unreadable_version_warns_without_failing() {
-        let fix = "Owlshift is tested with claude 2.1.283; \
+        let fix = "Owlshift is tested with claude 2.1.283, 2.1.284; \
                    if a run misbehaves, install a tested version";
         for answer in [
             Answer::Exit(0, "9.9.9 (Claude Code)\n", ""),
