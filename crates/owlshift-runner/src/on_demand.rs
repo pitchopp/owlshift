@@ -371,9 +371,12 @@ impl OnDemand<'_> {
         let checkout = self.dirs.checkout();
         let worktree = self.dirs.worktree(ticket);
         // A worktree kept from an earlier `do` is trusted only while its
-        // `.git` still links it to the checkout.
+        // `.git` still links it to the checkout. The executor refuses such a
+        // worktree too; checked here, under the lock, the project is marked
+        // and refused until a person looks.
         if fs::symlink_metadata(&worktree).is_ok()
-            && let Err(reason) = project::check_worktree_link(&checkout, &worktree)
+            && let Err(reason) =
+                crate::executor::check_worktree_link(&checkout.join(".git"), &worktree)
         {
             let text = format!("The worktree of {ticket} was changed between runs: {reason}\n");
             self.dirs
@@ -480,17 +483,14 @@ impl OnDemand<'_> {
                     return Err(refused("the run could not start", error));
                 }
             };
-            // The executor's check does not see the worktree's own `.git`:
-            // a link the run redirected is a breach too, found before the
-            // runner trusts anything git says in the worktree.
-            let link = project::check_worktree_link(&checkout, &worktree).err();
-            let mut breaches: Vec<String> = match &report.outcome {
+            // The executor's isolation check starts with the worktree's
+            // `.git` link: a redirected one is among the violations.
+            let breaches: Vec<String> = match &report.outcome {
                 Outcome::Quarantined(violations) => {
                     violations.iter().map(ToString::to_string).collect()
                 }
                 _ => Vec::new(),
             };
-            breaches.extend(link.clone());
             let marked = if breaches.is_empty() {
                 self.dirs.clear_unverified()
             } else {
@@ -501,13 +501,7 @@ impl OnDemand<'_> {
                 ))
             };
             marked.map_err(|e| refused("the project's marker", e))?;
-            let mut ended = run_ended(&report);
-            if let Some(link) = &link {
-                ended.insert("outcome".to_owned(), json!("quarantined"));
-                ended.insert("reason".to_owned(), json!(breaches.join("; ")));
-                ended.insert("link".to_owned(), json!(link));
-            }
-            sink.emit(ticket, Some(&run), EventKind::RunEnded, ended);
+            sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
             if let Some(usage) = &report.usage {
                 sink.emit(ticket, Some(&run), EventKind::Usage, usage_data(usage));
             }

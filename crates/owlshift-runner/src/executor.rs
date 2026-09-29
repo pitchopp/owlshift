@@ -9,7 +9,10 @@
 //! outcome:
 //!
 //! - an isolation violation quarantines the run, whatever else happened
-//!   ([`isolation`]);
+//!   ([`isolation`]). The check starts with the worktree's `.git` link and
+//!   the repository's shared git files, read from the file system, so a run
+//!   that redirected its link or planted a command there is quarantined
+//!   before the runner's git runs anywhere;
 //! - a run is [`Outcome::Finished`] only when the harness reports it
 //!   completed *and* the role left a valid `result.json`: an exit status is
 //!   never taken as proof;
@@ -63,7 +66,7 @@ use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
 pub use git::{Git, GitError};
 pub use harness::{Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus, SandboxNeeds};
-pub use isolation::Violation;
+pub use isolation::{Violation, check_worktree_link};
 
 /// The directory of the run's own files, relative to the worktree.
 pub const RUN_DIR: &str = ".owlshift/run";
@@ -81,7 +84,8 @@ pub const MAX_RESULT_BYTES: u64 = MAX_ARTIFACT_BYTES;
 /// Runs roles. One value serves every run of a runner.
 #[derive(Clone, Debug)]
 pub struct Executor {
-    /// The runner's own git, for the worktree and the isolation check.
+    /// The runner's own git, for the worktree and the isolation check. It
+    /// runs no hook and no file-system monitor ([`Git`]).
     pub git: Git,
     /// The environment every agent gets. The caller builds it with
     /// [`AgentEnv::from_runner`] and the variables the project declares for
@@ -101,8 +105,10 @@ pub struct Executor {
 #[derive(Clone, Copy, Debug)]
 pub struct RunSpec<'a> {
     /// The checkout the worktree belongs to, which the run must leave
-    /// untouched. The isolation check assumes nobody else changes it during
-    /// the run: a person editing or committing there makes the run look
+    /// untouched. A kept worktree is reused only while its `.git` links it
+    /// to this checkout's repository. The isolation check assumes nobody
+    /// else changes it during the run: a person editing or committing there
+    /// makes the run look
     /// like a breach.
     pub main: &'a Path,
     /// The ticket's worktree, an absolute path: created at the first run,
