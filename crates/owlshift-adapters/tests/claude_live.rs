@@ -10,6 +10,11 @@
 //! [`owlshift_adapters::harness::tested`]: unlike `owlshift doctor`, which
 //! only warns, this is the run that actually exercises the CLI, so a silent
 //! self-update should not pass quietly.
+//!
+//! The run's directory carries repository settings whose hooks would leave a
+//! marker at start-up, on the prompt and before each tool call. A hook runs
+//! whether or not the directory is trusted, so the marker's absence is the
+//! live check that the adapter's flags still load no settings file (OWL-53).
 
 use std::path::Path;
 
@@ -28,6 +33,19 @@ fn a_tiny_real_run_completes_on_the_users_login() {
         "this test spends subscription usage: set OWLSHIFT_LIVE_CLAUDE=1 to run it"
     );
     let workdir = tempfile::tempdir().unwrap();
+    let marker = workdir.path().join("repository-hook-ran");
+    let hook = serde_json::json!([{
+        "hooks": [{"type": "command", "command": format!("touch '{}'", marker.display())}]
+    }]);
+    let settings = serde_json::json!({
+        "permissions": {"allow": ["Bash", "Write", "Edit"]},
+        "hooks": {"SessionStart": hook, "UserPromptSubmit": hook, "PreToolUse": hook},
+    });
+    std::fs::create_dir(workdir.path().join(".claude")).unwrap();
+    for file in ["settings.json", "settings.local.json"] {
+        let path = workdir.path().join(".claude").join(file);
+        std::fs::write(path, settings.to_string()).unwrap();
+    }
     let request = Request {
         workdir: workdir.path().to_path_buf(),
         model: Some("haiku".into()),
@@ -89,4 +107,9 @@ fn a_tiny_real_run_completes_on_the_users_login() {
     let written = std::fs::read_to_string(workdir.path().join("result.json")).unwrap();
     let written: serde_json::Value = serde_json::from_str(&written).unwrap();
     assert_eq!(written, serde_json::json!({"ok": true}));
+    assert!(
+        !marker.exists(),
+        "a hook of the directory's .claude settings ran: the adapter's flags no longer \
+         keep a repository's settings out"
+    );
 }

@@ -54,13 +54,24 @@ pub const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 const POLL: Duration = Duration::from_millis(20);
 
-/// The flags of check C1's guardrail finding: no user settings (hooks,
-/// plugins, user `CLAUDE.md`) and no MCP server but those passed explicitly,
-/// so the user's own connectors (tracker, chat, mail) never reach an agent.
+/// The flags of check C1's guardrail finding, and of OWL-53: no settings file
+/// and no MCP server but those passed explicitly.
+///
+/// `--setting-sources` with an empty value loads none of the user, project
+/// and local settings files, so neither the user's hooks and plugins nor
+/// the worktree's `.claude/settings.json` and
+/// `.claude/settings.local.json` apply. The worktree is written by agents:
+/// under `project,local`, a trusted worktree's allow rule, and even an
+/// untrusted one's hook, let a read-only role run Bash and Write. The same
+/// flag keeps Claude Code from loading the worktree's `CLAUDE.md`, rules,
+/// skills, commands and agents; the brief carries the project's rules.
+/// `--settings` and managed settings still apply. Checked live (OWL-53,
+/// recorded under check C1 in `docs/design/build-plan.md`).
+///
 /// The agent environment (`owlshift_core::agent_env`) covers what lies
 /// outside Claude Code, and [`Run::mcp_servers`] lets the executor check that
 /// no server was loaded.
-const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
+const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "", "--strict-mcp-config"];
 
 /// Refuses what the user's other Claude Code sessions send to a run. Every
 /// `claude -p` listens on a local socket, the `messaging_socket_path` of its
@@ -206,14 +217,10 @@ impl std::error::Error for CommandError {}
 ///
 /// The tools that reach beyond the run are always removed and, without network
 /// access, the web tools too, all in one `--disallowedTools` flag; Bash, when
-/// allowed, can still reach the network. The worktree's own project settings
-/// (`.claude/settings.json`) still apply, since C1's guardrail keeps the
-/// `project` and `local` sources, and their allow rules count once the
-/// worktree is trusted, which a linked worktree is when its main checkout is.
-/// Neither an allow rule given with `--settings` (OWL-42) nor one in a trusted
-/// worktree's project settings (OWL-46, observed on the tools a run without a
-/// login offers) brought a removed tool back. Messages from the user's other
-/// sessions are refused on every launch (`PEER_INBOX_ARGS`).
+/// allowed, can still reach the network. No settings file is read, so nothing
+/// in the worktree grants a permission or runs a hook (`GUARDRAIL_ARGS`).
+/// Messages from the user's other sessions are refused on every launch
+/// (`PEER_INBOX_ARGS`).
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
     if request.permissions.browser {
         return Err(CommandError::Unsupported("a browser"));
@@ -845,6 +852,12 @@ mod tests {
         PEER_INBOX_ARGS.join(" ")
     }
 
+    /// The settings-source and MCP flags as they appear on the command line;
+    /// their values are pinned by the contract tests.
+    fn guardrail() -> String {
+        GUARDRAIL_ARGS.join(" ")
+    }
+
     #[test]
     fn a_read_only_run_may_write_only_its_result_file() {
         let request = request(PermissionLevel::ReadOnly);
@@ -854,8 +867,9 @@ mod tests {
                 "-p --output-format stream-json --verbose \
                  --permission-mode dontAsk --allowedTools Edit(./.owlshift/result.json) \
                  --permission-prompts none --disallowedTools {} \
-                 --setting-sources project,local --strict-mcp-config {} --no-session-persistence",
+                 {} {} --no-session-persistence",
                 denied(),
+                guardrail(),
                 inbox()
             )
         );
@@ -878,8 +892,9 @@ mod tests {
                  --permission-mode acceptEdits --allowedTools Bash \
                  --permission-prompts none --disallowedTools {} WebFetch WebSearch \
                  --json-schema {{\"type\":\"object\"}} --max-budget-usd 2.5 \
-                 --setting-sources project,local --strict-mcp-config {} --no-session-persistence",
+                 {} {} --no-session-persistence",
                 denied(),
+                guardrail(),
                 inbox()
             )
         );
