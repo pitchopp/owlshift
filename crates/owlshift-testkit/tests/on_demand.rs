@@ -23,7 +23,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::graphql::{Response, Transport};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
-use owlshift_contracts::brief::Brief;
+use owlshift_contracts::brief::{Brief, Relation};
 use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
@@ -209,6 +209,11 @@ const AGENTS: &str = "Sign off every commit (`git commit -s`).\n";
 
 impl Bench {
     fn new(assignee: bool) -> Self {
+        Self::by(assignee, "maintainer")
+    }
+
+    /// A bench whose ticket was created by `author`.
+    fn by(assignee: bool, author: &str) -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("owlshift do ")
             .tempdir()
@@ -233,7 +238,7 @@ impl Bench {
         fs::write(
             ticket.join("ticket.md"),
             format!(
-                "+++\ntitle = \"Add a greeting\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n\
+                "+++\ntitle = \"Add a greeting\"\nauthor = \"{author}\"\nstage = \"Todo\"\n\
                  {assignee}+++\n\nAdd GREETING.md saying Hello.\n"
             ),
         )
@@ -497,6 +502,34 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
         ("AGENTS.md", AGENTS)
     );
     assert!(rule.applies_to.is_empty());
+}
+
+/// The brief of the first run, and its ticket author's relation: the brief
+/// tells the agent whether the ticket text is the decider's instruction or
+/// quoted data.
+#[test]
+fn the_brief_names_the_relation_of_the_ticket_author() {
+    for (author, relation) in [
+        ("maintainer", Relation::Decider),
+        ("stranger", Relation::Other),
+    ] {
+        let bench = Bench::by(true, author);
+        let replies = vec![bench.reply(Some("Hello"), Some(DONE))];
+        let (outcome, printed) = bench.run(replies, None);
+        outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+        let started = bench
+            .events()
+            .into_iter()
+            .find(|event| event.kind == EventKind::RunStarted)
+            .expect("a run started");
+        let run_dir = started.data["run_dir"].as_str().unwrap();
+        let brief =
+            Brief::parse(&fs::read_to_string(Path::new(run_dir).join("brief.json")).unwrap())
+                .unwrap();
+        assert_eq!(brief.ticket.author.name, author);
+        assert_eq!(brief.ticket.author.relation, relation, "{author}");
+    }
 }
 
 /// How a case prepares its bench and gives its replies.
