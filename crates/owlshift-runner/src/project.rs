@@ -350,8 +350,37 @@ mod tests {
         }
     }
 
+    /// The lock is checked in a fresh copy of this test binary, running
+    /// [`helper_one_do_at_a_time_per_project`] alone. In this process, other
+    /// tests fork children (`git`, `sh`), and a child forked while the lock
+    /// is held keeps it until it execs (see [`ProjectDirs::lock`]): the
+    /// released lock then looked held (seen once on macOS on 2026-09-29).
+    /// Alone, nothing forks.
     #[test]
     fn one_do_at_a_time_per_project() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "project::tests::helper_one_do_at_a_time_per_project",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_one_do_at_a_time_per_project() {
+        if !std::env::args().any(|arg| arg == "--exact") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dirs = ProjectDirs::new(dir.path(), &Repo::parse("demo/project").unwrap());
         let held = dirs.lock().unwrap().expect("the first lock is free");

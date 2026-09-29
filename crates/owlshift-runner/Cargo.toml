@@ -22,12 +22,6 @@ toml.workspace = true
 tempfile.workspace = true
 
 [features]
-# Test only: `AgentEnv::without_confinement`, for the test bench and this
-# crate's integration tests. No shipped crate enables it (OWL-41).
+# Test only: `AgentEnv::without_confinement`, for the test bench. No shipped
+# crate enables it (OWL-41).
 testkit = []
-
-# They check the agent environment itself, bare, so they need the feature;
-# `cargo test --workspace` has it through the test bench.
-[[test]]
-name = "agent_credentials"
-required-features = ["testkit"]
