@@ -457,9 +457,6 @@ mod tests {
                 description: "Say hello in the README.\r\n".to_owned(),
             }
         );
-        // The runner's view keeps the author, an account like a comment's.
-        let shared = shared::Tracker::ticket(&tracker, &id()).unwrap();
-        assert_eq!(shared.author, account("reporter".to_owned()));
     }
 
     #[test]

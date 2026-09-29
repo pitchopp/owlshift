@@ -25,8 +25,8 @@ struct Case {
     /// Whether it has an assignee. Who it is differs between a live run and
     /// its pseudonymized recording, so the suite checks presence only.
     assigned: bool,
-    /// Whether its assignee's account created it: the ticket's author is
-    /// then that same account, which makes the description the decider's.
+    /// Whether its assignee's account created it, by the account's
+    /// identifier: what makes the description the decider's.
     created_by_assignee: bool,
     labels: &'static [&'static str],
     /// A ticket that does not exist.
@@ -65,8 +65,8 @@ fn check(tracker: &dyn Tracker, case: &Case) {
     );
     assert_eq!(ticket.labels, case.labels);
     let by_assignee = matches!(
-        &ticket.author,
-        Author::Account(author) if ticket.assignee.as_ref() == Some(author)
+        (&ticket.author, &ticket.assignee),
+        (Author::Account(author), Some(assignee)) if author.id == assignee.id
     );
     assert_eq!(
         by_assignee, case.created_by_assignee,
@@ -120,7 +120,7 @@ fn the_markdown_tracker_conforms() {
     fs::create_dir_all(dir.join("comments")).unwrap();
     fs::write(
         dir.join("ticket.md"),
-        "+++\ntitle = \"Add a greeting\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n\
+        "+++\ntitle = \"Add a greeting\"\nauthor = \"reporter\"\nstage = \"Todo\"\n\
          priority = \"medium\"\nassignee = \"maintainer\"\nlabels = [\"Feature\", \"Docs\"]\n+++\n\n\
          Say hello in the README.\n",
     )
@@ -142,7 +142,7 @@ fn the_markdown_tracker_conforms() {
         description_start: "Say hello",
         priority: Priority::Medium,
         assigned: true,
-        created_by_assignee: true,
+        created_by_assignee: false,
         labels: &["Feature", "Docs"],
         missing: id("DEMO-404"),
         body: BODY,

@@ -597,7 +597,7 @@ impl OnDemand<'_> {
                 title: ticket.title.clone(),
                 url: None,
                 labels: ticket.labels.clone(),
-                author: ticket_author(ticket, decider),
+                author: account_author(&ticket.author, decider),
                 description: ticket.description.clone(),
             },
             decider: decider.name.clone(),
@@ -776,22 +776,17 @@ fn comment_author(comment: &Comment, decider: &Person) -> Author {
     }
 }
 
-/// A ticket's author as the brief shows it: the decider when the assignee's
-/// account created the ticket, so its description reads as instructions;
-/// anyone else, or an author the tracker cannot name, is quoted as data. An
-/// edit of the description by someone else after its creation is not seen:
-/// the tracker names the creator only.
-fn ticket_author(ticket: &Ticket, decider: &Person) -> Author {
-    account_author(&ticket.author, decider)
-}
-
-/// The decider when this is the assignee's account, by its identifier and
-/// never its name; `other` otherwise.
+/// A ticket's or a comment's author as the brief shows it: the decider when
+/// it is the assignee's account, matched by its identifier and never its name
+/// (an empty identifier matches nothing), so the text reads as instructions;
+/// anyone else, or an author the tracker cannot name, is quoted as data. For
+/// a ticket, the author is its creator: an edit of the description by
+/// someone else after its creation is not seen.
 fn account_author(author: &TrackerAuthor, decider: &Person) -> Author {
     match author {
         TrackerAuthor::Account(person) => Author {
             name: person.name.clone(),
-            relation: if person.id == decider.id {
+            relation: if !person.id.trim().is_empty() && person.id == decider.id {
                 Relation::Decider
             } else {
                 Relation::Other
@@ -1060,40 +1055,23 @@ mod tests {
         }
     }
 
-    /// Only the assignee's account, matched by identifier, makes a ticket's
-    /// description the decider's; a same-named account, a bot and an author
-    /// the tracker cannot name are quoted as data.
+    /// The thread test above pins the account match, shared by tickets and
+    /// comments; an author the tracker cannot name and an empty identifier,
+    /// which the Markdown front matter accepts, never make the decider.
     #[test]
-    fn a_ticket_is_the_deciders_only_when_the_assignee_created_it() {
+    fn an_unnamed_or_blank_author_is_never_the_decider() {
         let decider = Person {
             id: "u1".into(),
             name: "Maintainer".into(),
         };
-        let ticket = |author: TrackerAuthor| Ticket {
-            id: TicketId::new("OWL-1").unwrap(),
-            title: "t".into(),
-            description: "Do it.".into(),
-            priority: owlshift_contracts::Priority::Unset,
-            assignee: Some(decider.clone()),
-            labels: Vec::new(),
-            author,
+        let unknown = account_author(&TrackerAuthor::unknown(), &decider);
+        assert_eq!(unknown.relation, Relation::Other);
+        let nobody = Person {
+            id: String::new(),
+            name: String::new(),
         };
-        let cases = [
-            (TrackerAuthor::Account(decider.clone()), Relation::Decider),
-            (
-                TrackerAuthor::Account(Person {
-                    id: "u2".into(),
-                    name: "Maintainer".into(),
-                }),
-                Relation::Other,
-            ),
-            (TrackerAuthor::Other { name: "bot".into() }, Relation::Other),
-            (TrackerAuthor::unknown(), Relation::Other),
-        ];
-        for (author, relation) in cases {
-            let shown = ticket_author(&ticket(author.clone()), &decider);
-            assert_eq!(shown.relation, relation, "{author:?}");
-        }
+        let blank = account_author(&TrackerAuthor::Account(nobody.clone()), &nobody);
+        assert_eq!(blank.relation, Relation::Other);
     }
 
     #[test]

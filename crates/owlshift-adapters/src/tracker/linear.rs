@@ -237,7 +237,8 @@ macro_rules! comment_fields {
 
 const TICKET_QUERY: &str = "query Ticket($id: String!) { issue(id: $id) { \
     identifier title description priority assignee { id displayName } \
-    creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
+    creator { id displayName } botActor { name } externalUserCreator { name } \
+    labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
 
 const COMMENTS_QUERY: &str = concat!(
     "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { \
@@ -393,15 +394,20 @@ struct Named {
     name: Option<String>,
 }
 
-/// Who wrote an issue or a comment: the Linear account when there is one,
-/// otherwise the bot or external user Linear names, otherwise nobody it still
-/// knows (a deleted account).
+/// Who wrote an issue or a comment. It is an account only when Linear names
+/// an account and nothing else: a bot or an external user alongside it means
+/// an integration acted, and what it carried is not the account's own text,
+/// so the author is then that bot or external user. The recorded answers
+/// never set both; the rule fails closed if Linear ever does. Nobody named
+/// (a deleted account) is [`Author::unknown`].
 fn author(user: Option<User>, bot: Option<Named>, external: Option<Named>) -> Author {
     match (user, bot, external) {
-        (Some(user), _, _) => Author::Account(user.into_person()),
-        (None, Some(Named { name: Some(name) }), _)
-        | (None, _, Some(Named { name: Some(name) })) => Author::Other { name },
-        _ => Author::unknown(),
+        (Some(user), None, None) => Author::Account(user.into_person()),
+        (user, bot, external) => bot
+            .and_then(|b| b.name)
+            .or_else(|| external.and_then(|e| e.name))
+            .or_else(|| user.map(|u| u.display_name))
+            .map_or_else(Author::unknown, |name| Author::Other { name }),
     }
 }
 
@@ -565,36 +571,48 @@ mod tests {
         assert!(tracker(vec![refused]).post_comment(&id, "x").is_err());
     }
 
-    /// The shape Linear gave on 2026-09-29 for OWL-1, made by its onboarding
-    /// workflow: no creator, a bot actor. Such a ticket is never an account's.
+    /// OWL-1 as Linear gave it on 2026-09-29, made by its onboarding
+    /// workflow: no creator, a bot actor.
     #[test]
-    fn a_ticket_without_a_creator_is_attributed_to_what_linear_names() {
-        let id = TicketId::new("OWL-1").unwrap();
-        let ticket = |creator: &str, bot: &str| {
-            let body = format!(
-                r#"{{"data":{{"issue":{{"identifier":"OWL-1","title":"t","description":null,
-                "priority":0,"assignee":null,"creator":{creator},"botActor":{bot},
-                "externalUserCreator":null,"labels":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}"#
-            );
-            tracker(vec![Box::leak(body.into_boxed_str())])
-                .ticket(&id)
-                .unwrap()
-                .author
-        };
+    fn a_ticket_made_by_a_bot_is_attributed_to_the_bot() {
+        let owl_1 = r#"{"data":{"issue":{"identifier":"OWL-1","title":"t","description":null,
+            "priority":0,"assignee":null,"creator":null,"botActor":{"name":"Linear"},
+            "externalUserCreator":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}"#;
+        let ticket = tracker(vec![owl_1])
+            .ticket(&TicketId::new("OWL-1").unwrap())
+            .unwrap();
         assert_eq!(
-            ticket("null", r#"{"name":"Linear"}"#),
+            ticket.author,
             Author::Other {
                 name: "Linear".to_owned()
             }
         );
-        assert_eq!(ticket("null", "null"), Author::unknown());
-        assert_eq!(
-            ticket(r#"{"id":"u1","displayName":"person-1"}"#, "null"),
-            Author::Account(Person {
+    }
+
+    /// An account is the author only when Linear names nothing else beside
+    /// it: an integration acting for an account never reads as the account.
+    #[test]
+    fn an_account_beside_a_bot_or_an_external_user_is_not_the_author() {
+        let user = || {
+            Some(User {
                 id: "u1".to_owned(),
-                name: "person-1".to_owned()
+                display_name: "person-1".to_owned(),
             })
+        };
+        let named = |name: Option<&str>| {
+            Some(Named {
+                name: name.map(str::to_owned),
+            })
+        };
+        let other = |name: &str| Author::Other {
+            name: name.to_owned(),
+        };
+        assert_eq!(author(user(), named(Some("Slack")), None), other("Slack"));
+        assert_eq!(
+            author(user(), None, named(Some("Customer"))),
+            other("Customer")
         );
+        assert_eq!(author(user(), named(None), None), other("person-1"));
     }
 
     #[test]
