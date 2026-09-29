@@ -931,7 +931,21 @@ mod tests {
         .unwrap();
         assert_eq!(check_worktree_link(&common, &worktree), Ok(()));
 
-        for case in [
+        // Windows drops a path's trailing space, so no folder `owl-1 ` can
+        // exist: the link names the real administrative folder, for git and
+        // for the check alike, and is accepted.
+        #[cfg(windows)]
+        {
+            let admin = common.join("worktrees").join("owl-1");
+            fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {} \n", admin.display()),
+            )
+            .unwrap();
+            assert_eq!(check_worktree_link(&common, &worktree), Ok(()));
+        }
+
+        let cases = [
             "a gitdir elsewhere",
             "no gitdir line",
             "a .git folder",
@@ -940,7 +954,12 @@ mod tests {
             "a trailing space",
             "a second line",
             "an oversized link",
-        ] {
+        ];
+        // On Windows the trailing-space attack cannot be built (see above).
+        let cases = cases
+            .into_iter()
+            .filter(|case| cfg!(not(windows)) || *case != "a trailing space");
+        for case in cases {
             let dir = tempfile::tempdir().unwrap();
             let (common, admin, worktree) = linked(dir.path());
             // A git directory of the agent's own, with the same layout.
