@@ -175,6 +175,9 @@ impl Tracker for LinearTracker {
             priority: priority(issue.priority)?,
             assignee: issue.assignee.map(User::into_person),
             labels: issue.labels.nodes.into_iter().map(|l| l.name).collect(),
+            author: issue
+                .creator
+                .map_or_else(Author::unknown, |u| Author::Account(u.into_person())),
         })
     }
 
@@ -225,7 +228,7 @@ macro_rules! comment_fields {
 
 const TICKET_QUERY: &str = "query Ticket($id: String!) { issue(id: $id) { \
     identifier title description priority assignee { id displayName } \
-    labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
+    creator { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
 
 const COMMENTS_QUERY: &str = concat!(
     "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { \
@@ -334,6 +337,7 @@ struct Issue {
     description: Option<String>,
     priority: f64,
     assignee: Option<User>,
+    creator: Option<User>,
     labels: Connection<Label>,
 }
 
@@ -406,9 +410,7 @@ impl LinearComment {
             (Some(user), _, _) => Author::Account(user.into_person()),
             (None, Some(Named { name: Some(name) }), _)
             | (None, _, Some(Named { name: Some(name) })) => Author::Other { name },
-            _ => Author::Other {
-                name: "unknown".to_owned(),
-            },
+            _ => Author::unknown(),
         };
         Comment {
             id: self.id,
@@ -534,7 +536,7 @@ mod tests {
     fn what_the_adapter_cannot_represent_is_refused_not_truncated() {
         let id = TicketId::new("OWL-1").unwrap();
         let many_labels = r#"{"data":{"issue":{"identifier":"OWL-1","title":"t","description":null,
-            "priority":0,"assignee":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}"#;
+            "priority":0,"assignee":null,"creator":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}"#;
         assert!(tracker(vec![many_labels]).ticket(&id).is_err());
 
         let stuck = r#"{"data":{"issue":{"comments":{"nodes":[],

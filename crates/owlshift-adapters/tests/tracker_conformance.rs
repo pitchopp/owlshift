@@ -25,6 +25,9 @@ struct Case {
     /// Whether it has an assignee. Who it is differs between a live run and
     /// its pseudonymized recording, so the suite checks presence only.
     assigned: bool,
+    /// Whether its assignee's account created it: the ticket's author is
+    /// then that same account, which makes the description the decider's.
+    created_by_assignee: bool,
     labels: &'static [&'static str],
     /// A ticket that does not exist.
     missing: TicketId,
@@ -61,6 +64,15 @@ fn check(tracker: &dyn Tracker, case: &Case) {
         ticket.assignee
     );
     assert_eq!(ticket.labels, case.labels);
+    let by_assignee = matches!(
+        &ticket.author,
+        Author::Account(author) if ticket.assignee.as_ref() == Some(author)
+    );
+    assert_eq!(
+        by_assignee, case.created_by_assignee,
+        "{:?} for {:?}",
+        ticket.author, ticket.assignee
+    );
 
     let missing = tracker.ticket(&case.missing).unwrap_err();
     assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
@@ -108,7 +120,7 @@ fn the_markdown_tracker_conforms() {
     fs::create_dir_all(dir.join("comments")).unwrap();
     fs::write(
         dir.join("ticket.md"),
-        "+++\ntitle = \"Add a greeting\"\nauthor = \"reporter\"\nstage = \"Todo\"\n\
+        "+++\ntitle = \"Add a greeting\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n\
          priority = \"medium\"\nassignee = \"maintainer\"\nlabels = [\"Feature\", \"Docs\"]\n+++\n\n\
          Say hello in the README.\n",
     )
@@ -130,6 +142,7 @@ fn the_markdown_tracker_conforms() {
         description_start: "Say hello",
         priority: Priority::Medium,
         assigned: true,
+        created_by_assignee: true,
         labels: &["Feature", "Docs"],
         missing: id("DEMO-404"),
         body: BODY,
@@ -153,6 +166,7 @@ fn linear_case() -> Case {
         description_start: "**Why.**",
         priority: Priority::Medium,
         assigned: true,
+        created_by_assignee: true,
         labels: &["Feature", "Adapters"],
         missing: id("OWL-99999"),
         body: BODY,
