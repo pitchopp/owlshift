@@ -1,0 +1,26 @@
+# Temporary (OWL-47): observes a console Ctrl-C on `owlshift doctor` on
+# windows-latest, with the test output shown. Approved by the maintainer on
+# 2026-09-29 as a temporary change; removed before review.
+name: OWL-47 observation
+
+on:
+  push:
+    branches: [sghirma/owl-47-confirm-ctrl-c-stops-a-hung-doctor-probe-on-windows]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  observe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Ctrl-C on doctor
+        run: cargo test -p owlshift-cli --test cli --locked ctrl_c -- --nocapture --test-threads=1
