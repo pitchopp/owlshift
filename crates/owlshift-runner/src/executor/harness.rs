@@ -479,7 +479,7 @@ mod tests {
                 login.path().as_os_str().to_owned(),
             ),
         ];
-        let agent = AgentEnv::new(parent.clone(), &[]).unwrap();
+        let agent = AgentEnv::new(parent.clone()).unwrap();
         let refused = claude().sandbox_needs(&agent).unwrap_err();
         let text = refused.to_string();
         assert!(text.contains("no login for agent runs"), "{text}");
@@ -490,7 +490,7 @@ mod tests {
         let needs = claude().sandbox_needs(&agent).unwrap();
         assert_eq!(needs.writable, [login.path().to_path_buf()]);
 
-        let bare = AgentEnv::new(parent, &[]).unwrap().without_confinement();
+        let bare = AgentEnv::new(parent).unwrap().without_confinement();
         std::fs::remove_file(login.path().join(".credentials.json")).unwrap();
         assert!(claude().sandbox_needs(&bare).unwrap().writable.is_empty());
     }
@@ -558,7 +558,7 @@ mod tests {
 
         let _launcher = owlshift_platform::sandbox::use_built_launcher();
         let dir = tempfile::tempdir().unwrap();
-        let agent = AgentEnv::new(std::env::vars_os(), &[]).unwrap();
+        let agent = AgentEnv::new(std::env::vars_os()).unwrap();
         let paths = RunPaths {
             workdir: dir.path().to_owned(),
             ..RunPaths::default()

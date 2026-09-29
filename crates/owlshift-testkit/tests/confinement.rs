@@ -91,7 +91,7 @@ impl Bench {
     }
 
     fn agent(&self) -> AgentEnv {
-        AgentEnv::new(self.env.agent_parent(), &[]).unwrap()
+        AgentEnv::new(self.env.agent_parent()).unwrap()
     }
 
     fn run(&self, agent: AgentEnv, script: &str) -> Result<RunReport, ExecutorError> {

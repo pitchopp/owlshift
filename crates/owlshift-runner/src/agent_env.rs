@@ -111,15 +111,13 @@ const HIDDEN_IN_HOME: &[&str] = &[
 const TOOL_CHAINS: &[&str] = &[".rustup", ".cargo/bin", ".cargo/registry", ".cargo/git"];
 
 impl AgentEnv {
-    /// The agent environment built from `parent`, with no declared variable:
-    /// `declared` is checked against an empty allow-list, so only an empty
-    /// list builds. A project's run uses [`AgentEnv::for_project`]. It is
-    /// confined.
+    /// The agent environment built from `parent`, with no declared variable.
+    /// A project's run, which declares some, uses
+    /// [`AgentEnv::for_project`]. It is confined.
     pub fn new(
         parent: impl IntoIterator<Item = (OsString, OsString)>,
-        declared: &[&str],
     ) -> Result<Self, AgentEnvError> {
-        Self::for_project(parent, declared, &[])
+        Self::for_project(parent, &[], &[])
     }
 
     /// The agent environment built from `parent`, with the variables named in
@@ -842,7 +840,7 @@ mod tests {
         let parent = pairs
             .iter()
             .map(|(name, value)| (OsString::from(name), OsString::from(value)));
-        AgentEnv::new(parent, &[]).unwrap()
+        AgentEnv::new(parent).unwrap()
     }
 
     #[test]
