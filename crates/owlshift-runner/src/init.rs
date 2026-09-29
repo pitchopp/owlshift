@@ -110,6 +110,10 @@ states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs I
 # in the personal configuration. A path under your home stays unreadable to
 # the sandboxed run unless it is on the PATH.
 # gate_env = [\"FEATURE_FLAGS\"]
+# The files agents receive as the project's rules, taken whole from the
+# default branch. Left out, the root AGENTS.md is used when there is one.
+# Once set, every file listed must exist there; [] sends no rule.
+# rules = [\"AGENTS.md\", \".claude/rules/testing.md\"]
 
 [pipeline]
 # A ticket's pipeline variant, unless intake or a label picks another:
