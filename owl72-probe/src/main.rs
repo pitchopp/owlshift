@@ -17,6 +17,7 @@ fn main() {
 }
 
 #[cfg(windows)]
+#[allow(dead_code, unused_imports, reason = "round 1 checks are kept for reference")]
 mod win {
     use std::ffi::{OsStr, c_void};
     use std::fs;
@@ -52,9 +53,10 @@ mod win {
         DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
-        ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        ACL, ACL_REVISION, AddAce, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
         GetSecurityDescriptorSacl, InitializeAcl, LABEL_SECURITY_INFORMATION, NO_INHERITANCE,
-        PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+        SID_AND_ATTRIBUTES,
         SUB_CONTAINERS_AND_OBJECTS_INHERIT,
     };
     use windows_sys::Win32::System::JobObjects::{
@@ -241,11 +243,19 @@ mod win {
             }
         }
         let (reader, writer) = std::io::pipe().expect("pipe");
-        // SAFETY: a handle this process owns.
-        unsafe { SetHandleInformation(writer.as_raw_handle(), HANDLE_FLAG_INHERIT, 1) };
+        // Standard input: a pipe whose writer is already closed, so the
+        // program reads an end of file, as a runner's command would.
+        let (stdin_reader, stdin_writer) = std::io::pipe().expect("pipe");
+        drop(stdin_writer);
+        // SAFETY: handles this process owns.
+        unsafe {
+            SetHandleInformation(writer.as_raw_handle(), HANDLE_FLAG_INHERIT, 1);
+            SetHandleInformation(stdin_reader.as_raw_handle(), HANDLE_FLAG_INHERIT, 1);
+        }
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdin_reader.as_raw_handle();
         startup.StartupInfo.hStdOutput = writer.as_raw_handle();
         startup.StartupInfo.hStdError = writer.as_raw_handle();
         startup.lpAttributeList = list;
@@ -272,6 +282,7 @@ mod win {
             (created, error)
         };
         drop(writer);
+        drop(stdin_reader);
         if created == 0 {
             return Err(error);
         }
@@ -421,17 +432,17 @@ mod win {
         }
     }
 
-    /// Sets a low integrity label, inherited by what is inside
-    /// (`low = true`), or removes the explicit label (`low = false`).
-    fn set_label(path: &Path, low: bool) -> (u32, Duration) {
+    /// Sets the integrity label an SDDL string gives, such as
+    /// `S:(ML;OICI;NW;;;LW)`, or removes the explicit label (`None`).
+    fn set_label(path: &Path, label: Option<&str>) -> (u32, Duration) {
         let path_w = wide(path);
         let started = Instant::now();
         // SAFETY: as in `set_acl`; the empty ACL lives in a local buffer.
         unsafe {
             let mut empty = [0u64; 8];
             let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-            let sacl: *mut ACL = if low {
-                let sddl = wide("S:(ML;OICI;NW;;;LW)");
+            let sacl: *mut ACL = if let Some(label) = label {
+                let sddl = wide(label);
                 if ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     sddl.as_ptr(),
                     SDDL_REVISION_1,
@@ -605,29 +616,107 @@ mod win {
         format!("-sS -m 15 -o NUL -w \"%{{http_code}}\" {url}")
     }
 
+
+    /// Stops `path` from inheriting, keeps every ACE but those naming `sid`
+    /// (the inherited ones made explicit), then grants `grant` to `sid` when
+    /// given; the change propagated to what is inside.
+    fn protect_without(path: &Path, sid: PSID, grant: Option<(u32, u32)>) -> u32 {
+        let path_w = wide(path);
+        // SAFETY: as in `set_acl`; each ACE is copied within its size into
+        // an ACL buffer as large as the old one.
+        unsafe {
+            let mut dacl: *mut ACL = ptr::null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            let error = GetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            );
+            if error != 0 {
+                return error;
+            }
+            let mut buffer = vec![0u64; usize::from((*dacl).AclSize).div_ceil(8) + 8];
+            let new = buffer.as_mut_ptr().cast::<ACL>();
+            InitializeAcl(new, (buffer.len() * 8) as u32, ACL_REVISION);
+            for index in 0..(*dacl).AceCount {
+                let mut ace: *mut c_void = ptr::null_mut();
+                if GetAce(dacl, u32::from(index), &mut ace) == 0 {
+                    continue;
+                }
+                let bytes = ace.cast::<u8>();
+                let size = u16::from_le_bytes([*bytes.add(2), *bytes.add(3)]);
+                if (*bytes == 0 || *bytes == 1) && EqualSid(bytes.add(8).cast(), sid) != 0 {
+                    continue;
+                }
+                let mut copy = std::slice::from_raw_parts(bytes, usize::from(size)).to_vec();
+                copy[1] &= !0x10;
+                AddAce(new, ACL_REVISION, u32::MAX, copy.as_ptr().cast(), u32::from(size));
+            }
+            let mut granted: *mut ACL = ptr::null_mut();
+            let mut chosen = new;
+            if let Some((mask, inherit)) = grant {
+                let entry = EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: mask,
+                    grfAccessMode: GRANT_ACCESS,
+                    grfInheritance: inherit,
+                    Trustee: TRUSTEE_W {
+                        pMultipleTrustee: ptr::null_mut(),
+                        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                        TrusteeForm: TRUSTEE_IS_SID,
+                        TrusteeType: TRUSTEE_IS_UNKNOWN,
+                        ptstrName: sid.cast(),
+                    },
+                };
+                let error = SetEntriesInAclW(1, &entry, new, &mut granted);
+                if error != 0 {
+                    LocalFree(descriptor);
+                    return error;
+                }
+                chosen = granted;
+            }
+            let error = SetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                chosen,
+                ptr::null(),
+            );
+            if !granted.is_null() {
+                LocalFree(granted.cast());
+            }
+            LocalFree(descriptor);
+            error
+        }
+    }
+
     // -------------------------------------------------------------- helper
 
     /// The probe run again, as a program inside the container.
     fn helper(args: &[String]) {
         match args.first().map(String::as_str) {
             Some("noop") => println!("helper ran"),
-            Some("cred-read") => println!("{}", cred_read()),
-            Some("listen") => {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-                let port = listener.local_addr().unwrap().port();
-                fs::write(Path::new(&args[1]).join("port.txt"), port.to_string())
-                    .expect("port file");
-                listener.set_nonblocking(true).unwrap();
-                println!("accepted: {}", answer_one(&listener, Duration::from_secs(25)));
-            }
-            Some("spawn") => {
-                // args: container name, capability SIDs (may be none)
-                let sid = derived_sid(&args[1]);
-                let caps: Vec<PSID> = args[2..].iter().map(|text| string_sid(text)).collect();
-                println!(
-                    "{}",
-                    confined(sid, &caps, &cmd(), "/d /c exit 7", &system_root())
-                );
+            Some("open-nul") => {
+                for name in ["NUL", r"\\.\NUL"] {
+                    let open = |read: bool, write: bool| {
+                        match fs::OpenOptions::new().read(read).write(write).open(name) {
+                            Ok(_) => "ok".to_owned(),
+                            Err(error) => format!("{:?}", error.raw_os_error()),
+                        }
+                    };
+                    println!(
+                        "{name}: read+write {}, read {}, write {}",
+                        open(true, true),
+                        open(true, false),
+                        open(false, true)
+                    );
+                }
             }
             other => println!("unknown helper {other:?}"),
         }
@@ -635,6 +724,7 @@ mod win {
 
     // ---------------------------------------------------------------- main
 
+    /// Round 2: what round 1 (run 36603469888) left open or turned up.
     pub fn main() {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("helper") {
@@ -645,182 +735,62 @@ mod win {
         let exe = std::env::current_exe().unwrap();
         let exe_text = exe.display().to_string();
         let exe_dir = exe.parent().unwrap().to_owned();
-        println!("== OWL-72 AppContainer probe ==");
+        println!("== OWL-72 AppContainer probe, round 2 ==");
         check("os", bare(&cmd(), "/d /c ver", &root));
-        check("probe", &exe_text);
-
-        // The probe in a job of its own, as the runner puts the launcher.
-        // SAFETY: a new job; our own process handle.
-        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        let assigned = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
-        check("job.probe-assigned", assigned != 0);
-
         let (sid, how) = profile_sid(PROFILE);
         check("profile", format!("{how}, {}", sid_text(sid)));
-        let internet = string_sid(INTERNET_CLIENT);
-        let internet_server = string_sid(INTERNET_CLIENT_SERVER);
-        let private = string_sid(PRIVATE_NETWORK);
-        let net = [internet, private];
-
-        // Fake secrets and folders, in the user's temporary folder.
-        let base = std::env::temp_dir().join(format!("owl72-{}", std::process::id()));
-        let home = base.join("home");
-        fs::create_dir_all(home.join(r".config\gh")).unwrap();
-        fs::create_dir_all(home.join("other-project")).unwrap();
-        let token = home.join(r".config\gh\hosts.yml");
-        let sibling_env = home.join(r"other-project\.env");
-        fs::write(&token, format!("github.com:\n    oauth_token: gho_{MARKER}\n")).unwrap();
-        fs::write(&sibling_env, format!("API_KEY={MARKER}\n")).unwrap();
-        let outside = std::env::current_dir().unwrap().join("owl72-outside.txt");
-        fs::write(&outside, format!("{MARKER}\n")).unwrap();
-        check("paths", format!("base {}, outside {}", base.display(), outside.display()));
-
-        // --- 1. What a container reaches by default.
-        let sys_file = root.join(r"System32\drivers\etc\hosts");
-        check(
-            "default.system-file",
-            confined(sid, &[], &cmd(), &format!("/d /c type \"{}\"", sys_file.display()), &root),
-        );
         let quoted = |path: &Path| format!("\"{}\"", path.display());
-        for (name, path) in [("gh-token", &token), ("sibling-env", &sibling_env)] {
-            let line = format!("/d /c type {}", quoted(path));
-            check(&format!("default.{name}.bare"), bare(&cmd(), &line, &root));
-            check(&format!("default.{name}.confined"), confined(sid, &[], &cmd(), &line, &root));
+        let tree = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+
+        let base = std::env::temp_dir().join(format!("owl72b-{}", std::process::id()));
+        let granted = base.join("granted");
+        for dir in ["hooks", "hooks2", "ml-dir"] {
+            fs::create_dir_all(granted.join(dir)).unwrap();
+            fs::write(granted.join(dir).join("sample"), "sample\n").unwrap();
         }
+        for file in ["secret.env", "secret2.env", "secret3.env", "ml-file.env"] {
+            fs::write(granted.join(file), format!("API_KEY={MARKER}\n")).unwrap();
+        }
+        let (error, _) = set_acl(&granted, sid, MODIFY, GRANT_ACCESS, tree);
+        check("setup.grant", format!("error {error}"));
+
+        // 1. The program the launcher starts, and one its child starts.
         check(
-            "default.gh-token.grandchild",
+            "image.launched-directly",
+            confined(sid, &[], &exe_text, "helper noop", &root),
+        );
+        let grandchild = format!("/d /s /c \"\"{exe_text}\" helper noop\"");
+        check(
+            "image.started-by-child-not-granted",
+            confined(sid, &[], &cmd(), &grandchild, &root),
+        );
+        let (error, _) = set_acl(&exe_dir, sid, READ_EXECUTE, GRANT_ACCESS, tree);
+        check(
+            "image.started-by-child-granted",
+            format!(
+                "grant error {error}; {}",
+                confined(sid, &[], &cmd(), &grandchild, &root)
+            ),
+        );
+
+        // 2. The NUL device.
+        check(
+            "nul.cmd-redirect",
             confined(
                 sid,
                 &[],
                 &cmd(),
-                &format!("/d /c \"{}\" /d /c type {}", cmd(), quoted(&token)),
+                "/d /c echo x> NUL && echo redirected",
                 &root,
             ),
         );
-        let profile_dir = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
+        check("nul.open-bare", bare(&exe_text, "helper open-nul", &root));
         check(
-            "default.list-profile",
-            confined(sid, &[], &cmd(), &format!("/d /c dir /b {}", quoted(&profile_dir)), &root),
-        );
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            check(
-                "default.list-appdata",
-                confined(
-                    sid,
-                    &[],
-                    &cmd(),
-                    &format!("/d /c dir /b {}", quoted(Path::new(&appdata))),
-                    &root,
-                ),
-            );
-        }
-        check(
-            "default.outside-profile-file",
-            confined(sid, &[], &cmd(), &format!("/d /c type {}", quoted(&outside)), &root),
-        );
-        check("default.git-version", confined(sid, &[], GIT, "--version", &root));
-        check(
-            "default.program-in-workspace",
-            confined(sid, &[], &exe_text, "helper noop", &root),
+            "nul.open-confined",
+            confined(sid, &[], &exe_text, "helper open-nul", &root),
         );
 
-        // A job's process starts its children in the job, a container's too.
-        match spawn_in(sid, &[], &cmd(), "/d /c ping -n 3 127.0.0.1 > NUL", &root) {
-            Ok(child) => {
-                let mut in_job = 0;
-                // SAFETY: both handles are open.
-                unsafe { IsProcessInJob(child.process, job, &mut in_job) };
-                check("job.container-child-in-job", in_job != 0);
-                child.wait(Duration::from_secs(20));
-            }
-            Err(error) => check("job.container-child-in-job", format!("not created: {error}")),
-        }
-
-        // A container with no profile.
-        let bare_sid = derived_sid(&format!("owlshift.owl72.noprofile.{}", std::process::id()));
-        check(
-            "profile.not-created",
-            confined(
-                bare_sid,
-                &[],
-                &cmd(),
-                &format!("/d /c type \"{}\" > NUL && echo ran", sys_file.display()),
-                &root,
-            ),
-        );
-
-        // --- 2. Grants: reading a program's folder, writing with and
-        // without a low integrity label.
-        let (error, took) = set_acl(
-            &exe_dir,
-            sid,
-            READ_EXECUTE,
-            GRANT_ACCESS,
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        );
-        check("grant.program-folder", format!("error {error}, {took:?}"));
-        check(
-            "grant.program-in-workspace",
-            confined(sid, &[], &exe_text, "helper noop", &root),
-        );
-
-        let no_label = base.join("w-nolabel");
-        let low = base.join("w-low");
-        for dir in [&no_label, &low] {
-            fs::create_dir_all(dir.join("hooks")).unwrap();
-            fs::write(dir.join("existing.txt"), "existing\n").unwrap();
-            fs::write(dir.join(r"hooks\sample"), "sample\n").unwrap();
-            fs::write(dir.join("secret.env"), format!("API_KEY={MARKER}\n")).unwrap();
-            let (error, _) =
-                set_acl(dir, sid, MODIFY, GRANT_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
-            assert_eq!(error, 0, "grant on {}", dir.display());
-        }
-        let (error, _) = set_label(&low, true);
-        check("label.set-low", format!("error {error}"));
-        for (name, dir) in [("nolabel", &no_label), ("low", &low)] {
-            check(
-                &format!("write.{name}.read-existing"),
-                confined(sid, &[], &cmd(), "/d /c type existing.txt", dir),
-            );
-            confined(sid, &[], &cmd(), "/d /c echo new> new.txt", dir);
-            check(&format!("write.{name}.create-file"), dir.join("new.txt").exists());
-            confined(sid, &[], &cmd(), "/d /c echo more>> existing.txt", dir);
-            let appended = fs::read_to_string(dir.join("existing.txt")).unwrap();
-            check(&format!("write.{name}.append"), appended.contains("more"));
-            confined(sid, &[], &cmd(), "/d /c md sub && echo x> sub\\f.txt", dir);
-            check(&format!("write.{name}.mkdir-and-write"), dir.join(r"sub\f.txt").exists());
-        }
-
-        // --- 3. Denied paths inside a granted, labelled folder: a secret
-        // file, and a protected folder (git's hooks).
-        let secret = low.join("secret.env");
-        let hooks = low.join("hooks");
-        let (error, _) = set_acl(&secret, sid, ALL, DENY_ACCESS, NO_INHERITANCE);
-        check("deny.secret-set", format!("error {error}"));
-        let (error, _) =
-            set_acl(&hooks, sid, ANY_WRITE, DENY_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
-        check("deny.hooks-set", format!("error {error}"));
-        check(
-            "deny.secret-read",
-            confined(sid, &[], &cmd(), "/d /c type secret.env", &low),
-        );
-        confined(sid, &[], &cmd(), "/d /c del /q secret.env", &low);
-        check("deny.secret-still-there-after-del", secret.exists());
-        confined(sid, &[], &cmd(), "/d /c ren secret.env moved.env", &low);
-        check("deny.secret-still-there-after-ren", secret.exists());
-        check(
-            "deny.hooks-read",
-            confined(sid, &[], &cmd(), "/d /c type hooks\\sample", &low),
-        );
-        confined(sid, &[], &cmd(), "/d /c echo x> hooks\\pre-commit", &low);
-        check("deny.hooks-write-landed", hooks.join("pre-commit").exists());
-        confined(sid, &[], &cmd(), "/d /c rd /s /q hooks", &low);
-        check("deny.hooks-still-there-after-rd", hooks.join("sample").exists());
-        confined(sid, &[], &cmd(), "/d /c ren hooks hooks-moved", &low);
-        check("deny.hooks-still-there-after-ren", hooks.join("sample").exists());
-
-        // --- 4. Git in a granted, labelled repository, with the profile
-        // (git's HOME) closed.
+        // 3. Git, with a standard input this time, in a granted repository.
         let repo = base.join("repo");
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("README.md"), "hello\n").unwrap();
@@ -831,198 +801,175 @@ mod win {
             "git.bare-commit",
             bare(GIT, &format!("{identity} commit -q -m seed"), &repo),
         );
-        let (error, _) =
-            set_acl(&repo, sid, MODIFY, GRANT_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
-        let (label_error, _) = set_label(&repo, true);
-        check("git.grant", format!("acl error {error}, label error {label_error}"));
-        check("git.status", confined(sid, &[], GIT, "status --porcelain", &repo));
+        let (error, _) = set_acl(&repo, sid, MODIFY, GRANT_ACCESS, tree);
+        check("git.grant", format!("error {error}"));
+        check("git.version", confined(sid, &[], GIT, "--version", &root));
+        check(
+            "git.status",
+            confined(sid, &[], GIT, "status --porcelain", &repo),
+        );
         fs::write(repo.join("b.txt"), "b\n").unwrap();
         check("git.add", confined(sid, &[], GIT, "add b.txt", &repo));
         check(
             "git.commit",
-            confined(sid, &[], GIT, &format!("{identity} commit -q -m confined"), &repo),
-        );
-        check("git.log", bare(GIT, "log --oneline", &repo));
-
-        // --- 5. The Credential Manager.
-        let mut written = cred_write(CRED_PERSIST_LOCAL_MACHINE);
-        let mut persist = "local machine";
-        if written != 0 {
-            check("cred.write-local-machine", format!("error {written}"));
-            written = cred_write(CRED_PERSIST_SESSION);
-            persist = "session";
-        }
-        check("cred.write", format!("error {written} ({persist})"));
-        check("cred.read-in-probe", cred_read());
-        check("cred.read-bare-helper", bare(&exe_text, "helper cred-read", &root));
-        check(
-            "cred.read-confined",
-            confined(sid, &[], &exe_text, "helper cred-read", &root),
-        );
-        check(
-            "cred.read-confined-with-network-caps",
-            confined(sid, &net, &exe_text, "helper cred-read", &root),
-        );
-        let cmdkey = root.join(r"System32\cmdkey.exe").display().to_string();
-        let list = format!("/list:{CRED_TARGET}");
-        check("cred.cmdkey-bare", bare(&cmdkey, &list, &root));
-        check("cred.cmdkey-confined", confined(sid, &[], &cmdkey, &list, &root));
-        check("cred.delete", format!("error {}", cred_delete()));
-
-        // --- 6. The network.
-        let url = "https://example.com/";
-        check("net.bare", bare(&curl(), &curl_line(url), &root));
-        check("net.no-capability", confined(sid, &[], &curl(), &curl_line(url), &root));
-        check(
-            "net.internetClient",
-            confined(sid, &[internet], &curl(), &curl_line(url), &root),
-        );
-        check(
-            "net.internetClient+privateNetwork",
-            confined(sid, &net, &curl(), &curl_line(url), &root),
-        );
-        for (name, caps) in [
-            ("loopback-to-host.no-capability", &[][..]),
-            ("loopback-to-host.internet+private", &net[..]),
-            (
-                "loopback-to-host.internet+server+private",
-                &[internet, internet_server, private][..],
-            ),
-        ] {
-            let (port, answered) = host_listener();
-            let result = confined(
-                sid,
-                caps,
-                &curl(),
-                &curl_line(&format!("http://127.0.0.1:{port}/")),
-                &root,
-            );
-            // Unblock a listener nobody reached.
-            let _ = std::net::TcpStream::connect(("127.0.0.1", port));
-            let reached = answered.join().unwrap();
-            check(&format!("net.{name}"), format!("{result}; listener answered: {reached}"));
-        }
-        let all_net = [internet, internet_server, private];
-        let _ = fs::remove_file(low.join("port.txt"));
-        match spawn_in(sid, &all_net, &exe_text, &format!("helper listen {}", quoted(&low)), &low)
-        {
-            Ok(server) => {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                let mut port = None;
-                while Instant::now() < deadline && port.is_none() {
-                    port = fs::read_to_string(low.join("port.txt")).ok();
-                    thread::sleep(Duration::from_millis(100));
-                }
-                match port {
-                    Some(port) => {
-                        let client = confined(
-                            sid,
-                            &all_net,
-                            &curl(),
-                            &curl_line(&format!("http://127.0.0.1:{port}/")),
-                            &root,
-                        );
-                        let from_host = bare(
-                            &curl(),
-                            &curl_line(&format!("http://127.0.0.1:{port}/")),
-                            &root,
-                        );
-                        check(
-                            "net.loopback-same-container",
-                            format!("client {client}; host client {from_host}; server {}",
-                                server.wait(Duration::from_secs(30))),
-                        );
-                    }
-                    None => check(
-                        "net.loopback-same-container",
-                        format!("no port; server {}", server.wait(Duration::from_secs(5))),
-                    ),
-                }
-            }
-            Err(error) => check("net.loopback-same-container", format!("not created: {error}")),
-        }
-
-        // --- 7. A container's process starting one in another container,
-        // or with a capability it lacks.
-        check(
-            "nest.other-container",
             confined(
                 sid,
                 &[],
-                &exe_text,
-                &format!("helper spawn owlshift.owl72.other.{}", std::process::id()),
-                &root,
+                GIT,
+                &format!("{identity} commit -q -m confined"),
+                &repo,
+            ),
+        );
+        check("git.log-bare", bare(GIT, "log --oneline", &repo));
+
+        // 4. Deny entries naming the container, dumped this time.
+        let secret = granted.join("secret.env");
+        let hooks = granted.join("hooks");
+        let (error, _) = set_acl(&secret, sid, ALL, DENY_ACCESS, NO_INHERITANCE);
+        check(
+            "deny.secret",
+            format!("error {error}; {}", aces_for(&secret, sid)),
+        );
+        check(
+            "deny.secret-read",
+            confined(sid, &[], &cmd(), "/d /c type secret.env", &granted),
+        );
+        let (error, _) = set_acl(&hooks, sid, ANY_WRITE, DENY_ACCESS, tree);
+        check(
+            "deny.hooks",
+            format!("error {error}; {}", aces_for(&hooks, sid)),
+        );
+        confined(
+            sid,
+            &[],
+            &cmd(),
+            "/d /c echo x> hooks\\pre-commit",
+            &granted,
+        );
+        check("deny.hooks-write-landed", hooks.join("pre-commit").exists());
+        let (error, _) = set_acl(&secret, sid, 0, REVOKE_ACCESS, NO_INHERITANCE);
+        check(
+            "deny.secret-after-revoke",
+            format!("error {error}; {}", aces_for(&secret, sid)),
+        );
+        // A deny entry for every container: ALL APPLICATION PACKAGES.
+        let secret3 = granted.join("secret3.env");
+        let all_packages = string_sid("S-1-15-2-1");
+        let (error, _) = set_acl(&secret3, all_packages, ALL, DENY_ACCESS, NO_INHERITANCE);
+        check(
+            "deny.all-packages-read",
+            format!(
+                "error {error}; {}",
+                confined(sid, &[], &cmd(), "/d /c type secret3.env", &granted)
+            ),
+        );
+
+        // 5. Inheritance broken, the container left out: a hidden file, and
+        // a folder it may only read.
+        let secret2 = granted.join("secret2.env");
+        let error = protect_without(&secret2, sid, None);
+        check(
+            "protect.secret",
+            format!("error {error}; {}", aces_for(&secret2, sid)),
+        );
+        check(
+            "protect.secret-read",
+            confined(sid, &[], &cmd(), "/d /c type secret2.env", &granted),
+        );
+        confined(sid, &[], &cmd(), "/d /c del /q secret2.env", &granted);
+        check("protect.secret-still-there-after-del", secret2.exists());
+        confined(
+            sid,
+            &[],
+            &cmd(),
+            "/d /c ren secret2.env moved.env",
+            &granted,
+        );
+        check("protect.secret-still-there-after-ren", secret2.exists());
+        let hooks2 = granted.join("hooks2");
+        let error = protect_without(&hooks2, sid, Some((READ_EXECUTE, tree)));
+        check(
+            "protect.hooks",
+            format!("error {error}; {}", aces_for(&hooks2, sid)),
+        );
+        check(
+            "protect.hooks-read",
+            confined(sid, &[], &cmd(), "/d /c type hooks2\\sample", &granted),
+        );
+        confined(
+            sid,
+            &[],
+            &cmd(),
+            "/d /c echo x> hooks2\\pre-commit",
+            &granted,
+        );
+        check(
+            "protect.hooks-write-landed",
+            hooks2.join("pre-commit").exists(),
+        );
+        confined(sid, &[], &cmd(), "/d /c echo x>> hooks2\\sample", &granted);
+        check(
+            "protect.hooks-append-landed",
+            fs::read_to_string(hooks2.join("sample"))
+                .unwrap()
+                .contains('x'),
+        );
+        confined(sid, &[], &cmd(), "/d /c del /q hooks2\\sample", &granted);
+        check(
+            "protect.hooks-still-there-after-del",
+            hooks2.join("sample").exists(),
+        );
+        confined(sid, &[], &cmd(), "/d /c rd /s /q hooks2", &granted);
+        check(
+            "protect.hooks-still-there-after-rd",
+            hooks2.join("sample").exists(),
+        );
+        confined(sid, &[], &cmd(), "/d /c ren hooks2 hooks2-moved", &granted);
+        check(
+            "protect.hooks-still-there-after-ren",
+            hooks2.join("sample").exists(),
+        );
+
+        // 6. Explicit medium integrity labels inside the granted folder.
+        let ml_file = granted.join("ml-file.env");
+        let (error, _) = set_label(&ml_file, Some("S:(ML;;NWNR;;;ME)"));
+        check(
+            "label.medium-no-read-up-file",
+            format!(
+                "error {error}; {}",
+                confined(sid, &[], &cmd(), "/d /c type ml-file.env", &granted)
+            ),
+        );
+        let ml_dir = granted.join("ml-dir");
+        let (error, _) = set_label(&ml_dir, Some("S:(ML;OICI;NW;;;ME)"));
+        confined(sid, &[], &cmd(), "/d /c echo x> ml-dir\\new.txt", &granted);
+        check(
+            "label.medium-no-write-up-folder",
+            format!(
+                "error {error}; write landed {}",
+                ml_dir.join("new.txt").exists()
             ),
         );
         check(
-            "nest.same-container-plus-capability",
+            "label.container-level",
             confined(
                 sid,
                 &[],
-                &exe_text,
-                &format!("helper spawn {PROFILE} {INTERNET_CLIENT}"),
+                &cmd(),
+                "/d /c whoami /groups | findstr /i Label",
                 &root,
             ),
         );
         check(
-            "nest.same-container-same-capabilities",
-            confined(sid, &[], &exe_text, &format!("helper spawn {PROFILE}"), &root),
+            "label.granted-folder",
+            bare(&cmd(), &format!("/d /c icacls {}", quoted(&granted)), &root),
         );
 
-        // --- 8. Undoing: what REVOKE_ACCESS removes, and the profile.
-        check("undo.before", format!(
-            "w-low {}; secret {}; hooks {}",
-            aces_for(&low, sid),
-            aces_for(&secret, sid),
-            aces_for(&hooks, sid)
-        ));
+        // Cleanup.
+        set_acl(&exe_dir, sid, 0, REVOKE_ACCESS, NO_INHERITANCE);
         // SAFETY: a NUL-terminated local.
         let deleted = unsafe { DeleteAppContainerProfile(wide(PROFILE).as_ptr()) };
-        check("undo.profile-deleted", format!("hr {deleted:#x}"));
-        check("undo.after-profile-delete", aces_for(&low, sid));
-        let (error, took) = set_acl(&low, sid, 0, REVOKE_ACCESS, NO_INHERITANCE);
-        check("undo.revoke-folder", format!("error {error}, {took:?}"));
-        let (error, _) = set_acl(&secret, sid, 0, REVOKE_ACCESS, NO_INHERITANCE);
-        check("undo.revoke-secret", format!("error {error}"));
-        check("undo.after-revoke", format!(
-            "w-low {}; secret {}; hooks {}; existing.txt {}",
-            aces_for(&low, sid),
-            aces_for(&secret, sid),
-            aces_for(&hooks, sid),
-            aces_for(&low.join("existing.txt"), sid)
-        ));
-
-        // --- 9. How fast a change spreads through a large folder.
-        let big = base.join("big");
-        let started = Instant::now();
-        let (dirs, files) = (100, 200);
-        for d in 0..dirs {
-            let dir = big.join(format!("d{d:03}"));
-            fs::create_dir_all(&dir).unwrap();
-            for f in 0..files {
-                fs::write(dir.join(format!("f{f:03}.txt")), b"x").unwrap();
-            }
-        }
-        let count = dirs * files;
-        check("speed.create", format!("{count} files in {:?}", started.elapsed()));
-        let rate = |took: Duration| format!("{took:?} ({:.0} files/s)", count as f64 / took.as_secs_f64());
-        let (error, took) =
-            set_acl(&big, sid, MODIFY, GRANT_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
-        check("speed.grant", format!("error {error}, {}", rate(took)));
-        let (error, took) = set_label(&big, true);
-        check("speed.label-low", format!("error {error}, {}", rate(took)));
-        let (error, took) = set_acl(&big, sid, 0, REVOKE_ACCESS, NO_INHERITANCE);
-        check("speed.revoke", format!("error {error}, {}", rate(took)));
-        let (error, took) = set_label(&big, false);
-        check("speed.label-remove", format!("error {error}, {}", rate(took)));
-        check(
-            "speed.after",
-            format!("big {}; a file {}", aces_for(&big, sid), aces_for(&big.join(r"d000\f000.txt"), sid)),
-        );
-
-        // Cleanup: the program folder's grant, the planted files.
-        set_acl(&exe_dir, sid, 0, REVOKE_ACCESS, NO_INHERITANCE);
-        let _ = fs::remove_file(&outside);
+        check("cleanup.profile-deleted", format!("hr {deleted:#x}"));
         check("cleanup.base-removed", fs::remove_dir_all(&base).is_ok());
         println!("== done ==");
     }
