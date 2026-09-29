@@ -11,16 +11,16 @@
 //! - Linux: `bwrap` (bubblewrap), found in the system folders only, never on
 //!   the agent's `PATH`, with a private `/tmp`, an empty `/run/user`, its own
 //!   PID namespace and `/proc`, and the policy's folders bound back in.
-//! - Native Windows: no confinement yet, so [`available`] refuses and agent
-//!   runs there are refused; WSL2 runs the Linux sandbox (decision D9). The
-//!   launch path is ready (OWL-71): given a launcher, [`wrap`] and
-//!   [`wrap_line`] return a command that runs `owlshift-launch`, which the
-//!   runner starts inside the run's Job Object and which creates the program
-//!   itself with `CreateProcessW`, so the program is in that job too. It
-//!   applies nothing of the policy. A shipped build has no launcher until
-//!   OWL-72, which finds it next to the running program and adds an
-//!   AppContainer; until then only a test sets one
-//!   (`use_built_launcher`), and [`wrap`] refuses like [`available`].
+//! - Native Windows: no confinement, so [`available`] refuses and agent runs
+//!   there are refused; WSL2 runs the Linux sandbox (decision D9). Native
+//!   confinement is set aside (decided 2026-09-29, build plan). What remains
+//!   is test-only, and slated for removal (OWL-89): given a launcher,
+//!   [`wrap`] and [`wrap_line`] return a command that runs `owlshift-launch`,
+//!   which the runner starts inside the run's Job Object and which creates
+//!   the program itself with `CreateProcessW`, so the program is in that job
+//!   too. It applies nothing of the policy. A shipped build has no launcher;
+//!   only a test sets one (`use_built_launcher`), and [`wrap`] refuses like
+//!   [`available`].
 //! - Anything else: [`SandboxError::Unsupported`].
 //!
 //! The policy is the same on both systems. The home is neither read nor
@@ -107,7 +107,7 @@ impl fmt::Display for SandboxError {
         match self {
             Self::Unsupported => f.write_str(
                 "agent runs are confined with sandbox-exec on macOS and bwrap on Linux; \
-                 native Windows has no confinement yet, so Owlshift refuses to run an agent \
+                 native Windows has no confinement, so Owlshift refuses to run an agent \
                  there: run Owlshift under WSL2",
             ),
             Self::Missing { program } => write!(
@@ -190,9 +190,9 @@ pub fn wrap_line(policy: &Policy, program: &OsStr, line: &OsStr) -> Result<Comma
 #[cfg(all(windows, any(test, feature = "testkit")))]
 const LAUNCHER: &str = "owlshift-launch.exe";
 
-/// The launcher [`wrap`] starts on Windows. A shipped build has none until
-/// OWL-72, which looks next to the running program as it lifts the refusal
-/// of [`available`].
+/// The launcher [`wrap`] starts on Windows. A shipped build has none: the
+/// launcher is test-only, and slated for removal (OWL-89), since native
+/// confinement is set aside.
 #[cfg(all(windows, not(any(test, feature = "testkit"))))]
 fn launcher() -> Option<PathBuf> {
     None
@@ -803,7 +803,7 @@ mod imp {
 
     /// The launcher's command: `owlshift-launch -- PROGRAM LINE`, in the
     /// policy's working directory, and nothing else of the policy yet. The
-    /// options before `--` are left for the confinement OWL-72 adds. The
+    /// options before `--` are unused: native confinement is set aside. The
     /// working directory is not made real: `canonicalize` gives a `\\?\`
     /// path on Windows, which `cmd.exe` cannot run in.
     pub(super) fn wrap_line(
@@ -822,7 +822,7 @@ mod imp {
     }
 
     pub(super) fn available() -> Result<(), SandboxError> {
-        // OWL-72 lifts this once the launcher applies an AppContainer.
+        // Native confinement is set aside (build plan, 2026-09-29): refused.
         Err(SandboxError::Unsupported)
     }
 }
