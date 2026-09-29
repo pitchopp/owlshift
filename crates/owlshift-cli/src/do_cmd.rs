@@ -138,6 +138,16 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
     let outcome = on_demand.run(&ticket, &mut sink);
+    // OWL-88: a sentinel that ended during the run left it unprotected, and
+    // is never restarted; one that never started was warned of in `main`.
+    #[cfg(unix)]
+    if let owlshift_runner::system::SentinelStatus::Ended(how) = system.sentinel() {
+        eprintln!(
+            "owlshift: warning: its sentinel ended during this run ({}): a hard kill of Owlshift \
+             would have left the processes it started running",
+            printable(&how)
+        );
+    }
     let mut stdout = io::stdout();
     match outcome {
         Ok(delivered) => {

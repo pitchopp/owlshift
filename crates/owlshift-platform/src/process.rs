@@ -13,9 +13,11 @@ mod sentinel;
 mod signals;
 mod tree;
 
+#[cfg(unix)]
+pub use sentinel::SentinelStatus;
 pub use signals::stop_trees_on_signal;
 #[cfg(unix)]
-pub use signals::stop_trees_when_killed;
+pub use signals::{sentinel_status, stop_trees_when_killed};
 pub use tree::ProcessTree;
 
 use std::ffi::OsStr;

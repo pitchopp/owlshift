@@ -18,7 +18,7 @@
 
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::Pid;
@@ -43,19 +43,38 @@ for tree in $trees; do
 done
 "#;
 
-/// A running sentinel: the write end of its input.
+/// A running sentinel: the write end of its input, and the process, so
+/// that its end can be seen (OWL-88).
 ///
-/// The sentinel is never waited on. It ends once Owlshift has; one killed
-/// by someone else stays a zombie until Owlshift ends.
+/// Nothing waits for the sentinel to end: it ends once Owlshift has. One
+/// that ends first, killed by someone else, stays a zombie until its
+/// [`status`](Self::status) is read.
 #[derive(Debug)]
 pub(super) struct Sentinel {
+    process: Child,
     input: ChildStdin,
+}
+
+/// Whether the sentinel protects the live trees from a hard kill
+/// (`stop_trees_when_killed`), as far as this process can tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SentinelStatus {
+    /// None runs: `stop_trees_when_killed` was not called, or failed.
+    NotRunning,
+    /// It runs, and gives its best effort.
+    Running {
+        /// Its process id.
+        pid: u32,
+    },
+    /// It ended, as said: nothing protects the trees any more. Owlshift
+    /// never starts another.
+    Ended(String),
 }
 
 impl Sentinel {
     /// Starts a sentinel that knows of no tree yet.
     pub(super) fn start() -> io::Result<Self> {
-        let mut child = Command::new("/bin/sh")
+        let mut process = Command::new("/bin/sh")
             .args(["-c", SCRIPT, "owlshift-sentinel"])
             .env_clear()
             .current_dir("/")
@@ -64,13 +83,27 @@ impl Sentinel {
             .stderr(Stdio::null())
             .process_group(0)
             .spawn()?;
-        let input = child.stdin.take().expect("the input is piped");
+        let input = process.stdin.take().expect("the input is piped");
         // A sentinel that stops reading must never block a spawn, a dropped
         // tree or the signal handler, which all write under the lock of the
         // live trees: once the pipe is full, a line is lost instead.
         let flags = fcntl_getfl(&input)?;
         fcntl_setfl(&input, flags | OFlags::NONBLOCK)?;
-        Ok(Self { input })
+        Ok(Self { process, input })
+    }
+
+    /// Whether it still runs, without waiting: a sentinel that ended is
+    /// reaped here. One stopped, and so not reading, still counts as
+    /// running: the system does not tell it apart without a wait that
+    /// would take its status from `Child`.
+    pub(super) fn status(&mut self) -> SentinelStatus {
+        match self.process.try_wait() {
+            Ok(None) => SentinelStatus::Running {
+                pid: self.process.id(),
+            },
+            Ok(Some(status)) => SentinelStatus::Ended(status.to_string()),
+            Err(error) => SentinelStatus::Ended(format!("its state cannot be read: {error}")),
+        }
     }
 
     /// Tells the sentinel a tree is live.

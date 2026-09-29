@@ -213,6 +213,8 @@ struct HungProbe {
     owlshift: std::process::Child,
     /// The probe's pid and its child's.
     pids: Vec<u32>,
+    /// Where `doctor` writes its report.
+    report: std::path::PathBuf,
     _bin: tempfile::TempDir,
     _config_dir: tempfile::TempDir,
 }
@@ -252,6 +254,7 @@ impl HungProbe {
         fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
 
         let config_dir = tempfile::tempdir().unwrap();
+        let report = config_dir.path().join("report");
         let mut owlshift = Command::new(env!("CARGO_BIN_EXE_owlshift"))
             .arg("doctor")
             .current_dir(config_dir.path())
@@ -259,7 +262,7 @@ impl HungProbe {
             .env("HOME", config_dir.path())
             .env("XDG_CONFIG_HOME", config_dir.path())
             .env("OWLSHIFT_CONFIG_DIR", config_dir.path())
-            .stdout(Stdio::null())
+            .stdout(fs::File::create(&report).unwrap())
             .stderr(Stdio::null())
             .process_group(0)
             .spawn()
@@ -281,6 +284,7 @@ impl HungProbe {
         Self {
             owlshift,
             pids,
+            report,
             _bin: bin,
             _config_dir: config_dir,
         }
@@ -324,6 +328,75 @@ impl HungProbe {
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Cleans up after a failed test: nothing it started keeps running. Only
+/// then: once a test passed, the probe's pids may already be another
+/// process's.
+#[cfg(unix)]
+impl Drop for HungProbe {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        for pid in &self.pids {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &pid.to_string()])
+                .status();
+        }
+        let _ = self.owlshift.kill();
+        let _ = self.owlshift.wait();
+    }
+}
+
+/// OWL-88: `doctor` reports a sentinel killed while it runs, with how it
+/// ended, as a warning; and writing to the dead sentinel's pipe, when the
+/// probe ends, does not end Owlshift.
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_sentinel_killed_while_it_runs() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let mut hung = HungProbe::start();
+    let found = Command::new("pgrep")
+        .args([
+            "-P",
+            &hung.owlshift.id().to_string(),
+            "-f",
+            "owlshift-sentinel",
+        ])
+        .output()
+        .unwrap();
+    let found = String::from_utf8(found.stdout).unwrap();
+    let sentinel: Vec<&str> = found.split_whitespace().collect();
+    assert_eq!(sentinel.len(), 1, "sentinels found: {found:?}");
+    hung.signal(&["-s", "KILL", sentinel[0]]);
+    // Gone before the probe ends and `doctor` reads its state; well within
+    // the probe's ten-second deadline.
+    let gone = Instant::now() + Duration::from_secs(5);
+    while is_alive(sentinel[0].parse().unwrap()) {
+        assert!(Instant::now() < gone, "the sentinel still runs");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        hung.owlshift.try_wait().unwrap().is_none(),
+        "doctor ended early"
+    );
+    for pid in hung.pids.clone() {
+        hung.signal(&["-s", "KILL", &pid.to_string()]);
+    }
+
+    let status = hung.ended("the end of its probe");
+    assert_eq!(status.signal(), None, "{status}");
+    let report = fs::read_to_string(&hung.report).unwrap();
+    let line = report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("sentinel"))
+        .unwrap_or_else(|| panic!("no sentinel line:\n{report}"));
+    assert_eq!(line.split_whitespace().next(), Some("warn"), "{report}");
+    assert!(line.contains("ended (signal: 9"), "{report}");
 }
 
 /// Whether a process is still running; a zombie is not.
