@@ -139,11 +139,16 @@ impl Bench {
 
     /// A run whose worktree is `worktree`.
     fn run_in(&self, worktree: &Path) -> ExecutorError {
+        self.run_from(worktree, BRANCH, "origin/main")
+    }
+
+    /// A run whose worktree is `worktree`, on `branch` started from `base`.
+    fn run_from(&self, worktree: &Path, branch: &str, base: &str) -> ExecutorError {
         let spec = RunSpec {
             main: &self.main,
             worktree,
-            branch: BRANCH,
-            base: "origin/main",
+            branch,
+            base,
             run_dir: &self.tmp.path().join("run"),
             brief: &self.brief,
         };
@@ -202,6 +207,87 @@ fn a_worktree_on_another_branch_refuses_the_run() {
         matches!(&error, ExecutorError::Worktree(reason) if reason.contains("refs/heads/other")),
         "{error:?}"
     );
+}
+
+impl Bench {
+    /// What `rev` resolves to in the main checkout.
+    fn commit(&self, rev: &str) -> String {
+        let out = self
+            .env
+            .run(&self.main, &["rev-parse", "--verify", rev])
+            .unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
+    }
+
+    /// A new commit on top of the main checkout's `HEAD`, on no branch.
+    fn stray_commit(&self) -> String {
+        let out = self
+            .env
+            .run(
+                &self.main,
+                &["commit-tree", "-p", "HEAD", "-m", "planted", "HEAD^{tree}"],
+            )
+            .unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
+    }
+
+    fn head_of(&self, worktree: &Path) -> String {
+        let out = self.env.run(worktree, &["rev-parse", "HEAD"]).unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
+    }
+}
+
+/// A base given by name starts from the remote-tracking ref, not from a
+/// local branch named like it; a base given as a full commit id starts
+/// there (OWL-66).
+#[test]
+fn a_local_branch_named_like_the_base_does_not_shadow_it() {
+    let bench = Bench::new();
+    let remote = bench.commit("refs/remotes/origin/main");
+    let planted = bench.stray_commit();
+    assert_ne!(planted, remote);
+    bench
+        .env
+        .run(
+            &bench.main,
+            &["update-ref", "refs/heads/origin/main", &planted],
+        )
+        .unwrap();
+
+    // Each run creates its worktree and branch, then stops at the command.
+    let error = bench.run();
+    assert!(matches!(error, ExecutorError::Command(_)), "{error:?}");
+    assert_eq!(bench.head_of(&bench.worktree), remote);
+
+    let by_id = bench.tmp.path().join("by-id");
+    let error = bench.run_from(&by_id, "owlshift/T-2", &planted);
+    assert!(matches!(error, ExecutorError::Command(_)), "{error:?}");
+    assert_eq!(bench.head_of(&by_id), planted);
+}
+
+/// A base that is not exactly a remote-tracking ref or a full commit id is
+/// refused before any worktree is made: a missing remote-tracking ref,
+/// even with a local branch at its full name, an abbreviated id, and a
+/// revision expression (OWL-66).
+#[test]
+fn a_base_that_is_not_a_remote_tracking_ref_or_a_full_id_is_refused() {
+    let bench = Bench::new();
+    let remote = bench.commit("refs/remotes/origin/main");
+    bench
+        .env
+        .run(
+            &bench.main,
+            &["update-ref", "refs/heads/refs/remotes/origin/gone", &remote],
+        )
+        .unwrap();
+    for base in ["origin/gone", &remote[..12], "origin/main~0"] {
+        let error = bench.run_from(&bench.worktree, BRANCH, base);
+        assert!(
+            matches!(&error, ExecutorError::Spec(reason) if reason.contains(base)),
+            "{base}: {error:?}"
+        );
+        assert!(!bench.worktree.exists(), "{base}");
+    }
 }
 
 /// A worktree refused before any git runs in it: its `.git` is not a link

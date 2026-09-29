@@ -3,8 +3,10 @@
 //!
 //! An agent, a harness CLI and every command it runs from its shell, starts
 //! from an empty environment. It inherits only what a program needs to run
-//! and what its harness needs to find its own login ([`INHERITED`]), plus the
-//! variables the project declares for its gate and the operator allows
+//! and what its harness needs to find its own login ([`INHERITED`]), the
+//! locale ([`LOCALE_CATEGORIES`]) and the operator's proxy
+//! ([`PROXY_VARIABLES`], refused when it holds a login), plus the variables
+//! the project declares for its gate and the operator allows
 //! ([`check_declared`]); then [`OVERRIDES`] leave git and gh without a
 //! credential. Each override rests on a live check recorded
 //! in the build plan (results, "OWL-22").
@@ -83,18 +85,38 @@ pub const INHERITED: &[&str] = &[
     // Where each harness keeps its own login.
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
-    // Reaching the network through the operator's proxy and certificates.
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
+    // Reaching the network through the operator's proxy, with the
+    // `PROXY_VARIABLES` below, and certificates.
     "NO_PROXY",
-    "ALL_PROXY",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
 ];
 
-/// Prefixes of inherited names: the locale categories.
-pub const INHERITED_PREFIXES: &[&str] = &["LC_"];
+/// The locale categories an agent inherits, POSIX's and glibc's, beside
+/// `LANG` and `LANGUAGE` (OWL-76). Another `LC_` name, such as
+/// `LC_TERMINAL`, is not inherited.
+pub const LOCALE_CATEGORIES: &[&str] = &[
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_ADDRESS",
+    "LC_IDENTIFICATION",
+    "LC_MEASUREMENT",
+    "LC_NAME",
+    "LC_PAPER",
+    "LC_TELEPHONE",
+];
+
+/// The proxy variables an agent inherits, unless one holds a login (OWL-76):
+/// a value holding `@` anywhere refuses the agent environment, whether the
+/// variable is inherited or declared. `@` is what ends a login in a URL,
+/// percent-encoded or not, with a scheme or without one, as curl reads it.
+pub const PROXY_VARIABLES: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
 
 /// Set on every agent, after everything else. The build plan records the
 /// live check behind each one (results, "OWL-22").
@@ -140,6 +162,9 @@ pub enum AgentEnvError {
     /// Declared variables the operator does not allow on this machine, each
     /// named once (OWL-63).
     NotAllowed(Vec<String>),
+    /// A proxy variable whose value holds a login, named without its value
+    /// (OWL-76). It comes from the runner's own environment.
+    ProxyLogin(String),
 }
 
 impl fmt::Display for AgentEnvError {
@@ -168,6 +193,12 @@ impl fmt::Display for AgentEnvError {
                  configuration",
                 names.join(", ")
             ),
+            Self::ProxyLogin(name) => write!(
+                f,
+                "{name} holds a proxy login in the runner's environment, and no proxy login \
+                 reaches an agent: use a proxy that needs none in its URL, such as a local \
+                 forwarding proxy that holds the login"
+            ),
         }
     }
 }
@@ -178,13 +209,15 @@ pub const LOADER_VARIABLES: &[&str] = &["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PA
 
 impl std::error::Error for AgentEnvError {}
 
-/// The environment of an agent, sorted by name: the [`INHERITED`] variables
-/// of `parent` and those named in `declared`, then the [`OVERRIDES`].
+/// The environment of an agent, sorted by name: the inherited variables of
+/// `parent` ([`INHERITED`], [`LOCALE_CATEGORIES`], [`PROXY_VARIABLES`]) and
+/// those named in `declared`, then the [`OVERRIDES`].
 ///
 /// `parent` is the runner's own environment; `declared` names the variables
 /// the project declares for its gate and `allowed` those the operator lets
 /// reach an agent, checked as [`check_declared`] says. A declared variable
-/// absent from `parent` is simply not set.
+/// absent from `parent` is simply not set. A proxy variable holding a login
+/// is refused, the first by name ([`AgentEnvError::ProxyLogin`]).
 pub fn agent_environment(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
     declared: &[&str],
@@ -199,6 +232,14 @@ pub fn agent_environment(
         if kept {
             vars.insert(name, value);
         }
+    }
+    let proxy_login = vars.iter().find(|(name, value)| {
+        name.to_str().is_some_and(is_proxy) && value.as_encoded_bytes().contains(&b'@')
+    });
+    if let Some((name, _)) = proxy_login {
+        return Err(AgentEnvError::ProxyLogin(
+            name.to_string_lossy().into_owned(),
+        ));
     }
     for (name, value) in OVERRIDES {
         vars.insert(OsString::from(name), OsString::from(value));
@@ -274,10 +315,11 @@ pub fn check_agent_variables<'a>(
 }
 
 fn is_inherited(name: &str) -> bool {
-    INHERITED.iter().any(|kept| kept.eq_ignore_ascii_case(name))
-        || INHERITED_PREFIXES
-            .iter()
-            .any(|prefix| starts_with_ignore_case(name, prefix))
+    contains_name(INHERITED, name) || contains_name(LOCALE_CATEGORIES, name) || is_proxy(name)
+}
+
+fn is_proxy(name: &str) -> bool {
+    contains_name(PROXY_VARIABLES, name)
 }
 
 fn is_reserved(name: &str) -> bool {
@@ -316,6 +358,11 @@ mod tests {
             ("PATH", "/bin"),
             ("HOME", "/home/op"),
             ("LC_CTYPE", "UTF-8"),
+            ("LC_TERMINAL", "iTerm2"),
+            ("LC_MY_TOKEN", "secret"),
+            ("https_proxy", "http://proxy:3128"),
+            ("ALL_PROXY", "socks5://proxy:1080"),
+            ("NO_PROXY", "localhost,.internal"),
             ("SystemRoot", "C:\\Windows"),
             ("CLAUDE_CONFIG_DIR", "/home/op/.claude"),
             ("DATABASE_URL", "postgres://localhost/test"),
@@ -334,6 +381,7 @@ mod tests {
         let ssh = "ssh -o BatchMode=yes -o IdentityAgent=none -o PubkeyAuthentication=no \
                    -o GSSAPIAuthentication=no";
         let expected = env(&[
+            ("ALL_PROXY", "socks5://proxy:1080"),
             ("CLAUDE_CONFIG_DIR", "/home/op/.claude"),
             ("DATABASE_URL", "postgres://localhost/test"),
             ("GH_ENTERPRISE_TOKEN", NO_CREDENTIAL),
@@ -346,12 +394,48 @@ mod tests {
             ("GIT_TERMINAL_PROMPT", "0"),
             ("HOME", "/home/op"),
             ("LC_CTYPE", "UTF-8"),
+            ("NO_PROXY", "localhost,.internal"),
             ("PATH", "/bin"),
             ("SystemRoot", "C:\\Windows"),
+            ("https_proxy", "http://proxy:3128"),
         ]);
         assert_eq!(agent, expected);
         let vars = agent.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str()));
         assert_eq!(check_agent_variables(vars), Ok(()));
+    }
+
+    #[test]
+    fn a_proxy_holding_a_login_never_reaches_an_agent() {
+        let clean = ("HTTP_PROXY", "http://proxy:3128");
+        for (name, value) in [
+            ("http_proxy", "http://fake-user:fake-pass@proxy:3128"),
+            ("HTTPS_PROXY", "fake-user:fake-pass@proxy:3128"),
+            ("All_Proxy", "socks5://fake-user:fake-pass@proxy:1080"),
+        ] {
+            let parent = env(&[clean, (name, value), ("PATH", "/bin")]);
+            let refused = agent_environment(parent, &[], &[]);
+            assert_eq!(refused, Err(AgentEnvError::ProxyLogin(name.to_owned())));
+            let message = refused.unwrap_err().to_string();
+            assert!(message.starts_with(name) && !message.contains("fake-pass"));
+        }
+        // Declaring and allowing the variable does not pass it either.
+        let parent = env(&[("https_proxy", "http://fake-user:fake-pass@proxy:3128")]);
+        assert_eq!(
+            agent_environment(parent, &["HTTPS_PROXY"], &["https_proxy"]),
+            Err(AgentEnvError::ProxyLogin("https_proxy".to_owned()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_proxy_login_is_found_in_a_value_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let value = OsString::from_vec(b"http://fake\xff:x@proxy:3128".to_vec());
+        let parent = vec![(OsString::from("HTTP_PROXY"), value)];
+        assert_eq!(
+            agent_environment(parent, &[], &[]),
+            Err(AgentEnvError::ProxyLogin("HTTP_PROXY".to_owned()))
+        );
     }
 
     #[test]
