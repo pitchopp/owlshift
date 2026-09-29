@@ -62,6 +62,13 @@ pub struct Policy {
     /// private to the sandbox, and a folder named here inside it is created
     /// empty there.
     pub temp: Vec<PathBuf>,
+    /// Symbolic links recreated where the home or a closed folder hides
+    /// them, as `(at, target)`: a folder named through a link, such as
+    /// sdkman's `~/.sdkman/candidates/java/current`, is found where it is
+    /// named. Only bwrap needs them, since its home starts empty: on macOS a
+    /// link in a closed folder already leads to an opened one (checked live
+    /// on 2026-09-29, OWL-68). A link grants nothing its target does not.
+    pub links: Vec<(PathBuf, PathBuf)>,
     /// The working directory of the confined program.
     pub workdir: PathBuf,
 }
@@ -155,11 +162,7 @@ pub fn available() -> Result<(), SandboxError> {
 /// `path` as the system resolves it: its longest existing part made real,
 /// links included, and the rest appended. Seatbelt matches real paths
 /// (`/tmp` is `/private/tmp` on macOS), and bwrap binds real ones.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    allow(dead_code, reason = "no sandbox to build on this system")
-)]
-fn real(path: &Path) -> PathBuf {
+pub fn real(path: &Path) -> PathBuf {
     let mut existing = path.to_path_buf();
     let mut rest: Vec<OsString> = Vec::new();
     loop {
@@ -191,6 +194,16 @@ fn resolved(policy: &Policy) -> Policy {
         protected: all(&policy.protected),
         hidden: all(&policy.hidden),
         temp: all(&policy.temp),
+        // A link's own place is kept, only its folder made real: resolving
+        // it whole would name its target.
+        links: policy
+            .links
+            .iter()
+            .filter_map(|(at, target)| {
+                let place = real(at.parent()?).join(at.file_name()?);
+                Some((place, real(target)))
+            })
+            .collect(),
         workdir: real(&policy.workdir),
     }
 }
@@ -313,8 +326,8 @@ pub enum Kind {
 /// Mounts are ordered from the shallowest path to the deepest, so a folder
 /// bound inside another, or a path hidden inside a bound folder, lands on
 /// top of it; at the same depth, the private folders come first, then the
-/// read-only binds, the writable ones, the protected paths and the hidden
-/// ones.
+/// read-only binds and the links, the writable ones, the protected paths and
+/// the hidden ones.
 pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<OsString> {
     // Rank orders mounts of the same depth.
     let mut mounts: Vec<(PathBuf, u8, Vec<OsString>)> = Vec::new();
@@ -386,6 +399,14 @@ pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<
             Some(Kind::Directory) => add(path, 5, vec![os("--tmpfs"), path.into()]),
             Some(Kind::File) => add(path, 5, vec![os("--ro-bind"), os("/dev/null"), path.into()]),
             None => {}
+        }
+    }
+    for (at, target) in &policy.links {
+        // Only where a private folder hides the link: inside a bound folder,
+        // or outside any private one, the host's own link is already there.
+        let hidden = policy.hidden.iter().any(|path| at.starts_with(path));
+        if private(at) && !bound(at) && !hidden {
+            add(at, 2, vec![os("--symlink"), target.into(), at.into()]);
         }
     }
     let depth = |path: &Path| {
@@ -622,6 +643,10 @@ mod tests {
                 "/srv/run".into(),
             ],
             temp: vec!["/tmp/agent".into()],
+            links: vec![(
+                "/home/op/.sdkman/java/current".into(),
+                "/home/op/.sdkman/java/17".into(),
+            )],
             workdir: "/home/op/wt".into(),
         }
     }
@@ -711,7 +736,15 @@ mod tests {
             Some("/home/op/wt/.env") => Some(Kind::File),
             _ => None,
         };
-        let args: Vec<String> = bwrap_args(&policy(), kind)
+        // Links inside a bound folder or outside the private ones are the
+        // host's own, already there.
+        let mut policy = policy();
+        for at in ["/home/op/wt/jdk", "/opt/jdk"] {
+            policy
+                .links
+                .push((at.into(), "/home/op/.sdkman/java/17".into()));
+        }
+        let args: Vec<String> = bwrap_args(&policy, kind)
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
             .collect();
@@ -755,6 +788,9 @@ mod tests {
             "--ro-bind",
             "/dev/null",
             "/home/op/wt/.env",
+            "--symlink",
+            "/home/op/.sdkman/java/17",
+            "/home/op/.sdkman/java/current",
             "--chdir",
             "/home/op/wt",
         ];

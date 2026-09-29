@@ -25,7 +25,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use owlshift_adapters::harness::claude;
@@ -44,6 +44,10 @@ use crate::system::PROBE_TIMEOUT;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentEnv {
     vars: Vec<(OsString, OsString)>,
+    /// The names the project declares for its gate (`stack.gate_env`): the
+    /// folders their values name in the home are opened, read-only
+    /// ([`AgentEnv::policy`]).
+    gate_env: Vec<String>,
     /// Whether every command spawned for the agent is confined. Always true
     /// outside the test bench.
     confined: bool,
@@ -90,11 +94,19 @@ const HIDDEN_IN_HOME: &[&str] = &[
     ".cargo/credentials",
     ".cargo/credentials.toml",
     ".local/share/keyrings",
+    // Maven's and Gradle's repository passwords.
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
+    ".gradle/gradle.properties",
+    // The Keychain, which the macOS sandbox closes itself: listed so that no
+    // folder holding it, `~/Library`, is opened for a variable.
+    "Library/Keychains",
 ];
 
 /// Tool-chain folders under the home an agent reads: installed compilers and
 /// their package caches, never their credentials ([`HIDDEN_IN_HOME`]). The
-/// folders of the agent's `PATH` under the home are read too.
+/// folders the agent's `PATH` and declared variables name under the home are
+/// read too ([`named_folder`]).
 const TOOL_CHAINS: &[&str] = &[".rustup", ".cargo/bin", ".cargo/registry", ".cargo/git"];
 
 impl AgentEnv {
@@ -120,6 +132,7 @@ impl AgentEnv {
     ) -> Result<Self, AgentEnvError> {
         agent_environment(parent, declared, allowed).map(|vars| Self {
             vars,
+            gate_env: declared.iter().map(|name| (*name).to_owned()).collect(),
             confined: true,
         })
     }
@@ -198,10 +211,13 @@ impl AgentEnv {
     /// The sandbox for a run: see the module documentation.
     ///
     /// Opened in the home: git's own configuration, the tool chains
-    /// ([`TOOL_CHAINS`]) and the folders of the agent's `PATH` under it,
-    /// never the home itself; then the run's own paths. Closed wherever
-    /// they are: the credential files of [`HIDDEN_IN_HOME`] and the run's
-    /// hidden paths.
+    /// ([`TOOL_CHAINS`]) and the folders the agent's `PATH` and declared
+    /// variables name under it, read-only, never the home itself nor a
+    /// folder that is, lies in or holds a path the run hides, closes or
+    /// writes ([`named_folder`], OWL-68); then the run's own paths. Closed
+    /// wherever they are: the credential files of [`HIDDEN_IN_HOME`] and the
+    /// run's hidden paths. It reads the file system, to judge each named
+    /// folder by its real path.
     pub fn policy(&self, run: &RunPaths) -> Policy {
         let home = self
             .var("HOME")
@@ -218,12 +234,6 @@ impl AgentEnv {
         if let Some(home) = &home {
             readable.push(home.join(".gitconfig"));
             readable.extend(TOOL_CHAINS.iter().map(|dir| home.join(dir)));
-            if let Some(path) = self.var("PATH") {
-                readable.extend(
-                    std::env::split_paths(path)
-                        .filter(|dir| dir.is_absolute() && dir.starts_with(home) && dir != home),
-                );
-            }
             hidden.extend(HIDDEN_IN_HOME.iter().map(|path| home.join(path)));
         }
         if let Some(config_home) = &config_home {
@@ -257,6 +267,32 @@ impl AgentEnv {
         closed.sort();
         closed.dedup();
 
+        // The folders the agent's variables name in the home.
+        let mut links = Vec::new();
+        if let Some((home, real_home)) = home
+            .as_ref()
+            .and_then(|home| Some((home, std::fs::canonicalize(home).ok()?)))
+        {
+            let kept_out: Vec<PathBuf> = hidden
+                .iter()
+                .chain(&closed)
+                .chain(&writable)
+                .chain(&run.temp)
+                .map(|path| sandbox::real(path))
+                .filter(|path| path.starts_with(&real_home) && *path != real_home)
+                .collect();
+            let named = ["PATH"]
+                .into_iter()
+                .chain(self.gate_env.iter().map(String::as_str))
+                .flat_map(|name| self.values_of(name))
+                .flat_map(std::env::split_paths);
+            for dir in named {
+                let folder = named_folder(home, &real_home, &dir, &kept_out);
+                readable.extend(folder.open);
+                links.extend(folder.link);
+            }
+        }
+
         Policy {
             home,
             closed,
@@ -265,8 +301,19 @@ impl AgentEnv {
             protected,
             hidden,
             temp: run.temp.iter().cloned().collect(),
+            links,
             workdir: run.workdir.clone(),
         }
+    }
+
+    /// The values of every variable named `name`, in any letter case: on
+    /// Unix, `JAVA_HOME` and `java_home` are two variables, and both reach
+    /// the agent once either is declared.
+    fn values_of<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a OsStr> + 'a {
+        self.vars
+            .iter()
+            .filter(move |(n, _)| n.to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+            .map(|(_, value)| value.as_os_str())
     }
 
     /// The command to spawn for `inner`, an agent command built with its
@@ -350,6 +397,71 @@ impl AgentEnv {
         let dir = String::from_utf8_lossy(&captured.stdout).trim().to_owned();
         Ok(PathBuf::from(dir))
     }
+}
+
+/// What the sandbox makes of a folder a variable names: see [`named_folder`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NamedFolder {
+    /// Its real path, read-only, when it lies in the home.
+    open: Option<PathBuf>,
+    /// The link to recreate, as `(at, target)`, when the variable names the
+    /// folder through a link in the home, such as sdkman's `current`.
+    link: Option<(PathBuf, PathBuf)>,
+}
+
+/// What the sandbox makes of `dir`, a folder named by the agent's `PATH` or
+/// by a declared variable, in the home `home`, whose real path is
+/// `real_home` (OWL-68).
+///
+/// The folder is judged by its real path, so that neither `..` nor a link
+/// can name the home or a credential, and that real path is what is opened,
+/// so the check and the sandbox see the same folder. Nothing is opened for a
+/// relative or missing path, a file, the home or a folder above it, or a
+/// folder that is, lies in or holds a path of `kept_out`: the real paths the
+/// run hides, closes or writes in the home. The last rule keeps a broad
+/// folder closed, such as `~/.config`, which holds `.config/gh` and may hold
+/// credentials no list names; it also keeps a folder the agent writes, where
+/// it could swap a link, from being judged at all. A folder outside the home
+/// is not opened either: the sandbox already leaves it readable, or closes
+/// it on purpose.
+///
+/// When `dir` lies in the home but names its folder through a link, the
+/// link is recreated where it is named, as long as that place is not kept
+/// out: the sandbox's home starts empty on Linux.
+fn named_folder(home: &Path, real_home: &Path, dir: &Path, kept_out: &[PathBuf]) -> NamedFolder {
+    let mut folder = NamedFolder::default();
+    if !dir.is_absolute() {
+        return folder;
+    }
+    let Ok(real) = std::fs::canonicalize(dir) else {
+        return folder;
+    };
+    if !real.is_dir() || real_home.starts_with(&real) {
+        return folder;
+    }
+    let touches = |path: &Path| {
+        kept_out
+            .iter()
+            .any(|kept| path.starts_with(kept) || kept.starts_with(path))
+    };
+    if real.starts_with(real_home) {
+        if touches(&real) {
+            return folder;
+        }
+        folder.open = Some(real.clone());
+    }
+    let at = dir
+        .strip_prefix(home)
+        .ok()
+        .filter(|rel| rel.components().all(|c| matches!(c, Component::Normal(_))))
+        .map(|rel| real_home.join(rel));
+    if let Some(at) = at
+        && at != real
+        && !kept_out.iter().any(|kept| at.starts_with(kept))
+    {
+        folder.link = Some((at, real));
+    }
+    folder
 }
 
 /// A credential an agent could reach, or a probe that could not tell.
@@ -745,6 +857,201 @@ mod tests {
         assert_eq!(policy.temp, [PathBuf::from("/srv/run-temp")]);
         assert!(!has(&policy.writable, "/tmp/op"));
         assert_eq!(policy.workdir, Path::new("/srv/wt"));
+    }
+
+    /// OWL-68: a folder the `PATH` or a declared variable names in the home
+    /// is opened by its real path, and a link naming it is recreated; the
+    /// home, a credential folder, one holding a credential, closed or
+    /// written paths, a file, a missing path and a value that is no path
+    /// open nothing, and an inherited variable's folder is not opened.
+    #[cfg(unix)]
+    #[test]
+    fn the_policy_opens_named_folders_by_their_real_path_and_never_a_credential() {
+        use std::os::unix::fs::symlink;
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let home = base.join("home");
+        for dir in [
+            ".sdkman/candidates/java/17",
+            ".local/bin",
+            "go",
+            ".nvm",
+            ".config/tool",
+            ".aws/bin",
+            "tools/tmp",
+            "wt/sdk",
+            "bin",
+            "claude",
+        ] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let java = home.join(".sdkman/candidates/java");
+        symlink(java.join("17"), java.join("current")).unwrap();
+        symlink(&home, home.join("homelink")).unwrap();
+        std::fs::create_dir_all(base.join("opt/jdk")).unwrap();
+        symlink(base.join("opt/jdk"), home.join("jdk")).unwrap();
+        std::fs::write(home.join("tool.txt"), "").unwrap();
+
+        let at = |path: &str| home.join(path).into_os_string();
+        // A `:`-separated list, `~/` naming the home; a URL splits into
+        // pieces that are no folder.
+        let list = |paths: &[&str]| {
+            let entries: Vec<String> = paths
+                .iter()
+                .map(|path| match path.strip_prefix("~/") {
+                    Some(rest) => home.join(rest).display().to_string(),
+                    None => (*path).to_owned(),
+                })
+                .collect();
+            OsString::from(entries.join(":"))
+        };
+        let parent = [
+            ("HOME".into(), home.clone().into_os_string()),
+            ("TMPDIR".into(), at("tools/tmp")),
+            (
+                "PATH".into(),
+                list(&["~/bin/..", "~/.local/bin", "/usr/bin"]),
+            ),
+            ("CLAUDE_CONFIG_DIR".into(), at("claude")),
+            ("SDK_A".into(), at(".sdkman/candidates/java/current")),
+            ("sdk_a".into(), at("go")),
+            (
+                "TOOL_PATHS".into(),
+                list(&[
+                    "~/.nvm",
+                    "~/homelink",
+                    "~/.config",
+                    "~/.aws/bin",
+                    "~/tools",
+                    "~/wt/sdk",
+                    "~/tool.txt",
+                    "~/missing",
+                    "~/jdk",
+                    "on",
+                    "postgres://u:p@h/db",
+                ]),
+            ),
+        ];
+        let declared = ["SDK_A", "TOOL_PATHS"];
+        let agent = AgentEnv::for_project(parent, &declared, &declared).unwrap();
+        let run = RunPaths {
+            workdir: home.join("wt"),
+            ..RunPaths::default()
+        };
+        let policy = agent.policy(&run);
+
+        let fixed = [
+            ".gitconfig",
+            ".rustup",
+            ".cargo/bin",
+            ".cargo/registry",
+            ".cargo/git",
+            ".config/git",
+        ]
+        .map(|path| home.join(path));
+        let named: Vec<&PathBuf> = policy
+            .readable
+            .iter()
+            .filter(|path| !fixed.contains(path))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                &home.join(".local/bin"),
+                &java.join("17"),
+                &home.join("go"),
+                &home.join(".nvm"),
+            ]
+        );
+        assert_eq!(
+            policy.links,
+            [
+                (java.join("current"), java.join("17")),
+                (home.join("jdk"), base.join("opt/jdk")),
+            ]
+        );
+    }
+
+    /// Whether agent runs can be confined here, as `executor::gate`'s tests
+    /// ask: skipped with a message where they cannot, unless
+    /// `OWLSHIFT_REQUIRE_CONFINEMENT` is set.
+    #[cfg(unix)]
+    fn sandbox_or_skip() -> bool {
+        match sandbox::available() {
+            Ok(()) => true,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("OWLSHIFT_REQUIRE_CONFINEMENT").is_none(),
+                    "confinement is required here, but: {error}"
+                );
+                eprintln!("skipped: agent runs cannot be confined here: {error}");
+                false
+            }
+        }
+    }
+
+    /// OWL-68's acceptance, with the real sandbox: a confined command, as the
+    /// gate is spawned, reads a tool chain a declared variable names through
+    /// sdkman's `current` link, and reads nothing in a declared folder that
+    /// holds a credential folder or lies in one.
+    #[cfg(unix)]
+    #[test]
+    fn a_confined_command_reads_a_declared_tool_chain_and_no_credential_folder() {
+        use std::os::unix::fs::symlink;
+        if !sandbox_or_skip() {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let worktree = base.path().join("worktree");
+        let java = home.join(".sdkman/candidates/java");
+        let config = home.join(".config");
+        let cloud_bin = home.join(".aws/bin");
+        for dir in [
+            &java.join("17/bin"),
+            &config.join("tool"),
+            &cloud_bin,
+            &worktree,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        symlink(java.join("17"), java.join("current")).unwrap();
+        std::fs::write(java.join("17/bin/java"), "JDK_owl68\n").unwrap();
+        std::fs::write(config.join("tool/settings"), "FAKE_owl68\n").unwrap();
+        std::fs::write(cloud_bin.join("tool"), "FAKE_owl68\n").unwrap();
+
+        let declared = ["JAVA_HOME", "CONFIG_DIR", "CLOUD_BIN"];
+        let parent = std::env::vars_os()
+            .filter(|(name, _)| {
+                let name = name.to_string_lossy();
+                !["HOME", "TMPDIR", "XDG_CONFIG_HOME"].contains(&&*name)
+                    && !declared.iter().any(|d| d.eq_ignore_ascii_case(&name))
+            })
+            .chain([
+                ("HOME".into(), home.clone().into_os_string()),
+                ("JAVA_HOME".into(), java.join("current").into_os_string()),
+                ("CONFIG_DIR".into(), config.clone().into_os_string()),
+                ("CLOUD_BIN".into(), cloud_bin.clone().into_os_string()),
+            ]);
+        let agent = AgentEnv::for_project(parent, &declared, &declared).unwrap();
+        let run = RunPaths {
+            workdir: worktree,
+            ..RunPaths::default()
+        };
+        let cat = |file: &Path| {
+            let mut inner = Command::new("/bin/cat");
+            inner.arg(file);
+            agent.confine(inner, &run).unwrap().output().unwrap()
+        };
+
+        let out = cat(&java.join("current/bin/java"));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(out.stdout, b"JDK_owl68\n");
+        for file in [config.join("tool/settings"), cloud_bin.join("tool")] {
+            let out = cat(&file);
+            assert!(!out.status.success(), "{}: {out:?}", file.display());
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("FAKE_owl68"));
+        }
     }
 
     /// The shipped binary never turns confinement off: the switch is
