@@ -446,6 +446,7 @@ fn read_only_denial() {
         adapter(&request, |_| {}),
         "Use the Write tool to create .owlshift/result.json containing exactly {\"ok\": true}. \
          Then use the Write tool to create other.txt containing hello. \
+         If a write is refused, do not try another way. \
          Then reply with the single word done.",
     );
     recorded.expect(0, true);
@@ -758,7 +759,8 @@ fn repo_settings_ignored() {
         .path(&repository.worktree, "/work")
         .path(&repository.main, "/main")
         .path(&repository.home, "/config")
-        .path(repository.root.path(), "/scratch");
+        .path(repository.root.path(), "/scratch")
+        .socket(&recorded, 0);
     write("repo_settings_ignored.jsonl", &scrub.lines(&recorded.lines));
 }
 

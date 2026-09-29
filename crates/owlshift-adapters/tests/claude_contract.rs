@@ -56,7 +56,7 @@ fn success() {
         }
     );
     assert_eq!(run.billing, Billing::Subscription);
-    assert_eq!(run.harness_version.as_deref(), Some("2.1.283"));
+    assert_eq!(run.harness_version.as_deref(), Some("2.1.284"));
     assert_eq!(run.model.as_deref(), Some("claude-haiku-4-5-20251001"));
     assert_eq!(run.malformed_lines, 0);
     assert!(run.permission_denials.is_empty());
@@ -64,25 +64,25 @@ fn success() {
     let usage = run.usage.unwrap();
     assert_eq!(
         (usage.input_tokens, usage.output_tokens),
-        (10, 44),
+        (10, 51),
         "{usage:?}"
     );
     assert_eq!(usage.cache_read_input_tokens, 13689);
-    assert_eq!(usage.cache_creation_input_tokens, 7993);
-    assert_eq!(usage.cost_usd, Some(0.0175849));
-    assert_eq!((usage.duration_ms, usage.num_turns), (Some(1037), Some(1)));
+    assert_eq!(usage.cache_creation_input_tokens, 7179);
+    assert_eq!(usage.cost_usd, Some(0.0159919));
+    assert_eq!((usage.duration_ms, usage.num_turns), (Some(1052), Some(1)));
     let haiku = &usage.models["claude-haiku-4-5-20251001"];
-    assert_eq!((haiku.input_tokens, haiku.output_tokens), (10, 44));
+    assert_eq!((haiku.input_tokens, haiku.output_tokens), (10, 51));
 
     let limit = run.rate_limit.unwrap();
-    assert_eq!(limit.status, RateLimitStatus::Allowed);
-    assert_eq!(limit.window.as_deref(), Some("five_hour"));
+    assert_eq!(limit.status, RateLimitStatus::AllowedWarning);
+    assert_eq!(limit.window.as_deref(), Some("seven_day"));
     assert_eq!(
         limit.resets_at,
-        Some(Timestamp::from_second(1790613600).unwrap())
+        Some(Timestamp::from_second(1790748000).unwrap())
     );
-    assert_eq!(limit.five_hour_utilization, Some(0.02));
-    assert_eq!(limit.seven_day_utilization, Some(0.62));
+    assert_eq!(limit.five_hour_utilization, Some(0.19));
+    assert_eq!(limit.seven_day_utilization, Some(0.8));
 }
 
 /// A read-only run told to write its result file and another file: the
