@@ -30,7 +30,7 @@ fn smoke() {
 #[test]
 fn smoke_confined() {
     let parent = std::env::vars_os();
-    if let Err(error) = owlshift_runner::agent_env::AgentEnv::new(parent, &[])
+    if let Err(error) = owlshift_runner::agent_env::AgentEnv::new(parent)
         .unwrap()
         .sandbox_ready()
     {

@@ -322,7 +322,7 @@ impl Bench {
             // must reach the checkout and its own `.git`, which the sandbox
             // closes. Confinement has its own tests (OWL-41), and native
             // Windows refuses confined runs.
-            AgentEnv::new(self.env.agent_parent(), &[])
+            AgentEnv::new(self.env.agent_parent())
                 .unwrap()
                 .without_confinement(),
         );
@@ -929,7 +929,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         .filter(|(name, _)| name != "CLAUDE_CONFIG_DIR");
     let executor = on_demand::executor(
         Git::with_setup("git", move |command| env.apply(command)),
-        AgentEnv::new(parent, &[]).unwrap(),
+        AgentEnv::new(parent).unwrap(),
     );
     let harness = ClaudeHarness {
         program: PathBuf::from("claude"),

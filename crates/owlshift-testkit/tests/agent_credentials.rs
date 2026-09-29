@@ -212,7 +212,7 @@ fn the_check_finds_every_planted_credential_in_the_host_environment() {
 #[test]
 fn an_agent_reaches_none_of_them() {
     let host = host();
-    let agent = AgentEnv::new(host.parent.clone(), &[])
+    let agent = AgentEnv::new(host.parent.clone())
         .unwrap()
         .without_confinement();
     // Part of the check: gh is asked, and answers with the placeholder.
@@ -253,7 +253,7 @@ fn an_agent_reaches_none_of_them() {
 #[test]
 fn credentials_in_the_repository_configuration_are_reported_redacted() {
     let host = host();
-    let agent = AgentEnv::new(host.parent.clone(), &[])
+    let agent = AgentEnv::new(host.parent.clone())
         .unwrap()
         .without_confinement();
     let findings = agent.check(&host.leaky, FORGE);

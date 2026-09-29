@@ -67,7 +67,7 @@ impl Bench {
         // `tests/confinement.rs`.
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner.apply(command)),
-            agent: AgentEnv::new(env.agent_parent(), &[])
+            agent: AgentEnv::new(env.agent_parent())
                 .unwrap()
                 .without_confinement(),
             forge_hosts: Vec::new(),

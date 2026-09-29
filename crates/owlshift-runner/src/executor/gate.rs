@@ -645,7 +645,7 @@ mod tests {
     /// The agent environment of these tests, bare: they check the gate's own
     /// rules; the sandbox's are checked below and in the test bench.
     fn agent() -> AgentEnv {
-        AgentEnv::new(std::env::vars_os(), &[])
+        AgentEnv::new(std::env::vars_os())
             .unwrap()
             .without_confinement()
     }
@@ -688,7 +688,7 @@ mod tests {
         #[cfg(windows)]
         {
             let _launcher = owlshift_platform::sandbox::use_built_launcher();
-            check(&AgentEnv::new(std::env::vars_os(), &[]).unwrap());
+            check(&AgentEnv::new(std::env::vars_os()).unwrap());
         }
     }
 
@@ -1038,7 +1038,7 @@ mod tests {
     fn a_confined_gate_command_starts_through_the_launcher() {
         let _launcher = owlshift_platform::sandbox::use_built_launcher();
         let dir = tempfile::tempdir().unwrap();
-        let confined = AgentEnv::new(std::env::vars_os(), &[]).unwrap();
+        let confined = AgentEnv::new(std::env::vars_os()).unwrap();
         let command = confined
             .confine_shell("echo hi", &paths(dir.path()))
             .unwrap();
@@ -1171,7 +1171,7 @@ mod tests {
                     home.join(".config").into_os_string(),
                 ),
             ]);
-        let confined = AgentEnv::new(parent, &[]).unwrap();
+        let confined = AgentEnv::new(parent).unwrap();
         let bare = confined.clone().without_confinement();
         let paths = RunPaths {
             temp: Some(run_temp.clone()),
@@ -1337,7 +1337,7 @@ mod tests {
     #[test]
     fn a_confined_gate_command_is_refused_on_native_windows() {
         let dir = tempfile::tempdir().unwrap();
-        let confined = AgentEnv::new(std::env::vars_os(), &[]).unwrap();
+        let confined = AgentEnv::new(std::env::vars_os()).unwrap();
         let failure = gate_with(&confined, &paths(dir.path()), "echo hi").unwrap_err();
         assert!(failure.reason.contains("WSL2"), "{}", failure.reason);
     }
@@ -1525,7 +1525,6 @@ mod tests {
                 std::env::vars_os()
                     .filter(|(name, _)| name != "HOME")
                     .chain([("HOME".into(), home.clone().into_os_string())]),
-                &[],
             )
             .unwrap()
             .without_confinement();
