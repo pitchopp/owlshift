@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
-use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push};
+use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push_parts};
 use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
@@ -394,7 +394,18 @@ impl<'a> Writer<'a> {
                 message: error.to_string(),
             })
         })?;
-        read_push(branch, &output).map_err(WriteError::Push)
+        let ended = match output.code {
+            Some(code) => format!("exit status: {code}"),
+            None => "a signal".to_owned(),
+        };
+        read_push_parts(
+            branch,
+            output.success(),
+            &ended,
+            &output.stdout,
+            &output.stderr,
+        )
+        .map_err(WriteError::Push)
     }
 
     /// Opens the pull request of `head` into `base` with the run's title and

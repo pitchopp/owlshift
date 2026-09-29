@@ -286,7 +286,7 @@ Everything runs in the foreground; `resume` arrives in P2, `watch` in P3, the ba
 - **This repository** has its own `owlshift.toml`, written by `init`: Linear team OWL, and CI's three commands as its gate. A CLI test holds the gate to `.github/workflows/ci.yml`.
 - **Not run live here.** No real `do` was run: the three-ticket exit gate below is the maintainer's. The hidden prompt was not tried on any platform, and the shape of the `createPullRequest` answer still comes from OWL-17's made-up fixture.
 - **Known limits, and the follow-ups they call for.**
-  - The runner's git commands keep the executor's 120 s deadline (`executor/git.rs`), which can cut the first clone of a very large repository.
+  - The runner's git commands keep the executor's 120 s deadline (`executor/git.rs`), which can cut the first clone of a very large repository (OWL-60).
   - The `.git` link check runs once the executor returns. The executor's own isolation check reads the worktree (`rev-parse`, `symbolic-ref`, `merge-base`, none of which runs a hook or a configured command) through that link with the runner's environment before, and its `git status` of the checkout still runs with the runner's environment too. The link check belongs in the executor, before any git runs in the worktree after a run (`executor/isolation.rs`).
   - `Brief.rules` stays empty. Project conventions such as DCO sign-off reach the agent only through what the harness loads by itself, which the build role treats as data.
   - `logs` shows where each run's logs are, not their content.

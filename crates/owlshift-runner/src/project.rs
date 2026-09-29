@@ -214,7 +214,7 @@ pub struct Base {
 ///
 /// Every command runs under the runner git's own deadline, 120 s at the
 /// time of writing: a first clone of a very large repository can outlive
-/// it (a known limit).
+/// it (a known limit, OWL-60).
 pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<Base, String> {
     let checkout = dirs.checkout();
     let failed = |e: crate::executor::GitError| e.to_string();
