@@ -298,7 +298,7 @@ D1, D2, D3, D5, D7, D10 and D11 are agreed; five decisions remain open, none of 
 | D6 | Second validation project for P9 | A project on another stack, ideally on GitHub Issues; to name | Open |
 | D7 | Default runner location | The developer's machine; a team server is a P10 mode | Agreed |
 | D8 | Agent identity on Linear from P2 | Create a Linear app user, after check C4 confirms it works with polling and no public webhook endpoint; the `[agent]` marker otherwise | Open |
-| D9 | Windows scope | WSL2 from P1; native Windows only when a user needs it. Native confinement under way: agent commands can start through a launcher inside the run's Job Object (OWL-71, [build plan](build-plan.md#results)), which OWL-72 gives an AppContainer; until then native Windows runs no agent | Open |
+| D9 | Windows scope | WSL2 from P1; native Windows only when a user needs it. Native confinement under way: agent commands can start through a launcher inside the run's Job Object (OWL-71); a plain AppContainer cannot run git, since it cannot open `NUL`, and a restricted token was compared (OWL-72, [build plan](build-plan.md#results)); until one is chosen and built, native Windows runs no agent | Open |
 | D10 | Contribution terms | Developer Certificate of Origin sign-off on every commit, no CLA (decided 2026-09-28): light for contributors, authorship still traced; see `CONTRIBUTING.md` | Agreed |
 | D11 | Where the code lives | `~/Projects/owlshift`, on the personal GitHub account (`pitchopp/owlshift`), no dedicated organisation | Agreed |
 | D12 | Minimum supported systems | Set at the first release: the two latest macOS versions, the current Ubuntu LTS, Windows 11 with WSL2 | Open |
