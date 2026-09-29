@@ -35,6 +35,7 @@ use owlshift_runner::executor::{
 };
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
+use owlshift_testkit::gh;
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 use owlshift_testkit::harness::FakeHarness;
 use owlshift_testkit::reply::Reply;
@@ -305,6 +306,8 @@ impl Bench {
             current: RefCell::new(None),
             first: RefCell::new(first),
         };
+        // The executor's credential probes run the real gh on `github.com`.
+        gh::warm_up(&self.env.agent_parent());
         let env = self.env.clone();
         let executor = on_demand::executor(
             Git::with_setup("git", move |command| env.apply(command)),
