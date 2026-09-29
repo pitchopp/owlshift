@@ -44,7 +44,14 @@ fn reads_an_assigned_ticket() {
     assert!(!ticket.description.is_empty());
     assert_eq!(ticket.priority, Priority::High);
     assert_eq!(ticket.assignee, Some(maintainer()));
-    assert_eq!(ticket.author, Author::Account(maintainer()));
+    // Created by the assignee's account, which a holder of its API key
+    // could be (OWL-74): the creator is named, never an account.
+    assert_eq!(
+        ticket.author,
+        Author::Other {
+            name: maintainer().name
+        }
+    );
     assert!(!ticket.labels.is_empty());
 }
 

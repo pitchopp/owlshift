@@ -1077,6 +1077,40 @@ mod tests {
         assert_eq!(blank.relation, Relation::Other);
     }
 
+    /// OWL-80 as Linear gave it on 2026-09-29 (OWL-74), created by an agent
+    /// through the assignee's personal API key: the assignee's account as
+    /// creator, no bot actor, no external user. OWL-82, typed by hand in
+    /// Linear's app, answered alike. Its description is not the decider's
+    /// instructions.
+    #[test]
+    fn a_linear_ticket_created_through_the_deciders_key_is_not_the_deciders() {
+        use owlshift_adapters::tracker::linear::{LinearTracker, Response, Transport};
+
+        struct Owl80;
+        impl Transport for Owl80 {
+            fn send(&self, _: &Value) -> Result<Response, String> {
+                let body = r#"{"data":{"issue":{"identifier":"OWL-80","title":"t",
+                    "description":"d","priority":3,
+                    "assignee":{"id":"u1","displayName":"person-1"},
+                    "creator":{"id":"u1","displayName":"person-1"},
+                    "botActor":null,"externalUserCreator":null,
+                    "labels":{"nodes":[{"name":"Improvement"}],"pageInfo":{"hasNextPage":false}}}}}"#;
+                Ok(Response {
+                    status: 200,
+                    body: body.to_owned(),
+                })
+            }
+        }
+        let ticket = LinearTracker::with_transport(Owl80)
+            .ticket(&TicketId::new("OWL-80").unwrap())
+            .unwrap();
+        let decider = ticket.assignee.clone().unwrap();
+        assert_eq!(
+            account_author(&ticket.author, &decider).relation,
+            Relation::Other
+        );
+    }
+
     #[test]
     fn run_directories_never_collide() {
         let dir = tempfile::tempdir().unwrap();
