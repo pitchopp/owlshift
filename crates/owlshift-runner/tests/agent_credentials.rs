@@ -14,7 +14,8 @@
 //! configuration: the very things the agent environment has to overcome.
 //!
 //! gh ships on the CI runners and is required there; elsewhere a missing gh
-//! only skips its part, with a message.
+//! only skips its part, with a message. gh is started once before any probe
+//! runs: its first start on a machine can take longer than a probe is given.
 //!
 //! The agent environment is checked bare (`without_confinement`, behind the
 //! `testkit` feature): this is the environment layer, which must hold on its
@@ -24,14 +25,25 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use tempfile::TempDir;
 
 use owlshift_core::agent_env::NO_CREDENTIAL;
-use owlshift_platform::process::find_executable_in;
+use owlshift_platform::process::{OUTPUT_CAP, find_executable_in, run_command};
 use owlshift_runner::agent_env::{AgentEnv, CredentialFinding, check_environment};
 
 const FORGE: &[&str] = &["github.com"];
+
+/// How long gh's first start may take. A probe gives gh 10 s
+/// (`PROBE_TIMEOUT`), and a warm gh answers in about 0.1 s. The very first
+/// start on a machine reads gh's 42 MB binary from disk. On fresh Windows
+/// runners that took from 0.8 to 14 s over ten machines, one of them past the
+/// probe's 10 s (OWL-56, measured on 2026-09-29, runs 36553384681 and
+/// 36553676102). Git for Windows' `sh`, which the fixture's credential helper
+/// starts, took 0.3 to 0.7 s: it needs no warm-up.
+const GH_FIRST_START: Duration = Duration::from_secs(120);
 
 /// The variables planted in the host's environment, all credentials or
 /// traces of a parent harness session.
@@ -110,6 +122,7 @@ fn host() -> Host {
             .iter()
             .map(|(name, value)| set(name, OsStr::new(value))),
     );
+    warm_up_gh(&parent);
 
     let clean = tmp.path().join("clean");
     let leaky = tmp.path().join("leaky");
@@ -150,14 +163,44 @@ fn git(env: &[(OsString, OsString)], dir: &Path, args: &[&str]) {
     assert!(output.status.success(), "git {args:?}: {output:?}");
 }
 
-/// Whether gh is installed; on CI it must be.
-fn gh_installed(env: &[(OsString, OsString)]) -> bool {
+/// The gh the probes run with `env`: the one on its `PATH`.
+fn gh_on_path(env: &[(OsString, OsString)]) -> Option<PathBuf> {
     let path = env
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
         .map(|(_, value)| value.clone())
         .unwrap_or_default();
-    let installed = find_executable_in("gh", path).is_some();
+    find_executable_in("gh", path)
+}
+
+/// Starts gh once for the whole test binary, before any probe runs, so that
+/// the probes time gh's answer and not its first start
+/// ([`GH_FIRST_START`]). Tests that arrive meanwhile wait here, off their
+/// probes' clocks. Without gh there is nothing to start.
+fn warm_up_gh(env: &[(OsString, OsString)]) {
+    static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
+    let started = STARTED.get_or_init(|| {
+        let Some(gh) = gh_on_path(env) else {
+            return Ok(());
+        };
+        let mut command = Command::new(&gh);
+        command
+            .arg("--version")
+            .env_clear()
+            .envs(env.iter().map(|(n, v)| (n, v)));
+        match run_command(&mut command, None, GH_FIRST_START, OUTPUT_CAP) {
+            Ok(captured) if captured.success() => Ok(()),
+            outcome => Err(format!("{} --version: {outcome:?}", gh.display())),
+        }
+    });
+    if let Err(error) = started {
+        panic!("gh did not start: {error}");
+    }
+}
+
+/// Whether gh is installed; on CI it must be.
+fn gh_installed(env: &[(OsString, OsString)]) -> bool {
+    let installed = gh_on_path(env).is_some();
     if !installed {
         assert!(
             std::env::var_os("CI").is_none(),
