@@ -17,18 +17,17 @@ use std::process::{Child, Command};
 /// Dropping it stops nothing: a caller that gives up on a tree must call
 /// [`ProcessTree::kill`] first, or the tree keeps running.
 ///
-/// On Unix the tree is live from its spawn until this handle is dropped: a
-/// process that called [`stop_trees_on_signal`] stops it when told to end.
+/// The tree is live from its spawn until this handle is dropped: a process
+/// that called [`stop_trees_on_signal`] stops it when told to end.
 ///
 /// [`stop_trees_on_signal`]: super::stop_trees_on_signal
 #[derive(Debug)]
 pub struct ProcessTree {
     #[cfg(unix)]
     group: rustix::process::Pid,
-    #[cfg(unix)]
-    _live: super::signals::Registration,
     #[cfg(windows)]
-    job: std::os::windows::io::OwnedHandle,
+    job: std::sync::Arc<std::os::windows::io::OwnedHandle>,
+    _live: super::signals::Registration,
 }
 
 impl ProcessTree {
@@ -51,10 +50,18 @@ impl ProcessTree {
     pub fn kill(&self) -> io::Result<()> {
         imp::kill(self)
     }
+
+    /// The tree's entry among the live ones.
+    #[cfg(test)]
+    pub(super) fn registration(&self) -> &super::signals::Registration {
+        &self._live
+    }
 }
 
 #[cfg(unix)]
 pub(super) use imp::kill_group;
+#[cfg(windows)]
+pub(super) use imp::terminate_job;
 
 #[cfg(unix)]
 mod imp {
@@ -70,7 +77,8 @@ mod imp {
         // A group id of 0 makes the child the leader of a new group whose id
         // is its own pid.
         command.process_group(0);
-        let (child, group, live) = signals::register(|| command.spawn())?;
+        let (child, live) = signals::register(|| command.spawn(), Pid::from_child)?;
+        let group = Pid::from_child(&child);
         Ok((child, ProcessTree { group, _live: live }))
     }
 
@@ -110,12 +118,14 @@ mod imp {
     //! suspended process runs no code, so it cannot start a process before
     //! it is in the job; the processes it starts later inherit the job.
 
+    use super::super::signals;
     use super::ProcessTree;
     use std::io;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command};
     use std::ptr;
+    use std::sync::Arc;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -140,18 +150,22 @@ mod imp {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: the call succeeded, so `raw` is a new handle owned here.
-        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let job = Arc::new(unsafe { OwnedHandle::from_raw_handle(raw) });
 
         command.creation_flags(CREATE_SUSPENDED);
-        let mut child = command.spawn()?;
-        if let Err(error) = contain(&job, &child) {
-            // The child never ran; best effort, the error to report is the
-            // one above.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        Ok((child, ProcessTree { job }))
+        let spawn = || {
+            let mut child = command.spawn()?;
+            if let Err(error) = contain(&job, &child) {
+                // The child never ran; best effort, the error to report is
+                // the one above.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            Ok(child)
+        };
+        let (child, live) = signals::register(spawn, |_| Arc::clone(&job))?;
+        Ok((child, ProcessTree { job, _live: live }))
     }
 
     /// Places the suspended child in the job, then lets it run.
@@ -211,8 +225,13 @@ mod imp {
     }
 
     pub(super) fn kill(tree: &ProcessTree) -> io::Result<()> {
+        terminate_job(&tree.job)
+    }
+
+    /// Stops every process in the job.
+    pub(in crate::process) fn terminate_job(job: &OwnedHandle) -> io::Result<()> {
         // SAFETY: the job handle is open for the duration of the call.
-        if unsafe { TerminateJobObject(tree.job.as_raw_handle(), KILLED) } == 0 {
+        if unsafe { TerminateJobObject(job.as_raw_handle(), KILLED) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())

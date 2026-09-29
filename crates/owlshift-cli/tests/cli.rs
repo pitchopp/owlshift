@@ -278,23 +278,7 @@ fn is_alive(pid: u32) -> bool {
 #[cfg(windows)]
 #[test]
 fn ctrl_c_on_doctor_stops_a_probe_that_ignores_it_and_its_child() {
-    windows_ctrl_c::interrupt_doctor(true, false);
-}
-
-/// Observation for OWL-47, temporary: the same with a probe that reacts to
-/// Ctrl-C as a console program does by default.
-#[cfg(windows)]
-#[test]
-fn ctrl_c_on_doctor_stops_a_hung_probe_and_its_child_on_windows() {
-    windows_ctrl_c::interrupt_doctor(false, false);
-}
-
-/// Observation for OWL-47, temporary: a probe that ignores Ctrl-C and whose
-/// output, and its child's, still goes to `owlshift`.
-#[cfg(windows)]
-#[test]
-fn ctrl_c_on_doctor_with_a_probe_that_ignores_it_and_writes_to_owlshift() {
-    windows_ctrl_c::interrupt_doctor(true, true);
+    windows_ctrl_c::interrupt_doctor();
 }
 
 /// Helper, run in a console of its own by `interrupt_doctor`.
@@ -359,8 +343,6 @@ mod windows_ctrl_c {
     const CONFIG_DIR: &str = "OWLSHIFT_TEST_CONFIG_DIR";
     /// Where the hung probe writes its pid and its child's.
     const PIDS: &str = "OWLSHIFT_TEST_PIDS";
-    /// Set when the hung probe, and so its child, ignore Ctrl-C.
-    const IGNORE: &str = "OWLSHIFT_TEST_IGNORE_CTRL_C";
 
     /// The helpers act only when run alone, never in a plain
     /// `cargo test -- --ignored`.
@@ -395,28 +377,21 @@ mod windows_ctrl_c {
             .collect()
     }
 
-    pub(super) fn interrupt_doctor(probe_ignores_ctrl_c: bool, probe_writes_to_owlshift: bool) {
+    pub(super) fn interrupt_doctor() {
         let bin = tempfile::tempdir().unwrap();
         let pids = bin.path().join("pids");
         // This binary cannot answer `git --version` itself, since the test
         // harness rejects the option: a batch file, the form npm installs a
         // CLI in, starts the hung probe for `--version` and answers anything
         // else as git does outside a repository, so loading the
-        // configuration does not hang. The probe's output goes nowhere: a
-        // write to the pipe of an `owlshift` that has ended would fail and
-        // end it, and a hung probe writes nothing.
+        // configuration does not hang.
         let exe = std::env::current_exe().unwrap();
-        let output = if probe_writes_to_owlshift {
-            ""
-        } else {
-            " >nul 2>nul"
-        };
         fs::write(
             bin.path().join("git.cmd"),
             format!(
                 "@echo off\r\n\
                  if not \"%~1\"==\"--version\" goto other\r\n\
-                 \"{exe}\" --exact helper_hung_git --ignored --nocapture --test-threads=1{output}\r\n\
+                 \"{exe}\" --exact helper_hung_git --ignored --nocapture --test-threads=1\r\n\
                  exit /b %errorlevel%\r\n\
                  :other\r\n\
                  echo fatal: not a git repository 1>&2\r\n\
@@ -433,14 +408,10 @@ mod windows_ctrl_c {
             .env(BIN, bin.path())
             .env(CONFIG_DIR, config_dir.path())
             .env(PIDS, &pids)
-            .env_remove(IGNORE)
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(File::create(&log).unwrap())
             .stderr(File::create(bin.path().join("driver.err")).unwrap());
-        if probe_ignores_ctrl_c {
-            driver.env(IGNORE, "1");
-        }
         let mut driver = driver.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         let status = loop {
@@ -620,27 +591,16 @@ mod windows_ctrl_c {
         );
     }
 
-    /// The hung probe: ignores Ctrl-C when asked, which its child inherits,
-    /// starts that child, records both pids and waits on the child.
+    /// The hung probe: ignores Ctrl-C, which the child it then starts
+    /// inherits, records both pids and waits on the child.
     pub(super) fn hang_with_a_child() {
-        let ignores = std::env::var_os(IGNORE).is_some();
-        if ignores {
-            // SAFETY: no handler routine is passed.
-            let ignored = unsafe { SetConsoleCtrlHandler(None, 1) };
-            assert_ne!(ignored, 0, "{}", io::Error::last_os_error());
-        }
+        // SAFETY: no handler routine is passed.
+        let ignored = unsafe { SetConsoleCtrlHandler(None, 1) };
+        assert_ne!(ignored, 0, "{}", io::Error::last_os_error());
         let mut child = helper("helper_sleep").spawn().unwrap();
         let pids = var(PIDS);
         let staged = pids.with_extension("tmp");
-        fs::write(
-            &staged,
-            format!(
-                "{} {} (ignores Ctrl-C: {ignores})",
-                std::process::id(),
-                child.id()
-            ),
-        )
-        .unwrap();
+        fs::write(&staged, format!("{} {}", std::process::id(), child.id())).unwrap();
         fs::rename(&staged, &pids).unwrap();
         child.wait().unwrap();
     }
