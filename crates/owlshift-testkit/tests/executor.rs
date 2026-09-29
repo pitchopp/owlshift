@@ -58,9 +58,13 @@ impl Bench {
         let env = GitEnv::create(tmp.path().join("home")).unwrap();
         let remote = seed(&env, tmp.path(), &project).unwrap();
         let runner = env.clone();
+        // Bare: these refusals come before the sandbox, whose own are in
+        // `tests/confinement.rs`.
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner.apply(command)),
-            agent: AgentEnv::new(env.agent_parent(), &[]).unwrap(),
+            agent: AgentEnv::new(env.agent_parent(), &[])
+                .unwrap()
+                .without_confinement(),
             forge_hosts: Vec::new(),
             timeout: Duration::from_secs(60),
             gate_timeout: Duration::from_secs(60),

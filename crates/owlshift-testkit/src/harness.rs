@@ -2,12 +2,13 @@
 //! launched with the brief the executor wrote and a reply file.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
+use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
-    Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus, RunLog,
+    Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus, RunLog, SandboxNeeds,
 };
 
 use crate::reply::usage_limit;
@@ -17,8 +18,12 @@ use crate::reply::usage_limit;
 pub struct FakeHarness {
     /// The `owlshift-fake-harness` program.
     pub program: PathBuf,
-    /// The reply file it plays.
+    /// The reply file it plays: outside the run directory, which the sandbox
+    /// hides.
     pub reply: PathBuf,
+    /// What else it reads when confined, such as the files the bench's git
+    /// configuration names in its home.
+    pub readable: Vec<PathBuf>,
 }
 
 impl Harness for FakeHarness {
@@ -53,5 +58,15 @@ impl Harness for FakeHarness {
             (None, None) => HarnessStatus::Failed("ended by a signal".to_owned()),
         };
         Ok(HarnessEnd::new(run.exit_code, status))
+    }
+
+    /// The reply's folder and the bench's own files, read.
+    fn sandbox_needs(&self, _agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        let mut readable = self.readable.clone();
+        readable.extend(self.reply.parent().map(Path::to_path_buf));
+        Ok(SandboxNeeds {
+            readable,
+            writable: Vec::new(),
+        })
     }
 }
