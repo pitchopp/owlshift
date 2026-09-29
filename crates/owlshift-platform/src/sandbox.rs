@@ -41,6 +41,10 @@ pub struct Policy {
     /// The home, neither read nor written but for what follows; `None` when
     /// there is none to protect.
     pub home: Option<PathBuf>,
+    /// More folders neither read nor written but for what follows, like the
+    /// home: the temporary folders every process of the user shares. The
+    /// shared `/tmp` and `/var/tmp` are always closed.
+    pub closed: Vec<PathBuf>,
     /// Read, never written: tool chains, the harness's install folder, git's
     /// own configuration.
     pub readable: Vec<PathBuf>,
@@ -53,8 +57,10 @@ pub struct Policy {
     /// Neither read nor written, wherever they are: secret files and the
     /// runner's own run folder.
     pub hidden: Vec<PathBuf>,
-    /// Where temporary files go, written. On Linux `/tmp` is private to the
-    /// run, and a folder named here inside it is created empty.
+    /// Where temporary files go, read and written: the run's own folder, made
+    /// by the runner, never a folder the user shares. On Linux `/tmp` is
+    /// private to the sandbox, and a folder named here inside it is created
+    /// empty there.
     pub temp: Vec<PathBuf>,
     /// The working directory of the confined program.
     pub workdir: PathBuf,
@@ -179,6 +185,7 @@ fn resolved(policy: &Policy) -> Policy {
     let all = |paths: &[PathBuf]| paths.iter().map(|path| real(path)).collect();
     Policy {
         home: policy.home.as_deref().map(real),
+        closed: all(&policy.closed),
         readable: all(&policy.readable),
         writable: all(&policy.writable),
         protected: all(&policy.protected),
@@ -188,14 +195,26 @@ fn resolved(policy: &Policy) -> Policy {
     }
 }
 
+/// The read operations every read rule of the Seatbelt profile names: a file's
+/// content and extended attributes. Its metadata (`stat`) is left readable,
+/// but for hidden paths.
+const READ: &str = "file-read-data file-read-xattr";
+
 /// The Seatbelt profile of a resolved policy, and the parameters its rules
 /// name, as `(name, path)`: the profile quotes no path.
 ///
-/// The last matching rule wins, so the rules go from the widest to the
-/// narrowest: everything allowed, then no write anywhere but the devices and
-/// the temporary folders, then the home closed, then the readable and
-/// writable folders opened again, then the protected and hidden paths and
-/// the Keychain closed whatever came before.
+/// Among rules that name the same operations, the last one that matches
+/// wins, so the rules go from the widest to the narrowest: everything
+/// allowed, then no write anywhere but the devices, then the home and the
+/// closed folders shut, then the readable, writable and temporary folders
+/// opened again, then the protected and hidden paths and the Keychain closed
+/// whatever came before.
+///
+/// Every read rule names [`READ`] rather than the wildcard `file-read*`: an
+/// operation named outranks the wildcard whatever the order, so a wildcard
+/// allow would not reopen a closed folder, and a wildcard deny would not
+/// close a hidden file inside an opened one (both checked live on
+/// 2026-09-29). Every write rule names the wildcard `file-write*`.
 pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, String)>), SandboxError> {
     let mut params = Vec::new();
     let mut param = |prefix: &str, path: &Path| -> Result<String, SandboxError> {
@@ -208,34 +227,41 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, String)
     };
     let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
     profile.push_str("(allow file-write* (subpath \"/dev\"))\n");
-    for path in &policy.temp {
-        profile.push_str(&format!("(allow file-write* {})\n", param("T", path)?));
-    }
     if let Some(home) = &policy.home {
-        profile.push_str(&format!(
-            "(deny file-read-data file-read-xattr file-write* {})\n",
-            param("HOME", home)?
-        ));
+        let home = param("HOME", home)?;
+        profile.push_str(&format!("(deny {READ} file-write* {home})\n"));
+    }
+    for path in &policy.closed {
+        let path = param("C", path)?;
+        profile.push_str(&format!("(deny {READ} file-write* {path})\n"));
     }
     for path in &policy.readable {
-        profile.push_str(&format!(
-            "(allow file-read-data file-read-xattr {})\n",
-            param("R", path)?
-        ));
+        let path = param("R", path)?;
+        profile.push_str(&format!("(allow {READ} {path})\n"));
     }
     for path in &policy.writable {
-        profile.push_str(&format!(
-            "(allow file-read* file-write* {})\n",
-            param("W", path)?
-        ));
+        let path = param("W", path)?;
+        profile.push_str(&format!("(allow {READ} file-write* {path})\n"));
+    }
+    for path in &policy.temp {
+        let path = param("T", path)?;
+        profile.push_str(&format!("(allow {READ} file-write* {path})\n"));
+    }
+    // `getcwd` lists every folder above the working directory: the folders
+    // above an opened one, where they are closed, can be listed themselves,
+    // their files staying closed.
+    for path in above_opened(policy) {
+        let name = param("A", &path)?;
+        let literal = name.replacen("(subpath ", "(literal ", 1);
+        profile.push_str(&format!("(allow file-read-data {literal})\n"));
     }
     for path in &policy.protected {
         profile.push_str(&format!("(deny file-write* {})\n", param("P", path)?));
     }
     for path in &policy.hidden {
+        let path = param("H", path)?;
         profile.push_str(&format!(
-            "(deny file-read* file-write* {})\n",
-            param("H", path)?
+            "(deny {READ} file-read-metadata file-write* {path})\n"
         ));
     }
     profile.push_str(
@@ -243,6 +269,34 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, String)
          (global-name \"com.apple.securityd.xpc\"))\n",
     );
     Ok((profile, params))
+}
+
+/// The folders above the opened ones (readable, writable, temporary, and the
+/// working directory) that lie in the home or a closed folder, each once,
+/// in the order met.
+fn above_opened(policy: &Policy) -> Vec<PathBuf> {
+    let closed = |path: &Path| {
+        policy
+            .home
+            .iter()
+            .chain(&policy.closed)
+            .any(|root| path.starts_with(root))
+    };
+    let mut above: Vec<PathBuf> = Vec::new();
+    let opened = policy
+        .readable
+        .iter()
+        .chain(&policy.writable)
+        .chain(&policy.temp)
+        .chain([&policy.workdir]);
+    for path in opened {
+        for ancestor in path.ancestors().skip(1) {
+            if closed(ancestor) && !above.iter().any(|seen| seen == ancestor) {
+                above.push(ancestor.to_owned());
+            }
+        }
+    }
+    above
 }
 
 /// What a path is on the host, as the bwrap arguments need to know.
@@ -270,14 +324,27 @@ pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<
     let os = |text: &str| OsString::from(text);
     let tmp = Path::new("/tmp");
     let run_user = Path::new("/run/user");
+    let var_tmp = Path::new("/var/tmp");
     add(tmp, 0, vec![os("--tmpfs"), tmp.into()]);
-    if kind(run_user) == Some(Kind::Directory) {
-        add(run_user, 0, vec![os("--tmpfs"), run_user.into()]);
+    for shared in [run_user, var_tmp] {
+        if kind(shared) == Some(Kind::Directory) {
+            add(shared, 0, vec![os("--tmpfs"), shared.into()]);
+        }
     }
     if let Some(home) = &policy.home
         && kind(home) == Some(Kind::Directory)
     {
         add(home, 0, vec![os("--tmpfs"), home.into()]);
+    }
+    for path in &policy.closed {
+        // A folder inside a private one is already out of sight.
+        let private = [tmp, run_user, var_tmp]
+            .into_iter()
+            .chain(policy.home.as_deref())
+            .any(|root| path.starts_with(root));
+        if !private && path.parent().is_some() && kind(path) == Some(Kind::Directory) {
+            add(path, 0, vec![os("--tmpfs"), path.into()]);
+        }
     }
     for path in &policy.temp {
         if path.starts_with(tmp) {
@@ -303,12 +370,11 @@ pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<
             .any(|root| path.starts_with(root))
     };
     let private = |path: &Path| {
-        path.starts_with(tmp)
-            || path.starts_with(run_user)
-            || policy
-                .home
-                .as_ref()
-                .is_some_and(|home| path.starts_with(home))
+        [tmp, run_user, var_tmp]
+            .into_iter()
+            .chain(policy.home.as_deref())
+            .chain(policy.closed.iter().map(PathBuf::as_path))
+            .any(|root| path.starts_with(root))
     };
     for path in &policy.hidden {
         // A hidden path under a private folder is already out of sight,
@@ -375,6 +441,9 @@ mod imp {
             policy.hidden.push(home.join("Library/Keychains"));
         }
         policy.hidden.push("/Library/Keychains".into());
+        // The temporary folders every process of the user shares.
+        policy.closed.push("/private/tmp".into());
+        policy.closed.push("/private/var/tmp".into());
         let (profile, params) = seatbelt_profile(&policy)?;
         let mut command = Command::new(SANDBOX_EXEC);
         for (name, value) in params {
@@ -543,6 +612,7 @@ mod tests {
     fn policy() -> Policy {
         Policy {
             home: Some("/home/op".into()),
+            closed: vec!["/srv/shared-tmp".into()],
             readable: vec!["/home/op/.rustup".into()],
             writable: vec!["/home/op/wt".into(), "/srv/repo/.git".into()],
             protected: vec!["/srv/repo/.git/hooks".into()],
@@ -556,6 +626,8 @@ mod tests {
         }
     }
 
+    /// The temporary folder is opened after the closed ones, so a run's own
+    /// folder inside a shared one is the only temporary folder it reaches.
     #[test]
     fn the_seatbelt_profile_closes_the_home_the_writes_and_the_keychain() {
         let (profile, params) = seatbelt_profile(&policy()).unwrap();
@@ -563,15 +635,17 @@ mod tests {
             profile,
             "(version 1)\n(allow default)\n(deny file-write*)\n\
              (allow file-write* (subpath \"/dev\"))\n\
-             (allow file-write* (subpath (param \"T0\")))\n\
-             (deny file-read-data file-read-xattr file-write* (subpath (param \"HOME1\")))\n\
+             (deny file-read-data file-read-xattr file-write* (subpath (param \"HOME0\")))\n\
+             (deny file-read-data file-read-xattr file-write* (subpath (param \"C1\")))\n\
              (allow file-read-data file-read-xattr (subpath (param \"R2\")))\n\
-             (allow file-read* file-write* (subpath (param \"W3\")))\n\
-             (allow file-read* file-write* (subpath (param \"W4\")))\n\
-             (deny file-write* (subpath (param \"P5\")))\n\
-             (deny file-read* file-write* (subpath (param \"H6\")))\n\
-             (deny file-read* file-write* (subpath (param \"H7\")))\n\
-             (deny file-read* file-write* (subpath (param \"H8\")))\n\
+             (allow file-read-data file-read-xattr file-write* (subpath (param \"W3\")))\n\
+             (allow file-read-data file-read-xattr file-write* (subpath (param \"W4\")))\n\
+             (allow file-read-data file-read-xattr file-write* (subpath (param \"T5\")))\n\
+             (allow file-read-data (literal (param \"A6\")))\n\
+             (deny file-write* (subpath (param \"P7\")))\n\
+             (deny file-read-data file-read-xattr file-read-metadata file-write* (subpath (param \"H8\")))\n\
+             (deny file-read-data file-read-xattr file-read-metadata file-write* (subpath (param \"H9\")))\n\
+             (deny file-read-data file-read-xattr file-read-metadata file-write* (subpath (param \"H10\")))\n\
              (deny mach-lookup (global-name \"com.apple.SecurityServer\") \
              (global-name \"com.apple.securityd.xpc\"))\n"
         );
@@ -579,17 +653,42 @@ mod tests {
         assert_eq!(
             values,
             [
-                "/tmp/agent",
                 "/home/op",
+                "/srv/shared-tmp",
                 "/home/op/.rustup",
                 "/home/op/wt",
                 "/srv/repo/.git",
+                "/tmp/agent",
+                "/home/op",
                 "/srv/repo/.git/hooks",
                 "/home/op/.ssh",
                 "/home/op/wt/.env",
                 "/srv/run",
             ]
         );
+    }
+
+    /// `getcwd` on macOS lists each folder above the working directory, so
+    /// the folders above an opened one, inside the home or a closed folder,
+    /// can be listed, themselves only: their files stay closed. Checked live
+    /// on 2026-09-29: without it `pwd -P`, Python's `getcwd` and git fail
+    /// with "Operation not permitted" in a worktree under a closed folder.
+    #[test]
+    fn the_folders_above_an_opened_one_can_be_listed_and_no_more() {
+        let (profile, params) = seatbelt_profile(&policy()).unwrap();
+        let listed: Vec<&str> = params
+            .iter()
+            .filter(|(name, _)| name.starts_with('A'))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        // Above the home's opened folders: the home itself, and nothing
+        // outside the home or a closed folder.
+        assert_eq!(listed, ["/home/op"]);
+        assert!(profile.contains("(allow file-read-data (literal (param \"A"));
+        // Listing comes after the closing rules, and before the hidden ones.
+        let list = profile.find("(literal").unwrap();
+        assert!(profile.find("(param \"C1\")").unwrap() < list);
+        assert!(list < profile.find("file-read-metadata").unwrap());
     }
 
     #[cfg(unix)]
@@ -605,7 +704,10 @@ mod tests {
     #[test]
     fn the_bwrap_arguments_bind_the_policy_in_order() {
         let kind = |path: &Path| match path.to_str() {
-            Some("/run/user" | "/home/op" | "/home/op/.ssh" | "/srv/run") => Some(Kind::Directory),
+            Some(
+                "/run/user" | "/var/tmp" | "/home/op" | "/home/op/.ssh" | "/srv/run"
+                | "/srv/shared-tmp",
+            ) => Some(Kind::Directory),
             Some("/home/op/wt/.env") => Some(Kind::File),
             _ => None,
         };
@@ -629,7 +731,11 @@ mod tests {
             "--tmpfs",
             "/run/user",
             "--tmpfs",
+            "/var/tmp",
+            "--tmpfs",
             "/home/op",
+            "--tmpfs",
+            "/srv/shared-tmp",
             "--dir",
             "/tmp/agent",
             "--tmpfs",

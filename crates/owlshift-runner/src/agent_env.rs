@@ -14,7 +14,8 @@
 //! The sandbox leaves the home unreadable but for the folders a run needs
 //! ([`AgentEnv::policy`]), writes nowhere but the worktree, the repository's
 //! git folder (not its hooks or configuration), the harness's own login
-//! folder and the temporary folders, and closes the system credential store.
+//! folder and the run's own temporary folder, closes the temporary folders
+//! the user's other processes share, and closes the system credential store.
 //! An agent environment is always confined: the only way out is
 //! `without_confinement`, compiled for the test bench alone.
 //!
@@ -62,7 +63,14 @@ pub struct RunPaths {
     pub writable: Vec<PathBuf>,
     /// Paths neither read nor written, such as the runner's run folder.
     pub hidden: Vec<PathBuf>,
+    /// The run's own temporary folder, made by the runner and removed with
+    /// the run: the only temporary folder the agent writes, which `TMPDIR`,
+    /// `TMP` and `TEMP` name. `None`: no temporary folder is written.
+    pub temp: Option<PathBuf>,
 }
+
+/// The variables that name a temporary folder.
+const TEMP_VARIABLES: &[&str] = &["TMPDIR", "TMP", "TEMP"];
 
 /// Credential files and folders under the home, closed even when a folder
 /// that holds them is opened. Paths are relative to the home.
@@ -222,22 +230,26 @@ impl AgentEnv {
         }
         writable.extend(run.writable.iter().cloned());
 
-        let mut temp = Vec::new();
-        if let Some(dir) = self.var("TMPDIR").map(PathBuf::from)
-            && dir.is_absolute()
-        {
-            temp.push(dir);
-        }
-        #[cfg(target_os = "macos")]
-        temp.push(PathBuf::from("/tmp"));
+        // The temporary folders the runner inherited are shared with the
+        // user's other processes: closed, never opened. Only the run's own
+        // folder is written.
+        let mut closed: Vec<PathBuf> = TEMP_VARIABLES
+            .iter()
+            .filter_map(|name| self.var(name).map(PathBuf::from))
+            .chain([std::env::temp_dir()])
+            .filter(|dir| dir.is_absolute() && dir.parent().is_some())
+            .collect();
+        closed.sort();
+        closed.dedup();
 
         Policy {
             home,
+            closed,
             readable,
             writable,
             protected,
             hidden,
-            temp,
+            temp: run.temp.iter().cloned().collect(),
             workdir: run.workdir.clone(),
         }
     }
@@ -259,6 +271,20 @@ impl AgentEnv {
             inner
         };
         self.apply(&mut command);
+        // The temporary folder is the run's own, never the one inherited.
+        match &run.temp {
+            Some(dir) => {
+                for name in TEMP_VARIABLES {
+                    command.env(name, dir);
+                }
+            }
+            None if self.confined => {
+                for name in TEMP_VARIABLES {
+                    command.env_remove(name);
+                }
+            }
+            None => {}
+        }
         Ok(command)
     }
 
@@ -656,6 +682,7 @@ mod tests {
             readable: vec!["/opt/claude".into()],
             writable: vec!["/home/op/login".into()],
             hidden: vec!["/srv/run".into()],
+            temp: Some("/srv/run-temp".into()),
         };
         let policy = agent.policy(&run);
         let has = |list: &[PathBuf], path: &str| list.iter().any(|p| p == Path::new(path));
@@ -695,7 +722,12 @@ mod tests {
         ] {
             assert!(has(&policy.hidden, path), "{path}");
         }
-        assert!(has(&policy.temp, "/tmp/op"));
+        // The inherited temporary folder is closed; the run's own is the
+        // only one written.
+        assert!(has(&policy.closed, "/tmp/op"), "{:?}", policy.closed);
+        assert!(has(&policy.closed, &std::env::temp_dir().to_string_lossy()));
+        assert_eq!(policy.temp, [PathBuf::from("/srv/run-temp")]);
+        assert!(!has(&policy.writable, "/tmp/op"));
         assert_eq!(policy.workdir, Path::new("/srv/wt"));
     }
 

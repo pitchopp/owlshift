@@ -294,10 +294,20 @@ impl Executor {
         let needs = harness
             .sandbox_needs(&self.agent)
             .map_err(ExecutorError::Command)?;
+        // The run's own temporary folder: private to the user, removed when
+        // `run` returns, after every process of the run is stopped.
+        let temp = tempfile::Builder::new()
+            .prefix("owlshift-run-")
+            .tempdir()
+            .map_err(|source| ExecutorError::RunDir {
+                path: std::env::temp_dir(),
+                source,
+            })?;
         let mut paths = self.run_paths(spec)?;
         let inner = harness.command(&context).map_err(ExecutorError::Command)?;
         paths.readable = needs.readable;
         paths.writable = needs.writable;
+        paths.temp = Some(temp.path().to_owned());
         let mut command = self
             .agent
             .confine(inner, &paths)
@@ -379,6 +389,7 @@ impl Executor {
             readable: Vec::new(),
             writable: Vec::new(),
             hidden: vec![spec.run_dir.to_owned()],
+            temp: None,
         })
     }
 }

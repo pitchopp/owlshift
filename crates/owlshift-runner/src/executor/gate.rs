@@ -690,19 +690,85 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&env_file, "API_KEY=FAKE_owl41\n").unwrap();
+        // The runner's inherited `TMPDIR` names a folder holding a secret,
+        // and another sits in the temporary folder every process shares.
+        let inherited_tmp = base.path().join("inherited-tmp");
+        std::fs::create_dir_all(&inherited_tmp).unwrap();
+        let in_tmpdir = inherited_tmp.join("secret.txt");
+        std::fs::write(&in_tmpdir, "FAKE_owl41\n").unwrap();
+        let shared = tempfile::Builder::new()
+            .prefix("owlshift-owl41-shared-")
+            .tempfile()
+            .unwrap();
+        std::fs::write(shared.path(), "FAKE_owl41\n").unwrap();
+        let run_temp = base.path().join("run-temp");
+        std::fs::create_dir_all(&run_temp).unwrap();
+        // git's configuration folder is opened; a credential file in it is
+        // not.
+        let git_config = home.join(".config/git");
+        std::fs::create_dir_all(&git_config).unwrap();
+        std::fs::write(git_config.join("config"), "[core]\n").unwrap();
+        let git_credentials = git_config.join("credentials");
+        std::fs::write(&git_credentials, "https://u:FAKE_owl41@example.invalid\n").unwrap();
 
         let parent = std::env::vars_os()
-            .filter(|(name, _)| name != "HOME")
-            .chain([("HOME".into(), home.clone().into_os_string())]);
+            .filter(|(name, _)| {
+                !["HOME", "TMPDIR", "XDG_CONFIG_HOME"].contains(&&*name.to_string_lossy())
+            })
+            .chain([
+                ("HOME".into(), home.clone().into_os_string()),
+                ("TMPDIR".into(), inherited_tmp.clone().into_os_string()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    home.join(".config").into_os_string(),
+                ),
+            ]);
         let confined = AgentEnv::new(parent, &[]).unwrap();
         let bare = confined.clone().without_confinement();
-        let paths = paths(&worktree);
+        let paths = RunPaths {
+            temp: Some(run_temp.clone()),
+            ..paths(&worktree)
+        };
 
-        for file in [&token, &env_file] {
+        for file in [&token, &env_file, &in_tmpdir, &shared.path().to_owned()] {
             let line = format!("cat '{}'", file.display());
             gate_with(&bare, &paths, &line).expect("the bare control reads it");
             refused(gate_with(&confined, &paths, &line), &line);
         }
+
+        // Inside the opened folder, its configuration is read and the
+        // credential file is not: refused on macOS, empty on Linux.
+        gate_with(
+            &confined,
+            &paths,
+            &format!("cat '{}/config'", git_config.display()),
+        )
+        .expect("the opened git configuration is read");
+        let line = format!("grep -q FAKE_owl41 '{}'", git_credentials.display());
+        gate_with(&bare, &paths, &line).expect("the bare control finds the secret");
+        refused(gate_with(&confined, &paths, &line), &line);
+
+        // The inherited temporary folder is not written either; the run's
+        // own is, and it is the one `TMPDIR` names.
+        let planted = inherited_tmp.join("planted.txt");
+        let _ = gate_with(
+            &confined,
+            &paths,
+            &format!("echo planted > '{}'", planted.display()),
+        );
+        assert!(
+            !planted.exists(),
+            "a confined write reached the inherited TMPDIR"
+        );
+        gate_with(
+            &confined,
+            &paths,
+            &format!(
+                "test \"$TMPDIR\" = '{}' && echo ok > \"$TMPDIR/scratch.txt\"",
+                run_temp.display()
+            ),
+        )
+        .expect("the run writes in its own temporary folder");
 
         let zshrc = home.join(".zshrc");
         let _ = gate_with(
@@ -713,6 +779,11 @@ mod tests {
         assert!(!zshrc.exists(), "a confined write reached the home");
 
         gate_with(&confined, &paths, "echo ok > written.txt").unwrap();
+        // The worktree lies in a closed temporary folder, as it lies in the
+        // closed home in real runs: its working directory can still be read
+        // by the program `pwd`, not the shell's own.
+        gate_with(&confined, &paths, "/bin/pwd -P > /dev/null")
+            .expect("a confined command reads its working directory");
         assert_eq!(
             std::fs::read_to_string(worktree.join("written.txt")).unwrap(),
             "ok\n"
