@@ -9,7 +9,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// Held by each `do` of this file: see `Bench::run`.
+static RUNS: Mutex<()> = Mutex::new(());
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -271,6 +274,15 @@ impl Bench {
     /// Runs `owlshift do DEMO-1` with one reply per run; returns its outcome
     /// and what it printed.
     fn run(&self, replies: Vec<Reply>, first: Option<Agent>) -> (Result<Delivered, Stop>, String) {
+        // One `do` at a time in this process. A run forks children (the
+        // gate's `sh`, the agent's `git`: a command that sets PATH and names
+        // a bare program is forked, not spawned), and a child forked by one
+        // test's thread shares every file the process has open until it
+        // execs, another test's project lock included: that test's next
+        // `do` on the project would then find its own lock still held
+        // (seen on macOS CI, where forking is slow). `owlshift do` itself
+        // takes the lock once per process.
+        let _one_at_a_time = RUNS.lock().unwrap_or_else(PoisonError::into_inner);
         let replies = replies
             .into_iter()
             .map(|reply| {

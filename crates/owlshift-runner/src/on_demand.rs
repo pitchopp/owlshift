@@ -323,6 +323,10 @@ impl OnDemand<'_> {
     /// documentation.
     pub fn run(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
         check_team(self.config, ticket).map_err(Stop::Refused)?;
+        // The lock before the marker: every run writes the marker when it
+        // starts, so while another `do` works the project the marker only
+        // says a run is in flight. Once the lock is ours, a marker means a
+        // run that ended, or was cut off, before its check passed.
         let _lock = match self.dirs.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return Err(Stop::Busy(self.dirs.root().to_owned())),

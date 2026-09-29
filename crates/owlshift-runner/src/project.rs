@@ -134,6 +134,16 @@ impl ProjectDirs {
 
     /// Takes the project's lock, held until the returned value is dropped or
     /// the process ends; `None` when another process holds it.
+    ///
+    /// The lock belongs to an open file description (`flock` on Unix), which
+    /// a child forked by any thread of the process shares until it execs.
+    /// The standard library forks, rather than using `posix_spawn`, for a
+    /// command that sets `PATH` and names a bare program, as the gate's
+    /// `sh` and the agent's `git` do. So a lock just released can still look
+    /// held for the few moments a child forked by another thread takes to
+    /// exec. `owlshift do` takes it once per process, so this matters only
+    /// where one process runs several `do` in threads: the tests, which run
+    /// them one at a time.
     pub fn lock(&self) -> io::Result<Option<ProjectLock>> {
         fs::create_dir_all(&self.root)?;
         let file = OpenOptions::new()
