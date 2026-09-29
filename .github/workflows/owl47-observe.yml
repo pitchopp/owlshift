@@ -22,5 +22,15 @@ jobs:
           persist-credentials: false
       - name: Install the pinned toolchain
         run: rustup toolchain install
-      - name: Ctrl-C on doctor
+      - name: Ctrl-C on doctor, every case once
+        continue-on-error: true
         run: cargo test -p owlshift-cli --test cli --locked ctrl_c -- --nocapture --test-threads=1
+      - name: Ctrl-C on doctor, the probe that ignores it, five times
+        run: |
+          $passed = 0
+          for ($i = 1; $i -le 5; $i++) {
+            cargo test -p owlshift-cli --test cli --locked -- --exact ctrl_c_on_doctor_stops_a_probe_that_ignores_it_and_its_child --nocapture
+            if ($LASTEXITCODE -eq 0) { $passed++ }
+          }
+          Write-Output "OWL-47: the probe that ignores Ctrl-C was stopped in $passed of 5 runs"
+          exit 0

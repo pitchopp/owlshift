@@ -448,7 +448,8 @@ mod windows_ctrl_c {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = driver.kill();
+                // With `owlshift` and the probe, if still there.
+                stop(&[driver.id()]);
                 break driver.wait().unwrap();
             }
             thread::sleep(Duration::from_millis(50));
@@ -541,6 +542,18 @@ mod windows_ctrl_c {
         println!("probe: {}", fs::read_to_string(&pids).unwrap());
         let started = read_pids(&pids);
         assert_eq!(started.len(), 2, "{started:?}");
+        // So that a probe gone for another reason is never taken for one the
+        // Ctrl-C stopped.
+        let early: Vec<u32> = started
+            .iter()
+            .copied()
+            .filter(|&pid| !is_alive(pid))
+            .collect();
+        if !early.is_empty() {
+            let _ = owlshift.kill();
+            stop(&started);
+            panic!("gone before the Ctrl-C: {early:?} of the probe and its child {started:?}");
+        }
 
         let sent = Instant::now();
         // SAFETY: no pointer argument; group 0 is every process attached to
@@ -564,6 +577,11 @@ mod windows_ctrl_c {
             thread::sleep(Duration::from_millis(20));
         };
         let ended = sent.elapsed();
+        // The driver's own handler runs on a thread of its own, maybe later.
+        while !CTRL_C_SEEN.load(Ordering::SeqCst) && sent.elapsed() < ended + Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
         let seen = CTRL_C_SEEN.load(Ordering::SeqCst);
         println!(
             "owlshift ended {ended:?} after Ctrl-C: {status}; Ctrl-C seen by the driver: {seen}"
