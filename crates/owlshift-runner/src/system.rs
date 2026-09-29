@@ -4,14 +4,20 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(unix)]
-pub use owlshift_platform::process::SentinelStatus;
 pub use owlshift_platform::process::{Captured, RunError};
+#[cfg(unix)]
+pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
 /// How long a probe such as `git --version` may take. C8 measured about
 /// 0.1 s for the harness status commands.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a test sentinel may take to stop its test process group once
+/// its input ended (OWL-90): the bound the OWL-86 tests check, within a
+/// probe's deadline. It takes a few milliseconds.
+pub const SENTINEL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const _: () = assert!(SENTINEL_PROBE_TIMEOUT.as_millis() < PROBE_TIMEOUT.as_millis());
 
 pub trait System {
     /// Finds a program on the `PATH`.
@@ -31,6 +37,12 @@ pub trait System {
     #[cfg(unix)]
     fn sentinel(&self) -> SentinelStatus {
         owlshift_platform::process::sentinel_status()
+    }
+    /// Whether a sentinel stops a process group it was told of when its
+    /// input ends, tried on a test sentinel and a test group (OWL-90).
+    #[cfg(unix)]
+    fn sentinel_probe(&self) -> SentinelProbe {
+        owlshift_platform::process::probe_sentinel(SENTINEL_PROBE_TIMEOUT)
     }
 }
 
@@ -113,6 +125,9 @@ pub(crate) mod fake {
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
+        /// How the sentinel probe ends; `None`: the test sentinel works.
+        #[cfg(unix)]
+        sentinel_probe: Option<SentinelProbe>,
     }
 
     impl FakeSystem {
@@ -126,6 +141,13 @@ pub(crate) mod fake {
         #[cfg(unix)]
         pub(crate) fn sentinel_is(mut self, status: SentinelStatus) -> Self {
             self.sentinel = Some(status);
+            self
+        }
+
+        /// The sentinel probe ends so.
+        #[cfg(unix)]
+        pub(crate) fn sentinel_probe_is(mut self, probe: SentinelProbe) -> Self {
+            self.sentinel_probe = Some(probe);
             self
         }
 
@@ -191,6 +213,13 @@ pub(crate) mod fake {
             self.sentinel
                 .clone()
                 .unwrap_or(SentinelStatus::Running { pid: 4242 })
+        }
+
+        #[cfg(unix)]
+        fn sentinel_probe(&self) -> SentinelProbe {
+            self.sentinel_probe.clone().unwrap_or(SentinelProbe::Works {
+                elapsed: Duration::from_millis(3),
+            })
         }
     }
 }

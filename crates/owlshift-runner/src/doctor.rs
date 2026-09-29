@@ -17,9 +17,9 @@ use owlshift_contracts::config::TrackerKind;
 
 use crate::config::{Effective, FileState, exit_text};
 use crate::executor::harness::claude_login_command;
-#[cfg(unix)]
-use crate::system::SentinelStatus;
 use crate::system::{RunError, System, exact_version_of, version_of};
+#[cfg(unix)]
+use crate::system::{SentinelProbe, SentinelStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -69,6 +69,8 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(sandbox_check(system));
     #[cfg(unix)]
     checks.push(sentinel_check(&system.sentinel()));
+    #[cfg(unix)]
+    checks.push(sentinel_probe_check(&system.sentinel_probe()));
     if harnesses.contains(&Harness::Claude) {
         checks.push(agent_login_check(
             system,
@@ -187,6 +189,41 @@ fn sentinel_check(status: &SentinelStatus) -> Check {
             Status::Warn,
             format!("not running, it could not start: {UNPROTECTED}"),
             Some("check that `/bin/sh` runs; the error is printed above"),
+        ),
+    }
+}
+
+/// Whether a sentinel works on this host, not only runs: a test sentinel,
+/// told of a test process group, stops it when its input ends (OWL-90).
+/// Independent of the `sentinel` line, and, like it, a warning at worst.
+#[cfg(unix)]
+fn sentinel_probe_check(probe: &SentinelProbe) -> Check {
+    const SUBJECT: &str = "sentinel test";
+    const UNPROTECTED: &str = "a hard kill of Owlshift may leave the processes it started running";
+    match probe {
+        SentinelProbe::Works { elapsed } => check(
+            SUBJECT,
+            Status::Ok,
+            format!(
+                "a test sentinel stopped a test process group {} ms after its input ended",
+                elapsed.as_millis()
+            ),
+            None,
+        ),
+        SentinelProbe::CannotStart(why) => check(
+            SUBJECT,
+            Status::Warn,
+            format!("could not start {why}: {UNPROTECTED}"),
+            Some("check that `/bin/sh` runs"),
+        ),
+        SentinelProbe::Fails(why) => check(
+            SUBJECT,
+            Status::Warn,
+            format!("{why}: {UNPROTECTED}"),
+            Some(
+                "check that `/bin/sh` is a POSIX shell whose `kill -s KILL -- -<group>` stops \
+                 a process group",
+            ),
         ),
     }
 }
@@ -573,6 +610,43 @@ mod tests {
             assert_eq!(sentinel.status, Status::Warn, "{report}");
             assert!(sentinel.detail.starts_with(detail), "{report}");
             assert!(sentinel.fix.as_deref().unwrap().contains(fix), "{report}");
+        }
+    }
+
+    /// OWL-90: a test sentinel that does not stop its test group, or cannot
+    /// be started, is a warning that says why, never a failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_sentinel_that_fails_its_test_warns_without_failing() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let works = run(&ready(), &no_config());
+        let probe = line(&works, "sentinel test");
+        assert_eq!(probe.status, Status::Ok, "{works}");
+        assert!(
+            probe
+                .detail
+                .starts_with("a test sentinel stopped a test process group 3 ms"),
+            "{works}"
+        );
+
+        for (probe, detail, fix) in [
+            (
+                SentinelProbe::Fails("the test group still ran 5000 ms".into()),
+                "the test group still ran 5000 ms: a hard kill of Owlshift may leave",
+                "`kill -s KILL -- -<group>`",
+            ),
+            (
+                SentinelProbe::CannotStart("a test sentinel: no such file".into()),
+                "could not start a test sentinel: no such file: a hard kill",
+                "check that `/bin/sh` runs",
+            ),
+        ] {
+            let report = run(&ready().sentinel_probe_is(probe), &no_config());
+            let tested = line(&report, "sentinel test");
+            assert!(report.ready(), "{report}");
+            assert_eq!(tested.status, Status::Warn, "{report}");
+            assert!(tested.detail.starts_with(detail), "{report}");
+            assert!(tested.fix.as_deref().unwrap().contains(fix), "{report}");
         }
     }
 
