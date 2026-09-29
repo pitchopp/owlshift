@@ -99,12 +99,63 @@ pub struct Stack {
     /// operator does not allow in the personal `allow_gate_env`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_env: Vec<String>,
+    /// The files whose text reaches agents as the project's rules, paths
+    /// from the repository's root with `/` between folders, in order. Each is
+    /// read at the base commit, taken whole, and must exist there; a blank
+    /// file gives no rule. Files only, at most 32, and 64 KiB for all of them
+    /// together. Left out, the rules are the root `AGENTS.md` when the base
+    /// commit has one; `[]` gives no rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<String>>,
 }
+
+/// The most files [`Stack::rules`] may name.
+pub const MAX_RULE_FILES: usize = 32;
 
 impl Stack {
     /// The names of [`Stack::gate_env`], as the agent environment takes them.
     pub fn gate_env_names(&self) -> Vec<&str> {
         self.gate_env.iter().map(String::as_str).collect()
+    }
+
+    /// Checks the paths of [`Stack::rules`]: each a path from the
+    /// repository's root, `/` between its parts, none empty, `.` or `..`,
+    /// no `\` or control character, none named twice (compared as written),
+    /// and at most [`MAX_RULE_FILES`].
+    fn check_rules(&self) -> Result<(), String> {
+        let Some(paths) = &self.rules else {
+            return Ok(());
+        };
+        if paths.len() > MAX_RULE_FILES {
+            return Err(format!(
+                "{} files named, over the {MAX_RULE_FILES} Owlshift takes as rules",
+                paths.len()
+            ));
+        }
+        for (i, path) in paths.iter().enumerate() {
+            if path.chars().any(char::is_control) {
+                return Err(format!(
+                    "{path:?} holds a control character: name a file by its path"
+                ));
+            }
+            if path.contains('\\') {
+                return Err(format!("{path:?} holds `\\`: separate folders with `/`"));
+            }
+            if path.starts_with('/') {
+                return Err(format!(
+                    "{path:?} starts with `/`: name a file from the repository's root"
+                ));
+            }
+            if path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                return Err(format!(
+                    "{path:?} is not a file's path: no part of it may be empty, `.` or `..`"
+                ));
+            }
+            if paths[..i].contains(path) {
+                return Err(format!("{path:?} is named twice"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -169,6 +220,9 @@ impl ProjectConfig {
                 "tracker.team is required for Linear",
             ));
         }
+        self.stack
+            .check_rules()
+            .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.rules: {reason}")))?;
         check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
     }
 
@@ -400,7 +454,7 @@ mod tests {
         );
     }
 
-    fn project_with_gate_env(names: &str) -> Result<ProjectConfig, ContractError> {
+    fn project_with_stack(stack: &str) -> Result<ProjectConfig, ContractError> {
         ProjectConfig::parse(&format!(
             r#"
             requires = ">=0.1"
@@ -410,7 +464,7 @@ mod tests {
             states = {{ ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }}
             [stack]
             gate = ["make test"]
-            gate_env = {names}
+            {stack}
             [pipeline]
             default = "trivial"
             plan_approval = "never"
@@ -419,6 +473,61 @@ mod tests {
             always_human = []
             "#
         ))
+    }
+
+    fn project_with_gate_env(names: &str) -> Result<ProjectConfig, ContractError> {
+        project_with_stack(&format!("gate_env = {names}"))
+    }
+
+    #[test]
+    fn rules_name_files_from_the_repository_root() {
+        // Left out, the key stays out of the rendered file; `[]` is kept, as
+        // it means no rule rather than the default.
+        let absent = project_with_stack("").unwrap();
+        assert_eq!(absent.stack.rules, None);
+        assert!(!absent.render().contains("rules"));
+        let none = project_with_stack("rules = []").unwrap();
+        assert_eq!(none.stack.rules, Some(Vec::new()));
+        assert!(none.render().contains("rules = []"));
+        let named =
+            project_with_stack(r#"rules = ["AGENTS.md", ".claude/rules/testing.md"]"#).unwrap();
+        assert_eq!(
+            named.stack.rules.as_deref(),
+            Some(
+                &[
+                    "AGENTS.md".to_owned(),
+                    ".claude/rules/testing.md".to_owned()
+                ][..]
+            )
+        );
+
+        let many: Vec<String> = (0..=MAX_RULE_FILES)
+            .map(|i| format!("\"r{i}.md\""))
+            .collect();
+        let many = format!("[{}]", many.join(", "));
+        for (paths, reason) in [
+            (r#"[""]"#, "no part of it may be empty"),
+            (r#"["/etc/passwd"]"#, "starts with `/`"),
+            (r#"["docs\\rules.md"]"#, "separate folders with `/`"),
+            (
+                r#"["docs/../AGENTS.md"]"#,
+                "no part of it may be empty, `.` or `..`",
+            ),
+            (r#"["./AGENTS.md"]"#, "`.` or `..`"),
+            (r#"["docs//rules.md"]"#, "may be empty"),
+            (r#"["docs/"]"#, "may be empty"),
+            (r#"["AGENTS.md\u0000"]"#, "control character"),
+            (r#"["AGENTS.md", "AGENTS.md"]"#, "named twice"),
+            (many.as_str(), "33 files named, over the 32"),
+        ] {
+            let error = project_with_stack(&format!("rules = {paths}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("invalid owlshift.toml: stack.rules: ") && error.contains(reason),
+                "{paths}: {error}"
+            );
+        }
     }
 
     #[test]

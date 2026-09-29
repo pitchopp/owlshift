@@ -10,6 +10,7 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
 [stack]
 gate = ["make lint", "make test"]
 resources = { migrations = "backend/*/migrations/**" }
+rules = ["AGENTS.md", ".claude/rules/testing.md"]
 
 [pipeline]
 default = "standard"
