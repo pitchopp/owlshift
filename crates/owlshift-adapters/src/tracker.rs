@@ -101,7 +101,9 @@ pub struct Ticket {
     pub assignee: Option<Person>,
     pub labels: Vec<String>,
     /// Who created the ticket. Later edits of the description by someone else
-    /// do not change it: the tracker names the creator, not every editor.
+    /// do not change it: the tracker names the creator, not every editor. An
+    /// adapter that cannot hold the creator's account to be the writer
+    /// reports it as [`Author::Other`].
     pub author: Author,
 }
 
@@ -120,7 +122,8 @@ pub enum Author {
     /// A tracker account; only an account can be a ticket's decider.
     Account(Person),
     /// Anything else the tracker names: a bot, an integration, an external
-    /// user, or nobody it still knows.
+    /// user, an account the adapter does not hold to be the writer (a Linear
+    /// issue's creator), or nobody it still knows.
     Other { name: String },
 }
 

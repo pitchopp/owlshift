@@ -25,9 +25,9 @@ struct Case {
     /// Whether it has an assignee. Who it is differs between a live run and
     /// its pseudonymized recording, so the suite checks presence only.
     assigned: bool,
-    /// Whether its assignee's account created it, by the account's
-    /// identifier: what makes the description the decider's.
-    created_by_assignee: bool,
+    /// Whether the adapter reports its assignee's account as its author, by
+    /// the account's identifier: what makes the description the decider's.
+    author_is_assignee: bool,
     labels: &'static [&'static str],
     /// A ticket that does not exist.
     missing: TicketId,
@@ -64,12 +64,12 @@ fn check(tracker: &dyn Tracker, case: &Case) {
         ticket.assignee
     );
     assert_eq!(ticket.labels, case.labels);
-    let by_assignee = matches!(
+    let author_is_assignee = matches!(
         (&ticket.author, &ticket.assignee),
         (Author::Account(author), Some(assignee)) if author.id == assignee.id
     );
     assert_eq!(
-        by_assignee, case.created_by_assignee,
+        author_is_assignee, case.author_is_assignee,
         "{:?} for {:?}",
         ticket.author, ticket.assignee
     );
@@ -120,7 +120,7 @@ fn the_markdown_tracker_conforms() {
     fs::create_dir_all(dir.join("comments")).unwrap();
     fs::write(
         dir.join("ticket.md"),
-        "+++\ntitle = \"Add a greeting\"\nauthor = \"reporter\"\nstage = \"Todo\"\n\
+        "+++\ntitle = \"Add a greeting\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n\
          priority = \"medium\"\nassignee = \"maintainer\"\nlabels = [\"Feature\", \"Docs\"]\n+++\n\n\
          Say hello in the README.\n",
     )
@@ -142,7 +142,7 @@ fn the_markdown_tracker_conforms() {
         description_start: "Say hello",
         priority: Priority::Medium,
         assigned: true,
-        created_by_assignee: false,
+        author_is_assignee: true,
         labels: &["Feature", "Docs"],
         missing: id("DEMO-404"),
         body: BODY,
@@ -166,7 +166,9 @@ fn linear_case() -> Case {
         description_start: "**Why.**",
         priority: Priority::Medium,
         assigned: true,
-        created_by_assignee: true,
+        // Its assignee's account created it, but a holder of that account's
+        // API key could have (OWL-74): Linear never reports the account.
+        author_is_assignee: false,
         labels: &["Feature", "Adapters"],
         missing: id("OWL-99999"),
         body: BODY,
