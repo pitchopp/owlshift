@@ -118,8 +118,12 @@ pub struct RunSpec<'a> {
     pub worktree: &'a Path,
     /// The ticket's branch, checked out in the worktree.
     pub branch: &'a str,
-    /// What a new branch starts from: a commit, or a name resolved to one
-    /// when the branch is created. The isolation check leaves remote-tracking
+    /// What a new branch starts from, read only when the branch is created:
+    /// a full commit id, or a remote-tracking name such as `origin/main`,
+    /// looked up as exactly `refs/remotes/<name>` so a local branch named
+    /// like it cannot stand in for it (OWL-66). An abbreviated id, a local
+    /// branch name and a revision expression such as `origin/main~1` are
+    /// refused. The isolation check leaves remote-tracking
     /// refs out, so an earlier run can move `origin/main`: `owlshift do`
     /// passes the commit it resolved right after its fetch (OWL-51).
     pub base: &'a str,
