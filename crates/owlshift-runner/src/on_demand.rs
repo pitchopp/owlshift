@@ -15,7 +15,8 @@
 //!
 //! In this version the build stage is the whole pipeline: questions and a
 //! blocked run are printed, not posted (P2), the tracker's visible stage is
-//! not moved, and the project's rules are not injected into the brief.
+//! not moved. The brief carries the project's rules, read once per `do`
+//! at the base commit ([`crate::rules`]).
 
 use std::fmt;
 use std::fs;
@@ -33,8 +34,8 @@ use owlshift_adapters::forge::{Branch, CheckSet, CommitId, ErrorKind, PullReques
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry,
-    TicketBrief,
+    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, Relation, Rule,
+    ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
@@ -52,6 +53,7 @@ use crate::executor::{
     DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport, RunSpec,
 };
 use crate::project::{self, ProjectDirs};
+use crate::rules;
 use crate::writer::{DeliveryReport, Gate, Writer};
 
 /// How long one Build run may take before its process tree is stopped.
@@ -391,6 +393,11 @@ impl OnDemand<'_> {
             .forge
             .find_open_pull_request(&head, &base_branch)
             .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
+        // The rules come from the base commit, after the fetch, never from
+        // the ticket's branch, which agents write; every run of this `do`
+        // gets the same.
+        let rules = rules::project_rules(git, &checkout, &base)
+            .map_err(|e| refused("the project's rules", e))?;
         sink.emit(
             ticket,
             None,
@@ -402,6 +409,10 @@ impl OnDemand<'_> {
                 ("worktree", path(&worktree)),
                 ("checkout", path(&checkout)),
                 ("pull_request", json!(open.map(|pr| pr.number))),
+                (
+                    "rules",
+                    json!(rules.iter().map(|rule| &rule.source).collect::<Vec<_>>()),
+                ),
             ]),
         );
 
@@ -424,7 +435,7 @@ impl OnDemand<'_> {
                 .tracker
                 .comments(ticket)
                 .map_err(|e| refused(&format!("reading the comments of {ticket}"), e))?;
-            let brief = self.brief(&found, &decider, &comments, &worktree, &gathered);
+            let brief = self.brief(&found, &decider, &comments, &worktree, &rules, &gathered);
             sink.emit(
                 ticket,
                 Some(&run),
@@ -572,6 +583,7 @@ impl OnDemand<'_> {
         decider: &Person,
         comments: &[Comment],
         worktree: &Path,
+        rules: &[Rule],
         gathered: &Gathered,
     ) -> Brief {
         let thread = comments
@@ -604,7 +616,7 @@ impl OnDemand<'_> {
             checkpoint: checkpoint(worktree),
             zones: Vec::new(),
             resources: Vec::new(),
-            rules: Vec::new(),
+            rules: rules.to_vec(),
             permissions: Permissions {
                 level: PermissionLevel::WriteWorktree,
                 network: false,
