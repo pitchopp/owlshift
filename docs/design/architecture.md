@@ -286,7 +286,7 @@ Owlshift works on its own backlog, in a dedicated Linear workspace, from P1; the
 
 ## 12. Decisions
 
-D1, D2, D3, D5, D7, D10 and D11 are agreed; five decisions remain open, none of them blocking P0. Also settled: open source under Apache-2.0, repository content in English, tracker, forge and harness as adapters.
+D1, D2, D3, D5, D7, D9, D10 and D11 are agreed; four decisions remain open, none of them blocking P0. Also settled: open source under Apache-2.0, repository content in English, tracker, forge and harness as adapters.
 
 | # | Decision | Outcome or recommendation | Status |
 | --- | --- | --- | --- |
@@ -298,7 +298,7 @@ D1, D2, D3, D5, D7, D10 and D11 are agreed; five decisions remain open, none of 
 | D6 | Second validation project for P9 | A project on another stack, ideally on GitHub Issues; to name | Open |
 | D7 | Default runner location | The developer's machine; a team server is a P10 mode | Agreed |
 | D8 | Agent identity on Linear from P2 | Create a Linear app user, after check C4 confirms it works with polling and no public webhook endpoint; the `[agent]` marker otherwise | Open |
-| D9 | Windows scope | WSL2 from P1; native Windows only when a user needs it. Native confinement under way: agent commands can start through a launcher inside the run's Job Object (OWL-71); a plain AppContainer cannot run git, since it cannot open `NUL`, and a restricted token was compared (OWL-72, [build plan](build-plan.md#results)); until one is chosen and built, native Windows runs no agent | Open |
+| D9 | Windows scope | WSL2 from P1; native Windows only when a user needs it. Decided 2026-09-29: native Windows confinement is set aside; a confined run is refused there and WSL2 is the supported path. The live checks (OWL-72: a plain AppContainer cannot run git, a restricted token was compared, [build plan](build-plan.md#results)) are the starting point if native Windows comes back; the `owlshift-launch` launcher is test-only and is to be removed (decided 2026-09-30, OWL-89) | Agreed |
 | D10 | Contribution terms | Developer Certificate of Origin sign-off on every commit, no CLA (decided 2026-09-28): light for contributors, authorship still traced; see `CONTRIBUTING.md` | Agreed |
 | D11 | Where the code lives | `~/Projects/owlshift`, on the personal GitHub account (`pitchopp/owlshift`), no dedicated organisation | Agreed |
 | D12 | Minimum supported systems | Set at the first release: the two latest macOS versions, the current Ubuntu LTS, Windows 11 with WSL2 | Open |

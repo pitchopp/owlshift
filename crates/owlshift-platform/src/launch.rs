@@ -1,15 +1,17 @@
 //! `owlshift-launch`, the program that starts an agent command on native
-//! Windows (OWL-71): the runner starts it as the root of the run's process
-//! tree, inside its Job Object, and it creates the program itself with
-//! `CreateProcessW`. A process in a job starts its children in that job
-//! (`tree.rs` allows no breakaway), so stopping the tree stops the program
-//! and everything it started.
+//! Windows (OWL-71). It is test-only: native confinement is set aside (build
+//! plan, 2026-09-29) and the launcher is slated for removal (OWL-89). The
+//! runner starts it as the root of the run's process tree, inside its Job
+//! Object, and it creates the program itself with `CreateProcessW`. A
+//! process in a job starts its children in that job (`tree.rs` allows no
+//! breakaway), so stopping the tree stops the program and everything it
+//! started.
 //!
 //! It is a program of its own because std's `Command` on stable Rust cannot
 //! pass a proc-thread attribute (checked on rustc 1.98.1 on 2026-09-29, build
-//! plan, "OWL-71"), and the AppContainer OWL-72 adds is one: that is the one
-//! call to extend, with `STARTUPINFOEXW` and `SECURITY_CAPABILITIES`. Today
-//! it applies nothing.
+//! plan, "OWL-71"), and an AppContainer is given through one
+//! (`STARTUPINFOEXW` with `SECURITY_CAPABILITIES`). No AppContainer is
+//! planned; it applies nothing.
 //!
 //! Its arguments are exactly `-- PROGRAM LINE`, which `sandbox::wrap` and
 //! `sandbox::wrap_line` build. `LINE` is the rest of the program's command
