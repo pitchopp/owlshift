@@ -196,6 +196,23 @@ fn a_runs_own_work_passes_and_every_breach_is_found() {
     );
 }
 
+/// A main checkout whose status is larger than the probes' 64 KiB output cap
+/// is read whole: a breach listed past that point is still found.
+#[test]
+fn a_breach_past_64_kib_of_status_is_found() {
+    let f = Fixture::new();
+    // 1,200 untracked files of 60-byte names: some 74 KiB of status before
+    // the breach, which sorts after them.
+    let filler = "x".repeat(54);
+    for n in 0..1200 {
+        fs::write(f.main.join(format!("a{n:04}-{filler}")), "").unwrap();
+    }
+    assert_eq!(
+        f.around(|f| fs::write(f.main.join("z-breach.txt"), "x").unwrap()),
+        [files(&["z-breach.txt"])]
+    );
+}
+
 #[test]
 fn a_rebase_run_may_land_on_its_new_base_and_nowhere_else() {
     let f = Fixture::new();

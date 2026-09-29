@@ -62,7 +62,6 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
             None,
         )
         .map_err(worktree_error)?
-        .status
         .success();
     let mut args: Vec<&OsStr> = vec!["worktree".as_ref(), "add".as_ref(), "--quiet".as_ref()];
     let base;
@@ -145,7 +144,7 @@ fn check_spec(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
                 None,
             )
             .map_err(|e| ExecutorError::Spec(e.to_string()))?;
-        checked.status.success() && String::from_utf8_lossy(&checked.stdout).trim() == spec.branch
+        checked.success() && String::from_utf8_lossy(&checked.stdout).trim() == spec.branch
     };
     if valid {
         Ok(())

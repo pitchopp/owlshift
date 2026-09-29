@@ -3,25 +3,28 @@
 //! agent. The gate's checks run with the agent environment
 //! ([`Git::as_agent`]).
 //!
-//! Each command runs as the root of a process tree stopped at
-//! [`GIT_TIMEOUT`], like the harness. Its output is kept whole:
-//! `owlshift_platform::process::run_command` keeps 64 KiB, which would cut a
-//! large repository's status and blind the isolation check.
+//! Each command runs through `owlshift_platform::process::run_command`, as
+//! the root of a process tree stopped at [`GIT_TIMEOUT`]. Its output is kept
+//! whole ([`WHOLE_OUTPUT`]): the probes' 64 KiB would cut a large
+//! repository's status and blind the isolation check.
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
-use super::watch;
+use owlshift_platform::process::{Captured, RunError, run_command};
+
 use crate::agent_env::AgentEnv;
+use crate::config::exit_text;
 
 /// How long one of the executor's git commands may take.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The output cap of the executor's git commands: none.
+const WHOLE_OUTPUT: usize = usize::MAX;
 
 /// How the executor runs git: a program, and what to set on each command.
 #[derive(Clone)]
@@ -72,47 +75,28 @@ impl Git {
         dir: &Path,
         args: &[S],
         input: Option<&[u8]>,
-    ) -> Result<Output, GitError> {
-        let failed = |detail| GitError::new(dir, args, detail);
+    ) -> Result<Captured, GitError> {
         let mut command = Command::new(&self.program);
         command.args(args).current_dir(dir);
         (self.setup)(&mut command);
         // Messages in English, whatever the operator's locale.
-        command
-            .env("LC_ALL", "C")
-            .env("LANGUAGE", "")
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let (mut child, _tree, watchdog) = watch::spawn(&mut command, GIT_TIMEOUT)
-            .map_err(|e| failed(format!("could not run: {e}")))?;
-        if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
-            let input = input.to_vec();
-            thread::spawn(move || {
-                // A git that exits without reading all its input closes the
-                // pipe; its status tells the rest.
-                let _ = stdin.write_all(&input);
-            });
-        }
-        let output = child.wait_with_output();
-        if watchdog.finish() {
-            return Err(failed(format!(
-                "did not finish within {} s",
-                GIT_TIMEOUT.as_secs()
-            )));
-        }
-        output.map_err(|e| failed(format!("could not be read: {e}")))
+        command.env("LC_ALL", "C").env("LANGUAGE", "");
+        run_command(&mut command, input, GIT_TIMEOUT, WHOLE_OUTPUT).map_err(|error| {
+            let detail = match error {
+                RunError::Io(e) => format!("could not run: {e}"),
+                RunError::TimedOut => {
+                    format!("did not finish within {} s", GIT_TIMEOUT.as_secs())
+                }
+            };
+            GitError::new(dir, args, detail)
+        })
     }
 
     /// Runs git in `dir` and returns its standard output; a non-zero exit is
     /// an error carrying the end of its standard error.
     pub(crate) fn run<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Vec<u8>, GitError> {
         let output = self.output(dir, args, None)?;
-        if output.status.success() {
+        if output.success() {
             Ok(output.stdout)
         } else {
             Err(GitError::new(
@@ -120,7 +104,7 @@ impl Git {
                 args,
                 format!(
                     "failed with {}: {}",
-                    output.status,
+                    exit_text(output.code),
                     tail(&String::from_utf8_lossy(&output.stderr))
                 ),
             ))
