@@ -81,7 +81,8 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
         Err(error) => return fail(&format!("the built-in build role: {error}")),
     };
     // The personal file is valid here; were it not, no name would be allowed.
-    let allowed = config.allowed_gate_env().unwrap_or_default();
+    // The names are those allowed for the repository this run delivers to.
+    let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
     let agent = match AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed) {
         Ok(agent) => agent,
         Err(error) => return fail(&format!("the agent environment: {error}")),

@@ -14,3 +14,6 @@ fallback = "codex"
 [harnesses.codex]
 fallback = "claude"
 budget_usd = 20.0
+
+[repositories."github.com/ada/shop"]
+allow_gate_env = ["DATABASE_URL"]
