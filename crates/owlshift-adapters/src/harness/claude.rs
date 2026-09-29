@@ -62,6 +62,15 @@ const POLL: Duration = Duration::from_millis(20);
 /// no server was loaded.
 const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
 
+/// Refuses what the user's other Claude Code sessions send to a run. Every
+/// `claude -p` listens on a local socket, the `messaging_socket_path` of its
+/// `init` event, and a message another session sends there with
+/// `SendMessage` reaches the model as input. The `crossSessionInbound`
+/// setting, given with `--settings`, refuses it, and a repository's settings
+/// set to accept did not bring it back. Checked live (OWL-52, recorded under
+/// check C1 in `docs/design/build-plan.md`).
+const PEER_INBOX_ARGS: &[&str] = &["--settings", r#"{"crossSessionInbound":"refuse"}"#];
+
 /// The tools removed from every run because a call can act outside the run's
 /// worktree and budget. Checked live with Claude Code 2.1.283 (OWL-42 and
 /// OWL-46, recorded under check C1 in `docs/design/build-plan.md`): each is
@@ -203,7 +212,8 @@ impl std::error::Error for CommandError {}
 /// worktree is trusted, which a linked worktree is when its main checkout is.
 /// Neither an allow rule given with `--settings` (OWL-42) nor one in a trusted
 /// worktree's project settings (OWL-46, observed on the tools a run without a
-/// login offers) brought a removed tool back.
+/// login offers) brought a removed tool back. Messages from the user's other
+/// sessions are refused on every launch (`PEER_INBOX_ARGS`).
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
     if request.permissions.browser {
         return Err(CommandError::Unsupported("a browser"));
@@ -244,6 +254,7 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
         command.arg("--max-budget-usd").arg(budget.to_string());
     }
     command.args(GUARDRAIL_ARGS);
+    command.args(PEER_INBOX_ARGS);
     command.arg("--no-session-persistence");
     command
         .current_dir(&request.workdir)
@@ -828,6 +839,12 @@ mod tests {
         BEYOND_RUN_TOOLS.join(" ")
     }
 
+    /// The inbox flag as it appears on the command line; its value is pinned
+    /// by the contract tests.
+    fn inbox() -> String {
+        PEER_INBOX_ARGS.join(" ")
+    }
+
     #[test]
     fn a_read_only_run_may_write_only_its_result_file() {
         let request = request(PermissionLevel::ReadOnly);
@@ -837,8 +854,9 @@ mod tests {
                 "-p --output-format stream-json --verbose \
                  --permission-mode dontAsk --allowedTools Edit(./.owlshift/result.json) \
                  --permission-prompts none --disallowedTools {} \
-                 --setting-sources project,local --strict-mcp-config --no-session-persistence",
-                denied()
+                 --setting-sources project,local --strict-mcp-config {} --no-session-persistence",
+                denied(),
+                inbox()
             )
         );
         let command = command(Path::new("claude"), &request).unwrap();
@@ -860,8 +878,9 @@ mod tests {
                  --permission-mode acceptEdits --allowedTools Bash \
                  --permission-prompts none --disallowedTools {} WebFetch WebSearch \
                  --json-schema {{\"type\":\"object\"}} --max-budget-usd 2.5 \
-                 --setting-sources project,local --strict-mcp-config --no-session-persistence",
-                denied()
+                 --setting-sources project,local --strict-mcp-config {} --no-session-persistence",
+                denied(),
+                inbox()
             )
         );
     }

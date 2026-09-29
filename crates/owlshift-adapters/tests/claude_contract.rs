@@ -1,11 +1,13 @@
 //! Contract tests of the Claude Code harness: recorded `claude -p` output
 //! replayed through the adapter, with no model and no login.
 //!
-//! The fixtures in `fixtures/claude/` were recorded on 2026-09-28 with Claude
-//! Code 2.1.283 (see `docs/design/build-plan.md`, OWL-14 and OWL-46 results),
-//! then scrubbed: session, message and tool-use ids, timestamps, paths and
-//! thinking signatures replaced, the user's skills, plugins and agents and the
-//! local paths of the `init` event removed. Each test states the exit
+//! The fixtures in `fixtures/claude/` were recorded on 2026-09-28 and
+//! 2026-09-29 with Claude Code 2.1.283, but for the sender of OWL-52's probe
+//! (see `docs/design/build-plan.md`, OWL-14, OWL-46 and OWL-52 results),
+//! then scrubbed: session, message and
+//! tool-use ids, timestamps, paths and thinking signatures replaced, the
+//! user's skills, plugins and agents and the local paths of the `init` event
+//! removed or, for the inbox socket, replaced. Each test states the exit
 //! status and standard error the run had, since both decide the outcome.
 //! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
 //! limit on purpose (C7's open item). It follows the shapes C7 logged.
@@ -176,18 +178,10 @@ fn sorted<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     names
 }
 
-/// Every launch removes the tools that reach beyond the run, in its one
-/// `--disallowedTools` flag, with the web tools when the run has no network.
-/// `beyond_run_tools_denied.jsonl` was recorded with that argv (write in
-/// worktree, no network, a JSON Schema) plus, for the recording only, one
-/// `--settings` carrying an allow rule for each of those tools and a hook
-/// letting only `ToolSearch` and `StructuredOutput` through; the model was
-/// asked to load every deferred one with `ToolSearch`. None was offered,
-/// `ToolSearch` found none, and the model called nothing else.
-/// `success.jsonl`, recorded without the flag, was offered all of them. Exit
-/// 0, empty stderr.
-#[test]
-fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
+/// The command line of every kind of launch: both permission levels, with
+/// and without network, with a JSON Schema.
+fn every_launch() -> Vec<(PermissionLevel, bool, Vec<String>)> {
+    let mut launches = Vec::new();
     for level in [PermissionLevel::ReadOnly, PermissionLevel::WriteWorktree] {
         for network in [true, false] {
             let request = Request {
@@ -203,29 +197,61 @@ fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
                 json_schema: Some(r#"{"type":"object"}"#.into()),
                 max_budget_usd: None,
             };
-            let args: Vec<String> = command(Path::new("claude"), &request)
+            let args = command(Path::new("claude"), &request)
                 .unwrap()
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
-            let flags: Vec<usize> = (0..args.len())
-                .filter(|&at| args[at] == "--disallowedTools")
-                .collect();
-            let case = format!("{level:?}, network {network}: {args:?}");
-            // One flag: whether a second one would add to the first or
-            // replace it was not checked.
-            assert_eq!(flags.len(), 1, "{case}");
-            let denied: Vec<&str> = args[flags[0] + 1..]
-                .iter()
-                .take_while(|arg| !arg.starts_with("--"))
-                .map(String::as_str)
-                .collect();
-            let mut expected = BEYOND_RUN_TOOLS.to_vec();
-            if !network {
-                expected.extend(["WebFetch", "WebSearch"]);
-            }
-            assert_eq!(sorted(denied), sorted(expected), "{case}");
+            launches.push((level, network, args));
         }
+    }
+    launches
+}
+
+/// Where `flag` stands in `args`.
+fn positions(args: &[String], flag: &str) -> Vec<usize> {
+    (0..args.len()).filter(|&at| args[at] == flag).collect()
+}
+
+/// The tool calls the model made in a recording.
+fn tool_calls(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .filter(|event| event["type"] == "assistant")
+        .filter_map(|event| event["message"]["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == "tool_use")
+        .collect()
+}
+
+/// Every launch removes the tools that reach beyond the run, in its one
+/// `--disallowedTools` flag, with the web tools when the run has no network.
+/// `beyond_run_tools_denied.jsonl` was recorded with that argv (write in
+/// worktree, no network, a JSON Schema) plus, for the recording only, one
+/// `--settings` carrying an allow rule for each of those tools and a hook
+/// letting only `ToolSearch` and `StructuredOutput` through; the model was
+/// asked to load every deferred one with `ToolSearch`. None was offered,
+/// `ToolSearch` found none, and the model called nothing else.
+/// `success.jsonl`, recorded without the flag, was offered all of them. Exit
+/// 0, empty stderr.
+#[test]
+fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
+    for (level, network, args) in every_launch() {
+        let flags = positions(&args, "--disallowedTools");
+        let case = format!("{level:?}, network {network}: {args:?}");
+        // One flag: whether a second one would add to the first or replace
+        // it was not checked.
+        assert_eq!(flags.len(), 1, "{case}");
+        let denied: Vec<&str> = args[flags[0] + 1..]
+            .iter()
+            .take_while(|arg| !arg.starts_with("--"))
+            .map(String::as_str)
+            .collect();
+        let mut expected = BEYOND_RUN_TOOLS.to_vec();
+        if !network {
+            expected.extend(["WebFetch", "WebSearch"]);
+        }
+        assert_eq!(sorted(denied), sorted(expected), "{case}");
     }
 
     // The `init` event names the `Agent` tool `Task`.
@@ -241,13 +267,7 @@ fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
     }
 
     let events = recorded_events(name);
-    let calls: Vec<&Value> = events
-        .iter()
-        .filter(|event| event["type"] == "assistant")
-        .filter_map(|event| event["message"]["content"].as_array())
-        .flatten()
-        .filter(|block| block["type"] == "tool_use")
-        .collect();
+    let calls = tool_calls(&events);
     let called: Vec<&Value> = calls.iter().map(|block| &block["name"]).collect();
     assert_eq!(called, [&json!("ToolSearch"), &json!("StructuredOutput")]);
     let query = calls[0]["input"]["query"].as_str().unwrap();
@@ -274,17 +294,82 @@ fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
     assert_eq!(run.structured_output, Some(json!({"loaded": []})));
 }
 
+/// Every launch refuses what the user's other sessions send to the run's
+/// inbox, in one `--settings` flag. `peer_message_refused.jsonl` was recorded
+/// with the write-in-worktree argv, network on, that flag included, plus
+/// `--model haiku --effort low --max-turns 6` for the recording; the model
+/// was asked to run a 60 s Bash loop, then to report any message another
+/// session had sent. Meanwhile a second `claude -p`
+/// (`peer_message_sender.jsonl`, Claude Code 2.1.284, offered `SendMessage`
+/// alone, with a recording-only hook letting through one call to that inbox
+/// and nothing else) sent a probe to the `messaging_socket_path` of the first
+/// one's `init`. The sender was told the message was refused, and the probe
+/// reached neither the receiver's stream nor its answer. Without the flag,
+/// the same probe came back as the receiver's answer (build plan, OWL-52).
+/// Exit 0, empty stderr, for both.
+#[test]
+fn messages_from_other_sessions_are_refused_on_every_launch() {
+    for (level, network, args) in every_launch() {
+        let flags = positions(&args, "--settings");
+        let case = format!("{level:?}, network {network}: {args:?}");
+        // One flag: whether a second one would merge with the first or
+        // replace it was not checked.
+        assert_eq!(flags.len(), 1, "{case}");
+        let settings: Value = serde_json::from_str(&args[flags[0] + 1]).unwrap();
+        assert_eq!(settings, json!({"crossSessionInbound": "refuse"}), "{case}");
+    }
+
+    let receiver = recorded_events("peer_message_refused.jsonl");
+    let init = receiver
+        .iter()
+        .find(|event| event["type"] == "system" && event["subtype"] == "init")
+        .unwrap();
+    // The flag refuses messages; the inbox itself stays open.
+    let inbox = init["messaging_socket_path"].as_str().unwrap();
+
+    let sender = recorded_events("peer_message_sender.jsonl");
+    let calls = tool_calls(&sender);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["name"], "SendMessage");
+    assert_eq!(calls[0]["input"]["to"], json!(format!("uds:{inbox}")));
+    let probe = calls[0]["input"]["message"].as_str().unwrap();
+    let notices: Vec<&str> = sender
+        .iter()
+        .filter(|event| event["type"] == "system" && event["subtype"] == "informational")
+        .filter_map(|event| event["content"].as_str())
+        .collect();
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.starts_with("Cross-session message refused")),
+        "{notices:?}"
+    );
+
+    let marker = probe.split(':').next().unwrap();
+    assert!(marker.starts_with("OWL52-PROBE-"), "{probe}");
+    let recorded = std::fs::read_to_string(fixture("peer_message_refused.jsonl")).unwrap();
+    assert!(!recorded.contains(marker));
+    assert_eq!(
+        replay("peer_message_refused.jsonl", 0).outcome,
+        Outcome::Completed {
+            text: "NONE".into()
+        }
+    );
+}
+
 /// Every recorded fixture carries a version listed in `harness/tested.rs`,
 /// so re-recording with a new release cannot leave the list `owlshift
 /// doctor` reads behind. The constructed fixture proves nothing about a
-/// release and is skipped.
+/// release and is skipped, and so is the sender of OWL-52's probe: it plays
+/// one of the user's other sessions, whatever their version, not a run the
+/// adapter launches.
 #[test]
 fn recorded_versions_are_listed_as_tested() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
     let mut recorded = 0;
     for entry in std::fs::read_dir(dir).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();
-        if name == "usage_limit.jsonl" {
+        if name == "usage_limit.jsonl" || name == "peer_message_sender.jsonl" {
             continue;
         }
         let version = replay(&name, 0)
