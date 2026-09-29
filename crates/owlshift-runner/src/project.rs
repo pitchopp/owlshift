@@ -14,7 +14,14 @@
 //!     runs/<ticket>/<run>/ brief.json, stdout.log, stderr.log, gate.log
 //!     lock                 held by the one `owlshift do` working the project
 //!     unverified           a run whose isolation check has not passed
+//!     unfinished-clone     a first clone that has not finished
 //! ```
+//!
+//! A first clone stopped part-way, by its deadline, a crash or a Ctrl-C,
+//! leaves a folder that looks like a checkout. So the clone is marked
+//! `unfinished-clone` until it succeeds, and while the marker exists, the
+//! next `owlshift do` removes that folder and clones anew (OWL-80). Unlike
+//! `unverified`, it needs no person: a clone runs nothing of the project's.
 //!
 //! A run that breaks isolation may leave something in the clone, such as a
 //! hook or a configuration entry, that the next run's snapshot would take as
@@ -29,7 +36,8 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ids::TicketId;
@@ -173,10 +181,30 @@ impl ProjectDirs {
     }
 
     pub(crate) fn clear_unverified(&self) -> io::Result<()> {
-        match fs::remove_file(self.unverified_file()) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        }
+        remove_file_if_any(&self.unverified_file())
+    }
+
+    /// The marker of a first clone that has not finished (OWL-80).
+    pub fn unfinished_clone_file(&self) -> PathBuf {
+        self.root.join("unfinished-clone")
+    }
+}
+
+/// Removes the file at `path`, if there is one.
+fn remove_file_if_any(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Whether anything is at `path`, a symbolic link included. Only a missing
+/// entry means no: any other error is returned, never taken for absence.
+fn exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -228,6 +256,36 @@ pub struct Base {
 /// it fast.
 pub const CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// What the `unfinished-clone` marker says to a person who finds it.
+const UNFINISHED_CLONE: &str = "A first clone of the project started and has not finished: \
+     the next `owlshift do` removes `checkout` and clones the project anew.\n";
+
+/// How long removing a clone that did not finish keeps trying (OWL-80). On
+/// Windows, the files of a git just stopped can stay locked for a moment
+/// after its Job Object is terminated; on any platform, a child still dying
+/// can add a file while the folder is emptied.
+const REMOVAL_BUDGET: Duration = Duration::from_secs(10);
+
+/// Removes the folder of a clone that did not finish, if there is one,
+/// trying again with a growing pause until `budget` has passed; the error is
+/// the last attempt's.
+fn remove_partial_clone(checkout: &Path, budget: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + budget;
+    let mut pause = Duration::from_millis(50);
+    loop {
+        let error = match fs::remove_dir_all(checkout) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => error,
+        };
+        if Instant::now() + pause > deadline {
+            return Err(error);
+        }
+        thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_secs(1));
+    }
+}
+
 /// Brings the dedicated checkout up to date: clones `remote_url` into it the
 /// first time, and otherwise points its `origin` at `remote_url`, fetches,
 /// pruning what the forge deleted, and reads the forge's default branch
@@ -238,7 +296,12 @@ pub const CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// commit it points to after the fetch.
 ///
 /// The first clone runs under [`CLONE_TIMEOUT`]; every other command runs
-/// under the runner git's own deadline, 120 s.
+/// under the runner git's own deadline, 120 s. It is marked `unfinished-clone`
+/// until it succeeds (OWL-80): a failed clone's folder is removed, trying
+/// again for up to [`REMOVAL_BUDGET`], and while the marker exists, the next
+/// call removes whatever is left in `checkout` before cloning anew, or
+/// refuses when it cannot. The marker relies on the project lock, which
+/// `owlshift do` holds around this call: no other clone of the project runs.
 pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<Base, String> {
     sync_checkout_within(git, dirs, remote_url, CLONE_TIMEOUT)
 }
@@ -252,9 +315,21 @@ pub fn sync_checkout_within(
     clone_timeout: Duration,
 ) -> Result<Base, String> {
     let checkout = dirs.checkout();
+    let marker = dirs.unfinished_clone_file();
     let failed = |e: crate::executor::GitError| e.to_string();
-    if fs::symlink_metadata(&checkout).is_err() {
-        fs::create_dir_all(dirs.root()).map_err(|e| format!("{}: {e}", dirs.root().display()))?;
+    let io_failed = |path: &Path, e: io::Error| format!("{}: {e}", path.display());
+    if exists(&marker).map_err(|e| io_failed(&marker, e))? {
+        remove_partial_clone(&checkout, REMOVAL_BUDGET).map_err(|e| {
+            format!(
+                "{} holds a clone of the project that did not finish, and it could not be \
+                 removed ({e}); remove it and run again",
+                checkout.display()
+            )
+        })?;
+    }
+    if !exists(&checkout).map_err(|e| io_failed(&checkout, e))? {
+        fs::create_dir_all(dirs.root()).map_err(|e| io_failed(dirs.root(), e))?;
+        fs::write(&marker, UNFINISHED_CLONE).map_err(|e| io_failed(&marker, e))?;
         let args: [&OsStr; 5] = [
             "clone".as_ref(),
             "--quiet".as_ref(),
@@ -264,15 +339,22 @@ pub fn sync_checkout_within(
         ];
         git.run_within(dirs.root(), &args, clone_timeout)
             .map_err(|e| {
-                // A clone stopped part-way must not pass for a usable
-                // checkout on the next run.
-                let _ = fs::remove_dir_all(&checkout);
-                format!(
+                let mut message = format!(
                     "could not clone the project into {}: {}",
                     checkout.display(),
                     e.detail
-                )
+                );
+                // The marker stays whatever happens here, so the next run
+                // removes what is left rather than taking it for the
+                // project's checkout.
+                if let Err(error) = remove_partial_clone(&checkout, REMOVAL_BUDGET) {
+                    message.push_str(&format!(
+                        "; the partial clone could not be removed ({error}), the next run removes it"
+                    ));
+                }
+                message
             })?;
+        remove_file_if_any(&marker).map_err(|e| io_failed(&marker, e))?;
     } else {
         let args: [&OsStr; 4] = [
             "remote".as_ref(),
@@ -443,6 +525,56 @@ mod tests {
         dirs.clear_unverified().unwrap();
         dirs.clear_unverified().unwrap();
         assert_eq!(dirs.unverified().unwrap(), None);
+    }
+
+    /// A partial clone that stays in the way is reported once the budget is
+    /// spent, not waited on forever: on Unix, a file where the folder should
+    /// be; on Windows, a file inside it held open without delete sharing.
+    #[test]
+    fn a_partial_clone_that_stays_in_the_way_is_reported_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        #[cfg(unix)]
+        fs::write(&checkout, "").unwrap();
+        #[cfg(windows)]
+        let _held = held_open(&checkout);
+        let started = Instant::now();
+        assert!(remove_partial_clone(&checkout, Duration::from_millis(200)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The case the retry is for (OWL-80): a stopped git's file stays locked
+    /// for a moment, which a single attempt does not get past.
+    #[cfg(windows)]
+    #[test]
+    fn a_partial_clone_locked_for_a_moment_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let held = held_open(&checkout);
+        assert!(fs::remove_dir_all(&checkout).is_err(), "not locked");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        remove_partial_clone(&checkout, Duration::from_secs(10)).unwrap();
+        release.join().unwrap();
+        assert!(fs::symlink_metadata(&checkout).is_err());
+    }
+
+    /// A `checkout` folder with a file in its `.git` held open without
+    /// delete sharing, as a git still being stopped holds it.
+    #[cfg(windows)]
+    fn held_open(checkout: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+        let git_dir = checkout.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let file = git_dir.join("index");
+        fs::write(&file, "").unwrap();
+        OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(file)
+            .unwrap()
     }
 
     #[test]
