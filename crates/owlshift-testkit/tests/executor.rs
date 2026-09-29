@@ -309,9 +309,19 @@ impl Harness for Script {
     }
 }
 
-/// The shell command that points the worktree's `.git` at `evil`.
+/// The `sh` command that points the worktree's `.git` at `evil`: the
+/// harness script's.
 fn redirect(evil: &Path) -> String {
     format!("printf 'gitdir: %s\\n' '{}' > .git", evil.display())
+}
+
+/// The same, as a gate command: the gate runs through `cmd` on Windows.
+fn redirect_in_gate(evil: &Path) -> String {
+    if cfg!(windows) {
+        format!("echo gitdir: {}> .git", evil.display())
+    } else {
+        redirect(evil)
+    }
 }
 
 /// A run that points its worktree's `.git` elsewhere, from the harness or
@@ -328,11 +338,11 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
         let redirected: Arc<Mutex<Vec<String>>> = Arc::default();
         let runner = bench.env.clone();
         let seen = redirected.clone();
-        let evil_link = format!("gitdir: {}\n", evil.display());
+        let evil_link = format!("gitdir: {}", evil.display());
         let executor = Executor {
             git: Git::with_setup("git", move |command| {
                 runner.apply(command);
-                if fs::read_to_string(&link).is_ok_and(|text| text == evil_link) {
+                if fs::read_to_string(&link).is_ok_and(|text| text.starts_with(&evil_link)) {
                     seen.lock().unwrap().push(format!("{command:?}"));
                 }
             }),
@@ -344,7 +354,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
         let script = if case == "the harness" {
             format!("{} && {write_result}", redirect(&evil))
         } else {
-            brief.gate = vec![redirect(&evil)];
+            brief.gate = vec![redirect_in_gate(&evil)];
             write_result
         };
         let report = bench.run_with(&executor, &Script(script), &brief).unwrap();
