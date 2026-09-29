@@ -14,7 +14,7 @@ mod signals;
 mod tree;
 
 #[cfg(unix)]
-pub use sentinel::SentinelStatus;
+pub use sentinel::{SentinelProbe, SentinelStatus, probe_sentinel};
 pub use signals::stop_trees_on_signal;
 #[cfg(unix)]
 pub use signals::{sentinel_status, stop_trees_when_killed};

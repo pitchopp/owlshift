@@ -14,14 +14,19 @@
 //! the sentinel reads the end of its input, kills every group still live,
 //! and ends.
 //!
+//! [`probe_sentinel`] checks, with a sentinel and a process group of its
+//! own, that this host's `/bin/sh` does so (OWL-90).
+//!
 //! [`stop_trees_when_killed`]: super::stop_trees_when_killed
 
 use std::io::{self, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use rustix::process::Pid;
+use rustix::process::{Pid, Signal};
 
 /// What the sentinel runs: it keeps the groups of the `+` lines less those
 /// of the `-` lines, and at the end of its input kills each group left, as
@@ -71,18 +76,30 @@ pub enum SentinelStatus {
     Ended(String),
 }
 
+/// `/bin/sh` running `script` as `name`, with an empty environment, its
+/// input piped and its outputs dropped.
+fn sh(script: &str, name: &str) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", script, name])
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
 impl Sentinel {
     /// Starts a sentinel that knows of no tree yet.
     pub(super) fn start() -> io::Result<Self> {
-        let mut process = Command::new("/bin/sh")
-            .args(["-c", SCRIPT, "owlshift-sentinel"])
-            .env_clear()
-            .current_dir("/")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()?;
+        Self::start_running(SCRIPT, "owlshift-sentinel")
+    }
+
+    /// Starts `script` as a sentinel named `name`: [`SCRIPT`] but in the
+    /// test of a sentinel that never stops anything.
+    fn start_running(script: &str, name: &str) -> io::Result<Self> {
+        let mut process = sh(script, name).process_group(0).spawn()?;
         let input = process.stdin.take().expect("the input is piped");
         // A sentinel that stops reading must never block a spawn, a dropped
         // tree or the signal handler, which all write under the lock of the
@@ -122,5 +139,231 @@ impl Sentinel {
     fn send(&mut self, sign: char, group: Pid) {
         let line = format!("{sign} {}\n", group.as_raw_nonzero());
         let _ = self.input.write_all(line.as_bytes());
+    }
+}
+
+/// Whether a sentinel works on this host: whether one stops a process group
+/// it was told of when its input ends (OWL-90).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SentinelProbe {
+    /// It stopped the group, this long after its input ended.
+    Works {
+        /// From the end of its input to the group's last member reaped.
+        elapsed: Duration,
+    },
+    /// The test's processes could not start, as said.
+    CannotStart(String),
+    /// The sentinel did not stop the group, as said.
+    Fails(String),
+}
+
+/// What each member of the test group runs: it waits for a line on its
+/// input, which never comes, since the probe holds the write end until it
+/// is done. `read` is a shell builtin, so the empty environment is enough.
+const MEMBER: &str = "read -r line";
+
+/// Checks that a sentinel stops a process group it was told of when its
+/// input ends, within `bound`.
+///
+/// It starts a group of two processes of its own, the leader and a member
+/// that joins it, then a sentinel running [`SCRIPT`], tells the sentinel of
+/// the group and closes its input. The group is stopped when both are killed
+/// by `SIGKILL`. The sentinel of this process, if any, is never told of that
+/// group, and everything the probe starts is reaped before it returns.
+pub fn probe_sentinel(bound: Duration) -> SentinelProbe {
+    probe_with(SCRIPT, bound)
+}
+
+fn probe_with(script: &str, bound: Duration) -> SentinelProbe {
+    // Declared first, so that its drop reaps what was started on every way
+    // out, a panic included.
+    let mut started = Started::default();
+    let leader = match sh(MEMBER, "owlshift-probe-member").process_group(0).spawn() {
+        Ok(leader) => leader,
+        Err(error) => return SentinelProbe::CannotStart(format!("a test process: {error}")),
+    };
+    // The leader's own pid, and it stays reserved while the leader is not
+    // reaped: the group can be no one else's.
+    let group = Pid::from_child(&leader);
+    started.members.push(leader);
+    match sh(MEMBER, "owlshift-probe-member")
+        .process_group(group.as_raw_nonzero().get())
+        .spawn()
+    {
+        Ok(member) => started.members.push(member),
+        Err(error) => return SentinelProbe::CannotStart(format!("a test process: {error}")),
+    }
+    // Started after the members, so that none of them holds its input open.
+    let mut sentinel = match Sentinel::start_running(script, "owlshift-probe-sentinel") {
+        Ok(sentinel) => sentinel,
+        Err(error) => return SentinelProbe::CannotStart(format!("a test sentinel: {error}")),
+    };
+    sentinel.announce(group);
+    let Sentinel { process, input } = sentinel;
+    started.sentinel = Some(process);
+    drop(input);
+    let ended = Instant::now();
+    let deadline = ended + bound;
+    let bound_ms = bound.as_millis();
+
+    // The sentinel is reaped before the members: once it is gone nothing can
+    // signal the group any more, and only then may reaping the members free
+    // the group's id.
+    let sentinel = started.sentinel.as_mut().expect("the sentinel was kept");
+    match wait_until(sentinel, deadline) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return SentinelProbe::Fails(format!(
+                "the test sentinel still ran {bound_ms} ms after its input ended"
+            ));
+        }
+        Err(error) => {
+            return SentinelProbe::Fails(format!(
+                "the test sentinel's state cannot be read: {error}"
+            ));
+        }
+    }
+    // Only `try_wait` before the verdict: `wait` would close a member's
+    // input, and it would end by itself.
+    for member in &mut started.members {
+        match wait_until(member, deadline) {
+            Ok(Some(status)) if status.signal() == Some(Signal::KILL.as_raw()) => {}
+            Ok(Some(status)) => {
+                return SentinelProbe::Fails(format!(
+                    "a process of the test group ended otherwise ({status})"
+                ));
+            }
+            Ok(None) => {
+                return SentinelProbe::Fails(format!(
+                    "the test group still ran {bound_ms} ms after the test sentinel's input ended"
+                ));
+            }
+            Err(error) => {
+                return SentinelProbe::Fails(format!(
+                    "the test group's state cannot be read: {error}"
+                ));
+            }
+        }
+    }
+    SentinelProbe::Works {
+        elapsed: ended.elapsed(),
+    }
+}
+
+/// What [`probe_with`] started. Dropping it kills by pid what still runs,
+/// the sentinel first, and reaps all of it. It never signals a group: a
+/// process that is not reaped keeps its pid, so the signal cannot reach
+/// anyone else, which a group id no member holds any more could.
+#[derive(Default)]
+struct Started {
+    sentinel: Option<Child>,
+    members: Vec<Child>,
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        for child in self.sentinel.iter_mut().chain(&mut self.members) {
+            // Whatever the kill does, the wait ends: it closes the child's
+            // input, and each of these ends at the end of its input.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The child's status once it ended, reaping it; `None` if it still runs at
+/// `deadline`.
+fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(super::POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rustix::io::Errno;
+    use rustix::process::{WaitOptions, wait};
+
+    fn helper_requested() -> bool {
+        std::env::args().any(|arg| arg == "--exact")
+    }
+
+    /// Runs `probe` in this helper process, checks it left no child, running
+    /// or unreaped, and writes its verdict to `verdict`. The helper runs
+    /// alone, on one thread, so no other test's process is a child here, and
+    /// none can inherit the test sentinel's input: on macOS std makes a pipe
+    /// close-on-exec only after creating it.
+    fn probe_alone(probe: impl FnOnce() -> SentinelProbe) {
+        if helper_requested() {
+            let verdict = probe();
+            let left = wait(WaitOptions::NOHANG);
+            assert!(matches!(left, Err(Errno::CHILD)), "left: {left:?}");
+            std::fs::write("verdict", format!("{verdict:?}")).unwrap();
+        }
+    }
+
+    /// The verdict of the helper `name`, run in a process of its own.
+    fn verdict_of(name: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--ignored", "--test-threads=1"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::read_to_string(dir.path().join("verdict")).unwrap_or_else(|_| {
+            panic!(
+                "no verdict from {name}: {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    }
+
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_probe_the_sentinel() {
+        probe_alone(|| probe_sentinel(Duration::from_secs(5)));
+    }
+
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_probe_a_sentinel_that_stops_nothing() {
+        probe_alone(|| {
+            probe_with(
+                "while read -r sign group; do :; done",
+                Duration::from_millis(300),
+            )
+        });
+    }
+
+    /// OWL-90: this host's `/bin/sh`, running the sentinel's script, stops a
+    /// group it was told of when its input ends, and the probe leaves nothing
+    /// behind.
+    #[test]
+    fn the_sentinel_stops_a_group_when_its_input_ends() {
+        let verdict = verdict_of("process::sentinel::tests::helper_probe_the_sentinel");
+        assert!(verdict.starts_with("Works"), "{verdict}");
+    }
+
+    /// A sentinel that stops nothing fails the probe within its bound, and
+    /// the probe still stops and reaps the group itself.
+    #[test]
+    fn a_sentinel_that_stops_nothing_fails_and_leaves_nothing() {
+        let started = Instant::now();
+        let verdict =
+            verdict_of("process::sentinel::tests::helper_probe_a_sentinel_that_stops_nothing");
+        assert!(
+            verdict.starts_with("Fails(\"the test group still ran 300 ms"),
+            "{verdict}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "{verdict}");
     }
 }
