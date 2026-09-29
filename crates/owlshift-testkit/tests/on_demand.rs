@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Held by each `do` of this file: see `Bench::run`.
@@ -777,8 +778,10 @@ fn the_checkout_follows_the_forges_default_branch() {
     let url = bench.remote.bare.to_string_lossy().into_owned();
     let base = project::sync_checkout(&git, &bench.dirs(), &url).unwrap();
     assert_eq!(base.remote_ref, "origin/main");
-
     let bare = &bench.remote.bare;
+    let main = String::from_utf8(bench.env.run(bare, &["rev-parse", "main"]).unwrap()).unwrap();
+    assert_eq!(base.commit, main.trim());
+
     bench.env.run(bare, &["branch", "trunk", "main"]).unwrap();
     bench
         .env
@@ -789,6 +792,91 @@ fn the_checkout_follows_the_forges_default_branch() {
         (base.remote_ref.as_str(), base.branch.as_str()),
         ("origin/trunk", "trunk")
     );
+
+    // A default branch a run made symbolic survives the fetch and would lead
+    // git to another branch of origin: it is refused (OWL-51).
+    let checkout = bench.dirs().checkout();
+    bench
+        .env
+        .run(
+            &checkout,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/trunk",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .unwrap();
+    let error = project::sync_checkout(&git, &bench.dirs(), &url).unwrap_err();
+    assert!(
+        error.contains("refs/remotes/origin/trunk") && error.contains("is a symbolic ref"),
+        "{error}"
+    );
+}
+
+/// A run can move `origin/main` unseen, since the isolation check leaves
+/// remote-tracking refs out, but it does not choose where the next branch
+/// starts (OWL-51): the next `do` fetches, then pins the base to a commit by
+/// its full name, which a local branch named `origin/main` cannot shadow.
+#[test]
+fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
+    let bench = Bench::new(true);
+    let evil = Rc::new(RefCell::new(String::new()));
+    let (env, planted) = (bench.env.clone(), evil.clone());
+    let agent: Agent = Box::new(move |worktree: &Path| {
+        let git = |args: &[&str]| {
+            let out = env.run(worktree, args).unwrap();
+            String::from_utf8(out).unwrap().trim().to_owned()
+        };
+        let commit = git(&["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "Evil"]);
+        git(&["update-ref", "refs/remotes/origin/main", &commit]);
+        git(&["update-ref", "refs/remotes/origin/evil", &commit]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/evil",
+        ]);
+        *planted.borrow_mut() = commit;
+    });
+    let blocked = r#"{"format":1,"status":"blocked","summary":"Waiting."}"#;
+    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], Some(agent));
+    assert!(
+        matches!(
+            outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::Blocked,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    // Not a breach: the check leaves remote-tracking refs out.
+    assert_eq!(bench.dirs().unverified().unwrap(), None);
+    let evil = evil.borrow().clone();
+    let checkout = bench.dirs().checkout();
+    let at = |dir: &Path, name: &str| {
+        let out = bench.env.run(dir, &["rev-parse", name]).unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
+    };
+    assert_eq!(at(&checkout, "refs/remotes/origin/main"), evil);
+
+    // A later ticket starts a new branch: here the same one, removed. A
+    // local branch named like the base points at the agent's commit too.
+    let worktree = bench.dirs().worktree(&TicketId::new(TICKET).unwrap());
+    let worktree = worktree.to_str().unwrap();
+    for args in [
+        vec!["worktree", "remove", "--force", worktree],
+        vec!["branch", "-D", BRANCH],
+        vec!["branch", "origin/main", &evil],
+    ] {
+        bench.env.run(&checkout, &args).unwrap();
+    }
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let tip = bench.remote_branch().expect("the branch was pushed");
+    let bare = &bench.remote.bare;
+    assert_eq!(at(bare, &format!("{tip}^")), at(bare, "refs/heads/main"));
+    assert_ne!(at(bare, &format!("{tip}^")), evil);
 }
 
 /// A confined `do` whose agent cannot run, because this machine cannot

@@ -118,7 +118,10 @@ pub struct RunSpec<'a> {
     pub worktree: &'a Path,
     /// The ticket's branch, checked out in the worktree.
     pub branch: &'a str,
-    /// What a new branch starts from, such as `origin/main`.
+    /// What a new branch starts from: a commit, or a name resolved to one
+    /// when the branch is created. The isolation check leaves remote-tracking
+    /// refs out, so an earlier run can move `origin/main`: `owlshift do`
+    /// passes the commit it resolved right after its fetch (OWL-51).
     pub base: &'a str,
     /// Where the run's log files and a copy of its brief go, outside the
     /// worktree; created if missing.

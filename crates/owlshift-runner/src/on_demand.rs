@@ -409,6 +409,7 @@ impl OnDemand<'_> {
                 ("title", json!(found.title)),
                 ("branch", json!(branch)),
                 ("base", json!(base.remote_ref)),
+                ("base_commit", json!(base.commit)),
                 ("worktree", path(&worktree)),
                 ("checkout", path(&checkout)),
                 ("pull_request", json!(open.map(|pr| pr.number))),
@@ -462,7 +463,9 @@ impl OnDemand<'_> {
                 main: &checkout,
                 worktree: &worktree,
                 branch: &branch,
-                base: &base.remote_ref,
+                // The commit resolved after the fetch, not the name: a run
+                // can move a remote-tracking ref (OWL-51).
+                base: &base.commit,
                 run_dir: &run_dir,
                 brief: &brief,
             };
