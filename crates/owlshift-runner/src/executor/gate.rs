@@ -22,7 +22,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -242,10 +242,9 @@ fn run_commands(
                 Some(code) => format!("exit status {code}"),
                 None => "ended by a signal".to_owned(),
             }),
-            End::Exited(_) if ran.output_held => Some(format!(
-                "a process it started kept its output open, {} s after it was stopped",
-                OUTPUT_GRACE.as_secs()
-            )),
+            End::Exited(_) if ran.output_held => {
+                Some("a process it started kept its output open after it ended".to_owned())
+            }
             End::Exited(_) => ran
                 .log_error
                 .map(|e| format!("the runner could not write the gate log: {e}")),
@@ -267,6 +266,8 @@ enum End {
 
 struct Ran {
     end: End,
+    /// The tail of its output, as far as it was read: an abandoned output
+    /// keeps what was read before it was.
     tail: Tail,
     /// Its output was still open after the grace period: abandoned.
     output_held: bool,
@@ -307,11 +308,15 @@ fn run_one(agent: &AgentEnv, paths: &RunPaths, line: &str, deadline: Instant, lo
         Err(e) => return error(format!("could not start: {e}")),
     };
 
+    let tail = Arc::new(Mutex::new(Tail::default()));
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        // The receiver is gone when the output was abandoned.
-        let _ = sender.send(drain(reader, log));
-    });
+    {
+        let tail = Arc::clone(&tail);
+        thread::spawn(move || {
+            // The receiver is gone when the output was abandoned.
+            let _ = sender.send(drain(reader, log, &tail));
+        });
+    }
     let waited = child.wait();
     let timed_out = watchdog.finish();
     // What the command left running would hold the output open; the tree
@@ -320,10 +325,13 @@ fn run_one(agent: &AgentEnv, paths: &RunPaths, line: &str, deadline: Instant, lo
     let wait_for = deadline
         .saturating_duration_since(Instant::now())
         .max(OUTPUT_GRACE);
-    let (tail, log_error, output_held) = match receiver.recv_timeout(wait_for) {
-        Ok((tail, log_error)) => (tail, log_error, false),
-        Err(_) => (Tail::default(), None, true),
+    let (log_error, output_held) = match receiver.recv_timeout(wait_for) {
+        Ok(log_error) => (log_error, false),
+        Err(_) => (None, true),
     };
+    // An abandoned drain keeps reading into the log; the failure carries
+    // what it had kept when the wait ended, and nothing it reads later.
+    let tail = take_tail(&tail);
     let end = match waited {
         _ if timed_out => End::TimedOut,
         Ok(status) => End::Exited(status),
@@ -337,28 +345,41 @@ fn run_one(agent: &AgentEnv, paths: &RunPaths, line: &str, deadline: Instant, lo
     }
 }
 
-/// Reads the output to its end, copying it to the log and keeping its tail.
-/// A log write error stops the copy, not the reading.
-fn drain(mut reader: impl Read, mut log: File) -> (Tail, Option<String>) {
-    let mut tail = Tail::default();
+/// Reads the output to its end, keeping its tail in `tail`, shared with the
+/// caller so that what was read survives the drain being abandoned, and
+/// copying it to the log; the first log write error, which stops the copy,
+/// not the reading. Each chunk joins the tail before the log write, and the
+/// tail is never locked during a read or a write.
+fn drain(mut reader: impl Read, mut log: File, tail: &Mutex<Tail>) -> Option<String> {
     let mut log_error = None;
     let mut buffer = [0u8; 8192];
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
+                lock(tail).push(&buffer[..n]);
                 if log_error.is_none()
                     && let Err(e) = log.write_all(&buffer[..n])
                 {
                     log_error = Some(e.to_string());
                 }
-                tail.push(&buffer[..n]);
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    (tail, log_error)
+    log_error
+}
+
+/// The tail kept so far, leaving an empty one in its place.
+fn take_tail(tail: &Mutex<Tail>) -> Tail {
+    std::mem::take(&mut *lock(tail))
+}
+
+/// The tail, even when a thread panicked holding it: what it held is still
+/// the output, and the runner must not panic in turn.
+fn lock(tail: &Mutex<Tail>) -> MutexGuard<'_, Tail> {
+    tail.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The command line run through the platform's shell.
@@ -562,6 +583,80 @@ mod tests {
         let failure = outcome.unwrap_err();
         assert_eq!(failure.reason, "stopped at the gate's deadline, 1 s");
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_leave_an_escaped_pipe_holder() {
+        if helper_requested() {
+            use std::os::unix::process::CommandExt;
+            println!("BEFORE-THE-HOLD");
+            // In a group of its own, stopping the tree does not reach it, and
+            // it inherits this process's output.
+            drop(
+                Command::new("sleep")
+                    .arg("10")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+    }
+
+    /// The output read before the drain was abandoned is kept: a process
+    /// that left the tree holds the output past the wait, and the failure
+    /// still carries what the command wrote.
+    #[cfg(unix)]
+    #[test]
+    fn the_output_read_before_an_abandoned_drain_is_kept() {
+        let (outcome, log) = gate(
+            &[helper("helper_leave_an_escaped_pipe_holder")],
+            Duration::from_secs(5),
+        );
+        let failure = outcome.unwrap_err();
+        assert_eq!(
+            failure.reason,
+            "a process it started kept its output open after it ended"
+        );
+        assert!(failure.output.contains("BEFORE-THE-HOLD"), "{failure:?}");
+        assert!(log.contains("BEFORE-THE-HOLD"), "{log}");
+    }
+
+    /// The tail can be taken while the drain waits in a read, with what it
+    /// has read so far, cut as usual.
+    #[test]
+    fn the_tail_read_so_far_is_taken_while_the_drain_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = File::create(dir.path().join(GATE_LOG)).unwrap();
+        let (reader, mut writer) = io::pipe().unwrap();
+        let tail = Arc::new(Mutex::new(Tail::default()));
+        let drained = {
+            let tail = Arc::clone(&tail);
+            thread::spawn(move || drain(reader, log, &tail))
+        };
+        let mut output = vec![b'x'; OUTPUT_TAIL + 1024];
+        output.extend_from_slice(b"END");
+        writer.write_all(&output).unwrap();
+        // The writer stays open: the drain ends up waiting in its next read.
+        let waited = Instant::now();
+        loop {
+            let kept: Vec<u8> = tail.lock().unwrap().bytes.iter().copied().collect();
+            if kept.ends_with(b"END") {
+                break;
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(30),
+                "the drain never published the output"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (text, truncated) = take_tail(&tail).text();
+        assert!(truncated);
+        assert_eq!(text.len(), OUTPUT_TAIL);
+        assert!(text.ends_with("xEND"));
+        drop(writer);
+        assert_eq!(drained.join().unwrap(), None);
     }
 
     /// The tree is stopped once its root exits, so a process left holding
