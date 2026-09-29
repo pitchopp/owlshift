@@ -18,7 +18,9 @@ use std::process::{Child, Command};
 /// [`ProcessTree::kill`] first, or the tree keeps running.
 ///
 /// The tree is live from its spawn until this handle is dropped: a process
-/// that called [`stop_trees_on_signal`] stops it when told to end.
+/// that called [`stop_trees_on_signal`] stops it when told to end, and on
+/// Unix one that called `stop_trees_when_killed` has it stopped when it ends
+/// in any other way, killed outright or not.
 ///
 /// [`stop_trees_on_signal`]: super::stop_trees_on_signal
 #[derive(Debug)]

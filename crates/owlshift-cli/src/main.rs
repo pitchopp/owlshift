@@ -73,6 +73,15 @@ fn main() -> ExitCode {
     if let Err(error) = owlshift_platform::process::stop_trees_on_signal() {
         eprintln!("owlshift: cannot watch for Ctrl-C, a running probe would outlive it: {error}");
     }
+    // And when Owlshift is killed outright, a crash included, which runs no
+    // handler: a sentinel process stops them. First, before any other thread
+    // starts a process.
+    #[cfg(unix)]
+    if let Err(error) = owlshift_platform::process::stop_trees_when_killed() {
+        eprintln!(
+            "owlshift: cannot start its sentinel, a running probe would outlive a hard kill: {error}"
+        );
+    }
     let matches = Cli::command().long_version(long_version()).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
