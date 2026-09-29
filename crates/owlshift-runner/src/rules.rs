@@ -24,20 +24,14 @@ const MAX_RULE_BYTES: u64 = 64 * 1024;
 /// a fetch: one rule for the whole repository (`applies_to` empty) when the
 /// base commit has a root `AGENTS.md`, none when it has not.
 ///
-/// The base is resolved once, through its full name, so a local branch named
-/// like it (`refs/heads/origin/main`) cannot stand in for it. An entry that
-/// is not a regular file, a file over 64 KiB or not UTF-8, and any git
-/// failure are errors: a reason that names the file.
+/// The rules are read at `base.commit`, which
+/// [`sync_checkout`](crate::project::sync_checkout) resolved once through
+/// the base's full name, so a local branch named like it
+/// (`refs/heads/origin/main`) cannot stand in for it. An entry that is not a
+/// regular file, a file over 64 KiB or not UTF-8, and any git failure are
+/// errors: a reason that names the file.
 pub fn project_rules(git: &Git, checkout: &Path, base: &Base) -> Result<Vec<Rule>, String> {
     let at = format!("{RULE_FILE} on {}", base.remote_ref);
-    let full = format!("refs/remotes/{}^{{commit}}", base.remote_ref);
-    let commit = git
-        .run(
-            checkout,
-            &["rev-parse", "--verify", "--quiet", full.as_str()],
-        )
-        .map_err(|e| format!("reading {at}: the base does not resolve ({})", e.detail))?;
-    let commit = String::from_utf8_lossy(&commit).trim().to_owned();
     let listing = git
         .run(
             checkout,
@@ -47,7 +41,7 @@ pub fn project_rules(git: &Git, checkout: &Path, base: &Base) -> Result<Vec<Rule
                 "-z",
                 "-l",
                 "--full-tree",
-                commit.as_str(),
+                base.commit.as_str(),
                 "--",
                 RULE_FILE,
             ],

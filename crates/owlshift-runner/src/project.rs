@@ -208,10 +208,16 @@ fn component(name: &str) -> String {
 /// knows it after a fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Base {
-    /// The remote-tracking name, such as `origin/main`.
+    /// The remote-tracking name, such as `origin/main`, for messages and
+    /// events only: a run can move a remote-tracking ref (OWL-51), so a later
+    /// step is given `commit`, never this name.
     pub remote_ref: String,
     /// The branch on the forge, such as `main`: the pull request's base.
     pub branch: String,
+    /// The commit `refs/remotes/origin/<branch>` points to right after the
+    /// fetch, resolved once through that full name: what new branches start
+    /// from and what the project's rules are read at.
+    pub commit: String,
 }
 
 /// Brings the dedicated checkout up to date: clones `remote_url` into it the
@@ -220,7 +226,8 @@ pub struct Base {
 /// again, since a project can change it. Worktrees whose folder was removed
 /// are forgotten. Returns `origin`'s default branch, which a clone records
 /// as `refs/remotes/origin/HEAD` (checked with git 2.54 and on GitHub on
-/// 2026-09-29) and `git remote set-head origin --auto` refreshes.
+/// 2026-09-29) and `git remote set-head origin --auto` refreshes, with the
+/// commit it points to after the fetch.
 ///
 /// Every command runs under the runner git's own deadline, 120 s at the
 /// time of writing: a first clone of a very large repository can outlive
@@ -264,13 +271,16 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
     }
     git.run(&checkout, &["worktree", "prune"]).map_err(failed)?;
 
+    // The full name: `--short` would answer `remotes/origin/main` when a
+    // local branch `origin/main` exists (git 2.54, 2026-09-29). One level
+    // only: `set-head` has just written it.
     let head = [
         "symbolic-ref",
         "--quiet",
-        "--short",
+        "--no-recurse",
         "refs/remotes/origin/HEAD",
     ];
-    let remote_ref = match git.run(&checkout, &head) {
+    let target = match git.run(&checkout, &head) {
         Ok(name) => name,
         // A clone of a repository without a default branch records none.
         Err(_) => {
@@ -278,15 +288,45 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
             git.run(&checkout, &head).map_err(failed)?
         }
     };
-    let remote_ref = String::from_utf8_lossy(&remote_ref).trim().to_owned();
-    let branch = remote_ref
-        .strip_prefix("origin/")
+    let target = String::from_utf8_lossy(&target).trim().to_owned();
+    let branch = target
+        .strip_prefix("refs/remotes/origin/")
         .filter(|branch| !branch.is_empty())
-        .ok_or_else(|| {
-            format!("origin's default branch is {remote_ref:?}, not a branch of origin")
-        })?
+        .ok_or_else(|| format!("origin's default branch is {target:?}, not a branch of origin"))?
         .to_owned();
-    Ok(Base { remote_ref, branch })
+    // Resolved now, right after the fetch reset every remote-tracking ref a
+    // run could have moved, and by its full name, which no local branch
+    // shadows (OWL-51). A run can also make that ref symbolic, pointing at
+    // another branch of origin: the fetch keeps such a ref, and git follows
+    // it (git 2.54, 2026-09-29), so it is refused.
+    let symbolic = git
+        .output(
+            &checkout,
+            &["symbolic-ref", "--quiet", target.as_str()],
+            None,
+        )
+        .map_err(failed)?
+        .success();
+    if symbolic {
+        return Err(format!(
+            "{target} in {} is a symbolic ref, not a branch fetched from origin; \
+             remove it with `git update-ref --no-deref -d {target}` there and run again",
+            checkout.display()
+        ));
+    }
+    let full = format!("{target}^{{commit}}");
+    let commit = git
+        .run(
+            &checkout,
+            &["rev-parse", "--verify", "--end-of-options", full.as_str()],
+        )
+        .map_err(|e| format!("origin's default branch {target} does not resolve: {e}"))?;
+    let commit = String::from_utf8_lossy(&commit).trim().to_owned();
+    Ok(Base {
+        remote_ref: format!("origin/{branch}"),
+        branch,
+        commit,
+    })
 }
 
 /// `git remote set-head origin --auto`: asks the forge for its default

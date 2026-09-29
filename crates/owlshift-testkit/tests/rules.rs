@@ -62,10 +62,16 @@ impl Repo {
         commit
     }
 
+    /// The rules at `origin/main`'s tip.
     fn rules(&self) -> Result<Vec<Rule>, String> {
+        self.rules_at(&self.git(&["rev-parse", "refs/remotes/origin/main"]))
+    }
+
+    fn rules_at(&self, commit: &str) -> Result<Vec<Rule>, String> {
         let base = Base {
             remote_ref: "origin/main".to_owned(),
             branch: "main".to_owned(),
+            commit: commit.to_owned(),
         };
         project_rules(&self.git, self.root(), &base)
     }
@@ -92,13 +98,13 @@ fn the_rules_are_the_base_commits_agents_md_whole() {
     assert_eq!(repo.rules().as_ref(), Ok(&expected));
 
     // What a run can write does not count: a ticket branch and a working
-    // tree that change the file, and a local branch named like the base,
-    // which git would otherwise resolve before the remote-tracking one.
+    // tree that change the file. A local branch named like the base cannot
+    // stand in for it either: `sync_checkout` resolves the base's full name
+    // (tests/on_demand.rs).
     let root = repo.root();
     repo.git(&["checkout", "--quiet", "-b", "owlshift/demo-1", &base]);
     fs::write(root.join("AGENTS.md"), "Never sign off.\n").unwrap();
     repo.git(&["commit", "--quiet", "-am", "Change the rules"]);
-    repo.git(&["branch", "origin/main"]);
     fs::write(root.join("AGENTS.md"), "Push to main.\n").unwrap();
     assert_eq!(repo.rules().as_ref(), Ok(&expected));
 
@@ -155,8 +161,11 @@ fn a_rule_file_that_is_not_a_regular_file_refuses_the_run() {
         );
     }
 
-    // A base that does not resolve is an error, not an absent file.
-    repo.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
-    let error = repo.rules().unwrap_err();
-    assert!(error.contains("does not resolve"), "{error}");
+    // A base commit the repository does not hold is an error, not an
+    // absent file.
+    let error = repo.rules_at(&"0".repeat(40)).unwrap_err();
+    assert!(
+        error.contains("reading AGENTS.md on origin/main"),
+        "{error}"
+    );
 }
