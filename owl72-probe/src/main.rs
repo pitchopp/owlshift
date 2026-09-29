@@ -623,8 +623,9 @@ mod win {
     };
     use windows_sys::Win32::Security::{
         AddAccessAllowedAce, CreateRestrictedToken, DISABLE_MAX_PRIVILEGE,
-        GROUP_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
-        SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL, TOKEN_USER, TokenDefaultDacl,
+        GROUP_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL, TOKEN_GROUPS,
+        TOKEN_MANDATORY_LABEL, TOKEN_USER, TokenDefaultDacl, TokenIntegrityLevel, TokenLogonSid,
         TokenUser,
     };
     use windows_sys::Win32::System::Threading::{
@@ -638,7 +639,7 @@ mod win {
     /// the bypass of traverse checks dropped, and a second access check
     /// against Everyone, Users and `run` only. Its default DACL names the
     /// user, `run` and SYSTEM, so what the process creates is its own.
-    fn restricted_token(run: PSID) -> Result<HANDLE, String> {
+    fn restricted_token(run: PSID, logon: bool, low: bool) -> Result<HANDLE, String> {
         // SAFETY: handles and buffers are live locals; the token handle is
         // leaked on purpose, the probe exits soon after.
         unsafe {
@@ -646,7 +647,22 @@ mod win {
             if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut own) == 0 {
                 return Err(format!("OpenProcessToken: {}", GetLastError()));
             }
-            let restricting = [string_sid("S-1-1-0"), string_sid("S-1-5-32-545"), run];
+            let mut restricting = vec![string_sid("S-1-1-0"), string_sid("S-1-5-32-545"), run];
+            if logon {
+                let groups = Box::leak(vec![0u64; 16].into_boxed_slice());
+                let mut length = 0u32;
+                if GetTokenInformation(
+                    own,
+                    TokenLogonSid,
+                    groups.as_mut_ptr().cast(),
+                    (groups.len() * 8) as u32,
+                    &mut length,
+                ) == 0
+                {
+                    return Err(format!("TokenLogonSid: {}", GetLastError()));
+                }
+                restricting.push((*groups.as_ptr().cast::<TOKEN_GROUPS>()).Groups[0].Sid);
+            }
             let sids: Vec<SID_AND_ATTRIBUTES> = restricting
                 .iter()
                 .map(|&sid| SID_AND_ATTRIBUTES {
@@ -697,6 +713,24 @@ mod win {
             ) == 0
             {
                 return Err(format!("SetTokenInformation: {}", GetLastError()));
+            }
+            if low {
+                let low_sid = string_sid("S-1-16-4096");
+                let label = TOKEN_MANDATORY_LABEL {
+                    Label: SID_AND_ATTRIBUTES {
+                        Sid: low_sid,
+                        Attributes: 0x20, // SE_GROUP_INTEGRITY
+                    },
+                };
+                if SetTokenInformation(
+                    token,
+                    TokenIntegrityLevel,
+                    (&raw const label).cast(),
+                    size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(low_sid),
+                ) == 0
+                {
+                    return Err(format!("TokenIntegrityLevel: {}", GetLastError()));
+                }
             }
             Ok(token)
         }
@@ -862,9 +896,8 @@ mod win {
 
     // ---------------------------------------------------------------- main
 
-    /// Round 3: why the container cannot open NUL, whether a confined
-    /// process can open the runner's own process, and how a restricted
-    /// token answers the same questions as the container.
+    /// Round 4: two restricted tokens, the logon SID among the restricting
+    /// SIDs, at medium and at low integrity, against the same questions.
     pub fn main() {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("helper") {
@@ -875,12 +908,10 @@ mod win {
         let exe = std::env::current_exe().unwrap();
         let exe_text = exe.display().to_string();
         let pid = std::process::id();
-        println!("== OWL-72 probe, round 3 ==");
-        check("nul.sddl", nul_sddl());
-
+        println!("== OWL-72 probe, round 4 ==");
         let quoted = |path: &Path| format!("\"{}\"", path.display());
         let tree = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-        let base = std::env::temp_dir().join(format!("owl72c-{pid}"));
+        let base = std::env::temp_dir().join(format!("owl72d-{pid}"));
         let home = base.join("home");
         fs::create_dir_all(home.join(r".config\gh")).unwrap();
         fs::create_dir_all(home.join("other-project")).unwrap();
@@ -888,133 +919,99 @@ mod win {
         let sibling_env = home.join(r"other-project\.env");
         fs::write(&token_file, format!("github.com:\n    oauth_token: gho_{MARKER}\n")).unwrap();
         fs::write(&sibling_env, format!("API_KEY={MARKER}\n")).unwrap();
-        let outside = std::env::current_dir().unwrap().join("owl72-outside.txt");
-        fs::write(&outside, format!("{MARKER}\n")).unwrap();
-        let granted = base.join("granted");
-        fs::create_dir_all(&granted).unwrap();
-        let repo = base.join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        fs::write(repo.join("README.md"), "hello\n").unwrap();
         let identity = "-c user.name=owl72 -c user.email=owl72@example.invalid";
-        bare(GIT, "init -q", &repo);
-        bare(GIT, &format!("{identity} add README.md"), &repo);
-        bare(GIT, &format!("{identity} commit -q -m seed"), &repo);
 
-        // The container: can it open the probe's own process?
-        let (sid, _) = profile_sid(PROFILE);
-        check(
-            "container.open-probe-process",
-            confined(sid, &[], &exe_text, &format!("helper open-process {pid}"), &root),
-        );
-
-        // The restricted token, granted the same folders as the container
-        // was, through its own SID.
-        let run = string_sid(&format!("S-1-9-1-{pid}"));
-        for dir in [&granted, &repo] {
-            let (error, _) = set_acl(dir, run, MODIFY, GRANT_ACCESS, tree);
-            assert_eq!(error, 0, "grant on {}", dir.display());
-        }
-        let token = match restricted_token(run) {
-            Ok(token) => token,
-            Err(error) => {
-                check("restricted.token", error);
-                return;
+        for (index, (name, logon, low)) in [("logon", true, false), ("logon-low", true, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let run = string_sid(&format!("S-1-9-1-{pid}-{index}"));
+            let granted = base.join(format!("granted-{name}"));
+            let repo = base.join(format!("repo-{name}"));
+            fs::create_dir_all(&granted).unwrap();
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(repo.join("README.md"), "hello\n").unwrap();
+            bare(GIT, "init -q", &repo);
+            bare(GIT, &format!("{identity} add README.md"), &repo);
+            bare(GIT, &format!("{identity} commit -q -m seed"), &repo);
+            for dir in [&granted, &repo] {
+                let (error, _) = set_acl(dir, run, MODIFY, GRANT_ACCESS, tree);
+                assert_eq!(error, 0, "grant on {}", dir.display());
+                if low {
+                    let (error, _) = set_label(dir, Some("S:(ML;OICI;NW;;;LW)"));
+                    assert_eq!(error, 0, "label on {}", dir.display());
+                }
             }
-        };
-        check("restricted.token", "created");
-        check("restricted.helper", restricted(token, &exe_text, "helper noop", &root));
-        let sys_file = root.join(r"System32\drivers\etc\hosts");
-        check(
-            "restricted.system-file",
-            restricted(token, &cmd(), &format!("/d /c type {} > NUL && echo read", quoted(&sys_file)), &root),
-        );
-        for (name, path) in [("gh-token", &token_file), ("sibling-env", &sibling_env)] {
-            check(
-                &format!("restricted.{name}"),
-                restricted(token, &cmd(), &format!("/d /c type {}", quoted(path)), &root),
+            let token = match restricted_token(run, logon, low) {
+                Ok(token) => token,
+                Err(error) => {
+                    check(&format!("{name}.token"), error);
+                    continue;
+                }
+            };
+            let c = |what: &str, result: String| check(&format!("{name}.{what}"), result);
+            c("helper", restricted(token, &exe_text, "helper noop", &root));
+            for (what, path) in [("gh-token", &token_file), ("sibling-env", &sibling_env)] {
+                c(
+                    what,
+                    restricted(token, &cmd(), &format!("/d /c type {}", quoted(path)), &root),
+                );
+            }
+            let profile_dir = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
+            c(
+                "list-profile",
+                restricted(token, &cmd(), &format!("/d /c dir /b {}", quoted(&profile_dir)), &root),
             );
-        }
-        check(
-            "restricted.gh-token.grandchild",
-            restricted(
+            for (what, dir) in [
+                ("programdata", PathBuf::from(r"C:\ProgramData")),
+                ("workspace", std::env::current_dir().unwrap()),
+                ("granted", granted.clone()),
+            ] {
+                let target = dir.join(format!("owl72d-{pid}-{name}.txt"));
+                restricted(token, &cmd(), &format!("/d /c echo x> {}", quoted(&target)), &root);
+                c(&format!("write-{what}-landed"), target.exists().to_string());
+                let _ = fs::remove_file(&target);
+            }
+            c("nul", restricted(token, &exe_text, "helper open-nul", &root));
+            c("git-version", restricted(token, GIT, "--version", &root));
+            c("git-status", restricted(token, GIT, "status --porcelain", &repo));
+            fs::write(repo.join("b.txt"), "b\n").unwrap();
+            c("git-add", restricted(token, GIT, "add b.txt", &repo));
+            c(
+                "git-commit",
+                restricted(token, GIT, &format!("{identity} commit -q -m confined"), &repo),
+            );
+            c("git-log-bare", bare(GIT, "log --oneline", &repo));
+            c("net", restricted(token, &curl(), &curl_line("https://example.com/"), &root));
+            let (port, answered) = host_listener();
+            let result = restricted(
                 token,
-                &cmd(),
-                &format!("/d /c \"{}\" /d /c type {}", cmd(), quoted(&token_file)),
+                &curl(),
+                &curl_line(&format!("http://127.0.0.1:{port}/")),
                 &root,
-            ),
-        );
-        let profile_dir = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
-        check(
-            "restricted.list-profile",
-            restricted(token, &cmd(), &format!("/d /c dir /b {}", quoted(&profile_dir)), &root),
-        );
-        check(
-            "restricted.outside-profile-file",
-            restricted(token, &cmd(), &format!("/d /c type {}", quoted(&outside)), &root),
-        );
-        let temp_root = std::env::temp_dir().join(format!("owl72c-{pid}-temp-write.txt"));
-        restricted(token, &cmd(), &format!("/d /c echo x> {}", quoted(&temp_root)), &root);
-        check("restricted.temp-root-write-landed", temp_root.exists());
-        for (name, dir) in [
-            ("programdata", PathBuf::from(r"C:\ProgramData")),
-            ("users-public", PathBuf::from(r"C:\Users\Public")),
-            ("workspace", std::env::current_dir().unwrap()),
-        ] {
-            let target = dir.join(format!("owl72c-{pid}.txt"));
-            restricted(token, &cmd(), &format!("/d /c echo x> {}", quoted(&target)), &root);
-            check(&format!("restricted.write-{name}-landed"), target.exists());
-            let _ = fs::remove_file(&target);
+            );
+            let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+            c(
+                "loopback-to-host",
+                format!("{result}; listener answered: {}", answered.join().unwrap()),
+            );
+            let written = cred_write(CRED_PERSIST_LOCAL_MACHINE);
+            c(
+                "cred-read",
+                format!(
+                    "write error {written}; {}",
+                    restricted(token, &exe_text, "helper cred-read", &root)
+                ),
+            );
+            cred_delete();
+            c(
+                "open-probe-process",
+                restricted(token, &exe_text, &format!("helper open-process {pid}"), &root),
+            );
+            for dir in [&granted, &repo] {
+                set_acl(dir, run, 0, REVOKE_ACCESS, NO_INHERITANCE);
+            }
         }
-        restricted(token, &cmd(), "/d /c echo x> new.txt", &granted);
-        check("restricted.write-granted-landed", granted.join("new.txt").exists());
-        check("restricted.nul", restricted(token, &exe_text, "helper open-nul", &root));
-        check(
-            "restricted.nul-redirect",
-            restricted(token, &cmd(), "/d /c echo x> NUL && echo redirected", &root),
-        );
-        check("restricted.git-version", restricted(token, GIT, "--version", &root));
-        check("restricted.git-status", restricted(token, GIT, "status --porcelain", &repo));
-        fs::write(repo.join("b.txt"), "b\n").unwrap();
-        check("restricted.git-add", restricted(token, GIT, "add b.txt", &repo));
-        check(
-            "restricted.git-commit",
-            restricted(token, GIT, &format!("{identity} commit -q -m confined"), &repo),
-        );
-        check("restricted.git-log-bare", bare(GIT, "log --oneline", &repo));
-        let written = cred_write(CRED_PERSIST_LOCAL_MACHINE);
-        check("restricted.cred-write", format!("error {written}"));
-        check("restricted.cred-read", restricted(token, &exe_text, "helper cred-read", &root));
-        check("restricted.cred-delete", format!("error {}", cred_delete()));
-        check(
-            "restricted.open-probe-process",
-            restricted(token, &exe_text, &format!("helper open-process {pid}"), &root),
-        );
-        check(
-            "restricted.net",
-            restricted(token, &curl(), &curl_line("https://example.com/"), &root),
-        );
-        let (port, answered) = host_listener();
-        let result = restricted(
-            token,
-            &curl(),
-            &curl_line(&format!("http://127.0.0.1:{port}/")),
-            &root,
-        );
-        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
-        check(
-            "restricted.loopback-to-host",
-            format!("{result}; listener answered: {}", answered.join().unwrap()),
-        );
-
-        // Cleanup.
-        for dir in [&granted, &repo] {
-            set_acl(dir, run, 0, REVOKE_ACCESS, NO_INHERITANCE);
-        }
-        let _ = fs::remove_file(&outside);
-        let _ = fs::remove_file(&temp_root);
-        // SAFETY: a NUL-terminated local.
-        let deleted = unsafe { DeleteAppContainerProfile(wide(PROFILE).as_ptr()) };
-        check("cleanup.profile-deleted", format!("hr {deleted:#x}"));
         check("cleanup.base-removed", fs::remove_dir_all(&base).is_ok());
         println!("== done ==");
     }
