@@ -51,6 +51,16 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # OWL-81: `cargo test --workspace` runs other test binaries
+      # (agent_credentials among them) before on_demand, so a warm gh hides
+      # a cold-start failure. On the Windows runner the on_demand binary
+      # runs alone first, proving it passes without another binary having
+      # warmed gh: the warm-up is shared through the testkit since OWL-70.
+      # Approved on OWL-81 on 2026-09-29, as the CI-settings floor of
+      # architecture section 8 requires.
+      - name: Test the on-demand binary alone
+        if: runner.os == 'Windows'
+        run: cargo test -p owlshift-testkit --test on_demand --locked
       - name: Test
         run: cargo test --workspace --locked
 

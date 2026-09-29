@@ -32,6 +32,12 @@
 //!   read (the 50 most recent, OWL-11, OWL-13) have the account of the
 //!   personal API key and no bot actor.
 //!
+//! Checked live on 2026-09-29 (OWL-74; build plan, check C4): an issue typed
+//! by hand in Linear's app (OWL-82) and issues an agent created through the
+//! same account's personal API key (OWL-80, OWL-81, OWL-74) answer alike on
+//! every field compared, and the schema has no field naming the client. So a
+//! ticket's creator is never reported as an account (`ticket_author`).
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -186,7 +192,7 @@ impl Tracker for LinearTracker {
             priority: priority(issue.priority)?,
             assignee: issue.assignee.map(User::into_person),
             labels: issue.labels.nodes.into_iter().map(|l| l.name).collect(),
-            author: author(issue.creator, issue.bot_actor, issue.external_user_creator),
+            author: ticket_author(issue.creator, issue.bot_actor, issue.external_user_creator),
         })
     }
 
@@ -394,12 +400,15 @@ struct Named {
     name: Option<String>,
 }
 
-/// Who wrote an issue or a comment. It is an account only when Linear names
-/// an account and nothing else: a bot or an external user alongside it means
-/// an integration acted, and what it carried is not the account's own text,
-/// so the author is then that bot or external user. The recorded answers
-/// never set both; the rule fails closed if Linear ever does. Nobody named
-/// (a deleted account) is [`Author::unknown`].
+/// Who wrote a comment, and the base of [`ticket_author`]. It is an account
+/// only when Linear names an account and nothing else: a bot or an external
+/// user alongside it means an integration acted, and what it carried is not
+/// the account's own text, so the author is then that bot or external user.
+/// The recorded answers never set both; the rule fails closed if Linear ever
+/// does. Nobody named (a deleted account) is [`Author::unknown`].
+///
+/// A comment posted through an account's personal API key is that account's
+/// too: a limit accepted for comments, which are how the decider answers.
 fn author(user: Option<User>, bot: Option<Named>, external: Option<Named>) -> Author {
     match (user, bot, external) {
         (Some(user), None, None) => Author::Account(user.into_person()),
@@ -408,6 +417,21 @@ fn author(user: Option<User>, bot: Option<Named>, external: Option<Named>) -> Au
             .or_else(|| external.and_then(|e| e.name))
             .or_else(|| user.map(|u| u.display_name))
             .map_or_else(Author::unknown, |name| Author::Other { name }),
+    }
+}
+
+/// Who created an issue: never an account. Whoever holds an account's
+/// personal API key, a script or an agent, creates issues as that account,
+/// and Linear answers alike for an issue the account typed by hand (checked
+/// 2026-09-29, OWL-74). So the creator keeps its name but reads as an author
+/// the adapter cannot vouch for, and a ticket's description is never the
+/// decider's instructions. The creator's identifier is still read: the rule
+/// for bots and external users, and the recorded query, are shared with
+/// comments.
+fn ticket_author(creator: Option<User>, bot: Option<Named>, external: Option<Named>) -> Author {
+    match author(creator, bot, external) {
+        Author::Account(person) => Author::Other { name: person.name },
+        other => other,
     }
 }
 

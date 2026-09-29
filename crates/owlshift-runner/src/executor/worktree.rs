@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use owlshift_contracts::brief::Brief;
 
-use super::git::Git;
+use super::git::{Git, GitError};
 use super::{BRIEF_PATH, ExecutorError, RUN_DIR, RunSpec};
 
 /// Creates the ticket's worktree on its branch, or checks that the one
@@ -73,18 +73,8 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
     if exists {
         args.extend([spec.worktree.as_os_str(), spec.branch.as_ref()]);
     } else {
-        let resolved = git
-            .run(
-                spec.main,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--end-of-options",
-                    format!("{}^{{commit}}", spec.base).as_str(),
-                ],
-            )
+        base = resolve_base(git, spec.main, spec.base)
             .map_err(|e| ExecutorError::Spec(format!("base {:?}: {e}", spec.base)))?;
-        base = String::from_utf8_lossy(&resolved).trim().to_owned();
         args.extend([
             "-b".as_ref(),
             spec.branch.as_ref(),
@@ -94,6 +84,42 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
     }
     git.run(spec.main, &args).map_err(worktree_error)?;
     Ok(())
+}
+
+/// The commit a new branch starts from. A full object id is taken as the
+/// commit it names: git never lets a ref shadow 40 or 64 hex digits. Any
+/// other base is a remote-tracking name, looked up as exactly
+/// `refs/remotes/<base>` (OWL-66): a local branch named like it
+/// (`refs/heads/origin/main`, or `refs/heads/refs/remotes/origin/main` when
+/// the remote-tracking ref is missing) cannot stand in for it, and a
+/// revision expression such as `origin/main~1` is refused. Checked on
+/// 2026-09-29 with git 2.54: `rev-parse` gave a planted
+/// `refs/heads/origin/main` for `origin/main`, and a planted
+/// `refs/heads/refs/remotes/origin/main` for an absent
+/// `refs/remotes/origin/main`; `show-ref --verify` refused both the absent
+/// ref and the expressions.
+fn resolve_base(git: &Git, main: &Path, base: &str) -> Result<String, GitError> {
+    let full_id = matches!(base.len(), 40 | 64) && base.bytes().all(|b| b.is_ascii_hexdigit());
+    let object = if full_id {
+        base.to_owned()
+    } else {
+        let full_name = format!("refs/remotes/{base}");
+        let hash = git.run(
+            main,
+            &["show-ref", "--verify", "--hash", full_name.as_str()],
+        )?;
+        String::from_utf8_lossy(&hash).trim().to_owned()
+    };
+    let commit = git.run(
+        main,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            format!("{object}^{{commit}}").as_str(),
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&commit).trim().to_owned())
 }
 
 /// Requires an existing worktree to be one the isolation check protects
