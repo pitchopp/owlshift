@@ -34,7 +34,7 @@ use owlshift_core::agent_env::{
 };
 use owlshift_core::floor::FloorViolation;
 use owlshift_platform::paths;
-use owlshift_platform::process::{Captured, find_executable_in, run_command};
+use owlshift_platform::process::{Captured, OUTPUT_CAP, find_executable_in, run_command};
 use owlshift_platform::sandbox::{self, Policy, SandboxError};
 
 use crate::system::PROBE_TIMEOUT;
@@ -327,8 +327,8 @@ impl AgentEnv {
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(workdir);
         self.apply(&mut command);
-        let captured =
-            run_command(&mut command, None, PROBE_TIMEOUT).map_err(|error| error.to_string())?;
+        let captured = run_command(&mut command, None, PROBE_TIMEOUT, OUTPUT_CAP)
+            .map_err(|error| error.to_string())?;
         if captured.code != Some(0) {
             return Err(format!("it exited with status {:?}", captured.code));
         }
@@ -436,7 +436,8 @@ fn probe_environment(
         .map_or_else(OsString::new, |(_, value)| value.clone());
     let probe = |program: &Path, args: &[&str], input: Option<&[u8]>| {
         let mut command = build(program, args)?;
-        run_command(&mut command, input, PROBE_TIMEOUT).map_err(|error| error.to_string())
+        run_command(&mut command, input, PROBE_TIMEOUT, OUTPUT_CAP)
+            .map_err(|error| error.to_string())
     };
 
     match find_executable_in("git", &search_path) {
