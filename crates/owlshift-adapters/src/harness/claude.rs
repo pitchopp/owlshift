@@ -13,7 +13,8 @@
 //! executor gives the child the agent environment of
 //! `owlshift_core::agent_env`, which keeps what `claude` needs to find the
 //! login the user configured, normally their subscription (architecture
-//! principle 9), and no tracker, forge or cloud credential.
+//! principle 9), and no tracker, forge or cloud credential. The runner adds
+//! [`PEER_INBOX_ENV`] to it.
 //!
 //! Every CLI behaviour relied on here was checked live and is recorded in
 //! `docs/design/build-plan.md`, under checks C1 and C7 and the OWL-14
@@ -81,6 +82,18 @@ const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "", "--strict-mcp-config"
 /// set to accept did not bring it back. Checked live (OWL-52, recorded under
 /// check C1 in `docs/design/build-plan.md`).
 const PEER_INBOX_ARGS: &[&str] = &["--settings", r#"{"crossSessionInbound":"refuse"}"#];
+
+/// Switches the inbox itself off: with this variable, `claude -p` binds no
+/// socket and its `init` names none, confined or not. The CLI reads it as
+/// the override of a feature gate; it is not documented, so
+/// [`PEER_INBOX_ARGS`] stays as the documented layer. This adapter cannot
+/// set it, since the executor replaces the command's whole environment:
+/// `AgentEnv::from_runner` does, for every agent the CLI launches. Checked
+/// live (OWL-52 and OWL-65, recorded under check C1 in
+/// `docs/design/build-plan.md`): under the macOS sandbox the inbox is shut
+/// today only because `/tmp` is closed, and pointing `CLAUDE_CODE_TMPDIR`
+/// at the run's own temporary folder reopens it without this variable.
+pub const PEER_INBOX_ENV: (&str, &str) = ("CLAUDE_CODE_HARBOR_KITE", "0");
 
 /// The tools removed from every run because a call can act outside the run's
 /// worktree and budget. Checked live with Claude Code 2.1.283 (OWL-42 and
