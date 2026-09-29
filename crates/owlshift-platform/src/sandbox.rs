@@ -401,11 +401,14 @@ pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<
             None => {}
         }
     }
+    let mut linked: Vec<&Path> = Vec::new();
     for (at, target) in &policy.links {
         // Only where a private folder hides the link: inside a bound folder,
         // or outside any private one, the host's own link is already there.
+        // Each place once: bwrap may refuse a second link where one exists.
         let hidden = policy.hidden.iter().any(|path| at.starts_with(path));
-        if private(at) && !bound(at) && !hidden {
+        if private(at) && !bound(at) && !hidden && !linked.contains(&at.as_path()) {
+            linked.push(at);
             add(at, 2, vec![os("--symlink"), target.into(), at.into()]);
         }
     }
@@ -737,9 +740,13 @@ mod tests {
             _ => None,
         };
         // Links inside a bound folder or outside the private ones are the
-        // host's own, already there.
+        // host's own, already there; a link given twice is made once.
         let mut policy = policy();
-        for at in ["/home/op/wt/jdk", "/opt/jdk"] {
+        for at in [
+            "/home/op/wt/jdk",
+            "/opt/jdk",
+            "/home/op/.sdkman/java/current",
+        ] {
             policy
                 .links
                 .push((at.into(), "/home/op/.sdkman/java/17".into()));

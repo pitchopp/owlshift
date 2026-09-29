@@ -286,10 +286,21 @@ impl AgentEnv {
                 .chain(self.gate_env.iter().map(String::as_str))
                 .flat_map(|name| self.values_of(name))
                 .flat_map(std::env::split_paths);
+            // A folder named twice, by a name declared twice in two letter
+            // cases, by `PATH` declared again, or by two variables, is
+            // opened and linked once.
             for dir in named {
                 let folder = named_folder(home, &real_home, &dir, &kept_out);
-                readable.extend(folder.open);
-                links.extend(folder.link);
+                if let Some(open) = folder.open
+                    && !readable.contains(&open)
+                {
+                    readable.push(open);
+                }
+                if let Some(link) = folder.link
+                    && !links.contains(&link)
+                {
+                    links.push(link);
+                }
             }
         }
 
@@ -863,7 +874,10 @@ mod tests {
     /// is opened by its real path, and a link naming it is recreated; the
     /// home, a credential folder, one holding a credential, closed or
     /// written paths, a file, a missing path and a value that is no path
-    /// open nothing, and an inherited variable's folder is not opened.
+    /// open nothing, and an inherited variable's folder is not opened. A
+    /// folder named again (`PATH` declared, a name declared in two letter
+    /// cases, `PATH` and a variable naming one link) is opened and linked
+    /// once.
     #[cfg(unix)]
     #[test]
     fn the_policy_opens_named_folders_by_their_real_path_and_never_a_credential() {
@@ -910,7 +924,12 @@ mod tests {
             ("TMPDIR".into(), at("tools/tmp")),
             (
                 "PATH".into(),
-                list(&["~/bin/..", "~/.local/bin", "/usr/bin"]),
+                list(&[
+                    "~/bin/..",
+                    "~/.local/bin",
+                    "~/.sdkman/candidates/java/current",
+                    "/usr/bin",
+                ]),
             ),
             ("CLAUDE_CONFIG_DIR".into(), at("claude")),
             ("SDK_A".into(), at(".sdkman/candidates/java/current")),
@@ -932,7 +951,7 @@ mod tests {
                 ]),
             ),
         ];
-        let declared = ["SDK_A", "TOOL_PATHS"];
+        let declared = ["SDK_A", "TOOL_PATHS", "sdk_a", "PATH"];
         let agent = AgentEnv::for_project(parent, &declared, &declared).unwrap();
         let run = RunPaths {
             workdir: home.join("wt"),
