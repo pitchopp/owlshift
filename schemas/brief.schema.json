@@ -286,14 +286,14 @@
       "type": "object",
       "properties": {
         "applies_to": {
-          "description": "The zones the rule applies to.",
+          "description": "The zones the rule applies to; empty, the whole repository.",
           "type": "array",
           "items": {
             "type": "string"
           }
         },
         "source": {
-          "description": "The file the rule comes from.",
+          "description": "The file the rule comes from, relative to the repository's root, as\nthe base commit holds it.",
           "type": "string"
         },
         "text": {

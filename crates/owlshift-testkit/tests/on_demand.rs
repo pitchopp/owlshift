@@ -202,6 +202,9 @@ const DONE: &str = r#"{"format":1,"status":"done","summary":"Added GREETING.md; 
 "decisions":[{"question":"Tone","decision":"Friendly","basis":"The ticket"}],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
+/// The project's rules, which every brief carries (OWL-61).
+const AGENTS: &str = "Sign off every commit (`git commit -s`).\n";
+
 impl Bench {
     fn new(assignee: bool) -> Self {
         let tmp = tempfile::Builder::new()
@@ -219,6 +222,7 @@ impl Bench {
              [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n",
         )
         .unwrap();
+        fs::write(project.join("AGENTS.md"), AGENTS).unwrap();
         let assignee = if assignee {
             "assignee = \"maintainer\"\n"
         } else {
@@ -480,6 +484,15 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
     );
     let checkpoint = brief.checkpoint.expect("the fix run resumes from the plan");
     assert_eq!(checkpoint.plan.unwrap().as_str(), ".owlshift/run/plan.md");
+
+    // The project's rules, from the base commit, reach every run's brief.
+    assert_eq!(brief.rules.len(), 1, "{:?}", brief.rules);
+    let rule = &brief.rules[0];
+    assert_eq!(
+        (rule.source.as_str(), rule.text.as_str()),
+        ("AGENTS.md", AGENTS)
+    );
+    assert!(rule.applies_to.is_empty());
 }
 
 /// How a case prepares its bench and gives its replies.
@@ -588,6 +601,23 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
             }),
             |s| matches!(s, Stop::Delivery(reason) if reason.contains("moved")),
             Some(EventKind::TrackerWrite),
+        ),
+        (
+            "rules too long",
+            Box::new(|b| {
+                // A rule is never cut: the run is refused before it starts.
+                let checkout = &b.remote.checkout;
+                fs::write(checkout.join("AGENTS.md"), "a".repeat(64 * 1024 + 1)).unwrap();
+                b.env
+                    .run(checkout, &["commit", "--quiet", "-am", "Grow the rules"])
+                    .unwrap();
+                b.env
+                    .run(checkout, &["push", "--quiet", "origin", "main"])
+                    .unwrap();
+                Vec::new()
+            }),
+            |s| matches!(s, Stop::Refused(reason) if reason.contains("AGENTS.md on origin/main holds")),
+            None,
         ),
     ];
     for (name, replies, expected, last) in cases {

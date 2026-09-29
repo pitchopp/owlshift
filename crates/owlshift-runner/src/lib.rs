@@ -13,6 +13,7 @@ pub mod init;
 pub mod on_demand;
 pub mod project;
 pub mod roles;
+pub mod rules;
 pub mod system;
 pub mod tracker;
 pub mod writer;

@@ -150,9 +150,10 @@ pub struct Checkpoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
-    /// The zones the rule applies to.
+    /// The zones the rule applies to; empty, the whole repository.
     pub applies_to: Vec<String>,
-    /// The file the rule comes from.
+    /// The file the rule comes from, relative to the repository's root, as
+    /// the base commit holds it.
     pub source: String,
     pub text: String,
 }
