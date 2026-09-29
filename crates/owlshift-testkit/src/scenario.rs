@@ -83,6 +83,12 @@ pub struct Scenario {
     /// The project's gate for this scenario, in place of the fixture's
     /// `stack.gate`: a bench convenience, so short scenarios share a fixture.
     pub gate: Option<Vec<String>>,
+    /// Variables added to the runner's environment the agent environment is
+    /// built from (the bench's, not the test process's), replacing one of
+    /// the same name in any letter case: what a project's `stack.gate_env`
+    /// can pick from.
+    #[serde(default)]
+    pub runner_env: BTreeMap<String, String>,
     /// Whether the fake harness and the gate run inside the OS sandbox, as
     /// agent runs do (OWL-41). Off by default: the scenarios check the
     /// pipeline and the isolation check, a separate layer, and the sandbox
@@ -344,7 +350,13 @@ impl Driver {
         let timeout = scenario
             .timeout_ms
             .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
-        let agent = AgentEnv::new(git.agent_parent(), &[]).map_err(|e| e.to_string())?;
+        let mut parent = git.agent_parent();
+        for (name, value) in &scenario.runner_env {
+            parent.retain(|(n, _)| !n.to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)));
+            parent.push((name.into(), value.into()));
+        }
+        let agent =
+            AgentEnv::new(parent, &config.stack.gate_env_names()).map_err(|e| e.to_string())?;
         let agent = if scenario.confined {
             agent
         } else {

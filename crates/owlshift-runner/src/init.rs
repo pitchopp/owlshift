@@ -103,7 +103,11 @@ states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs I
 # repository root. The build role runs it before it reports done, then
 # Owlshift runs it again on the commit it delivers. With no command, the
 # build role stops with `blocked`.
-{gate}
+{gate}# Agents start from an almost empty environment. Name here the variables of
+# your environment the gate needs, such as a tool chain's path; the whole
+# agent run sees them. Credential variables are refused.
+# gate_env = [\"JAVA_HOME\"]
+
 [pipeline]
 # A ticket's pipeline variant, unless intake or a label picks another:
 # \"trivial\", \"standard\" or \"risky\". In this version, `owlshift do` runs

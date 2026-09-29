@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
+use owlshift_core::agent_env::check_declared;
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,22 @@ pub struct Stack {
     /// Named resources and the path globs they cover.
     #[serde(default)]
     pub resources: BTreeMap<String, String>,
+    /// Names of variables of the runner's environment the gate needs, such as
+    /// a tool chain's path or a feature flag. Names only: each takes its value
+    /// from the runner's environment, and one the runner lacks is not set.
+    /// They reach the whole agent run, the harness and the commands it starts
+    /// as well as the gate. A credential variable, a `GIT_` name, a variable
+    /// Owlshift overrides or one that makes the dynamic loader load code is
+    /// refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_env: Vec<String>,
+}
+
+impl Stack {
+    /// The names of [`Stack::gate_env`], as the agent environment takes them.
+    pub fn gate_env_names(&self) -> Vec<&str> {
+        self.gate_env.iter().map(String::as_str).collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -145,7 +162,8 @@ impl ProjectConfig {
                 "tracker.team is required for Linear",
             ));
         }
-        Ok(())
+        check_declared(&self.stack.gate_env_names())
+            .map_err(|error| ContractError::invalid(PROJECT, format!("stack.gate_env: {error}")))
     }
 }
 
@@ -346,6 +364,61 @@ mod tests {
             error.contains("this is Owlshift 0.4.2: upgrade Owlshift"),
             "{error}"
         );
+    }
+
+    fn project_with_gate_env(names: &str) -> Result<ProjectConfig, ContractError> {
+        ProjectConfig::parse(&format!(
+            r#"
+            requires = ">=0.1"
+            [tracker]
+            kind = "markdown"
+            admit = {{ label = "owlshift" }}
+            states = {{ ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }}
+            [stack]
+            gate = ["make test"]
+            gate_env = {names}
+            [pipeline]
+            default = "trivial"
+            plan_approval = "never"
+            [models]
+            [policy]
+            always_human = []
+            "#
+        ))
+    }
+
+    #[test]
+    fn gate_env_declares_names_the_agent_may_receive() {
+        let config = project_with_gate_env(r#"["JAVA_HOME", "feature_flag"]"#).unwrap();
+        assert_eq!(config.stack.gate_env_names(), ["JAVA_HOME", "feature_flag"]);
+        assert!(
+            config
+                .render()
+                .contains("gate_env = [\"JAVA_HOME\", \"feature_flag\"]")
+        );
+    }
+
+    #[test]
+    fn gate_env_refuses_what_an_agent_must_not_receive() {
+        for (names, reason) in [
+            (
+                r#"["JAVA_HOME", "github_token"]"#,
+                "agents never receive credentials",
+            ),
+            (
+                r#"["Git_Dir"]"#,
+                "Owlshift sets how git and gh authenticate",
+            ),
+            (r#"["LD_PRELOAD"]"#, "dynamic loader"),
+            (r#"["FEATURE=on"]"#, "declare names only"),
+        ] {
+            let error = project_with_gate_env(names).unwrap_err().to_string();
+            assert!(
+                error.starts_with("invalid owlshift.toml: stack.gate_env: ")
+                    && error.contains(reason),
+                "{names}: {error}"
+            );
+        }
     }
 
     #[test]
