@@ -326,19 +326,47 @@ mod tests {
         }
     }
 
-    /// Runs a helper that starts a long-lived grandchild, and checks that the
-    /// run stops at its deadline and that neither process outlives it.
-    fn assert_nothing_outlives_the_deadline(name: &str) {
+    /// Runs a helper that starts a long-lived grandchild, with the command
+    /// `build` makes of this test binary, its arguments and the helper's
+    /// working directory, and checks that the run stops at its deadline and
+    /// that no process the helper named outlives it: itself, its grandchild,
+    /// and its parent when it named one. Returns the working directory.
+    fn assert_nothing_outlives_the_deadline(
+        name: &str,
+        build: impl FnOnce(&Path, &[&str], &Path) -> Command,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let test = format!("process::tests::{name}");
+        let args = [
+            "--exact",
+            &test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ];
         let timeout = Duration::from_secs(4);
         let started = Instant::now();
-        let outcome = helper(name, Some(dir.path()), timeout);
+        let outcome = run_command(
+            &mut build(&exe, &args, dir.path()),
+            None,
+            timeout,
+            OUTPUT_CAP,
+        );
         assert!(matches!(outcome, Err(RunError::TimedOut)), "{outcome:?}");
         assert!(started.elapsed() < timeout + Duration::from_secs(2));
 
         let pids = std::fs::read_to_string(dir.path().join("pids"))
             .expect("the helper started its grandchild before the deadline");
-        let pids: Vec<u32> = pids.split(' ').map(|pid| pid.parse().unwrap()).collect();
+        let mut pids: Vec<u32> = pids.split(' ').map(|pid| pid.parse().unwrap()).collect();
+        if let Ok(parent) = std::fs::read_to_string(dir.path().join("parent")) {
+            pids.extend(
+                parent
+                    .split(' ')
+                    .next()
+                    .map(|pid| pid.parse::<u32>().unwrap()),
+            );
+        }
         // Killed processes take a moment to be gone: an orphan is reaped by
         // the system, a Windows process ends asynchronously.
         let settled = Instant::now() + Duration::from_secs(5);
@@ -346,6 +374,62 @@ mod tests {
             assert!(Instant::now() < settled, "still running: {pids:?}");
             thread::sleep(Duration::from_millis(50));
         }
+        dir
+    }
+
+    /// A helper run directly, as a probe.
+    fn direct(exe: &Path, args: &[&str], dir: &Path) -> Command {
+        probe_command(exe, args, Some(dir))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_name_the_parent_then_wait_on_a_grandchild() {
+        if helper_requested() {
+            let (pid, name) = parent();
+            std::fs::write("parent", format!("{pid} {name}")).unwrap();
+            spawn_grandchild().wait().unwrap();
+        }
+    }
+
+    /// This process's parent: its pid and image name, from a snapshot of the
+    /// system's processes.
+    #[cfg(windows)]
+    fn parent() -> (u32, String) {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+
+        // SAFETY: no pointer argument.
+        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        assert_ne!(raw, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+        // SAFETY: the call succeeded, so `raw` is a new handle owned here.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut entries = Vec::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..PROCESSENTRY32W::default()
+        };
+        // SAFETY: `entry` is a live local with `dwSize` set, as required.
+        let mut more = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } != 0;
+        while more {
+            entries.push(entry);
+            // SAFETY: as for `Process32FirstW`.
+            more = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } != 0;
+        }
+        let find = |pid: u32| entries.iter().find(|entry| entry.th32ProcessID == pid);
+        let me = find(std::process::id()).expect("this process is in the snapshot");
+        let parent = find(me.th32ParentProcessID).expect("the parent is running");
+        let name = &parent.szExeFile;
+        let len = name
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(name.len());
+        (parent.th32ProcessID, String::from_utf16_lossy(&name[..len]))
     }
 
     /// Whether a process is still running; a zombie is not.
@@ -433,12 +517,35 @@ mod tests {
 
     #[test]
     fn a_timed_out_probe_is_stopped_with_the_processes_it_started() {
-        assert_nothing_outlives_the_deadline("helper_wait_on_a_grandchild");
+        assert_nothing_outlives_the_deadline("helper_wait_on_a_grandchild", direct);
     }
 
     #[test]
     fn a_process_holding_the_output_open_is_stopped_at_the_deadline() {
-        assert_nothing_outlives_the_deadline("helper_leave_a_pipe_holder");
+        assert_nothing_outlives_the_deadline("helper_leave_a_pipe_holder", direct);
+    }
+
+    /// OWL-71: a command the Windows sandbox builds runs as a child of the
+    /// launcher, which the tree starts inside its Job Object; the child and
+    /// everything it starts join that job, so the launcher, the program and
+    /// its grandchild are all stopped at the deadline.
+    #[cfg(windows)]
+    #[test]
+    fn a_launched_program_is_stopped_with_its_launcher_at_the_deadline() {
+        let _launcher = crate::sandbox::use_built_launcher();
+        let dir = assert_nothing_outlives_the_deadline(
+            "helper_name_the_parent_then_wait_on_a_grandchild",
+            |exe, args, dir| {
+                let policy = crate::sandbox::Policy {
+                    workdir: dir.to_owned(),
+                    ..crate::sandbox::Policy::default()
+                };
+                crate::sandbox::wrap(&policy, exe.as_os_str(), args).unwrap()
+            },
+        );
+        let parent = std::fs::read_to_string(dir.path().join("parent")).unwrap();
+        let (_, name) = parent.split_once(' ').unwrap();
+        assert!(name.eq_ignore_ascii_case("owlshift-launch.exe"), "{parent}");
     }
 
     #[test]

@@ -21,6 +21,11 @@ toml.workspace = true
 # run (OWL-41).
 tempfile.workspace = true
 
+[dev-dependencies]
+# The Windows tests start agent commands through the launcher Cargo built
+# (`sandbox::use_built_launcher`, OWL-71).
+owlshift-platform = { workspace = true, features = ["testkit"] }
+
 [features]
 # Test only: `AgentEnv::without_confinement`, for the test bench. No shipped
 # crate enables it (OWL-41).
