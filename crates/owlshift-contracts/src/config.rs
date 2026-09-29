@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use owlshift_core::agent_env::check_declared;
+use owlshift_core::agent_env::{check_declared, check_names};
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -95,7 +95,8 @@ pub struct Stack {
     /// folders and the `PATH`'s folders under the home), so a tool chain
     /// installed elsewhere under the home stays unreadable. A credential
     /// variable, a `GIT_` name, a variable Owlshift overrides or one that
-    /// makes the dynamic loader load code is refused.
+    /// makes the dynamic loader load code is refused, and so is a name the
+    /// operator does not allow in the personal `allow_gate_env`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_env: Vec<String>,
 }
@@ -158,6 +159,9 @@ impl ProjectConfig {
         toml::to_string(self).expect("contract types always serialize to TOML")
     }
 
+    /// Checks what the file alone decides. Whether the operator allows the
+    /// names of `stack.gate_env` depends on the personal file:
+    /// [`Self::check_gate_env`] checks that where both are known.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.tracker.kind == TrackerKind::Linear && self.tracker.team.is_none() {
             return Err(ContractError::invalid(
@@ -165,9 +169,19 @@ impl ProjectConfig {
                 "tracker.team is required for Linear",
             ));
         }
-        check_declared(&self.stack.gate_env_names())
-            .map_err(|error| ContractError::invalid(PROJECT, format!("stack.gate_env: {error}")))
+        check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
     }
+
+    /// Checks `stack.gate_env` against the names the operator allows, the
+    /// personal `allow_gate_env`: the rule the agent environment applies
+    /// (`owlshift_core::agent_env::check_declared`, OWL-63).
+    pub fn check_gate_env(&self, allowed: &[&str]) -> Result<(), ContractError> {
+        check_declared(&self.stack.gate_env_names(), allowed).map_err(gate_env_error)
+    }
+}
+
+fn gate_env_error(error: owlshift_core::agent_env::AgentEnvError) -> ContractError {
+    ContractError::invalid(PROJECT, format!("stack.gate_env: {error}"))
 }
 
 /// The personal file, in the user's configuration directory, never committed.
@@ -191,6 +205,15 @@ pub struct PersonalConfig {
     /// Whether to keep the machine awake while runs are in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_awake: Option<bool>,
+    /// Names of variables of this machine's environment that a project may
+    /// pass to its agents by declaring them in `stack.gate_env`, in any
+    /// letter case. A project's declaration never widens this list: a name
+    /// declared but not listed here is refused. It applies to every project
+    /// run on this machine. A credential variable, a `GIT_` name, a variable
+    /// Owlshift overrides or one that makes the dynamic loader load code
+    /// cannot be listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_gate_env: Vec<String>,
 }
 
 /// The user's accounts on the tracker and the forge.
@@ -252,7 +275,15 @@ impl PersonalConfig {
         toml::to_string(self).expect("contract types always serialize to TOML")
     }
 
+    /// The names of [`PersonalConfig::allow_gate_env`].
+    pub fn allow_gate_env_names(&self) -> Vec<&str> {
+        self.allow_gate_env.iter().map(String::as_str).collect()
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
+        check_names(&self.allow_gate_env_names()).map_err(|error| {
+            ContractError::invalid(PERSONAL, format!("allow_gate_env: {error}"))
+        })?;
         for (harness, settings) in self.harnesses.iter() {
             if settings.fallback == Some(harness) {
                 return Err(ContractError::invalid(
@@ -418,6 +449,41 @@ mod tests {
             let error = project_with_gate_env(names).unwrap_err().to_string();
             assert!(
                 error.starts_with("invalid owlshift.toml: stack.gate_env: ")
+                    && error.contains(reason),
+                "{names}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_env_passes_only_what_the_operator_allows() {
+        let config = project_with_gate_env(r#"["DATABASE_URL", "JAVA_HOME"]"#).unwrap();
+        assert!(
+            config
+                .check_gate_env(&["java_home", "database_url"])
+                .is_ok()
+        );
+        assert_eq!(
+            config
+                .check_gate_env(&["JAVA_HOME"])
+                .unwrap_err()
+                .to_string(),
+            "invalid owlshift.toml: stack.gate_env: DATABASE_URL may not reach an agent on this \
+             machine: the operator allows a name for every project run here by adding it to \
+             `allow_gate_env` in the personal configuration"
+        );
+
+        let personal = PersonalConfig::parse("allow_gate_env = [\"DATABASE_URL\"]\n").unwrap();
+        assert_eq!(personal.allow_gate_env_names(), ["DATABASE_URL"]);
+        for (names, reason) in [
+            (r#"["GH_TOKEN"]"#, "agents never receive credentials"),
+            (r#"["A=B"]"#, "declare names only"),
+        ] {
+            let error = PersonalConfig::parse(&format!("allow_gate_env = {names}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("invalid personal configuration: allow_gate_env: ")
                     && error.contains(reason),
                 "{names}: {error}"
             );

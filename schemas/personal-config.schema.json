@@ -4,6 +4,13 @@
   "description": "The personal file, in the user's configuration directory, never committed.",
   "type": "object",
   "properties": {
+    "allow_gate_env": {
+      "description": "Names of variables of this machine's environment that a project may\npass to its agents by declaring them in `stack.gate_env`, in any\nletter case. A project's declaration never widens this list: a name\ndeclared but not listed here is refused. It applies to every project\nrun on this machine. A credential variable, a `GIT_` name, a variable\nOwlshift overrides or one that makes the dynamic loader load code\ncannot be listed.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "concurrent_runs": {
       "description": "How many runs this machine runs at once.",
       "type": [

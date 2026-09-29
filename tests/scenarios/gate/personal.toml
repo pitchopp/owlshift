@@ -1,0 +1,3 @@
+# The operator's personal file: it lets the fixture's gate receive the probe
+# variable it declares in `stack.gate_env` (OWL-63).
+allow_gate_env = ["OWLSHIFT_GATE_PROBE"]

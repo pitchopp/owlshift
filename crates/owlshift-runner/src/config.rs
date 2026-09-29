@@ -101,7 +101,39 @@ impl Effective {
             Some(path) => FileState::load(path, PersonalConfig::parse),
             None => FileState::NotApplicable("this system has no configuration directory".into()),
         };
-        Self { project, personal }
+        let mut effective = Self { project, personal };
+        effective.check_gate_env();
+        effective
+    }
+
+    /// The names the operator lets a project pass to its agents, the
+    /// personal `allow_gate_env`: none without a personal file, `None` when
+    /// the personal file is unknown or invalid.
+    pub fn allowed_gate_env(&self) -> Option<Vec<&str>> {
+        match &self.personal {
+            FileState::Loaded { config, .. } => Some(config.allow_gate_env_names()),
+            FileState::Absent(_) | FileState::NotApplicable(_) => Some(Vec::new()),
+            FileState::Unavailable(_) | FileState::Invalid { .. } => None,
+        }
+    }
+
+    /// Refuses, as invalid, a project that declares for its gate a variable
+    /// the operator does not allow (OWL-63). With the personal file unknown
+    /// or invalid, the configuration is invalid already and the project is
+    /// left as it is.
+    fn check_gate_env(&mut self) {
+        let FileState::Loaded { path, config, .. } = &self.project else {
+            return;
+        };
+        let Some(allowed) = self.allowed_gate_env() else {
+            return;
+        };
+        if let Err(error) = config.check_gate_env(&allowed) {
+            self.project = FileState::Invalid {
+                path: path.clone(),
+                error: error.to_string(),
+            };
+        }
     }
 
     /// Whether both files could be read and are valid, or are simply absent.
@@ -263,6 +295,40 @@ mod tests {
         let shown = effective.to_string();
         assert!(shown.contains("upgrade Owlshift"), "{shown}");
         assert!(matches!(effective.personal, FileState::Invalid { .. }));
+    }
+
+    /// OWL-63's acceptance: a project that declares a variable the operator
+    /// does not allow is refused when the configuration is loaded.
+    #[test]
+    fn a_declared_variable_needs_the_operators_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaring = PROJECT.replace(
+            "gate = [\"cargo test\"]",
+            "gate = [\"cargo test\"]\ngate_env = [\"DATABASE_URL\"]",
+        );
+        fs::write(dir.path().join(PROJECT_FILE), declaring).unwrap();
+        let personal = dir.path().join("personal.toml");
+        let load = || Effective::load(&repository(dir.path()), dir.path(), Some(personal.clone()));
+
+        let effective = load();
+        assert!(!effective.is_valid());
+        let FileState::Invalid { error, .. } = &effective.project else {
+            panic!("{effective}");
+        };
+        assert!(
+            error.starts_with("invalid owlshift.toml: stack.gate_env: DATABASE_URL may not reach")
+                && error.contains("`allow_gate_env`"),
+            "{error}"
+        );
+
+        fs::write(&personal, "allow_gate_env = [\"database_url\"]\n").unwrap();
+        let effective = load();
+        assert!(effective.is_valid(), "{effective}");
+        assert!(matches!(effective.project, FileState::Loaded { .. }));
+
+        // An invalid personal file makes the configuration invalid on its own.
+        fs::write(&personal, "allow_gate_env = \"DATABASE_URL\"\n").unwrap();
+        assert!(!load().is_valid());
     }
 
     #[test]

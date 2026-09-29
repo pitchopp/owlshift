@@ -357,6 +357,31 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
     let bare = tempfile::tempdir().unwrap();
     let bare = bare.path().to_string_lossy().into_owned();
     git(repo.path(), &["remote", "add", "origin", &bare]);
+
+    // OWL-63: a variable the project declares for its gate needs the
+    // operator's allowance, or the project file is refused.
+    let project_file = repo.path().join("owlshift.toml");
+    let written = fs::read_to_string(&project_file).unwrap();
+    let declaring = written.replace(
+        "# gate_env = [\"FEATURE_FLAGS\"]",
+        "gate_env = [\"DATABASE_URL\"]",
+    );
+    assert_ne!(declaring, written);
+    fs::write(&project_file, declaring).unwrap();
+    let output = owlshift(repo.path(), config_dir.path(), &["do", "OWL-1"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("DATABASE_URL may not reach an agent on this machine")
+            && stderr(&output).contains("`allow_gate_env`"),
+        "{}",
+        stderr(&output)
+    );
+    fs::write(
+        config_dir.path().join("config.toml"),
+        "allow_gate_env = [\"DATABASE_URL\"]\n",
+    )
+    .unwrap();
+
     let output = owlshift(repo.path(), config_dir.path(), &["do", "OWL-1"]);
     assert!(!output.status.success());
     assert!(

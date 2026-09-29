@@ -4,8 +4,9 @@
 //! An agent, a harness CLI and every command it runs from its shell, starts
 //! from an empty environment. It inherits only what a program needs to run
 //! and what its harness needs to find its own login ([`INHERITED`]), plus the
-//! variables the project declares for its gate; then [`OVERRIDES`] leave git
-//! and gh without a credential. Each override rests on a live check recorded
+//! variables the project declares for its gate and the operator allows
+//! ([`check_declared`]); then [`OVERRIDES`] leave git and gh without a
+//! credential. Each override rests on a live check recorded
 //! in the build plan (results, "OWL-22").
 //!
 //! This closes what an agent reaches without going around Owlshift. A process
@@ -136,6 +137,9 @@ pub enum AgentEnvError {
     /// NUL. A project declares names only; the values come from the runner's
     /// environment.
     Malformed(String),
+    /// Declared variables the operator does not allow on this machine, each
+    /// named once (OWL-63).
+    NotAllowed(Vec<String>),
 }
 
 impl fmt::Display for AgentEnvError {
@@ -157,6 +161,13 @@ impl fmt::Display for AgentEnvError {
                 "{name} cannot be passed to an agent: it makes the dynamic loader load \
                  code into the sandbox program before the sandbox applies"
             ),
+            Self::NotAllowed(names) => write!(
+                f,
+                "{} may not reach an agent on this machine: the operator allows a name for \
+                 every project run here by adding it to `allow_gate_env` in the personal \
+                 configuration",
+                names.join(", ")
+            ),
         }
     }
 }
@@ -171,18 +182,20 @@ impl std::error::Error for AgentEnvError {}
 /// of `parent` and those named in `declared`, then the [`OVERRIDES`].
 ///
 /// `parent` is the runner's own environment; `declared` names the variables
-/// the project declares for its gate, refused as [`check_declared`] says. A
-/// declared variable absent from `parent` is simply not set.
+/// the project declares for its gate and `allowed` those the operator lets
+/// reach an agent, checked as [`check_declared`] says. A declared variable
+/// absent from `parent` is simply not set.
 pub fn agent_environment(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
     declared: &[&str],
+    allowed: &[&str],
 ) -> Result<Vec<(OsString, OsString)>, AgentEnvError> {
-    check_declared(declared)?;
+    check_declared(declared, allowed)?;
     let mut vars = BTreeMap::new();
     for (name, value) in parent {
-        let kept = name.to_str().is_some_and(|name| {
-            is_inherited(name) || declared.iter().any(|d| d.eq_ignore_ascii_case(name))
-        });
+        let kept = name
+            .to_str()
+            .is_some_and(|name| is_inherited(name) || contains_name(declared, name));
         if kept {
             vars.insert(name, value);
         }
@@ -193,28 +206,53 @@ pub fn agent_environment(
     Ok(vars.into_iter().collect())
 }
 
-/// Checks the names a project declares for its gate (`stack.gate_env`), as
-/// [`agent_environment`] does before it builds anything: a name that is not a
-/// variable name, a credential variable, a `GIT_` name or an override, or a
-/// dynamic-loader variable is refused, in any letter case.
+/// Checks the names a project declares for its gate (`stack.gate_env`)
+/// against those the operator allows (the personal `allow_gate_env`), as
+/// [`agent_environment`] does before it builds anything, and as the
+/// configuration does when it is loaded (OWL-63).
 ///
-/// The refusal is by name: a secret the operator keeps under a name of its
-/// own reaches the agent once a project declares it.
-pub fn check_declared(declared: &[&str]) -> Result<(), AgentEnvError> {
-    if let Some(name) = declared
+/// What [`check_names`] refuses is refused first, allowed or not. Then every
+/// declared name the operator does not allow is refused: a project's file,
+/// which any contributor can change, never widens what reaches an agent.
+/// Names compare in any letter case.
+pub fn check_declared(declared: &[&str], allowed: &[&str]) -> Result<(), AgentEnvError> {
+    check_names(declared)?;
+    let mut refused: Vec<String> = Vec::new();
+    for name in declared {
+        if !contains_name(allowed, name) && !refused.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+            refused.push((*name).to_owned());
+        }
+    }
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(AgentEnvError::NotAllowed(refused))
+    }
+}
+
+/// Checks names that would reach an agent, whoever names them: a name that
+/// is not a variable name, a credential variable, a `GIT_` name or an
+/// override, or a dynamic-loader variable is refused, in any letter case.
+/// Neither a project's declaration nor the operator's allow-list passes one.
+pub fn check_names(names: &[&str]) -> Result<(), AgentEnvError> {
+    if let Some(name) = names
         .iter()
         .find(|name| name.is_empty() || name.contains(['=', '\0']))
     {
         return Err(AgentEnvError::Malformed((*name).to_owned()));
     }
-    floor::check_agent_environment(declared.iter().copied()).map_err(AgentEnvError::Floor)?;
-    if let Some(name) = declared.iter().find(|name| is_reserved(name)) {
+    floor::check_agent_environment(names.iter().copied()).map_err(AgentEnvError::Floor)?;
+    if let Some(name) = names.iter().find(|name| is_reserved(name)) {
         return Err(AgentEnvError::Reserved((*name).to_owned()));
     }
-    if let Some(name) = declared.iter().find(|name| is_loader(name)) {
+    if let Some(name) = names.iter().find(|name| is_loader(name)) {
         return Err(AgentEnvError::Loader((*name).to_owned()));
     }
     Ok(())
+}
+
+fn contains_name(names: &[&str], name: &str) -> bool {
+    names.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
 /// Checks an environment an agent would get: every credential variable in
@@ -292,7 +330,7 @@ mod tests {
             ("CLAUDECODE", "1"),
             ("ANTHROPIC_BASE_URL", "http://127.0.0.1:1"),
         ]);
-        let agent = agent_environment(parent, &["database_url"]).unwrap();
+        let agent = agent_environment(parent, &["database_url"], &["DATABASE_URL"]).unwrap();
         let ssh = "ssh -o BatchMode=yes -o IdentityAgent=none -o PubkeyAuthentication=no \
                    -o GSSAPIAuthentication=no";
         let expected = env(&[
@@ -325,7 +363,7 @@ mod tests {
             "ssh_auth_sock",
         ] {
             assert_eq!(
-                agent_environment(Vec::new(), &[name]),
+                agent_environment(Vec::new(), &[name], &[name]),
                 Err(AgentEnvError::Floor(FloorViolation::CredentialVariables(
                     vec![name.to_owned()]
                 ))),
@@ -339,7 +377,7 @@ mod tests {
             "git_config_count",
         ] {
             assert_eq!(
-                agent_environment(Vec::new(), &[name]),
+                agent_environment(Vec::new(), &[name], &[name]),
                 Err(AgentEnvError::Reserved(name.to_owned())),
                 "{name}"
             );
@@ -356,14 +394,14 @@ mod tests {
             "dyld_x",
         ] {
             assert_eq!(
-                agent_environment(Vec::new(), &[name]),
+                agent_environment(Vec::new(), &[name], &[name]),
                 Err(AgentEnvError::Loader(name.to_owned())),
                 "{name}"
             );
         }
         for name in ["", "FEATURE=on", "A\0B"] {
             assert_eq!(
-                agent_environment(Vec::new(), &[name]),
+                agent_environment(Vec::new(), &[name], &[name]),
                 Err(AgentEnvError::Malformed(name.to_owned())),
                 "{name:?}"
             );
@@ -372,6 +410,43 @@ mod tests {
             AgentEnvError::Malformed("FEATURE=on".into()).to_string(),
             "\"FEATURE=on\" is not a variable name: declare names only, the values come from \
              the runner's environment"
+        );
+    }
+
+    #[test]
+    fn a_declared_name_the_operator_does_not_allow_is_refused() {
+        let parent = env(&[("DATABASE_URL", "postgres://db/test"), ("PATH", "/bin")]);
+        assert_eq!(
+            agent_environment(
+                parent.clone(),
+                &[
+                    "DATABASE_URL",
+                    "my_linear_token",
+                    "My_Linear_Token",
+                    "JAVA_HOME"
+                ],
+                &["java_home"],
+            ),
+            Err(AgentEnvError::NotAllowed(vec![
+                "DATABASE_URL".to_owned(),
+                "my_linear_token".to_owned(),
+            ]))
+        );
+        assert_eq!(
+            AgentEnvError::NotAllowed(vec!["DATABASE_URL".into(), "X".into()]).to_string(),
+            "DATABASE_URL, X may not reach an agent on this machine: the operator allows a name \
+             for every project run here by adding it to `allow_gate_env` in the personal \
+             configuration"
+        );
+        // Allowing a name does not pass it: only declaring it does.
+        let agent = agent_environment(parent, &[], &["DATABASE_URL"]).unwrap();
+        assert!(!agent.iter().any(|(name, _)| name == "DATABASE_URL"));
+        // What the floor refuses stays refused, allowed or not.
+        assert_eq!(
+            check_declared(&["GH_TOKEN"], &["GH_TOKEN"]),
+            Err(AgentEnvError::Floor(FloorViolation::CredentialVariables(
+                vec!["GH_TOKEN".to_owned()]
+            )))
         );
     }
 
