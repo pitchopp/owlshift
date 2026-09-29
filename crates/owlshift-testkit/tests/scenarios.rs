@@ -88,6 +88,30 @@ fn the_gate_runs_on_the_last_commit_only() {
     );
 }
 
+/// OWL-44's acceptance: a variable the project declares in `stack.gate_env`
+/// reaches the gate. `git --config-env` fails with "missing environment
+/// variable" when the variable is unset, the same under sh and cmd.
+#[test]
+fn a_declared_variable_reaches_the_gate() {
+    play_on_gate(
+        "gate-env",
+        r#"
+        description = "The fixture declares OWLSHIFT_GATE_PROBE for its gate and the runner has it: the gate, which needs it, passes."
+        ticket = "DEMO-2"
+        start = "2026-09-28T09:00:00Z"
+        gate = ["git --config-env=owlshift.probe=OWLSHIFT_GATE_PROBE config --get owlshift.probe"]
+        runner_env = { OWLSHIFT_GATE_PROBE = "on" }
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n" }, commit = "Add a greeting", result = "results/build-done.json" }
+        expect = { event = "completed", stage = "verify", gate_failure = "none", branch_pushed = true }
+        "#,
+    );
+}
+
 #[test]
 fn a_gate_that_commits_fails() {
     play_on_gate(

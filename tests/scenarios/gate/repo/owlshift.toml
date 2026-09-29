@@ -8,6 +8,8 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
 [stack]
 # The same under sh and cmd: fails until GREETING.md says Hello.
 gate = ["git grep -q Hello -- GREETING.md"]
+# What a_declared_variable_reaches_the_gate gives the gate (OWL-44).
+gate_env = ["OWLSHIFT_GATE_PROBE"]
 
 [pipeline]
 default = "trivial"

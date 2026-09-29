@@ -132,12 +132,21 @@ pub enum AgentEnvError {
     /// `LD_PRELOAD` or a `DYLD_` name: the sandbox program would load it
     /// before the sandbox applies (OWL-41).
     Loader(String),
+    /// A declared name that cannot name a variable: empty, or holding `=` or
+    /// NUL. A project declares names only; the values come from the runner's
+    /// environment.
+    Malformed(String),
 }
 
 impl fmt::Display for AgentEnvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Floor(violation) => violation.fmt(f),
+            Self::Malformed(name) => write!(
+                f,
+                "{name:?} is not a variable name: declare names only, the values come from \
+                 the runner's environment"
+            ),
             Self::Reserved(name) => write!(
                 f,
                 "{name} cannot be passed to an agent: Owlshift sets how git and gh \
@@ -162,20 +171,13 @@ impl std::error::Error for AgentEnvError {}
 /// of `parent` and those named in `declared`, then the [`OVERRIDES`].
 ///
 /// `parent` is the runner's own environment; `declared` names the variables
-/// the project declares for its gate. A declared credential variable, or one
-/// that is a `GIT_` name or an override, is refused, in any letter case. A
+/// the project declares for its gate, refused as [`check_declared`] says. A
 /// declared variable absent from `parent` is simply not set.
 pub fn agent_environment(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
     declared: &[&str],
 ) -> Result<Vec<(OsString, OsString)>, AgentEnvError> {
-    floor::check_agent_environment(declared.iter().copied()).map_err(AgentEnvError::Floor)?;
-    if let Some(name) = declared.iter().find(|name| is_reserved(name)) {
-        return Err(AgentEnvError::Reserved((*name).to_owned()));
-    }
-    if let Some(name) = declared.iter().find(|name| is_loader(name)) {
-        return Err(AgentEnvError::Loader((*name).to_owned()));
-    }
+    check_declared(declared)?;
     let mut vars = BTreeMap::new();
     for (name, value) in parent {
         let kept = name.to_str().is_some_and(|name| {
@@ -189,6 +191,30 @@ pub fn agent_environment(
         vars.insert(OsString::from(name), OsString::from(value));
     }
     Ok(vars.into_iter().collect())
+}
+
+/// Checks the names a project declares for its gate (`stack.gate_env`), as
+/// [`agent_environment`] does before it builds anything: a name that is not a
+/// variable name, a credential variable, a `GIT_` name or an override, or a
+/// dynamic-loader variable is refused, in any letter case.
+///
+/// The refusal is by name: a secret the operator keeps under a name of its
+/// own reaches the agent once a project declares it.
+pub fn check_declared(declared: &[&str]) -> Result<(), AgentEnvError> {
+    if let Some(name) = declared
+        .iter()
+        .find(|name| name.is_empty() || name.contains(['=', '\0']))
+    {
+        return Err(AgentEnvError::Malformed((*name).to_owned()));
+    }
+    floor::check_agent_environment(declared.iter().copied()).map_err(AgentEnvError::Floor)?;
+    if let Some(name) = declared.iter().find(|name| is_reserved(name)) {
+        return Err(AgentEnvError::Reserved((*name).to_owned()));
+    }
+    if let Some(name) = declared.iter().find(|name| is_loader(name)) {
+        return Err(AgentEnvError::Loader((*name).to_owned()));
+    }
+    Ok(())
 }
 
 /// Checks an environment an agent would get: every credential variable in
@@ -335,6 +361,18 @@ mod tests {
                 "{name}"
             );
         }
+        for name in ["", "FEATURE=on", "A\0B"] {
+            assert_eq!(
+                agent_environment(Vec::new(), &[name]),
+                Err(AgentEnvError::Malformed(name.to_owned())),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            AgentEnvError::Malformed("FEATURE=on".into()).to_string(),
+            "\"FEATURE=on\" is not a variable name: declare names only, the values come from \
+             the runner's environment"
+        );
     }
 
     #[test]
