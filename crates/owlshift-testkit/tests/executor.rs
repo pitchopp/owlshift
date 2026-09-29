@@ -315,10 +315,12 @@ fn redirect(evil: &Path) -> String {
     format!("printf 'gitdir: %s\\n' '{}' > .git", evil.display())
 }
 
-/// The same, as a gate command: the gate runs through `cmd` on Windows.
+/// The same, as a gate command: the gate runs through `cmd` on Windows,
+/// whose redirection cannot overwrite the hidden file git makes of `.git`
+/// there, so the file is unhidden first.
 fn redirect_in_gate(evil: &Path) -> String {
     if cfg!(windows) {
-        format!("echo gitdir: {}> .git", evil.display())
+        format!("attrib -h .git && echo gitdir: {}> .git", evil.display())
     } else {
         redirect(evil)
     }
