@@ -1,6 +1,6 @@
-# TEMPORARY (OWL-56): measures how long gh takes to answer `gh auth token`
-# on the hosted runners, cold and warm. Removed before the pull request is
-# ready for review.
+# TEMPORARY (OWL-56): runs the agent_credentials tests on ten fresh Windows
+# runners, gh cold at the start of each, and prints the warm-up and probe
+# timings. Removed before the pull request is ready for review.
 name: OWL-56 diagnostics
 
 on:
@@ -10,38 +10,24 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  warm-up:
-    name: warm-up (${{ matrix.rep }})
+  proof:
+    name: agent_credentials on a fresh runner (${{ matrix.rep }})
     strategy:
       fail-fast: false
       matrix:
-        rep: [1, 2, 3, 4]
+        rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     runs-on: windows-latest
     steps:
-      - name: Time a gh --version warm-up, then gh auth token, then sh
-        shell: pwsh
-        env:
-          GH_TOKEN: owlshift-agent-has-no-credential
-        run: |
-          $gh = (Get-Command gh).Source
-          function Time-It([string]$label, [string]$exe, [string[]]$argv) {
-            $psi = [Diagnostics.ProcessStartInfo]::new($exe)
-            foreach ($a in $argv) { $psi.ArgumentList.Add($a) }
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.UseShellExecute = $false
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            $p = [Diagnostics.Process]::Start($psi)
-            $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
-            $null = $p.WaitForExit(120000); $null = $o.Wait(120000); $null = $e.Wait(120000)
-            "{0,-22} {1,8:N0} ms  code {2}" -f $label, $sw.Elapsed.TotalMilliseconds, $p.ExitCode
-          }
-          Time-It 'cold gh --version' $gh @('--version')
-          Time-It 'then gh auth token' $gh @('auth', 'token', '--hostname', 'github.com')
-          Time-It 'again gh auth token' $gh @('auth', 'token', '--hostname', 'github.com')
-          $sh = 'C:\Program Files\Git\usr\bin\sh.exe'
-          Time-It 'cold sh -c true' $sh @('-c', 'true')
-          Time-It 'warm sh -c true' $sh @('-c', 'true')
-          $git = (Get-Command git).Source
-          Time-It 'git --version' $git @('--version')
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Build the test
+        run: cargo test -p owlshift-runner --features testkit --test agent_credentials --locked --no-run
+      - name: Run the test, gh cold
+        run: cargo test -p owlshift-runner --features testkit --test agent_credentials --locked -- --nocapture
