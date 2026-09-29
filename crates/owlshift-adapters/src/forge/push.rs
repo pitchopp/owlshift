@@ -83,8 +83,28 @@ pub fn push_command(
 
 /// Reads the output of a [`push_command`] for `branch`.
 pub fn read_push(branch: &Branch, output: &Output) -> Result<Pushed, PushError> {
+    read_push_parts(
+        branch,
+        output.status.success(),
+        &output.status.to_string(),
+        &output.stdout,
+        &output.stderr,
+    )
+}
+
+/// [`read_push`] from the parts of a push's output, for a caller that ran
+/// [`push_command`] its own way: whether git exited with status 0, how it
+/// ended (for a message, such as `exit status: 1`), and its standard output
+/// and standard error.
+pub fn read_push_parts(
+    branch: &Branch,
+    success: bool,
+    ended: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Pushed, PushError> {
     let target = format!("refs/heads/{branch}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(stdout);
     // `<flag>\t<from>:<to>\t<summary>`; Git for Windows ends lines with CRLF.
     let line = stdout
         .lines()
@@ -99,7 +119,7 @@ pub fn read_push(branch: &Branch, output: &Output) -> Result<Pushed, PushError> 
         Some(("!", summary)) => Err(PushError::Rejected {
             reason: summary.trim().to_owned(),
         }),
-        Some((flag, _)) if output.status.success() => match flag {
+        Some((flag, _)) if success => match flag {
             "*" => Ok(Pushed::Created),
             " " => Ok(Pushed::FastForward),
             "=" => Ok(Pushed::UpToDate),
@@ -109,9 +129,8 @@ pub fn read_push(branch: &Branch, output: &Output) -> Result<Pushed, PushError> 
         },
         _ => Err(PushError::Failed {
             message: format!(
-                "git push exited with {}: {}",
-                output.status,
-                tail(&String::from_utf8_lossy(&output.stderr))
+                "git push exited with {ended}: {}",
+                tail(&String::from_utf8_lossy(stderr))
             ),
         }),
     }

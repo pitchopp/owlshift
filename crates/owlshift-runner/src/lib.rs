@@ -1,12 +1,17 @@
 //! The Owlshift runner: the daemon loop, the executor (worktrees, spawning,
-//! isolation check), the writer and the local store.
+//! isolation check), the writer and the local store; and, until the daemon
+//! exists, `owlshift do`'s run of one ticket ([`on_demand`]).
 
 pub mod agent_env;
 pub mod artifact;
 pub mod config;
 pub mod doctor;
+pub mod events;
 pub mod executor;
 pub mod forge;
+pub mod init;
+pub mod on_demand;
+pub mod project;
 pub mod roles;
 pub mod system;
 pub mod tracker;

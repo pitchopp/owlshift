@@ -2,15 +2,25 @@
 //! (architecture section 5, step 4). It asks the policy floor before each
 //! write ([`floor::check_action`]).
 //!
-//! This build has one write, the delivery report: a marked
-//! `[owlshift] DELIVERY` comment on the ticket once its pull request is open,
-//! so the person sees what was delivered without a terminal (principle 1).
-//! `owlshift do` (OWL-20) opens the adapters and calls it.
+//! This build has three writes, all made by `owlshift do` (OWL-20) once a
+//! Build run is done and the runner's own run of the project gate passed:
+//! pushing the gated commit to the ticket's branch
+//! ([`Writer::push_branch`]), opening the ticket's pull request, or finding
+//! the one already open ([`Writer::open_pull_request`]), and the delivery
+//! report: a marked `[owlshift] DELIVERY` comment on the ticket once its pull
+//! request is open, so the person sees what was delivered without a
+//! terminal (principle 1). There is no merge.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
+use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push_parts};
 use owlshift_adapters::forge::{
-    self, CheckSet, CheckState, Mergeable, PrState, PullRequest, Verdict,
+    self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
 use owlshift_adapters::tracker::{Comment, Error as TrackerError, Tracker};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
@@ -18,6 +28,8 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::result::{Decision, Followup};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
+
+use crate::executor::Git;
 
 /// What the delivery report says about one ticket.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +351,101 @@ impl<'a> Writer<'a> {
         Self { tracker }
     }
 
+    /// Pushes exactly `commit` to `branch` on `remote`, with the runner's own
+    /// git and the person's own git credentials: the commit the gate passed
+    /// on, never whatever the branch points to by then. A plain push, never
+    /// a force: the remote refuses anything but creating the branch or
+    /// moving it forward (`owlshift_adapters::forge::push`).
+    ///
+    /// `checkout` is the dedicated checkout, never a ticket's worktree: an
+    /// agent owns every file of its worktree, `.git` included, and could
+    /// point it at a git directory whose hooks or configuration run code
+    /// with the person's credentials. The worktree's commits are in the
+    /// checkout's object store. No hook runs either way: `--no-verify` skips
+    /// `pre-push`, and `core.hooksPath` names a folder that does not exist,
+    /// so no other hook (`reference-transaction`) is found; the file-system
+    /// monitor is off.
+    pub fn push_branch(
+        &self,
+        git: &Git,
+        checkout: &Path,
+        remote: &str,
+        commit: &CommitId,
+        branch: &Branch,
+    ) -> Result<Pushed, WriteError> {
+        floor::check_action(Action::PushBranch, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        // The adapter builds the push; the runner's git runs it, so a test
+        // bench's hermetic setup applies to the push too.
+        let command = push_command(Path::new("git"), checkout, remote, commit, branch)
+            .map_err(WriteError::Push)?;
+        let mut pushed = command.get_args();
+        let mut args: Vec<OsString> = vec![
+            "-c".into(),
+            hooks_nowhere().into(),
+            "-c".into(),
+            "core.fsmonitor=false".into(),
+        ];
+        args.extend(pushed.next().map(OsStr::to_owned));
+        args.push("--no-verify".into());
+        args.extend(pushed.map(OsStr::to_owned));
+        let output = git.output(checkout, &args, None).map_err(|error| {
+            WriteError::Push(PushError::Failed {
+                message: error.to_string(),
+            })
+        })?;
+        let ended = match output.code {
+            Some(code) => format!("exit status: {code}"),
+            None => "a signal".to_owned(),
+        };
+        read_push_parts(
+            branch,
+            output.success(),
+            &ended,
+            &output.stdout,
+            &output.stderr,
+        )
+        .map_err(WriteError::Push)
+    }
+
+    /// Opens the pull request of `head` into `base` with the run's title and
+    /// body, or returns the one already open, so a second delivery of the
+    /// same ticket never opens a second pull request. An open one keeps its
+    /// title and body.
+    pub fn open_pull_request(
+        &self,
+        forge: &GitHubForge,
+        head: &Branch,
+        base: &Branch,
+        title: &str,
+        body: &str,
+    ) -> Result<OpenedPullRequest, WriteError> {
+        floor::check_action(Action::OpenPullRequest, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        if let Some(pull_request) = forge
+            .find_open_pull_request(head, base)
+            .map_err(WriteError::Forge)?
+        {
+            return Ok(OpenedPullRequest {
+                pull_request,
+                opened: false,
+            });
+        }
+        let pull_request = forge
+            .open_pull_request(NewPullRequest {
+                head,
+                base,
+                title,
+                body,
+                draft: false,
+            })
+            .map_err(WriteError::Forge)?;
+        Ok(OpenedPullRequest {
+            pull_request,
+            opened: true,
+        })
+    }
+
     /// Posts the delivery report on its ticket and returns the comment.
     ///
     /// When the ticket's newest delivery report already has exactly this
@@ -375,6 +482,32 @@ fn is_delivery(body: &str) -> bool {
     )
 }
 
+/// `core.hooksPath=<folder>` for a folder that does not exist, named by this
+/// process and the time, so nothing can have been planted there: git finds
+/// no hook in it.
+fn hooks_nowhere() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let base =
+        std::env::temp_dir().join(format!("owlshift-no-hooks-{}-{nanos}", std::process::id()));
+    let mut folder = base.clone();
+    let mut n = 1;
+    while fs::symlink_metadata(&folder).is_ok() {
+        n += 1;
+        folder = PathBuf::from(format!("{}-{n}", base.display()));
+    }
+    format!("core.hooksPath={}", folder.display())
+}
+
+/// The ticket's pull request, and whether this call opened it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedPullRequest {
+    pub pull_request: PullRequest,
+    /// `false` when it was already open.
+    pub opened: bool,
+}
+
 /// A write the Writer did not make.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteError {
@@ -382,6 +515,10 @@ pub enum WriteError {
     Floor(FloorViolation),
     /// The tracker failed.
     Tracker(TrackerError),
+    /// The forge failed.
+    Forge(forge::Error),
+    /// The push did not land.
+    Push(PushError),
 }
 
 impl fmt::Display for WriteError {
@@ -389,6 +526,8 @@ impl fmt::Display for WriteError {
         match self {
             Self::Floor(violation) => write!(f, "refused by the policy floor: {violation}"),
             Self::Tracker(error) => write!(f, "tracker: {error}"),
+            Self::Forge(error) => write!(f, "forge: {error}"),
+            Self::Push(error) => error.fmt(f),
         }
     }
 }

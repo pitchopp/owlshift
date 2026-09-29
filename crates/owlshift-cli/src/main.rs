@@ -1,5 +1,9 @@
 //! The `owlshift` binary.
 
+mod do_cmd;
+mod init_cmd;
+mod logs_cmd;
+
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -8,6 +12,7 @@ use owlshift_contracts::format::{
 };
 use owlshift_runner::config::{Effective, OWLSHIFT_VERSION};
 use owlshift_runner::doctor;
+use owlshift_runner::events::printable;
 use owlshift_runner::system::HostSystem;
 
 /// Works a team's backlog with coding agents, and asks a human on the ticket
@@ -27,6 +32,22 @@ enum Command {
     /// Read the configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Write a commented owlshift.toml for this repository, then store the
+    /// tracker and forge secrets `owlshift do` needs in the system keychain.
+    Init(init_cmd::Args),
+    /// Run one ticket to a verified pull request, in the foreground.
+    Do {
+        /// The ticket, such as OWL-12.
+        ticket: String,
+    },
+    /// Print the events `owlshift do` recorded, oldest first.
+    Logs {
+        /// Only this ticket's events.
+        ticket: Option<String>,
+        /// Keep printing new events as they are recorded, until Ctrl-C.
+        #[arg(long, short)]
+        follow: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -46,8 +67,8 @@ fn long_version() -> String {
 }
 
 fn main() -> ExitCode {
-    // Before any probe starts: a probe runs in a process group of its own,
-    // out of reach of the terminal's Ctrl-C, so Owlshift stops it itself.
+    // Before any probe or run starts: each runs in a process group of its
+    // own, out of reach of the terminal's Ctrl-C, so Owlshift stops it itself.
     if let Err(error) = owlshift_platform::process::stop_trees_on_signal() {
         eprintln!("owlshift: cannot watch for Ctrl-C, a running probe would outlive it: {error}");
     }
@@ -78,7 +99,16 @@ fn main() -> ExitCode {
             print!("{config}");
             exit_code(config.is_valid())
         }
+        Command::Init(args) => init_cmd::run(&args, &config),
+        Command::Do { ticket } => do_cmd::run(&system, &config, &ticket),
+        Command::Logs { ticket, follow } => logs_cmd::run(ticket.as_deref(), follow),
     }
+}
+
+/// Prints `message` on standard error, safe for a terminal, and fails.
+fn fail(message: &str) -> ExitCode {
+    eprintln!("owlshift: {}", printable(message));
+    ExitCode::FAILURE
 }
 
 fn exit_code(success: bool) -> ExitCode {

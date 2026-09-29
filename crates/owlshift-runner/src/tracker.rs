@@ -11,16 +11,15 @@ use owlshift_platform::keychain::{Keychain, SERVICE};
 /// one key per machine for now.
 pub const LINEAR_ACCOUNT: &str = "linear";
 
-/// The Linear adapter, with its API key read from `keychain`.
-///
-/// No command calls it yet: `owlshift do` (OWL-20) will, and hand the adapter
-/// to the [writer](crate::writer); `owlshift init` (OWL-20) will store the key.
+/// The Linear adapter, with its API key read from `keychain`: `owlshift do`
+/// reads the ticket with it and hands it to the [writer](crate::writer);
+/// `owlshift init` stores the key.
 pub fn linear(keychain: &Keychain) -> Result<LinearTracker, String> {
     match keychain.read(LINEAR_ACCOUNT) {
         Ok(Some(key)) => Ok(LinearTracker::new(ApiKey::new(key.expose()))),
         Ok(None) => Err(format!(
-            "no Linear API key in the system keychain: store one under service \
-             `{SERVICE}`, account `{LINEAR_ACCOUNT}`"
+            "no Linear API key in the system keychain: run `owlshift init` in a terminal, or \
+             store one under service `{SERVICE}`, account `{LINEAR_ACCOUNT}`"
         )),
         Err(error) => Err(error.to_string()),
     }

@@ -28,8 +28,9 @@
 //!   default variant;
 //! - the answer check is not run: an `answer` step gives its verdict, and
 //!   only `answered` until the answer-check role arrives in P2;
-//! - a `blocked` or `premise_false` result is refused, and no PARKED,
-//!   RE-ASK, RESUME or DELIVERY comment is written.
+//! - a run's outcome maps onto the core event as `owlshift do` maps it
+//!   (`owlshift_runner::on_demand::core_event`), and no PARKED, RE-ASK,
+//!   RESUME or DELIVERY comment is written.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -50,12 +51,13 @@ use owlshift_contracts::comment::{Footer, Header, MarkerKind};
 use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::result::{self, RunResult};
+use owlshift_contracts::result::RunResult;
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
+use owlshift_runner::on_demand::core_event;
 
 use crate::git::{GitEnv, Remote, seed};
 use crate::harness::FakeHarness;
@@ -471,13 +473,13 @@ impl Driver {
             self.gate_failure = gate.failure.clone();
         }
         let own_failure = report.exit_code == Some(OWN_FAILURE);
-        let outcome = outcome(&report.outcome);
+        let (event, result) = core_event(&report.outcome);
+        let result = result.cloned();
         self.last_run = Some(report);
         if own_failure {
             return Err("the fake harness could not do what the reply says".to_owned());
         }
 
-        let (event, result) = outcome?;
         self.apply(event)?;
         if let (Event::Questions, Some(result)) = (event, &result) {
             let body = self.questions_comment(result)?;
@@ -754,31 +756,6 @@ impl Driver {
             )
         })
     }
-}
-
-/// The core event the executor's outcome maps onto, and the result when the
-/// run left a valid one. A usage limit is an interruption; a failed run, or
-/// a result with status `failed`, is a failed run; a breach of isolation is
-/// a quarantine.
-fn outcome(outcome: &Outcome) -> Result<(Event, Option<RunResult>), String> {
-    let result = match outcome {
-        Outcome::Finished { result, .. } => result,
-        Outcome::UsageLimit { .. } => return Ok((Event::Interrupted, None)),
-        Outcome::Failed(_) => return Ok((Event::RunFailed, None)),
-        Outcome::Quarantined(_) => return Ok((Event::Quarantined, None)),
-    };
-    let event = match result.status {
-        result::Status::Done => Event::Completed,
-        result::Status::Questions => Event::Questions,
-        result::Status::Failed => Event::RunFailed,
-        status @ (result::Status::Blocked | result::Status::PremiseFalse) => {
-            return Err(format!(
-                "a `{}` result is not supported by the stand-in driver",
-                name(&status)
-            ));
-        }
-    };
-    Ok((event, Some(RunResult::clone(result))))
 }
 
 /// Checks a gate failure against `none` or a text it contains.

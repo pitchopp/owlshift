@@ -97,7 +97,11 @@ fn every_contract_round_trips() {
     assert!(result.pr.is_none());
 
     round_trip("brief.json", Brief::parse, Brief::render);
-    round_trip("event.json", Event::parse, Event::render);
+    let event = round_trip("event.json", Event::parse, Event::render);
+    // One line of the event log reads back as the same event.
+    let line = event.render_line();
+    assert!(!line.contains('\n'), "{line}");
+    assert_eq!(Event::parse(&line).unwrap(), event);
     round_trip("claim.json", Claim::parse, Claim::render);
     round_trip(
         "ticket-state.json",

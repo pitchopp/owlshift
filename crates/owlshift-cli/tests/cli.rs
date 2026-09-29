@@ -18,20 +18,43 @@ use std::process::{Command, Output};
 /// binary shells out to from the host's own git configuration — git reads
 /// `$XDG_CONFIG_HOME/git/config` independently of `HOME`, so both are needed
 /// for that isolation; neither plays a part in resolving the personal
-/// configuration file anymore.
+/// configuration file anymore. `OWLSHIFT_DATA_DIR` is `<config_dir>/data`.
+///
+/// No test here reaches the system keychain: `init` runs with
+/// `--skip-secrets`, and `do` is refused before it opens the keychain.
 fn owlshift(dir: &Path, config_dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_owlshift"))
+    command(dir, config_dir, args).output().unwrap()
+}
+
+fn command(dir: &Path, config_dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_owlshift"));
+    command
         .args(args)
         .current_dir(dir)
         .env("HOME", config_dir)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("OWLSHIFT_CONFIG_DIR", config_dir)
+        .env("OWLSHIFT_DATA_DIR", config_dir.join("data"))
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .output()
-        .unwrap()
+        .env_remove("GIT_CEILING_DIRECTORIES");
+    command
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 fn git_init(dir: &Path) {
@@ -246,4 +269,231 @@ fn is_alive(pid: u32) -> bool {
     let state = String::from_utf8_lossy(&ps.stdout);
     let state = state.trim();
     !state.is_empty() && !state.starts_with('Z')
+}
+
+#[test]
+fn init_writes_a_commented_project_file_once() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let args = [
+        "init",
+        "--tracker",
+        "markdown",
+        "--gate",
+        "cargo fmt --check",
+        "--gate",
+        "cargo test",
+        "--skip-secrets",
+    ];
+
+    let output = owlshift(repo.path(), config_dir.path(), &args);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let path = repo.path().join("owlshift.toml");
+    let written = fs::read_to_string(&path).unwrap();
+    let config = owlshift_contracts::config::ProjectConfig::parse(&written).unwrap();
+    assert_eq!(config.stack.gate, ["cargo fmt --check", "cargo test"]);
+    assert!(
+        written.starts_with("# Owlshift project configuration"),
+        "{written}"
+    );
+
+    // Run again, with other values: the file stays as it was.
+    let output = owlshift(
+        repo.path(),
+        config_dir.path(),
+        &["init", "--team", "OWL", "--skip-secrets"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("exists: kept"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), written);
+
+    // Linear needs its team; outside a repository there is no project.
+    let other = tempfile::tempdir().unwrap();
+    git_init(other.path());
+    let output = owlshift(other.path(), config_dir.path(), &["init", "--skip-secrets"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--team"), "{}", stderr(&output));
+    assert!(!other.path().join("owlshift.toml").exists());
+    let outside = tempfile::tempdir().unwrap();
+    let output = owlshift(
+        outside.path(),
+        config_dir.path(),
+        &["init", "--skip-secrets"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("git repository"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// What `do` refuses before it opens the keychain.
+#[test]
+fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+
+    let output = owlshift(repo.path(), config_dir.path(), &["do", "OWL-1"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("run `owlshift init`"),
+        "{}",
+        stderr(&output)
+    );
+
+    let init = ["init", "--tracker", "markdown", "--skip-secrets"];
+    assert!(
+        owlshift(repo.path(), config_dir.path(), &init)
+            .status
+            .success()
+    );
+    let bare = tempfile::tempdir().unwrap();
+    let bare = bare.path().to_string_lossy().into_owned();
+    git(repo.path(), &["remote", "add", "origin", &bare]);
+    let output = owlshift(repo.path(), config_dir.path(), &["do", "OWL-1"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not a github.com repository"),
+        "{}",
+        stderr(&output)
+    );
+
+    // A Linear project runs its own team's tickets only.
+    let linear = tempfile::tempdir().unwrap();
+    git_init(linear.path());
+    let init = ["init", "--team", "OWL", "--skip-secrets"];
+    assert!(
+        owlshift(linear.path(), config_dir.path(), &init)
+            .status
+            .success()
+    );
+    let output = owlshift(linear.path(), config_dir.path(), &["do", "LOC-12"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("LOC-12 is not a ticket of team OWL"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!config_dir.path().join("data").exists());
+}
+
+const EVENTS: &str = concat!(
+    r#"{"format":1,"at":"2026-09-29T10:00:00Z","project":"demo/project","ticket":"OWL-1","kind":"dispatch","data":{"branch":"owlshift/owl-1"}}"#,
+    "\n",
+    r#"{"format":1,"at":"2026-09-29T10:01:00Z","project":"demo/project","ticket":"OWL-2","run":"r1","kind":"run_started","data":{"role":"build"}}"#,
+    "\n",
+);
+
+#[test]
+fn logs_prints_the_events_of_every_ticket_or_one() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let output = owlshift(config_dir.path(), config_dir.path(), &["logs"]);
+    assert!(output.status.success());
+    assert!(
+        stderr(&output).contains("no event recorded yet"),
+        "{}",
+        stderr(&output)
+    );
+
+    let data = config_dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("events.jsonl"), EVENTS).unwrap();
+    let all = stdout(&owlshift(config_dir.path(), config_dir.path(), &["logs"]));
+    assert_eq!(
+        all,
+        "2026-09-29T10:00:00Z OWL-1 dispatch branch=owlshift/owl-1\n\
+         2026-09-29T10:01:00Z OWL-2 run_started run=r1 role=build\n"
+    );
+    let one = stdout(&owlshift(
+        config_dir.path(),
+        config_dir.path(),
+        &["logs", "OWL-2"],
+    ));
+    assert_eq!(
+        one,
+        "2026-09-29T10:01:00Z OWL-2 run_started run=r1 role=build\n"
+    );
+}
+
+#[test]
+fn logs_follow_prints_events_as_they_are_recorded() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let config_dir = tempfile::tempdir().unwrap();
+    let data = config_dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let (first, second) = EVENTS.split_once('\n').unwrap();
+    fs::write(data.join("events.jsonl"), format!("{first}\n")).unwrap();
+
+    let mut child = command(config_dir.path(), config_dir.path(), &["logs", "--follow"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (lines, received) = mpsc::channel();
+    let reader = BufReader::new(child.stdout.take().unwrap());
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            if lines.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || received.recv_timeout(Duration::from_secs(10));
+    let seen = next();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(data.join("events.jsonl"))
+        .unwrap();
+    file.write_all(second.as_bytes()).unwrap();
+    let appended = next();
+    // Ended by the test, as Ctrl-C would: `--follow` has no end of its own.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        seen.as_deref(),
+        Ok("2026-09-29T10:00:00Z OWL-1 dispatch branch=owlshift/owl-1")
+    );
+    assert_eq!(
+        appended.as_deref(),
+        Ok("2026-09-29T10:01:00Z OWL-2 run_started run=r1 role=build")
+    );
+}
+
+/// The repository's own project file, which `owlshift do` reads on
+/// Owlshift's tickets, parses and gates on what CI runs.
+#[test]
+fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = fs::read_to_string(root.join("owlshift.toml")).unwrap();
+    let config = owlshift_contracts::config::ProjectConfig::parse(&text).unwrap();
+    assert_eq!(config.tracker.team.as_deref(), Some("OWL"));
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let runs: Vec<&str> = ci
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("run: "))
+        .collect();
+    assert!(!config.stack.gate.is_empty());
+    for command in &config.stack.gate {
+        assert!(
+            runs.contains(&command.as_str()),
+            "{command} is not a CI step"
+        );
+    }
+    for step in ["cargo fmt", "cargo clippy", "cargo test"] {
+        assert!(
+            config.stack.gate.iter().any(|c| c.starts_with(step)),
+            "the gate misses CI's {step}"
+        );
+    }
 }

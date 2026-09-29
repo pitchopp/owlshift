@@ -15,6 +15,8 @@ owlshift-adapters.workspace = true
 owlshift-platform.workspace = true
 jiff.workspace = true
 semver.workspace = true
+serde_json.workspace = true
+toml.workspace = true
 # Each run's own temporary folder, private to the user and removed with the
 # run (OWL-41).
 tempfile.workspace = true

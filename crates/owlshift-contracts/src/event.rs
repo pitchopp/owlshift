@@ -64,4 +64,10 @@ impl Event {
     pub fn render(&self) -> String {
         format::render_json(self)
     }
+
+    /// Renders an event as one line of JSON, with no line break, for an
+    /// append-only log of one event per line. [`Event::parse`] reads it back.
+    pub fn render_line(&self) -> String {
+        serde_json::to_string(self).expect("an event always serializes to JSON")
+    }
 }
