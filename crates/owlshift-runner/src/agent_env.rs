@@ -351,6 +351,10 @@ impl AgentEnv {
     /// everything between them. `confine` would quote that line again: it
     /// rebuilds the command from `get_args`, which hands back a raw argument
     /// as a plain one.
+    ///
+    /// Confined on native Windows, it refuses with
+    /// [`SandboxError::Unsupported`], as [`sandbox::wrap`] does there: native
+    /// confinement is set aside (decision D9).
     pub fn confine_shell(&self, line: &str, run: &RunPaths) -> Result<Command, SandboxError> {
         #[cfg(unix)]
         let command = {
@@ -361,15 +365,18 @@ impl AgentEnv {
         #[cfg(windows)]
         let command = {
             use std::os::windows::process::CommandExt;
-            let shell = self.var("COMSPEC").unwrap_or(OsStr::new("cmd.exe"));
-            let tail = format!("/d /s /c \"{line}\"");
+            // Refused here rather than through `sandbox::wrap`, which would
+            // quote the line again. Deliberate: revisit with any native
+            // Windows confinement.
             if self.confined {
-                sandbox::wrap_line(&self.policy(run), shell, OsStr::new(&tail))?
-            } else {
-                let mut command = Command::new(shell);
-                command.raw_arg(tail).current_dir(&run.workdir);
-                command
+                return Err(SandboxError::Unsupported);
             }
+            let shell = self.var("COMSPEC").unwrap_or(OsStr::new("cmd.exe"));
+            let mut command = Command::new(shell);
+            command
+                .raw_arg(format!("/d /s /c \"{line}\""))
+                .current_dir(&run.workdir);
+            command
         };
         Ok(self.environment(command, run))
     }
@@ -1118,9 +1125,8 @@ mod tests {
         }
     }
 
-    /// The shipped binary never turns confinement off: the switches, this
-    /// one and the Windows launcher a test sets (OWL-71), are compiled for
-    /// tests alone, and the CLI's code never names them.
+    /// The shipped binary never turns confinement off: the switch is
+    /// compiled for tests alone, and the CLI's code never names it.
     #[test]
     fn the_cli_never_turns_confinement_off() {
         let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../owlshift-cli/src");
@@ -1132,12 +1138,31 @@ mod tests {
                     stack.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    for switch in ["without_confinement", "use_built_launcher"] {
-                        assert!(!text.contains(switch), "{} names {switch}", path.display());
-                    }
+                    assert!(
+                        !text.contains("without_confinement"),
+                        "{} names without_confinement",
+                        path.display()
+                    );
                 }
             }
         }
+    }
+
+    /// Native Windows has no sandbox: a confined agent command is refused on
+    /// both paths, the harness's and the gate's, before anything runs.
+    #[cfg(windows)]
+    #[test]
+    fn a_confined_command_is_refused_on_native_windows() {
+        let env = AgentEnv::new(std::env::vars_os()).unwrap();
+        assert!(env.is_confined());
+        let run = RunPaths {
+            workdir: std::env::temp_dir(),
+            ..RunPaths::default()
+        };
+        let harness = env.confine(Command::new("git"), &run).unwrap_err();
+        assert_eq!(harness, SandboxError::Unsupported);
+        let gate = env.confine_shell("echo hi", &run).unwrap_err();
+        assert_eq!(gate, SandboxError::Unsupported);
     }
 
     #[test]

@@ -680,18 +680,6 @@ mod tests {
         (outcome, std::fs::read_to_string(&log_path).unwrap())
     }
 
-    /// Runs `check` for the bare agent and, on Windows, for a confined one
-    /// whose commands start through the launcher Cargo built (OWL-71): the
-    /// same gate rules hold through it.
-    fn for_each_agent(check: impl Fn(&AgentEnv)) {
-        check(&agent());
-        #[cfg(windows)]
-        {
-            let _launcher = owlshift_platform::sandbox::use_built_launcher();
-            check(&AgentEnv::new(std::env::vars_os()).unwrap());
-        }
-    }
-
     fn lines(commands: &[&str]) -> Vec<String> {
         commands.iter().map(|c| (*c).to_owned()).collect()
     }
@@ -779,13 +767,11 @@ mod tests {
 
     #[test]
     fn a_command_past_the_deadline_is_stopped() {
-        for_each_agent(|agent| {
-            let started = Instant::now();
-            let (outcome, _) = gate_as(agent, &[helper("helper_sleep")], Duration::from_secs(1));
-            let failure = outcome.unwrap_err();
-            assert_eq!(failure.reason, "stopped at the gate's deadline, 1 s");
-            assert!(started.elapsed() < Duration::from_secs(10));
-        });
+        let started = Instant::now();
+        let (outcome, _) = gate(&[helper("helper_sleep")], Duration::from_secs(1));
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.reason, "stopped at the gate's deadline, 1 s");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[cfg(unix)]
@@ -1009,44 +995,22 @@ mod tests {
         let probe = "test \"$GH_TOKEN\" = owlshift-agent-has-no-credential";
         #[cfg(windows)]
         let probe = "if not \"%GH_TOKEN%\"==\"owlshift-agent-has-no-credential\" exit 1";
-        for_each_agent(|agent| {
-            let (outcome, _) = gate_as(agent, &lines(&[probe]), Duration::from_secs(60));
-            assert_eq!(outcome, Ok(()));
-        });
+        let (outcome, _) = gate(&lines(&[probe]), Duration::from_secs(60));
+        assert_eq!(outcome, Ok(()));
     }
 
     /// `cmd.exe` gets the line verbatim, inner quotes, doubled spaces and
-    /// backslashes before a quote included, bare and through the launcher.
+    /// backslashes before a quote included.
     #[cfg(windows)]
     #[test]
     fn cmd_keeps_the_line_verbatim() {
         let echoed = r#""a  b" \"q\" "c:\x\""#;
-        for_each_agent(|agent| {
-            let (outcome, log) = gate_as(
-                agent,
-                &[format!("echo {echoed} && exit 5")],
-                Duration::from_secs(60),
-            );
-            assert_eq!(outcome.unwrap_err().reason, "exit status 5");
-            assert!(log.contains(echoed), "{log}");
-        });
-    }
-
-    /// OWL-71: with a launcher, a confined gate command starts through it.
-    #[cfg(windows)]
-    #[test]
-    fn a_confined_gate_command_starts_through_the_launcher() {
-        let _launcher = owlshift_platform::sandbox::use_built_launcher();
-        let dir = tempfile::tempdir().unwrap();
-        let confined = AgentEnv::new(std::env::vars_os()).unwrap();
-        let command = confined
-            .confine_shell("echo hi", &paths(dir.path()))
-            .unwrap();
-        let program = Path::new(command.get_program()).file_name().unwrap();
-        assert!(
-            program.eq_ignore_ascii_case("owlshift-launch.exe"),
-            "{program:?}"
+        let (outcome, log) = gate(
+            &[format!("echo {echoed} && exit 5")],
+            Duration::from_secs(60),
         );
+        assert_eq!(outcome.unwrap_err().reason, "exit status 5");
+        assert!(log.contains(echoed), "{log}");
     }
 
     #[test]

@@ -7,19 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-# `cargo run -p owlshift-cli`, which the `cargo owl` alias runs, starts this
-# one of the two binaries.
-default-run = "owlshift"
 
 [[bin]]
 name = "owlshift"
 path = "src/main.rs"
-
-# Starts an agent command inside the run's Job Object on native Windows
-# (OWL-71); installed next to `owlshift`, where the runner looks for it.
-[[bin]]
-name = "owlshift-launch"
-path = "src/bin/owlshift-launch.rs"
 
 [dependencies]
 owlshift-runner.workspace = true
