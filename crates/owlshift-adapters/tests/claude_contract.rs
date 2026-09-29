@@ -1,14 +1,14 @@
 //! Contract tests of the Claude Code harness: recorded `claude -p` output
 //! replayed through the adapter, with no model and no login.
 //!
-//! The fixtures in `fixtures/claude/` were recorded on 2026-09-28 and
-//! 2026-09-29 with Claude Code 2.1.283, but for the sender of OWL-52's probe
-//! (see `docs/design/build-plan.md`, OWL-14, OWL-46 and OWL-52 results),
-//! then scrubbed: session, message and
-//! tool-use ids, timestamps, paths and thinking signatures replaced, the
-//! user's skills, plugins and agents and the local paths of the `init` event
-//! removed or, for the inbox socket, replaced. Each test states the exit
-//! status and standard error the run had, since both decide the outcome.
+//! The fixtures in `fixtures/claude/` were recorded on 2026-09-29 with Claude
+//! Code 2.1.284 by `tests/claude_record.rs`, which also scrubs them: session,
+//! message, request and tool-use ids, timestamps, paths and thinking
+//! signatures replaced, the user's skills, plugins, agents, commands and
+//! memory paths removed from the `init` event, and the inbox socket
+//! replaced (see `docs/design/build-plan.md`, OWL-14, OWL-46, OWL-52, OWL-53
+//! and OWL-77 results). Each test states the exit status and standard error
+//! the run had, since both decide the outcome; the recorder checks them.
 //! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
 //! limit on purpose (C7's open item). It follows the shapes C7 logged.
 //! `repo_settings_ignored.jsonl` was recorded with the real CLI and a local
@@ -309,7 +309,7 @@ fn tools_reaching_beyond_the_run_are_denied_on_every_launch() {
 /// `--model haiku --effort low --max-turns 6` for the recording; the model
 /// was asked to run a 60 s Bash loop, then to report any message another
 /// session had sent. Meanwhile a second `claude -p`
-/// (`peer_message_sender.jsonl`, Claude Code 2.1.284, offered `SendMessage`
+/// (`peer_message_sender.jsonl`, on `sonnet`, offered `SendMessage`
 /// alone, with a recording-only hook letting through one call to that inbox
 /// and nothing else) sent a probe to the `messaging_socket_path` of the first
 /// one's `init`. The sender was told the message was refused, and the probe

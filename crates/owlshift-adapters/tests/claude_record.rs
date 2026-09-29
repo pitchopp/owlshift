@@ -928,7 +928,7 @@ fn events(message: &Value) -> String {
 #[test]
 fn scrub_rewrites_ids_paths_and_user_setup() {
     let mut scrub = Scrub::default();
-    scrub.path(Path::new("/tmp"), "/work");
+    scrub.literal("/tmp", "/work");
     let session = "0f8e2c1a-9b3d-4e5f-8a7b-6c5d4e3f2a1b";
     let lines = [
         format!(
