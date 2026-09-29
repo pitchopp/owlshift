@@ -21,6 +21,18 @@
 //! status check ignores submodules, so a gitlink planted in the index does
 //! not start git in a folder whose configuration nothing checked.
 //!
+//! The worktree's attributes, which the run wrote, choose the filter driver
+//! each file goes through, and a driver already configured (git-lfs in the
+//! user's configuration, one the repository had) would run in the gate's
+//! status on content the run chose (OWL-73). Just before each status, the
+//! gate lists every driver git would find and switches each one off for that
+//! command (`-c filter.<name>.clean=`, `smudge`, `process`, and
+//! `required=false`). A driver whose name a `-c` argument cannot carry fails
+//! the gate, and so does a list git could not give. The cost: a file a driver
+//! filters is read raw, so once its timestamps change it reads as modified,
+//! and the gate fails. The status runs no other driver (diff, merge), and
+//! `rev-parse` reads no attributes (checked on 2026-09-29, build plan).
+//!
 //! Every command's output, standard output and standard error interleaved,
 //! goes whole to the gate log in the caller's run directory; a failure keeps
 //! the last [`OUTPUT_TAIL`] bytes for the next Build run's brief. The gate
@@ -42,6 +54,7 @@ use super::git::Git;
 use super::isolation::Violation;
 use super::watch;
 use crate::agent_env::{AgentEnv, RunPaths};
+use crate::config::exit_text;
 
 /// A gate deadline for callers without a reason to pick another.
 pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -227,25 +240,24 @@ fn head(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
 /// The worktree's uncommitted paths, tracked or not, as a short list; empty
 /// when it is clean. Ignored files do not count, and neither do submodules:
 /// git would look into one with its own git, reading configuration the
-/// guard does not check.
+/// guard does not check. Every filter driver git would find is switched off
+/// ([`filter_drivers_off`]); a list read that way names them.
 fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
-    let out = git
-        .run(
-            worktree,
-            &agent_git_args(&[
-                "status",
-                "--porcelain",
-                "-z",
-                "--untracked-files=all",
-                "--no-renames",
-                "--ignore-submodules=all",
-            ]),
-        )
-        .map_err(|e| {
-            around(format!(
-                "the runner could not read the worktree's status: {e}"
-            ))
-        })?;
+    let (drivers, off) = filter_drivers_off(git, worktree)?;
+    let mut args: Vec<&str> = off.iter().map(String::as_str).collect();
+    args.extend([
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+        "--ignore-submodules=all",
+    ]);
+    let out = git.run(worktree, &agent_git_args(&args)).map_err(|e| {
+        around(format!(
+            "the runner could not read the worktree's status: {e}"
+        ))
+    })?;
     // Each entry is `XY path`, NUL-terminated; with no renames, no entry
     // carries a second path.
     let paths: Vec<String> = out
@@ -262,7 +274,90 @@ fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
     if paths.len() > LISTED_PATHS {
         listed.push_str(&format!(" and {} more", paths.len() - LISTED_PATHS));
     }
+    if !listed.is_empty() && !drivers.is_empty() {
+        listed.push_str(&format!(
+            " (read with the filter drivers {} switched off: a file they filter reads as \
+             modified once its timestamps change)",
+            drivers.join(", ")
+        ));
+    }
     Ok(listed)
+}
+
+/// Every filter driver git would find for the worktree, and the arguments
+/// that switch each one off for a command: the gate's status runs outside
+/// the sandbox, and the worktree's attributes, which the run wrote, choose
+/// the driver a file goes through (OWL-73). The drivers are read just before
+/// each status, from the configuration that status reads.
+fn filter_drivers_off(
+    git: &Git,
+    worktree: &Path,
+) -> Result<(Vec<String>, Vec<String>), GateFailure> {
+    let listing = |detail: String| {
+        around(format!(
+            "the runner could not list the filter drivers git would run: {detail}"
+        ))
+    };
+    let out = git
+        .output(
+            worktree,
+            &agent_git_args(&["config", "-z", "--get-regexp", r"^filter\."]),
+            None,
+        )
+        .map_err(|e| listing(e.to_string()))?;
+    let records = match out.code {
+        Some(0) => out.stdout,
+        // No key matched.
+        Some(1) if out.stdout.is_empty() => Vec::new(),
+        code => {
+            return Err(listing(format!(
+                "git config failed with {}: {}",
+                exit_text(code),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+    };
+    let drivers = filter_drivers(&records).map_err(|name| {
+        around(format!(
+            "a filter driver named {name:?} is configured, which the gate cannot switch off \
+             for its own git: the gate does not run"
+        ))
+    })?;
+    let off = drivers
+        .iter()
+        .flat_map(|name| {
+            ["clean=", "smudge=", "process=", "required=false"]
+                .map(|setting| ["-c".to_owned(), format!("filter.{name}.{setting}")])
+        })
+        .flatten()
+        .collect();
+    Ok((drivers, off))
+}
+
+/// The names of the filter drivers in `records`, the output of `git config
+/// -z --get-regexp`: each record is a key, then a newline and its value when
+/// it has one. A key without a driver name is skipped, as git skips it. A
+/// name that a `-c` argument cannot carry (holding `=`, empty, or not UTF-8)
+/// is the error.
+fn filter_drivers(records: &[u8]) -> Result<Vec<String>, String> {
+    let mut names = std::collections::BTreeSet::new();
+    for record in records.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let key = record.split(|&b| b == b'\n').next().unwrap_or_default();
+        let Some(rest) = key.strip_prefix(b"filter.") else {
+            continue;
+        };
+        let Some(end) = rest.iter().rposition(|&b| b == b'.') else {
+            continue;
+        };
+        let name = &rest[..end];
+        match std::str::from_utf8(name) {
+            Ok(name) if !name.is_empty() && !name.contains('=') => {
+                names.insert(name.to_owned());
+            }
+            _ => return Err(String::from_utf8_lossy(name).into_owned()),
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 /// The arguments of a git command run as the agent: no optional lock, and
@@ -1064,6 +1159,24 @@ mod tests {
         assert!(failure.reason.contains("WSL2"), "{}", failure.reason);
     }
 
+    /// OWL-73: the drivers named in `git config -z --get-regexp` records,
+    /// with or without a value, each once and case kept; a name `-c` cannot
+    /// carry is refused.
+    #[test]
+    fn filter_drivers_are_read_from_the_config_listing() {
+        let records = b"filter.Owl.clean\ntouch x; cat\0filter.Owl.required\0\
+            filter.a.b.process\nf\0filter.clean\nx\0filter.owl.smudge\ny\0";
+        assert_eq!(filter_drivers(records).unwrap(), ["Owl", "a.b", "owl"]);
+        assert_eq!(filter_drivers(b"").unwrap(), Vec::<String>::new());
+        for (records, name) in [
+            (&b"filter.a=b.clean\nv\0"[..], "a=b"),
+            (b"filter..clean\nv\0", ""),
+            (b"filter.\xff.clean\nv\0", "\u{fffd}"),
+        ] {
+            assert_eq!(filter_drivers(records).unwrap_err(), name);
+        }
+    }
+
     /// OWL-64: what a gate command plants for git to run never runs in the
     /// gate's own git. Each test ends with a control: a plain `git status`
     /// run afterwards does run what was planted.
@@ -1127,9 +1240,13 @@ mod tests {
 
         impl Repo {
             fn gate(&self, command: &str) -> GateReport {
+                self.gate_as(&agent(), command)
+            }
+
+            fn gate_as(&self, agent: &AgentEnv, command: &str) -> GateReport {
                 run(
                     &Git::new("git"),
-                    &agent(),
+                    agent,
                     &paths(&self.worktree),
                     &[command.to_owned()],
                     Duration::from_secs(60),
@@ -1145,6 +1262,26 @@ mod tests {
 
             fn log(&self) -> String {
                 std::fs::read_to_string(self.base.path().join(GATE_LOG)).unwrap()
+            }
+
+            /// Sets `key` in the repository's shared configuration, as it
+            /// was before the run: the snapshot is taken again.
+            fn configure(&mut self, key: &str, value: &str) {
+                let main = self.worktree.with_file_name("main");
+                git_in(&main, &["config", key, value]);
+                self.snapshot =
+                    Snapshot::take(&Git::new("git"), &main, &self.worktree, "owl-1").unwrap();
+            }
+
+            /// Gives `a.txt` and `b.txt` the time `stamp`, their size kept,
+            /// so that git must read them again.
+            fn touch(&self, stamp: &str) {
+                let touched = Command::new("touch")
+                    .args(["-t", stamp, "a.txt", "b.txt"])
+                    .current_dir(&self.worktree)
+                    .status()
+                    .unwrap();
+                assert!(touched.success());
             }
         }
 
@@ -1169,6 +1306,110 @@ mod tests {
 
             git_in(&repo.worktree, &["status", "--porcelain"]);
             assert!(repo.marker.exists(), "the control never ran the filter");
+        }
+
+        /// OWL-73, the acceptance: attributes naming a driver the repository
+        /// had and one the user's configuration holds make neither run in
+        /// the gate's git, before the commands or after them. Their files
+        /// keep their content, so a gate that changes nothing else passes.
+        #[test]
+        fn a_configured_filter_named_by_the_attributes_never_runs() {
+            let mut repo = repo();
+            // The build run's commit: `b.txt`, and attributes naming both
+            // drivers, committed before any driver exists.
+            let worktree = &repo.worktree;
+            std::fs::write(worktree.join("b.txt"), "b\n").unwrap();
+            std::fs::write(
+                worktree.join(".gitattributes"),
+                "a.txt filter=owl\nb.txt filter=home\n",
+            )
+            .unwrap();
+            git_in(worktree, &["add", "b.txt", ".gitattributes"]);
+            git_in(worktree, &["commit", "-q", "-m", "build"]);
+            repo.configure("filter.owl.clean", &repo.touch_marker());
+            let home = repo.worktree.with_file_name("home");
+            let home_marker = home.join("marker");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(
+                home.join(".gitconfig"),
+                format!(
+                    "[filter \"home\"]\n\tclean = \"touch '{}'; cat\"\n",
+                    home_marker.display()
+                ),
+            )
+            .unwrap();
+            let agent = AgentEnv::new(
+                std::env::vars_os()
+                    .filter(|(name, _)| name != "HOME")
+                    .chain([("HOME".into(), home.clone().into_os_string())]),
+                &[],
+            )
+            .unwrap()
+            .without_confinement();
+            // The snapshot's own git may have run the repository's driver.
+            let _ = std::fs::remove_file(&repo.marker);
+            let ran = || repo.marker.exists() || home_marker.exists();
+
+            repo.touch("200001010000");
+            let report = repo.gate_as(&agent, "true");
+            assert!(report.passed(), "{report:?}");
+            assert!(!ran(), "the gate's git ran a driver");
+
+            let report = repo.gate_as(
+                &agent,
+                "printf 'a.txt filter=home\\nb.txt filter=owl\\n' > .gitattributes && \
+                 touch -t 200001020000 a.txt b.txt",
+            );
+            assert!(report.breach.is_empty(), "{report:?}");
+            let failure = report.failure.as_ref().expect("the gate failed");
+            assert!(failure.command.is_none(), "{report:?}");
+            // The machine's own drivers, such as a system git-lfs, are
+            // switched off and named too.
+            let reason = &failure.reason;
+            let named = reason
+                .strip_prefix(
+                    "the gate changed files: .gitattributes (read with the filter drivers ",
+                )
+                .and_then(|rest| rest.split_once(" switched off"))
+                .map(|(drivers, _)| drivers.split(", ").collect::<Vec<_>>())
+                .unwrap_or_default();
+            assert!(
+                named.contains(&"home") && named.contains(&"owl"),
+                "{reason}"
+            );
+            assert!(!ran(), "the gate's git ran a driver");
+
+            // The control: the user's own git, with that home.
+            let control = Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&repo.worktree)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join("xdg"))
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(control.status.success(), "{control:?}");
+            assert!(
+                repo.marker.exists() && home_marker.exists(),
+                "the control never ran both drivers"
+            );
+        }
+
+        /// A configured driver whose name a `-c` argument cannot carry stops
+        /// the gate before any command runs.
+        #[test]
+        fn a_driver_that_cannot_be_switched_off_stops_the_gate() {
+            let mut repo = repo();
+            repo.configure("filter.a=b.clean", "cat");
+            let report = repo.gate(&format!("touch '{}'", repo.marker.display()));
+            assert!(report.breach.is_empty(), "{report:?}");
+            let failure = report.failure.as_ref().expect("the gate failed");
+            assert!(
+                failure.command.is_none() && failure.reason.contains("named \"a=b\""),
+                "{report:?}"
+            );
+            assert!(!repo.marker.exists(), "a gate command ran");
         }
 
         /// A `.git` link redirected by a gate command stops the gate as well.
