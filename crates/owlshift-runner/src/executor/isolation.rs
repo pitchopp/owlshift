@@ -333,8 +333,9 @@ impl Snapshot {
     }
 
     /// The checks made before any git runs, on the file system alone: the
-    /// worktree's `.git` link, then the shared git files.
-    fn check_files(&self, worktree: &Path) -> Vec<Violation> {
+    /// worktree's `.git` link, then the shared git files. The gate makes
+    /// them too, before its own git (OWL-64).
+    pub(crate) fn check_files(&self, worktree: &Path) -> Vec<Violation> {
         let mut violations = Vec::new();
         if let Err(reason) = check_worktree_link(&self.common, worktree) {
             violations.push(Violation::WorktreeLink(reason));
