@@ -171,91 +171,154 @@ fn personal_config_file_is_read_from_the_override_directory() {
 #[cfg(unix)]
 #[test]
 fn ctrl_c_on_doctor_stops_a_hung_probe_and_its_child() {
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
-    use std::process::Stdio;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     const SIGINT: i32 = 2;
 
-    // A `git` whose `--version` starts a long-lived child, records both
-    // pids, and waits on the child; anything else answers as git does
-    // outside a repository, so loading the configuration does not hang.
-    let bin = tempfile::tempdir().unwrap();
-    let pids = bin.path().join("pids");
-    let git = bin.path().join("git");
-    fs::write(
-        &git,
-        format!(
-            "#!/bin/sh\n\
-             if [ \"$1\" = --version ]; then\n\
-             \x20 sleep 30 &\n\
-             \x20 echo \"$$ $!\" > '{pids}.tmp'\n\
-             \x20 mv '{pids}.tmp' '{pids}'\n\
-             \x20 wait\n\
-             fi\n\
-             echo 'fatal: not a git repository' >&2\n\
-             exit 128\n",
-            pids = pids.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let config_dir = tempfile::tempdir().unwrap();
-    let mut owlshift = Command::new(env!("CARGO_BIN_EXE_owlshift"))
-        .arg("doctor")
-        .current_dir(config_dir.path())
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
-        .env("HOME", config_dir.path())
-        .env("XDG_CONFIG_HOME", config_dir.path())
-        .env("OWLSHIFT_CONFIG_DIR", config_dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-
-    let probe_started = Instant::now() + Duration::from_secs(10);
-    while !pids.exists() {
-        if let Some(status) = owlshift.try_wait().unwrap() {
-            panic!("owlshift ended before its probe started: {status}");
-        }
-        assert!(Instant::now() < probe_started, "the probe never started");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let pids: Vec<u32> = fs::read_to_string(&pids)
-        .unwrap()
-        .split_whitespace()
-        .map(|pid| pid.parse().unwrap())
-        .collect();
-
-    let interrupted = Command::new("kill")
-        .args(["-INT", &owlshift.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(interrupted.success());
-
-    // Promptly: well before the probe's own ten-second deadline.
-    let ended = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = owlshift.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= ended {
-            let _ = owlshift.kill();
-            panic!("owlshift still running 5 s after SIGINT");
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
+    let mut hung = HungProbe::start();
+    hung.signal(&["-INT", &hung.owlshift.id().to_string()]);
+    let status = hung.ended("SIGINT");
     assert_eq!(status.signal(), Some(SIGINT), "{status}");
+    hung.assert_probe_gone();
+}
 
-    // Killed processes take a moment to be gone: an orphan is reaped by the
-    // system.
-    let settled = Instant::now() + Duration::from_secs(5);
-    while pids.iter().any(|&pid| is_alive(pid)) {
-        assert!(Instant::now() < settled, "still running: {pids:?}");
-        thread::sleep(Duration::from_millis(50));
+/// The acceptance criterion for OWL-86: killing `doctor` outright while a
+/// probe hangs, which runs no handler, still stops the probe and the process
+/// it started. The whole process group `owlshift` leads is killed, so what
+/// stops the probe cannot be in that group.
+#[cfg(unix)]
+#[test]
+fn a_hard_kill_of_doctor_stops_a_hung_probe_and_its_child() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const SIGKILL: i32 = 9;
+
+    let mut hung = HungProbe::start();
+    let group = format!("-{}", hung.owlshift.id());
+    hung.signal(&["-s", "KILL", "--", &group]);
+    let status = hung.ended("SIGKILL");
+    assert_eq!(status.signal(), Some(SIGKILL), "{status}");
+    hung.assert_probe_gone();
+}
+
+/// `owlshift doctor` whose git probe hangs with a child, `owlshift` leading a
+/// process group of its own, so the tests can kill that group without
+/// killing themselves.
+#[cfg(unix)]
+struct HungProbe {
+    owlshift: std::process::Child,
+    /// The probe's pid and its child's.
+    pids: Vec<u32>,
+    _bin: tempfile::TempDir,
+    _config_dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl HungProbe {
+    /// Starts `doctor` and waits until the probe and its child run.
+    fn start() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        // A `git` whose `--version` starts a long-lived child, records both
+        // pids, and waits on the child; anything else answers as git does
+        // outside a repository, so loading the configuration does not hang.
+        let bin = tempfile::tempdir().unwrap();
+        let pids = bin.path().join("pids");
+        let git = bin.path().join("git");
+        fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --version ]; then\n\
+                 \x20 sleep 30 &\n\
+                 \x20 echo \"$$ $!\" > '{pids}.tmp'\n\
+                 \x20 mv '{pids}.tmp' '{pids}'\n\
+                 \x20 wait\n\
+                 fi\n\
+                 echo 'fatal: not a git repository' >&2\n\
+                 exit 128\n",
+                pids = pids.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut owlshift = Command::new(env!("CARGO_BIN_EXE_owlshift"))
+            .arg("doctor")
+            .current_dir(config_dir.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+            .env("HOME", config_dir.path())
+            .env("XDG_CONFIG_HOME", config_dir.path())
+            .env("OWLSHIFT_CONFIG_DIR", config_dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+
+        let probe_started = Instant::now() + Duration::from_secs(10);
+        while !pids.exists() {
+            if let Some(status) = owlshift.try_wait().unwrap() {
+                panic!("owlshift ended before its probe started: {status}");
+            }
+            assert!(Instant::now() < probe_started, "the probe never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let pids = fs::read_to_string(&pids)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        Self {
+            owlshift,
+            pids,
+            _bin: bin,
+            _config_dir: config_dir,
+        }
+    }
+
+    /// Runs `kill` with `args`.
+    fn signal(&self, args: &[&str]) {
+        let sent = Command::new("kill").args(args).status().unwrap();
+        assert!(sent.success(), "kill {args:?}");
+    }
+
+    /// Waits for `owlshift` to end after `signal`, promptly: well before the
+    /// probe's own ten-second deadline.
+    fn ended(&mut self, signal: &str) -> std::process::ExitStatus {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let ended = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.owlshift.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= ended {
+                let _ = self.owlshift.kill();
+                panic!("owlshift still running 5 s after {signal}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Checks the probe and its child are gone within five seconds: killed
+    /// processes take a moment to be gone, as an orphan is reaped by the
+    /// system.
+    fn assert_probe_gone(&self) {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let settled = Instant::now() + Duration::from_secs(5);
+        while self.pids.iter().any(|&pid| is_alive(pid)) {
+            assert!(Instant::now() < settled, "still running: {:?}", self.pids);
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
