@@ -33,6 +33,20 @@ jobs:
         run: rustup toolchain install
       - name: Show the toolchain
         run: cargo --version --verbose
+      # OWL-41: agent runs are confined with bwrap on Linux. The image keeps
+      # unprivileged programs from creating user namespaces (AppArmor), so
+      # bwrap alone is allowed them with a scoped profile, as on a user's
+      # machine; the runner-wide sysctl is left as it is. The confinement
+      # tests must then run, not skip. Approved on OWL-41 on 2026-09-29, as
+      # the CI-settings floor of architecture section 8 requires.
+      - name: Allow bwrap user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          sudo install -m 0644 .github/apparmor/bwrap /etc/apparmor.d/bwrap
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          echo "OWLSHIFT_REQUIRE_CONFINEMENT=1" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
