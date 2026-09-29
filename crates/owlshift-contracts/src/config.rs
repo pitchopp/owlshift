@@ -87,12 +87,15 @@ pub struct Stack {
     #[serde(default)]
     pub resources: BTreeMap<String, String>,
     /// Names of variables of the runner's environment the gate needs, such as
-    /// a tool chain's path or a feature flag. Names only: each takes its value
-    /// from the runner's environment, and one the runner lacks is not set.
-    /// They reach the whole agent run, the harness and the commands it starts
-    /// as well as the gate. A credential variable, a `GIT_` name, a variable
-    /// Owlshift overrides or one that makes the dynamic loader load code is
-    /// refused.
+    /// a feature flag. Names only: each takes its value, as is, from the
+    /// runner's environment, and one the runner lacks is not set. They reach
+    /// the whole agent run, the harness and the commands it starts as well as
+    /// the gate. The sandbox does not follow them: a path under the home is
+    /// readable only if the run already opens it (the known tool-chain
+    /// folders and the `PATH`'s folders under the home), so a tool chain
+    /// installed elsewhere under the home stays unreadable. A credential
+    /// variable, a `GIT_` name, a variable Owlshift overrides or one that
+    /// makes the dynamic loader load code is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_env: Vec<String>,
 }

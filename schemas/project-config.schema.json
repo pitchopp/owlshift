@@ -159,7 +159,7 @@
           }
         },
         "gate_env": {
-          "description": "Names of variables of the runner's environment the gate needs, such as\na tool chain's path or a feature flag. Names only: each takes its value\nfrom the runner's environment, and one the runner lacks is not set.\nThey reach the whole agent run, the harness and the commands it starts\nas well as the gate. A credential variable, a `GIT_` name, a variable\nOwlshift overrides or one that makes the dynamic loader load code is\nrefused.",
+          "description": "Names of variables of the runner's environment the gate needs, such as\na feature flag. Names only: each takes its value, as is, from the\nrunner's environment, and one the runner lacks is not set. They reach\nthe whole agent run, the harness and the commands it starts as well as\nthe gate. The sandbox does not follow them: a path under the home is\nreadable only if the run already opens it (the known tool-chain\nfolders and the `PATH`'s folders under the home), so a tool chain\ninstalled elsewhere under the home stays unreadable. A credential\nvariable, a `GIT_` name, a variable Owlshift overrides or one that\nmakes the dynamic loader load code is refused.",
           "type": "array",
           "items": {
             "type": "string"
