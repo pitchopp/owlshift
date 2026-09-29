@@ -36,6 +36,8 @@ const WHOLE_OUTPUT: usize = usize::MAX;
 #[derive(Clone)]
 pub struct Git {
     program: PathBuf,
+    /// The deadline of a command that names none: [`GIT_TIMEOUT`].
+    timeout: Duration,
     setup: Arc<dyn Fn(&mut Command) + Send + Sync>,
 }
 
@@ -62,8 +64,16 @@ impl Git {
     ) -> Self {
         Self {
             program: program.into(),
+            timeout: GIT_TIMEOUT,
             setup: Arc::new(setup),
         }
+    }
+
+    /// The same git with `timeout` as the deadline of its commands, in place
+    /// of [`GIT_TIMEOUT`]: lets a test stand a short default in for 120 s.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// The same program, run with the agent environment in place of this
@@ -82,16 +92,28 @@ impl Git {
         args: &[S],
         input: Option<&[u8]>,
     ) -> Result<Captured, GitError> {
+        self.output_within(dir, args, input, self.timeout)
+    }
+
+    /// [`Git::output`] with its own deadline, still stopping the whole
+    /// process tree when it passes.
+    pub(crate) fn output_within<S: AsRef<OsStr>>(
+        &self,
+        dir: &Path,
+        args: &[S],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<Captured, GitError> {
         let mut command = Command::new(&self.program);
         command.args(hardening()).args(args).current_dir(dir);
         (self.setup)(&mut command);
         // Messages in English, whatever the operator's locale.
         command.env("LC_ALL", "C").env("LANGUAGE", "");
-        run_command(&mut command, input, GIT_TIMEOUT, WHOLE_OUTPUT).map_err(|error| {
+        run_command(&mut command, input, timeout, WHOLE_OUTPUT).map_err(|error| {
             let detail = match error {
                 RunError::Io(e) => format!("could not run: {e}"),
                 RunError::TimedOut => {
-                    format!("did not finish within {} s", GIT_TIMEOUT.as_secs())
+                    format!("did not finish within {} s", timeout.as_secs())
                 }
             };
             GitError::new(dir, args, detail)
@@ -101,7 +123,17 @@ impl Git {
     /// Runs git in `dir` and returns its standard output; a non-zero exit is
     /// an error carrying the end of its standard error.
     pub(crate) fn run<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Vec<u8>, GitError> {
-        let output = self.output(dir, args, None)?;
+        self.run_within(dir, args, self.timeout)
+    }
+
+    /// [`Git::run`] with its own deadline.
+    pub(crate) fn run_within<S: AsRef<OsStr>>(
+        &self,
+        dir: &Path,
+        args: &[S],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, GitError> {
+        let output = self.output_within(dir, args, None, timeout)?;
         if output.success() {
             Ok(output.stdout)
         } else {

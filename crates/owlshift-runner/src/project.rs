@@ -29,6 +29,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ids::TicketId;
@@ -214,6 +215,13 @@ pub struct Base {
     pub branch: String,
 }
 
+/// How long the first clone of a project may take (OWL-60): a large
+/// repository's whole history crosses the network once, and can outlive the
+/// runner git's 120 s deadline on a slow link. The fetch of a later `do` is
+/// incremental and keeps the short deadline, so a stalled network still stops
+/// it fast.
+pub const CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Brings the dedicated checkout up to date: clones `remote_url` into it the
 /// first time, and otherwise points its `origin` at `remote_url`, fetches,
 /// pruning what the forge deleted, and reads the forge's default branch
@@ -222,10 +230,20 @@ pub struct Base {
 /// as `refs/remotes/origin/HEAD` (checked with git 2.54 and on GitHub on
 /// 2026-09-29) and `git remote set-head origin --auto` refreshes.
 ///
-/// Every command runs under the runner git's own deadline, 120 s at the
-/// time of writing: a first clone of a very large repository can outlive
-/// it (a known limit, OWL-60).
+/// The first clone runs under [`CLONE_TIMEOUT`]; every other command runs
+/// under the runner git's own deadline, 120 s.
 pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<Base, String> {
+    sync_checkout_within(git, dirs, remote_url, CLONE_TIMEOUT)
+}
+
+/// [`sync_checkout`] with `clone_timeout` as the first clone's deadline: for
+/// a test that cannot wait [`CLONE_TIMEOUT`].
+pub fn sync_checkout_within(
+    git: &Git,
+    dirs: &ProjectDirs,
+    remote_url: &str,
+    clone_timeout: Duration,
+) -> Result<Base, String> {
     let checkout = dirs.checkout();
     let failed = |e: crate::executor::GitError| e.to_string();
     if fs::symlink_metadata(&checkout).is_err() {
@@ -237,13 +255,17 @@ pub fn sync_checkout(git: &Git, dirs: &ProjectDirs, remote_url: &str) -> Result<
             remote_url.as_ref(),
             "checkout".as_ref(),
         ];
-        git.run(dirs.root(), &args).map_err(|e| {
-            format!(
-                "could not clone the project into {}: {}",
-                checkout.display(),
-                e.detail
-            )
-        })?;
+        git.run_within(dirs.root(), &args, clone_timeout)
+            .map_err(|e| {
+                // A clone stopped part-way must not pass for a usable
+                // checkout on the next run.
+                let _ = fs::remove_dir_all(&checkout);
+                format!(
+                    "could not clone the project into {}: {}",
+                    checkout.display(),
+                    e.detail
+                )
+            })?;
     } else {
         let args: [&OsStr; 4] = [
             "remote".as_ref(),
