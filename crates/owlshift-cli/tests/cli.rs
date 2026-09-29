@@ -184,8 +184,8 @@ fn ctrl_c_on_doctor_stops_a_hung_probe_and_its_child() {
 
 /// The acceptance criterion for OWL-86: killing `doctor` outright while a
 /// probe hangs, which runs no handler, still stops the probe and the process
-/// it started. The whole process group `owlshift` leads is killed, so what
-/// stops the probe cannot be in that group.
+/// it started, within five seconds. The whole process group `owlshift` leads
+/// is killed, so what stops the probe, the sentinel, cannot be in that group.
 #[cfg(unix)]
 #[test]
 fn a_hard_kill_of_doctor_stops_a_hung_probe_and_its_child() {
@@ -194,6 +194,10 @@ fn a_hard_kill_of_doctor_stops_a_hung_probe_and_its_child() {
     const SIGKILL: i32 = 9;
 
     let mut hung = HungProbe::start();
+    // Owlshift tells the sentinel about a tree right after the spawn
+    // returns, well under a millisecond after the probe started; this is
+    // margin for a loaded runner, since a kill before that escapes.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let group = format!("-{}", hung.owlshift.id());
     hung.signal(&["-s", "KILL", "--", &group]);
     let status = hung.ended("SIGKILL");

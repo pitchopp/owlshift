@@ -6,12 +6,16 @@
 //! waited on. [`run_command`] runs a command the caller prepared the same
 //! way, keeping as much of its output as the caller asks for. [`ProcessTree`] is the mechanism, shared with the executor;
 //! [`stop_trees_on_signal`] stops the live trees when the process is told to
-//! end.
+//! end, and, on Unix, `stop_trees_when_killed` when it is killed outright.
 
+#[cfg(unix)]
+mod sentinel;
 mod signals;
 mod tree;
 
 pub use signals::stop_trees_on_signal;
+#[cfg(unix)]
+pub use signals::stop_trees_when_killed;
 pub use tree::ProcessTree;
 
 use std::ffi::OsStr;
@@ -546,6 +550,81 @@ mod tests {
         let parent = std::fs::read_to_string(dir.path().join("parent")).unwrap();
         let (_, name) = parent.split_once(' ').unwrap();
         assert!(name.eq_ignore_ascii_case("owlshift-launch.exe"), "{parent}");
+    }
+
+    /// Spawns `sleep 30` as the root of a tree.
+    #[cfg(unix)]
+    fn sleeper() -> (Child, ProcessTree) {
+        ProcessTree::spawn(Command::new("sleep").arg("30")).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_own_trees_then_sleep() {
+        if helper_requested() {
+            // Spawned before the sentinel starts, which learns of it then.
+            let (live, _tree) = sleeper();
+            stop_trees_when_killed().unwrap();
+            let (dropped, tree) = sleeper();
+            drop(tree);
+            std::fs::write("pids.tmp", format!("{} {}", live.id(), dropped.id())).unwrap();
+            std::fs::rename("pids.tmp", "pids").unwrap();
+            thread::sleep(Duration::from_secs(20));
+        }
+    }
+
+    /// OWL-86: once the sentinel runs, killing the process that owns the
+    /// trees outright stops every live tree, one spawned before the sentinel
+    /// started included, and leaves a tree whose handle was dropped running.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_kill_stops_the_live_trees_and_leaves_a_dropped_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut owner = Command::new(exe)
+            .args([
+                "--exact",
+                "process::tests::helper_own_trees_then_sleep",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(dir.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pids = dir.path().join("pids");
+        let started = Instant::now() + Duration::from_secs(10);
+        while !pids.exists() {
+            if let Some(status) = owner.try_wait().unwrap() {
+                panic!("the owner ended before its trees started: {status}");
+            }
+            assert!(Instant::now() < started, "the trees never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let pids: Vec<u32> = std::fs::read_to_string(pids)
+            .unwrap()
+            .split(' ')
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        let (live, dropped) = (pids[0], pids[1]);
+
+        // SIGKILL: no handler runs.
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+
+        let settled = Instant::now() + Duration::from_secs(5);
+        while is_alive(live) {
+            assert!(Instant::now() < settled, "the live tree still runs");
+            thread::sleep(Duration::from_millis(50));
+        }
+        // The sentinel stops every tree it knows of at once: give a wrong
+        // stop time to land before checking it did not happen.
+        thread::sleep(Duration::from_millis(300));
+        let spared = is_alive(dropped);
+        let _ = Command::new("kill").arg(dropped.to_string()).status();
+        assert!(spared, "the dropped tree was stopped");
     }
 
     #[test]

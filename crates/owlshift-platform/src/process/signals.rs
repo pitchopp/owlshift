@@ -1,4 +1,6 @@
-//! Stopping every live process tree when the process is told to end.
+//! Stopping every live process tree when the process ends: when it is told
+//! to end ([`stop_trees_on_signal`]), and on Unix when it is killed outright
+//! (`stop_trees_when_killed`, through the sentinel).
 //!
 //! On Unix a tree's root runs in a process group of its own, so the signals a
 //! terminal sends to its foreground group (Ctrl-C, Ctrl-\, a closed
@@ -57,6 +59,57 @@ pub fn stop_trees_on_signal() -> io::Result<()> {
 /// Whether the policy is installed.
 static INSTALLED: Mutex<bool> = Mutex::new(false);
 
+/// Makes every live [`ProcessTree`] stop when the process ends however it
+/// ends, where no handler runs: killed outright (SIGKILL), crashed, or ended
+/// by the system for want of memory. A tree still live at a normal exit is
+/// stopped too.
+///
+/// It starts the sentinel, a `/bin/sh` loop in a process group of its own,
+/// told of each tree as it becomes live and as its handle is dropped,
+/// through a pipe only this process holds. When this process ends, the
+/// system closes the pipe, and the sentinel kills the process group of each
+/// tree still live, as [`ProcessTree::kill`] does, then ends. A tree whose
+/// handle was dropped is left running, as dropping it promises, and so is a
+/// tree the handler of [`stop_trees_on_signal`] already stopped.
+///
+/// It is a best effort, not a guarantee:
+///
+/// - a kill that lands between a tree's start and the moment the sentinel is
+///   told of it, well under a millisecond, leaves that tree running;
+/// - once the sentinel is killed, or stops reading, it protects nothing
+///   more; this process never waits on it;
+/// - as with [`ProcessTree::kill`], a process that left its tree's group is
+///   not stopped, and a group id could in theory belong to another group by
+///   then, once the pid space wrapped around.
+///
+/// Call it first thing in `main`, before another thread starts a process: on
+/// a system that has no `pipe2`, as macOS, a pipe is made close-on-exec just
+/// after it is created, so a process started at that moment could inherit
+/// the sentinel's pipe and hide this process's end from it. Trees live
+/// before the call are covered too. Once it succeeded, later calls do
+/// nothing; after a failure, it can be called again.
+///
+/// Unix only: native Windows is out of scope for this guarantee (decided on
+/// 2026-09-29, see `docs/design/runtime-and-operations.md`).
+///
+/// [`ProcessTree`]: super::ProcessTree
+/// [`ProcessTree::kill`]: super::ProcessTree::kill
+#[cfg(unix)]
+pub fn stop_trees_when_killed() -> io::Result<()> {
+    let mut guard = live();
+    let live = &mut *guard;
+    if live.sentinel.is_some() {
+        return Ok(());
+    }
+    // Under the lock, so no tree starts meanwhile.
+    let mut sentinel = super::sentinel::Sentinel::start()?;
+    for &(_, group) in &live.trees {
+        sentinel.announce(group);
+    }
+    live.sentinel = Some(sentinel);
+    Ok(())
+}
+
 /// What stops a live tree: its process group.
 #[cfg(unix)]
 pub(super) type Stopper = rustix::process::Pid;
@@ -70,11 +123,17 @@ pub(super) type Stopper = std::sync::Arc<std::os::windows::io::OwnedHandle>;
 struct Live {
     next: u64,
     trees: Vec<(u64, Stopper)>,
+    /// The sentinel, once [`stop_trees_when_killed`] started it, told of
+    /// every change to `trees` under this lock.
+    #[cfg(unix)]
+    sentinel: Option<super::sentinel::Sentinel>,
 }
 
 static LIVE: Mutex<Live> = Mutex::new(Live {
     next: 0,
     trees: Vec::new(),
+    #[cfg(unix)]
+    sentinel: None,
 });
 
 /// The live trees. A panic cannot leave them half-updated, so a poisoned
@@ -91,7 +150,15 @@ pub(super) struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        live().trees.retain(|(id, _)| *id != self.id);
+        let mut guard = live();
+        let live = &mut *guard;
+        #[cfg(unix)]
+        if let Some(sentinel) = &mut live.sentinel
+            && let Some(&(_, group)) = live.trees.iter().find(|(id, _)| *id == self.id)
+        {
+            sentinel.withdraw(group);
+        }
+        live.trees.retain(|(id, _)| *id != self.id);
     }
 }
 
@@ -109,11 +176,17 @@ pub(super) fn register(
     spawn: impl FnOnce() -> io::Result<Child>,
     stopper: impl FnOnce(&Child) -> Stopper,
 ) -> io::Result<(Child, Registration)> {
-    let mut live = live();
+    let mut guard = live();
     let child = spawn()?;
+    let live = &mut *guard;
     let id = live.next;
     live.next += 1;
-    live.trees.push((id, stopper(&child)));
+    let stopper = stopper(&child);
+    #[cfg(unix)]
+    if let Some(sentinel) = &mut live.sentinel {
+        sentinel.announce(stopper);
+    }
+    live.trees.push((id, stopper));
     Ok((child, Registration { id }))
 }
 
@@ -122,16 +195,23 @@ pub(super) fn register(
 /// sees its tree stopped blocks when it drops the tree's handle, so it cannot
 /// end the process first.
 fn stop_every_tree() -> MutexGuard<'static, Live> {
-    let live = live();
+    let mut guard = live();
+    let live = &mut *guard;
     for (_, stopper) in &live.trees {
         // Best effort: a tree that cannot be stopped must not spare the
         // ones after it.
         #[cfg(unix)]
-        let _ = super::tree::kill_group(*stopper);
+        if super::tree::kill_group(*stopper).is_ok()
+            && let Some(sentinel) = &mut live.sentinel
+        {
+            // Stopped: once this process is gone, its group id may be
+            // another group's, which the sentinel must not kill.
+            sentinel.withdraw(*stopper);
+        }
         #[cfg(windows)]
         let _ = super::tree::terminate_job(stopper);
     }
-    live
+    guard
 }
 
 #[cfg(unix)]
