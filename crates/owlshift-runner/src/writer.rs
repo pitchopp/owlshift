@@ -13,9 +13,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
 use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push_parts};
@@ -362,9 +360,10 @@ impl<'a> Writer<'a> {
     /// point it at a git directory whose hooks or configuration run code
     /// with the person's credentials. The worktree's commits are in the
     /// checkout's object store. No hook runs either way: `--no-verify` skips
-    /// `pre-push`, and `core.hooksPath` names a folder that does not exist,
-    /// so no other hook (`reference-transaction`) is found; the file-system
-    /// monitor is off.
+    /// `pre-push`, and the runner's git gives every command a
+    /// `core.hooksPath` that does not exist, so no other hook
+    /// (`reference-transaction`) is found, and turns the file-system monitor
+    /// off (`executor::Git`).
     pub fn push_branch(
         &self,
         git: &Git,
@@ -380,13 +379,7 @@ impl<'a> Writer<'a> {
         let command = push_command(Path::new("git"), checkout, remote, commit, branch)
             .map_err(WriteError::Push)?;
         let mut pushed = command.get_args();
-        let mut args: Vec<OsString> = vec![
-            "-c".into(),
-            hooks_nowhere().into(),
-            "-c".into(),
-            "core.fsmonitor=false".into(),
-        ];
-        args.extend(pushed.next().map(OsStr::to_owned));
+        let mut args: Vec<OsString> = pushed.next().map(OsStr::to_owned).into_iter().collect();
         args.push("--no-verify".into());
         args.extend(pushed.map(OsStr::to_owned));
         let output = git.output(checkout, &args, None).map_err(|error| {
@@ -480,24 +473,6 @@ fn is_delivery(body: &str) -> bool {
         MarkedComment::parse(body),
         Ok(Some(MarkedComment { header, .. })) if header.kind == MarkerKind::Delivery
     )
-}
-
-/// `core.hooksPath=<folder>` for a folder that does not exist, named by this
-/// process and the time, so nothing can have been planted there: git finds
-/// no hook in it.
-fn hooks_nowhere() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let base =
-        std::env::temp_dir().join(format!("owlshift-no-hooks-{}-{nanos}", std::process::id()));
-    let mut folder = base.clone();
-    let mut n = 1;
-    while fs::symlink_metadata(&folder).is_ok() {
-        n += 1;
-        folder = PathBuf::from(format!("{}-{n}", base.display()));
-    }
-    format!("core.hooksPath={}", folder.display())
 }
 
 /// The ticket's pull request, and whether this call opened it.

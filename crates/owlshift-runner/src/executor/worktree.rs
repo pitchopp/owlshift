@@ -19,6 +19,11 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
     let worktree_error = |e: super::GitError| ExecutorError::Worktree(e.to_string());
 
     if fs::symlink_metadata(spec.worktree).is_ok() {
+        // The kept worktree's `.git` is checked before any git runs in it:
+        // an earlier run could have pointed it elsewhere.
+        let common = common_dir(git, spec.main)?;
+        super::isolation::check_worktree_link(&common, spec.worktree)
+            .map_err(ExecutorError::Worktree)?;
         check_linked(git, spec)?;
         let head = git
             .output(spec.worktree, &["symbolic-ref", "-q", "HEAD"], None)
@@ -99,17 +104,10 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
 /// either, is refused too. Paths are compared once resolved, links
 /// included.
 fn check_linked(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
-    let resolved = |dir: &Path, args: &[&str]| -> Result<PathBuf, ExecutorError> {
-        let printed = git
-            .run(dir, args)
-            .map_err(|e| ExecutorError::Worktree(e.to_string()))?;
-        canonical(&dir.join(String::from_utf8_lossy(&printed).trim()))
-    };
-    let common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
     let top = ["rev-parse", "--path-format=absolute", "--show-toplevel"];
-    let worktree_top = resolved(spec.worktree, &top)?;
-    let linked = resolved(spec.worktree, &common)? == resolved(spec.main, &common)?
-        && worktree_top != resolved(spec.main, &top)?
+    let worktree_top = resolved(git, spec.worktree, &top)?;
+    let linked = common_dir(git, spec.worktree)? == common_dir(git, spec.main)?
+        && worktree_top != resolved(git, spec.main, &top)?
         && worktree_top == canonical(spec.worktree)?;
     if linked {
         Ok(())
@@ -120,6 +118,23 @@ fn check_linked(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
             spec.main.display()
         )))
     }
+}
+
+/// The common git directory of the repository at `dir`, resolved.
+fn common_dir(git: &Git, dir: &Path) -> Result<PathBuf, ExecutorError> {
+    resolved(
+        git,
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+}
+
+/// The path git prints in `dir`, resolved.
+fn resolved(git: &Git, dir: &Path, args: &[&str]) -> Result<PathBuf, ExecutorError> {
+    let printed = git
+        .run(dir, args)
+        .map_err(|e| ExecutorError::Worktree(e.to_string()))?;
+    canonical(&dir.join(String::from_utf8_lossy(&printed).trim()))
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, ExecutorError> {

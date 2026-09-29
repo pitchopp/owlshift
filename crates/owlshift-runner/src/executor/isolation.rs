@@ -35,6 +35,20 @@
 //! check cannot tell which run did it. [`Snapshot::check`] is the check of a
 //! run alone, told of no other run.
 //!
+//! Before any git runs, two checks read the file system alone (OWL-59):
+//!
+//! - **The worktree's `.git` link** ([`check_worktree_link`]): an agent owns
+//!   every file of its worktree, `.git` included, and a link pointed at a
+//!   git directory of its own would have git in the worktree read that
+//!   directory's hooks and configuration.
+//! - **The shared git files**, compared with the snapshot's: a run that
+//!   planted a command there, such as a clean filter that `git status` would
+//!   run, is caught before the runner's git reads them.
+//!
+//! A violation there ends the check: no git runs, and the other checks are
+//! not made. The runner's git runs no hook and no file-system monitor
+//! either way (`executor::Git`).
+//!
 //! A check that cannot run counts as a violation. Nothing is written: git
 //! runs with `--no-optional-locks`, and `hash-object` without `-w`.
 //!
@@ -60,9 +74,15 @@ const SHARED_FILE_CAP: u64 = 1024 * 1024;
 /// The most names a violation lists before summing up the rest.
 const LISTED: usize = 10;
 
+/// The most bytes of a git link file (`.git`, `commondir`): one path.
+const LINK_FILE_CAP: u64 = 4096;
+
 /// What the run must leave alone, as it was before the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
+    /// The repository's common git directory, resolved before the run, so
+    /// that the checks made before any git know where it is.
+    common: PathBuf,
     main: MainState,
     /// The worktree's commit when the run started.
     start: String,
@@ -159,6 +179,9 @@ pub enum Violation {
         expected: String,
         found: Option<String>,
     },
+    /// The worktree's `.git` no longer links it to the repository: why
+    /// ([`check_worktree_link`]).
+    WorktreeLink(String),
     /// The branch descends neither from the run's start commit nor, for a
     /// rebase, from its new base.
     History {
@@ -193,6 +216,7 @@ impl fmt::Display for Violation {
                 "the worktree is on {}, not {expected}",
                 found.as_deref().unwrap_or("no branch")
             ),
+            Self::WorktreeLink(reason) => f.write_str(reason),
             Self::History {
                 start,
                 end,
@@ -280,7 +304,14 @@ impl Snapshot {
         branch: &str,
         onto: Option<&str>,
     ) -> Result<Self, SnapshotError> {
-        let main = MainState::read(git, main, branch)?;
+        let printed = git.run(
+            main,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let common = PathBuf::from(trimmed(&printed));
+        let common = fs::canonicalize(&common)
+            .map_err(|e| SnapshotError(format!("{}: {e}", common.display())))?;
+        let main = MainState::read(git, main, branch, &common)?;
         let start = trimmed(&git.run(worktree, &["rev-parse", "--verify", "HEAD"])?);
         let onto = onto
             .map(|onto| {
@@ -293,7 +324,34 @@ impl Snapshot {
                 .map_err(|e| SnapshotError(format!("the new base {onto:?}: {e}")))
             })
             .transpose()?;
-        Ok(Self { main, start, onto })
+        Ok(Self {
+            common,
+            main,
+            start,
+            onto,
+        })
+    }
+
+    /// The checks made before any git runs, on the file system alone: the
+    /// worktree's `.git` link, then the shared git files.
+    fn check_files(&self, worktree: &Path) -> Vec<Violation> {
+        let mut violations = Vec::new();
+        if let Err(reason) = check_worktree_link(&self.common, worktree) {
+            violations.push(Violation::WorktreeLink(reason));
+        }
+        match read_shared(&self.common) {
+            Ok(after) => {
+                let shared: Vec<String> = changed(&self.main.shared, &after)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if !shared.is_empty() {
+                    violations.push(Violation::SharedGitFiles(shared));
+                }
+            }
+            Err(error) => violations.push(Violation::CheckFailed(error.to_string())),
+        }
+        violations
     }
 
     /// Everything a run alone changed that it had to leave alone; empty
@@ -318,8 +376,18 @@ impl Snapshot {
         branch: &str,
         concurrent: &dyn Fn() -> Concurrent,
     ) -> Checked {
+        // Nothing the run left in the shared git files, or behind a
+        // redirected link, may run in the runner's git: a violation found
+        // on the file system ends the check before any git runs.
+        let violations = self.check_files(worktree);
+        if !violations.is_empty() {
+            return Checked {
+                violations,
+                tip: None,
+            };
+        }
         let earlier = concurrent();
-        let mut violations = match MainState::read(git, main, branch) {
+        let mut violations = match MainState::read(git, main, branch, &self.common) {
             Ok(after) => self.main.compare(&after, &earlier, &concurrent()),
             Err(error) => vec![Violation::CheckFailed(error.to_string())],
         };
@@ -379,7 +447,7 @@ fn is_ancestor(git: &Git, dir: &Path, ancestor: &str, end: &str) -> Result<bool,
 }
 
 impl MainState {
-    fn read(git: &Git, main: &Path, branch: &str) -> Result<Self, SnapshotError> {
+    fn read(git: &Git, main: &Path, branch: &str, common: &Path) -> Result<Self, SnapshotError> {
         let head = git.output(main, &["rev-parse", "-q", "--verify", "HEAD"], None)?;
         let head = match head.code {
             Some(0) => Some(trimmed(&head.stdout)),
@@ -407,13 +475,7 @@ impl MainState {
         let records = status_records(&status).map_err(SnapshotError)?;
         let entries = contents(git, main, records)?;
 
-        let common = trimmed(&git.run(main, &["rev-parse", "--git-common-dir"])?);
-        let common = main.join(common);
-        let mut shared = BTreeMap::new();
-        for name in ["config", "config.worktree", "hooks", "info"] {
-            shared_files(&common, name, &mut shared)
-                .map_err(|e| SnapshotError(format!("{}: {e}", common.join(name).display())))?;
-        }
+        let shared = read_shared(common)?;
 
         let own = format!("refs/heads/{branch}");
         let listed = git.run(main, &["for-each-ref", "--format=%(objectname) %(refname)"])?;
@@ -670,6 +732,97 @@ fn path_of(bytes: &[u8]) -> PathBuf {
     }
 }
 
+/// The shared git files every worktree reads: `config`, `config.worktree`,
+/// `hooks/` and `info/` under the common directory.
+fn read_shared(common: &Path) -> Result<BTreeMap<String, Content>, SnapshotError> {
+    let mut shared = BTreeMap::new();
+    for name in ["config", "config.worktree", "hooks", "info"] {
+        shared_files(common, name, &mut shared)
+            .map_err(|e| SnapshotError(format!("{}: {e}", common.join(name).display())))?;
+    }
+    Ok(shared)
+}
+
+/// Checks that the worktree's `.git` still links it to the repository whose
+/// common git directory is `common`, such as `<checkout>/.git`, before the
+/// runner trusts anything git says in it.
+///
+/// An agent owns every file of its worktree, `.git` included: pointing it,
+/// or the `commondir` of its administrative folder, at a git directory of
+/// its own would make git in the worktree read that directory's hooks and
+/// configuration, which the isolation check never sees. So `.git` must be a
+/// plain file whose `gitdir: ` names a folder of `<common>/worktrees`, that
+/// folder's `commondir` must lead back to `common`, and it must hold no
+/// `config.worktree`. Both files are read as git reads them: the whole file,
+/// less its trailing line breaks, so a trailing space names another folder
+/// here as it does for git; a file past a few kilobytes is refused. Paths
+/// are compared once resolved, links included. No git command runs here.
+pub fn check_worktree_link(common: &Path, worktree: &Path) -> Result<(), String> {
+    let breach = |what: String| format!("the worktree's .git link was changed: {what}");
+    let common =
+        fs::canonicalize(common).map_err(|e| breach(format!("{}: {e}", common.display())))?;
+    let worktrees = common.join("worktrees");
+    let link = worktree.join(".git");
+    let text = read_link_file(&link).map_err(breach)?;
+    let target = text
+        .strip_prefix("gitdir: ")
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| breach(format!("{} does not name a gitdir", link.display())))?;
+    let resolve = |from: &Path, path: &str| {
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            from.join(path)
+        };
+        fs::canonicalize(&path).map_err(|e| breach(format!("{}: {e}", path.display())))
+    };
+    let admin = resolve(worktree, target)?;
+    if admin.parent() != Some(worktrees.as_path()) {
+        return Err(breach(format!(
+            "it leads to {}, outside {}",
+            admin.display(),
+            worktrees.display()
+        )));
+    }
+    let commondir = admin.join("commondir");
+    let named = read_link_file(&commondir).map_err(breach)?;
+    if resolve(&admin, &named)? != common {
+        return Err(breach(format!(
+            "{} leads away from {}",
+            commondir.display(),
+            common.display()
+        )));
+    }
+    let own_config = admin.join("config.worktree");
+    if fs::symlink_metadata(&own_config).is_ok() {
+        return Err(breach(format!("{} appeared", own_config.display())));
+    }
+    Ok(())
+}
+
+/// A git link file (`.git`, `commondir`), as git reads it: a plain file,
+/// less its trailing line breaks, holding one line of text.
+fn read_link_file(path: &Path) -> Result<String, String> {
+    let fail = |what: &str| format!("{} {what}", path.display());
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()) {
+        return Err(fail("is not a plain file"));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(LINK_FILE_CAP + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > LINK_FILE_CAP {
+        return Err(fail("is too large"));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| fail("is not UTF-8 text"))?;
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.contains(['\n', '\r', '\0']) {
+        return Err(fail("holds more than one line"));
+    }
+    Ok(text.to_owned())
+}
+
 /// Records `name` under `common`, and everything below it for a
 /// directory, without following links.
 fn shared_files(common: &Path, name: &str, out: &mut BTreeMap<String, Content>) -> io::Result<()> {
@@ -742,6 +895,93 @@ mod tests {
         assert!(status_records(b"2 R. N... 100644 100644 100644 b b R100 new.md\0").is_err());
         assert!(status_records(b"# branch.oid abc\0").is_err());
         assert_eq!(status_records(b"").unwrap(), []);
+    }
+
+    /// What `git worktree add` leaves, built by hand: a checkout's
+    /// administrative folder for the worktree, and the worktree's `.git`.
+    /// Returns the common directory, the administrative folder and the
+    /// worktree.
+    fn linked(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let common = dir.join("checkout").join(".git");
+        let admin = common.join("worktrees").join("owl-1");
+        let worktree = dir.join("worktrees").join("owl-1");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        (common, admin, worktree)
+    }
+
+    #[test]
+    fn a_worktree_must_stay_linked_to_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (common, _, worktree) = linked(dir.path());
+        assert_eq!(check_worktree_link(&common, &worktree), Ok(()));
+
+        // A relative gitdir, as `worktree.useRelativePaths` writes it, with
+        // a Windows line break.
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../checkout/.git/worktrees/owl-1\r\n",
+        )
+        .unwrap();
+        assert_eq!(check_worktree_link(&common, &worktree), Ok(()));
+
+        for case in [
+            "a gitdir elsewhere",
+            "no gitdir line",
+            "a .git folder",
+            "a commondir elsewhere",
+            "a per-worktree configuration",
+            "a trailing space",
+            "a second line",
+            "an oversized link",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (common, admin, worktree) = linked(dir.path());
+            // A git directory of the agent's own, with the same layout.
+            let evil = dir.path().join("evil");
+            let evil_admin = evil.join("worktrees").join("owl-1");
+            fs::create_dir_all(&evil_admin).unwrap();
+            fs::write(evil_admin.join("commondir"), "../..\n").unwrap();
+            let link = worktree.join(".git");
+            let gitdir = format!("gitdir: {}", admin.display());
+            match case {
+                "a gitdir elsewhere" => {
+                    fs::write(&link, format!("gitdir: {}\n", evil_admin.display())).unwrap()
+                }
+                "no gitdir line" => fs::write(&link, "ref: HEAD\n").unwrap(),
+                "a .git folder" => {
+                    fs::remove_file(&link).unwrap();
+                    fs::create_dir(&link).unwrap();
+                }
+                "a commondir elsewhere" => {
+                    fs::write(admin.join("commondir"), evil.display().to_string()).unwrap()
+                }
+                "a per-worktree configuration" => {
+                    fs::write(admin.join("config.worktree"), "[core]\n\tfsmonitor = x\n").unwrap()
+                }
+                // Git keeps the space: it opens `owl-1 `, a folder of the
+                // agent's, not `owl-1`.
+                "a trailing space" => {
+                    let sibling = admin.with_file_name("owl-1 ");
+                    fs::create_dir_all(&sibling).unwrap();
+                    fs::write(sibling.join("commondir"), evil.display().to_string()).unwrap();
+                    fs::write(&link, format!("{gitdir} \n")).unwrap();
+                }
+                "a second line" => fs::write(&link, format!("{gitdir}\nmore\n")).unwrap(),
+                _ => fs::write(&link, format!("{gitdir}{}\n", " ".repeat(5000))).unwrap(),
+            }
+            let error = check_worktree_link(&common, &worktree).unwrap_err();
+            assert!(
+                error.contains("the worktree's .git link was changed"),
+                "{case}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -7,13 +7,19 @@
 //! the root of a process tree stopped at [`GIT_TIMEOUT`]. Its output is kept
 //! whole ([`WHOLE_OUTPUT`]): the probes' 64 KiB would cut a large
 //! repository's status and blind the isolation check.
+//!
+//! No command runs a hook or a file-system monitor, whatever the
+//! repository's configuration says ([`hardening`]): a run can write the
+//! repository's shared git files, and the runner's git must not run what it
+//! planted there before the isolation check has seen it.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use owlshift_platform::process::{Captured, RunError, run_command};
 
@@ -77,7 +83,7 @@ impl Git {
         input: Option<&[u8]>,
     ) -> Result<Captured, GitError> {
         let mut command = Command::new(&self.program);
-        command.args(args).current_dir(dir);
+        command.args(hardening()).args(args).current_dir(dir);
         (self.setup)(&mut command);
         // Messages in English, whatever the operator's locale.
         command.env("LC_ALL", "C").env("LANGUAGE", "");
@@ -110,6 +116,37 @@ impl Git {
             ))
         }
     }
+}
+
+/// What every command of the runner's git starts with, before the
+/// subcommand: `core.hooksPath` naming a folder that does not exist, so no
+/// hook is found, and `core.fsmonitor=false`, so no monitor command runs.
+/// Given with `-c`, they win over every configuration file.
+fn hardening() -> [OsString; 4] {
+    [
+        "-c".into(),
+        hooks_nowhere().into(),
+        "-c".into(),
+        "core.fsmonitor=false".into(),
+    ]
+}
+
+/// `core.hooksPath=<folder>` for a folder that does not exist, named by this
+/// process and the time, so nothing can have been planted there: git finds
+/// no hook in it.
+fn hooks_nowhere() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let base =
+        std::env::temp_dir().join(format!("owlshift-no-hooks-{}-{nanos}", std::process::id()));
+    let mut folder = base.clone();
+    let mut n = 1;
+    while fs::symlink_metadata(&folder).is_ok() {
+        n += 1;
+        folder = PathBuf::from(format!("{}-{n}", base.display()));
+    }
+    format!("core.hooksPath={}", folder.display())
 }
 
 /// The last lines of a command's standard error, enough to say why it
@@ -154,3 +191,19 @@ impl fmt::Display for GitError {
 }
 
 impl std::error::Error for GitError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_command_turns_hooks_and_the_monitor_off() {
+        let args = hardening();
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[2], "-c");
+        assert_eq!(args[3], "core.fsmonitor=false");
+        let hooks = args[1].to_str().unwrap();
+        let folder = hooks.strip_prefix("core.hooksPath=").unwrap();
+        assert!(fs::symlink_metadata(folder).is_err(), "{folder} exists");
+    }
+}

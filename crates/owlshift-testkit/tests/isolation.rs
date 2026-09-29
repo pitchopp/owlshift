@@ -188,12 +188,79 @@ fn a_runs_own_work_passes_and_every_breach_is_found() {
         "{rewound:?}"
     );
 
-    // A check that cannot run is a violation.
+    // A worktree gone takes its `.git` link with it: a violation, found
+    // before any git runs.
     let gone = f.around(|f| fs::remove_dir_all(&f.worktree).unwrap());
     assert!(
-        matches!(gone.as_slice(), [Violation::CheckFailed(_)]),
+        matches!(gone.as_slice(), [Violation::WorktreeLink(_)]),
         "{gone:?}"
     );
+}
+
+/// What a run leaves behind its worktree's `.git`, or in the shared git
+/// files, is found on the file system before the runner's git runs: no git
+/// command runs after the breach, so neither a git directory of the run's
+/// own nor a clean filter it configured, which `git status` of the main
+/// checkout would run on a changed file, ever runs.
+#[test]
+fn a_redirected_link_or_a_planted_filter_stops_the_check_before_any_git() {
+    for case in ["a redirected link", "a planted filter"] {
+        let f = Fixture::new();
+        let ran: Arc<Mutex<Option<Vec<PathBuf>>>> = Arc::new(Mutex::new(None));
+        let runner = f.env.clone();
+        let seen = ran.clone();
+        let git = Git::with_setup("git", move |command| {
+            runner.apply(command);
+            if let Some(dirs) = seen.lock().unwrap().as_mut() {
+                dirs.push(command.get_current_dir().unwrap().to_owned());
+            }
+        });
+        let before = Snapshot::take(&git, &f.main, &f.worktree, BRANCH).unwrap();
+        let fired = f._tmp.path().join("filter-fired");
+        match case {
+            "a redirected link" => {
+                let evil = f._tmp.path().join("evil");
+                fs::create_dir_all(&evil).unwrap();
+                fs::write(
+                    f.worktree.join(".git"),
+                    format!("gitdir: {}\n", evil.display()),
+                )
+                .unwrap();
+            }
+            _ => {
+                let fired = fired.to_string_lossy().replace('\\', "/");
+                f.main_git(&[
+                    "config",
+                    "filter.owl.clean",
+                    &format!("sh -c 'echo ran > \"{fired}\"; cat'"),
+                ]);
+                fs::write(f.main.join(".git/info/attributes"), "* filter=owl\n").unwrap();
+                // A tracked file whose status git must read again, through
+                // the filter.
+                fs::write(f.main.join("README.md"), "changed\n").unwrap();
+            }
+        }
+        *ran.lock().unwrap() = Some(Vec::new());
+        let violations = before.check(&git, &f.main, &f.worktree, BRANCH);
+        let expected = match case {
+            "a redirected link" => matches!(violations.as_slice(), [Violation::WorktreeLink(_)]),
+            _ => {
+                violations
+                    == [Violation::SharedGitFiles(vec![
+                        "config".into(),
+                        "info/attributes".into(),
+                    ])]
+            }
+        };
+        assert!(expected, "{case}: {violations:?}");
+        assert_eq!(ran.lock().unwrap().as_deref(), Some(&[][..]), "{case}");
+        assert!(!fired.exists(), "{case}: the filter ran");
+        if case == "a planted filter" {
+            // The control: `git status` does run it.
+            f.main_git(&["status", "--porcelain"]);
+            assert!(fired.exists(), "the planted filter never runs");
+        }
+    }
 }
 
 /// A main checkout whose status is larger than the probes' 64 KiB output cap
