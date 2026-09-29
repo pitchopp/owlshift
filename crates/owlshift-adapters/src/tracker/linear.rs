@@ -21,6 +21,17 @@
 //!   answers HTTP 401 with code `AUTHENTICATION_ERROR`.
 //! - `commentCreate` accepts an issue identifier such as `OWL-13`.
 //!
+//! Checked live on 2026-09-29 (OWL-62), by schema introspection and a read of
+//! the workspace's issues:
+//!
+//! - `Issue.creator` is the account that created the issue, null when that
+//!   account was deleted or an integration or system process created it; the
+//!   issue's `botActor` or `externalUserCreator` then names it. OWL-1 to OWL-4,
+//!   made by Linear's onboarding, have a null creator and the bot actor
+//!   `Linear` (type `workflow`); every other issue has a creator, and those
+//!   read (the 50 most recent, OWL-11, OWL-13) have the account of the
+//!   personal API key and no bot actor.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -175,9 +186,7 @@ impl Tracker for LinearTracker {
             priority: priority(issue.priority)?,
             assignee: issue.assignee.map(User::into_person),
             labels: issue.labels.nodes.into_iter().map(|l| l.name).collect(),
-            author: issue
-                .creator
-                .map_or_else(Author::unknown, |u| Author::Account(u.into_person())),
+            author: author(issue.creator, issue.bot_actor, issue.external_user_creator),
         })
     }
 
@@ -228,7 +237,7 @@ macro_rules! comment_fields {
 
 const TICKET_QUERY: &str = "query Ticket($id: String!) { issue(id: $id) { \
     identifier title description priority assignee { id displayName } \
-    creator { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
+    creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
 
 const COMMENTS_QUERY: &str = concat!(
     "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { \
@@ -338,6 +347,8 @@ struct Issue {
     priority: f64,
     assignee: Option<User>,
     creator: Option<User>,
+    bot_actor: Option<Named>,
+    external_user_creator: Option<Named>,
     labels: Connection<Label>,
 }
 
@@ -382,6 +393,18 @@ struct Named {
     name: Option<String>,
 }
 
+/// Who wrote an issue or a comment: the Linear account when there is one,
+/// otherwise the bot or external user Linear names, otherwise nobody it still
+/// knows (a deleted account).
+fn author(user: Option<User>, bot: Option<Named>, external: Option<Named>) -> Author {
+    match (user, bot, external) {
+        (Some(user), _, _) => Author::Account(user.into_person()),
+        (None, Some(Named { name: Some(name) }), _)
+        | (None, _, Some(Named { name: Some(name) })) => Author::Other { name },
+        _ => Author::unknown(),
+    }
+}
+
 #[derive(Deserialize)]
 struct CommentsData {
     issue: IssueComments,
@@ -406,15 +429,9 @@ struct LinearComment {
 
 impl LinearComment {
     fn into_comment(self) -> Comment {
-        let author = match (self.user, self.bot_actor, self.external_user) {
-            (Some(user), _, _) => Author::Account(user.into_person()),
-            (None, Some(Named { name: Some(name) }), _)
-            | (None, _, Some(Named { name: Some(name) })) => Author::Other { name },
-            _ => Author::unknown(),
-        };
         Comment {
             id: self.id,
-            author,
+            author: author(self.user, self.bot_actor, self.external_user),
             created_at: self.created_at,
             edited_at: self.edited_at,
             body: self.body,
@@ -536,7 +553,8 @@ mod tests {
     fn what_the_adapter_cannot_represent_is_refused_not_truncated() {
         let id = TicketId::new("OWL-1").unwrap();
         let many_labels = r#"{"data":{"issue":{"identifier":"OWL-1","title":"t","description":null,
-            "priority":0,"assignee":null,"creator":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}"#;
+            "priority":0,"assignee":null,"creator":null,"botActor":null,
+            "externalUserCreator":null,"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}"#;
         assert!(tracker(vec![many_labels]).ticket(&id).is_err());
 
         let stuck = r#"{"data":{"issue":{"comments":{"nodes":[],
@@ -545,6 +563,38 @@ mod tests {
 
         let refused = r#"{"data":{"commentCreate":{"success":false,"comment":null}}}"#;
         assert!(tracker(vec![refused]).post_comment(&id, "x").is_err());
+    }
+
+    /// The shape Linear gave on 2026-09-29 for OWL-1, made by its onboarding
+    /// workflow: no creator, a bot actor. Such a ticket is never an account's.
+    #[test]
+    fn a_ticket_without_a_creator_is_attributed_to_what_linear_names() {
+        let id = TicketId::new("OWL-1").unwrap();
+        let ticket = |creator: &str, bot: &str| {
+            let body = format!(
+                r#"{{"data":{{"issue":{{"identifier":"OWL-1","title":"t","description":null,
+                "priority":0,"assignee":null,"creator":{creator},"botActor":{bot},
+                "externalUserCreator":null,"labels":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}"#
+            );
+            tracker(vec![Box::leak(body.into_boxed_str())])
+                .ticket(&id)
+                .unwrap()
+                .author
+        };
+        assert_eq!(
+            ticket("null", r#"{"name":"Linear"}"#),
+            Author::Other {
+                name: "Linear".to_owned()
+            }
+        );
+        assert_eq!(ticket("null", "null"), Author::unknown());
+        assert_eq!(
+            ticket(r#"{"id":"u1","displayName":"person-1"}"#, "null"),
+            Author::Account(Person {
+                id: "u1".to_owned(),
+                name: "person-1".to_owned()
+            })
+        );
     }
 
     #[test]
