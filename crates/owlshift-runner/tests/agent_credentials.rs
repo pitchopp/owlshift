@@ -188,10 +188,7 @@ fn warm_up_gh(env: &[(OsString, OsString)]) {
             .arg("--version")
             .env_clear()
             .envs(env.iter().map(|(n, v)| (n, v)));
-        let t = std::time::Instant::now();
-        let outcome = run_command(&mut command, None, GH_FIRST_START, OUTPUT_CAP);
-        eprintln!("OWL56-TIMING warm-up {} ms", t.elapsed().as_millis());
-        match outcome {
+        match run_command(&mut command, None, GH_FIRST_START, OUTPUT_CAP) {
             Ok(captured) if captured.success() => Ok(()),
             outcome => Err(format!("{} --version: {outcome:?}", gh.display())),
         }
@@ -217,9 +214,7 @@ fn gh_installed(env: &[(OsString, OsString)]) -> bool {
 #[test]
 fn the_check_finds_every_planted_credential_in_the_host_environment() {
     let host = host();
-    let t = std::time::Instant::now();
     let findings = check_environment(&host.parent, &host.clean, FORGE);
-    eprintln!("OWL56-TIMING check host {} ms", t.elapsed().as_millis());
 
     let Some(CredentialFinding::Variables(names)) = findings.first() else {
         panic!("no credential variable found: {findings:?}");
@@ -263,10 +258,7 @@ fn an_agent_reaches_none_of_them() {
         .without_confinement();
     // Part of the check: gh is asked, and answers with the placeholder.
     gh_installed(agent.vars());
-    let t = std::time::Instant::now();
-    let findings = agent.check(&host.clean, FORGE);
-    eprintln!("OWL56-TIMING check agent {} ms", t.elapsed().as_millis());
-    assert_eq!(findings, []);
+    assert_eq!(agent.check(&host.clean, FORGE), []);
 
     // What a process spawned as an agent actually sees.
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -305,9 +297,7 @@ fn credentials_in_the_repository_configuration_are_reported_redacted() {
     let agent = AgentEnv::new(host.parent.clone(), &[])
         .unwrap()
         .without_confinement();
-    let t = std::time::Instant::now();
     let findings = agent.check(&host.leaky, FORGE);
-    eprintln!("OWL56-TIMING check leaky {} ms", t.elapsed().as_millis());
     let keys: Vec<String> = findings
         .iter()
         .map(|finding| match finding {
