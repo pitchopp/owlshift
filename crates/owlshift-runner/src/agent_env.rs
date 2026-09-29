@@ -98,24 +98,39 @@ const HIDDEN_IN_HOME: &[&str] = &[
 const TOOL_CHAINS: &[&str] = &[".rustup", ".cargo/bin", ".cargo/registry", ".cargo/git"];
 
 impl AgentEnv {
-    /// The agent environment built from `parent`, with the variables named in
-    /// `declared` (the project's, for its gate). It is confined.
+    /// The agent environment built from `parent`, with no declared variable:
+    /// `declared` is checked against an empty allow-list, so only an empty
+    /// list builds. A project's run uses [`AgentEnv::for_project`]. It is
+    /// confined.
     pub fn new(
         parent: impl IntoIterator<Item = (OsString, OsString)>,
         declared: &[&str],
     ) -> Result<Self, AgentEnvError> {
-        agent_environment(parent, declared).map(|vars| Self {
+        Self::for_project(parent, declared, &[])
+    }
+
+    /// The agent environment built from `parent`, with the variables named in
+    /// `declared` (the project's `stack.gate_env`) that `allowed` (the
+    /// operator's personal `allow_gate_env`) lets through; a declared name
+    /// not allowed is refused (OWL-63). It is confined.
+    pub fn for_project(
+        parent: impl IntoIterator<Item = (OsString, OsString)>,
+        declared: &[&str],
+        allowed: &[&str],
+    ) -> Result<Self, AgentEnvError> {
+        agent_environment(parent, declared, allowed).map(|vars| Self {
             vars,
             confined: true,
         })
     }
 
-    /// The agent environment built from the runner's own, confined, with
-    /// Claude Code pointed at the login made for agent runs
+    /// The agent environment built from the runner's own, as
+    /// [`AgentEnv::for_project`] builds it, confined, with Claude Code
+    /// pointed at the login made for agent runs
     /// ([`paths::claude_agent_login_dir`]): the sandbox closes the Keychain,
     /// where the operator's own login lives on macOS.
-    pub fn from_runner(declared: &[&str]) -> Result<Self, AgentEnvError> {
-        let mut env = Self::new(std::env::vars_os(), declared)?;
+    pub fn from_runner(declared: &[&str], allowed: &[&str]) -> Result<Self, AgentEnvError> {
+        let mut env = Self::for_project(std::env::vars_os(), declared, allowed)?;
         if let Some(dir) = paths::claude_agent_login_dir() {
             env.set("CLAUDE_CONFIG_DIR", dir.into_os_string());
         }

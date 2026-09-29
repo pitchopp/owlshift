@@ -24,7 +24,7 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
         "this test spends subscription usage: set OWLSHIFT_LIVE_CLAUDE=1 to run it"
     );
     let workdir = tempfile::tempdir().unwrap();
-    let agent = AgentEnv::from_runner(&[]).unwrap();
+    let agent = AgentEnv::from_runner(&[], &[]).unwrap();
     assert_eq!(agent.check(workdir.path(), &["github.com"]), []);
 
     let request = Request {

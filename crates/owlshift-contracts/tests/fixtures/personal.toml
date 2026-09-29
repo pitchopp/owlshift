@@ -2,6 +2,7 @@
 requires = ">=0.1"
 concurrent_runs = 2
 keep_awake = true
+allow_gate_env = ["JAVA_HOME"]
 
 [identity]
 tracker = "ada@example.com"

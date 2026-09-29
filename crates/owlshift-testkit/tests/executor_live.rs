@@ -50,7 +50,7 @@ fn a_real_role_runs_through_the_executor() {
     let executor = Executor {
         git: Git::with_setup("git", move |command| runner.apply(command)),
         // Your own environment: the agent needs your harness login.
-        agent: AgentEnv::from_runner(&[]).unwrap(),
+        agent: AgentEnv::from_runner(&[], &[]).unwrap(),
         forge_hosts: vec!["github.com".into()],
         timeout: Duration::from_secs(300),
         gate_timeout: Duration::from_secs(300),

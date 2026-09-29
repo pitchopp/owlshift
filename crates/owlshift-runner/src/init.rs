@@ -105,8 +105,10 @@ states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs I
 # build role stops with `blocked`.
 {gate}# Agents start from an almost empty environment. Name here the variables of
 # your environment the gate needs, such as a feature flag; the whole agent
-# run sees them. Credential variables are refused. A path under your home
-# stays unreadable to the sandboxed run unless it is on the PATH.
+# run sees them. Credential variables are refused, and each machine that
+# runs Owlshift passes only the names its operator lists in `allow_gate_env`
+# in the personal configuration. A path under your home stays unreadable to
+# the sandboxed run unless it is on the PATH.
 # gate_env = [\"FEATURE_FLAGS\"]
 
 [pipeline]

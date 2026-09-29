@@ -1,8 +1,10 @@
 //! Scenario files and their runner.
 //!
 //! A scenario is a TOML file with a fixture folder of the same name beside
-//! it: `repo/`, the project seeded as `main` into a local bare remote, and
-//! the prepared result files its replies name. Each `[[step]]` does one thing
+//! it: `repo/`, the project seeded as `main` into a local bare remote, the
+//! prepared result files its replies name, and an optional `personal.toml`,
+//! the operator's personal file, whose `allow_gate_env` the project's
+//! `stack.gate_env` is checked against as when the configuration is loaded. Each `[[step]]` does one thing
 //! (`dispatch = true`, `run = <reply>`, `comment = { author, body }` or
 //! `answer = "answered"`) and may carry an `expect` table, checked right
 //! after it. Time is virtual: step `n` happens `n` minutes after `start`.
@@ -48,7 +50,7 @@ use owlshift_contracts::brief::{
     Author, Brief, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::{Footer, Header, MarkerKind};
-use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
+use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::result::RunResult;
@@ -355,8 +357,23 @@ impl Driver {
             parent.retain(|(n, _)| !n.to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)));
             parent.push((name.into(), value.into()));
         }
-        let agent =
-            AgentEnv::new(parent, &config.stack.gate_env_names()).map_err(|e| e.to_string())?;
+        let personal_path = fixture.join("personal.toml");
+        let personal = match fs::read_to_string(&personal_path) {
+            Ok(text) => Some(PersonalConfig::parse(&text).map_err(|e| e.to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(Err(error.to_string())),
+        }
+        .transpose()
+        .map_err(|e| format!("{}: {e}", personal_path.display()))?;
+        let allowed = personal
+            .as_ref()
+            .map(PersonalConfig::allow_gate_env_names)
+            .unwrap_or_default();
+        config
+            .check_gate_env(&allowed)
+            .map_err(|e| format!("{}: {e}", config_path.display()))?;
+        let agent = AgentEnv::for_project(parent, &config.stack.gate_env_names(), &allowed)
+            .map_err(|e| e.to_string())?;
         let agent = if scenario.confined {
             agent
         } else {
