@@ -14,6 +14,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 use crate::format::ContractError;
+use crate::ids::is_repository_part;
 use crate::{Harness, PlanApproval, Variant};
 
 const PROJECT: &str = "owlshift.toml";
@@ -172,9 +173,12 @@ impl ProjectConfig {
         check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
     }
 
-    /// Checks `stack.gate_env` against the names the operator allows, the
-    /// personal `allow_gate_env`: the rule the agent environment applies
-    /// (`owlshift_core::agent_env::check_declared`, OWL-63).
+    /// Checks `stack.gate_env` against the names the operator allows for
+    /// this project, from the personal file
+    /// ([`PersonalConfig::allow_gate_env_names`]): the rule the agent
+    /// environment applies (`owlshift_core::agent_env::check_declared`,
+    /// OWL-63). The names already passed `check_names` in [`Self::validate`],
+    /// so on a parsed file only a name the operator does not allow fails.
     pub fn check_gate_env(&self, allowed: &[&str]) -> Result<(), ContractError> {
         check_declared(&self.stack.gate_env_names(), allowed).map_err(gate_env_error)
     }
@@ -209,11 +213,49 @@ pub struct PersonalConfig {
     /// pass to its agents by declaring them in `stack.gate_env`, in any
     /// letter case. A project's declaration never widens this list: a name
     /// declared but not listed here is refused. It applies to every project
-    /// run on this machine. A credential variable, a `GIT_` name, a variable
-    /// Owlshift overrides or one that makes the dynamic loader load code
-    /// cannot be listed.
+    /// run on this machine; `repositories` allows a name for one repository
+    /// only. A credential variable, a `GIT_` name, a variable Owlshift
+    /// overrides or one that makes the dynamic loader load code cannot be
+    /// listed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_gate_env: Vec<String>,
+    /// Settings for one repository, keyed `github.com/<owner>/<name>` in any
+    /// letter case. The repository of a project is read from its checkout's
+    /// `origin` remote, which the committed project file cannot set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repositories: BTreeMap<String, RepositorySettings>,
+}
+
+/// The personal settings of one repository.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySettings {
+    /// Names a project of this repository may pass to its agents, on top of
+    /// the machine-wide `allow_gate_env`, under the same rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_gate_env: Vec<String>,
+}
+
+/// The host part of a repository key of [`PersonalConfig::repositories`]:
+/// only GitHub repositories are delivered to so far.
+const GITHUB: &str = "github.com";
+
+/// Checks a key of [`PersonalConfig::repositories`]:
+/// `github.com/<owner>/<name>`.
+fn check_repository_key(key: &str) -> Result<(), String> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        [host, owner, name]
+            if host.eq_ignore_ascii_case(GITHUB)
+                && is_repository_part(owner)
+                && is_repository_part(name) =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "a repository is written {GITHUB}/<owner>/<name>, as its `origin` remote names it"
+        )),
+    }
 }
 
 /// The user's accounts on the tracker and the forge.
@@ -275,15 +317,40 @@ impl PersonalConfig {
         toml::to_string(self).expect("contract types always serialize to TOML")
     }
 
-    /// The names of [`PersonalConfig::allow_gate_env`].
-    pub fn allow_gate_env_names(&self) -> Vec<&str> {
-        self.allow_gate_env.iter().map(String::as_str).collect()
+    /// The names the operator allows a project of `repository` to pass to
+    /// its agents: the machine-wide [`PersonalConfig::allow_gate_env`], then
+    /// those of the [`PersonalConfig::repositories`] entry whose key is
+    /// `repository` (`github.com/<owner>/<name>`, compared in any letter
+    /// case). With no repository known, only the machine-wide names.
+    pub fn allow_gate_env_names(&self, repository: Option<&str>) -> Vec<&str> {
+        let scoped = self
+            .repositories
+            .iter()
+            .filter(|(key, _)| repository.is_some_and(|r| key.eq_ignore_ascii_case(r)))
+            .flat_map(|(_, settings)| &settings.allow_gate_env);
+        self.allow_gate_env
+            .iter()
+            .chain(scoped)
+            .map(String::as_str)
+            .collect()
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
-        check_names(&self.allow_gate_env_names()).map_err(|error| {
+        check_names(&names(&self.allow_gate_env)).map_err(|error| {
             ContractError::invalid(PERSONAL, format!("allow_gate_env: {error}"))
         })?;
+        for (key, settings) in &self.repositories {
+            let quoted = toml::Value::String(key.clone());
+            check_repository_key(key).map_err(|error| {
+                ContractError::invalid(PERSONAL, format!("repositories.{quoted}: {error}"))
+            })?;
+            check_names(&names(&settings.allow_gate_env)).map_err(|error| {
+                ContractError::invalid(
+                    PERSONAL,
+                    format!("repositories.{quoted}.allow_gate_env: {error}"),
+                )
+            })?;
+        }
         for (harness, settings) in self.harnesses.iter() {
             if settings.fallback == Some(harness) {
                 return Err(ContractError::invalid(
@@ -302,6 +369,10 @@ impl PersonalConfig {
         }
         Ok(())
     }
+}
+
+fn names(list: &[String]) -> Vec<&str> {
+    list.iter().map(String::as_str).collect()
 }
 
 /// Reads a configuration file's `requires` leniently, ignoring every other
@@ -469,12 +540,13 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "invalid owlshift.toml: stack.gate_env: DATABASE_URL may not reach an agent on this \
-             machine: the operator allows a name for every project run here by adding it to \
-             `allow_gate_env` in the personal configuration"
+             machine: the operator allows a name in the personal configuration, for every \
+             repository in `allow_gate_env`, or for one in the `allow_gate_env` of its \
+             `[repositories.\"github.com/<owner>/<name>\"]` table"
         );
 
         let personal = PersonalConfig::parse("allow_gate_env = [\"DATABASE_URL\"]\n").unwrap();
-        assert_eq!(personal.allow_gate_env_names(), ["DATABASE_URL"]);
+        assert_eq!(personal.allow_gate_env_names(None), ["DATABASE_URL"]);
         for (names, reason) in [
             (r#"["GH_TOKEN"]"#, "agents never receive credentials"),
             (r#"["A=B"]"#, "declare names only"),
@@ -486,6 +558,56 @@ mod tests {
                 error.starts_with("invalid personal configuration: allow_gate_env: ")
                     && error.contains(reason),
                 "{names}: {error}"
+            );
+        }
+    }
+
+    /// OWL-75: a name allowed for one repository is not allowed for another.
+    #[test]
+    fn a_name_can_be_allowed_for_one_repository() {
+        let personal = PersonalConfig::parse(
+            r#"
+            allow_gate_env = ["JAVA_HOME"]
+            [repositories."github.com/Acme/API"]
+            allow_gate_env = ["DATABASE_URL"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            personal.allow_gate_env_names(Some("github.com/acme/api")),
+            ["JAVA_HOME", "DATABASE_URL"]
+        );
+        assert_eq!(
+            personal.allow_gate_env_names(Some("github.com/acme/web")),
+            ["JAVA_HOME"]
+        );
+        assert_eq!(personal.allow_gate_env_names(None), ["JAVA_HOME"]);
+        assert!(
+            personal
+                .render()
+                .contains("[repositories.\"github.com/Acme/API\"]")
+        );
+
+        for (input, error) in [
+            (
+                "[repositories.\"acme/api\"]",
+                "repositories.\"acme/api\": a repository is written github.com/<owner>/<name>",
+            ),
+            (
+                "[repositories.\"github.com/acme/api/extra\"]",
+                "repositories.\"github.com/acme/api/extra\": a repository is written",
+            ),
+            (
+                // Every entry is checked, not only the current repository's.
+                "[repositories.\"github.com/acme/web\"]\nallow_gate_env = [\"GH_TOKEN\"]",
+                "repositories.\"github.com/acme/web\".allow_gate_env: agents never receive \
+                 credentials",
+            ),
+        ] {
+            let actual = PersonalConfig::parse(input).unwrap_err().to_string();
+            assert!(
+                actual.starts_with(&format!("invalid personal configuration: {error}")),
+                "{input}: {actual}"
             );
         }
     }

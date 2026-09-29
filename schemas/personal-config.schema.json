@@ -5,7 +5,7 @@
   "type": "object",
   "properties": {
     "allow_gate_env": {
-      "description": "Names of variables of this machine's environment that a project may\npass to its agents by declaring them in `stack.gate_env`, in any\nletter case. A project's declaration never widens this list: a name\ndeclared but not listed here is refused. It applies to every project\nrun on this machine. A credential variable, a `GIT_` name, a variable\nOwlshift overrides or one that makes the dynamic loader load code\ncannot be listed.",
+      "description": "Names of variables of this machine's environment that a project may\npass to its agents by declaring them in `stack.gate_env`, in any\nletter case. A project's declaration never widens this list: a name\ndeclared but not listed here is refused. It applies to every project\nrun on this machine; `repositories` allows a name for one repository\nonly. A credential variable, a `GIT_` name, a variable Owlshift\noverrides or one that makes the dynamic loader load code cannot be\nlisted.",
       "type": "array",
       "items": {
         "type": "string"
@@ -35,6 +35,13 @@
         "boolean",
         "null"
       ]
+    },
+    "repositories": {
+      "description": "Settings for one repository, keyed `github.com/<owner>/<name>` in any\nletter case. The repository of a project is read from its checkout's\n`origin` remote, which the committed project file cannot set.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RepositorySettings"
+      }
     },
     "requires": {
       "description": "The Owlshift versions that can read this file: a semantic version\nrequirement such as `>=0.4`.",
@@ -121,6 +128,20 @@
             "string",
             "null"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RepositorySettings": {
+      "description": "The personal settings of one repository.",
+      "type": "object",
+      "properties": {
+        "allow_gate_env": {
+          "description": "Names a project of this repository may pass to its agents, on top of\nthe machine-wide `allow_gate_env`, under the same rules.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false

@@ -962,6 +962,10 @@ mod tests {
                 "carries a credential",
             ),
             ("https://gitlab.com/o/r.git", "not a github.com repository"),
+            (
+                "https://example.invalid/@github.com/o/r.git",
+                "not a github.com repository",
+            ),
             ("/srv/git/r.git", "not a github.com repository"),
         ] {
             let error = check_origin(url).unwrap_err();

@@ -188,9 +188,10 @@ impl fmt::Display for AgentEnvError {
             ),
             Self::NotAllowed(names) => write!(
                 f,
-                "{} may not reach an agent on this machine: the operator allows a name for \
-                 every project run here by adding it to `allow_gate_env` in the personal \
-                 configuration",
+                "{} may not reach an agent on this machine: the operator allows a name in \
+                 the personal configuration, for every repository in `allow_gate_env`, or for \
+                 one in the `allow_gate_env` of its `[repositories.\"github.com/<owner>/<name>\"]` \
+                 table",
                 names.join(", ")
             ),
             Self::ProxyLogin(name) => write!(
@@ -519,8 +520,9 @@ mod tests {
         assert_eq!(
             AgentEnvError::NotAllowed(vec!["DATABASE_URL".into(), "X".into()]).to_string(),
             "DATABASE_URL, X may not reach an agent on this machine: the operator allows a name \
-             for every project run here by adding it to `allow_gate_env` in the personal \
-             configuration"
+             in the personal configuration, for every repository in `allow_gate_env`, or for \
+             one in the `allow_gate_env` of its `[repositories.\"github.com/<owner>/<name>\"]` \
+             table"
         );
         // Allowing a name does not pass it: only declaring it does.
         let agent = agent_environment(parent, &[], &["DATABASE_URL"]).unwrap();

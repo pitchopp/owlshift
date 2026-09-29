@@ -80,6 +80,11 @@ pub fn origin_url(git: &Git, root: &Path) -> Result<String, String> {
     let url = git
         .run(root, &["remote", "get-url", "origin"])
         .map_err(|_| "the repository has no remote `origin` to clone from".to_owned())?;
+    origin_text(url)
+}
+
+/// The URL in what `git remote get-url origin` printed.
+pub fn origin_text(url: Vec<u8>) -> Result<String, String> {
     let url = String::from_utf8(url)
         .map_err(|_| "the URL of `origin` is not UTF-8 text".to_owned())?
         .trim()
