@@ -7,7 +7,8 @@
 //! agents cannot be confined, and [`AgentEnv::check`] probes, from inside the
 //! sandbox, what the agent could still reach in the worktree; a finding stops
 //! the run before it starts. The harness command, and each gate command, is
-//! spawned as [`AgentEnv::confine`] returns it: wrapped in the sandbox, with
+//! spawned as [`AgentEnv::confine`] (or, for a shell line,
+//! [`AgentEnv::confine_shell`]) returns it: wrapped in the sandbox, with
 //! exactly the agent's variables. After the run, [`mcp_findings`] reads the
 //! MCP servers the harness reported loading.
 //!
@@ -283,15 +284,56 @@ impl AgentEnv {
     /// Without confinement (the test bench), `inner` itself comes back, with
     /// the agent's variables.
     pub fn confine(&self, inner: Command, run: &RunPaths) -> Result<Command, SandboxError> {
-        let mut command = if self.confined {
-            sandbox::wrap(&self.policy(run), inner.get_program(), inner.get_args())?
+        let command = self.sandboxed(inner, run)?;
+        Ok(self.environment(command, run))
+    }
+
+    /// [`AgentEnv::confine`] for a command line run through the platform's
+    /// shell: `sh -c` on Unix, and on Windows `cmd.exe` (`COMSPEC`) with
+    /// `/d /s /c "line"`, given verbatim, since its quoting rules are not
+    /// those of other programs. `/s` makes it strip the outer quotes and keep
+    /// everything between them. `confine` would quote that line again: it
+    /// rebuilds the command from `get_args`, which hands back a raw argument
+    /// as a plain one.
+    pub fn confine_shell(&self, line: &str, run: &RunPaths) -> Result<Command, SandboxError> {
+        #[cfg(unix)]
+        let command = {
+            let mut inner = Command::new("sh");
+            inner.arg("-c").arg(line);
+            self.sandboxed(inner, run)?
+        };
+        #[cfg(windows)]
+        let command = {
+            use std::os::windows::process::CommandExt;
+            let shell = self.var("COMSPEC").unwrap_or(OsStr::new("cmd.exe"));
+            let tail = format!("/d /s /c \"{line}\"");
+            if self.confined {
+                sandbox::wrap_line(&self.policy(run), shell, OsStr::new(&tail))?
+            } else {
+                let mut command = Command::new(shell);
+                command.raw_arg(tail).current_dir(&run.workdir);
+                command
+            }
+        };
+        Ok(self.environment(command, run))
+    }
+
+    /// `inner` wrapped in the sandbox of `run`, or, without confinement,
+    /// `inner` itself in the run's working directory.
+    fn sandboxed(&self, inner: Command, run: &RunPaths) -> Result<Command, SandboxError> {
+        if self.confined {
+            sandbox::wrap(&self.policy(run), inner.get_program(), inner.get_args())
         } else {
             let mut inner = inner;
             inner.current_dir(&run.workdir);
-            inner
-        };
+            Ok(inner)
+        }
+    }
+
+    /// Gives an agent command exactly the agent's variables, and the run's
+    /// own temporary folder, never the one inherited.
+    fn environment(&self, mut command: Command, run: &RunPaths) -> Command {
         self.apply(&mut command);
-        // The temporary folder is the run's own, never the one inherited.
         match &run.temp {
             Some(dir) => {
                 for name in TEMP_VARIABLES {
@@ -305,7 +347,7 @@ impl AgentEnv {
             }
             None => {}
         }
-        Ok(command)
+        command
     }
 
     /// [`check_environment`] with these variables, each probe run as the
@@ -752,8 +794,9 @@ mod tests {
         assert_eq!(policy.workdir, Path::new("/srv/wt"));
     }
 
-    /// The shipped binary never turns confinement off: the switch is
-    /// compiled for the test bench alone, and the CLI's code never names it.
+    /// The shipped binary never turns confinement off: the switches, this
+    /// one and the Windows launcher a test sets (OWL-71), are compiled for
+    /// tests alone, and the CLI's code never names them.
     #[test]
     fn the_cli_never_turns_confinement_off() {
         let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../owlshift-cli/src");
@@ -765,11 +808,9 @@ mod tests {
                     stack.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    assert!(
-                        !text.contains("without_confinement"),
-                        "{} turns confinement off",
-                        path.display()
-                    );
+                    for switch in ["without_confinement", "use_built_launcher"] {
+                        assert!(!text.contains(switch), "{} names {switch}", path.display());
+                    }
                 }
             }
         }

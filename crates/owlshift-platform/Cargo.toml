@@ -32,3 +32,8 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# Test only: `sandbox::use_built_launcher`, which makes the Windows sandbox
+# start the launcher Cargo built (OWL-71). No shipped crate enables it.
+testkit = []

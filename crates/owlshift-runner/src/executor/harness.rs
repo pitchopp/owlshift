@@ -513,4 +513,89 @@ mod tests {
              in the working directory.\n"
         );
     }
+
+    /// What comes before the arguments the launched helper prints.
+    #[cfg(windows)]
+    const SENTINEL: &str = "launched-arguments";
+
+    /// Arguments a quoting mistake would change. The helper reads them after
+    /// [`SENTINEL`]; libtest takes them for more test names, which match no
+    /// test, since none starts with `-`.
+    #[cfg(windows)]
+    const ARGUMENTS: [&str; 6] = ["", "a b", "a\"b", r#"a\"b"#, r"c:\x\", "a\tb"];
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper, run by the test below"]
+    fn helper_echo() {
+        if std::env::args().any(|arg| arg == "--exact") {
+            use std::io::Write as _;
+            let mut out = String::new();
+            let args = std::env::args().skip_while(|arg| arg != SENTINEL).skip(1);
+            for (index, arg) in args.enumerate() {
+                out.push_str(&format!("launched-arg{index}={arg:?}\n"));
+            }
+            let mut input = String::new();
+            io::stdin().read_to_string(&mut input).unwrap();
+            out.push_str(&format!("launched-input={input:?}\n"));
+            let token = std::env::var("GH_TOKEN").unwrap_or_default();
+            out.push_str(&format!("launched-token={token:?}\n"));
+            io::stdout().write_all(out.as_bytes()).unwrap();
+            io::stdout().flush().unwrap();
+            std::process::exit(3);
+        }
+    }
+
+    /// OWL-71: on the harness's path, `AgentEnv::confine`, with a launcher
+    /// set, the command starts through it; the program gets its arguments,
+    /// its input and the agent's variables, and its exit code comes back.
+    /// libtest prints its own lines on the same stream, hence `contains`.
+    #[cfg(windows)]
+    #[test]
+    fn a_confined_harness_command_starts_through_the_launcher() {
+        use crate::agent_env::RunPaths;
+        use owlshift_platform::process::{OUTPUT_CAP, run_command};
+
+        let _launcher = owlshift_platform::sandbox::use_built_launcher();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = AgentEnv::new(std::env::vars_os(), &[]).unwrap();
+        let paths = RunPaths {
+            workdir: dir.path().to_owned(),
+            ..RunPaths::default()
+        };
+        let mut inner = Command::new(std::env::current_exe().unwrap());
+        inner
+            .args([
+                "--exact",
+                "executor::harness::tests::helper_echo",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+                SENTINEL,
+            ])
+            .args(ARGUMENTS);
+        let mut command = agent.confine(inner, &paths).unwrap();
+        let program = Path::new(command.get_program()).file_name().unwrap();
+        assert!(
+            program.eq_ignore_ascii_case("owlshift-launch.exe"),
+            "{program:?}"
+        );
+
+        let input = Some(&b"the prompt"[..]);
+        let captured =
+            run_command(&mut command, input, Duration::from_secs(60), OUTPUT_CAP).unwrap();
+        let out = String::from_utf8_lossy(&captured.stdout);
+        assert_eq!(captured.code, Some(3), "{out}");
+        for (index, arg) in ARGUMENTS.iter().enumerate() {
+            assert!(
+                out.contains(&format!("launched-arg{index}={arg:?}\n")),
+                "{out}"
+            );
+        }
+        assert!(out.contains("launched-input=\"the prompt\"\n"), "{out}");
+        assert!(
+            out.contains("launched-token=\"owlshift-agent-has-no-credential\"\n"),
+            "{out}"
+        );
+    }
 }
