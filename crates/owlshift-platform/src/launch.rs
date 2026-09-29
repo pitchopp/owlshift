@@ -1,10 +1,11 @@
 //! `owlshift-launch`, the program that starts an agent command on native
 //! Windows (OWL-71). It is test-only: native confinement is set aside (build
-//! plan, 2026-09-29) and the launcher is slated for removal (OWL-89). The runner starts it as the root of the run's process
-//! tree, inside its Job Object, and it creates the program itself with
-//! `CreateProcessW`. A process in a job starts its children in that job
-//! (`tree.rs` allows no breakaway), so stopping the tree stops the program
-//! and everything it started.
+//! plan, 2026-09-29) and the launcher is slated for removal (OWL-89). The
+//! runner starts it as the root of the run's process tree, inside its Job
+//! Object, and it creates the program itself with `CreateProcessW`. A
+//! process in a job starts its children in that job (`tree.rs` allows no
+//! breakaway), so stopping the tree stops the program and everything it
+//! started.
 //!
 //! It is a program of its own because std's `Command` on stable Rust cannot
 //! pass a proc-thread attribute (checked on rustc 1.98.1 on 2026-09-29, build
