@@ -200,11 +200,16 @@ fn a_runs_own_work_passes_and_every_breach_is_found() {
 /// What a run leaves behind its worktree's `.git`, or in the shared git
 /// files, is found on the file system before the runner's git runs: no git
 /// command runs after the breach, so neither a git directory of the run's
-/// own nor a clean filter it configured, which `git status` of the main
+/// own, nor another repository the main checkout's `commondir` points at,
+/// nor a clean filter it configured, which `git status` of the main
 /// checkout would run on a changed file, ever runs.
 #[test]
 fn a_redirected_link_or_a_planted_filter_stops_the_check_before_any_git() {
-    for case in ["a redirected link", "a planted filter"] {
+    for case in [
+        "a redirected link",
+        "a redirected checkout",
+        "a planted filter",
+    ] {
         let f = Fixture::new();
         let ran: Arc<Mutex<Option<Vec<PathBuf>>>> = Arc::new(Mutex::new(None));
         let runner = f.env.clone();
@@ -227,6 +232,17 @@ fn a_redirected_link_or_a_planted_filter_stops_the_check_before_any_git() {
                 )
                 .unwrap();
             }
+            "a redirected checkout" => {
+                // Git in the main checkout would read that repository's
+                // configuration, and whatever filter it names (OWL-50).
+                let evil = f._tmp.path().join("evil");
+                fs::create_dir_all(&evil).unwrap();
+                fs::write(
+                    f.main.join(".git/commondir"),
+                    format!("{}\n", evil.display()),
+                )
+                .unwrap();
+            }
             _ => {
                 let fired = fired.to_string_lossy().replace('\\', "/");
                 f.main_git(&[
@@ -244,6 +260,9 @@ fn a_redirected_link_or_a_planted_filter_stops_the_check_before_any_git() {
         let violations = before.check(&git, &f.main, &f.worktree, BRANCH);
         let expected = match case {
             "a redirected link" => matches!(violations.as_slice(), [Violation::WorktreeLink(_)]),
+            "a redirected checkout" => {
+                violations == [Violation::SharedGitFiles(vec!["commondir".into()])]
+            }
             _ => {
                 violations
                     == [Violation::SharedGitFiles(vec![
@@ -261,6 +280,57 @@ fn a_redirected_link_or_a_planted_filter_stops_the_check_before_any_git() {
             assert!(fired.exists(), "the planted filter never runs");
         }
     }
+}
+
+/// A repository a run nests in the main checkout, with a clean filter and a
+/// file-system monitor in its own configuration, which no shared git file
+/// names, and a gitlink staged for it: the check finds the gitlink without
+/// starting git in the nested repository, so neither helper runs. Plain
+/// `git status` would look into it and run the filter (OWL-50).
+#[test]
+fn a_planted_submodule_starts_no_git_in_it() {
+    let f = Fixture::new();
+    let fired = f._tmp.path().join("filter-fired");
+    let monitored = f._tmp.path().join("monitor-fired");
+    let sub = f.main.join("sub");
+    let violations = f.around(|f| {
+        f.main_git(&["init", "--quiet", "sub"]);
+        f.commit_file(&sub, "file.txt", "one\n");
+        let sentinel = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        f.env
+            .run(
+                &sub,
+                &[
+                    "config",
+                    "filter.owl.clean",
+                    &format!("sh -c 'echo ran > \"{}\"; cat'", sentinel(&fired)),
+                ],
+            )
+            .unwrap();
+        f.env
+            .run(
+                &sub,
+                &[
+                    "config",
+                    "core.fsmonitor",
+                    &format!("sh -c 'echo ran > \"{}\"'", sentinel(&monitored)),
+                ],
+            )
+            .unwrap();
+        fs::write(sub.join(".gitattributes"), "* filter=owl\n").unwrap();
+        // A tracked file whose status the nested git must read again,
+        // through the filter.
+        fs::write(sub.join("file.txt"), "two\n").unwrap();
+        let gitlink = format!("160000,{},sub", f.commit(&sub, "HEAD"));
+        f.main_git(&["update-index", "--add", "--cacheinfo", &gitlink]);
+    });
+    assert_eq!(violations, [files(&["sub"])]);
+    assert!(!fired.exists(), "the nested repository's filter ran");
+    assert!(!monitored.exists(), "the nested repository's monitor ran");
+    // The control: plain `git status` looks into the nested repository and
+    // runs its filter.
+    f.main_git(&["status", "--porcelain"]);
+    assert!(fired.exists(), "the nested repository's filter never runs");
 }
 
 /// A main checkout whose status is larger than the probes' 64 KiB output cap

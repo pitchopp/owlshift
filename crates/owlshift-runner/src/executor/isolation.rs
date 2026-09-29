@@ -15,7 +15,8 @@
 //! - **Shared git state untouched**: the repository's `config`,
 //!   `config.worktree`, `hooks/` and `info/`, which every worktree shares,
 //!   so a planted hook or `core.hooksPath` cannot run code in the user's
-//!   checkout later.
+//!   checkout later, and no `commondir` there, which would point git in the
+//!   main checkout at another repository's configuration.
 //! - **Diff inside the worktree**: no ref of the repository was created,
 //!   moved or deleted but the run's branch (tags, other branches,
 //!   `refs/stash`); remote-tracking refs are left out, a fetch being
@@ -47,16 +48,20 @@
 //!
 //! A violation there ends the check: no git runs, and the other checks are
 //! not made. The runner's git runs no hook and no file-system monitor
-//! either way (`executor::Git`).
+//! either way (`executor::Git`), and the main checkout's status starts no
+//! git in a submodule (`--ignore-submodules=dirty`; it still reads the
+//! submodule's HEAD itself), so no git runs with a configuration nothing
+//! checked (OWL-50).
 //!
 //! A check that cannot run counts as a violation. Nothing is written: git
 //! runs with `--no-optional-locks`, and `hash-object` without `-w`.
 //!
 //! It assumes nobody else changes the main checkout during the run: a
 //! person editing there looks like a breach. Known limits: changes outside
-//! the repository, a file inside an ignored directory, and an index flag
-//! (`assume-unchanged`, `skip-worktree`) hiding an edit go unseen; confining
-//! the agent is the operating system's job.
+//! the repository, a file inside an ignored directory, an edit inside a
+//! submodule's work tree (a gitlink added or moved is still found), and an
+//! index flag (`assume-unchanged`, `skip-worktree`) hiding an edit go
+//! unseen; confining the agent is the operating system's job.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -462,6 +467,12 @@ impl MainState {
         };
         let branch_now = symbolic_head(git, main)?;
 
+        // `--ignore-submodules=dirty`: git starts no git of its own in a
+        // submodule, whose configuration (a clean filter) no shared git file
+        // holds and would run with the runner's environment, yet a
+        // gitlink added or moved is still listed. Not `all`, as the gate's
+        // status has (`gate::uncommitted`): it hides a planted gitlink. A
+        // `status` option, which no `-c` of `Git`'s hardening can set (OWL-50).
         let status = git.run(
             main,
             &[
@@ -471,6 +482,7 @@ impl MainState {
                 "-z",
                 "--untracked-files=all",
                 "--ignored=matching",
+                "--ignore-submodules=dirty",
             ],
         )?;
         let records = status_records(&status).map_err(SnapshotError)?;
@@ -734,10 +746,12 @@ fn path_of(bytes: &[u8]) -> PathBuf {
 }
 
 /// The shared git files every worktree reads: `config`, `config.worktree`,
-/// `hooks/` and `info/` under the common directory.
+/// `hooks/` and `info/` under the common directory, and `commondir`, which
+/// git follows from the main checkout's git directory to read another's
+/// configuration (OWL-50).
 fn read_shared(common: &Path) -> Result<BTreeMap<String, Content>, SnapshotError> {
     let mut shared = BTreeMap::new();
-    for name in ["config", "config.worktree", "hooks", "info"] {
+    for name in ["commondir", "config", "config.worktree", "hooks", "info"] {
         shared_files(common, name, &mut shared)
             .map_err(|e| SnapshotError(format!("{}: {e}", common.join(name).display())))?;
     }
