@@ -25,6 +25,9 @@ struct Case {
     /// Whether it has an assignee. Who it is differs between a live run and
     /// its pseudonymized recording, so the suite checks presence only.
     assigned: bool,
+    /// Whether its assignee's account created it, by the account's
+    /// identifier: what makes the description the decider's.
+    created_by_assignee: bool,
     labels: &'static [&'static str],
     /// A ticket that does not exist.
     missing: TicketId,
@@ -61,6 +64,15 @@ fn check(tracker: &dyn Tracker, case: &Case) {
         ticket.assignee
     );
     assert_eq!(ticket.labels, case.labels);
+    let by_assignee = matches!(
+        (&ticket.author, &ticket.assignee),
+        (Author::Account(author), Some(assignee)) if author.id == assignee.id
+    );
+    assert_eq!(
+        by_assignee, case.created_by_assignee,
+        "{:?} for {:?}",
+        ticket.author, ticket.assignee
+    );
 
     let missing = tracker.ticket(&case.missing).unwrap_err();
     assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
@@ -130,6 +142,7 @@ fn the_markdown_tracker_conforms() {
         description_start: "Say hello",
         priority: Priority::Medium,
         assigned: true,
+        created_by_assignee: false,
         labels: &["Feature", "Docs"],
         missing: id("DEMO-404"),
         body: BODY,
@@ -153,6 +166,7 @@ fn linear_case() -> Case {
         description_start: "**Why.**",
         priority: Priority::Medium,
         assigned: true,
+        created_by_assignee: true,
         labels: &["Feature", "Adapters"],
         missing: id("OWL-99999"),
         body: BODY,

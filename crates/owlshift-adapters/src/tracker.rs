@@ -36,7 +36,7 @@ pub trait Tracker {
 /// A row of the tracker capability table in architecture section 6.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Capability {
-    /// Read a ticket: title, description, priority, assignee, labels.
+    /// Read a ticket: title, description, priority, assignee, labels, author.
     ReadTicket,
     /// List the admitted tickets.
     ListAdmitted,
@@ -100,6 +100,9 @@ pub struct Ticket {
     pub priority: Priority,
     pub assignee: Option<Person>,
     pub labels: Vec<String>,
+    /// Who created the ticket. Later edits of the description by someone else
+    /// do not change it: the tracker names the creator, not every editor.
+    pub author: Author,
 }
 
 /// A tracker account.
@@ -111,7 +114,7 @@ pub struct Person {
     pub name: String,
 }
 
-/// Who wrote a comment.
+/// Who wrote a ticket or a comment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Author {
     /// A tracker account; only an account can be a ticket's decider.
@@ -131,6 +134,15 @@ pub struct Comment {
     /// When its author last edited it; `None` if never edited.
     pub edited_at: Option<Timestamp>,
     pub body: String,
+}
+
+impl Author {
+    /// The author the tracker could not name.
+    pub fn unknown() -> Self {
+        Self::Other {
+            name: "unknown".to_owned(),
+        }
+    }
 }
 
 impl Comment {

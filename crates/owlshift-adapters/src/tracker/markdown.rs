@@ -235,7 +235,7 @@ impl MarkdownTracker {
 /// serve the test bench, which sets comment authors and times itself; the
 /// runner posts as [`MarkdownTracker::AGENT`] at the current time.
 ///
-/// The inherent types carry more than the shared ones (the author, the stage,
+/// The inherent types carry more than the shared ones (the stage,
 /// blocked-by). They converge when the trait carries the visible stage (P2)
 /// and blocked-by relations; until then the conversion lives only here.
 impl shared::Tracker for MarkdownTracker {
@@ -256,6 +256,7 @@ impl shared::Tracker for MarkdownTracker {
                 name,
             }),
             labels: ticket.labels,
+            author: account(ticket.author),
         })
     }
 
@@ -298,14 +299,20 @@ impl MarkdownTracker {
 fn shared_comment(comment: Comment) -> shared::Comment {
     shared::Comment {
         id: format!("{}-{}", comment.at.strftime(TIME_FORMAT), comment.author),
-        author: shared::Author::Account(shared::Person {
-            id: comment.author.clone(),
-            name: comment.author,
-        }),
+        author: account(comment.author),
         created_at: comment.at,
         edited_at: None,
         body: comment.body,
     }
+}
+
+/// A name in a ticket folder is an account: the file format has no bots, and
+/// the name is both the account's identifier and what it shows.
+fn account(name: String) -> shared::Author {
+    shared::Author::Account(shared::Person {
+        id: name.clone(),
+        name,
+    })
 }
 
 fn other(error: TrackerError) -> shared::Error {

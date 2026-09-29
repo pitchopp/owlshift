@@ -1,9 +1,9 @@
 {
-  "recorded": "2026-09-28 on the Owlshift workspace, recorded live",
+  "recorded": "2026-09-29 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
   "exchanges": [
     {
       "request": {
-        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
+        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
         "variables": {
           "id": "OWL-13"
         }
@@ -16,7 +16,13 @@
               "displayName": "person-1",
               "id": "00000000-0000-4000-8000-000000000001"
             },
+            "botActor": null,
+            "creator": {
+              "displayName": "person-1",
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
             "description": "**Why.** P1 works real tickets from Owlshift's own Linear workspace.\n\n**Scope:**\n\n* Read a ticket: title, description, priority, assignee, labels, comments with author and last-edit time.\n* Post a comment.\n* Declare the adapter's capabilities ([architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 6).\n* The API key comes from the system keychain.\n\n**Acceptance.** Recorded HTTP fixtures, plus a first tracker conformance suite the adapter passes.",
+            "externalUserCreator": null,
             "identifier": "OWL-13",
             "labels": {
               "nodes": [
@@ -39,7 +45,7 @@
     },
     {
       "request": {
-        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
+        "query": "query Ticket($id: String!) { issue(id: $id) { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }",
         "variables": {
           "id": "OWL-99999"
         }
@@ -84,9 +90,34 @@
         "data": {
           "issue": {
             "comments": {
-              "nodes": [],
+              "nodes": [
+                {
+                  "body": "Pull request: https://github.com/pitchopp/owlshift/pull/16",
+                  "botActor": null,
+                  "createdAt": "2026-09-28T13:30:44.787Z",
+                  "editedAt": null,
+                  "externalUser": null,
+                  "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
+                  "user": {
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  }
+                },
+                {
+                  "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
+                  "botActor": null,
+                  "createdAt": "2026-09-28T13:15:04.851Z",
+                  "editedAt": null,
+                  "externalUser": null,
+                  "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
+                  "user": {
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  }
+                }
+              ],
               "pageInfo": {
-                "endCursor": null,
+                "endCursor": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                 "hasNextPage": false
               }
             }
@@ -178,10 +209,10 @@
             "comment": {
               "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
               "botActor": null,
-              "createdAt": "2026-09-28T13:15:04.851Z",
+              "createdAt": "2026-09-29T11:28:54.335Z",
               "editedAt": null,
               "externalUser": null,
-              "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
+              "id": "00000000-0000-4000-8000-00000000c001",
               "user": {
                 "displayName": "person-1",
                 "id": "00000000-0000-4000-8000-000000000001"
@@ -190,7 +221,8 @@
             "success": true
           }
         }
-      }
+      },
+      "synthesized": "not posted: shaped like the recorded comments"
     },
     {
       "request": {
@@ -207,6 +239,30 @@
           "issue": {
             "comments": {
               "nodes": [
+                {
+                  "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
+                  "botActor": null,
+                  "createdAt": "2026-09-29T11:28:54.335Z",
+                  "editedAt": null,
+                  "externalUser": null,
+                  "id": "00000000-0000-4000-8000-00000000c001",
+                  "user": {
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  }
+                },
+                {
+                  "body": "Pull request: https://github.com/pitchopp/owlshift/pull/16",
+                  "botActor": null,
+                  "createdAt": "2026-09-28T13:30:44.787Z",
+                  "editedAt": null,
+                  "externalUser": null,
+                  "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
+                  "user": {
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  }
+                },
                 {
                   "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
                   "botActor": null,
@@ -227,7 +283,8 @@
             }
           }
         }
-      }
+      },
+      "synthesized": "recorded, plus the made-up comment"
     }
   ]
 }

@@ -159,7 +159,7 @@ The Markdown tracker is not a toy: it is the core's test double, the zero-accoun
 
 | Capability | Required | Fallback when missing |
 | --- | --- | --- |
-| Read a ticket: title, description, priority, assignee, labels | yes | none |
+| Read a ticket: title, description, priority, assignee, labels, author | yes | none |
 | List admitted tickets | yes | none |
 | Read and write comments with author and last-edit time | yes | none |
 | Show the visible stage (ready, in progress, needs input, in review) | yes | `agent:*` labels when states are fixed (GitHub Issues is open/closed only) |
