@@ -35,21 +35,27 @@ pub fn login_status_args(harness: Harness) -> &'static [&'static str] {
     }
 }
 
-/// How to install a missing CLI.
-pub fn install_hint(harness: Harness) -> &'static str {
+/// The page that tells how to install a missing CLI.
+pub fn install_page(harness: Harness) -> &'static str {
     match harness {
-        Harness::Claude => "install Claude Code: https://code.claude.com/docs/en/setup",
-        Harness::Codex => {
-            "install Codex: npm install -g @openai/codex (see https://developers.openai.com/codex/cli)"
-        }
+        Harness::Claude => "https://code.claude.com/docs/en/setup",
+        Harness::Codex => "https://developers.openai.com/codex/cli",
     }
 }
 
-/// How to log a CLI in.
-pub fn login_hint(harness: Harness) -> &'static str {
+/// The one command that installs a missing CLI, when there is one.
+pub fn install_command(harness: Harness) -> Option<&'static str> {
     match harness {
-        Harness::Claude => "run `claude auth login`",
-        Harness::Codex => "run `codex login`",
+        Harness::Claude => None,
+        Harness::Codex => Some("npm install -g @openai/codex"),
+    }
+}
+
+/// The command that logs a CLI in.
+pub fn login_command(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Claude => "claude auth login",
+        Harness::Codex => "codex login",
     }
 }
 

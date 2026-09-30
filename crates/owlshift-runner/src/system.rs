@@ -24,6 +24,10 @@ pub trait System {
     fn locate(&self, program: &str) -> Option<PathBuf>;
     /// Runs a program with no input, within [`PROBE_TIMEOUT`].
     fn run(&self, program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<Captured, RunError>;
+    /// The user's home folder, which reports write `~` (OWL-99).
+    fn home(&self) -> Option<PathBuf> {
+        owlshift_platform::paths::home_dir()
+    }
     /// Whether agent runs can be confined here (OWL-41).
     fn sandbox(&self) -> Result<(), SandboxError> {
         owlshift_platform::sandbox::available()
@@ -210,6 +214,10 @@ pub(crate) mod fake {
                 Some(Answer::TimedOut) => Err(RunError::TimedOut),
                 None => panic!("unscripted command: {command}"),
             }
+        }
+
+        fn home(&self) -> Option<PathBuf> {
+            Some(PathBuf::from("/home/ada"))
         }
 
         fn sandbox(&self) -> Result<(), SandboxError> {

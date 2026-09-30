@@ -166,6 +166,81 @@ fn personal_config_file_is_read_from_the_override_directory() {
     assert!(!personal_line.contains("not found at"), "{shown}");
 }
 
+/// `owlshift doctor` with only a fake `git` and the system folders on the
+/// `PATH`, so no `claude` or `codex` of the host is found and the agent
+/// login, which needs `claude`, is not asked of the keychain.
+#[cfg(unix)]
+fn doctor(args: &[&str]) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = tempfile::tempdir().unwrap();
+    let git = bin.path().join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\n\
+         if [ \"$1\" = --version ]; then echo 'git version 2.54.0'; exit 0; fi\n\
+         echo 'fatal: not a git repository' >&2\n\
+         exit 128\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut all = vec!["doctor"];
+    all.extend_from_slice(args);
+    command(config_dir.path(), config_dir.path(), &all)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env_remove("NO_COLOR")
+        .output()
+        .unwrap()
+}
+
+/// OWL-99: redirected, the report has no colour, even with `NO_COLOR`
+/// unset; it is grouped in sections, and closes on what to fix. `claude`
+/// is missing, so the exit status is 1.
+#[cfg(unix)]
+#[test]
+fn doctor_redirected_is_plain_text_by_section() {
+    let output = doctor(&[]);
+    let shown = stdout(&output);
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(!shown.contains('\x1b'), "{shown}");
+    for heading in ["\nTools\n", "\nAgent isolation\n", "\nProject\n"] {
+        assert!(shown.contains(heading), "{shown}");
+    }
+    assert!(shown.contains("  ✓ git "), "{shown}");
+    assert!(shown.contains("  ✗ claude "), "{shown}");
+    assert!(shown.contains("to fix before `owlshift do`"), "{shown}");
+    assert!(shown.contains("owlshift doctor    (to check)"), "{shown}");
+}
+
+/// OWL-99: `--json` prints the same report as JSON, and keeps the exit
+/// status.
+#[cfg(unix)]
+#[test]
+fn doctor_json_is_the_same_report() {
+    let output = doctor(&["--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ready"], false);
+    assert!(report["problems"].as_u64().unwrap() >= 1);
+    assert_eq!(report["next"], serde_json::Value::Null);
+    let checks = report["checks"].as_array().unwrap();
+    let claude = checks
+        .iter()
+        .find(|check| check["subject"] == "claude")
+        .unwrap();
+    assert_eq!(claude["status"], "fail");
+    assert_eq!(claude["section"], "tools");
+    assert_eq!(claude["detail"], "not found on the PATH");
+    assert!(claude["why"].is_string());
+    assert!(claude["fix"][0]["do"].is_string());
+    for check in checks {
+        for key in ["status", "section", "subject", "detail", "why", "fix"] {
+            assert!(check.get(key).is_some(), "{key} missing: {check}");
+        }
+    }
+}
+
 /// The acceptance criterion for OWL-43: Ctrl-C on `doctor` while a probe
 /// hangs stops the probe and the process it started, although the probe runs
 /// in a process group of its own, out of the terminal's reach; and the CLI
@@ -394,7 +469,7 @@ fn doctor_reports_a_sentinel_killed_while_it_runs() {
     assert_eq!(status.signal(), None, "{status}");
     let report = fs::read_to_string(&hung.report).unwrap();
     let line = sentinel_line(&report);
-    assert_eq!(line.split_whitespace().next(), Some("warn"), "{report}");
+    assert_eq!(line.split_whitespace().next(), Some("!"), "{report}");
     assert!(line.contains("ended (signal: 9"), "{report}");
 }
 
@@ -418,7 +493,7 @@ fn doctor_reports_a_sentinel_stopped_while_it_runs() {
     assert_eq!(status.signal(), None, "{status}");
     let report = fs::read_to_string(&hung.report).unwrap();
     let line = sentinel_line(&report);
-    assert_eq!(line.split_whitespace().next(), Some("warn"), "{report}");
+    assert_eq!(line.split_whitespace().next(), Some("!"), "{report}");
     assert!(
         line.contains(&format!("stopped (pid {sentinel})")),
         "{report}"

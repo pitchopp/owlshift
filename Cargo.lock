@@ -1395,6 +1395,7 @@ dependencies = [
  "owlshift-platform",
  "owlshift-runner",
  "rpassword",
+ "serde_json",
  "tempfile",
  "windows-sys 0.61.2",
 ]

@@ -7,3 +7,4 @@ pub mod keychain;
 pub mod paths;
 pub mod process;
 pub mod sandbox;
+pub mod terminal;

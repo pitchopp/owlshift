@@ -41,6 +41,11 @@ pub fn data_dir() -> Option<PathBuf> {
     )
 }
 
+/// The user's home directory, `None` when the platform reports none.
+pub fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
 /// `override_dir`: `OWLSHIFT_CONFIG_DIR` as read from the environment.
 /// Unset, empty or relative means "no override". `config_dir`: the
 /// platform's parent configuration directory, as `dirs::config_dir()`

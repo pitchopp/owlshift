@@ -22,6 +22,8 @@ clap.workspace = true
 rpassword.workspace = true
 
 [dev-dependencies]
+# Reads `owlshift doctor --json` (OWL-99).
+serde_json.workspace = true
 tempfile.workspace = true
 
 # The Windows Ctrl-C test sends a console Ctrl-C (OWL-47).
