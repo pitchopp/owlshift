@@ -141,8 +141,8 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
     finish(system, outcome, &mut io::stdout(), &mut io::stderr())
 }
 
-/// The end of a run: the warning of a sentinel that ended during it, then
-/// its outcome.
+/// The end of a run: the warning of a sentinel that ended during it, or is
+/// stopped at its end, then its outcome.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn finish(
     system: &dyn System,
@@ -152,14 +152,29 @@ fn finish(
 ) -> ExitCode {
     // OWL-88: a sentinel that ended during the run left it unprotected, and
     // is never restarted; one that never started was warned of in `main`.
+    // OWL-91: one stopped protects nothing while it is.
     #[cfg(unix)]
-    if let owlshift_runner::system::SentinelStatus::Ended(how) = system.sentinel() {
-        let _ = writeln!(
-            stderr,
-            "owlshift: warning: its sentinel ended during this run ({}): a hard kill of Owlshift \
-             would have left the processes it started running",
-            printable(&how)
-        );
+    {
+        use owlshift_runner::system::SentinelStatus;
+        match system.sentinel() {
+            SentinelStatus::Running { .. } | SentinelStatus::NotRunning => {}
+            SentinelStatus::Stopped { .. } => {
+                let _ = writeln!(
+                    stderr,
+                    "owlshift: warning: its sentinel is stopped at the end of this run: a hard \
+                     kill of Owlshift while it was stopped would have left the processes it \
+                     started running"
+                );
+            }
+            SentinelStatus::Ended(how) => {
+                let _ = writeln!(
+                    stderr,
+                    "owlshift: warning: its sentinel ended during this run ({}): a hard kill of \
+                     Owlshift would have left the processes it started running",
+                    printable(&how)
+                );
+            }
+        }
     }
     match outcome {
         Ok(delivered) => {
@@ -226,6 +241,18 @@ mod tests {
 
         let (_, _, stderr) = finish_refused(SentinelStatus::Ended("\u{1b}[2J".to_owned()));
         assert!(stderr.contains("(\\u{1b}[2J)"), "{stderr}");
+    }
+
+    #[test]
+    fn a_sentinel_stopped_at_the_end_of_the_run_is_warned_of() {
+        let (code, stdout, stderr) = finish_refused(SentinelStatus::Stopped { pid: 4242 });
+        assert_eq!(
+            stderr,
+            "owlshift: warning: its sentinel is stopped at the end of this run: a hard kill of \
+             Owlshift while it was stopped would have left the processes it started running\n"
+        );
+        assert_eq!(stdout, "\nNot run: no ticket\n");
+        assert_eq!(code, ExitCode::FAILURE);
     }
 
     #[test]

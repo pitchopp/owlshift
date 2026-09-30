@@ -33,7 +33,7 @@ pub trait System {
         path.is_file()
     }
     /// Whether the sentinel still protects the live process trees from a
-    /// hard kill of Owlshift (OWL-86, OWL-88).
+    /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
     #[cfg(unix)]
     fn sentinel(&self) -> SentinelStatus {
         owlshift_platform::process::sentinel_status()
