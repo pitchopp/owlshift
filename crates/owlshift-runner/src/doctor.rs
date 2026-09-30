@@ -582,7 +582,8 @@ fn agent_login_check(system: &dyn System) -> Check {
 }
 
 /// The harnesses declared in the personal file, or both when it declares
-/// none (scenario S15: each configured harness must be ready).
+/// none (scenario S15). Codex that is not ready is only a warning until P5: see
+/// [`not_needed_before_review_roles`].
 fn required_harnesses(config: &Effective) -> Vec<Harness> {
     if let FileState::Loaded { config, .. } = &config.personal {
         let declared: Vec<Harness> = config.harnesses.iter().map(|(h, _)| h).collect();
@@ -600,18 +601,14 @@ fn harness_why(harness: Harness) -> &'static str {
             "`owlshift do` runs every agent in Claude Code, so it must be installed. \
              Agent runs log in with the token the `claude agent login` line checks."
         }
-        Harness::Codex => {
-            "Owlshift requires each harness your personal config declares, and \
-                           both when it declares none. Codex runs the review roles from P5; \
-                           `owlshift do` does not use it yet."
-        }
+        Harness::Codex => "Codex runs the review roles from P5; `owlshift do` does not use it yet.",
     }
 }
 
 fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> Check {
     let program = harness::program(harness);
     let Some(path) = system.locate(program) else {
-        let mut fix = vec![match harness::install_command(harness) {
+        let fix = vec![match harness::install_command(harness) {
             Some(command) => {
                 Step::run_noting(command, &format!("see {}", harness::install_page(harness)))
             }
@@ -621,19 +618,14 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
                 harness::install_page(harness)
             )),
         }];
-        if harness == Harness::Codex {
-            fix.push(Step::act(
-                "Or, to use Claude Code alone, declare only `[harnesses.claude]` in your \
-                 personal config.toml",
-            ));
-        }
-        return Check::fail(
+        let missing = Check::fail(
             Section::Tools,
             program,
             "not found on the PATH",
             harness_why(harness),
             fix,
         );
+        return not_needed_before_review_roles(missing, harness);
     };
     let (version, exact) = match system.run(&path, &["--version"], None) {
         Ok(out) if out.code == Some(0) => (version_of(&out.stdout), exact_version_of(&out.stdout)),
@@ -646,7 +638,44 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
     );
     let mut result = login_check(system, harness, &path, &found);
     flag_untested(&mut result, harness, exact.as_deref());
-    result
+    not_needed_before_review_roles(result, harness)
+}
+
+/// Codex that is missing, logged out or unreadable is a warning, not a
+/// failure: `owlshift do` does not run it before the review roles (P5), so
+/// it is not a problem to fix before `do` (OWL-102). The decision is made
+/// here and only here.
+///
+/// P5 must replace the unconditional downgrade with a condition: Codex stays
+/// a failure once a configured role uses it. No configuration maps roles to
+/// harnesses yet, so there is nothing to read today.
+fn not_needed_before_review_roles(mut check: Check, harness: Harness) -> Check {
+    if harness != Harness::Codex || check.status != Status::Fail {
+        return check;
+    }
+    let steps: Vec<String> = check
+        .fix
+        .iter()
+        .map(|step| match step {
+            Step::Run {
+                command,
+                note: Some(note),
+            } => format!("`{command}` ({note})"),
+            Step::Run {
+                command,
+                note: None,
+            } => format!("`{command}`"),
+            Step::Do(text) => text.clone(),
+        })
+        .collect();
+    check.status = Status::Warn;
+    check.why = Some(format!(
+        "{DOES_NOT_BLOCK} it does not use Codex yet; the review roles will, from P5, and \
+         then Codex must be ready. To get it ready: {}.",
+        steps.join(", then ")
+    ));
+    check.fix = Vec::new();
+    check
 }
 
 fn harness_name(harness: Harness) -> &'static str {
@@ -1318,14 +1347,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_and_logged_out_harnesses_say_how_to_fix_them() {
+    fn a_missing_claude_fails_and_says_how_to_fix_it() {
         let system = with_git(FakeSystem::default())
             .install("codex")
             .answer(
                 "codex --version",
                 Answer::Exit(0, "codex-cli 0.154.0\n", ""),
             )
-            .answer(CODEX_STATUS, Answer::Exit(1, "", "Not logged in\n"));
+            .answer(CODEX_STATUS, Answer::Exit(0, "", CODEX_API_KEY));
         let report = run(&system, &no_config());
 
         assert!(!report.ready());
@@ -1335,43 +1364,65 @@ mod tests {
                 "Install Claude Code: https://code.claude.com/docs/en/setup"
             )]
         );
-        assert_eq!(fixes(&report, "codex"), [Step::run("codex login")]);
-        assert_eq!(report.failures(), 2);
+        assert_eq!(report.failures(), 1);
     }
 
+    /// OWL-102: `owlshift do` does not run Codex before the review roles
+    /// (P5), so a Codex that is logged out, missing or unreadable is a
+    /// warning that says so, not a problem to fix.
     #[test]
-    fn a_missing_codex_can_be_installed_or_left_out() {
-        let system = logged_in(with_git(FakeSystem::default()).install("claude").answer(
-            "claude --version",
-            Answer::Exit(0, "2.1.283 (Claude Code)\n", ""),
-        ));
-        let report = run(&system, &no_config());
-        let fix = fixes(&report, "codex");
-        assert_eq!(commands(&fix), ["npm install -g @openai/codex"]);
-        assert!(format!("{fix:?}").contains("[harnesses.claude]"), "{fix:?}");
-    }
+    fn a_codex_that_is_not_ready_warns_while_claude_is_ready() {
+        let claude_only = |system: FakeSystem| {
+            system.install("claude").answer(
+                "claude --version",
+                Answer::Exit(0, "2.1.283 (Claude Code)\n", ""),
+            )
+        };
+        let logged_out = claude_only(with_git(FakeSystem::default()))
+            .install("codex")
+            .answer(
+                "codex --version",
+                Answer::Exit(0, "codex-cli 0.154.0\n", ""),
+            )
+            .answer(CODEX_STATUS, Answer::Exit(1, "", "Not logged in\n"))
+            .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""));
+        let unknown = claude_only(with_git(FakeSystem::default()))
+            .install("codex")
+            .answer(
+                "codex --version",
+                Answer::Exit(0, "codex-cli 0.154.0\n", ""),
+            )
+            .answer(
+                CODEX_STATUS,
+                Answer::Exit(0, "", "Signed in as ada@example.com\n"),
+            )
+            .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""));
+        let missing = logged_in(claude_only(with_git(FakeSystem::default())));
 
-    #[test]
-    fn an_undeterminable_codex_login_fails_without_echoing_the_answer() {
-        let system = logged_in(with_harnesses(with_git(FakeSystem::default()))).answer(
-            CODEX_STATUS,
-            Answer::Exit(0, "", "Signed in as ada@example.com\n"),
-        );
-        let report = run(&system, &no_config());
-        let shown = report.to_string();
-
-        assert!(!report.ready());
-        assert!(
-            line(&report, "codex")
-                .detail
-                .contains("`codex login status` gave an answer Owlshift does not know"),
-            "{shown}"
-        );
-        assert_eq!(
-            commands(&fixes(&report, "codex")),
-            ["codex login status", "codex login"]
-        );
-        assert!(!shown.contains("ada@example.com"), "{shown}");
+        for (system, step) in [
+            (logged_out, "`codex login`"),
+            (unknown, "`codex login status`"),
+            (missing, "`npm install -g @openai/codex`"),
+        ] {
+            let report = run(&system, &no_config());
+            let codex = line(&report, "codex");
+            assert_eq!(codex.status, Status::Warn, "{report}");
+            assert_eq!(codex.fix, []);
+            let why = codex.why.as_deref().unwrap();
+            assert!(why.starts_with(DOES_NOT_BLOCK), "{why}");
+            assert!(why.contains("from P5"), "{why}");
+            assert!(why.contains(step), "{why}");
+            assert!(report.ready(), "{report}");
+            assert_eq!(report.failures(), 0, "{report}");
+            assert!(!report.to_string().contains("ada@example.com"), "{report}");
+            assert!(
+                !report
+                    .checks
+                    .iter()
+                    .any(|c| c.subject == "codex" && c.status == Status::Fail),
+                "{report}"
+            );
+        }
     }
 
     /// OWL-97: agent runs log in with the stored token, never with the
@@ -1499,10 +1550,11 @@ mod tests {
         assert_eq!(codex.fix, []);
     }
 
-    /// A failure keeps its fix at an untested version (every Codex version
-    /// is untested); an informational line becomes a warning.
+    /// A Codex that is not ready at an untested version (every Codex version
+    /// is untested) is still the warning of OWL-102, and its detail says the
+    /// version is untested; an informational line becomes a warning.
     #[test]
-    fn a_failure_at_an_untested_version_keeps_its_fix() {
+    fn a_codex_not_ready_at_an_untested_version_is_one_warning() {
         let system = with_harnesses(with_git(FakeSystem::default()))
             .answer(
                 "claude --version",
@@ -1515,15 +1567,15 @@ mod tests {
             .answer(CODEX_STATUS, Answer::Exit(1, "", "Not logged in\n"));
         let report = run(&system, &no_config());
         let codex = line(&report, "codex");
-        assert_eq!(codex.status, Status::Fail);
+        assert_eq!(codex.status, Status::Warn);
         assert_eq!(
             codex.detail,
             "0.154.0 (/fake/bin/codex), not logged in; no version tested with Owlshift yet"
         );
-        assert_eq!(fixes(&report, "codex"), [Step::run("codex login")]);
+        assert_eq!(codex.fix, []);
 
         let claude = line(&report, "claude");
-        assert_eq!(report.failures(), 1, "{report}");
+        assert_eq!(report.failures(), 0, "{report}");
         assert_eq!(claude.status, Status::Warn);
         assert_eq!(
             claude.detail,
