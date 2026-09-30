@@ -159,7 +159,9 @@ fn finish(
 ) -> ExitCode {
     // OWL-88: a sentinel that ended during the run left it unprotected, and
     // is never restarted; one that never started was warned of in `main`.
-    // OWL-91: one stopped protects nothing while it is.
+    // OWL-91, OWL-95: one stopped at the end still stops the live trees once
+    // continued at Owlshift's end, with the exceptions the warning names;
+    // one the guard killed during the run is reported as ended.
     #[cfg(unix)]
     {
         use owlshift_runner::system::SentinelStatus;
@@ -168,9 +170,11 @@ fn finish(
             SentinelStatus::Stopped { .. } => {
                 let _ = writeln!(
                     stderr,
-                    "owlshift: warning: its sentinel is stopped at the end of this run: a hard \
-                     kill of Owlshift while it was stopped would have left the processes it \
-                     started running"
+                    "owlshift: warning: its sentinel is stopped at the end of this run: the \
+                     system continues it as Owlshift ends, and it then stops, best effort, the \
+                     processes Owlshift started, unless it was stopped in its first milliseconds \
+                     (before it ignores SIGHUP) or, on Linux, Owlshift's end leaves it to a \
+                     subreaper in the same session"
                 );
             }
             SentinelStatus::Ended(how) => {
@@ -255,8 +259,11 @@ mod tests {
         let (code, stdout, stderr) = finish_refused(SentinelStatus::Stopped { pid: 4242 });
         assert_eq!(
             stderr,
-            "owlshift: warning: its sentinel is stopped at the end of this run: a hard kill of \
-             Owlshift while it was stopped would have left the processes it started running\n"
+            "owlshift: warning: its sentinel is stopped at the end of this run: the system \
+             continues it as Owlshift ends, and it then stops, best effort, the processes \
+             Owlshift started, unless it was stopped in its first milliseconds (before it \
+             ignores SIGHUP) or, on Linux, Owlshift's end leaves it to a subreaper in the same \
+             session\n"
         );
         assert_eq!(stdout, "\nNot run: no ticket\n");
         assert_eq!(code, ExitCode::FAILURE);

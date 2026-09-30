@@ -442,8 +442,9 @@ fn apparmor_profile_printf() -> String {
 /// Whether the sentinel of this very command runs, the process that stops
 /// the probes and agent runs Owlshift started when Owlshift is killed
 /// outright (OWL-86). A warning, never a failure: it is a best effort, not a
-/// guardrail, and it is never restarted (OWL-88). A stopped one protects
-/// nothing either (OWL-91).
+/// guardrail, and it is never restarted (OWL-88). A stopped one warns too
+/// (OWL-91), though it still stops the live trees at Owlshift's end, with
+/// the exceptions its warning names (OWL-93, OWL-95).
 #[cfg(unix)]
 fn sentinel_check(status: &SentinelStatus) -> Check {
     const SUBJECT: &str = "sentinel";
@@ -463,10 +464,18 @@ fn sentinel_check(status: &SentinelStatus) -> Check {
         SentinelStatus::Stopped { pid } => Check::warn(
             Section::AgentIsolation,
             SUBJECT,
-            format!("stopped (pid {pid}), it reads nothing until continued: {UNPROTECTED}"),
+            format!(
+                "stopped (pid {pid}), it reads nothing until continued: the system continues it \
+                 at Owlshift's end, a hard kill included, and it then stops, best effort, the \
+                 processes Owlshift started, unless its input fills first, in which case \
+                 Owlshift kills it and it stops nothing"
+            ),
             why(
-                "To restore it, look for what stops the `/bin/sh` process whose command line \
-                 ends in `owlshift-sentinel`.",
+                "It also stops nothing if it was stopped in its first milliseconds, before it \
+                 ignores SIGHUP, or, on Linux, if Owlshift's end leaves it to a subreaper in the \
+                 same session, where it stays stopped until something continues it. To restore \
+                 it, look for what stops the `/bin/sh` process whose command line ends in \
+                 `owlshift-sentinel`.",
             ),
         ),
         SentinelStatus::Ended(how) => Check::warn(
@@ -1165,9 +1174,14 @@ mod tests {
             ),
             (
                 SentinelStatus::Stopped { pid: 4242 },
-                "stopped (pid 4242), it reads nothing until continued: a hard kill of Owlshift \
-                 would leave",
-                "look for what stops the `/bin/sh` process",
+                "stopped (pid 4242), it reads nothing until continued: the system continues it at \
+                 Owlshift's end, a hard kill included, and it then stops, best effort, the \
+                 processes Owlshift started, unless its input fills first, in which case Owlshift \
+                 kills it and it stops nothing",
+                "stopped in its first milliseconds, before it ignores SIGHUP, or, on Linux, if \
+                 Owlshift's end leaves it to a subreaper in the same session, where it stays \
+                 stopped until something continues it. To restore it, look for what stops the \
+                 `/bin/sh` process",
             ),
             (
                 SentinelStatus::NotRunning,
