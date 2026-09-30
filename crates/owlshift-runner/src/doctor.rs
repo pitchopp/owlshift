@@ -161,7 +161,8 @@ fn sandbox_check(system: &dyn System) -> Check {
 /// Whether the sentinel of this very command runs, the process that stops
 /// the probes and agent runs Owlshift started when Owlshift is killed
 /// outright (OWL-86). A warning, never a failure: it is a best effort, not a
-/// guardrail, and it is never restarted (OWL-88).
+/// guardrail, and it is never restarted (OWL-88). A stopped one protects
+/// nothing either (OWL-91).
 #[cfg(unix)]
 fn sentinel_check(status: &SentinelStatus) -> Check {
     const SUBJECT: &str = "sentinel";
@@ -169,6 +170,8 @@ fn sentinel_check(status: &SentinelStatus) -> Check {
         "a hard kill of Owlshift would leave the processes it started running";
     const FIND: &str = "look for what ends the `/bin/sh` process whose command line ends in \
                         `owlshift-sentinel`";
+    const FIND_STOP: &str = "look for what stops the `/bin/sh` process whose command line ends \
+                             in `owlshift-sentinel`";
     match status {
         SentinelStatus::Running { pid } => check(
             SUBJECT,
@@ -177,6 +180,12 @@ fn sentinel_check(status: &SentinelStatus) -> Check {
                 "running (pid {pid}): a hard kill of Owlshift stops, best effort, the processes it started"
             ),
             None,
+        ),
+        SentinelStatus::Stopped { pid } => check(
+            SUBJECT,
+            Status::Warn,
+            format!("stopped (pid {pid}), it reads nothing until continued: {UNPROTECTED}"),
+            Some(FIND_STOP),
         ),
         SentinelStatus::Ended(how) => check(
             SUBJECT,
@@ -579,7 +588,8 @@ mod tests {
     }
 
     /// OWL-88: a sentinel that ended or never started is a warning that says
-    /// what is lost, never a failure; a running one is quiet.
+    /// what is lost, never a failure; a running one is quiet. OWL-91: a
+    /// stopped one warns too.
     #[cfg(unix)]
     #[test]
     fn a_missing_or_ended_sentinel_warns_without_failing() {
@@ -597,6 +607,12 @@ mod tests {
                 SentinelStatus::Ended("signal: 9 (SIGKILL)".into()),
                 "ended (signal: 9 (SIGKILL)): a hard kill of Owlshift would leave",
                 "`owlshift-sentinel`",
+            ),
+            (
+                SentinelStatus::Stopped { pid: 4242 },
+                "stopped (pid 4242), it reads nothing until continued: a hard kill of Owlshift \
+                 would leave",
+                "look for what stops the `/bin/sh` process",
             ),
             (
                 SentinelStatus::NotRunning,

@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use rustix::process::{Pid, Signal};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, waitid};
 
 /// What the sentinel runs: it keeps the groups of the `+` lines less those
 /// of the `-` lines, and at the end of its input kills each group left, as
@@ -71,6 +71,14 @@ pub enum SentinelStatus {
         /// Its process id.
         pid: u32,
     },
+    /// It runs but is stopped, as by SIGSTOP, and reads nothing until it is
+    /// continued (OWL-91): it protects nothing meanwhile, and when this
+    /// process ends, the system hangs it up before it reads the end of its
+    /// input.
+    Stopped {
+        /// Its process id.
+        pid: u32,
+    },
     /// It ended, as said: nothing protects the trees any more. Owlshift
     /// never starts another.
     Ended(String),
@@ -109,18 +117,29 @@ impl Sentinel {
         Ok(Self { process, input })
     }
 
-    /// Whether it still runs, without waiting: a sentinel that ended is
-    /// reaped here. One stopped, and so not reading, still counts as
-    /// running: the system does not tell it apart without a wait that
-    /// would take its status from `Child`.
+    /// Whether it still runs, and is not stopped, without waiting: a
+    /// sentinel that ended is reaped here.
     pub(super) fn status(&mut self) -> SentinelStatus {
+        let pid = self.process.id();
         match self.process.try_wait() {
-            Ok(None) => SentinelStatus::Running {
-                pid: self.process.id(),
-            },
+            Ok(None) if self.is_stopped() => SentinelStatus::Stopped { pid },
+            Ok(None) => SentinelStatus::Running { pid },
             Ok(Some(status)) => SentinelStatus::Ended(status.to_string()),
             Err(error) => SentinelStatus::Ended(format!("its state cannot be read: {error}")),
         }
+    }
+
+    /// Whether it is stopped (OWL-91), asked only while it is not reaped, so
+    /// its pid is its own. The wait takes nothing: `NOWAIT` leaves the stop
+    /// to be seen again, and an end, not asked for, is left to `try_wait`.
+    fn is_stopped(&self) -> bool {
+        let options = WaitIdOptions::STOPPED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        // An error tells nothing: `try_wait` just said it runs, so it counts
+        // as running, the answer before OWL-91.
+        matches!(
+            waitid(WaitId::Pid(Pid::from_child(&self.process)), options),
+            Ok(Some(status)) if status.stopped()
+        )
     }
 
     /// Tells the sentinel a tree is live.
@@ -290,7 +309,7 @@ mod tests {
     use super::*;
 
     use rustix::io::Errno;
-    use rustix::process::{WaitOptions, wait};
+    use rustix::process::{WaitOptions, kill_process, wait};
 
     fn helper_requested() -> bool {
         std::env::args().any(|arg| arg == "--exact")
@@ -365,5 +384,57 @@ mod tests {
             "{verdict}"
         );
         assert!(started.elapsed() < Duration::from_secs(5), "{verdict}");
+    }
+
+    /// A sentinel killed and reaped when dropped, however the test ends.
+    struct Reaped(Sentinel);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            // SIGKILL ends it even stopped, and std knows once it is reaped,
+            // so neither call can reach another process.
+            let _ = self.0.process.kill();
+            let _ = self.0.process.wait();
+        }
+    }
+
+    /// Its status once `done` holds, or the last one read within 5 s.
+    fn status_once(sentinel: &mut Sentinel, done: fn(&SentinelStatus) -> bool) -> SentinelStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = sentinel.status();
+            if done(&status) || Instant::now() >= deadline {
+                return status;
+            }
+            thread::sleep(super::super::POLL);
+        }
+    }
+
+    /// OWL-91: a stopped sentinel is told apart from a running one until it
+    /// is continued, and its end is still read and reaped. It runs in this
+    /// process, unlike the probes: nothing here waits for the end of its
+    /// input, so another test's child inheriting the pipe on macOS changes
+    /// nothing.
+    #[test]
+    fn a_stopped_sentinel_is_told_apart_until_it_is_continued() {
+        let mut reaped = Reaped(Sentinel::start().unwrap());
+        let sentinel = &mut reaped.0;
+        let pid = sentinel.process.id();
+        let id = Pid::from_child(&sentinel.process);
+
+        kill_process(id, Signal::STOP).unwrap();
+        let stopped = status_once(sentinel, |s| matches!(s, SentinelStatus::Stopped { .. }));
+        assert_eq!(stopped, SentinelStatus::Stopped { pid });
+        // Seen again: the wait took nothing.
+        assert_eq!(sentinel.status(), SentinelStatus::Stopped { pid });
+
+        kill_process(id, Signal::CONT).unwrap();
+        let continued = status_once(sentinel, |s| matches!(s, SentinelStatus::Running { .. }));
+        assert_eq!(continued, SentinelStatus::Running { pid });
+
+        kill_process(id, Signal::STOP).unwrap();
+        sentinel.process.kill().unwrap();
+        let ended = status_once(sentinel, |s| matches!(s, SentinelStatus::Ended(_)));
+        assert_eq!(ended, SentinelStatus::Ended("signal: 9 (SIGKILL)".into()));
     }
 }

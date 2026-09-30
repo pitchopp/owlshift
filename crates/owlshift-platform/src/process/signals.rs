@@ -78,7 +78,7 @@ static INSTALLED: Mutex<bool> = Mutex::new(false);
 ///   told of it, well under a millisecond, leaves that tree running;
 /// - once the sentinel is killed, or stops reading, it protects nothing
 ///   more, and it is not restarted; [`sentinel_status`] tells whether it
-///   still runs, without waiting on it;
+///   still runs, or is stopped, without waiting on it;
 /// - as with [`ProcessTree::kill`], a process that left its tree's group is
 ///   not stopped, and a group id could in theory belong to another group by
 ///   then, once the pid space wrapped around.
@@ -112,10 +112,8 @@ pub fn stop_trees_when_killed() -> io::Result<()> {
 }
 
 /// Whether the sentinel [`stop_trees_when_killed`] started still runs, so
-/// that a command can say when the protection is gone (OWL-88). It never
-/// waits: a sentinel that ended is reaped here.
-///
-/// One that stopped reading is not seen: it still runs.
+/// that a command can say when the protection is gone (OWL-88), or is
+/// stopped (OWL-91). It never waits: a sentinel that ended is reaped here.
 #[cfg(unix)]
 pub fn sentinel_status() -> super::SentinelStatus {
     match &mut live().sentinel {

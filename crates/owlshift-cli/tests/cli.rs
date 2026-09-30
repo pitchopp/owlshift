@@ -290,6 +290,23 @@ impl HungProbe {
         }
     }
 
+    /// The pid of `owlshift`'s sentinel, its one child named so.
+    fn sentinel(&self) -> u32 {
+        let found = Command::new("pgrep")
+            .args([
+                "-P",
+                &self.owlshift.id().to_string(),
+                "-f",
+                "owlshift-sentinel",
+            ])
+            .output()
+            .unwrap();
+        let found = String::from_utf8(found.stdout).unwrap();
+        let sentinel: Vec<&str> = found.split_whitespace().collect();
+        assert_eq!(sentinel.len(), 1, "sentinels found: {found:?}");
+        sentinel[0].parse().unwrap()
+    }
+
     /// Runs `kill` with `args`.
     fn signal(&self, args: &[&str]) {
         let sent = Command::new("kill").args(args).status().unwrap();
@@ -356,30 +373,13 @@ impl Drop for HungProbe {
 #[test]
 fn doctor_reports_a_sentinel_killed_while_it_runs() {
     use std::os::unix::process::ExitStatusExt;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     let mut hung = HungProbe::start();
-    let found = Command::new("pgrep")
-        .args([
-            "-P",
-            &hung.owlshift.id().to_string(),
-            "-f",
-            "owlshift-sentinel",
-        ])
-        .output()
-        .unwrap();
-    let found = String::from_utf8(found.stdout).unwrap();
-    let sentinel: Vec<&str> = found.split_whitespace().collect();
-    assert_eq!(sentinel.len(), 1, "sentinels found: {found:?}");
-    hung.signal(&["-s", "KILL", sentinel[0]]);
+    let sentinel = hung.sentinel();
+    hung.signal(&["-s", "KILL", &sentinel.to_string()]);
     // Gone before the probe ends and `doctor` reads its state; well within
     // the probe's ten-second deadline.
-    let gone = Instant::now() + Duration::from_secs(5);
-    while is_alive(sentinel[0].parse().unwrap()) {
-        assert!(Instant::now() < gone, "the sentinel still runs");
-        thread::sleep(Duration::from_millis(20));
-    }
+    wait_for("the sentinel to be gone", || !is_alive(sentinel));
     assert!(
         hung.owlshift.try_wait().unwrap().is_none(),
         "doctor ended early"
@@ -391,23 +391,104 @@ fn doctor_reports_a_sentinel_killed_while_it_runs() {
     let status = hung.ended("the end of its probe");
     assert_eq!(status.signal(), None, "{status}");
     let report = fs::read_to_string(&hung.report).unwrap();
-    let line = report
-        .lines()
-        .find(|line| line.split_whitespace().nth(1) == Some("sentinel"))
-        .unwrap_or_else(|| panic!("no sentinel line:\n{report}"));
+    let line = sentinel_line(&report);
     assert_eq!(line.split_whitespace().next(), Some("warn"), "{report}");
     assert!(line.contains("ended (signal: 9"), "{report}");
+}
+
+/// OWL-91: `doctor` reports a sentinel stopped while it runs, although it
+/// still runs, as a warning.
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_sentinel_stopped_while_it_runs() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut hung = HungProbe::start();
+    let sentinel = hung.sentinel();
+    let _left = KillIfStopped(sentinel);
+    hung.signal(&["-s", "STOP", &sentinel.to_string()]);
+    wait_for("the sentinel to stop", || state(sentinel).starts_with('T'));
+    for pid in hung.pids.clone() {
+        hung.signal(&["-s", "KILL", &pid.to_string()]);
+    }
+
+    let status = hung.ended("the end of its probe");
+    assert_eq!(status.signal(), None, "{status}");
+    let report = fs::read_to_string(&hung.report).unwrap();
+    let line = sentinel_line(&report);
+    assert_eq!(line.split_whitespace().next(), Some("warn"), "{report}");
+    assert!(
+        line.contains(&format!("stopped (pid {sentinel})")),
+        "{report}"
+    );
+}
+
+/// Kills, when dropped, a sentinel left stopped: only while `ps` shows it
+/// stopped and `pgrep` finds it a sentinel, so that its pid, not reaped, is
+/// still its own. The system ends it once `owlshift` ended, where that
+/// leaves its process group orphaned (OWL-91), not everywhere.
+#[cfg(unix)]
+struct KillIfStopped(u32);
+
+#[cfg(unix)]
+impl Drop for KillIfStopped {
+    fn drop(&mut self) {
+        // Nothing here may panic: it also runs while a failed test unwinds.
+        let pid = self.0.to_string();
+        let sentinel = Command::new("pgrep")
+            .args(["-f", "owlshift-sentinel"])
+            .output()
+            .is_ok_and(|found| {
+                String::from_utf8_lossy(&found.stdout)
+                    .split_whitespace()
+                    .any(|found| found == pid)
+            });
+        let stopped = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .is_ok_and(|ps| String::from_utf8_lossy(&ps.stdout).trim().starts_with('T'));
+        if sentinel && stopped {
+            let _ = Command::new("kill").args(["-s", "KILL", &pid]).status();
+        }
+    }
+}
+
+/// The `sentinel` line of a `doctor` report.
+#[cfg(unix)]
+fn sentinel_line(report: &str) -> &str {
+    report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("sentinel"))
+        .unwrap_or_else(|| panic!("no sentinel line:\n{report}"))
+}
+
+/// Waits until `done` holds, 5 s at most.
+#[cfg(unix)]
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < deadline, "5 s without {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A process's state as `ps` shows it, empty once it is gone.
+#[cfg(unix)]
+fn state(pid: u32) -> String {
+    let ps = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&ps.stdout).trim().to_owned()
 }
 
 /// Whether a process is still running; a zombie is not.
 #[cfg(unix)]
 fn is_alive(pid: u32) -> bool {
-    let ps = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    let state = String::from_utf8_lossy(&ps.stdout);
-    let state = state.trim();
+    let state = state(pid);
     !state.is_empty() && !state.starts_with('Z')
 }
 
