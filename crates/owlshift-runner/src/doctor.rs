@@ -597,8 +597,8 @@ fn required_harnesses(config: &Effective) -> Vec<Harness> {
 fn harness_why(harness: Harness) -> &'static str {
     match harness {
         Harness::Claude => {
-            "`owlshift do` runs every agent in Claude Code, and Owlshift requires \
-                            each harness it may run to be installed and logged in."
+            "`owlshift do` runs every agent in Claude Code, so it must be installed. \
+             Agent runs log in with the token the `claude agent login` line checks."
         }
         Harness::Codex => {
             "Owlshift requires each harness your personal config declares, and \
@@ -670,6 +670,32 @@ fn login_check(system: &dyn System, harness: Harness, path: &Path, found: &str) 
         Err(RunError::TimedOut) => (Login::Unknown, "did not answer in time"),
         Err(RunError::Io(_)) => (Login::Unknown, "could not be run"),
     };
+    // Agent runs log in with the token `claude agent login` checks (OWL-94),
+    // never with the operator's own Claude Code login: its state is only
+    // information (OWL-97).
+    if harness == Harness::Claude {
+        const UNUSED: &str = "(agent runs do not use it)";
+        return match login {
+            Login::LoggedIn { method, plan } => {
+                let plan = plan.map(|p| format!(", {p} plan")).unwrap_or_default();
+                Check::ok(
+                    Section::Tools,
+                    program,
+                    format!("{found}, your own login: logged in ({method}{plan})"),
+                )
+            }
+            Login::LoggedOut => Check::info(
+                Section::Tools,
+                program,
+                format!("{found}, your own login: not logged in {UNUSED}"),
+            ),
+            Login::Unknown => Check::info(
+                Section::Tools,
+                program,
+                format!("{found}, your own login: unknown, `{status_command}` {why} {UNUSED}"),
+            ),
+        };
+    }
     match login {
         Login::LoggedIn { method, plan } => {
             let plan = plan.map(|p| format!(", {p} plan")).unwrap_or_default();
@@ -703,7 +729,7 @@ fn login_check(system: &dyn System, harness: Harness, path: &Path, found: &str) 
 /// read: the CLI may have changed a flag or a message under the user
 /// (`docs/design/runtime-and-operations.md`, "Updates & versions"). Never a
 /// failure, since an untested version may well work; a failed check keeps
-/// its status and its fix.
+/// its status and its fix, and an informational one becomes a warning.
 fn flag_untested(check: &mut Check, harness: Harness, version: Option<&str>) {
     if version.is_some_and(|version| tested::is_tested(harness, version)) {
         return;
@@ -716,7 +742,7 @@ fn flag_untested(check: &mut Check, harness: Harness, version: Option<&str>) {
     } else {
         check.detail.push_str("; version not tested with Owlshift");
     }
-    if check.status == Status::Ok {
+    if matches!(check.status, Status::Ok | Status::Info) {
         check.status = Status::Warn;
         let mut why = match harness {
             Harness::Codex => format!(
@@ -941,7 +967,7 @@ mod tests {
         assert_eq!(line(&report, "git").detail, "2.54.0 (/fake/bin/git)");
         assert_eq!(
             line(&report, "claude").detail,
-            "2.1.283 (/fake/bin/claude), logged in (claude.ai, max plan)"
+            "2.1.283 (/fake/bin/claude), your own login: logged in (claude.ai, max plan)"
         );
         assert!(
             line(&report, "codex")
@@ -1326,28 +1352,84 @@ mod tests {
     }
 
     #[test]
-    fn an_undeterminable_login_fails_without_echoing_the_answer() {
-        let system = with_harnesses(with_git(FakeSystem::default()))
-            .answer(CLAUDE_STATUS, Answer::TimedOut)
-            .answer(
-                CODEX_STATUS,
-                Answer::Exit(0, "", "Signed in as ada@example.com\n"),
-            );
+    fn an_undeterminable_codex_login_fails_without_echoing_the_answer() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default()))).answer(
+            CODEX_STATUS,
+            Answer::Exit(0, "", "Signed in as ada@example.com\n"),
+        );
         let report = run(&system, &no_config());
         let shown = report.to_string();
 
         assert!(!report.ready());
         assert!(
-            line(&report, "claude")
+            line(&report, "codex")
                 .detail
-                .contains("`claude auth status --json` did not answer in time"),
+                .contains("`codex login status` gave an answer Owlshift does not know"),
             "{shown}"
         );
         assert_eq!(
-            commands(&fixes(&report, "claude")),
-            ["claude auth status --json", "claude auth login"]
+            commands(&fixes(&report, "codex")),
+            ["codex login status", "codex login"]
         );
         assert!(!shown.contains("ada@example.com"), "{shown}");
+    }
+
+    /// OWL-97: agent runs log in with the stored token, never with the
+    /// operator's own Claude Code login, so that login logged out or
+    /// unreadable is information, not a failure. The token stays the gate.
+    #[test]
+    fn the_own_claude_login_is_information_only() {
+        for (answer, state) in [
+            (
+                Answer::Exit(1, r#"{"loggedIn": false, "authMethod": "none"}"#, ""),
+                "not logged in",
+            ),
+            (
+                Answer::TimedOut,
+                "unknown, `claude auth status --json` did not answer in time",
+            ),
+            (
+                Answer::Exit(0, "Signed in as ada@example.com\n", ""),
+                "unknown, `claude auth status --json` gave an answer Owlshift does not know",
+            ),
+        ] {
+            let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+                .answer(CLAUDE_STATUS, answer);
+            let report = run(&system, &no_config());
+            let shown = report.to_string();
+            let claude = line(&report, "claude");
+            assert!(report.ready(), "{shown}");
+            assert_eq!(claude.status, Status::Info, "{shown}");
+            assert_eq!(
+                claude.detail,
+                format!(
+                    "2.1.283 (/fake/bin/claude), your own login: {state} (agent runs do not use it)"
+                )
+            );
+            assert_eq!(claude.fix, []);
+            assert_eq!(line(&report, "claude agent login").status, Status::Ok);
+            assert!(!shown.contains("auth login"), "{shown}");
+            assert!(!shown.contains("ada@example.com"), "{shown}");
+            let json = report.to_json();
+            let entry = json["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["subject"] == "claude")
+                .unwrap();
+            assert_eq!(entry["status"], "info");
+            assert_eq!(entry["fix"], serde_json::json!([]));
+            assert_eq!(json["problems"], 0);
+
+            // Without the token, its own line fails; the own login does not.
+            let report = run(&system.unstored("claude-agent"), &no_config());
+            assert_eq!(report.failures(), 1, "{report}");
+            assert_eq!(
+                commands(&fixes(&report, "claude agent login")),
+                AGENT_LOGIN_COMMANDS
+            );
+            assert_eq!(line(&report, "claude").status, Status::Info);
+        }
     }
 
     fn line<'a>(report: &'a Report, subject: &str) -> &'a Check {
@@ -1417,6 +1499,8 @@ mod tests {
         assert_eq!(codex.fix, []);
     }
 
+    /// A failure keeps its fix at an untested version (every Codex version
+    /// is untested); an informational line becomes a warning.
     #[test]
     fn a_failure_at_an_untested_version_keeps_its_fix() {
         let system = with_harnesses(with_git(FakeSystem::default()))
@@ -1428,15 +1512,32 @@ mod tests {
                 CLAUDE_STATUS,
                 Answer::Exit(1, r#"{"loggedIn": false, "authMethod": "none"}"#, ""),
             )
-            .answer(CODEX_STATUS, Answer::Exit(0, "", CODEX_API_KEY));
+            .answer(CODEX_STATUS, Answer::Exit(1, "", "Not logged in\n"));
         let report = run(&system, &no_config());
+        let codex = line(&report, "codex");
+        assert_eq!(codex.status, Status::Fail);
+        assert_eq!(
+            codex.detail,
+            "0.154.0 (/fake/bin/codex), not logged in; no version tested with Owlshift yet"
+        );
+        assert_eq!(fixes(&report, "codex"), [Step::run("codex login")]);
+
         let claude = line(&report, "claude");
-        assert_eq!(claude.status, Status::Fail);
+        assert_eq!(report.failures(), 1, "{report}");
+        assert_eq!(claude.status, Status::Warn);
         assert_eq!(
             claude.detail,
-            "9.9.9 (/fake/bin/claude), not logged in; version not tested with Owlshift"
+            "9.9.9 (/fake/bin/claude), your own login: not logged in (agent runs do not use \
+             it); version not tested with Owlshift"
         );
-        assert_eq!(fixes(&report, "claude"), [Step::run("claude auth login")]);
+        assert_eq!(
+            claude.why.as_deref(),
+            Some(
+                "Does not block `owlshift do`: an untested version usually works. If a run \
+                 misbehaves, install a tested version: claude 2.1.283, 2.1.284."
+            )
+        );
+        assert_eq!(claude.fix, []);
     }
 
     #[test]
