@@ -51,8 +51,7 @@ pub struct Policy {
     /// Read, never written: tool chains, the harness's install folder, git's
     /// own configuration.
     pub readable: Vec<PathBuf>,
-    /// Read and written: the worktree, the repository's git folder, the
-    /// harness's login folder.
+    /// Read and written: the worktree, the repository's git folder.
     pub writable: Vec<PathBuf>,
     /// Never written, even inside a writable folder: the git folder's hooks
     /// and configuration.

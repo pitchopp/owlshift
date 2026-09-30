@@ -14,8 +14,8 @@
 //!
 //! The sandbox leaves the home unreadable but for the folders a run needs
 //! ([`AgentEnv::policy`]), writes nowhere but the worktree, the repository's
-//! git folder (not its hooks or configuration), the harness's own login
-//! folder and the run's own temporary folder, closes the temporary folders
+//! git folder (not its hooks or configuration) and the run's own temporary
+//! folder, which holds the harness's configuration, closes the temporary folders
 //! the user's other processes share, and closes the system credential store.
 //! An agent environment is always confined: the only way out is
 //! `without_confinement`, compiled for the test bench alone.
@@ -34,7 +34,6 @@ use owlshift_core::agent_env::{
     AgentEnvError, NO_CREDENTIAL, agent_environment, check_agent_variables,
 };
 use owlshift_core::floor::FloorViolation;
-use owlshift_platform::paths;
 use owlshift_platform::process::{Captured, OUTPUT_CAP, find_executable_in, run_command};
 use owlshift_platform::sandbox::{self, Policy, SandboxError};
 
@@ -64,13 +63,14 @@ pub struct RunPaths {
     pub git_dir: Option<PathBuf>,
     /// More folders read, such as the harness's install folder.
     pub readable: Vec<PathBuf>,
-    /// More folders read and written, such as the harness's login folder.
+    /// More folders read and written.
     pub writable: Vec<PathBuf>,
     /// Paths neither read nor written, such as the runner's run folder.
     pub hidden: Vec<PathBuf>,
     /// The run's own temporary folder, made by the runner and removed with
     /// the run: the only temporary folder the agent writes, which `TMPDIR`,
-    /// `TMP` and `TEMP` name. `None`: no temporary folder is written.
+    /// `TMP` and `TEMP` name, and where the harness keeps its configuration
+    /// for the run. `None`: no temporary folder is written.
     pub temp: Option<PathBuf>,
 }
 
@@ -137,18 +137,16 @@ impl AgentEnv {
     }
 
     /// The agent environment built from the runner's own, as
-    /// [`AgentEnv::for_project`] builds it, confined, with Claude Code
-    /// pointed at the login made for agent runs
-    /// ([`paths::claude_agent_login_dir`]): the sandbox closes the Keychain,
-    /// where the operator's own login lives on macOS. Claude Code's inbox for
+    /// [`AgentEnv::for_project`] builds it, confined. Claude Code's inbox for
     /// the user's other sessions is switched off ([`claude::PEER_INBOX_ENV`],
     /// OWL-65), whatever the runner's environment and the declared variables
-    /// say. Only this constructor sets either variable.
+    /// say; only this constructor sets it. No login is among the variables:
+    /// the sandbox closes the Keychain, where the operator's own login lives
+    /// on macOS, and the login of agent runs is set by the executor on the
+    /// harness command alone, never on a gate command or a probe
+    /// (`executor::harness::HarnessLogin`, OWL-94).
     pub fn from_runner(declared: &[&str], allowed: &[&str]) -> Result<Self, AgentEnvError> {
         let mut env = Self::for_project(std::env::vars_os(), declared, allowed)?;
-        if let Some(dir) = paths::claude_agent_login_dir() {
-            env.set("CLAUDE_CONFIG_DIR", dir.into_os_string());
-        }
         let (name, value) = claude::PEER_INBOX_ENV;
         env.set(name, value.into());
         Ok(env)
@@ -542,6 +540,9 @@ pub enum CredentialFinding {
     GitSetting { key: String },
     /// The harness loaded these MCP servers.
     McpServers(Vec<String>),
+    /// The run's result or an artifact holds the harness's own login token,
+    /// which its shell inherits (OWL-94): named, never shown.
+    LoginCopied { into: String },
     /// A probe could not run or did not finish: what it looks for is unknown,
     /// so it counts as found.
     ProbeFailed { probe: &'static str, reason: String },
@@ -565,6 +566,11 @@ impl fmt::Display for CredentialFinding {
             Self::McpServers(names) => {
                 write!(f, "the harness loaded MCP servers: {}", names.join(", "))
             }
+            Self::LoginCopied { into } => write!(
+                f,
+                "{into} holds the harness's login token, so the run's output is refused: \
+                 revoke that token, then make a new one"
+            ),
             Self::ProbeFailed { probe, reason } => write!(f, "could not check {probe}: {reason}"),
         }
     }
@@ -1178,6 +1184,9 @@ mod tests {
             CredentialFinding::GitSetting {
                 key: "remote.origin.url".into(),
             },
+            CredentialFinding::LoginCopied {
+                into: ".owlshift/run/result.json".into(),
+            },
         ];
         let text: Vec<String> = findings.iter().map(ToString::to_string).collect();
         assert_eq!(
@@ -1188,6 +1197,8 @@ mod tests {
                  or an askpass program)",
                 "gh hands the agent a login for github.com",
                 "the git setting remote.origin.url carries a credential",
+                ".owlshift/run/result.json holds the harness's login token, so the run's \
+                 output is refused: revoke that token, then make a new one",
             ]
         );
     }

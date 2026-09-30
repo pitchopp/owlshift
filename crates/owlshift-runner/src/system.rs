@@ -28,9 +28,13 @@ pub trait System {
     fn sandbox(&self) -> Result<(), SandboxError> {
         owlshift_platform::sandbox::available()
     }
-    /// Whether a file is there; it is only looked at, never read.
-    fn is_file(&self, path: &Path) -> bool {
-        path.is_file()
+    /// Whether the system keychain holds a secret for `account`, under
+    /// Owlshift's service: its presence only, never its value. The error
+    /// says why the keychain could not be read.
+    fn secret_stored(&self, account: &str) -> Result<bool, String> {
+        owlshift_platform::keychain::Keychain::system()
+            .and_then(|keychain| keychain.contains(account))
+            .map_err(|error| error.to_string())
     }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
@@ -120,8 +124,10 @@ pub(crate) mod fake {
         answers: HashMap<String, Answer>,
         /// Why agent runs cannot be confined; `None`: they can.
         sandbox: Option<SandboxError>,
-        /// Files that are not there; every other one is.
-        absent: Vec<PathBuf>,
+        /// Keychain accounts with no secret; every other one has one.
+        unstored: Vec<String>,
+        /// Why the keychain cannot be read; `None`: it can.
+        keychain_error: Option<String>,
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
@@ -151,9 +157,15 @@ pub(crate) mod fake {
             self
         }
 
-        /// A file that is not there.
-        pub(crate) fn absent(mut self, path: PathBuf) -> Self {
-            self.absent.push(path);
+        /// No secret is stored for this keychain account.
+        pub(crate) fn unstored(mut self, account: &str) -> Self {
+            self.unstored.push(account.to_owned());
+            self
+        }
+
+        /// The keychain cannot be read, for this reason.
+        pub(crate) fn keychain_fails(mut self, reason: &str) -> Self {
+            self.keychain_error = Some(reason.to_owned());
             self
         }
 
@@ -204,8 +216,11 @@ pub(crate) mod fake {
             self.sandbox.clone().map_or(Ok(()), Err)
         }
 
-        fn is_file(&self, path: &Path) -> bool {
-            !self.absent.iter().any(|absent| absent == path)
+        fn secret_stored(&self, account: &str) -> Result<bool, String> {
+            match &self.keychain_error {
+                Some(reason) => Err(reason.clone()),
+                None => Ok(!self.unstored.iter().any(|unstored| unstored == account)),
+            }
         }
 
         #[cfg(unix)]

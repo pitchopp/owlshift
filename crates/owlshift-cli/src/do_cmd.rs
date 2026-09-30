@@ -16,7 +16,7 @@ use owlshift_platform::keychain::Keychain;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::{EventLog, EventSink, printable};
-use owlshift_runner::executor::harness::ClaudeHarness;
+use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::BUILD_ROLE;
@@ -104,6 +104,13 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
         Ok(forge) => forge,
         Err(error) => return fail(&error),
     };
+    // The token agent runs log in with (OWL-94), read with the other
+    // secrets and set on the harness command alone. None stored refuses the
+    // run, with the fix, before anything is cloned.
+    let login = match keychain.read(CLAUDE_AGENT_ACCOUNT) {
+        Ok(login) => login,
+        Err(error) => return fail(&error.to_string()),
+    };
     let budget = match &config.personal {
         FileState::Loaded { config, .. } => config
             .harnesses
@@ -122,6 +129,7 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
             .and_then(|tier| tier.claude.clone()),
         effort: None,
         max_budget_usd: budget,
+        login,
     };
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);

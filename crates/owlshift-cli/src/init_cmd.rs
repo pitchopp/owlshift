@@ -137,14 +137,23 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     for spec in &report.kept {
         println!("Kept the {spec} already stored.");
     }
-    if report.missing.is_empty() {
+    for spec in &report.refused {
+        eprintln!(
+            "owlshift: not stored: the {spec}: what was given holds a space or a control \
+             character, as a secret pasted across lines does."
+        );
+    }
+    if report.missing.is_empty() && report.refused.is_empty() {
         return next_steps();
     }
     for spec in &report.missing {
         eprintln!("owlshift: missing: the {spec}: {}.", spec.help);
     }
     if terminal {
-        eprintln!("owlshift: run `owlshift init` again to store it.");
+        eprintln!(
+            "owlshift: run `owlshift init` again to store it (`--replace-secrets` replaces a \
+             stored one)."
+        );
     } else {
         eprintln!(
             "owlshift: `owlshift init` asks for secrets on a terminal only: run it again in one."

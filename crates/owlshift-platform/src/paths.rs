@@ -41,22 +41,6 @@ pub fn data_dir() -> Option<PathBuf> {
     )
 }
 
-/// The folder that holds the login Claude Code uses for agent runs: a second
-/// login of the operator's own account, made once with `claude auth login`
-/// inside the sandbox, which Owlshift names through `CLAUDE_CONFIG_DIR` and
-/// never reads (OWL-41). It sits beside the personal configuration file, as
-/// `agent-login/claude`, under the same `OWLSHIFT_CONFIG_DIR` override.
-///
-/// `None` when the configuration directory is unknown.
-pub fn claude_agent_login_dir() -> Option<PathBuf> {
-    login_dir(personal_config_file()?)
-}
-
-/// The Claude Code login folder beside a personal configuration file.
-fn login_dir(config_file: PathBuf) -> Option<PathBuf> {
-    Some(config_file.parent()?.join("agent-login").join("claude"))
-}
-
 /// `override_dir`: `OWLSHIFT_CONFIG_DIR` as read from the environment.
 /// Unset, empty or relative means "no override". `config_dir`: the
 /// platform's parent configuration directory, as `dirs::config_dir()`
@@ -177,18 +161,5 @@ mod tests {
             );
         }
         assert_eq!(resolve_data(None, None), None);
-    }
-
-    #[test]
-    fn the_agent_login_sits_beside_the_personal_file() {
-        let dir = PathBuf::from(if cfg!(windows) {
-            r"C:\Users\test\owlshift-config"
-        } else {
-            "/tmp/owlshift-config"
-        });
-        assert_eq!(
-            login_dir(dir.join("config.toml")),
-            Some(dir.join("agent-login").join("claude"))
-        );
     }
 }

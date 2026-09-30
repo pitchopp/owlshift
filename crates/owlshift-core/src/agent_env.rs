@@ -3,7 +3,8 @@
 //!
 //! An agent, a harness CLI and every command it runs from its shell, starts
 //! from an empty environment. It inherits only what a program needs to run
-//! and what its harness needs to find its own login ([`INHERITED`]), the
+//! and where a harness other than Claude Code finds its own login
+//! ([`INHERITED`]), the
 //! locale ([`LOCALE_CATEGORIES`]) and the operator's proxy
 //! ([`PROXY_VARIABLES`], refused when it holds a login), plus the variables
 //! the project declares for its gate and the operator allows
@@ -35,9 +36,10 @@ pub const NO_CREDENTIAL: &str = "owlshift-agent-has-no-credential";
 ///
 /// Left out on purpose, among others: every token variable, `SSH_AUTH_SOCK`,
 /// every `GIT_*` variable, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and
-/// `DISPLAY` (they locate the Secret Service), and the variables a parent
-/// Claude Code session sets (`CLAUDECODE`, `ANTHROPIC_*`, `CLAUDE_*` but the
-/// configuration directory).
+/// `DISPLAY` (they locate the Secret Service), and every variable of Claude
+/// Code (`CLAUDECODE`, `ANTHROPIC_*`, `CLAUDE_*`): a confined Claude Code run
+/// gets its login and a configuration folder of its own from the runner, on
+/// the harness command alone (OWL-94).
 pub const INHERITED: &[&str] = &[
     // Running programs.
     "PATH",
@@ -82,8 +84,7 @@ pub const INHERITED: &[&str] = &[
     "PROCESSOR_ARCHITECTURE",
     "NUMBER_OF_PROCESSORS",
     "COMPUTERNAME",
-    // Where each harness keeps its own login.
-    "CLAUDE_CONFIG_DIR",
+    // Where Codex keeps its own login.
     "CODEX_HOME",
     // Reaching the network through the operator's proxy, with the
     // `PROXY_VARIABLES` below, and certificates.
@@ -366,6 +367,7 @@ mod tests {
             ("NO_PROXY", "localhost,.internal"),
             ("SystemRoot", "C:\\Windows"),
             ("CLAUDE_CONFIG_DIR", "/home/op/.claude"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-x"),
             ("DATABASE_URL", "postgres://localhost/test"),
             ("NODE_ENV", "test"),
             ("LINEAR_API_KEY", "lin_api_x"),
@@ -383,7 +385,6 @@ mod tests {
                    -o GSSAPIAuthentication=no";
         let expected = env(&[
             ("ALL_PROXY", "socks5://proxy:1080"),
-            ("CLAUDE_CONFIG_DIR", "/home/op/.claude"),
             ("DATABASE_URL", "postgres://localhost/test"),
             ("GH_ENTERPRISE_TOKEN", NO_CREDENTIAL),
             ("GH_TOKEN", NO_CREDENTIAL),

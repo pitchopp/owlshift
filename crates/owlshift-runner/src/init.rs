@@ -5,9 +5,9 @@
 //! overwritten: it is committed, and a person edits it from there. The
 //! secrets go to the system keychain, never to a file, an argument, an
 //! event or a message: the tracker's (a Linear API key, when the tracker is
-//! Linear) and the forge's (a GitHub token). The command line asks for them
-//! on a terminal only; this module decides which are missing and stores
-//! what it is given.
+//! Linear), the forge's (a GitHub token) and the token agent runs log in to
+//! Claude Code with (OWL-94). The command line asks for them on a terminal
+//! only; this module decides which are missing and stores what it is given.
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -20,6 +20,7 @@ use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
+use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::forge::{GITHUB_ACCOUNT, GITHUB_TOKEN_HELP};
 use crate::tracker::LINEAR_ACCOUNT;
 
@@ -42,8 +43,8 @@ pub fn project_file(options: &InitOptions) -> Result<String, String> {
         "\
 # Owlshift project configuration. Commit it: every developer and every
 # runner of the project read this file. It holds no secret: the tracker and
-# forge credentials live in each machine's system keychain (`owlshift init`
-# stores them), and the model logins stay with each harness CLI.
+# forge credentials, and the token agent runs log in to Claude Code with,
+# live in each machine's system keychain (`owlshift init` stores them).
 
 # The Owlshift versions that can read this file.
 requires = \">={}.{}\"
@@ -200,12 +201,22 @@ pub const GITHUB_TOKEN: SecretSpec = SecretSpec {
     help: GITHUB_TOKEN_HELP,
 };
 
+/// The Claude Code token agent runs log in with (OWL-94): confined, they
+/// cannot reach the Keychain, where the operator's own login lives.
+pub const CLAUDE_TOKEN: SecretSpec = SecretSpec {
+    account: CLAUDE_AGENT_ACCOUNT,
+    label: "Claude Code token for agent runs",
+    help: "a long-lived token of your Claude subscription, which agent runs log in with: run \
+           `claude setup-token` and paste the token it prints",
+};
+
 /// The secrets `owlshift do` needs for a project on `tracker`: the forge's
-/// always, the tracker's for Linear.
+/// and the agent runs' Claude Code token always, since `do` runs Claude
+/// Code, and the tracker's for Linear.
 pub fn required_secrets(tracker: TrackerKind) -> Vec<SecretSpec> {
     match tracker {
-        TrackerKind::Linear => vec![LINEAR_KEY, GITHUB_TOKEN],
-        TrackerKind::Markdown => vec![GITHUB_TOKEN],
+        TrackerKind::Linear => vec![LINEAR_KEY, GITHUB_TOKEN, CLAUDE_TOKEN],
+        TrackerKind::Markdown => vec![GITHUB_TOKEN, CLAUDE_TOKEN],
     }
 }
 
@@ -218,13 +229,17 @@ pub struct SecretsReport {
     pub kept: Vec<SecretSpec>,
     /// Neither in the keychain nor given.
     pub missing: Vec<SecretSpec>,
+    /// Given, but not one word: holding a space or a control character, as
+    /// a secret pasted wrong does. Not stored; one already there is kept.
+    pub refused: Vec<SecretSpec>,
 }
 
 /// Makes sure each of `specs` is in `keychain`. One already there is kept,
 /// unless `replace`; for any other, `ask` is called and what it gives is
-/// stored. `ask` answers `None` when it cannot ask, or was given nothing:
-/// the secret is then kept when it exists, missing otherwise. A secret is
-/// never part of the report or of an error.
+/// stored, trimmed, when it is one word ([`Secret::is_one_word`]), and
+/// refused otherwise. `ask` answers `None` when it cannot ask, or was given
+/// nothing: the secret is then kept when it exists, missing otherwise. A
+/// secret is never part of the report or of an error.
 pub fn store_secrets(
     keychain: &Keychain,
     specs: &[SecretSpec],
@@ -238,10 +253,13 @@ pub fn store_secrets(
             report.kept.push(*spec);
             continue;
         }
-        let given = ask(spec).filter(|secret| !secret.expose().trim().is_empty());
+        let given = ask(spec)
+            .map(|secret| Secret::new(secret.expose().trim()))
+            .filter(|secret| !secret.expose().is_empty());
         match given {
+            Some(secret) if !secret.is_one_word() => report.refused.push(*spec),
             Some(secret) => {
-                keychain.store(spec.account, &Secret::new(secret.expose().trim()))?;
+                keychain.store(spec.account, &secret)?;
                 report.stored.push(*spec);
             }
             None if present => report.kept.push(*spec),
@@ -322,8 +340,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(asked, [LINEAR_ACCOUNT]);
-        assert_eq!(report.stored, [LINEAR_KEY]);
+        assert_eq!(asked, [LINEAR_ACCOUNT, CLAUDE_AGENT_ACCOUNT]);
+        assert_eq!(report.stored, [LINEAR_KEY, CLAUDE_TOKEN]);
         assert_eq!(report.kept, [GITHUB_TOKEN]);
         assert!(report.missing.is_empty());
         // Stored trimmed, and absent from everything a person is shown.
@@ -331,8 +349,21 @@ mod tests {
             keychain.read(LINEAR_ACCOUNT).unwrap().unwrap().expose(),
             SENTINEL
         );
-        let shown = format!("{report:?} {} {}", LINEAR_KEY, GITHUB_TOKEN);
+        assert_eq!(
+            keychain
+                .read(CLAUDE_AGENT_ACCOUNT)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            SENTINEL
+        );
+        let shown = format!("{report:?} {LINEAR_KEY} {GITHUB_TOKEN} {CLAUDE_TOKEN}");
         assert!(!shown.contains("SENTINEL"), "{shown}");
+        assert!(CLAUDE_TOKEN.help.contains("`claude setup-token`"));
+        assert_eq!(
+            required_secrets(TrackerKind::Markdown),
+            [GITHUB_TOKEN, CLAUDE_TOKEN]
+        );
 
         // Replacing asks again; an empty answer keeps what is there, and a
         // secret nobody gives is missing.
@@ -344,5 +375,22 @@ mod tests {
         keychain.delete(GITHUB_ACCOUNT).unwrap();
         let report = store_secrets(&keychain, &[GITHUB_TOKEN], false, &mut |_| None).unwrap();
         assert_eq!(report.missing, [GITHUB_TOKEN]);
+
+        // A secret pasted across two lines is refused, and the one stored
+        // is kept.
+        let report = store_secrets(&keychain, &[CLAUDE_TOKEN], true, &mut |_| {
+            Some(Secret::new("sk-ant-oat01-SENTINEL\nrest"))
+        })
+        .unwrap();
+        assert_eq!(report.refused, [CLAUDE_TOKEN]);
+        assert!(report.stored.is_empty());
+        assert_eq!(
+            keychain
+                .read(CLAUDE_AGENT_ACCOUNT)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            SENTINEL
+        );
     }
 }

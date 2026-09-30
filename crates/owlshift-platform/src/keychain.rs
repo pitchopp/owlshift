@@ -30,6 +30,13 @@ impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// Whether the value is one word: not empty, with no space and no
+    /// control character. Every secret Owlshift keeps is a key or a token;
+    /// one holding a line break or a space was pasted wrong.
+    pub fn is_one_word(&self) -> bool {
+        !self.0.is_empty() && !self.0.chars().any(|c| c.is_whitespace() || c.is_control())
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -110,6 +117,19 @@ impl Keychain {
         }
     }
 
+    /// Whether a secret is stored for `account`, for a check that needs its
+    /// presence alone, such as `owlshift doctor`'s: the value is never
+    /// returned. The store may still read the entry to answer, as the macOS
+    /// Keychain does, so the system may ask to allow the access, as it does
+    /// for [`Keychain::read`].
+    pub fn contains(&self, account: &str) -> Result<bool, KeychainError> {
+        match self.entry(account)?.get_credential() {
+            Ok(_) => Ok(true),
+            Err(StoreError::NoEntry) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Stores a secret for `account`, replacing any previous one.
     pub fn store(&self, account: &str, secret: &Secret) -> Result<(), KeychainError> {
         Ok(self.entry(account)?.set_password(secret.expose())?)
@@ -137,9 +157,13 @@ mod tests {
     fn an_entry_is_stored_read_replaced_and_deleted() {
         let keychain = Keychain::in_memory();
         assert_eq!(keychain.read("linear").unwrap(), None);
+        assert!(!keychain.contains("linear").unwrap());
         assert!(!keychain.delete("linear").unwrap());
 
         keychain.store("linear", &Secret::new("first")).unwrap();
+        assert!(keychain.contains("linear").unwrap());
+        // An account is matched whole, not as part of another's name.
+        assert!(!keychain.contains("line").unwrap());
         keychain.store("linear", &Secret::new("second")).unwrap();
         assert_eq!(
             keychain.read("linear").unwrap(),
@@ -149,6 +173,15 @@ mod tests {
 
         assert!(keychain.delete("linear").unwrap());
         assert_eq!(keychain.read("linear").unwrap(), None);
+        assert!(!keychain.contains("linear").unwrap());
+    }
+
+    #[test]
+    fn a_secret_is_one_word() {
+        assert!(Secret::new("sk-ant-oat01-a_b").is_one_word());
+        for pasted_wrong in ["", "a b", "a\nb", "a\tb", "a\u{0}b", "a\u{a0}b"] {
+            assert!(!Secret::new(pasted_wrong).is_one_word(), "{pasted_wrong:?}");
+        }
     }
 
     #[test]
@@ -173,7 +206,9 @@ mod tests {
         let keychain = Keychain::system().unwrap();
         let account = format!("live-check-{}", std::process::id());
         keychain.delete(&account).unwrap();
+        assert!(!keychain.contains(&account).unwrap());
         keychain.store(&account, &Secret::new("dummy")).unwrap();
+        assert!(keychain.contains(&account).unwrap());
         assert_eq!(keychain.read(&account).unwrap(), Some(Secret::new("dummy")));
         assert!(keychain.delete(&account).unwrap());
         assert_eq!(keychain.read(&account).unwrap(), None);

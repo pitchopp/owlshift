@@ -21,7 +21,9 @@ use std::process::{Command, Output};
 /// configuration file anymore. `OWLSHIFT_DATA_DIR` is `<config_dir>/data`.
 ///
 /// No test here reaches the system keychain: `init` runs with
-/// `--skip-secrets`, and `do` is refused before it opens the keychain.
+/// `--skip-secrets`, `do` is refused before it opens the keychain, and
+/// `doctor` asks it for the agent runs' token only when `claude` is on the
+/// `PATH`, which these tests keep to a fake `git` and the system folders.
 fn owlshift(dir: &Path, config_dir: &Path, args: &[&str]) -> Output {
     command(dir, config_dir, args).output().unwrap()
 }
