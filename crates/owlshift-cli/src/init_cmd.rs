@@ -164,7 +164,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
 
 fn next_steps() -> ExitCode {
     println!(
-        "Next: `owlshift doctor` checks git and the harness logins; `owlshift do TICKET` runs \
+        "Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for agent runs; `owlshift do TICKET` runs \
          a ticket."
     );
     ExitCode::SUCCESS

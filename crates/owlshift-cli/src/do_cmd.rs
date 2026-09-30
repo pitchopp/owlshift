@@ -80,7 +80,7 @@ fn run_with(
     };
     let Some(claude) = system.locate("claude") else {
         return Err(
-            "`claude` is not on the PATH: install Claude Code and log in (`owlshift doctor` checks it)"
+            "`claude` is not on the PATH: install Claude Code (agent runs log in with the token `owlshift init` stores; `owlshift doctor` checks it)"
                 .to_owned(),
         );
     };

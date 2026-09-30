@@ -27,7 +27,7 @@ A repository that people and agents can build in safely, and a first command tha
 - Cargo workspace with its six crates; CI on macOS, Linux and Windows running format, lint and tests.
 - Contracts written and schema-checked: brief, `result.json`, project and personal config (TOML), events, git ref layout.
 - Test harness: a fake harness, an in-repository test tracker, a local bare git remote, a scenario runner.
-- CLI skeleton: `owlshift --version`, `owlshift doctor` (git, `claude` and `codex` installed and logged in), `owlshift config show`.
+- CLI skeleton: `owlshift --version`, `owlshift doctor` (git, `claude` and `codex` installed, `codex` logged in, the token agent runs log in to Claude Code with stored by `owlshift init`), `owlshift config show`.
 - Project tooling: the Owlshift Linear workspace (states including Needs Input and Triage, labels, one project per step), a contribution guide, decision D10.
 
 **Exit gate.** CI green on the three platforms; one scenario runs end to end with the fake harness and the test tracker; `owlshift doctor` reports the maintainer's machine correctly.
