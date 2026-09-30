@@ -14,6 +14,14 @@
 //! the sentinel reads the end of its input, kills every group still live,
 //! and ends.
 //!
+//! The writes never block: a line that finds the pipe full is lost. A
+//! sentinel that lost a line holds a list that may miss a `-`, so Owlshift
+//! kills it at once, before the drop or the stop that wrote the line
+//! returns (OWL-93): it then stops nothing, not even a tree whose handle was
+//! dropped. Its script ignores SIGHUP, so a sentinel stopped when Owlshift
+//! ends, which the system then hangs up and continues, still reads the end
+//! of its input.
+//!
 //! [`probe_sentinel`] checks, with a sentinel and a process group of its
 //! own, that this host's `/bin/sh` does so (OWL-90).
 //!
@@ -32,7 +40,15 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, waitid};
 /// of the `-` lines, and at the end of its input kills each group left, as
 /// `ProcessTree::kill` does. POSIX sh, builtins only, since it runs with an
 /// empty environment: dash on Debian and Ubuntu, bash on macOS.
-const SCRIPT: &str = r#"trees=
+///
+/// It first ignores SIGHUP (OWL-93): when Owlshift's end orphans the
+/// sentinel's process group while the sentinel is stopped, the system sends
+/// the group SIGHUP, then SIGCONT, and the sentinel must live on to read the
+/// end of its input. It then closes its output, which only a test reads, to
+/// tell it so.
+const SCRIPT: &str = r#"trap '' HUP
+exec >&-
+trees=
 while read -r sign group; do
   case $sign in
     +) trees="$trees $group" ;;
@@ -58,7 +74,13 @@ done
 pub(super) struct Sentinel {
     process: Child,
     input: ChildStdin,
+    /// Whether a line to it was lost, its pipe full, and so it was killed
+    /// (OWL-93). Nothing more is written to it then.
+    lost: bool,
 }
+
+/// How a sentinel killed for a lost line ended.
+const LOST: &str = "killed by Owlshift once its input was full, a line to it lost";
 
 /// Whether the sentinel protects the live trees from a hard kill
 /// (`stop_trees_when_killed`), as far as this process can tell.
@@ -72,15 +94,16 @@ pub enum SentinelStatus {
         pid: u32,
     },
     /// It runs but is stopped, as by SIGSTOP, and reads nothing until it is
-    /// continued (OWL-91): it protects nothing meanwhile, and when this
-    /// process ends, the system hangs it up before it reads the end of its
-    /// input.
+    /// continued (OWL-91). When this process ends, the system continues it,
+    /// and it stops the live trees then (OWL-93), unless its input filled
+    /// first: this process kills it then, and it ends.
     Stopped {
         /// Its process id.
         pid: u32,
     },
     /// It ended, as said: nothing protects the trees any more. Owlshift
-    /// never starts another.
+    /// never starts another, and kills it itself once a line to it is lost
+    /// (OWL-93).
     Ended(String),
 }
 
@@ -107,21 +130,38 @@ impl Sentinel {
     /// Starts `script` as a sentinel named `name`: [`SCRIPT`] but in the
     /// test of a sentinel that never stops anything.
     fn start_running(script: &str, name: &str) -> io::Result<Self> {
-        let mut process = sh(script, name).process_group(0).spawn()?;
+        let mut command = sh(script, name);
+        // Its output stays in `process`, never read but by the tests: the
+        // script writes nothing to it, it closes it.
+        command.stdout(Stdio::piped()).process_group(0);
+        let mut process = command.spawn()?;
         let input = process.stdin.take().expect("the input is piped");
         // A sentinel that stops reading must never block a spawn, a dropped
         // tree or the signal handler, which all write under the lock of the
         // live trees: once the pipe is full, a line is lost instead.
         let flags = fcntl_getfl(&input)?;
         fcntl_setfl(&input, flags | OFlags::NONBLOCK)?;
-        Ok(Self { process, input })
+        Ok(Self {
+            process,
+            input,
+            lost: false,
+        })
     }
 
     /// Whether it still runs, and is not stopped, without waiting: a
     /// sentinel that ended is reaped here.
     pub(super) fn status(&mut self) -> SentinelStatus {
         let pid = self.process.id();
-        match self.process.try_wait() {
+        let state = self.process.try_wait();
+        if self.lost {
+            // Killed by SIGKILL, which nothing catches: it runs no more,
+            // reaped or not yet.
+            return SentinelStatus::Ended(match state {
+                Ok(Some(status)) => format!("{LOST} ({status})"),
+                _ => LOST.to_owned(),
+            });
+        }
+        match state {
             Ok(None) if self.is_stopped() => SentinelStatus::Stopped { pid },
             Ok(None) => SentinelStatus::Running { pid },
             Ok(Some(status)) => SentinelStatus::Ended(status.to_string()),
@@ -142,6 +182,18 @@ impl Sentinel {
         )
     }
 
+    /// Waits until its script closed its output, which it does once it
+    /// ignores SIGHUP, or until it ended.
+    #[cfg(test)]
+    pub(super) fn wait_until_it_ignores_hangups(&mut self) {
+        use std::io::Read;
+
+        let mut output = self.process.stdout.take().expect("the output is piped");
+        let mut rest = Vec::new();
+        output.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the sentinel wrote {rest:?}");
+    }
+
     /// Tells the sentinel a tree is live.
     pub(super) fn announce(&mut self, group: Pid) {
         self.send('+', group);
@@ -155,9 +207,25 @@ impl Sentinel {
     /// Best effort: a line that cannot be written is lost, whether the
     /// sentinel is gone or its pipe is full. A write this short to a pipe is
     /// whole or nothing, so the sentinel never reads half a line.
+    ///
+    /// A line lost to a full pipe leaves the sentinel with a list that may
+    /// miss a `-`, and once continued it would kill a tree whose handle was
+    /// dropped. So it is killed here, under the lock of the live trees,
+    /// before the drop or the stop that sent the line returns (OWL-93): a
+    /// hard kill of Owlshift before then ends it while that tree is still
+    /// live. The kill, by its pid, which stays its own until it is reaped,
+    /// fails only for a sentinel that ended already.
     fn send(&mut self, sign: char, group: Pid) {
+        if self.lost {
+            return;
+        }
         let line = format!("{sign} {}\n", group.as_raw_nonzero());
-        let _ = self.input.write_all(line.as_bytes());
+        if let Err(error) = self.input.write_all(line.as_bytes())
+            && error.kind() == io::ErrorKind::WouldBlock
+        {
+            self.lost = true;
+            let _ = self.process.kill();
+        }
     }
 }
 
@@ -218,7 +286,7 @@ fn probe_with(script: &str, bound: Duration) -> SentinelProbe {
         Err(error) => return SentinelProbe::CannotStart(format!("a test sentinel: {error}")),
     };
     sentinel.announce(group);
-    let Sentinel { process, input } = sentinel;
+    let Sentinel { process, input, .. } = sentinel;
     started.sentinel = Some(process);
     drop(input);
     let ended = Instant::now();
@@ -436,5 +504,35 @@ mod tests {
         sentinel.process.kill().unwrap();
         let ended = status_once(sentinel, |s| matches!(s, SentinelStatus::Ended(_)));
         assert_eq!(ended, SentinelStatus::Ended("signal: 9 (SIGKILL)".into()));
+    }
+
+    /// OWL-93: a stopped sentinel sent more lines than its pipe holds loses
+    /// one, and is killed for it at once, which its status says.
+    #[test]
+    fn a_sentinel_that_loses_a_line_is_killed() {
+        let mut reaped = Reaped(Sentinel::start().unwrap());
+        let sentinel = &mut reaped.0;
+        kill_process(Pid::from_child(&sentinel.process), Signal::STOP).unwrap();
+        let stopped = status_once(sentinel, |s| matches!(s, SentinelStatus::Stopped { .. }));
+        assert!(
+            matches!(stopped, SentinelStatus::Stopped { .. }),
+            "{stopped:?}"
+        );
+
+        // Pid 1 leads no tree, so each line changes nothing; 256 KiB of
+        // them, more than a pipe holds.
+        let none = Pid::from_raw(1).unwrap();
+        for _ in 0..64 * 1024 {
+            sentinel.withdraw(none);
+        }
+        assert!(sentinel.lost, "no line was lost");
+        let ended = status_once(
+            sentinel,
+            |s| matches!(s, SentinelStatus::Ended(how) if how.ends_with(')')),
+        );
+        assert_eq!(
+            ended,
+            SentinelStatus::Ended(format!("{LOST} (signal: 9 (SIGKILL))"))
+        );
     }
 }

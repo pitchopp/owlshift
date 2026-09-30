@@ -372,13 +372,18 @@ mod tests {
     /// Whether a process is still running; a zombie is not.
     #[cfg(unix)]
     fn is_alive(pid: u32) -> bool {
+        let state = state(pid);
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    /// A process's state as `ps` shows it; empty once it is gone.
+    #[cfg(unix)]
+    fn state(pid: u32) -> String {
         let ps = Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
             .unwrap();
-        let state = String::from_utf8_lossy(&ps.stdout);
-        let state = state.trim();
-        !state.is_empty() && !state.starts_with('Z')
+        String::from_utf8_lossy(&ps.stdout).trim().to_owned()
     }
 
     /// Whether a process is still running.
@@ -468,20 +473,283 @@ mod tests {
         ProcessTree::spawn(Command::new("sleep").arg("30")).unwrap()
     }
 
+    /// Waits until `done` holds, 5 s at most.
+    #[cfg(unix)]
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "still waiting for {what} after 5 s"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Writes `pids`, space-separated, to `pids` in the working directory,
+    /// whole or not at all.
+    #[cfg(unix)]
+    fn write_pids(pids: &[u32]) {
+        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        std::fs::write("pids.tmp", pids.join(" ")).unwrap();
+        std::fs::rename("pids.tmp", "pids").unwrap();
+    }
+
+    /// What a helper that owns trees does with its sentinel before it is
+    /// killed.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scenario {
+        /// Leaves it running.
+        Running,
+        /// Stops it (OWL-93).
+        Stopped,
+        /// Stops it, then sends it more lines than its pipe holds, and only
+        /// then drops the tree to spare, so that the line telling so is
+        /// lost (OWL-93).
+        Filled,
+    }
+
+    /// Owns a live tree, spawned before the sentinel starts, which learns of
+    /// it then, and a tree whose handle it drops; writes the pids of both
+    /// roots and of the sentinel, then sleeps until it is killed.
+    #[cfg(unix)]
+    fn own_trees_then_sleep(scenario: Scenario) {
+        use rustix::process::{Pid, Signal, kill_process};
+
+        let (live, _live) = sleeper();
+        stop_trees_when_killed().unwrap();
+        signals::with_sentinel(|sentinel| sentinel.wait_until_it_ignores_hangups()).unwrap();
+        let (dropped, tree) = sleeper();
+        let mut tree = Some(tree);
+        if scenario != Scenario::Filled {
+            drop(tree.take());
+        }
+        let status = sentinel_status();
+        let SentinelStatus::Running { pid: sentinel } = status else {
+            panic!("the sentinel does not run: {status:?}");
+        };
+        if scenario != Scenario::Running {
+            let pid = Pid::from_raw(i32::try_from(sentinel).unwrap()).unwrap();
+            kill_process(pid, Signal::STOP).unwrap();
+            wait_until("the sentinel to stop", || {
+                matches!(sentinel_status(), SentinelStatus::Stopped { .. })
+            });
+        }
+        if scenario == Scenario::Filled {
+            // Pid 1 leads no tree, so each line changes nothing; 256 KiB of
+            // them, more than a pipe holds.
+            let none = Pid::from_raw(1).unwrap();
+            signals::with_sentinel(|sentinel| {
+                for _ in 0..64 * 1024 {
+                    sentinel.withdraw(none);
+                }
+            });
+            drop(tree.take());
+        }
+        write_pids(&[live.id(), dropped.id(), sentinel]);
+        thread::sleep(Duration::from_secs(20));
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore = "helper, run by the tests below"]
     fn helper_own_trees_then_sleep() {
         if helper_requested() {
-            // Spawned before the sentinel starts, which learns of it then.
-            let (live, _tree) = sleeper();
-            stop_trees_when_killed().unwrap();
-            let (dropped, tree) = sleeper();
-            drop(tree);
-            std::fs::write("pids.tmp", format!("{} {}", live.id(), dropped.id())).unwrap();
-            std::fs::rename("pids.tmp", "pids").unwrap();
-            thread::sleep(Duration::from_secs(20));
+            own_trees_then_sleep(Scenario::Running);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_own_trees_with_the_sentinel_stopped_then_sleep() {
+        if helper_requested() {
+            own_trees_then_sleep(Scenario::Stopped);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_own_trees_with_the_sentinel_input_filled_then_sleep() {
+        if helper_requested() {
+            own_trees_then_sleep(Scenario::Filled);
+        }
+    }
+
+    /// The name of the shell `helper_own_a_stopped_shell_then_sleep` starts.
+    #[cfg(unix)]
+    const ORPHAN: &str = "owlshift-test-orphan";
+
+    /// Starts a shell in a process group of its own that writes `hup` to a
+    /// file when it gets SIGHUP, and reads its input, a pipe this helper
+    /// holds; stops it once it traps SIGHUP, writes its pid, then sleeps
+    /// until it is killed.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_own_a_stopped_shell_then_sleep() {
+        if helper_requested() {
+            use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process, waitid};
+            use std::os::unix::process::CommandExt;
+
+            let mut shell = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap 'echo hup > hup' HUP; echo > ready; read -r line; :",
+                    ORPHAN,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            wait_until("the shell to trap SIGHUP", || Path::new("ready").exists());
+            let pid = Pid::from_child(&shell);
+            kill_process(pid, Signal::STOP).unwrap();
+            let stopped = WaitIdOptions::STOPPED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+            wait_until(
+                "the shell to stop",
+                || matches!(waitid(WaitId::Pid(pid), stopped), Ok(Some(status)) if status.stopped()),
+            );
+            write_pids(&[shell.id()]);
+            thread::sleep(Duration::from_secs(20));
+            // Not reached when the test kills this helper, as it does.
+            let _ = shell.kill();
+            let _ = shell.wait();
+        }
+    }
+
+    /// A helper of this test binary, run in a process of its own and in a
+    /// directory of its own, where it writes the pids of what it owns.
+    #[cfg(unix)]
+    struct Owner {
+        process: Child,
+        dir: tempfile::TempDir,
+        pids: Vec<u32>,
+    }
+
+    #[cfg(unix)]
+    impl Owner {
+        /// Starts the helper `name` and waits for its pids.
+        fn start(name: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = std::env::current_exe().unwrap();
+            let test = format!("process::tests::{name}");
+            let process = Command::new(exe)
+                .args([
+                    "--exact",
+                    &test,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(dir.path())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut owner = Self {
+                process,
+                dir,
+                pids: Vec::new(),
+            };
+            let pids = owner.dir.path().join("pids");
+            let started = Instant::now() + Duration::from_secs(10);
+            while !pids.exists() {
+                if let Some(status) = owner.process.try_wait().unwrap() {
+                    panic!("{name} ended before it wrote its pids: {status}");
+                }
+                assert!(Instant::now() < started, "{name} never wrote its pids");
+                thread::sleep(Duration::from_millis(20));
+            }
+            owner.pids = std::fs::read_to_string(pids)
+                .unwrap()
+                .split(' ')
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            owner
+        }
+
+        /// Kills it outright, with SIGKILL: no handler runs.
+        fn kill(&mut self) {
+            self.process.kill().unwrap();
+            self.process.wait().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            // Once reaped, both do nothing.
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
+    }
+
+    /// Kills, on the way out, what a test leaves behind: the trees, `sleep`
+    /// processes, and a process left stopped when its parent was killed, each
+    /// only while `ps` still shows it as such, so that its pid is still its
+    /// own. `KillIfStopped` in the CLI's tests does as much for `owlshift`'s
+    /// sentinel, in a crate of its own.
+    #[cfg(unix)]
+    struct Left {
+        trees: Vec<u32>,
+        /// The pid and the name of the process that may be left stopped.
+        stopped: (u32, &'static str),
+    }
+
+    #[cfg(unix)]
+    impl Drop for Left {
+        fn drop(&mut self) {
+            // Nothing here may panic: it also runs while a failed test
+            // unwinds.
+            let shown = |pid: u32| {
+                Command::new("ps")
+                    .args(["-ww", "-o", "stat=,command=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|ps| String::from_utf8_lossy(&ps.stdout).trim().to_owned())
+                    .unwrap_or_default()
+            };
+            let kill = |pid: u32| {
+                let _ = Command::new("kill")
+                    .args(["-s", "KILL", &pid.to_string()])
+                    .status();
+            };
+            for &tree in &self.trees {
+                let shown = shown(tree);
+                if !shown.starts_with('Z') && shown.ends_with("sleep 30") {
+                    kill(tree);
+                }
+            }
+            let (pid, name) = self.stopped;
+            let shown = shown(pid);
+            if shown.starts_with('T') && shown.contains(name) {
+                kill(pid);
+            }
+        }
+    }
+
+    /// Kills the owner of the trees outright, then checks that its live tree
+    /// is gone within 5 s and that the tree whose handle it dropped still
+    /// runs.
+    #[cfg(unix)]
+    fn assert_a_hard_kill_stops_only_the_live_tree(helper: &str) {
+        let mut owner = Owner::start(helper);
+        let &[live, dropped, sentinel] = owner.pids.as_slice() else {
+            panic!("pids: {:?}", owner.pids);
+        };
+        let _left = Left {
+            trees: vec![live, dropped],
+            stopped: (sentinel, "owlshift-sentinel"),
+        };
+        owner.kill();
+        wait_until("the live tree to be stopped", || !is_alive(live));
+        // The sentinel stops every tree it knows of at once: give a wrong
+        // stop time to land before checking it did not happen.
+        thread::sleep(Duration::from_millis(300));
+        assert!(is_alive(dropped), "the dropped tree was stopped");
     }
 
     /// OWL-86: once the sentinel runs, killing the process that owns the
@@ -490,51 +758,66 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hard_kill_stops_the_live_trees_and_leaves_a_dropped_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = std::env::current_exe().unwrap();
-        let mut owner = Command::new(exe)
-            .args([
-                "--exact",
-                "process::tests::helper_own_trees_then_sleep",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .current_dir(dir.path())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let pids = dir.path().join("pids");
-        let started = Instant::now() + Duration::from_secs(10);
-        while !pids.exists() {
-            if let Some(status) = owner.try_wait().unwrap() {
-                panic!("the owner ended before its trees started: {status}");
-            }
-            assert!(Instant::now() < started, "the trees never started");
-            thread::sleep(Duration::from_millis(20));
-        }
-        let pids: Vec<u32> = std::fs::read_to_string(pids)
-            .unwrap()
-            .split(' ')
-            .map(|pid| pid.parse().unwrap())
-            .collect();
-        let (live, dropped) = (pids[0], pids[1]);
+        assert_a_hard_kill_stops_only_the_live_tree("helper_own_trees_then_sleep");
+    }
 
-        // SIGKILL: no handler runs.
-        owner.kill().unwrap();
-        owner.wait().unwrap();
+    /// OWL-93: a sentinel stopped when the process owning the trees is killed
+    /// outright still stops the live trees, and only them: that process's end
+    /// orphans the sentinel's group, so the system sends it SIGHUP, which it
+    /// ignores, then SIGCONT.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_kill_with_the_sentinel_stopped_still_stops_the_live_trees() {
+        assert_a_hard_kill_stops_only_the_live_tree(
+            "helper_own_trees_with_the_sentinel_stopped_then_sleep",
+        );
+    }
 
-        let settled = Instant::now() + Duration::from_secs(5);
-        while is_alive(live) {
-            assert!(Instant::now() < settled, "the live tree still runs");
-            thread::sleep(Duration::from_millis(50));
-        }
-        // The sentinel stops every tree it knows of at once: give a wrong
-        // stop time to land before checking it did not happen.
+    /// OWL-93: a stopped sentinel that lost a line, the one that spares a
+    /// tree whose handle was dropped, never stops that tree, even once a hard
+    /// kill of the process owning the trees has the system continue it.
+    #[cfg(unix)]
+    #[test]
+    fn a_sentinel_that_lost_a_line_never_stops_a_dropped_tree() {
+        let mut owner = Owner::start("helper_own_trees_with_the_sentinel_input_filled_then_sleep");
+        let &[live, dropped, sentinel] = owner.pids.as_slice() else {
+            panic!("pids: {:?}", owner.pids);
+        };
+        let _left = Left {
+            trees: vec![live, dropped],
+            stopped: (sentinel, "owlshift-sentinel"),
+        };
+        owner.kill();
+        // Whatever the sentinel does, it has done once it is gone.
+        wait_until("the sentinel to be gone", || !is_alive(sentinel));
         thread::sleep(Duration::from_millis(300));
-        let spared = is_alive(dropped);
-        let _ = Command::new("kill").arg(dropped.to_string()).status();
-        assert!(spared, "the dropped tree was stopped");
+        assert!(is_alive(dropped), "the dropped tree was stopped");
+    }
+
+    /// OWL-93, what the sentinel relies on: a stopped process whose group the
+    /// end of its parent orphans gets SIGHUP, then SIGCONT, as POSIX requires
+    /// of such an exit. Run on Linux and macOS; where a subreaper of the same
+    /// session adopts the process, its group is not orphaned and this fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_group_is_hung_up_then_continued_when_its_parent_ends() {
+        let mut owner = Owner::start("helper_own_a_stopped_shell_then_sleep");
+        let shell = owner.pids[0];
+        let _left = Left {
+            trees: Vec::new(),
+            stopped: (shell, ORPHAN),
+        };
+        let hup = owner.dir.path().join("hup");
+        // While its parent lives, its group is not orphaned: nothing
+        // continues it, nothing hangs it up.
+        assert!(state(shell).starts_with('T'), "{}", state(shell));
+        assert!(!hup.exists());
+        owner.kill();
+        // Continued, it runs its trap, then reads the end of its input.
+        wait_until("the shell to be hung up and gone", || {
+            hup.exists() && !is_alive(shell)
+        });
+        assert_eq!(std::fs::read_to_string(&hup).unwrap(), "hup\n");
     }
 
     #[test]

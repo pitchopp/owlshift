@@ -76,9 +76,15 @@ static INSTALLED: Mutex<bool> = Mutex::new(false);
 ///
 /// - a kill that lands between a tree's start and the moment the sentinel is
 ///   told of it, well under a millisecond, leaves that tree running;
-/// - once the sentinel is killed, or stops reading, it protects nothing
-///   more, and it is not restarted; [`sentinel_status`] tells whether it
-///   still runs, or is stopped, without waiting on it;
+/// - once the sentinel is killed it protects nothing more, and it is not
+///   restarted; [`sentinel_status`] tells whether it still runs, or is
+///   stopped, without waiting on it;
+/// - a sentinel that is stopped reads nothing, but when this process ends
+///   the system continues it, and it stops the live trees then, unless its
+///   input filled first: a line to it is lost then, so this process kills it
+///   rather than let it act on a list that misses one; and one stopped in
+///   its first milliseconds, before its script ignores SIGHUP, dies of the
+///   SIGHUP that comes with being continued;
 /// - as with [`ProcessTree::kill`], a process that left its tree's group is
 ///   not stopped, and a group id could in theory belong to another group by
 ///   then, once the pid space wrapped around.
@@ -120,6 +126,13 @@ pub fn sentinel_status() -> super::SentinelStatus {
         Some(sentinel) => sentinel.status(),
         None => super::SentinelStatus::NotRunning,
     }
+}
+
+/// Acts on the sentinel [`stop_trees_when_killed`] started, if any, under
+/// the lock of the live trees.
+#[cfg(all(test, unix))]
+pub(super) fn with_sentinel<R>(act: impl FnOnce(&mut super::sentinel::Sentinel) -> R) -> Option<R> {
+    live().sentinel.as_mut().map(act)
 }
 
 /// What stops a live tree: its process group.
