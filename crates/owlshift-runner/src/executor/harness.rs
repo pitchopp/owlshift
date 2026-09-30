@@ -80,6 +80,12 @@ pub struct SandboxNeeds {
     pub writable: Vec<PathBuf>,
     /// The login the harness runs on; `None`: it needs none from the runner.
     pub login: Option<HarnessLogin>,
+    /// The variable naming a temporary folder of the harness's own, such as
+    /// `CLAUDE_CODE_TMPDIR`. The executor sets it on the harness command
+    /// alone to [`HARNESS_TEMP_DIR`](super::HARNESS_TEMP_DIR) in the run's own
+    /// temporary folder, which the harness makes itself: nothing more is
+    /// opened in the sandbox (OWL-100).
+    pub temp_variable: Option<&'static str>,
 }
 
 /// A harness's login for agent runs (OWL-94). The executor gives it to the
@@ -331,10 +337,15 @@ impl Harness for ClaudeHarness {
 
     /// The folders `claude` is installed in (the one on the `PATH` and the
     /// one its link leads to), read; and its login, the token of `login`
-    /// with a configuration folder of the run's own. A confined run without
-    /// a token, or with one that is not one word, is refused with the fix.
+    /// with a configuration folder of the run's own; and, confined, a
+    /// temporary folder of the run's own, clear of the user's
+    /// `/tmp/claude-<uid>` (OWL-100). A confined run without a token, or with
+    /// one that is not one word, is refused with the fix.
     fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
         let mut needs = SandboxNeeds::default();
+        if agent.is_confined() {
+            needs.temp_variable = Some(claude::TMPDIR_ENV);
+        }
         let program = if self.program.is_absolute() {
             Some(self.program.clone())
         } else {
@@ -554,11 +565,13 @@ mod tests {
                 config_variable: "CLAUDE_CONFIG_DIR",
             })
         );
+        assert_eq!(needs.temp_variable, Some("CLAUDE_CODE_TMPDIR"));
         assert!(needs.writable.is_empty());
         assert!(!format!("{needs:?}").contains("SENTINEL"));
 
         let bare = AgentEnv::new(parent).unwrap().without_confinement();
-        assert_eq!(claude(None).sandbox_needs(&bare).unwrap().login, None);
+        let needs = claude(None).sandbox_needs(&bare).unwrap();
+        assert_eq!((needs.login, needs.temp_variable), (None, None));
     }
 
     #[test]

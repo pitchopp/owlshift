@@ -35,10 +35,12 @@ use owlshift_testkit::git::{GitEnv, seed};
 const BRANCH: &str = "owlshift/T-1";
 
 /// A harness that is one shell script, logged in with a token when one is
-/// given, as Claude Code is.
+/// given, as Claude Code is, and naming a temporary folder of its own when
+/// asked, as Claude Code does (OWL-100).
 struct Script {
     line: String,
     login: Option<Secret>,
+    temp_variable: Option<&'static str>,
 }
 
 impl Harness for Script {
@@ -55,6 +57,7 @@ impl Harness for Script {
                 token,
                 config_variable: claude::CONFIG_DIR_ENV,
             }),
+            temp_variable: self.temp_variable,
             ..SandboxNeeds::default()
         })
     }
@@ -121,6 +124,15 @@ impl Bench {
         script: &str,
         login: Option<Secret>,
     ) -> Result<RunReport, ExecutorError> {
+        let harness = Script {
+            line: script.to_owned(),
+            login,
+            temp_variable: None,
+        };
+        self.run_harness(agent, &harness)
+    }
+
+    fn run_harness(&self, agent: AgentEnv, harness: &Script) -> Result<RunReport, ExecutorError> {
         let runner = self.env.clone();
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner.apply(command)),
@@ -137,11 +149,7 @@ impl Bench {
             run_dir: &self.run_dir(),
             brief: &brief(),
         };
-        let harness = Script {
-            line: script.to_owned(),
-            login,
-        };
-        executor.run(&spec, &harness)
+        executor.run(&spec, harness)
     }
 
     fn run_dir(&self) -> PathBuf {
@@ -409,6 +417,101 @@ fn a_confined_harness_logs_in_with_its_token_and_no_output_keeps_it() {
         "{text}"
     );
     assert!(!format!("{leaked:?}").contains(TOKEN));
+}
+
+/// A harness that keeps its temporary files as Claude Code does: in a
+/// `claude-<uid>` folder under `CLAUDE_CODE_TMPDIR`, which must be set (the
+/// `:?` fails the script otherwise). It says whether it wrote there, whether
+/// that folder lies in the run's `TMPDIR`, and what it gets from the user's
+/// own `/tmp/claude-<uid>`.
+#[cfg(unix)]
+const TEMP_FILES: &str = r#"
+uid=$(id -u) || exit 3
+d="${CLAUDE_CODE_TMPDIR:?}/claude-$uid"
+mkdir -p "$d" && echo x > "$d/probe" && echo own=ok > probe.txt || echo own=failed > probe.txt
+case "$CLAUDE_CODE_TMPDIR" in "$TMPDIR"/*) echo tmpdir=run;; *) echo tmpdir=other;; esac >> probe.txt
+out=$(ls "/tmp/claude-$uid" 2>&1)
+case "$out" in
+  *"not permitted"*) echo operator=denied;;
+  *"No such file"*) echo operator=absent;;
+  *) echo operator=other;;
+esac >> probe.txt
+echo "path=$d" >> probe.txt
+mkdir -p .owlshift/run
+printf '{"format":1,"status":"blocked","summary":"probed"}' > .owlshift/run/result.json
+"#;
+
+/// The user's own `/tmp/claude-<uid>`, made for the test when it is absent
+/// and removed after it only then, and only if still empty.
+#[cfg(target_os = "macos")]
+struct OperatorFolder(Option<PathBuf>);
+
+#[cfg(target_os = "macos")]
+impl OperatorFolder {
+    fn ensure() -> Self {
+        let uid = Command::new("id").arg("-u").output().unwrap().stdout;
+        let path = PathBuf::from(format!(
+            "/tmp/claude-{}",
+            String::from_utf8(uid).unwrap().trim()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => Self(Some(path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Self(None),
+            Err(e) => panic!("{}: {e}", path.display()),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for OperatorFolder {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_dir(path);
+        }
+    }
+}
+
+/// OWL-100's acceptance through the executor: a confined harness that names
+/// its temporary folder runs while the user's own `/tmp/claude-<uid>` exists,
+/// which made a confined `claude -p` exit at start-up on macOS. It writes in
+/// a folder of the run's own temporary folder instead, and cannot reach the
+/// user's: Seatbelt denies it on macOS, where the test makes sure it exists;
+/// bwrap's private `/tmp` does not hold it on Linux. On macOS the harness's
+/// folder is also shown gone after the run; under bwrap it never reaches the
+/// host.
+#[cfg(unix)]
+#[test]
+fn a_confined_harness_keeps_its_temporary_files_clear_of_the_operators_folder() {
+    let bench = Bench::new();
+    let agent = bench.agent();
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let _operator = OperatorFolder::ensure();
+    let harness = Script {
+        line: TEMP_FILES.to_owned(),
+        login: None,
+        temp_variable: Some(claude::TMPDIR_ENV),
+    };
+    let report = bench.run_harness(agent, &harness).unwrap();
+    assert!(
+        matches!(
+            report.outcome,
+            owlshift_runner::executor::Outcome::Finished { .. }
+        ),
+        "{:?}",
+        report.outcome
+    );
+    let probe = bench.probe();
+    let operator = if cfg!(target_os = "macos") {
+        "operator=denied"
+    } else {
+        "operator=absent"
+    };
+    assert_eq!(probe[..3], ["own=ok", "tmpdir=run", operator], "{probe:?}");
+    let path = probe[3].strip_prefix("path=").unwrap();
+    assert!(!PathBuf::from(path).exists(), "{path} outlived the run");
 }
 
 /// Native Windows has no sandbox: the run is refused before anything is

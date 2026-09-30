@@ -93,7 +93,19 @@ const PEER_INBOX_ARGS: &[&str] = &["--settings", r#"{"crossSessionInbound":"refu
 /// `docs/design/build-plan.md`): under the macOS sandbox the inbox is shut
 /// today only because `/tmp` is closed, and pointing `CLAUDE_CODE_TMPDIR`
 /// at the run's own temporary folder reopens it without this variable.
+/// Since OWL-100 the executor does point it there ([`TMPDIR_ENV`]), so this
+/// variable is what keeps the socket unbound.
 pub const PEER_INBOX_ENV: (&str, &str) = ("CLAUDE_CODE_HARBOR_KITE", "0");
+
+/// The folder where Claude Code keeps its temporary files, a folder per
+/// project in a `claude-<uid>` folder, by default under `/tmp`. The macOS
+/// sandbox closes `/tmp`, and a confined `claude -p` whose user already has
+/// a `/tmp/claude-<uid>`, made by their own sessions, exits at start-up with
+/// "Error processing settings: EPERM". The executor sets it on the harness
+/// command to a folder in the run's own temporary folder, which the CLI makes
+/// itself. Not documented. Checked live with Claude Code 2.1.284 (OWL-100,
+/// recorded under OWL-41 in `docs/design/build-plan.md`).
+pub const TMPDIR_ENV: &str = "CLAUDE_CODE_TMPDIR";
 
 /// The variable naming the descriptor through which a confined run logs in:
 /// a pipe holding a long-lived token of the operator's subscription, made by
