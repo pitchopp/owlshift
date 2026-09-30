@@ -90,6 +90,10 @@ pub const MAX_RESULT_BYTES: u64 = MAX_ARTIFACT_BYTES;
 /// temporary folder, when the harness logs in with a token (OWL-94).
 pub const HARNESS_CONFIG_DIR: &str = "harness-config";
 
+/// The harness's temporary folder of one run, in the run's own temporary
+/// folder, when the harness names one (OWL-100). The harness makes it.
+pub const HARNESS_TEMP_DIR: &str = "harness-tmp";
+
 /// Runs roles. One value serves every run of a runner.
 #[derive(Clone, Debug)]
 pub struct Executor {
@@ -363,6 +367,13 @@ impl Executor {
             login
                 .apply(&mut command, config)
                 .map_err(ExecutorError::Spawn)?;
+        }
+        if let Some(variable) = needs.temp_variable {
+            // Clear of the temporary folders the user's own processes share,
+            // which the sandbox closes (OWL-100). The harness makes the folder
+            // in the run's temporary folder, already written: nothing more is
+            // opened.
+            command.env(variable, temp.path().join(HARNESS_TEMP_DIR));
         }
         command
             .stdin(Stdio::piped())

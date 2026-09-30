@@ -18,8 +18,8 @@ use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::ids::RelativePath;
 use owlshift_platform::keychain::Keychain;
 use owlshift_runner::agent_env::{AgentEnv, RunPaths, mcp_findings};
-use owlshift_runner::executor::HARNESS_CONFIG_DIR;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness, Harness};
+use owlshift_runner::executor::{HARNESS_CONFIG_DIR, HARNESS_TEMP_DIR};
 
 #[test]
 #[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
@@ -85,6 +85,11 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
     inner.args(built.get_args());
     let mut command = agent.confine(inner, &run).unwrap();
     login.apply(&mut command, &config).unwrap();
+    // As the executor sets it, clear of your own `/tmp/claude-<uid>` (OWL-100).
+    let variable = needs
+        .temp_variable
+        .expect("a confined run names its temporary folder");
+    command.env(variable, temp.path().join(HARNESS_TEMP_DIR));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
