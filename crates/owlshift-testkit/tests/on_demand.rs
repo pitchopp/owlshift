@@ -913,23 +913,18 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
 }
 
 /// A confined `do` whose agent cannot run, because this machine cannot
-/// confine agents or Claude Code has no login for agent runs, is refused
-/// before anything is cloned, read or recorded. Which of the two depends on
-/// the machine: native Windows and a Linux without bwrap fail the first.
+/// confine agents or Claude Code has no token for agent runs (OWL-94), is
+/// refused before anything is cloned, read or recorded. Which of the two
+/// depends on the machine: native Windows and a Linux without bwrap fail
+/// the first.
 #[test]
 fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
     let bench = Bench::new(true);
     let env = bench.env.clone();
-    // Confined, and with no Claude Code login folder named, whatever the
-    // host's own variables say.
-    let parent = bench
-        .env
-        .agent_parent()
-        .into_iter()
-        .filter(|(name, _)| name != "CLAUDE_CONFIG_DIR");
+    // Confined, and with no token for agent runs.
     let executor = on_demand::executor(
         Git::with_setup("git", move |command| env.apply(command)),
-        AgentEnv::new(parent).unwrap(),
+        AgentEnv::new(bench.env.agent_parent()).unwrap(),
     );
     let harness = ClaudeHarness {
         program: PathBuf::from("claude"),
@@ -937,6 +932,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         model: None,
         effort: None,
         max_budget_usd: None,
+        login: None,
     };
     let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let config = ProjectConfig::parse(&config_text).unwrap();
@@ -958,7 +954,12 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
     let outcome = on_demand.run(&TicketId::new(TICKET).unwrap(), &mut sink);
-    assert!(matches!(outcome, Err(Stop::Refused(_))), "{outcome:?}");
+    let Err(Stop::Refused(reason)) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    if executor.agent.sandbox_ready().is_ok() {
+        assert!(reason.contains("`claude setup-token`"), "{reason}");
+    }
     assert!(!dirs.checkout().exists(), "nothing is cloned");
     assert!(bench.events().is_empty());
 }

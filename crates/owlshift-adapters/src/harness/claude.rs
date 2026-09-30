@@ -95,6 +95,21 @@ const PEER_INBOX_ARGS: &[&str] = &["--settings", r#"{"crossSessionInbound":"refu
 /// at the run's own temporary folder reopens it without this variable.
 pub const PEER_INBOX_ENV: (&str, &str) = ("CLAUDE_CODE_HARBOR_KITE", "0");
 
+/// The variable through which a confined run logs in: a long-lived token of
+/// the operator's subscription, made by `claude setup-token`. With it, and
+/// with the Keychain closed and [`CONFIG_DIR_ENV`] naming an empty folder,
+/// `claude -p` completed on the subscription (`apiKeySource: "none"`);
+/// `claude auth status` then says `authMethod: "oauth_token"` without
+/// checking the token. Checked live (OWL-94, recorded under OWL-41 in
+/// `docs/design/build-plan.md`). The runner sets it on the harness command
+/// alone; it is a credential variable the agent environment never carries.
+pub const LOGIN_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The folder where Claude Code keeps its configuration and its session
+/// files. A confined run gets a fresh, empty one, so it finds no login but
+/// [`LOGIN_TOKEN_ENV`].
+pub const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
 /// The tools removed from every run because a call can act outside the run's
 /// worktree and budget. Checked live with Claude Code 2.1.283 (OWL-42 and
 /// OWL-46, recorded under check C1 in `docs/design/build-plan.md`): each is

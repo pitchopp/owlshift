@@ -61,13 +61,16 @@ use owlshift_contracts::brief::{Brief, GateFailure};
 use owlshift_contracts::ids::RelativePath;
 use owlshift_contracts::result::{self, RunResult};
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
+use owlshift_platform::keychain::Secret;
 
 use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
 
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
 pub use git::{Git, GitError};
-pub use harness::{Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus, SandboxNeeds};
+pub use harness::{
+    Harness, HarnessEnd, HarnessError, HarnessLogin, HarnessRun, HarnessStatus, SandboxNeeds,
+};
 pub use isolation::{Violation, check_worktree_link};
 
 /// The directory of the run's own files, relative to the worktree.
@@ -82,6 +85,10 @@ pub const RESULT_PATH: &str = ".owlshift/run/result.json";
 
 /// The most bytes `result.json` may hold, as for an artifact.
 pub const MAX_RESULT_BYTES: u64 = MAX_ARTIFACT_BYTES;
+
+/// The harness's configuration folder of one run, in the run's own
+/// temporary folder, when the harness logs in with a token (OWL-94).
+pub const HARNESS_CONFIG_DIR: &str = "harness-config";
 
 /// Runs roles. One value serves every run of a runner.
 #[derive(Clone, Debug)]
@@ -309,6 +316,10 @@ impl Executor {
         let needs = harness
             .sandbox_needs(&self.agent)
             .map_err(ExecutorError::Command)?;
+        let login = needs.login;
+        if let Some(login) = &login {
+            log.hide(&login.token);
+        }
         // The run's own temporary folder: private to the user, removed when
         // `run` returns, after every process of the run is stopped.
         let temp = tempfile::Builder::new()
@@ -327,12 +338,27 @@ impl Executor {
             .agent
             .confine(inner, &paths)
             .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
+        if let Some(login) = &login {
+            // An empty configuration folder of the run's own, in its
+            // temporary folder: no other login is found there, and nothing
+            // the harness writes outlives the run (OWL-94). The token goes on
+            // this command alone, last, and the command is never printed.
+            let config = temp.path().join(HARNESS_CONFIG_DIR);
+            fs::create_dir(&config).map_err(|source| ExecutorError::RunDir {
+                path: config.clone(),
+                source,
+            })?;
+            command
+                .env(login.config_variable, &config)
+                .env(login.token_variable, login.token.expose());
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let (mut child, tree, watchdog) =
             watch::spawn(&mut command, self.timeout).map_err(ExecutorError::Spawn)?;
+        drop(command);
         let driven = harness.drive(&context, &mut child, &mut log);
         let timed_out = watchdog.finish();
         // Whatever the run left running is stopped before anything it wrote
@@ -341,9 +367,11 @@ impl Executor {
         let _ = tree.kill();
         let _ = child.kill();
         let _ = child.wait();
+        log.finish();
 
         let violations = before.check(&self.git, spec.main, spec.worktree, spec.branch);
-        let (mut outcome, end) = decide(violations, timed_out, driven, spec);
+        let hidden = login.as_ref().map(|login| &login.token);
+        let (mut outcome, end) = decide(violations, timed_out, driven, spec, hidden);
         let mut gate = None;
         if brief.role == Role::Build && is_done(&outcome) {
             // The gate runs the code the run wrote, confined as the run was,
@@ -434,12 +462,13 @@ fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Op
 
 /// The outcome, in order of precedence: a violation, the deadline, a
 /// credential the harness loaded, a usage limit, a harness failure, then
-/// the result itself.
+/// the result itself, refused when it holds `hidden`, the harness's login.
 fn decide(
     violations: Vec<Violation>,
     timed_out: bool,
     driven: io::Result<HarnessEnd>,
     spec: &RunSpec<'_>,
+    hidden: Option<&Secret>,
 ) -> (Outcome, Option<HarnessEnd>) {
     let (driven, end) = match driven {
         Ok(end) => (Ok(()), Some(end)),
@@ -461,15 +490,25 @@ fn decide(
                     resets_at: *resets_at,
                 },
                 HarnessStatus::Failed(reason) => Outcome::Failed(Failure::Harness(reason.clone())),
-                HarnessStatus::Completed => read_result(spec.worktree, spec.branch),
+                HarnessStatus::Completed => read_result(spec.worktree, spec.branch, hidden),
             }
         }
     };
     (outcome, end)
 }
 
-/// Reads and validates the role's `result.json`, then its artifacts.
-fn read_result(worktree: &Path, branch: &str) -> Outcome {
+/// Reads and validates the role's `result.json`, then its artifacts. A
+/// result or an artifact that holds `hidden`, the harness's login, fails the
+/// run: what it says would reach the tracker, the pull request and the
+/// events (OWL-94).
+fn read_result(worktree: &Path, branch: &str, hidden: Option<&Secret>) -> Outcome {
+    let copied = |into: &str, bytes: &[u8]| {
+        hidden.is_some_and(|token| holds(bytes, token)).then(|| {
+            Outcome::Failed(Failure::Credentials(vec![CredentialFinding::LoginCopied {
+                into: into.to_owned(),
+            }]))
+        })
+    };
     let bytes = match read_confined(worktree, RESULT_PATH, MAX_RESULT_BYTES) {
         Ok(bytes) => bytes,
         Err(ConfinedError::Refused {
@@ -478,15 +517,31 @@ fn read_result(worktree: &Path, branch: &str) -> Outcome {
         }) => return Outcome::Failed(Failure::NoResult),
         Err(error) => return Outcome::Failed(Failure::InvalidResult(error.to_string())),
     };
+    if let Some(refused) = copied(RESULT_PATH, &bytes) {
+        return refused;
+    }
     let result = match validate_result(&bytes, branch) {
         Ok(result) => result,
         Err(reason) => return Outcome::Failed(Failure::InvalidResult(reason)),
     };
     match read_artifacts(worktree, &result.artifacts) {
-        Ok(artifacts) => Outcome::Finished {
-            result: Box::new(result),
-            artifacts,
-        },
+        Ok(artifacts) => {
+            let named = [
+                ("the plan artifact", &artifacts.plan),
+                ("the ledger artifact", &artifacts.ledger),
+                ("the findings artifact", &artifacts.findings),
+                ("the report artifact", &artifacts.report),
+            ];
+            for (into, bytes) in named {
+                if let Some(refused) = bytes.as_deref().and_then(|bytes| copied(into, bytes)) {
+                    return refused;
+                }
+            }
+            Outcome::Finished {
+                result: Box::new(result),
+                artifacts,
+            }
+        }
         Err(error) => Outcome::Failed(Failure::Artifact(error)),
     }
 }
@@ -507,16 +562,38 @@ pub fn validate_result(bytes: &[u8], branch: &str) -> Result<RunResult, String> 
     Ok(result)
 }
 
+/// What replaces the harness's login token in the run's log files.
+pub const REDACTED: &str = "<redacted>";
+
 /// The run's log files: the harness's standard output and standard error,
 /// written as they come. A write error does not stop the run; the first one
 /// is kept for the report.
-#[derive(Debug)]
+///
+/// Once told of the harness's login token ([`RunLog::hide`]), each file gets
+/// [`REDACTED`] wherever the harness printed the token, even split across two
+/// writes: the bytes that could start one are held back until the next
+/// write, or [`RunLog::finish`]. The agent's shell inherits the token, so a
+/// command such as `env` would otherwise log it (OWL-94).
 pub struct RunLog {
     stdout: File,
     stderr: File,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     error: Option<String>,
+    hidden: Option<Secret>,
+    stdout_held: Vec<u8>,
+    stderr_held: Vec<u8>,
+}
+
+impl fmt::Debug for RunLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The held bytes may be the start of the token.
+        f.debug_struct("RunLog")
+            .field("stdout_path", &self.stdout_path)
+            .field("stderr_path", &self.stderr_path)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RunLog {
@@ -535,18 +612,50 @@ impl RunLog {
             stdout_path,
             stderr_path,
             error: None,
+            hidden: None,
+            stdout_held: Vec::new(),
+            stderr_held: Vec::new(),
         })
+    }
+
+    /// Replaces `token` with [`REDACTED`] in everything logged from now on.
+    fn hide(&mut self, token: &Secret) {
+        if !token.expose().is_empty() {
+            self.hidden = Some(token.clone());
+        }
     }
 
     /// Appends bytes of standard output.
     pub fn stdout(&mut self, bytes: &[u8]) {
-        let written = self.stdout.write_all(bytes);
+        let written = redacted_write(
+            &mut self.stdout,
+            &mut self.stdout_held,
+            self.hidden.as_ref(),
+            bytes,
+        );
         self.keep(written, "stdout.log");
     }
 
     /// Appends bytes of standard error.
     pub fn stderr(&mut self, bytes: &[u8]) {
-        let written = self.stderr.write_all(bytes);
+        let written = redacted_write(
+            &mut self.stderr,
+            &mut self.stderr_held,
+            self.hidden.as_ref(),
+            bytes,
+        );
+        self.keep(written, "stderr.log");
+    }
+
+    /// Writes the bytes held back: too few to hold the token.
+    fn finish(&mut self) {
+        let written = self
+            .stdout
+            .write_all(&std::mem::take(&mut self.stdout_held));
+        self.keep(written, "stdout.log");
+        let written = self
+            .stderr
+            .write_all(&std::mem::take(&mut self.stderr_held));
         self.keep(written, "stderr.log");
     }
 
@@ -557,6 +666,51 @@ impl RunLog {
             self.error = Some(format!("{name}: {error}"));
         }
     }
+}
+
+/// Writes `bytes` to `file`, `hidden`'s value replaced with [`REDACTED`].
+/// `held` carries the last bytes of the previous write, which could start
+/// the token, and keeps this write's, fewer than the token's length.
+fn redacted_write(
+    file: &mut File,
+    held: &mut Vec<u8>,
+    hidden: Option<&Secret>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let Some(token) = hidden.map(|secret| secret.expose().as_bytes()) else {
+        return file.write_all(bytes);
+    };
+    held.extend_from_slice(bytes);
+    let text = replace_all(held, token, REDACTED.as_bytes());
+    let split = text.len().saturating_sub(token.len() - 1);
+    *held = text[split..].to_vec();
+    file.write_all(&text[..split])
+}
+
+/// `haystack` with every occurrence of `needle`, which is not empty,
+/// replaced with `with`.
+fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut at = 0;
+    while at < haystack.len() {
+        if haystack[at..].starts_with(needle) {
+            out.extend_from_slice(with);
+            at += needle.len();
+        } else {
+            out.push(haystack[at]);
+            at += 1;
+        }
+    }
+    out
+}
+
+/// Whether `haystack` holds `token`'s value.
+fn holds(haystack: &[u8], token: &Secret) -> bool {
+    let needle = token.expose().as_bytes();
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -577,6 +731,36 @@ mod tests {
         let unknown = br#"{"format":1,"status":"done","summary":"s","extra":1}"#;
         assert!(validate_result(unknown, "owlshift/T-1").is_err());
         assert!(validate_result(b"\xff", "owlshift/T-1").is_err());
+    }
+
+    /// OWL-94: the harness's login token never reaches the log files, even
+    /// split across writes or printed twice in a row; what is not the token
+    /// is logged as it came, the held bytes included.
+    #[test]
+    fn the_run_log_hides_the_login_token() {
+        const TOKEN: &str = "sk-ant-oat01-SENTINEL";
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RunLog::create(dir.path()).unwrap();
+        log.hide(&Secret::new(TOKEN));
+        for chunk in [
+            "env: A=1 T=sk-ant-",
+            "oat01-SENTINEL\nagain ",
+            TOKEN,
+            TOKEN,
+            " end sk-an",
+        ] {
+            log.stdout(chunk.as_bytes());
+        }
+        log.stderr(TOKEN.as_bytes());
+        log.finish();
+        assert!(!format!("{log:?}").contains("sk-an"));
+        let read = |name| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(
+            read("stdout.log"),
+            "env: A=1 T=<redacted>\nagain <redacted><redacted> end sk-an"
+        );
+        assert_eq!(read("stderr.log"), "<redacted>");
+        assert_eq!(log.error, None);
     }
 
     /// A breach the gate found quarantines the run without the second

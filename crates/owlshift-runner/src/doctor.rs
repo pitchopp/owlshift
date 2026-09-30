@@ -6,7 +6,7 @@
 //! C8 in `docs/design/build-plan.md`).
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use owlshift_adapters::harness::{self, Login, tested};
 use owlshift_adapters::tracker::Capability;
@@ -14,9 +14,10 @@ use owlshift_adapters::tracker::linear::LinearTracker;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::Harness;
 use owlshift_contracts::config::TrackerKind;
+use owlshift_platform::keychain::SERVICE;
 
 use crate::config::{Effective, FileState, exit_text};
-use crate::executor::harness::claude_login_command;
+use crate::executor::harness::{AGENT_LOGIN_FIX, CLAUDE_AGENT_ACCOUNT};
 use crate::system::{RunError, System, exact_version_of, version_of};
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
@@ -71,11 +72,9 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(sentinel_check(&system.sentinel()));
     #[cfg(unix)]
     checks.push(sentinel_probe_check(&system.sentinel_probe()));
-    if harnesses.contains(&Harness::Claude) {
-        checks.push(agent_login_check(
-            system,
-            owlshift_platform::paths::claude_agent_login_dir(),
-        ));
+    // A missing `claude` fails its own line: its agent login is not asked.
+    if harnesses.contains(&Harness::Claude) && system.locate("claude").is_some() {
+        checks.push(agent_login_check(system));
     }
     checks.push(file_check("project config", &config.project));
     checks.push(file_check("personal config", &config.personal));
@@ -237,32 +236,40 @@ fn sentinel_probe_check(probe: &SentinelProbe) -> Check {
     }
 }
 
-/// Whether Claude Code has the login agent runs use: confined, they cannot
-/// reach the Keychain, so they use a second login of the operator's account,
-/// made once in its own folder. Only whether its file is there is looked at.
-fn agent_login_check(system: &dyn System, dir: Option<PathBuf>) -> Check {
+/// Whether agent runs have their Claude Code login: a token made by
+/// `claude setup-token`, in the system keychain (OWL-94). Confined, agent
+/// runs cannot reach the Keychain, where the operator's own login lives.
+/// Only the token's presence is asked, never its value; whether it still
+/// works shows at the first run.
+fn agent_login_check(system: &dyn System) -> Check {
     const SUBJECT: &str = "claude agent login";
-    let Some(dir) = dir else {
-        return check(
+    let place =
+        format!("in the system keychain (service `{SERVICE}`, account `{CLAUDE_AGENT_ACCOUNT}`)");
+    match system.secret_stored(CLAUDE_AGENT_ACCOUNT) {
+        Ok(true) => check(
+            SUBJECT,
+            Status::Ok,
+            format!("a token for agent runs is stored {place}"),
+            None,
+        ),
+        Ok(false) => check(
             SUBJECT,
             Status::Fail,
-            "no configuration directory to keep it in",
-            Some("set OWLSHIFT_CONFIG_DIR to an absolute path"),
-        );
-    };
-    if system.is_file(&dir.join(".credentials.json")) {
-        check(SUBJECT, Status::Ok, dir.display().to_string(), None)
-    } else {
-        Check {
-            subject: SUBJECT.to_owned(),
-            status: Status::Fail,
-            detail: format!(
-                "none in {}: agent runs cannot reach the Keychain, so they use a second \
-                 login of your account, which you can revoke at any time",
-                dir.display()
+            format!(
+                "no token for agent runs {place}: agent runs cannot reach the Keychain, so \
+                 they log in with a long-lived token of your subscription"
             ),
-            fix: Some(claude_login_command(&dir)),
-        }
+            Some(AGENT_LOGIN_FIX),
+        ),
+        Err(error) => check(
+            SUBJECT,
+            Status::Fail,
+            format!("could not tell whether a token for agent runs is stored {place}: {error}"),
+            Some(
+                "make the system keychain available (on Linux, a running Secret Service), \
+                 then run `owlshift doctor` again",
+            ),
+        ),
     }
 }
 
@@ -666,22 +673,47 @@ mod tests {
         }
     }
 
-    /// Without the login made for agent runs, the machine is not ready, and
-    /// the fix is the command that makes it; its file is only looked for.
+    /// OWL-94: agent runs need their token in the keychain. Stored, the
+    /// line is ok; absent, the fix names `claude setup-token` and `owlshift
+    /// init`; an unreadable keychain says so. Without `claude`, it is not
+    /// asked.
     #[test]
-    fn a_missing_agent_login_says_how_to_make_it() {
-        let dir = PathBuf::from("/home/ada/owlshift/agent-login/claude");
-        let system = with_harnesses(with_git(FakeSystem::default()))
-            .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""))
-            .absent(dir.join(".credentials.json"));
-        let check = agent_login_check(&system, Some(dir.clone()));
-        assert_eq!(check.status, Status::Fail);
-        let fix = check.fix.unwrap();
-        assert!(fix.contains("claude auth login"), "{fix}");
-        assert!(fix.contains(&*dir.to_string_lossy()), "{fix}");
+    fn the_agent_login_is_a_token_in_the_keychain() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let stored = run(&ready(), &no_config());
+        let login = line(&stored, "claude agent login");
+        assert_eq!(login.status, Status::Ok, "{stored}");
+        assert!(
+            login
+                .detail
+                .contains("(service `owlshift`, account `claude-agent`)"),
+            "{stored}"
+        );
 
-        let present = with_git(FakeSystem::default());
-        assert_eq!(agent_login_check(&present, Some(dir)).status, Status::Ok);
+        let missing = run(&ready().unstored("claude-agent"), &no_config());
+        assert!(!missing.ready());
+        let fix = &fixes(&missing, "claude agent login")[0];
+        assert!(fix.contains("`claude setup-token`"), "{fix}");
+        assert!(fix.contains("`owlshift init`"), "{fix}");
+        assert!(!missing.to_string().contains("auth login"), "{missing}");
+
+        let locked = run(&ready().keychain_fails("keychain: locked"), &no_config());
+        let login = line(&locked, "claude agent login");
+        assert_eq!(login.status, Status::Fail, "{locked}");
+        assert!(login.detail.ends_with("keychain: locked"), "{locked}");
+
+        let no_claude = with_git(FakeSystem::default()).install("codex").answer(
+            "codex --version",
+            Answer::Exit(0, "codex-cli 0.154.0\n", ""),
+        );
+        let report = run(&logged_in(no_claude), &no_config());
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.subject != "claude agent login"),
+            "{report}"
+        );
     }
 
     #[test]

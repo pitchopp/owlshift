@@ -27,13 +27,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Check whether this machine is ready: git, the harness CLIs and their
-    /// logins, the configuration files.
+    /// logins, the agent runs' Claude Code token, the configuration files.
     Doctor,
     /// Read the configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
     /// Write a commented owlshift.toml for this repository, then store the
-    /// tracker and forge secrets `owlshift do` needs in the system keychain.
+    /// tracker and forge secrets and the agent runs' Claude Code token
+    /// `owlshift do` needs in the system keychain.
     Init(init_cmd::Args),
     /// Run one ticket to a verified pull request, in the foreground.
     Do {

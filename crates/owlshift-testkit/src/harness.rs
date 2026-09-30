@@ -66,7 +66,7 @@ impl Harness for FakeHarness {
         readable.extend(self.reply.parent().map(Path::to_path_buf));
         Ok(SandboxNeeds {
             readable,
-            writable: Vec::new(),
+            ..SandboxNeeds::default()
         })
     }
 }

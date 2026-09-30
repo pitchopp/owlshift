@@ -22,24 +22,40 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
+use owlshift_platform::keychain::Secret;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
-    Executor, ExecutorError, Git, Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus,
-    RunLog, RunReport, RunSpec,
+    Executor, ExecutorError, Git, Harness, HarnessEnd, HarnessError, HarnessLogin, HarnessRun,
+    HarnessStatus, RunLog, RunReport, RunSpec, SandboxNeeds,
 };
 use owlshift_testkit::git::{GitEnv, seed};
 
 const BRANCH: &str = "owlshift/T-1";
 
-/// A harness that is one shell script.
-struct Script(String);
+/// A harness that is one shell script, logged in with a token when one is
+/// given, as Claude Code is.
+struct Script {
+    line: String,
+    login: Option<Secret>,
+}
 
 impl Harness for Script {
     fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         let mut command = Command::new("sh");
-        command.arg("-c").arg(&self.0);
+        command.arg("-c").arg(&self.line);
         Ok(command)
+    }
+
+    fn sandbox_needs(&self, _agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        Ok(SandboxNeeds {
+            login: self.login.clone().map(|token| HarnessLogin {
+                token_variable: "CLAUDE_CODE_OAUTH_TOKEN",
+                token,
+                config_variable: "CLAUDE_CONFIG_DIR",
+            }),
+            ..SandboxNeeds::default()
+        })
     }
 
     fn drive(
@@ -95,6 +111,15 @@ impl Bench {
     }
 
     fn run(&self, agent: AgentEnv, script: &str) -> Result<RunReport, ExecutorError> {
+        self.run_logged_in(agent, script, None)
+    }
+
+    fn run_logged_in(
+        &self,
+        agent: AgentEnv,
+        script: &str,
+        login: Option<Secret>,
+    ) -> Result<RunReport, ExecutorError> {
         let runner = self.env.clone();
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner.apply(command)),
@@ -108,10 +133,18 @@ impl Bench {
             worktree: &self.worktree,
             branch: BRANCH,
             base: "origin/main",
-            run_dir: &self.tmp.path().join("run"),
+            run_dir: &self.run_dir(),
             brief: &brief(),
         };
-        executor.run(&spec, &Script(script.to_owned()))
+        let harness = Script {
+            line: script.to_owned(),
+            login,
+        };
+        executor.run(&spec, &harness)
+    }
+
+    fn run_dir(&self) -> PathBuf {
+        self.tmp.path().join("run")
     }
 
     /// The probe's lines, `name=status`, written in the worktree.
@@ -229,6 +262,97 @@ fn a_confined_run_and_its_descendants_reach_no_planted_secret() {
         "{:?}",
         report.outcome
     );
+}
+
+/// The token of OWL-94's bench test, made up.
+#[cfg(unix)]
+const TOKEN: &str = "sk-ant-oat01-owl94-FAKE-token";
+
+/// A logged-in harness that sees its token and a configuration folder of
+/// the run's own, empty, then prints its whole environment and the token,
+/// and writes a result holding the token when `LEAK` is set.
+#[cfg(unix)]
+const LOGGED_IN: &str = r#"
+case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in sk-ant-oat01-owl94-*) echo token=seen;; *) echo token=missing;; esac > probe.txt
+case "${CLAUDE_CONFIG_DIR:-}" in "$TMPDIR"/*) echo config=run;; *) echo config=other;; esac >> probe.txt
+echo "config_files=$(ls -A "$CLAUDE_CONFIG_DIR" | wc -l | tr -d ' ')" >> probe.txt
+echo "config_path=$CLAUDE_CONFIG_DIR" >> probe.txt
+echo written > "$CLAUDE_CONFIG_DIR/session"
+env
+printf 'token: %s\n' "$CLAUDE_CODE_OAUTH_TOKEN" >&2
+mkdir -p .owlshift/run
+printf '{"format":1,"status":"blocked","summary":"%s"}' "${LEAK:+$CLAUDE_CODE_OAUTH_TOKEN}" > .owlshift/run/result.json
+"#;
+
+/// OWL-94's acceptance through the executor: a confined harness logs in
+/// with its token, in an empty configuration folder of the run's own that
+/// is gone with the run. The token it prints reaches no log file, no file
+/// of the run directory and not the report; a result holding it fails the
+/// run with a finding that does not show it.
+#[cfg(unix)]
+#[test]
+fn a_confined_harness_logs_in_with_its_token_and_no_output_keeps_it() {
+    let bench = Bench::new();
+    let agent = bench.agent();
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let token = Some(Secret::new(TOKEN));
+    let report = bench
+        .run_logged_in(agent.clone(), LOGGED_IN, token.clone())
+        .unwrap();
+    let probe = bench.probe();
+    assert_eq!(
+        probe[..3],
+        ["token=seen", "config=run", "config_files=0"],
+        "{probe:?}"
+    );
+    let config = probe[3].strip_prefix("config_path=").unwrap();
+    assert!(!PathBuf::from(config).exists(), "{config} outlived the run");
+    assert!(
+        matches!(
+            report.outcome,
+            owlshift_runner::executor::Outcome::Finished { .. }
+        ),
+        "{:?}",
+        report.outcome
+    );
+    let stdout = fs::read_to_string(&report.stdout_log).unwrap();
+    assert!(
+        stdout.contains("CLAUDE_CODE_OAUTH_TOKEN=<redacted>"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&report.stderr_log).unwrap(),
+        "token: <redacted>\n"
+    );
+    let mut files = vec![bench.run_dir()];
+    while let Some(path) = files.pop() {
+        if path.is_dir() {
+            files.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+        } else {
+            let bytes = fs::read(&path).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains(TOKEN),
+                "{} holds the token",
+                path.display()
+            );
+        }
+    }
+    assert!(!format!("{report:?}").contains(TOKEN));
+
+    let leaked = bench
+        .run_logged_in(agent, &format!("LEAK=1\n{LOGGED_IN}"), token)
+        .unwrap();
+    let owlshift_runner::executor::Outcome::Failed(failure) = &leaked.outcome else {
+        panic!("{:?}", leaked.outcome);
+    };
+    let text = failure.to_string();
+    assert!(
+        text.starts_with(".owlshift/run/result.json holds the harness's login token"),
+        "{text}"
+    );
+    assert!(!format!("{leaked:?}").contains(TOKEN));
 }
 
 /// Native Windows has no sandbox: the run is refused before anything is
