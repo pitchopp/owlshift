@@ -77,7 +77,7 @@ owlshift start --at-login    # plain `start` runs for this session only
 owlshift uninstall --purge   # --purge also removes history and worktrees
 ```
 
-Prerequisites: git, and at least one harness CLI installed and logged in (`claude`, `codex`). Owlshift reuses that login, so the user's own subscription.
+Prerequisites: git, and at least one harness CLI installed (`claude`, `codex`). Codex is logged in on the user's own subscription, which Owlshift reuses. Claude Code only has to be installed: agent runs log in with the token of the user's subscription that `owlshift init` keeps, made with `claude setup-token`; the user's own Claude Code login is not used.
 
 **Against lingering services:**
 
@@ -120,7 +120,7 @@ One update path per install method, a restart that never loses work, and a versi
 
 Configuration is plain text in two files plus the keychain; every screen that edits it later writes to those same files, which stay the reviewable record.
 
-**`owlshift init`** detects the stack (`package.json`, `pyproject.toml`, `Makefile`, `Cargo.toml`…), connects the tracker (OAuth where offered, else a token), stores tracker and forge secrets in the system keychain, writes a commented project file, and registers the project with the daemon. It checks that the harness CLIs are logged in; it never asks for a model API key. In P1 (OWL-20), `init` writes the commented project file from its flags and stores the tracker and forge secrets, asking for them on a terminal only. Stack detection (P9), a check that the tracker answers and the registration with the daemon (P7) come later, and the harness logins are `owlshift doctor`'s to check. `init` also stores the token Claude Code agent runs log in with (OWL-94): agent runs are confined and cannot reach the Keychain, so the operator makes a long-lived token of the same subscription with `claude setup-token` and pastes it into `init`, which keeps it in the system keychain; `--replace-secrets` replaces one that expired or was revoked. `owlshift do` refuses to start without it, before it clones anything, and says how to make it, as `owlshift doctor` does.
+**`owlshift init`** detects the stack (`package.json`, `pyproject.toml`, `Makefile`, `Cargo.toml`…), connects the tracker (OAuth where offered, else a token), stores tracker and forge secrets in the system keychain, writes a commented project file, and registers the project with the daemon. It checks that Codex is logged in and that Claude Code agent runs have their token (below); it never asks for a model API key. In P1 (OWL-20), `init` writes the commented project file from its flags and stores the tracker and forge secrets, asking for them on a terminal only. Stack detection (P9), a check that the tracker answers and the registration with the daemon (P7) come later, and the harness logins are `owlshift doctor`'s to check. `init` also stores the token Claude Code agent runs log in with (OWL-94): agent runs are confined and cannot reach the Keychain, so the operator makes a long-lived token of the same subscription with `claude setup-token` and pastes it into `init`, which keeps it in the system keychain; `--replace-secrets` replaces one that expired or was revoked. `owlshift do` refuses to start without it, before it clones anything, and says how to make it, as `owlshift doctor` does.
 
 | Layer | Where | Holds |
 | --- | --- | --- |

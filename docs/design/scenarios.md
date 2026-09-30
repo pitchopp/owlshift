@@ -151,7 +151,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 *I adopt Owlshift on a repository in minutes, without reading the code of Owlshift.*
 
 - `owlshift init` detects the stack, connects the tracker, stores tracker and forge secrets in the system keychain and writes a commented project file. It never asks for a model API key.
-- `owlshift doctor` checks every capability the config relies on, including that each configured harness CLI is installed and logged in, and names what is missing and how to fix it.
+- `owlshift doctor` checks every capability the config relies on, including that each configured harness CLI is installed, that Codex is logged in, that agent runs have their Claude Code token (made with `claude setup-token`, stored by `owlshift init`), and names what is missing and how to fix it.
 - A missing required capability stops `init`, never a run.
 
 ### S16. Several projects on one machine
