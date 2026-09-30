@@ -1,6 +1,7 @@
 //! `owlshift do TICKET`: opens what one run needs, in this order, and hands
-//! it to `owlshift_runner::on_demand`. Everything that can be refused
-//! without a credential is refused before the keychain is opened.
+//! it to `owlshift_runner::on_demand`. What `do` itself can refuse without
+//! a credential, a host where agent runs cannot be confined included, is
+//! refused before the keychain is opened.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -12,7 +13,7 @@ use owlshift_contracts::Role;
 use owlshift_contracts::config::TrackerKind;
 use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
-use owlshift_platform::keychain::Keychain;
+use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::{EventLog, EventSink, printable};
@@ -30,87 +31,80 @@ use crate::fail;
 const HEAD_WAIT: Duration = Duration::from_secs(2);
 
 pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
-    let ticket = match TicketId::new(ticket) {
-        Ok(ticket) => ticket,
-        Err(error) => return fail(&error.to_string()),
-    };
+    run_with(system, config, ticket, Keychain::system).unwrap_or_else(|refusal| fail(&refusal))
+}
+
+/// [`run`], with the keychain opened by `open_keychain`: a refusal before
+/// the run is returned, for the caller to print.
+fn run_with(
+    system: &dyn System,
+    config: &Effective,
+    ticket: &str,
+    open_keychain: fn() -> Result<Keychain, KeychainError>,
+) -> Result<ExitCode, String> {
+    let ticket = TicketId::new(ticket).map_err(|error| error.to_string())?;
     let (project_file, project) = match &config.project {
         FileState::Loaded { path, config, .. } => (path, config),
         FileState::Absent(path) => {
-            return fail(&format!(
+            return Err(format!(
                 "no project file at {}: run `owlshift init` first",
                 path.display()
             ));
         }
         FileState::NotApplicable(reason) => {
-            return fail(&format!("`owlshift do` runs in a git repository: {reason}"));
+            return Err(format!("`owlshift do` runs in a git repository: {reason}"));
         }
-        FileState::Unavailable(reason) => return fail(reason),
+        FileState::Unavailable(reason) => return Err(reason.clone()),
         FileState::Invalid { path, error } => {
-            return fail(&format!("{} is invalid: {error}", path.display()));
+            return Err(format!("{} is invalid: {error}", path.display()));
         }
     };
     if !config.is_valid() {
-        return fail("the personal configuration is invalid: see `owlshift config show`");
+        return Err("the personal configuration is invalid: see `owlshift config show`".to_owned());
     }
-    if let Err(error) = on_demand::check_team(project, &ticket) {
-        return fail(&error);
-    }
+    on_demand::check_team(project, &ticket)?;
     let root = project_file.parent().unwrap_or(project_file);
     let git = project::runner_git();
-    let remote_url = match project::origin_url(&git, root) {
-        Ok(url) => url,
-        Err(error) => return fail(&error),
-    };
-    let repo = match on_demand::check_origin(&remote_url) {
-        Ok(repo) => repo,
-        Err(error) => return fail(&error),
-    };
+    let remote_url = project::origin_url(&git, root)?;
+    let repo = on_demand::check_origin(&remote_url)?;
+    // OWL-98: a host where agent runs cannot be confined is refused before
+    // the keychain is opened, so it never prompts for or loads a secret for
+    // a run that cannot happen. `do` always confines its agents
+    // (`AgentEnv::from_runner`); `OnDemand::run` checks again.
+    system.sandbox().map_err(|error| error.to_string())?;
     let Some(data_dir) = owlshift_platform::paths::data_dir() else {
-        return fail(
-            "this system has no data directory: set OWLSHIFT_DATA_DIR to an absolute path",
+        return Err(
+            "this system has no data directory: set OWLSHIFT_DATA_DIR to an absolute path"
+                .to_owned(),
         );
     };
     let Some(claude) = system.locate("claude") else {
-        return fail(
-            "`claude` is not on the PATH: install Claude Code and log in (`owlshift doctor` checks it)",
+        return Err(
+            "`claude` is not on the PATH: install Claude Code and log in (`owlshift doctor` checks it)"
+                .to_owned(),
         );
     };
-    let prompt = match strip_role_front_matter(Role::Build, BUILD_ROLE) {
-        Ok(prompt) => prompt,
-        Err(error) => return fail(&format!("the built-in build role: {error}")),
-    };
+    let prompt = strip_role_front_matter(Role::Build, BUILD_ROLE)
+        .map_err(|error| format!("the built-in build role: {error}"))?;
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
-    let agent = match AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed) {
-        Ok(agent) => agent,
-        Err(error) => return fail(&format!("the agent environment: {error}")),
-    };
+    let agent = AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed)
+        .map_err(|error| format!("the agent environment: {error}"))?;
 
     // From here on, the credentials: the runner's own, never an agent's.
-    let keychain = match Keychain::system() {
-        Ok(keychain) => keychain,
-        Err(error) => return fail(&error.to_string()),
-    };
+    let keychain = open_keychain().map_err(|error| error.to_string())?;
     let tracker: Box<dyn Tracker> = match project.tracker.kind {
-        TrackerKind::Linear => match tracker::linear(&keychain) {
-            Ok(linear) => Box::new(linear),
-            Err(error) => return fail(&error),
-        },
+        TrackerKind::Linear => Box::new(tracker::linear(&keychain)?),
         TrackerKind::Markdown => Box::new(MarkdownTracker::new(root)),
     };
-    let forge = match forge::github(&keychain, repo.clone()) {
-        Ok(forge) => forge,
-        Err(error) => return fail(&error),
-    };
+    let forge = forge::github(&keychain, repo.clone())?;
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
     // run, with the fix, before anything is cloned.
-    let login = match keychain.read(CLAUDE_AGENT_ACCOUNT) {
-        Ok(login) => login,
-        Err(error) => return fail(&error.to_string()),
-    };
+    let login = keychain
+        .read(CLAUDE_AGENT_ACCOUNT)
+        .map_err(|error| error.to_string())?;
     let budget = match &config.personal {
         FileState::Loaded { config, .. } => config
             .harnesses
@@ -146,7 +140,12 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
     let outcome = on_demand.run(&ticket, &mut sink);
-    finish(system, outcome, &mut io::stdout(), &mut io::stderr())
+    Ok(finish(
+        system,
+        outcome,
+        &mut io::stdout(),
+        &mut io::stderr(),
+    ))
 }
 
 /// The end of a run: the warning of a sentinel that ended during it, or is
@@ -275,5 +274,84 @@ mod tests {
             assert_eq!(stdout, "\nNot run: no ticket\n");
             assert_eq!(code, ExitCode::FAILURE);
         }
+    }
+}
+
+#[cfg(test)]
+mod refusals {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use owlshift_contracts::config::ProjectConfig;
+    use owlshift_platform::sandbox::SandboxError;
+    use owlshift_runner::system::{Captured, RunError};
+
+    use super::*;
+
+    /// A host where agent runs cannot be confined, asked nothing else.
+    struct NoSandbox;
+
+    impl System for NoSandbox {
+        fn locate(&self, _program: &str) -> Option<PathBuf> {
+            unreachable!("a host that cannot confine is refused before `claude` is looked for")
+        }
+
+        fn run(&self, _: &Path, _: &[&str], _: Option<&Path>) -> Result<Captured, RunError> {
+            unreachable!("a host that cannot confine is refused before any program runs")
+        }
+
+        fn sandbox(&self) -> Result<(), SandboxError> {
+            Err(SandboxError::Unsupported)
+        }
+
+        fn secret_stored(&self, _account: &str) -> Result<bool, String> {
+            unreachable!("a host that cannot confine is refused before any secret is looked at")
+        }
+    }
+
+    fn no_keychain() -> Result<Keychain, KeychainError> {
+        panic!("the keychain was opened on a host that cannot confine agent runs")
+    }
+
+    #[test]
+    fn a_host_that_cannot_confine_is_refused_before_the_keychain_is_opened() {
+        // A project `do` would otherwise go on with: a Linear project of
+        // team OWL, in a repository whose origin is on github.com.
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owlshift/demo.git",
+            ],
+        ] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let project = ProjectConfig::parse(
+            "requires = \">=0.0\"\n[tracker]\nkind = \"linear\"\nteam = \"OWL\"\n\
+             admit = \"delegation\"\n\
+             states = { ready = \"a\", working = \"b\", needs_input = \"c\", review = \"d\" }\n\
+             [stack]\ngate = []\n[pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n\
+             [models]\n[policy]\nalways_human = []\n",
+        )
+        .unwrap();
+        let config = Effective {
+            project: FileState::Loaded {
+                path: repo.path().join("owlshift.toml"),
+                config: project,
+                entries: Vec::new(),
+            },
+            personal: FileState::Absent(repo.path().join("config.toml")),
+        };
+
+        let refusal = run_with(&NoSandbox, &config, "OWL-1", no_keychain).unwrap_err();
+        assert_eq!(refusal, SandboxError::Unsupported.to_string());
     }
 }
