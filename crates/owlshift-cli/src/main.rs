@@ -27,8 +27,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Check whether this machine is ready: git, the harness CLIs and their
-    /// logins, the agent runs' Claude Code token, the configuration files.
-    Doctor,
+    /// logins, the agent runs' isolation and Claude Code token, the
+    /// configuration files. Says why each problem matters and how to fix it.
+    Doctor {
+        /// Print the report as JSON, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read the configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -101,9 +106,13 @@ fn main() -> ExitCode {
     );
 
     match cli.command {
-        Command::Doctor => {
+        Command::Doctor { json } => {
             let report = doctor::run(&system, &config);
-            print!("{report}");
+            if json {
+                println!("{:#}", report.to_json());
+            } else {
+                print!("{}", report.render(&doctor::render::Style::for_stdout()));
+            }
             exit_code(report.ready())
         }
         Command::Config(ConfigCommand::Show) => {

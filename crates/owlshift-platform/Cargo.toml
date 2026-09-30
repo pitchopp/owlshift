@@ -17,7 +17,8 @@ which.workspace = true
 # apple-native on macOS, zbus-secret-service on other Unix systems,
 # windows-native on Windows.
 [target.'cfg(unix)'.dependencies]
-rustix.workspace = true
+# `termios`: the terminal's width, for `owlshift doctor`'s report (OWL-99).
+rustix = { workspace = true, features = ["termios"] }
 signal-hook.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
