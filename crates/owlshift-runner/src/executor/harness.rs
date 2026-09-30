@@ -23,7 +23,7 @@ use jiff::Timestamp;
 use owlshift_adapters::harness::claude::{self, EXIT_GRACE, Effort, STDERR_CAP, Usage};
 use owlshift_contracts::brief::Brief;
 use owlshift_platform::keychain::Secret;
-use owlshift_platform::process::find_executable_in;
+use owlshift_platform::process::{find_executable_in, hand_over_on_descriptor};
 
 use super::{BRIEF_PATH, RunLog};
 use crate::agent_env::{AgentEnv, CredentialFinding, mcp_findings};
@@ -82,13 +82,15 @@ pub struct SandboxNeeds {
     pub login: Option<HarnessLogin>,
 }
 
-/// A harness's login for agent runs (OWL-94). The executor sets it on the
-/// harness command alone, right before the spawn: never in the agent
-/// environment, so a gate command and the credential probes never get it.
+/// A harness's login for agent runs (OWL-94). The executor gives it to the
+/// harness command alone, right before the spawn ([`HarnessLogin::apply`]):
+/// never in the agent environment, so a gate command and the credential
+/// probes never get it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HarnessLogin {
-    /// The variable that carries the token, such as `CLAUDE_CODE_OAUTH_TOKEN`.
-    pub token_variable: &'static str,
+    /// The variable naming the descriptor the harness reads its token from,
+    /// such as `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` (OWL-96).
+    pub descriptor_variable: &'static str,
     /// The token; its `Debug` output is redacted.
     pub token: Secret,
     /// The variable that names the harness's configuration folder, such as
@@ -96,6 +98,22 @@ pub struct HarnessLogin {
     /// run's own temporary folder, so the harness finds no other login there
     /// and nothing it writes outlives the run.
     pub config_variable: &'static str,
+}
+
+impl HarnessLogin {
+    /// Gives `command` this login: the token on a pipe its child inherits,
+    /// the variable naming that descriptor, and `config` as the harness's
+    /// configuration folder. The token is in no environment and no argument
+    /// ([`hand_over_on_descriptor`]). Drop `command` right after the spawn:
+    /// it holds the runner's copy of the pipe until then. The error never
+    /// holds the token.
+    pub fn apply(&self, command: &mut Command, config: &Path) -> io::Result<()> {
+        let descriptor = hand_over_on_descriptor(command, self.token.expose().as_bytes())?;
+        command
+            .env(self.descriptor_variable, descriptor.to_string())
+            .env(self.config_variable, config);
+        Ok(())
+    }
 }
 
 /// The keychain account, under service `owlshift`, of the Claude Code token
@@ -337,7 +355,7 @@ impl Harness for ClaudeHarness {
             Some(token) if !token.is_one_word() => return Err(NoAgentLogin::Malformed.into()),
             Some(token) => {
                 needs.login = Some(HarnessLogin {
-                    token_variable: claude::LOGIN_TOKEN_ENV,
+                    descriptor_variable: claude::LOGIN_TOKEN_FD_ENV,
                     token: token.clone(),
                     config_variable: claude::CONFIG_DIR_ENV,
                 });
@@ -531,7 +549,7 @@ mod tests {
         assert_eq!(
             needs.login,
             Some(HarnessLogin {
-                token_variable: "CLAUDE_CODE_OAUTH_TOKEN",
+                descriptor_variable: "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
                 token: Secret::new(TOKEN),
                 config_variable: "CLAUDE_CONFIG_DIR",
             })

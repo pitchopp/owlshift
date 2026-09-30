@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+use owlshift_adapters::harness::claude;
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::{
     Author, Brief, PermissionLevel, Permissions, Relation, TicketBrief,
@@ -50,9 +51,9 @@ impl Harness for Script {
     fn sandbox_needs(&self, _agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
         Ok(SandboxNeeds {
             login: self.login.clone().map(|token| HarnessLogin {
-                token_variable: "CLAUDE_CODE_OAUTH_TOKEN",
+                descriptor_variable: claude::LOGIN_TOKEN_FD_ENV,
                 token,
-                config_variable: "CLAUDE_CONFIG_DIR",
+                config_variable: claude::CONFIG_DIR_ENV,
             }),
             ..SandboxNeeds::default()
         })
@@ -268,27 +269,63 @@ fn a_confined_run_and_its_descendants_reach_no_planted_secret() {
 #[cfg(unix)]
 const TOKEN: &str = "sk-ant-oat01-owl94-FAKE-token";
 
-/// A logged-in harness that sees its token and a configuration folder of
-/// the run's own, empty, then prints its whole environment and the token,
-/// and writes a result holding the token when `LEAK` is set.
+/// A logged-in harness that reads its token from the descriptor it is named,
+/// as Claude Code does (OWL-96), and sees a configuration folder of the
+/// run's own, empty. Its probe says, never showing the token: whether it
+/// read it; whether `CLAUDE_CODE_OAUTH_TOKEN` is set and whether its raw
+/// environment holds the token; whether a process it starts afterwards reads
+/// anything from the descriptor; and, where there is a `/proc`, how many
+/// processes inside the sandbox have the token in their exec block, with
+/// one started with it on purpose as the control, so the count is 1. Then
+/// it prints its whole environment and the token, and writes a result
+/// holding the token when `LEAK` is set.
 #[cfg(unix)]
 const LOGGED_IN: &str = r#"
-case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in sk-ant-oat01-owl94-*) echo token=seen;; *) echo token=missing;; esac > probe.txt
+fd="${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-none}"
+tok=
+[ "$fd" != none ] && read -r tok < "/dev/fd/$fd"
+case "$tok" in sk-ant-oat01-owl94-*) echo token=seen;; *) echo token=missing;; esac > probe.txt
+echo "var=${CLAUDE_CODE_OAUTH_TOKEN+set}" >> probe.txt
+case "$(env)" in *"$tok"*) echo env=holds;; *) echo env=absent;; esac >> probe.txt
+rest=$(sh -c 'cat "/dev/fd/$0"' "$fd" 2>/dev/null)
+[ -z "$rest" ] && echo after=empty >> probe.txt || echo after=more >> probe.txt
+if [ -d /proc/self ]; then
+  T="$tok" sleep 30 &
+  control=$!
+  tries=0
+  while :; do
+    n=0
+    for f in /proc/[0-9]*/environ; do
+      c=$(tr '\0' '\n' < "$f" 2>/dev/null) || continue
+      case "$c" in *"$tok"*) n=$((n+1));; esac
+    done
+    tries=$((tries+1))
+    { [ "$n" -ge 1 ] || [ "$tries" -ge 50 ]; } && break
+    sleep 0.1
+  done
+  kill "$control"
+  echo "environ=$n" >> probe.txt
+else
+  echo environ=skipped >> probe.txt
+fi
 case "${CLAUDE_CONFIG_DIR:-}" in "$TMPDIR"/*) echo config=run;; *) echo config=other;; esac >> probe.txt
 echo "config_files=$(ls -A "$CLAUDE_CONFIG_DIR" | wc -l | tr -d ' ')" >> probe.txt
 echo "config_path=$CLAUDE_CONFIG_DIR" >> probe.txt
 echo written > "$CLAUDE_CONFIG_DIR/session"
 env
-printf 'token: %s\n' "$CLAUDE_CODE_OAUTH_TOKEN" >&2
+printf 'token: %s\n' "$tok" >&2
 mkdir -p .owlshift/run
-printf '{"format":1,"status":"blocked","summary":"%s"}' "${LEAK:+$CLAUDE_CODE_OAUTH_TOKEN}" > .owlshift/run/result.json
+printf '{"format":1,"status":"blocked","summary":"%s"}' "${LEAK:+$tok}" > .owlshift/run/result.json
 "#;
 
 /// OWL-94's acceptance through the executor: a confined harness logs in
 /// with its token, in an empty configuration folder of the run's own that
 /// is gone with the run. The token it prints reaches no log file, no file
 /// of the run directory and not the report; a result holding it fails the
-/// run with a finding that does not show it.
+/// run with a finding that does not show it. OWL-96's: the token reaches the
+/// harness through the sandbox (Seatbelt, or bwrap on the Linux CI job) on a
+/// descriptor, in no environment and no exec block, and what the harness
+/// starts after reading it gets nothing from the descriptor.
 #[cfg(unix)]
 #[test]
 fn a_confined_harness_logs_in_with_its_token_and_no_output_keeps_it() {
@@ -302,12 +339,25 @@ fn a_confined_harness_logs_in_with_its_token_and_no_output_keeps_it() {
         .run_logged_in(agent.clone(), LOGGED_IN, token.clone())
         .unwrap();
     let probe = bench.probe();
+    let environ = if cfg!(target_os = "linux") {
+        "environ=1"
+    } else {
+        "environ=skipped"
+    };
     assert_eq!(
-        probe[..3],
-        ["token=seen", "config=run", "config_files=0"],
+        probe[..7],
+        [
+            "token=seen",
+            "var=",
+            "env=absent",
+            "after=empty",
+            environ,
+            "config=run",
+            "config_files=0"
+        ],
         "{probe:?}"
     );
-    let config = probe[3].strip_prefix("config_path=").unwrap();
+    let config = probe[7].strip_prefix("config_path=").unwrap();
     assert!(!PathBuf::from(config).exists(), "{config} outlived the run");
     assert!(
         matches!(
@@ -319,7 +369,13 @@ fn a_confined_harness_logs_in_with_its_token_and_no_output_keeps_it() {
     );
     let stdout = fs::read_to_string(&report.stdout_log).unwrap();
     assert!(
-        stdout.contains("CLAUDE_CODE_OAUTH_TOKEN=<redacted>"),
+        stdout.contains("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="),
+        "{stdout}"
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")),
         "{stdout}"
     );
     assert_eq!(

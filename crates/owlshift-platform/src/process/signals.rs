@@ -167,6 +167,15 @@ fn live() -> MutexGuard<'static, Live> {
     LIVE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Runs `act` while no process tree can start: [`register`] holds the same
+/// lock across its spawn. For a descriptor that must not be inherited by a
+/// process forked meanwhile, on a system that has no `pipe2` (OWL-96).
+#[cfg(unix)]
+pub(super) fn while_no_tree_starts<R>(act: impl FnOnce() -> R) -> R {
+    let _guard = live();
+    act()
+}
+
 /// A live tree's entry; dropping it removes the entry.
 #[derive(Debug)]
 pub(super) struct Registration {

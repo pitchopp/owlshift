@@ -57,9 +57,12 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join(HARNESS_CONFIG_DIR);
     std::fs::create_dir(&config).unwrap();
+    // Bound read and written, as the executor binds it: under bwrap the
+    // temporary folder is made anew, empty.
     let run = RunPaths {
         workdir: workdir.path().to_path_buf(),
         readable: needs.readable,
+        writable: vec![config.clone()],
         temp: Some(temp.path().to_path_buf()),
         ..RunPaths::default()
     };
@@ -81,20 +84,23 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
     let mut inner = Command::new(built.get_program());
     inner.args(built.get_args());
     let mut command = agent.confine(inner, &run).unwrap();
+    login.apply(&mut command, &config).unwrap();
     command
-        .env(login.config_variable, &config)
-        .env(login.token_variable, login.token.expose())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("`claude` is on the PATH");
+    // It holds the runner's copy of the token's pipe.
+    drop(command);
     let run = drive(&mut child, "Reply with the single word ok.", |_| {}).unwrap();
 
+    // Nothing printed shows the token, even should the CLI echo it.
+    let hide = |text: String| text.replace(login.token.expose(), "<redacted>");
     assert!(
         matches!(run.outcome, Outcome::Completed { .. }),
-        "{:?}\nstderr: {}",
-        run.outcome,
-        String::from_utf8_lossy(&run.stderr)
+        "{}\nstderr: {}",
+        hide(format!("{:?}", run.outcome)),
+        hide(String::from_utf8_lossy(&run.stderr).into_owned())
     );
     assert_eq!(
         run.billing,

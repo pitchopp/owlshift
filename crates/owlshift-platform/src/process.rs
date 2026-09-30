@@ -7,12 +7,16 @@
 //! way, keeping as much of its output as the caller asks for. [`ProcessTree`] is the mechanism, shared with the executor;
 //! [`stop_trees_on_signal`] stops the live trees when the process is told to
 //! end, and, on Unix, `stop_trees_when_killed` when it is killed outright.
+//! [`hand_over_on_descriptor`] gives a child a secret on an inherited
+//! descriptor, never in its environment.
 
+mod handover;
 #[cfg(unix)]
 mod sentinel;
 mod signals;
 mod tree;
 
+pub use handover::hand_over_on_descriptor;
 #[cfg(unix)]
 pub use sentinel::{SentinelProbe, SentinelStatus, probe_sentinel};
 pub use signals::stop_trees_on_signal;
