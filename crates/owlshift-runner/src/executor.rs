@@ -334,22 +334,33 @@ impl Executor {
         paths.readable = needs.readable;
         paths.writable = needs.writable;
         paths.temp = Some(temp.path().to_owned());
+        // An empty configuration folder of the run's own, in its temporary
+        // folder: no other login is found there, and nothing the harness
+        // writes outlives the run (OWL-94). It is bound read and written:
+        // under bwrap the temporary folder is made anew, empty, inside the
+        // sandbox's private `/tmp`, so a folder the runner made there would
+        // not be seen.
+        let config = match &login {
+            Some(_) => {
+                let config = temp.path().join(HARNESS_CONFIG_DIR);
+                fs::create_dir(&config).map_err(|source| ExecutorError::RunDir {
+                    path: config.clone(),
+                    source,
+                })?;
+                paths.writable.push(config.clone());
+                Some(config)
+            }
+            None => None,
+        };
         let mut command = self
             .agent
             .confine(inner, &paths)
             .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
-        if let Some(login) = &login {
-            // An empty configuration folder of the run's own, in its
-            // temporary folder: no other login is found there, and nothing
-            // the harness writes outlives the run (OWL-94). The token goes on
-            // this command alone, last, and the command is never printed.
-            let config = temp.path().join(HARNESS_CONFIG_DIR);
-            fs::create_dir(&config).map_err(|source| ExecutorError::RunDir {
-                path: config.clone(),
-                source,
-            })?;
+        if let (Some(login), Some(config)) = (&login, &config) {
+            // The token goes on this command alone, last, and the command is
+            // never printed.
             command
-                .env(login.config_variable, &config)
+                .env(login.config_variable, config)
                 .env(login.token_variable, login.token.expose());
         }
         command
