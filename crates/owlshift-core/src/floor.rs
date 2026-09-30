@@ -64,12 +64,13 @@ pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), Floor
 /// ([`crate::agent_env`]).
 pub const CREDENTIAL_VARIABLES: &[&str] = &[
     // Model providers: Owlshift never handles a model API key. The one model
-    // login it holds, the agent runs' `claude setup-token` token, is set by
-    // the runner on the harness command alone, never through the agent
-    // environment (OWL-94).
+    // login it holds, the agent runs' `claude setup-token` token, is handed
+    // by the runner to the harness command alone, on a descriptor the second
+    // variable names, never through the agent environment (OWL-94, OWL-96).
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",

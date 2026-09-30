@@ -357,11 +357,12 @@ impl Executor {
             .confine(inner, &paths)
             .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
         if let (Some(login), Some(config)) = (&login, &config) {
-            // The token goes on this command alone, last, and the command is
-            // never printed.
-            command
-                .env(login.config_variable, config)
-                .env(login.token_variable, login.token.expose());
+            // The token goes to this command alone, on a pipe its child
+            // inherits, never in an environment (OWL-96); the error does not
+            // hold it.
+            login
+                .apply(&mut command, config)
+                .map_err(ExecutorError::Spawn)?;
         }
         command
             .stdin(Stdio::piped())
