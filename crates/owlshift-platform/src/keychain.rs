@@ -110,6 +110,17 @@ impl Keychain {
         }
     }
 
+    /// Whether a secret is stored for `account`. The value is not returned:
+    /// a check that needs presence alone, such as `owlshift doctor`'s, never
+    /// holds it.
+    pub fn contains(&self, account: &str) -> Result<bool, KeychainError> {
+        match self.entry(account)?.get_credential() {
+            Ok(_) => Ok(true),
+            Err(StoreError::NoEntry) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Stores a secret for `account`, replacing any previous one.
     pub fn store(&self, account: &str, secret: &Secret) -> Result<(), KeychainError> {
         Ok(self.entry(account)?.set_password(secret.expose())?)
@@ -137,9 +148,11 @@ mod tests {
     fn an_entry_is_stored_read_replaced_and_deleted() {
         let keychain = Keychain::in_memory();
         assert_eq!(keychain.read("linear").unwrap(), None);
+        assert!(!keychain.contains("linear").unwrap());
         assert!(!keychain.delete("linear").unwrap());
 
         keychain.store("linear", &Secret::new("first")).unwrap();
+        assert!(keychain.contains("linear").unwrap());
         keychain.store("linear", &Secret::new("second")).unwrap();
         assert_eq!(
             keychain.read("linear").unwrap(),
@@ -149,6 +162,7 @@ mod tests {
 
         assert!(keychain.delete("linear").unwrap());
         assert_eq!(keychain.read("linear").unwrap(), None);
+        assert!(!keychain.contains("linear").unwrap());
     }
 
     #[test]
