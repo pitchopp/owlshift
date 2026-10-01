@@ -87,7 +87,7 @@ const PEER_INBOX_ARGS: &[&str] = &["--settings", r#"{"crossSessionInbound":"refu
 /// Switches the inbox itself off: with this variable, `claude -p` binds no
 /// socket and its `init` names none, confined or not. The CLI reads it as
 /// the override of a feature gate; it is not documented, so
-/// [`PEER_INBOX_ARGS`] stays as the documented layer. This adapter cannot
+/// `PEER_INBOX_ARGS` stays as the documented layer. This adapter cannot
 /// set it, since the executor replaces the command's whole environment:
 /// `AgentEnv::from_runner` does, for every agent the CLI launches. Checked
 /// live (OWL-52 and OWL-65, recorded under check C1 in
