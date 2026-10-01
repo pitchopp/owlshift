@@ -33,3 +33,7 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Reads a process's state in the tests, with no `ps` (OWL-110).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc.workspace = true
