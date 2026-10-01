@@ -23,7 +23,6 @@ pub fn is_alive(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::*;
     use std::{fs, io};
 
     pub fn state(pid: u32) -> String {
