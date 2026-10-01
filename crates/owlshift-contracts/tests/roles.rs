@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use owlshift_contracts::Role;
-use owlshift_contracts::format::strip_role_front_matter;
+use owlshift_contracts::format::{RESULT_FORMAT, strip_role_front_matter};
 use owlshift_contracts::result::RunResult;
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
@@ -15,6 +15,18 @@ use serde_json::Value;
 
 /// The line budget of the build prompt, which the harness re-reads every run.
 const BUILD_MAX_LINES: usize = 120;
+
+/// `result.json` fields and values only the answer check writes (OWL-23): the
+/// build prompt need not name them, and a build result carrying them is
+/// refused.
+const ANSWER_CHECK_ONLY: &[&str] = &[
+    "verdicts",
+    "class",
+    "answered",
+    "partial",
+    "unanswered",
+    "counter_question",
+];
 
 /// Brief fields the build prompt relies on, as dotted paths from the brief's
 /// root; arrays and alternatives are crossed on the way.
@@ -155,7 +167,13 @@ fn names_and_values(node: &Value, out: &mut BTreeSet<String>) {
 
 #[test]
 fn build_front_matter_matches_the_contract_formats() {
-    strip_role_front_matter(Role::Build, &build_prompt()).unwrap_or_else(|e| panic!("{e}"));
+    let prompt = build_prompt();
+    strip_role_front_matter(Role::Build, &prompt).unwrap_or_else(|e| panic!("{e}"));
+    // The prose names the format the role must write, too.
+    assert!(
+        prompt.contains(&format!("JSON with `format` {RESULT_FORMAT},")),
+        "roles/build.md does not say result.json has `format` {RESULT_FORMAT}"
+    );
 }
 
 #[test]
@@ -172,6 +190,12 @@ fn build_prompt_names_every_result_field_and_value() {
     let text = build_prompt();
     let mut expected = BTreeSet::new();
     names_and_values(&generated("result"), &mut expected);
+    for word in ANSWER_CHECK_ONLY {
+        assert!(
+            expected.remove(*word),
+            "{word} is no longer in the result schema"
+        );
+    }
     let missing: Vec<_> = expected.iter().filter(|w| !names(&text, w)).collect();
     assert!(
         missing.is_empty(),

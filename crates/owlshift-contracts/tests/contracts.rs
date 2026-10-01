@@ -12,7 +12,7 @@ use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requ
 use owlshift_contracts::event::Event;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{Claim, PersistedState, claim_ref, ticket_ref};
-use owlshift_contracts::result::{RunResult, Status};
+use owlshift_contracts::result::{AnswerClass, RunResult, Status};
 use serde_json::{Value, json};
 
 /// Artifact paths that could leave the worktree, on any platform.
@@ -95,6 +95,13 @@ fn every_contract_round_trips() {
     assert_eq!(result.status, Status::Questions);
     assert_eq!(result.questions[0].id.as_str(), "Q1");
     assert!(result.pr.is_none());
+    assert!(result.verdicts.is_empty());
+    let checked = round_trip(
+        "result-answer-check.json",
+        RunResult::parse,
+        RunResult::render,
+    );
+    assert_eq!(checked.verdicts[0].class, AnswerClass::Unanswered);
 
     round_trip("brief.json", Brief::parse, Brief::render);
     let event = round_trip("event.json", Event::parse, Event::render);
@@ -173,10 +180,15 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(2);
-            v["verdicts"] = json!([]);
+            v["format"] = json!(3);
+            v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 1, before result.json carried verdicts",
+        parse(|v| v["format"] = json!(1)),
+        "unknown format 1",
     );
     rejects(
         "format 0",
@@ -197,23 +209,64 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 2, "status""#),
+        RunResult::parse(r#"{"format": 3, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 1, "status""#),
+        RunResult::parse(r#"{"format": 2, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(2));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(3));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 2,
-            supported: 1,
+            found: 3,
+            supported: 2,
             ..
         })
     ));
+    // Verdicts: known classes, in question order, each with a reason, and
+    // with `done` only.
+    let verdicts =
+        |edit: fn(&mut Value)| RunResult::parse(&edited("result-answer-check.json", edit));
+    rejects(
+        "unknown class",
+        verdicts(|v| v["verdicts"][0]["class"] = json!("settled")),
+        "unknown variant `settled`",
+    );
+    rejects(
+        "unknown field in a verdict",
+        verdicts(|v| v["verdicts"][0]["extra"] = json!(1)),
+        "unknown field `extra`",
+    );
+    rejects(
+        "verdict without a reason",
+        verdicts(|v| v["verdicts"][0]["reason"] = json!(" \t\n")),
+        "the verdict for Q2 has no reason",
+    );
+    rejects(
+        "verdict repeated",
+        verdicts(|v| {
+            let first = v["verdicts"][0].clone();
+            v["verdicts"].as_array_mut().unwrap().push(first);
+        }),
+        "the verdict for Q2 is repeated or out of order",
+    );
+    rejects(
+        "verdicts out of order",
+        verdicts(|v| {
+            let mut q1 = v["verdicts"][0].clone();
+            q1["question"] = json!("Q1");
+            v["verdicts"].as_array_mut().unwrap().push(q1);
+        }),
+        "the verdict for Q1 is repeated or out of order",
+    );
+    rejects(
+        "verdicts without done",
+        verdicts(|v| v["status"] = json!("blocked")),
+        "verdicts are given but status is not done",
+    );
     // Artifact paths come from a model: they must stay inside the worktree.
     for path in BAD_PATHS {
         let input = edited("result-sample.json", |v| {
@@ -231,6 +284,81 @@ fn result_rejections() {
     // Deserializing the type directly still refuses another format.
     let direct = serde_json::from_str::<RunResult>(&newer).unwrap_err();
     assert!(direct.to_string().contains("upgrade Owlshift"));
+}
+
+/// Verdicts against the brief of the run: from the answer check only, one for
+/// each question of the thread's latest ask (OWL-23).
+#[test]
+fn result_against_the_brief() {
+    let brief = |edit: fn(&mut Value)| Brief::parse(&edited("brief.json", edit)).unwrap();
+    let answer_check = brief(|v| v["role"] = json!("answer_check"));
+    let checked =
+        |edit: fn(&mut Value)| RunResult::parse(&edited("result-answer-check.json", edit)).unwrap();
+
+    // brief.json's latest ask is the re-ask of Q2 alone, before a comment.
+    for class in ["answered", "partial", "unanswered", "counter_question"] {
+        let mut value: Value = serde_json::from_str(&fixture("result-answer-check.json")).unwrap();
+        value["verdicts"][0]["class"] = json!(class);
+        let result = RunResult::parse(&value.to_string()).unwrap();
+        result.validate_against(&answer_check).unwrap();
+    }
+    rejects(
+        "a verdict on a question the re-ask settled earlier",
+        checked(|v| {
+            let mut q1 = v["verdicts"][0].clone();
+            q1["question"] = json!("Q1");
+            v["verdicts"].as_array_mut().unwrap().insert(0, q1);
+        })
+        .validate_against(&answer_check),
+        "the verdict for Q1 names a question the latest ask of round 1 did not ask",
+    );
+    rejects(
+        "a done answer check without verdicts",
+        checked(|v| v["verdicts"] = json!([])).validate_against(&answer_check),
+        "no verdict for Q2 of round 1",
+    );
+    // A later round is the latest ask, whole: Q1 and Q2 of round 2.
+    let round_two = brief(|v| {
+        v["role"] = json!("answer_check");
+        let mut round = v["thread"][0].clone();
+        round["round"] = json!(2);
+        v["thread"].as_array_mut().unwrap().push(round);
+    });
+    rejects(
+        "a verdict missing for the latest round",
+        checked(|_| {}).validate_against(&round_two),
+        "no verdict for Q1 of round 2",
+    );
+    rejects(
+        "an answer check on a thread that asks nothing",
+        checked(|_| {}).validate_against(&brief(|v| {
+            v["role"] = json!("answer_check");
+            v["thread"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|e| e["type"] == "comment");
+        })),
+        "asks no question",
+    );
+    // An answer check that did not finish gives no verdict, and needs none.
+    checked(|v| {
+        v["status"] = json!("failed");
+        v["verdicts"] = json!([]);
+    })
+    .validate_against(&answer_check)
+    .unwrap();
+
+    // Any other role gives no verdict.
+    let build = brief(|_| {});
+    rejects(
+        "verdicts from the build role",
+        checked(|_| {}).validate_against(&build),
+        "verdicts are given but the run's role is build, not answer_check",
+    );
+    RunResult::parse(&fixture("result-sample.json"))
+        .unwrap()
+        .validate_against(&build)
+        .unwrap();
 }
 
 #[test]

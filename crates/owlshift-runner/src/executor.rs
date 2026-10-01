@@ -513,7 +513,9 @@ fn decide(
                     resets_at: *resets_at,
                 },
                 HarnessStatus::Failed(reason) => Outcome::Failed(Failure::Harness(reason.clone())),
-                HarnessStatus::Completed => read_result(spec.worktree, spec.branch, hidden),
+                HarnessStatus::Completed => {
+                    read_result(spec.worktree, spec.branch, spec.brief, hidden)
+                }
             }
         }
     };
@@ -524,7 +526,7 @@ fn decide(
 /// result or an artifact that holds `hidden`, the harness's login, fails the
 /// run: what it says would reach the tracker, the pull request and the
 /// events (OWL-94).
-fn read_result(worktree: &Path, branch: &str, hidden: Option<&Secret>) -> Outcome {
+fn read_result(worktree: &Path, branch: &str, brief: &Brief, hidden: Option<&Secret>) -> Outcome {
     let copied = |into: &str, bytes: &[u8]| {
         hidden.is_some_and(|token| holds(bytes, token)).then(|| {
             Outcome::Failed(Failure::Credentials(vec![CredentialFinding::LoginCopied {
@@ -543,7 +545,7 @@ fn read_result(worktree: &Path, branch: &str, hidden: Option<&Secret>) -> Outcom
     if let Some(refused) = copied(RESULT_PATH, &bytes) {
         return refused;
     }
-    let result = match validate_result(&bytes, branch) {
+    let result = match validate_result(&bytes, branch, brief) {
         Ok(result) => result,
         Err(reason) => return Outcome::Failed(Failure::InvalidResult(reason)),
     };
@@ -569,11 +571,13 @@ fn read_result(worktree: &Path, branch: &str, hidden: Option<&Secret>) -> Outcom
     }
 }
 
-/// Parses `result.json` against its contract, and requires a pull request
-/// to name the run's own branch.
-pub fn validate_result(bytes: &[u8], branch: &str) -> Result<RunResult, String> {
+/// Parses `result.json` against its contract and against the run's brief
+/// (verdicts from the answer check only, covering its latest ask), and
+/// requires a pull request to name the run's own branch.
+pub fn validate_result(bytes: &[u8], branch: &str, brief: &Brief) -> Result<RunResult, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_owned())?;
     let result = RunResult::parse(text).map_err(|e| e.to_string())?;
+    result.validate_against(brief).map_err(|e| e.to_string())?;
     if let Some(pr) = &result.pr
         && pr.branch != branch
     {
@@ -741,19 +745,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_result_is_valid_for_its_contract_and_its_branch() {
-        let done = br#"{"format":1,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
-        assert!(validate_result(done, "owlshift/T-1").is_ok());
+    fn a_result_is_valid_for_its_contract_its_brief_and_its_branch() {
+        let brief = Brief::parse(&format!(
+            r#"{{"format":{},"role":"build","project":"p",
+                "ticket":{{"id":"T-1","title":"t","author":{{"name":"a","relation":"decider"}},"description":"d"}},
+                "decider":"a","permissions":{{"level":"write_worktree","network":false,"browser":false}},
+                "gate":[],"result_path":"result.json"}}"#,
+            owlshift_contracts::format::BRIEF_FORMAT
+        ))
+        .unwrap();
+        let done = br#"{"format":2,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+        assert!(validate_result(done, "owlshift/T-1", &brief).is_ok());
 
-        let other = validate_result(done, "owlshift/T-2").unwrap_err();
+        let other = validate_result(done, "owlshift/T-2", &brief).unwrap_err();
         assert!(other.contains("pr.branch"), "{other}");
         // A contract rule: questions needs a question.
-        let empty = br#"{"format":1,"status":"questions","summary":"s","questions":[]}"#;
-        assert!(validate_result(empty, "owlshift/T-1").is_err());
+        let empty = br#"{"format":2,"status":"questions","summary":"s","questions":[]}"#;
+        assert!(validate_result(empty, "owlshift/T-1", &brief).is_err());
+        // A rule against the brief: verdicts come from the answer check only.
+        let verdicts = br#"{"format":2,"status":"done","summary":"s","verdicts":[{"question":"Q1","class":"answered","reason":"r"}]}"#;
+        let refused = validate_result(verdicts, "owlshift/T-1", &brief).unwrap_err();
+        assert!(refused.contains("role is build"), "{refused}");
         // Unknown fields are refused, and so is text that is not UTF-8.
-        let unknown = br#"{"format":1,"status":"done","summary":"s","extra":1}"#;
-        assert!(validate_result(unknown, "owlshift/T-1").is_err());
-        assert!(validate_result(b"\xff", "owlshift/T-1").is_err());
+        let unknown = br#"{"format":2,"status":"done","summary":"s","extra":1}"#;
+        assert!(validate_result(unknown, "owlshift/T-1", &brief).is_err());
+        assert!(validate_result(b"\xff", "owlshift/T-1", &brief).is_err());
     }
 
     /// OWL-94: the harness's login token never reaches the log files, even

@@ -200,7 +200,7 @@ struct Bench {
     github: Arc<FakeGitHub>,
 }
 
-const DONE: &str = r#"{"format":1,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const DONE: &str = r#"{"format":2,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "decisions":[{"question":"Tone","decision":"Friendly","basis":"The ticket"}],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
@@ -541,9 +541,9 @@ type Check = fn(&Stop) -> bool;
 /// and the remote's branch moves only when the push itself went through.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
-    let questions = r#"{"format":1,"status":"questions","summary":"One choice is yours.",
+    let questions = r#"{"format":2,"status":"questions","summary":"One choice is yours.",
         "questions":[{"id":"Q1","category":"scope","context":"Two readings.","text":"Which one?"}]}"#;
-    let blocked = r#"{"format":1,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":2,"status":"blocked","summary":"The gate needs network."}"#;
     let reset: jiff::Timestamp = "2026-09-29T15:00:00Z".parse().unwrap();
 
     let cases: Vec<(&str, Setup, Check, Option<EventKind>)> = vec![
@@ -871,7 +871,7 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         ]);
         *planted.borrow_mut() = commit;
     });
-    let blocked = r#"{"format":1,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":2,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], Some(agent));
     assert!(
         matches!(

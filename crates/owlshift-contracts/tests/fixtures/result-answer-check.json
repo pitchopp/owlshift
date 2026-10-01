@@ -1,0 +1,12 @@
+{
+  "format": 2,
+  "status": "done",
+  "summary": "Q2, re-asked, is still open: only someone other than the decider answered it.",
+  "verdicts": [
+    {
+      "question": "Q2",
+      "class": "unanswered",
+      "reason": "The only reply on the time zone comes from Grace, who is not the decider."
+    }
+  ]
+}
