@@ -214,7 +214,7 @@ pub fn printable(text: &str) -> String {
     out
 }
 
-/// How [`print`] follows the log once it reached its end.
+/// How [`print()`] follows the log once it reached its end.
 pub struct Follow<'a> {
     /// How long to wait between two looks at the file.
     pub poll: Duration,

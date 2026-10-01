@@ -51,6 +51,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # OWL-106: a broken link in the docs of a public item goes unnoticed
+      # until rustdoc runs. Approved on OWL-106 on 2026-10-01, as the
+      # CI-settings floor of architecture section 8 requires.
+      - name: Rustdoc
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
       # OWL-81: `cargo test --workspace` runs other test binaries
       # (agent_credentials among them) before on_demand, so a warm gh hides
       # a cold-start failure. On the Windows runner the on_demand binary

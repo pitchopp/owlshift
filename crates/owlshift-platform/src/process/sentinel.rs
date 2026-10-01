@@ -253,7 +253,7 @@ const MEMBER: &str = "read -r line";
 /// input ends, within `bound`.
 ///
 /// It starts a group of two processes of its own, the leader and a member
-/// that joins it, then a sentinel running [`SCRIPT`], tells the sentinel of
+/// that joins it, then a sentinel running `SCRIPT`, tells the sentinel of
 /// the group and closes its input. The group is stopped when both are killed
 /// by `SIGKILL`. The sentinel of this process, if any, is never told of that
 /// group, and everything the probe starts is reaped before it returns.

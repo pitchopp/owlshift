@@ -303,7 +303,7 @@ fn remove_partial_clone(checkout: &Path, budget: Duration) -> io::Result<()> {
 /// The first clone runs under [`CLONE_TIMEOUT`]; every other command runs
 /// under the runner git's own deadline, 120 s. It is marked `unfinished-clone`
 /// until it succeeds (OWL-80): a failed clone's folder is removed, trying
-/// again for up to [`REMOVAL_BUDGET`], and while the marker exists, the next
+/// again for up to `REMOVAL_BUDGET`, and while the marker exists, the next
 /// call removes whatever is left in `checkout` before cloning anew, or
 /// refuses when it cannot. The marker relies on the project lock, which
 /// `owlshift do` holds around this call: no other clone of the project runs.

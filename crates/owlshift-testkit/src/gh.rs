@@ -35,7 +35,7 @@ pub fn on_path(env: &[(OsString, OsString)]) -> Option<PathBuf> {
 }
 
 /// Starts the gh found with `env` once for the whole test binary, so that
-/// the probes time gh's answer and not its first start ([`FIRST_START`]).
+/// the probes time gh's answer and not its first start (`FIRST_START`).
 /// Tests that arrive meanwhile wait here, off their probes' clocks. Without
 /// gh there is nothing to start.
 ///
@@ -45,7 +45,7 @@ pub fn on_path(env: &[(OsString, OsString)]) -> Option<PathBuf> {
 ///
 /// # Panics
 ///
-/// When gh does not start and answer within [`FIRST_START`].
+/// When gh does not start and answer within `FIRST_START`.
 pub fn warm_up(env: &[(OsString, OsString)]) {
     static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
     let started = STARTED.get_or_init(|| {

@@ -2,7 +2,7 @@
 //! `done` (OWL-16): the role's own claim that the gate is green is never
 //! taken as proof.
 //!
-//! [`run`] runs the brief's `gate` commands in the worktree, in order, each
+//! `run` runs the brief's `gate` commands in the worktree, in order, each
 //! through the platform's shell (`sh -c` on Unix, `cmd /d /s /c` on
 //! Windows), with the agent environment and no input, and stops at the first
 //! failure. Around them it requires a clean worktree before and after, and
