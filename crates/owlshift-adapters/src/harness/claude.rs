@@ -12,9 +12,10 @@
 //! Owlshift never passes a credential, and this adapter sets no variable: the
 //! executor gives the child the agent environment of
 //! `owlshift_core::agent_env`, which keeps what `claude` needs to find the
-//! login the user configured, normally their subscription (architecture
-//! principle 9), and no tracker, forge or cloud credential. The runner adds
-//! [`PEER_INBOX_ENV`] to it.
+//! login of agent runs, the `claude setup-token` token of the user's
+//! subscription that `owlshift init` stores (architecture principle 9), and no
+//! tracker, forge or cloud credential. The runner adds [`PEER_INBOX_ENV`] to
+//! it.
 //!
 //! Every CLI behaviour relied on here was checked live and is recorded in
 //! `docs/design/build-plan.md`, under checks C1 and C7 and the OWL-14

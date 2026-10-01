@@ -63,7 +63,7 @@ Native binary on every developer machine; Windows goes through WSL2 first; Docke
 
 **Where Docker fits.**
 
-1. **Server mode:** an official image and a compose file for a Linux server, where there is no VM overhead. The harness CLIs are logged in inside the server once, as on any machine.
+1. **Server mode:** an official image and a compose file for a Linux server, where there is no VM overhead. Codex is logged in inside the server once, and the Claude Code token is made with `claude setup-token` and stored by `owlshift init`, as on any machine.
 2. **Optional sandbox per project:** each run in a disposable container, a layer of defence on top of the harnesses' own sandboxes, worth it for public repositories.
 
 ## Install, lifecycle & uninstall

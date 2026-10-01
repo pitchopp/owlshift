@@ -7,7 +7,7 @@ Owlshift is an open-source runner that works a team's existing backlog continuou
 - **Your tracker stays the interface.** No new board to adopt: questions, answers and delivery reports live on the ticket.
 - **The human decision loop is the product.** Questions can come at any stage; answers are checked before anything resumes; there is no limit on rounds.
 - **Scheduling is enforced.** Blockers gate dispatch, and declared resources keep two in-flight tickets (agent or human) from colliding.
-- **Bring your own agents, on your own subscription.** Claude Code, Codex, or a mix, per project, per role or per ticket. Owlshift drives the CLIs you are already logged in to and never asks for an API key.
+- **Bring your own agents, on your own subscription.** Claude Code, Codex, or a mix, per project, per role or per ticket. Owlshift drives the CLIs on your subscription (Codex through your login, Claude Code agent runs through a `claude setup-token` token that `owlshift init` stores, never your own Claude Code login) and never asks for an API key.
 - **Runs on your machine.** One light native background service; zero tokens at rest.
 
 ## Status
