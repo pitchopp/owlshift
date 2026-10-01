@@ -46,7 +46,7 @@ Nine rules; every later choice in this document derives from one of them.
 6. **Nothing enters the work queue without a human gesture.** The runner only pulls tickets a person admitted; follow-ups it proposes wait in an inbox.
 7. **Guardrails are enforced by the runner, not requested of the model.** Agents have no tracker write access and cannot merge, deploy or change state, by construction.
 8. **Neutral by contract.** Tracker, forge, harness, model and stack are adapters behind capability contracts. A contract is frozen only after three implementations exist, one of them possibly on paper.
-9. **Subscription first.** Owlshift drives the Claude and Codex CLIs exactly as the user configured them, normally logged in to their own subscription. It never asks for, stores or passes a model API key; a user who prefers API billing sets it in the CLI's own configuration, and Owlshift does not need to know.
+9. **Subscription first.** Owlshift drives the Claude and Codex CLIs on the user's own subscription: Codex through the login the user configured, Claude Code agent runs through a token of that subscription made with `claude setup-token` and stored by `owlshift init`, never the user's own Claude Code login. It never asks for, stores or passes a model API key; a user who prefers API billing sets it in the CLI's own configuration, and Owlshift does not need to know.
 
 ## 3. Core model
 
@@ -149,7 +149,7 @@ Five adapter kinds, each declaring its capabilities; `init` refuses a project wh
 | --- | --- | --- | --- |
 | Tracker | Tickets, comments, visible stage (table below) | Linear; a test tracker in the repo | GitHub Issues and the public Markdown tracker in P9; GitLab, Jira, Plane |
 | Forge | Open a PR, read the complete check set and review comments, push branches and custom refs, read merge state | GitHub | GitLab, Gitea, Bitbucket |
-| Harness | Run one role headless in a directory through the vendor's own CLI and its existing login, with a model, an effort and a permission level; honour the result-file contract; report usage and usage limits | Claude Code, Codex | OpenCode, Gemini CLI; a third one on paper before the contract freezes |
+| Harness | Run one role headless in a directory through the vendor's own CLI and the login that CLI's agent runs use (Codex's own, the stored `claude setup-token` token for Claude Code), with a model, an effort and a permission level; honour the result-file contract; report usage and usage limits | Claude Code, Codex | OpenCode, Gemini CLI; a third one on paper before the contract freezes |
 | Notifier | Send one short line to one person | Tracker mention; a generic webhook | Chat apps, e-mail, push services |
 | Stack profile | Declarative: install, full gate (lint, formatter, tests), dev servers and ports, resource patterns such as migration paths, path-scoped rules to inject | Hand-written for the first adopter | Detection presets per ecosystem in `init` |
 

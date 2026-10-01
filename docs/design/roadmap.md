@@ -37,7 +37,7 @@ A repository that people and agents can build in safely, and a first command tha
 `owlshift do OWL-12` replaces launching one agent by hand.
 
 - Linear tracker adapter: read a ticket, post a comment.
-- Claude Code harness: headless run on the user's login, model, effort, permission level, usage capture.
+- Claude Code harness: headless run logged in with the stored `claude setup-token` token, model, effort, permission level, usage capture.
 - Executor: worktree, brief, result validation, isolation check; the project's gate commands before delivery.
 - GitHub forge adapter: push the branch, open the PR, read the complete check set.
 - The floor from day one: no merge, no tracker credentials for agents, an exit code never trusted.

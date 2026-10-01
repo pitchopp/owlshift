@@ -9,12 +9,13 @@
 //! it stops a run by stopping the child's process group, which ends
 //! [`drive`] too.
 //!
-//! Owlshift never passes a credential, and this adapter sets no variable: the
-//! executor gives the child the agent environment of
-//! `owlshift_core::agent_env`, which keeps what `claude` needs to find the
-//! login the user configured, normally their subscription (architecture
-//! principle 9), and no tracker, forge or cloud credential. The runner adds
-//! [`PEER_INBOX_ENV`] to it.
+//! This adapter sets no variable. The executor gives the child the agent
+//! environment of `owlshift_core::agent_env`, which carries no tracker, forge
+//! or cloud credential. The runner hands over the agent-run token (made with
+//! `claude setup-token` and stored by `owlshift init`, architecture principle
+//! 9) on an inherited descriptor named by [`LOGIN_TOKEN_FD_ENV`]: it is never
+//! put in the environment, and it is never the user's own Claude Code login.
+//! The runner also adds [`PEER_INBOX_ENV`].
 //!
 //! Every CLI behaviour relied on here was checked live and is recorded in
 //! `docs/design/build-plan.md`, under checks C1 and C7 and the OWL-14
