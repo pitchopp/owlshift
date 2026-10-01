@@ -130,6 +130,20 @@ pub enum PlanApproval {
     Never,
 }
 
+/// How the decider's answers left one question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerClass {
+    /// The answers settle the question.
+    Answered,
+    /// The answers settle part of the question; the rest is missing.
+    Partial,
+    /// No answer from the decider addresses the question.
+    Unanswered,
+    /// The decider answered with a question of their own.
+    CounterQuestion,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

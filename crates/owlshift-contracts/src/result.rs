@@ -11,6 +11,10 @@ use crate::brief::{Brief, ThreadEntry};
 use crate::format::{self, ContractError, Format, RESULT_FORMAT};
 use crate::ids::{QuestionId, RelativePath};
 
+/// The answer check's classes live in the core, which folds them into one
+/// state-machine event.
+pub use owlshift_core::vocab::AnswerClass;
+
 const CONTRACT: &str = "result.json";
 
 /// The result of one run, written by the role as `result.json`.
@@ -89,20 +93,6 @@ pub struct Verdict {
     /// missing. Not empty and not only whitespace.
     #[schemars(regex(pattern = r"\S"))]
     pub reason: String,
-}
-
-/// How the decider's answers left one question.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AnswerClass {
-    /// The answers settle the question.
-    Answered,
-    /// The answers settle part of the question; the rest is missing.
-    Partial,
-    /// No answer from the decider addresses the question.
-    Unanswered,
-    /// The decider answered with a question of their own.
-    CounterQuestion,
 }
 
 /// A decision the role took on its own.
