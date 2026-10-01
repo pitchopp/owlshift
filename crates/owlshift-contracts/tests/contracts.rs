@@ -834,6 +834,26 @@ fn personal_config_rejections() {
         "nonzero",
     );
     rejects(
+        "unknown notification setting",
+        parse("desktop = false", "desktop = false\nsound = true"),
+        "unknown field `sound`",
+    );
+    let out_of_range = "harness Claude: usage_cap_percent must be a whole number from 1 to 100";
+    for (cap, needle) in [
+        ("0", out_of_range),
+        ("101", out_of_range),
+        ("80.5", "invalid type"),
+    ] {
+        rejects(
+            &format!("usage cap {cap}"),
+            parse(
+                "usage_cap_percent = 100",
+                &format!("usage_cap_percent = {cap}"),
+            ),
+            needle,
+        );
+    }
+    rejects(
         "bad requires",
         parse("requires = \">=0.1\"", "requires = \"1.0 or so\""),
         "requires",

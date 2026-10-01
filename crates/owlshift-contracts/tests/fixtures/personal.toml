@@ -8,8 +8,12 @@ allow_gate_env = ["JAVA_HOME"]
 tracker = "ada@example.com"
 forge = "ada"
 
+[notifications]
+desktop = false
+
 [harnesses.claude]
 fallback = "codex"
+usage_cap_percent = 100
 
 [harnesses.codex]
 fallback = "claude"

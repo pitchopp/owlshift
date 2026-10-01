@@ -158,6 +158,26 @@ fast     = { claude = "claude-haiku-4-5" }
 always_human = ["billing", "auth"]   # adds to the floor, never removes
 ```
 
+```toml
+# owlshift/config.toml, in the user's configuration directory
+concurrent_runs = 2
+keep_awake = true
+
+[notifications]
+desktop = true              # the default
+
+[harnesses.claude]
+fallback = "codex"
+usage_cap_percent = 80      # leave a fifth of each usage window to its owner
+
+[harnesses.codex]
+fallback = "claude"
+```
+
+**Notifications.** Decided on 2026-10-01 (OWL-24). `[notifications]` says how this machine tells its operator that they have become the blocker, at the moments [S6](scenarios.md#s6-the-human-is-the-bottleneck) lists: a question, a re-ask, a parked ticket, every harness at its usage limit; never for progress or a green check. Its one key so far, `desktop`, shows a notification through the operating system's own notification service; it is on unless set to `false`. It is how P2 tells a person that a question waits when Owlshift has no agent identity of its own on the tracker (the Linear app user of decision D8, pending check C4); someone the tracker already notifies can turn it off. Shown on this machine, it reaches its operator only: a decider elsewhere is reached through the tracker. A machine with no desktop session, such as a server, shows nothing, and no run or command fails for it. It is a table rather than a single switch because the webhook and the daily digest of P7 get their keys here when they are built; a webhook's address is a secret, so it will live in the keychain, not in this file. Until P2 the key is read and checked, and nothing acts on it.
+
+**Usage caps.** Decided on 2026-10-01 (OWL-24). A usage cap keeps part of a subscription for its owner, across every project this machine serves ([S16](scenarios.md#s16-several-projects-on-one-machine)). It is set per harness, `usage_cap_percent` under `[harnesses.<name>]`, a whole number from 1 to 100, and counts in the subscription's own terms ([architecture](architecture.md), section 9): the share used of each usage window the harness reports, its owner's use outside Owlshift included. While the latest share Owlshift has seen for any window of a harness is at or above its cap, and that window has not reset since, no new run starts on that harness: it counts as at its usage limit, and what [S10](scenarios.md#s10-circuit-breakers-and-usage-limits) says of one applies, fallback and notification included. A run already started is not stopped, so a window can end above its cap; and since a share is only known from a run's report, a cap holds nothing on a harness whose runs report none. Without a cap, only the provider's limit applies. One share covers every window of a harness; a cap per window can come later beside this key without changing it. Rejected: a cap on tokens or on runs, which Owlshift could count itself but which does not match a subscription's limit, since the provider decides what a window holds and a token of one model does not weigh what a token of another does. In the runs checked for C7 ([build plan](build-plan.md#results)), Claude Code reported a five-hour and a seven-day window in its `rate_limit_event`, each with its share and reset time; the adapter keeps both shares but only the reset time of the window a report is about, so P6 adds every window's share and reset time. What Codex reports is checked with C7's Codex part in P5. P6's scheduler enforces the cap, and decides where the latest share seen is kept across a restart; until then the key is read and checked, and nothing acts on it.
+
 ## Observability & the local web UI
 
 Every action is a recorded event, readable from the CLI from P1 and from a local web UI from P8; the tray app of P11 wraps that same UI instead of rebuilding it.

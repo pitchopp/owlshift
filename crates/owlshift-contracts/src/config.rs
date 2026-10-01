@@ -263,6 +263,10 @@ pub struct PersonalConfig {
     /// Whether to keep the machine awake while runs are in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_awake: Option<bool>,
+    /// How this machine tells its operator that they have become the
+    /// blocker.
+    #[serde(default)]
+    pub notifications: Notifications,
     /// Names of variables of this machine's environment that a project may
     /// pass to its agents by declaring them in `stack.gate_env`, in any
     /// letter case. A project's declaration never widens this list: a name
@@ -312,6 +316,18 @@ fn check_repository_key(key: &str) -> Result<(), String> {
     }
 }
 
+/// How this machine tells its operator that they have become the blocker: a
+/// question, a re-ask, a parked ticket, every harness at its usage limit;
+/// never progress.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Notifications {
+    /// Whether to show a desktop notification on this machine: on unless set
+    /// to `false`. A machine with no desktop session shows nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<bool>,
+}
+
 /// The user's accounts on the tracker and the forge.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -353,6 +369,14 @@ pub struct HarnessSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub budget_usd: Option<f64>,
+    /// A usage cap, in percent from 1 to 100: while the latest share seen of
+    /// any usage window this harness's subscription reports is at or above
+    /// it, and that window has not reset since, no new run starts on this
+    /// harness, which counts as at its usage limit. A harness whose runs
+    /// report no window is never held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub usage_cap_percent: Option<u8>,
 }
 
 impl PersonalConfig {
@@ -418,6 +442,16 @@ impl PersonalConfig {
                 return Err(ContractError::invalid(
                     PERSONAL,
                     format!("harness {harness:?}: budget_usd must be a number >= 0"),
+                ));
+            }
+            if let Some(cap) = settings.usage_cap_percent
+                && !(1..=100).contains(&cap)
+            {
+                return Err(ContractError::invalid(
+                    PERSONAL,
+                    format!(
+                        "harness {harness:?}: usage_cap_percent must be a whole number from 1 to 100"
+                    ),
                 ));
             }
         }
