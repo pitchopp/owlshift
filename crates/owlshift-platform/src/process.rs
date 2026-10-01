@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    use crate::test_proc::{command, is_alive, state};
+    use crate::test_proc::{command, is_alive, state, try_state};
 
     /// Whether a process is still running.
     #[cfg(windows)]
@@ -696,7 +696,7 @@ mod tests {
             // Nothing here may panic: it also runs while a failed test
             // unwinds.
             let shown = |pid: u32| {
-                let state = state(pid);
+                let state = try_state(pid);
                 if state.is_empty() {
                     return String::new();
                 }

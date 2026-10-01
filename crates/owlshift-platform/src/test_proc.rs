@@ -4,13 +4,22 @@
 //! include this file with `#[path]`.
 
 /// A process's state, as the letter `ps` shows first: `R` running, `S`
-/// asleep, `T` stopped, `Z` zombie. Empty once the process is gone.
+/// asleep, `T` stopped, `Z` zombie. Empty once the process is gone. Panics
+/// on a state it does not know: for a test's own assertions, never for a
+/// `Drop`, which uses [`try_state`].
 pub fn state(pid: u32) -> String {
-    imp::state(pid)
+    imp::state(pid).unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// [`state`], empty instead of a panic when the state cannot be read or is
+/// not known: for a `Drop`, which also runs while a failed test unwinds, and
+/// where a panic would abort the test binary and hide the first failure.
+pub fn try_state(pid: u32) -> String {
+    imp::state(pid).unwrap_or_default()
 }
 
 /// A process's arguments joined by spaces; empty once it is gone, or when
-/// its arguments cannot be read.
+/// its arguments cannot be read. Never panics, so a `Drop` may call it.
 pub fn command(pid: u32) -> String {
     imp::command(pid)
 }
@@ -25,19 +34,27 @@ pub fn is_alive(pid: u32) -> bool {
 mod imp {
     use std::{fs, io};
 
-    pub fn state(pid: u32) -> String {
+    /// `ESRCH` on Linux, whatever the architecture: the process exited
+    /// between the open and the read of `/proc/<pid>/stat`.
+    const ESRCH: i32 = 3;
+
+    pub fn state(pid: u32) -> Result<String, String> {
         match fs::read_to_string(format!("/proc/{pid}/stat")) {
             // `pid (comm) S ...`: the name may hold spaces and parentheses,
             // so the state follows the last closing one.
-            Ok(stat) => stat
+            Ok(stat) => Ok(stat
                 .rsplit_once(')')
                 .and_then(|(_, rest)| rest.trim_start().chars().next())
                 .map(String::from)
-                .unwrap_or_default(),
-            Err(error) => {
-                assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
-                String::new()
+                .unwrap_or_default()),
+            // The process is gone, or went while it was read.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(ESRCH) =>
+            {
+                Ok(String::new())
             }
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -91,7 +108,7 @@ mod imp {
         Some(buffer)
     }
 
-    pub fn state(pid: u32) -> String {
+    pub fn state(pid: u32) -> Result<String, String> {
         let mut mib = [
             libc::CTL_KERN,
             libc::KERN_PROC,
@@ -99,18 +116,20 @@ mod imp {
             pid as libc::c_int,
         ];
         let Some(info) = sysctl(&mut mib, KINFO_PROC_SIZE) else {
-            return String::new();
+            return Ok(String::new());
         };
-        assert!(info.len() > P_STAT, "short kinfo_proc: {}", info.len());
-        match u32::from(info[P_STAT]) {
-            libc::SIDL => "I",
-            libc::SRUN => "R",
-            libc::SSLEEP => "S",
-            libc::SSTOP => "T",
-            libc::SZOMB => "Z",
-            other => panic!("unknown process state {other}"),
+        let Some(&stat) = info.get(P_STAT) else {
+            return Err(format!("short kinfo_proc: {}", info.len()));
+        };
+        match u32::from(stat) {
+            libc::SIDL => Ok("I"),
+            libc::SRUN => Ok("R"),
+            libc::SSLEEP => Ok("S"),
+            libc::SSTOP => Ok("T"),
+            libc::SZOMB => Ok("Z"),
+            other => Err(format!("unknown process state {other}")),
         }
-        .to_owned()
+        .map(str::to_owned)
     }
 
     pub fn command(pid: u32) -> String {
