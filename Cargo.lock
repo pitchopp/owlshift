@@ -1390,6 +1390,7 @@ name = "owlshift-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "libc",
  "owlshift-adapters",
  "owlshift-contracts",
  "owlshift-platform",
@@ -1430,6 +1431,7 @@ dependencies = [
  "apple-native-keyring-store",
  "dirs",
  "keyring-core",
+ "libc",
  "rustix",
  "signal-hook",
  "tempfile",

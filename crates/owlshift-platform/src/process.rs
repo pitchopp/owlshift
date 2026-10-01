@@ -373,22 +373,8 @@ mod tests {
         }
     }
 
-    /// Whether a process is still running; a zombie is not.
     #[cfg(unix)]
-    fn is_alive(pid: u32) -> bool {
-        let state = state(pid);
-        !state.is_empty() && !state.starts_with('Z')
-    }
-
-    /// A process's state as `ps` shows it; empty once it is gone.
-    #[cfg(unix)]
-    fn state(pid: u32) -> String {
-        let ps = Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&ps.stdout).trim().to_owned()
-    }
+    use crate::test_proc::{command, is_alive, state};
 
     /// Whether a process is still running.
     #[cfg(windows)]
@@ -694,7 +680,7 @@ mod tests {
 
     /// Kills, on the way out, what a test leaves behind: the trees, `sleep`
     /// processes, and a process left stopped when its parent was killed, each
-    /// only while `ps` still shows it as such, so that its pid is still its
+    /// only while the system still shows it as such, so that its pid is still its
     /// own. `KillIfStopped` in the CLI's tests does as much for `owlshift`'s
     /// sentinel, in a crate of its own.
     #[cfg(unix)]
@@ -710,11 +696,11 @@ mod tests {
             // Nothing here may panic: it also runs while a failed test
             // unwinds.
             let shown = |pid: u32| {
-                Command::new("ps")
-                    .args(["-ww", "-o", "stat=,command=", "-p", &pid.to_string()])
-                    .output()
-                    .map(|ps| String::from_utf8_lossy(&ps.stdout).trim().to_owned())
-                    .unwrap_or_default()
+                let state = state(pid);
+                if state.is_empty() {
+                    return String::new();
+                }
+                format!("{state} {}", command(pid))
             };
             let kill = |pid: u32| {
                 let _ = Command::new("kill")

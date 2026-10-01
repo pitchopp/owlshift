@@ -500,8 +500,8 @@ fn doctor_reports_a_sentinel_stopped_while_it_runs() {
     );
 }
 
-/// Kills, when dropped, a sentinel left stopped: only while `ps` shows it
-/// stopped and `pgrep` finds it a sentinel, so that its pid, not reaped, is
+/// Kills, when dropped, a sentinel left stopped: only while it is
+/// stopped and its arguments name a sentinel, so that its pid, not reaped, is
 /// still its own. The system ends it once `owlshift` ended, where that
 /// leaves its process group orphaned (OWL-91), not everywhere.
 #[cfg(unix)]
@@ -511,21 +511,12 @@ struct KillIfStopped(u32);
 impl Drop for KillIfStopped {
     fn drop(&mut self) {
         // Nothing here may panic: it also runs while a failed test unwinds.
-        let pid = self.0.to_string();
-        let sentinel = Command::new("pgrep")
-            .args(["-f", "owlshift-sentinel"])
-            .output()
-            .is_ok_and(|found| {
-                String::from_utf8_lossy(&found.stdout)
-                    .split_whitespace()
-                    .any(|found| found == pid)
-            });
-        let stopped = Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid])
-            .output()
-            .is_ok_and(|ps| String::from_utf8_lossy(&ps.stdout).trim().starts_with('T'));
+        let sentinel = test_proc::command(self.0).contains("owlshift-sentinel");
+        let stopped = state(self.0).starts_with('T');
         if sentinel && stopped {
-            let _ = Command::new("kill").args(["-s", "KILL", &pid]).status();
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &self.0.to_string()])
+                .status();
         }
     }
 }
@@ -552,22 +543,13 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// A process's state as `ps` shows it, empty once it is gone.
+// A process's state, with no `ps`: it is setuid on macOS, which a confined
+// process may not run (OWL-110).
 #[cfg(unix)]
-fn state(pid: u32) -> String {
-    let ps = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&ps.stdout).trim().to_owned()
-}
-
-/// Whether a process is still running; a zombie is not.
+#[path = "../../owlshift-platform/src/test_proc.rs"]
+mod test_proc;
 #[cfg(unix)]
-fn is_alive(pid: u32) -> bool {
-    let state = state(pid);
-    !state.is_empty() && !state.starts_with('Z')
-}
+use test_proc::{is_alive, state};
 
 /// The acceptance criterion for OWL-47: on Windows, a console Ctrl-C on
 /// `doctor` while its git probe hangs stops the probe and the process it

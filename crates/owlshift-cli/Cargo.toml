@@ -26,6 +26,10 @@ rpassword.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
+# Reads a process's state in the tests, with no `ps` (OWL-110).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc.workspace = true
+
 # The Windows Ctrl-C test sends a console Ctrl-C (OWL-47).
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys.workspace = true
