@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Role;
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
-use crate::ids::{QuestionId, RelativePath, TicketId};
-use crate::result::{Question, check_question_order};
+use crate::ids::{RelativePath, TicketId};
+use crate::result::{Question, check_question_order, first_not_ascending};
 
 const CONTRACT: &str = "brief";
 
@@ -231,7 +231,6 @@ impl Brief {
                             format!("re-ask of round {round}, which is not earlier in the thread"),
                         ));
                     };
-                    let mut previous: Option<&QuestionId> = None;
                     for question in questions {
                         if usize::try_from(question.id.number()).map_or(true, |n| n > asked) {
                             return Err(ContractError::invalid(
@@ -242,16 +241,14 @@ impl Brief {
                                 ),
                             ));
                         }
-                        if previous.is_some_and(|p| p.number() >= question.id.number()) {
-                            return Err(ContractError::invalid(
-                                CONTRACT,
-                                format!(
-                                    "re-ask of round {round}: question {} is repeated or out of order",
-                                    question.id
-                                ),
-                            ));
-                        }
-                        previous = Some(&question.id);
+                    }
+                    if let Some(id) = first_not_ascending(questions.iter().map(|q| &q.id)) {
+                        return Err(ContractError::invalid(
+                            CONTRACT,
+                            format!(
+                                "re-ask of round {round}: question {id} is repeated or out of order"
+                            ),
+                        ));
                     }
                 }
                 ThreadEntry::Comment { .. } => {}

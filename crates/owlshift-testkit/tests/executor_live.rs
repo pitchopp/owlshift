@@ -27,7 +27,7 @@ use owlshift_testkit::git::{GitEnv, seed};
 /// A role small enough for a fast model: read the brief, answer in
 /// `result.json`.
 const ROLE: &str = "You are a test role. Read the brief, a JSON file. Then write the file named \
-    by its `result_path`: a JSON object with exactly the fields `format` (the number 1), \
+    by its `result_path`: a JSON object with exactly the fields `format` (the number 2), \
     `status` (the string \"done\") and `summary` (the brief's `ticket.title`, verbatim). \
     Do nothing else.";
 

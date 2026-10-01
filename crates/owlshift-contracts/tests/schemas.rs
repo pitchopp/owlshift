@@ -74,8 +74,9 @@ fn committed_schemas_match_the_types() {
 
 #[test]
 fn fixtures_validate_against_the_committed_schemas() {
-    let cases: [(&str, &str); 8] = [
+    let cases: [(&str, &str); 9] = [
         ("result", "result-sample.json"),
+        ("result", "result-answer-check.json"),
         ("brief", "brief.json"),
         ("event", "event.json"),
         ("claim", "claim.json"),
@@ -103,7 +104,7 @@ fn fixtures_validate_against_the_committed_schemas() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
-    let base = |status: &str| json!({ "format": 1, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 2, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -117,9 +118,30 @@ fn result_schema_carries_the_expressible_rules() {
     pr_done["status"] = json!("done");
     assert!(validator.is_valid(&pr_done));
 
-    let mut newer = base("done");
-    newer["format"] = json!(2);
-    assert!(!validator.is_valid(&newer));
+    for format in [1, 3] {
+        let mut other = base("done");
+        other["format"] = json!(format);
+        assert!(!validator.is_valid(&other), "format {format}");
+    }
+
+    // Verdicts go with `done` only, each with a reason that is not blank.
+    let verdict = |reason: &str| json!({ "question": "Q1", "class": "partial", "reason": reason });
+    let mut verdicts_done = base("done");
+    verdicts_done["verdicts"] = json!([verdict("Q1 still needs a time zone.")]);
+    assert!(validator.is_valid(&verdicts_done));
+    let mut verdicts_failed = verdicts_done.clone();
+    verdicts_failed["status"] = json!("failed");
+    assert!(!validator.is_valid(&verdicts_failed));
+    for reason in ["", " \t\n"] {
+        let mut blank = base("done");
+        blank["verdicts"] = json!([verdict(reason)]);
+        assert!(!validator.is_valid(&blank), "reason {reason:?}");
+        assert!(owlshift_contracts::result::RunResult::parse(&blank.to_string()).is_err());
+    }
+    let mut extra = base("done");
+    extra["verdicts"] = json!([verdict("r")]);
+    extra["verdicts"][0]["extra"] = json!(1);
+    assert!(!validator.is_valid(&extra));
 
     let mut out_of_order = base("questions");
     out_of_order["questions"] = json!([question("Q2")]);

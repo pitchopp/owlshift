@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift result.json",
-  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order.",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order, verdicts in increasing question order with a reason that is\nnot only whitespace, and, against the run's brief, verdicts from the\nanswer check only, covering exactly its latest ask.",
   "type": "object",
   "properties": {
     "artifacts": {
@@ -28,7 +28,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "pr": {
       "description": "The pull request to open; only with `status: done`.",
@@ -56,6 +56,14 @@
     "summary": {
       "description": "One or two sentences on what the run did.",
       "type": "string"
+    },
+    "verdicts": {
+      "description": "The answer check's verdict on each question of the latest ask, in\nquestion order; only from the answer check, and only with `status:\ndone`.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Verdict"
+      }
     }
   },
   "additionalProperties": false,
@@ -100,6 +108,25 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "verdicts": {
+            "minItems": 1
+          }
+        },
+        "required": [
+          "verdicts"
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "done"
+          }
+        }
+      }
     }
   ],
   "required": [
@@ -108,6 +135,31 @@
     "summary"
   ],
   "$defs": {
+    "AnswerClass": {
+      "description": "How the decider's answers left one question.",
+      "oneOf": [
+        {
+          "description": "The answers settle the question.",
+          "type": "string",
+          "const": "answered"
+        },
+        {
+          "description": "The answers settle part of the question; the rest is missing.",
+          "type": "string",
+          "const": "partial"
+        },
+        {
+          "description": "No answer from the decider addresses the question.",
+          "type": "string",
+          "const": "unanswered"
+        },
+        {
+          "description": "The decider answered with a question of their own.",
+          "type": "string",
+          "const": "counter_question"
+        }
+      ]
+    },
     "Artifacts": {
       "description": "Artifacts left by the run, as paths relative to the worktree that cannot\nleave it. Their content formats are defined by the roles that write them.",
       "type": "object",
@@ -304,6 +356,29 @@
         "blocked",
         "premise_false",
         "failed"
+      ]
+    },
+    "Verdict": {
+      "description": "The answer check's verdict on one question: how the decider's answers\nleft it.",
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/AnswerClass"
+        },
+        "question": {
+          "$ref": "#/$defs/QuestionId"
+        },
+        "reason": {
+          "description": "Why, from the answers: what settled the question, or what is still\nmissing. Not empty and not only whitespace.",
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question",
+        "class",
+        "reason"
       ]
     }
   }
