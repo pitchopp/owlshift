@@ -1,7 +1,8 @@
-//! `owlshift logs [TICKET] [--follow]`: the events `owlshift do` recorded,
+//! `owlshift logs [TICKET] [--last N] [--follow]`: the events `owlshift do` recorded,
 //! from the data directory's event log (`owlshift_runner::events`).
 
 use std::io::{self, ErrorKind};
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use crate::fail;
 /// How often `--follow` looks for new events.
 const POLL: Duration = Duration::from_millis(500);
 
-pub fn run(ticket: Option<&str>, follow: bool) -> ExitCode {
+pub fn run(ticket: Option<&str>, last: Option<NonZeroUsize>, follow: bool) -> ExitCode {
     let ticket = match ticket.map(TicketId::new).transpose() {
         Ok(ticket) => ticket,
         Err(error) => return fail(&error.to_string()),
@@ -35,6 +36,7 @@ pub fn run(ticket: Option<&str>, follow: bool) -> ExitCode {
         ticket.as_ref(),
         &mut io::stdout().lock(),
         &mut io::stderr(),
+        last,
         follow_mode,
     );
     match printed {

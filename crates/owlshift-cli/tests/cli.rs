@@ -1095,6 +1095,54 @@ fn logs_prints_the_events_of_every_ticket_or_one() {
 }
 
 #[test]
+fn logs_last_prints_only_the_final_events() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let data = config_dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let event = |minute: u32, ticket: &str| {
+        format!(
+            "{{\"format\":1,\"at\":\"2026-09-29T10:0{minute}:00Z\",\"project\":\"demo/project\",\"ticket\":\"{ticket}\",\"kind\":\"dispatch\",\"data\":{{}}}}\n"
+        )
+    };
+    let log: String = [
+        (0, "OWL-1"),
+        (1, "OWL-2"),
+        (2, "OWL-1"),
+        (3, "OWL-2"),
+        (4, "OWL-1"),
+    ]
+    .iter()
+    .map(|(m, t)| event(*m, t))
+    .collect();
+    fs::write(data.join("events.jsonl"), log).unwrap();
+    let logs = |args: &[&str]| {
+        let mut full = vec!["logs"];
+        full.extend_from_slice(args);
+        owlshift(config_dir.path(), config_dir.path(), &full)
+    };
+    let line =
+        |minute: u32, ticket: &str| format!("2026-09-29T10:0{minute}:00Z {ticket} dispatch\n");
+
+    assert_eq!(
+        stdout(&logs(&["--last", "2"])),
+        format!("{}{}", line(3, "OWL-2"), line(4, "OWL-1"))
+    );
+    assert_eq!(
+        stdout(&logs(&["OWL-1", "--last", "2"])),
+        format!("{}{}", line(2, "OWL-1"), line(4, "OWL-1"))
+    );
+    let everything = stdout(&logs(&[]));
+    assert_eq!(stdout(&logs(&["--last", "99"])), everything);
+    assert_eq!(everything.lines().count(), 5);
+
+    let refused = logs(&["--last", "0"]);
+    assert!(!refused.status.success());
+    assert!(stdout(&refused).is_empty());
+    assert!(stderr(&refused).contains("--last"), "{}", stderr(&refused));
+    assert!(!logs(&["--last", "two"]).status.success());
+}
+
+#[test]
 fn logs_follow_prints_events_as_they_are_recorded() {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;

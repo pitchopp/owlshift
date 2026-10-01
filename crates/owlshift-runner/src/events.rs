@@ -14,8 +14,10 @@
 //! comes from models, trackers and file names, and must not drive the
 //! terminal with control sequences.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -225,7 +227,10 @@ pub struct Follow<'a> {
 /// Prints the events of the log at `path` in order, only those of `ticket`
 /// when given, one [`format_line`] each, and returns how many it printed. A
 /// line that is not an event is reported on `errors` with its number, and
-/// skipped. With `follow`, it then keeps printing the events appended to the
+/// skipped. With `last`, only the last `last` of those events are printed,
+/// the ones that match being held in a buffer of that size while the file is
+/// read the first time, so a long log is never held whole; a log that does not
+/// exist yet counts as a read that found nothing. With `follow`, it then keeps printing the events appended to the
 /// file, waiting for the file to appear if needed, until `follow.stop` says
 /// so; a line is read only once its line break is written, so an event
 /// being appended is never printed half.
@@ -234,8 +239,12 @@ pub fn print(
     ticket: Option<&TicketId>,
     out: &mut dyn Write,
     errors: &mut dyn Write,
+    last: Option<NonZeroUsize>,
     follow: Option<Follow<'_>>,
 ) -> io::Result<usize> {
+    // The lines held back until the first read of the file ends.
+    let mut tail: Option<(usize, VecDeque<String>)> =
+        last.map(|n| (n.get(), VecDeque::with_capacity(n.get().min(1024))));
     let mut file = None;
     let mut pending = Vec::new();
     let mut line_number = 0usize;
@@ -260,8 +269,16 @@ pub fn print(
                 let text = String::from_utf8_lossy(raw);
                 match Event::parse(text.trim_end_matches('\r')) {
                     Ok(event) if ticket.is_none_or(|id| event.ticket.as_ref() == Some(id)) => {
-                        writeln!(out, "{}", format_line(&event))?;
-                        printed += 1;
+                        let line = format_line(&event);
+                        if let Some((keep, held)) = tail.as_mut() {
+                            if held.len() == *keep {
+                                held.pop_front();
+                            }
+                            held.push_back(line);
+                        } else {
+                            writeln!(out, "{line}")?;
+                            printed += 1;
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -272,6 +289,14 @@ pub fn print(
                         writeln!(errors, "{}", printable(&message))?;
                     }
                 }
+            }
+            // The first read is over: print the last events it matched, and
+            // let what follows through as it comes.
+            if let Some((_, held)) = tail.take() {
+                for line in &held {
+                    writeln!(out, "{line}")?;
+                }
+                printed += held.len();
             }
             out.flush()?;
         }
@@ -349,7 +374,7 @@ mod tests {
         log.append(&second).unwrap();
 
         let (mut out, mut errors) = (Vec::new(), Vec::new());
-        let printed = print(log.path(), None, &mut out, &mut errors, None).unwrap();
+        let printed = print(log.path(), None, &mut out, &mut errors, None, None).unwrap();
         assert_eq!(printed, 2);
         let out = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -361,7 +386,15 @@ mod tests {
 
         let mut only = Vec::new();
         let id = TicketId::new("OWL-2").unwrap();
-        print(log.path(), Some(&id), &mut only, &mut Vec::new(), None).unwrap();
+        print(
+            log.path(),
+            Some(&id),
+            &mut only,
+            &mut Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(only).unwrap(),
             format!("{}\n", format_line(&second))
@@ -369,11 +402,53 @@ mod tests {
     }
 
     #[test]
+    fn last_prints_the_final_matching_events_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::in_dir(dir.path());
+        let events: Vec<Event> = ["OWL-1", "OWL-2", "OWL-1", "OWL-2", "OWL-1"]
+            .into_iter()
+            .map(|t| event(t, EventKind::Dispatch, Data::new()))
+            .enumerate()
+            .map(|(i, mut e)| {
+                e.at = format!("2026-09-29T10:0{i}:00Z").parse().unwrap();
+                e
+            })
+            .collect();
+        for e in &events {
+            log.append(e).unwrap();
+        }
+        let run = |ticket: Option<&str>, last: usize| {
+            let id = ticket.map(|t| TicketId::new(t).unwrap());
+            let mut out = Vec::new();
+            let n = print(
+                log.path(),
+                id.as_ref(),
+                &mut out,
+                &mut Vec::new(),
+                NonZeroUsize::new(last),
+                None,
+            )
+            .unwrap();
+            (n, String::from_utf8(out).unwrap())
+        };
+        let lines = |picked: &[usize]| {
+            picked
+                .iter()
+                .map(|i| format!("{}\n", format_line(&events[*i])))
+                .collect::<String>()
+        };
+        assert_eq!(run(None, 2), (2, lines(&[3, 4])));
+        assert_eq!(run(Some("OWL-1"), 2), (2, lines(&[2, 4])));
+        assert_eq!(run(Some("OWL-2"), 1), (1, lines(&[3])));
+        assert_eq!(run(None, 50), (5, lines(&[0, 1, 2, 3, 4])));
+    }
+
+    #[test]
     fn a_missing_log_prints_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(EVENTS_FILE);
         assert_eq!(
-            print(&path, None, &mut Vec::new(), &mut Vec::new(), None).unwrap(),
+            print(&path, None, &mut Vec::new(), &mut Vec::new(), None, None).unwrap(),
             0
         );
     }
@@ -405,7 +480,15 @@ mod tests {
             poll: Duration::ZERO,
             stop: &stop,
         };
-        let printed = print(log.path(), None, &mut out, &mut Vec::new(), Some(follow)).unwrap();
+        let printed = print(
+            log.path(),
+            None,
+            &mut out,
+            &mut Vec::new(),
+            None,
+            Some(follow),
+        )
+        .unwrap();
         assert_eq!(printed, 1);
         assert_eq!(
             String::from_utf8(out).unwrap(),
