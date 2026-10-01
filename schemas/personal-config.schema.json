@@ -36,6 +36,11 @@
         "null"
       ]
     },
+    "notifications": {
+      "description": "How this machine tells its operator that they have become the\nblocker.",
+      "$ref": "#/$defs/Notifications",
+      "default": {}
+    },
     "repositories": {
       "description": "Settings for one repository, keyed `github.com/<owner>/<name>` in any\nletter case. The repository of a project is read from its checkout's\n`origin` remote, which the committed project file cannot set.",
       "type": "object",
@@ -83,6 +88,16 @@
               "type": "null"
             }
           ]
+        },
+        "usage_cap_percent": {
+          "description": "A usage cap, in percent from 1 to 100: while the latest share seen of\nany usage window this harness's subscription reports is at or above\nit, and that window has not reset since, no new run starts on this\nharness, which counts as at its usage limit. A harness whose runs\nreport no window is never held.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "maximum": 100,
+          "minimum": 1
         }
       },
       "additionalProperties": false
@@ -126,6 +141,20 @@
         "tracker": {
           "type": [
             "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Notifications": {
+      "description": "How this machine tells its operator that they have become the blocker: a\nquestion, a re-ask, a parked ticket, every harness at its usage limit;\nnever progress.",
+      "type": "object",
+      "properties": {
+        "desktop": {
+          "description": "Whether to show a desktop notification on this machine: on unless set\nto `false`. A machine with no desktop session shows nothing.",
+          "type": [
+            "boolean",
             "null"
           ]
         }
