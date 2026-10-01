@@ -512,7 +512,7 @@ impl Drop for KillIfStopped {
     fn drop(&mut self) {
         // Nothing here may panic: it also runs while a failed test unwinds.
         let sentinel = test_proc::command(self.0).contains("owlshift-sentinel");
-        let stopped = state(self.0).starts_with('T');
+        let stopped = test_proc::try_state(self.0).starts_with('T');
         if sentinel && stopped {
             let _ = Command::new("kill")
                 .args(["-s", "KILL", &self.0.to_string()])
