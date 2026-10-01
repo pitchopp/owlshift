@@ -290,16 +290,16 @@ pub fn print(
                     }
                 }
             }
-            // The first read is over: print the last events it matched, and
-            // let what follows through as it comes.
-            if let Some((_, held)) = tail.take() {
-                for line in &held {
-                    writeln!(out, "{line}")?;
-                }
-                printed += held.len();
-            }
-            out.flush()?;
         }
+        // The first pass is over, the file there or not: print the last events
+        // it matched, and let what follows through as it comes.
+        if let Some((_, held)) = tail.take() {
+            for line in &held {
+                writeln!(out, "{line}")?;
+            }
+            printed += held.len();
+        }
+        out.flush()?;
         let Some(follow) = &follow else {
             return Ok(printed);
         };
@@ -451,6 +451,41 @@ mod tests {
             print(&path, None, &mut Vec::new(), &mut Vec::new(), None, None).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn last_does_not_cut_the_events_of_a_log_that_appears_while_following() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::in_dir(dir.path());
+        let looks = Cell::new(0);
+        // The log does not exist at the first look, and holds three events at
+        // the second: they are live, not history, so `last` leaves them all.
+        let stop = || {
+            looks.set(looks.get() + 1);
+            if looks.get() == 1 {
+                for ticket in ["OWL-1", "OWL-2", "OWL-3"] {
+                    log.append(&event(ticket, EventKind::Dispatch, Data::new()))
+                        .unwrap();
+                }
+            }
+            looks.get() > 1
+        };
+        let mut out = Vec::new();
+        let follow = Follow {
+            poll: Duration::ZERO,
+            stop: &stop,
+        };
+        let printed = print(
+            log.path(),
+            None,
+            &mut out,
+            &mut Vec::new(),
+            NonZeroUsize::new(1),
+            Some(follow),
+        )
+        .unwrap();
+        assert_eq!(printed, 3);
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 3);
     }
 
     #[test]
