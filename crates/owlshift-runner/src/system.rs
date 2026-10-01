@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use owlshift_platform::paths::DataDirSource;
 pub use owlshift_platform::process::{Captured, RunError};
 #[cfg(unix)]
 pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
@@ -27,6 +28,11 @@ pub trait System {
     /// The user's home folder, which reports write `~` (OWL-99).
     fn home(&self) -> Option<PathBuf> {
         owlshift_platform::paths::home_dir()
+    }
+    /// The data directory and where it comes from, `None` when the system
+    /// has none (OWL-109). Only the path: the folder is never opened.
+    fn data_dir(&self) -> Option<(PathBuf, DataDirSource)> {
+        owlshift_platform::paths::data_dir_and_source()
     }
     /// Whether agent runs can be confined here (OWL-41).
     fn sandbox(&self) -> Result<(), SandboxError> {
@@ -126,6 +132,8 @@ pub(crate) mod fake {
     pub(crate) struct FakeSystem {
         located: HashMap<String, PathBuf>,
         answers: HashMap<String, Answer>,
+        /// The data directory; `None`: the platform's, `~/.local/share/owlshift`.
+        data_dir: Option<Option<(PathBuf, DataDirSource)>>,
         /// Why agent runs cannot be confined; `None`: they can.
         sandbox: Option<SandboxError>,
         /// Keychain accounts with no secret; every other one has one.
@@ -144,6 +152,12 @@ pub(crate) mod fake {
         /// Agent runs cannot be confined, for this reason.
         pub(crate) fn no_sandbox(mut self, error: SandboxError) -> Self {
             self.sandbox = Some(error);
+            self
+        }
+
+        /// The data directory is so, or the system has none.
+        pub(crate) fn data_dir_is(mut self, dir: Option<(PathBuf, DataDirSource)>) -> Self {
+            self.data_dir = Some(dir);
             self
         }
 
@@ -218,6 +232,15 @@ pub(crate) mod fake {
 
         fn home(&self) -> Option<PathBuf> {
             Some(PathBuf::from("/home/ada"))
+        }
+
+        fn data_dir(&self) -> Option<(PathBuf, DataDirSource)> {
+            self.data_dir.clone().unwrap_or_else(|| {
+                Some((
+                    PathBuf::from("/home/ada/.local/share/owlshift"),
+                    DataDirSource::Platform,
+                ))
+            })
         }
 
         fn sandbox(&self) -> Result<(), SandboxError> {
