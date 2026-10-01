@@ -102,7 +102,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 - Three re-asks on the same round, or two failed runs, park the ticket with a *parked* comment giving the reason and what would restart it.
 - A harness that reports its usage limit is paused until the reset time it reports; its roles switch to their declared fallback meanwhile. With no fallback left, dispatch waits for the earliest reset and the operator is notified once.
 - A run interrupted by a usage limit resumes from its checkpoint after the reset; it is not counted as a failure.
-- A daily dollar budget applies only to a harness the user configured for API billing.
+- `budget_usd` is a dollar cap on each run of a harness, not on a day's total, whatever the billing; Claude Code enforces it, Codex has no such option. A run stopped by it alone counts as a failed run.
 - Re-asks for an incomplete answer do not count as question rounds.
 
 ## Operations

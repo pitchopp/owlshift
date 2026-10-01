@@ -365,7 +365,12 @@ pub struct HarnessSettings {
     /// The harness to use when this one is at its usage limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Harness>,
-    /// A dollar budget, only for a harness configured for API billing.
+    /// A dollar cap on each run of a harness, not on a day's total, whatever
+    /// the billing. Owlshift passes it to Claude Code as `--max-budget-usd`,
+    /// which counts a run's cost at list price on a subscription too and
+    /// stops the run once its cost is above the cap, so a run can end above
+    /// it. A run stopped by it alone is a failed run. Codex has no such
+    /// option, so nothing enforces it there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub budget_usd: Option<f64>,

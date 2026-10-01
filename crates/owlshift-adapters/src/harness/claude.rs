@@ -215,10 +215,10 @@ pub struct Request {
     /// A JSON Schema for the final answer, returned in
     /// [`Run::structured_output`].
     pub json_schema: Option<String>,
-    /// A dollar cap on the run, passed as `--max-budget-usd`. It only means
-    /// something for a CLI configured for API billing; whether to set it
-    /// (the billing mode, the personal file's `budget_usd`) is the
-    /// executor's decision, not this adapter's.
+    /// A dollar cap on this run, passed as `--max-budget-usd`: the personal
+    /// file's `budget_usd`, a cap on each run of a harness, not on a day's
+    /// total, whatever the billing. On a subscription the CLI counts the
+    /// run's cost at list price.
     pub max_budget_usd: Option<f64>,
 }
 
