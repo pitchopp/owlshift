@@ -529,11 +529,25 @@ Each task is an issue in the Owlshift Linear workspace (team `OWL`), with its bl
 - [x] OWL-13 · Linear tracker adapter: read a ticket, post a comment, with recorded fixtures and a conformance suite (2026-09-28, [#16](https://github.com/pitchopp/owlshift/pull/16))
 - [x] OWL-14 · Claude Code harness adapter: headless run on the user's login, model, effort, permission level, usage capture (2026-09-28, [#15](https://github.com/pitchopp/owlshift/pull/15))
 - [x] OWL-15 · Executor: worktree, brief, spawn, process-tree stop, result validation, isolation check (2026-09-28, [#29](https://github.com/pitchopp/owlshift/pull/29))
-- [ ] OWL-16 · Gate commands from the project config before delivery
-- [ ] OWL-17 · GitHub forge adapter: push the branch, open the PR, read the complete check set
+- [x] OWL-16 · Gate commands from the project config before delivery (2026-09-29, [#32](https://github.com/pitchopp/owlshift/pull/32))
+- [x] OWL-17 · GitHub forge adapter: push the branch, open the PR, read the complete check set (2026-09-28, [#22](https://github.com/pitchopp/owlshift/pull/22))
 - [x] OWL-18 · Writer: delivery report on the ticket (2026-09-28, [#25](https://github.com/pitchopp/owlshift/pull/25))
 - [x] OWL-19 · Default build role prompt (2026-09-28, [#13](https://github.com/pitchopp/owlshift/pull/13))
-- [ ] OWL-20 · CLI: `init`, `do`, `logs`
-- [ ] OWL-41 · Confine agent runs at the OS level: the harness and the gate in `sandbox-exec` or `bwrap`, a second Claude login for agent runs
+- [x] OWL-20 · CLI: `init`, `do`, `logs` (2026-09-29, [#36](https://github.com/pitchopp/owlshift/pull/36))
+- [x] OWL-41 · Confine agent runs at the OS level: the harness and the gate in `sandbox-exec` or `bwrap`, a second Claude login for agent runs (2026-09-29, [#37](https://github.com/pitchopp/owlshift/pull/37); the second login became a `claude setup-token` token in OWL-94)
 
-**Exit gate.** Three real Owlshift tickets delivered as PRs by `owlshift do` on the maintainer's subscription, with no guardrail breach.
+**Exit gate.** One real Owlshift ticket delivered as a PR by `owlshift do` on the maintainer's subscription, and one run that cannot finish stopped without delivering, with no guardrail breach.
+
+Relaxed on 2026-10-01 (OWL-113) from three delivered tickets. The maintainer stopped after the two runs below: P1 has no questions on the ticket, so a run that needs a decision can only stop and be started again by hand, and further runs wait for P2.
+
+**Runs, 2026-10-01**, on the maintainer's machine (macOS 26.6.2, Claude Code 2.1.284, `claude-sonnet-5-5`), from `main` at `c0c0867`:
+
+- OWL-107 (README status): stopped `blocked` after 59 s (0.18 USD). Its change was committed in the worktree, but the gate could not pass in the sandbox: four tests ran `ps`, which a Seatbelt-confined process may not exec (setuid, recorded under OWL-110). Nothing was pushed, no PR was opened. The right stop, for a reason outside the ticket.
+- OWL-110 (tests without `ps`): `done`, gate passed in the sandbox, delivered as [#89](https://github.com/pitchopp/owlshift/pull/89) with its delivery report on the ticket, after 6 min (0.61 USD). The ubuntu leg of CI then failed: clippy refused an unused import in a module compiled on Linux only, which the gate, run on macOS, never built. Fixed by hand on the branch (`bfcc336`); CI green on the three platforms.
+- No guardrail breach: the agents committed locally only; the runner pushed, opened the PR and wrote to the tracker; nothing was merged.
+
+What the runs showed, each with its ticket:
+
+- A confined process cannot exec a setuid binary on macOS, whatever the profile allows: the project's own tests must not rely on one (OWL-110).
+- The gate runs on the host's platform only, so a change behind `cfg(target_os)` can pass it and fail CI elsewhere; `do` ends with the checks still running and nothing follows a red one. Roadmap P3 already plans a fix run on a red check (OWL-112).
+- The macOS Keychain asks twice per secret for an unsigned binary rebuilt by `cargo`, until "Always Allow" is chosen; it asks again after each rebuild.
