@@ -4,6 +4,7 @@ mod do_cmd;
 mod init_cmd;
 mod logs_cmd;
 
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -50,6 +51,9 @@ enum Command {
     Logs {
         /// Only this ticket's events.
         ticket: Option<String>,
+        /// Only the last N events, after the ticket filter (at least 1).
+        #[arg(long, value_name = "N")]
+        last: Option<NonZeroUsize>,
         /// Keep printing new events as they are recorded, until Ctrl-C.
         #[arg(long, short)]
         follow: bool,
@@ -121,7 +125,11 @@ fn main() -> ExitCode {
         }
         Command::Init(args) => init_cmd::run(&args, &config),
         Command::Do { ticket } => do_cmd::run(&system, &config, &ticket),
-        Command::Logs { ticket, follow } => logs_cmd::run(ticket.as_deref(), follow),
+        Command::Logs {
+            ticket,
+            last,
+            follow,
+        } => logs_cmd::run(ticket.as_deref(), last, follow),
     }
 }
 

@@ -365,7 +365,7 @@ Everything runs in the foreground; `resume` arrives in P2, `watch` in P3, the ba
 | `owlshift config show` | P0 | Effective configuration and the origin of each value |
 | `owlshift init` | P1 | Writes a commented `owlshift.toml` for the repository (`--tracker`, `--team`, `--gate`), then stores the tracker and forge secrets and the agent runs' Claude Code token in the system keychain (`--skip-secrets`, `--replace-secrets`) |
 | `owlshift do TICKET` | P1 | Runs one ticket to a verified PR, in the foreground |
-| `owlshift logs [TICKET] [--follow]` | P1 | Events, with the directory of each run's logs |
+| `owlshift logs [TICKET] [--last N] [--follow]` | P1 | Events, with the directory of each run's logs |
 
 **What `doctor` checks, as built in P0 (OWL-12).**
 
