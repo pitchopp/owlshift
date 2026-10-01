@@ -225,7 +225,7 @@ const READ: &str = "file-read-data file-read-xattr";
 /// opened again, then the protected and hidden paths and the Keychain closed
 /// whatever came before.
 ///
-/// Every read rule names [`READ`] rather than the wildcard `file-read*`: an
+/// Every read rule names `READ` rather than the wildcard `file-read*`: an
 /// operation named outranks the wildcard whatever the order, so a wildcard
 /// allow would not reopen a closed folder, and a wildcard deny would not
 /// close a hidden file inside an opened one (both checked live on

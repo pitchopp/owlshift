@@ -213,11 +213,11 @@ impl AgentEnv {
     /// The sandbox for a run: see the module documentation.
     ///
     /// Opened in the home: git's own configuration, the tool chains
-    /// ([`TOOL_CHAINS`]) and the folders the agent's `PATH` and declared
+    /// (`TOOL_CHAINS`) and the folders the agent's `PATH` and declared
     /// variables name under it, read-only, never the home itself nor a
     /// folder that is, lies in or holds a path the run hides, closes or
-    /// writes ([`named_folder`], OWL-68); then the run's own paths. Closed
-    /// wherever they are: the credential files of [`HIDDEN_IN_HOME`] and the
+    /// writes (`named_folder`, OWL-68); then the run's own paths. Closed
+    /// wherever they are: the credential files of `HIDDEN_IN_HOME` and the
     /// run's hidden paths. It reads the file system, to judge each named
     /// folder by its real path.
     pub fn policy(&self, run: &RunPaths) -> Policy {

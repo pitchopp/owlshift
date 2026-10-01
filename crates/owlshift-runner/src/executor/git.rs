@@ -70,7 +70,7 @@ impl Git {
     }
 
     /// The same git with `timeout` as the deadline of its commands, in place
-    /// of [`GIT_TIMEOUT`]: lets a test stand a short default in for 120 s.
+    /// of `GIT_TIMEOUT`: lets a test stand a short default in for 120 s.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self

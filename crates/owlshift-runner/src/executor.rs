@@ -592,10 +592,10 @@ pub const REDACTED: &str = "<redacted>";
 /// written as they come. A write error does not stop the run; the first one
 /// is kept for the report.
 ///
-/// Once told of the harness's login token ([`RunLog::hide`]), each file gets
+/// Once told of the harness's login token (`RunLog::hide`), each file gets
 /// [`REDACTED`] wherever the harness printed the token, even split across two
 /// writes: the bytes that could start one are held back until the next
-/// write, or [`RunLog::finish`]. The agent's shell inherits the token, so a
+/// write, or `RunLog::finish`. The agent's shell inherits the token, so a
 /// command such as `env` would otherwise log it (OWL-94).
 pub struct RunLog {
     stdout: File,
