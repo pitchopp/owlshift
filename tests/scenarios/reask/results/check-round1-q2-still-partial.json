@@ -1,0 +1,8 @@
+{
+  "format": 3,
+  "status": "done",
+  "summary": "The decider has not said how the greeting ends.",
+  "verdicts": [
+    { "question": "Q2", "class": "partial", "reason": "Still no word on the sign-off." }
+  ]
+}

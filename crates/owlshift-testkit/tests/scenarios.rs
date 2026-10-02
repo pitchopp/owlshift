@@ -63,6 +63,111 @@ fn reask() {
     }
 }
 
+/// OWL-123's acceptance: past the re-ask limit, a fourth incomplete answer
+/// parks the ticket with a PARKED comment naming what is still open and
+/// what restarts it.
+#[test]
+fn the_reask_limit_parks_the_ticket_with_a_parked_comment() {
+    let answered_again = |n: u32| {
+        format!(
+            r#"
+        [[step]]
+        comment = {{ author = "maintainer", body = "Q2: answer {n}.\n" }}
+
+        [[step]]
+        answer = {{ result = "results/check-round1-q2-still-partial.json" }}
+        expect = {{ event = "incomplete", reasks = {n}, waiting = "needs_input" }}
+        "#
+        )
+    };
+    let scenario = format!(
+        r#"
+        description = "Round 1's Q2 stays partial through three re-asks: the fourth incomplete answer parks the ticket."
+        ticket = "DEMO-3"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = {{ result = "results/questions-round1.json" }}
+
+        [[step]]
+        comment = {{ author = "maintainer", body = "Q1: English.\nQ2: \"Hello, reader.\"\n" }}
+
+        [[step]]
+        answer = {{ result = "results/check-round1-q2-partial.json" }}
+        expect = {{ event = "incomplete", reasks = 1 }}
+        {}{}
+        [[step]]
+        comment = {{ author = "maintainer", body = "Q2: answer 4.\n" }}
+
+        [[step]]
+        answer = {{ result = "results/check-round1-q2-still-partial.json" }}
+        [step.expect]
+        event = "incomplete"
+        waiting = "parked"
+        round = 1
+        comments = 9
+        [step.expect.last_comment]
+        author = "owlshift"
+        first_line = "[owlshift] PARKED"
+        contains = [
+          "Parked: the answers stayed incomplete, after 3 re-asks. Still open in round 1:",
+          "**Q2** (scope) What should the greeting say, and should it end with a sign-off?\nStill open (partial): Still no word on the sign-off.",
+          "**To restart it:** answer the questions still open here, then run `owlshift resume DEMO-3`.",
+          '<!-- owlshift:{{"format":1,"kind":"PARKED","ticket":"DEMO-3"}} -->',
+        ]
+        lacks = ["**Q1**"]
+        "#,
+        answered_again(2),
+        answered_again(3),
+    );
+    if let Err(error) = play_str(
+        "reask-limit",
+        &scenario,
+        &scenarios().join("reask"),
+        fake_harness(),
+    ) {
+        panic!("{error}");
+    }
+}
+
+/// OWL-123's acceptance: a second failed run parks the ticket with a PARKED
+/// comment; no question round was asked, so `do` runs it again.
+#[test]
+fn a_second_failed_run_parks_the_ticket_with_a_parked_comment() {
+    play_on_smoke(
+        "failed-runs",
+        r#"
+        description = "The build crashes twice: the second failure parks the ticket."
+        ticket = "DEMO-1"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { stderr = "fatal: out of memory\n", exit_code = 101 }
+        expect = { event = "run_failed", failed_runs = 1, comments = 0 }
+
+        [[step]]
+        run = { stderr = "fatal: out of memory\n", exit_code = 101 }
+        [step.expect]
+        event = "run_failed"
+        waiting = "parked"
+        comments = 1
+        [step.expect.last_comment]
+        author = "owlshift"
+        first_line = "[owlshift] PARKED"
+        contains = [
+          "Parked: a second run failed. The last failure: ",
+          "**To restart it:** run `owlshift do DEMO-1` to run it again.",
+        ]
+        "#,
+    );
+}
+
 /// The answer check runs once answers arrive: with no comment from the
 /// decider since the questions, an `answer` step is refused before any run.
 #[test]

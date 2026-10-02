@@ -635,7 +635,10 @@ fn event_claim_and_state_rejections() {
     );
     rejects(
         "a verdict on a question the ask did not ask",
-        asked(|v| v["asks"][1]["verdicts"] = json!([{"question": "Q1", "class": "answered", "reason": "r"}])),
+        asked(|v| {
+            v["asks"][1]["verdicts"] =
+                json!([{"question": "Q1", "class": "answered", "reason": "r"}])
+        }),
         "an ask of round 1 keeps a verdict for Q1, which it did not ask",
     );
     rejects(

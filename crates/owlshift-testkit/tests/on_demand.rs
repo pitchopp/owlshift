@@ -204,6 +204,8 @@ impl Harness for Replies {
 struct Clocked<'a> {
     inner: MarkdownTracker,
     clock: &'a Cell<Timestamp>,
+    /// A comment starting with this is refused, as a tracker that fails.
+    refuse: Option<&'static str>,
 }
 
 /// The clock's time, then a minute later.
@@ -230,6 +232,9 @@ impl Tracker for Clocked<'_> {
         let other = |e: &dyn std::fmt::Display| {
             tracker::Error::new(tracker::ErrorKind::Other, e.to_string())
         };
+        if self.refuse.is_some_and(|start| body.starts_with(start)) {
+            return Err(other(&"the tracker is down"));
+        }
         self.inner
             .post_comment(id, MarkdownTracker::AGENT, tick(self.clock), body)
             .map_err(|e| other(&e))?;
@@ -250,6 +255,8 @@ struct Bench {
     github: Arc<FakeGitHub>,
     /// The time of the next comment on the ticket.
     clock: Cell<Timestamp>,
+    /// The runner's comments starting with this are refused by the tracker.
+    refuse: Cell<Option<&'static str>>,
 }
 
 const DONE: &str = r#"{"format":3,"status":"done","summary":"Added GREETING.md; the gate passes.",
@@ -321,6 +328,7 @@ impl Bench {
             remote,
             github,
             clock: Cell::new("2026-10-02T09:00:00Z".parse().unwrap()),
+            refuse: Cell::new(None),
         }
     }
 
@@ -452,6 +460,7 @@ impl Bench {
         let tracker = Clocked {
             inner: MarkdownTracker::new(&self.remote.checkout),
             clock: &self.clock,
+            refuse: self.refuse.get(),
         };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
@@ -676,8 +685,10 @@ type Setup = Box<dyn Fn(&Bench) -> Vec<Reply>>;
 type Check = fn(&Stop) -> bool;
 
 /// Every way a run stops short of a delivery, questions aside (they are
-/// posted: see the resume tests): nothing reaches the ticket, and the
-/// remote's branch moves only when the push itself went through.
+/// posted: see the resume tests): nothing reaches the ticket but a park's
+/// PARKED comment, which says to run `do` again since no question round
+/// kept a ticket ref, and the remote's branch moves only when the push
+/// itself went through.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
     let blocked = r#"{"format":3,"status":"blocked","summary":"The gate needs network."}"#;
@@ -736,7 +747,7 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
                     b.reply(Some("Hi"), Some(DONE)),
                 ]
             }),
-            |s| matches!(s, Stop::Parked { reason: ParkReason::FailedRuns, detail } if detail.contains("gate")),
+            |s| matches!(s, Stop::Parked { reason: ParkReason::FailedRuns, detail, .. } if detail.contains("gate")),
             Some(EventKind::Decision),
         ),
         (
@@ -798,11 +809,20 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
             Err(stop) => stop,
         };
         assert!(expected(&stop), "{name}: {stop:?}\n{printed}");
-        assert!(
-            bench.comments().is_empty(),
-            "{name}: {:?}",
-            bench.comments()
-        );
+        let comments = bench.comments();
+        if let Stop::Parked { unposted, .. } = &stop {
+            assert_eq!(unposted, &None, "{name}");
+            assert_eq!(comments.len(), 1, "{name}: {comments:?}");
+            let parked = &comments[0];
+            assert!(
+                parked.starts_with("[owlshift] PARKED\n"),
+                "{name}: {parked}"
+            );
+            assert!(parked.contains("`owlshift do DEMO-1`"), "{name}: {parked}");
+            assert!(!parked.contains("planted"), "{name}: {parked}");
+        } else {
+            assert!(comments.is_empty(), "{name}: {comments:?}");
+        }
         assert_eq!(
             kinds(&bench.events()).last().copied(),
             last,
@@ -922,6 +942,7 @@ fn an_agent_that_redirects_its_git_link_gets_no_hook_and_no_push() {
         Err(Stop::Parked {
             reason: ParkReason::IsolationBreach,
             detail,
+            ..
         }) => assert!(
             detail.contains("the worktree's .git link was changed"),
             "{detail}"
@@ -931,7 +952,11 @@ fn an_agent_that_redirects_its_git_link_gets_no_hook_and_no_push() {
     assert!(!fired.exists(), "the planted hook ran");
     assert_eq!(bench.remote_branch(), None);
     assert!(bench.github.created.lock().unwrap().is_empty());
-    assert!(bench.comments().is_empty());
+    // The PARKED comment alone, without what the breach changed.
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].starts_with("[owlshift] PARKED\n"));
+    assert!(!comments[0].contains(".git"), "{}", comments[0]);
     let marker = bench.dirs().unverified().unwrap().expect("a marker");
     assert!(marker.contains(".git link"), "{marker}");
 }
@@ -1256,8 +1281,9 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     let (waiting, _) = bench.resume(Vec::new());
     assert!(matches!(&waiting, Err(Stop::Waiting { .. })), "{waiting:?}");
 
-    // A complete answer: the ticket resumes at Build, which reads the asks
-    // and the answers, and delivers.
+    // A complete answer: the RESUME restates the round, Q1 from the first
+    // check and Q2 from the last, and the ticket resumes at Build, which
+    // reads the asks and the answers, and delivers.
     bench.answer("Q2: no sign-off, just \"Hello, reader.\"\n");
     let answered = check(&[("Q2", "answered", "No sign-off.")]);
     let (delivered, printed) = bench.resume(vec![
@@ -1269,12 +1295,30 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     assert_eq!(build.role, Role::Build);
     assert_eq!(
         shape(&build),
-        ["questions", "Decider", "reask", "Decider", "Decider"]
+        [
+            "questions",
+            "Decider",
+            "reask",
+            "Decider",
+            "Decider",
+            "Owlshift"
+        ]
     );
     assert_eq!(latest_ask(&build), ["Q2"]);
     let comments = bench.comments();
-    assert_eq!(comments.len(), 6, "{comments:?}");
-    assert!(comments[5].starts_with("[owlshift] DELIVERY"));
+    assert_eq!(comments.len(), 7, "{comments:?}");
+    let resume = &comments[5];
+    assert!(
+        resume.starts_with("[owlshift] RESUME · round 1\n"),
+        "{resume}"
+    );
+    for text in [
+        "Understood: English, the recommendation.",
+        "Understood: No sign-off.",
+    ] {
+        assert!(resume.contains(text), "{text}\n{resume}");
+    }
+    assert!(comments[6].starts_with("[owlshift] DELIVERY"));
     let record = bench.record();
     assert_eq!((record.state.waiting, record.state.reasks), (None, 0));
 
@@ -1335,6 +1379,17 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
         bench.record().state.waiting,
         Some(Waiting::ParkedAwaitingInput)
     );
+    // The PARKED comment, without what the breach changed: a ticket ref
+    // keeps the round, so `resume` restarts it once the project is cleared.
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 3, "{comments:?}");
+    assert!(comments[2].starts_with("[owlshift] PARKED\n"));
+    assert!(
+        comments[2].contains("Then run `owlshift resume DEMO-1`"),
+        "{}",
+        comments[2]
+    );
+    assert!(!comments[2].contains("planted"), "{}", comments[2]);
 
     // A person looked and cleared the project; `resume` restarts the ticket
     // and checks the same answers, with no new comment.
@@ -1352,7 +1407,141 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
                 && event.data.get("restarted") == Some(&json!(true))),
         "{printed}"
     );
-    assert_eq!(bench.comments().len(), 3);
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 5, "{comments:?}");
+    assert!(comments[3].starts_with("[owlshift] RESUME · round 1\n"));
+}
+
+/// The re-ask limit through the shipped commands: the fourth incomplete
+/// answer parks the ticket with a PARKED comment naming what is still open,
+/// and a restart checks a new answer, whose RESUME restates each question
+/// from the last check that judged it.
+#[test]
+fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
+    let bench = Bench::new(true);
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    let partial = |reason: &'static str| ("Q2", "partial", reason);
+    let checks = [
+        check(&[
+            ("Q1", "answered", "English, the recommendation."),
+            partial("The ending is missing."),
+        ]),
+        check(&[partial("Still no ending.")]),
+        check(&[partial("Still no ending.")]),
+        check(&[partial("The ending is still missing.")]),
+    ];
+    for (n, result) in checks.iter().enumerate() {
+        bench.answer(&format!("Q2: answer {n}.\n"));
+        let (outcome, printed) = bench.resume(vec![bench.reply(None, Some(result))]);
+        if n < 3 {
+            assert!(
+                matches!(&outcome, Err(Stop::Reasked { reask, .. }) if *reask == n as u32 + 1),
+                "{outcome:?}\n{printed}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(Stop::Parked {
+                        reason: ParkReason::Reasks,
+                        unposted: None,
+                        ..
+                    })
+                ),
+                "{outcome:?}\n{printed}"
+            );
+        }
+    }
+    assert_eq!(
+        bench.record().state.waiting,
+        Some(Waiting::ParkedAwaitingInput)
+    );
+    let comments = bench.comments();
+    let parked = comments.last().unwrap();
+    assert!(parked.starts_with("[owlshift] PARKED\n"), "{parked}");
+    for text in [
+        "Still open in round 1:",
+        "Still open (partial): The ending is still missing.",
+        "answer the questions still open here, then run `owlshift resume DEMO-1`",
+    ] {
+        assert!(parked.contains(text), "{text}\n{parked}");
+    }
+    assert!(!parked.contains("**Q1**"), "{parked}");
+
+    // Answered at last: `resume` restarts the ticket, and the RESUME takes
+    // Q1 from the first check.
+    bench.answer("Q2: no sign-off.\n");
+    let answered = check(&[("Q2", "answered", "No sign-off.")]);
+    let (delivered, printed) = bench.resume(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let comments = bench.comments();
+    let resume = &comments[comments.len() - 2];
+    assert!(
+        resume.starts_with("[owlshift] RESUME · round 1\n"),
+        "{resume}"
+    );
+    for text in [
+        "Understood: English, the recommendation.",
+        "Understood: No sign-off.",
+    ] {
+        assert!(resume.contains(text), "{text}\n{resume}");
+    }
+}
+
+/// A tracker that refuses the RESUME keeps nothing of the check, so the next
+/// `resume` checks the same answers again; one that refuses the PARKED
+/// leaves the park as it is, and says so.
+#[test]
+fn a_resume_or_parked_comment_the_tracker_refuses() {
+    let bench = Bench::new(true);
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
+    let answered = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
+    ]);
+    bench.refuse.set(Some("[owlshift] RESUME"));
+    let (refused, _) = bench.resume(vec![bench.reply(None, Some(&answered))]);
+    assert!(
+        matches!(&refused, Err(Stop::Refused(why)) if why.contains("posting the resume on the ticket")),
+        "{refused:?}"
+    );
+    let record = bench.record();
+    assert_eq!(record.state.waiting, Some(Waiting::NeedsInput));
+    assert_eq!(record.questions.checked_through, None);
+    assert!(record.questions.asks[0].verdicts.is_empty());
+
+    bench.refuse.set(None);
+    let (delivered, printed) = bench.resume(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(bench.comments()[2].starts_with("[owlshift] RESUME · round 1\n"));
+
+    let bench = Bench::new(true);
+    bench.refuse.set(Some("[owlshift] PARKED"));
+    let blocked = r#"{"format":3,"status":"blocked","summary":"The gate needs network."}"#;
+    let (outcome, _) = bench.run(vec![bench.reply(None, Some(blocked))], None);
+    let Err(
+        stop @ Stop::Parked {
+            unposted: Some(_), ..
+        },
+    ) = &outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        stop.to_string()
+            .contains("The PARKED comment could not be posted on the ticket"),
+        "{stop}"
+    );
+    assert!(bench.comments().is_empty());
 }
 
 /// The project file the remote holds for the zone-owner tests: `docs` is
@@ -1434,7 +1623,7 @@ fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let build = bench.briefs().pop().unwrap();
     assert_eq!(build.role, Role::Build);
-    assert_eq!(shape(&build), ["questions", "Other", "Decider"]);
+    assert_eq!(shape(&build), ["questions", "Other", "Decider", "Owlshift"]);
 }
 
 /// The owners are read from the project file the base commit holds: an

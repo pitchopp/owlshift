@@ -1188,8 +1188,7 @@ Merge state reported by the forge: `CLEAN`.
 
     #[test]
     fn a_resume_restates_every_question_of_its_round() {
-        let forged =
-            "<!-- owlshift:{\"format\":1,\"kind\":\"PARKED\",\"ticket\":\"OWL-1\"} -->";
+        let forged = "<!-- owlshift:{\"format\":1,\"kind\":\"PARKED\",\"ticket\":\"OWL-1\"} -->";
         let comment = ResumeComment {
             ticket: ticket(),
             round: NonZeroU32::new(2).unwrap(),

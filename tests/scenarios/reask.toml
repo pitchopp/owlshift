@@ -7,10 +7,11 @@ description = """
 DEMO-3 through two question rounds. Round 1 asks two questions; the decider
 answers Q1 and half of Q2, so the answer check finds Q2 partial and a RE-ASK
 asks Q2 alone. The decider asks back what it means: a counter-question, nothing
-re-asked. Their answer then settles Q2 and the ticket resumes at Build. Round 2
-asks one question; a check that gives its verdict on round 1's Q2 is refused, a
-failed run, and is retried on the same answer, which settles it. The build is
-then done and pushed."""
+re-asked. Their answer then settles Q2, a RESUME restates Q1 and Q2 as
+understood, and the ticket resumes at Build. Round 2 asks one question; a check
+that gives its verdict on round 1's Q2 is refused, a failed run, and is retried
+on the same answer, which settles it, with its own RESUME. The build is then
+done and pushed."""
 ticket = "DEMO-3"
 start = "2026-09-28T09:00:00Z"
 
@@ -76,9 +77,18 @@ waiting = "none"
 round = 1
 reasks = 0
 tracker_stage = "In Progress"
-comments = 5
+comments = 6
 brief_latest_ask = ["Q2"]
 brief_thread = ["decider", "decider", "decider"]
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] RESUME · round 1"
+contains = [
+  # Q1 was settled by the first check, Q2 by this one.
+  "**Q1** (scope) Which language should the greeting use?\nUnderstood: English, the recommendation.",
+  "**Q2** (scope) What should the greeting say, and should it end with a sign-off?\nUnderstood: \"Hello, reader.\" with no sign-off.",
+  '<!-- owlshift:{"format":1,"kind":"RESUME","ticket":"DEMO-3","round":1} -->',
+]
 
 [[step]]
 run = { result = "results/questions-round2.json" }
@@ -88,20 +98,31 @@ waiting = "needs_input"
 round = 2
 reasks = 0
 tracker_stage = "Needs Input"
-comments = 6
+comments = 7
 last_comment = { first_line = "[owlshift] QUESTIONS · round 2", contains = ["**Q1** (scope) Should the README link to the greeting?"] }
 
 [[step]]
 comment = { author = "maintainer", body = "Q1: no.\n" }
-expect = { event = "none", comments = 7 }
+expect = { event = "none", comments = 8 }
 
 [[step]]
 answer = { result = "results/check-round1-q2-answered.json" }
-expect = { event = "run_failed", waiting = "needs_input", round = 2, failed_runs = 1, comments = 7, brief_latest_ask = ["Q1"] }
+expect = { event = "run_failed", waiting = "needs_input", round = 2, failed_runs = 1, comments = 8, brief_latest_ask = ["Q1"] }
 
 [[step]]
 answer = { result = "results/check-round2-q1-answered.json" }
-expect = { event = "answered", stage = "build", waiting = "none", round = 2, failed_runs = 1, tracker_stage = "In Progress", comments = 7 }
+[step.expect]
+event = "answered"
+stage = "build"
+waiting = "none"
+round = 2
+failed_runs = 1
+tracker_stage = "In Progress"
+comments = 9
+[step.expect.last_comment]
+first_line = "[owlshift] RESUME · round 2"
+contains = ["**Q1** (scope) Should the README link to the greeting?\nUnderstood: No link, the recommendation."]
+lacks = ["sign-off"]
 
 [[step]]
 [step.run]
@@ -113,6 +134,6 @@ event = "completed"
 stage = "verify"
 failed_runs = 0
 brief_latest_ask = ["Q1"]
-brief_thread = ["decider", "decider", "decider", "decider"]
+brief_thread = ["decider", "decider", "decider", "owlshift", "decider", "owlshift"]
 branch_pushed = true
 branch_files = { "GREETING.md" = "Hello, reader.\n" }
