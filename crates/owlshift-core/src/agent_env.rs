@@ -25,6 +25,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 
 use crate::floor::{self, FloorViolation};
+use crate::vocab::Harness;
 
 /// The value Owlshift gives a token variable instead of a credential. A tool
 /// that reads it fails to authenticate, rather than falling back to a login
@@ -39,8 +40,10 @@ pub const NO_CREDENTIAL: &str = "owlshift-agent-has-no-credential";
 /// `DISPLAY` (they locate the Secret Service), and every variable of Claude
 /// Code (`CLAUDECODE`, `ANTHROPIC_*`, `CLAUDE_*`): a confined Claude Code run
 /// gets its login and a configuration folder of its own from the runner, on
-/// the harness command alone (OWL-94). No project declares one of those
-/// either ([`HARNESS_VARIABLE_PREFIXES`]).
+/// the harness command alone (OWL-94). Of Codex's own variables (`CODEX_*`,
+/// `OPENAI_*`), only `CODEX_HOME` is inherited, so that a Codex run finds the
+/// login of the user's Codex configuration. No project declares one of
+/// those, `CODEX_HOME` included ([`HARNESS_VARIABLE_PREFIXES`]).
 pub const INHERITED: &[&str] = &[
     // Running programs.
     "PATH",
@@ -154,12 +157,23 @@ pub enum AgentEnvError {
     /// `GIT_` name or an override.
     Reserved(String),
     /// A declared variable that makes the dynamic loader load code, such as
-    /// `LD_PRELOAD` or a `DYLD_` name: the sandbox program would load it
-    /// before the sandbox applies (OWL-41).
+    /// `LD_PRELOAD`, an `LD_` or `DYLD_` name, or `GCONV_PATH`: the sandbox
+    /// program would load it before the sandbox applies (OWL-41, OWL-125).
     Loader(String),
-    /// A declared variable of Claude Code's own ([`HARNESS_VARIABLE_PREFIXES`]),
-    /// which can send a run to another provider or login (OWL-120).
-    Harness(String),
+    /// A declared variable that makes an interpreter run code as it starts
+    /// ([`STARTUP_CODE_VARIABLES`]): in a wrapper script standing for a
+    /// program the runner starts outside the sandbox, or in the Codex harness
+    /// (OWL-125).
+    StartupCode(String),
+    /// A declared variable of a harness's own ([`HARNESS_VARIABLE_PREFIXES`]),
+    /// which can send a run to another provider, server or login (OWL-120,
+    /// OWL-125).
+    Harness {
+        /// The harness whose variable it is.
+        harness: Harness,
+        /// The name as declared.
+        name: String,
+    },
     /// A declared name that cannot name a variable: empty, or holding `=` or
     /// NUL. A project declares names only; the values come from the runner's
     /// environment.
@@ -191,11 +205,29 @@ impl fmt::Display for AgentEnvError {
                 "{name} cannot be passed to an agent: it makes the dynamic loader load \
                  code into the sandbox program before the sandbox applies"
             ),
-            Self::Harness(name) => write!(
+            Self::StartupCode(name) => write!(
+                f,
+                "{name} cannot be passed to an agent: it makes an interpreter run code as it \
+                 starts, in the harness or in a wrapper of git the runner starts outside the \
+                 sandbox; set it in the gate command itself if the gate needs it"
+            ),
+            Self::Harness {
+                harness: Harness::Claude,
+                name,
+            } => write!(
                 f,
                 "{name} cannot be passed to an agent: Claude Code reads it to choose which \
                  provider, gateway or login a run uses, and agent runs log in only with the \
                  subscription token `owlshift init` keeps"
+            ),
+            Self::Harness {
+                harness: Harness::Codex,
+                name,
+            } => write!(
+                f,
+                "{name} cannot be passed to an agent: it is one of Codex's own variables \
+                 (`CODEX_*`, `OPENAI_*`), which choose the server, login or token endpoint a \
+                 Codex run uses, and agent runs keep those of the user's Codex configuration"
             ),
             Self::NotAllowed(names) => write!(
                 f,
@@ -215,19 +247,52 @@ impl fmt::Display for AgentEnvError {
     }
 }
 
-/// Names that make the dynamic loader load code into a program: they never
-/// reach an agent. Every `DYLD_` name is refused too.
-pub const LOADER_VARIABLES: &[&str] = &["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"];
+/// The prefixes of the names that make the dynamic loader load code into a
+/// program: they never reach an agent. glibc reads every `LD_` name as a
+/// setting of its loader, and macOS's loader every `DYLD_` name.
+pub const LOADER_PREFIXES: &[&str] = &["LD_", "DYLD_"];
 
-/// The prefixes of Claude Code's own variables: no name starting with one,
-/// nor `CLAUDECODE`, reaches an agent through a declaration (OWL-120).
-/// Claude Code reads from them where a run sends its requests and with which
-/// login: `ANTHROPIC_BASE_URL` names a gateway, which then receives the
-/// run's subscription token, and `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX` and
-/// `_FOUNDRY` switch to another provider's account; none of these shows in
-/// the run's `apiKeySource`. A prefix, not a list, since new names come with
-/// new releases. The runner sets the few a run needs itself.
-pub const HARNESS_VARIABLE_PREFIXES: &[&str] = &["ANTHROPIC_", "CLAUDE_"];
+/// Names outside [`LOADER_PREFIXES`] that make a program load code through
+/// the dynamic loader: glibc loads its character-set converters from
+/// `GCONV_PATH` (OWL-125).
+pub const LOADER_VARIABLES: &[&str] = &["GCONV_PATH"];
+
+/// Names that make an interpreter run code as it starts (OWL-125). The
+/// runner starts git outside the sandbox with the agent environment, found
+/// on the agent's `PATH`, where it can be a bash wrapper script (Nix's
+/// `makeWrapper`, an asdf or pyenv shim), and bash runs the file `BASH_ENV`
+/// names. Codex installed with npm starts as a Node launcher, which loads the
+/// code `NODE_OPTIONS` names (`--require`) and hands its environment to the
+/// Codex binary, so that code could set any of Codex's own variables
+/// ([`HARNESS_VARIABLE_PREFIXES`]). Other interpreters' start-up variables
+/// (`PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `ENV`) reach only interpreters that
+/// start inside the sandbox and stay declarable.
+pub const STARTUP_CODE_VARIABLES: &[&str] = &["BASH_ENV", "NODE_OPTIONS"];
+
+/// The prefixes of the harnesses' own variables: no name starting with one,
+/// nor `CLAUDECODE`, reaches an agent through a declaration. A prefix, not a
+/// list, since new names come with new releases. The runner sets the few a
+/// run needs itself.
+///
+/// Claude Code (OWL-120) reads from its prefixes where a run sends its
+/// requests and with which login: `ANTHROPIC_BASE_URL` names a gateway,
+/// which then receives the run's subscription token, and
+/// `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX` and `_FOUNDRY` switch to another
+/// provider's account; none of these shows in the run's `apiKeySource`.
+///
+/// Codex (OWL-125) sends the refresh token of the user's login to the host
+/// `CODEX_REFRESH_TOKEN_URL_OVERRIDE` names, takes its login from
+/// `CODEX_API_KEY` and hands its commands to the server
+/// `CODEX_EXEC_SERVER_URL` names; its binary holds dozens more `CODEX_` and
+/// `OPENAI_` names, and `OPENAI_BASE_URL`, its documented base URL, was
+/// ignored by 0.154.0. `CODEX_HOME` is inherited ([`INHERITED`]), never
+/// declared.
+pub const HARNESS_VARIABLE_PREFIXES: &[(&str, Harness)] = &[
+    ("ANTHROPIC_", Harness::Claude),
+    ("CLAUDE_", Harness::Claude),
+    ("CODEX_", Harness::Codex),
+    ("OPENAI_", Harness::Codex),
+];
 
 impl std::error::Error for AgentEnvError {}
 
@@ -295,7 +360,8 @@ pub fn check_declared(declared: &[&str], allowed: &[&str]) -> Result<(), AgentEn
 
 /// Checks names that would reach an agent, whoever names them: a name that
 /// is not a variable name, a credential variable, a `GIT_` name or an
-/// override, a dynamic-loader variable, or a variable of Claude Code's own
+/// override, a dynamic-loader variable, an interpreter's start-up code
+/// ([`STARTUP_CODE_VARIABLES`]), or a variable of a harness's own
 /// ([`HARNESS_VARIABLE_PREFIXES`]) is refused, in any letter case, in that
 /// order. Neither a project's declaration nor the operator's allow-list
 /// passes one.
@@ -313,8 +379,20 @@ pub fn check_names(names: &[&str]) -> Result<(), AgentEnvError> {
     if let Some(name) = names.iter().find(|name| is_loader(name)) {
         return Err(AgentEnvError::Loader((*name).to_owned()));
     }
-    if let Some(name) = names.iter().find(|name| is_harness_variable(name)) {
-        return Err(AgentEnvError::Harness((*name).to_owned()));
+    if let Some(name) = names
+        .iter()
+        .find(|name| contains_name(STARTUP_CODE_VARIABLES, name))
+    {
+        return Err(AgentEnvError::StartupCode((*name).to_owned()));
+    }
+    if let Some((name, harness)) = names
+        .iter()
+        .find_map(|name| harness_variable(name).map(|harness| (name, harness)))
+    {
+        return Err(AgentEnvError::Harness {
+            harness,
+            name: (*name).to_owned(),
+        });
     }
     Ok(())
 }
@@ -357,17 +435,21 @@ fn is_reserved(name: &str) -> bool {
 }
 
 fn is_loader(name: &str) -> bool {
-    starts_with_ignore_case(name, "DYLD_")
-        || LOADER_VARIABLES
-            .iter()
-            .any(|loader| loader.eq_ignore_ascii_case(name))
+    LOADER_PREFIXES
+        .iter()
+        .any(|prefix| starts_with_ignore_case(name, prefix))
+        || contains_name(LOADER_VARIABLES, name)
 }
 
-fn is_harness_variable(name: &str) -> bool {
-    name.eq_ignore_ascii_case("CLAUDECODE")
-        || HARNESS_VARIABLE_PREFIXES
-            .iter()
-            .any(|prefix| starts_with_ignore_case(name, prefix))
+/// The harness whose own variable `name` is, if it is one.
+fn harness_variable(name: &str) -> Option<Harness> {
+    if name.eq_ignore_ascii_case("CLAUDECODE") {
+        return Some(Harness::Claude);
+    }
+    HARNESS_VARIABLE_PREFIXES
+        .iter()
+        .find(|(prefix, _)| starts_with_ignore_case(name, prefix))
+        .map(|&(_, harness)| harness)
 }
 
 fn starts_with_ignore_case(name: &str, prefix: &str) -> bool {
@@ -411,12 +493,16 @@ mod tests {
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
             ("CLAUDECODE", "1"),
             ("ANTHROPIC_BASE_URL", "http://127.0.0.1:1"),
+            ("CODEX_HOME", "/home/op/.codex"),
+            ("CODEX_REFRESH_TOKEN_URL_OVERRIDE", "http://127.0.0.1:1"),
+            ("NODE_OPTIONS", "--require /tmp/x.js"),
         ]);
         let agent = agent_environment(parent, &["database_url"], &["DATABASE_URL"]).unwrap();
         let ssh = "ssh -o BatchMode=yes -o IdentityAgent=none -o PubkeyAuthentication=no \
                    -o GSSAPIAuthentication=no";
         let expected = env(&[
             ("ALL_PROXY", "socks5://proxy:1080"),
+            ("CODEX_HOME", "/home/op/.codex"),
             ("DATABASE_URL", "postgres://localhost/test"),
             ("GH_ENTERPRISE_TOKEN", NO_CREDENTIAL),
             ("GH_TOKEN", NO_CREDENTIAL),
@@ -508,8 +594,10 @@ mod tests {
         for name in [
             "LD_PRELOAD",
             "ld_library_path",
+            "Ld_Profile",
             "DYLD_INSERT_LIBRARIES",
             "dyld_x",
+            "gconv_path",
         ] {
             assert_eq!(
                 agent_environment(Vec::new(), &[name], &[name]),
@@ -517,18 +605,33 @@ mod tests {
                 "{name}"
             );
         }
-        // OWL-120: Claude Code's own variables, which route a run to a
-        // gateway or another provider, by prefix or by name.
-        for name in [
-            "ANTHROPIC_BASE_URL",
-            "claude_code_use_bedrock",
-            "Claude_Code_Use_Vertex",
-            "CLAUDE_",
-            "ClaudeCode",
+        // OWL-125: start-up code in the Codex launcher or a wrapper of git.
+        for name in ["BASH_ENV", "node_options"] {
+            assert_eq!(
+                agent_environment(Vec::new(), &[name], &[name]),
+                Err(AgentEnvError::StartupCode(name.to_owned())),
+                "{name}"
+            );
+        }
+        // OWL-120 and OWL-125: the harnesses' own variables, which route a
+        // run to a gateway, another provider or another server, by prefix or
+        // by name. A declared `CODEX_HOME` too, though it is inherited.
+        for (name, harness) in [
+            ("ANTHROPIC_BASE_URL", Harness::Claude),
+            ("claude_code_use_bedrock", Harness::Claude),
+            ("CLAUDE_", Harness::Claude),
+            ("ClaudeCode", Harness::Claude),
+            ("CODEX_REFRESH_TOKEN_URL_OVERRIDE", Harness::Codex),
+            ("codex_exec_server_url", Harness::Codex),
+            ("Codex_Home", Harness::Codex),
+            ("OpenAI_Base_Url", Harness::Codex),
         ] {
             assert_eq!(
                 agent_environment(Vec::new(), &[name], &[name]),
-                Err(AgentEnvError::Harness(name.to_owned())),
+                Err(AgentEnvError::Harness {
+                    harness,
+                    name: name.to_owned()
+                }),
                 "{name}"
             );
         }
@@ -538,6 +641,8 @@ mod tests {
             "Anthropic_Auth_Token",
             "claude_code_oauth_token",
             "AWS_BEARER_TOKEN_BEDROCK",
+            "Codex_Api_Key",
+            "OPENAI_API_KEY",
         ] {
             assert_eq!(
                 check_names(&[name]),
@@ -548,14 +653,49 @@ mod tests {
             );
         }
         assert_eq!(
-            check_names(&["MY_ANTHROPIC_FLAG", "CLAUDE", "ANTHROPICX", "CLAUDECODEX"]),
+            check_names(&[
+                "MY_ANTHROPIC_FLAG",
+                "CLAUDE",
+                "ANTHROPICX",
+                "CLAUDECODEX",
+                "CODEX",
+                "MY_OPENAI_FLAG",
+                "LDFLAGS",
+            ]),
+            Ok(())
+        );
+        // OWL-125, decided: these start-up variables reach only interpreters
+        // that start inside the sandbox, so a gate may still declare them.
+        assert_eq!(
+            check_names(&["PYTHONPATH", "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT", "ENV"]),
             Ok(())
         );
         assert_eq!(
-            AgentEnvError::Harness("ANTHROPIC_BASE_URL".into()).to_string(),
+            AgentEnvError::Harness {
+                harness: Harness::Claude,
+                name: "ANTHROPIC_BASE_URL".into()
+            }
+            .to_string(),
             "ANTHROPIC_BASE_URL cannot be passed to an agent: Claude Code reads it to choose \
              which provider, gateway or login a run uses, and agent runs log in only with the \
              subscription token `owlshift init` keeps"
+        );
+        assert_eq!(
+            AgentEnvError::Harness {
+                harness: Harness::Codex,
+                name: "CODEX_EXEC_SERVER_URL".into()
+            }
+            .to_string(),
+            "CODEX_EXEC_SERVER_URL cannot be passed to an agent: it is one of Codex's own \
+             variables (`CODEX_*`, `OPENAI_*`), which choose the server, login or token \
+             endpoint a Codex run uses, and agent runs keep those of the user's Codex \
+             configuration"
+        );
+        assert_eq!(
+            AgentEnvError::StartupCode("NODE_OPTIONS".into()).to_string(),
+            "NODE_OPTIONS cannot be passed to an agent: it makes an interpreter run code as it \
+             starts, in the harness or in a wrapper of git the runner starts outside the \
+             sandbox; set it in the gate command itself if the gate needs it"
         );
         for name in ["", "FEATURE=on", "A\0B"] {
             assert_eq!(

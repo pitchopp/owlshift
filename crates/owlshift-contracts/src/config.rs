@@ -759,6 +759,8 @@ mod tests {
                 "Owlshift sets how git and gh authenticate",
             ),
             (r#"["LD_PRELOAD"]"#, "dynamic loader"),
+            (r#"["NODE_OPTIONS"]"#, "run code as it starts"),
+            (r#"["CODEX_REFRESH_TOKEN_URL_OVERRIDE"]"#, "Codex"),
             (r#"["FEATURE=on"]"#, "declare names only"),
         ] {
             let error = project_with_gate_env(names).unwrap_err().to_string();

@@ -72,6 +72,8 @@ pub const CREDENTIAL_VARIABLES: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "OPENAI_API_KEY",
+    // Codex's API key: `codex exec` sends it as its login (OWL-125).
+    "CODEX_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     // Tracker.
