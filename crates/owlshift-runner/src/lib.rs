@@ -16,5 +16,6 @@ pub mod project;
 pub mod roles;
 pub mod rules;
 pub mod system;
+pub mod ticket_ref;
 pub mod tracker;
 pub mod writer;
