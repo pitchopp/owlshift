@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 use owlshift_adapters::harness::claude::PEER_INBOX_ENV;
+use owlshift_core::agent_env::AgentEnvError;
 use owlshift_runner::agent_env::{AgentEnv, RunPaths};
 
 /// Set in the helper's environment only.
@@ -53,8 +54,8 @@ fn the_runner_switches_claude_codes_inbox_off() {
         .collect();
     assert_eq!(set, [(OsStr::new(name), Some(OsStr::new(value)))]);
 
-    // A runner whose own environment turns the inbox on, for a project that
-    // declares the name and an operator who allows it.
+    // A runner whose own environment turns the inbox on. A project cannot
+    // declare the name, even allowed (OWL-120).
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -89,7 +90,11 @@ fn helper_reports_the_agent_value() {
     }
     let (name, _) = PEER_INBOX_ENV;
     assert_eq!(std::env::var(name).as_deref(), Ok("1"));
-    let agent = AgentEnv::from_runner(&[name], &[name]).unwrap();
+    assert_eq!(
+        AgentEnv::from_runner(&[name], &[name]),
+        Err(AgentEnvError::Harness(name.to_owned()))
+    );
+    let agent = AgentEnv::from_runner(&[], &[]).unwrap();
     let (value, entries) = inbox(&agent);
     println!(
         "inbox={} entries={entries};",

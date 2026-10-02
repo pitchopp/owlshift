@@ -26,7 +26,7 @@ use owlshift_platform::keychain::Secret;
 use owlshift_platform::process::{find_executable_in, hand_over_on_descriptor};
 
 use super::{BRIEF_PATH, RunLog};
-use crate::agent_env::{AgentEnv, CredentialFinding, mcp_findings};
+use crate::agent_env::{AgentEnv, CredentialFinding, billing_finding, mcp_findings};
 
 /// Why a harness could not build its command; the adapter's own error type
 /// stays reachable through downcasting.
@@ -388,7 +388,7 @@ pub fn prompt_with_brief(prompt: &str) -> String {
 }
 
 /// What a Claude Code run reported, as the executor reads it: an MCP server
-/// in its `init` event is a credential finding.
+/// or an API-key source in its `init` event is a credential finding.
 fn claude_end(run: claude::Run) -> HarnessEnd {
     let status = match &run.outcome {
         claude::Outcome::Completed { .. } => HarnessStatus::Completed,
@@ -400,7 +400,10 @@ fn claude_end(run: claude::Run) -> HarnessEnd {
     HarnessEnd {
         exit_code: run.exit_code,
         status,
-        findings: mcp_findings(&run).into_iter().collect(),
+        findings: mcp_findings(&run)
+            .into_iter()
+            .chain(billing_finding(&run))
+            .collect(),
         usage: run.usage,
         model: run.model,
         harness_version: run.harness_version,
@@ -519,6 +522,25 @@ mod tests {
                 "claude.ai Linear".into()
             ])]
         );
+
+        // OWL-120: an API key, such as one managed settings hand over, is a
+        // finding too; a run that does not say has none.
+        let init =
+            r#"{"type":"system","subtype":"init","mcp_servers":[],"apiKeySource":"apiKeyHelper"}"#;
+        let keyed = claude_end(run(&[init, DONE], 0));
+        assert_eq!(
+            keyed.findings,
+            [CredentialFinding::ApiKey {
+                source: "apiKeyHelper".into()
+            }]
+        );
+        let text = keyed.findings[0].to_string();
+        assert!(
+            text.contains("apiKeyHelper") && text.contains("managed settings"),
+            "{text}"
+        );
+        let silent = r#"{"type":"system","subtype":"init","mcp_servers":[]}"#;
+        assert_eq!(claude_end(run(&[silent, DONE], 0)).findings, []);
     }
 
     fn claude(login: Option<&str>) -> ClaudeHarness {
