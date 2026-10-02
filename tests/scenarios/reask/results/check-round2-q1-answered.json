@@ -1,0 +1,8 @@
+{
+  "format": 2,
+  "status": "done",
+  "summary": "The decider chose no link.",
+  "verdicts": [
+    { "question": "Q1", "class": "answered", "reason": "No link, the recommendation." }
+  ]
+}

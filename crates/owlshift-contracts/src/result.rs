@@ -1,13 +1,11 @@
 //! `result.json`: what a role leaves for the runner at the end of a run.
 
-use std::num::NonZeroU32;
-
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::Role;
-use crate::brief::{Brief, ThreadEntry};
+use crate::brief::Brief;
 use crate::format::{self, ContractError, Format, RESULT_FORMAT};
 use crate::ids::{QuestionId, RelativePath};
 
@@ -230,7 +228,7 @@ impl RunResult {
         if self.status != Status::Done {
             return Ok(());
         }
-        let Some((round, asked)) = latest_ask(brief) else {
+        let Some((round, asked)) = brief.latest_ask() else {
             return Err(ContractError::invalid(
                 CONTRACT,
                 "the answer check ran on a thread that asks no question",
@@ -260,20 +258,6 @@ impl RunResult {
         }
         Ok(())
     }
-}
-
-/// The round and the questions of the thread's latest ask: its last
-/// `questions` or `reask` entry.
-fn latest_ask(brief: &Brief) -> Option<(NonZeroU32, &[Question])> {
-    brief.thread.iter().rev().find_map(|entry| match entry {
-        ThreadEntry::Questions {
-            round, questions, ..
-        }
-        | ThreadEntry::Reask {
-            round, questions, ..
-        } => Some((*round, questions.as_slice())),
-        ThreadEntry::Comment { .. } => None,
-    })
 }
 
 /// The first id not greater than the one before it: repeated or out of

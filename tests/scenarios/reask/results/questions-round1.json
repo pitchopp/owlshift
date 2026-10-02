@@ -1,0 +1,21 @@
+{
+  "format": 2,
+  "status": "questions",
+  "summary": "The greeting's language and wording are not given.",
+  "questions": [
+    {
+      "id": "Q1",
+      "category": "scope",
+      "context": "The ticket asks for a greeting file but names no language.",
+      "text": "Which language should the greeting use?",
+      "options": ["English", "French"],
+      "recommendation": "English"
+    },
+    {
+      "id": "Q2",
+      "category": "scope",
+      "context": "The ticket names neither the words of the greeting nor how it ends.",
+      "text": "What should the greeting say, and should it end with a sign-off?"
+    }
+  ]
+}

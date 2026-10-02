@@ -3,6 +3,7 @@
 //! exists, `owlshift do`'s run of one ticket ([`on_demand`]).
 
 pub mod agent_env;
+pub mod answer_check;
 pub mod artifact;
 pub mod config;
 pub mod doctor;

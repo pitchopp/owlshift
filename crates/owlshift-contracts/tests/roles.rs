@@ -52,13 +52,46 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "result_path",
 ];
 
-/// Reads `roles/build.md`, with its line endings normalized to LF (a
-/// checkout may turn them into CRLF); the tests below assume LF.
-fn build_prompt() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../roles/build.md");
+/// Brief fields the answer-check prompt relies on.
+const ANSWER_CHECK_BRIEF_FIELDS: &[&str] = &[
+    "ticket.description",
+    "thread.round",
+    "thread.questions.id",
+    "thread.questions.category",
+    "thread.questions.context",
+    "thread.questions.text",
+    "thread.questions.options",
+    "thread.questions.recommendation",
+    "thread.author.relation",
+    "thread.body",
+    "result_path",
+];
+
+/// Reads `roles/<file>`, with its line endings normalized to LF (a checkout
+/// may turn them into CRLF); the tests below assume LF.
+fn prompt(file: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../roles")
+        .join(file);
     fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
         .replace("\r\n", "\n")
+}
+
+fn build_prompt() -> String {
+    prompt("build.md")
+}
+
+fn answer_check_prompt() -> String {
+    prompt("answer_check.md")
+}
+
+/// The JSON examples of a prompt, in ```json blocks.
+fn json_examples(text: &str) -> Vec<&str> {
+    text.split("```json\n")
+        .skip(1)
+        .map(|after| after.split_once("\n```").expect("an unclosed json block").0)
+        .collect()
 }
 
 /// Whether the prompt names `word` as code (`` `word` ``) or as a JSON string
@@ -220,14 +253,27 @@ fn build_prompt_names_every_floor_category() {
 #[test]
 fn build_example_result_parses() {
     let text = build_prompt();
-    let blocks: Vec<&str> = text
-        .split("```json\n")
-        .skip(1)
-        .map(|after| after.split_once("\n```").expect("an unclosed json block").0)
-        .collect();
+    let blocks = json_examples(&text);
     assert_eq!(blocks.len(), 1, "roles/build.md holds one json example");
     if let Err(e) = RunResult::parse(blocks[0]) {
         panic!("the example in roles/build.md is not a valid result.json: {e}");
+    }
+}
+
+/// Each field exists in the brief, and the prompt in `file` names it by its
+/// full path or by a tail of it, such as `author.relation` inside the thread.
+fn brief_fields_exist(file: &str, text: &str, fields: &[&str]) {
+    let brief = generated("brief");
+    for field in fields {
+        let path: Vec<&str> = field.split('.').collect();
+        assert!(
+            !resolve(&brief, &brief, &path).is_empty(),
+            "the brief has no {field}"
+        );
+        assert!(
+            (0..path.len()).any(|start| names(text, &path[start..].join("."))),
+            "roles/{file} does not name {field}"
+        );
     }
 }
 
@@ -235,19 +281,7 @@ fn build_example_result_parses() {
 fn build_brief_fields_exist() {
     let text = build_prompt();
     let brief = generated("brief");
-    for field in BUILD_BRIEF_FIELDS {
-        let path: Vec<&str> = field.split('.').collect();
-        assert!(
-            !resolve(&brief, &brief, &path).is_empty(),
-            "the brief has no {field}"
-        );
-        // The prompt may name a field by its full path or by a tail of it,
-        // such as `author.relation` inside the thread.
-        assert!(
-            (0..path.len()).any(|start| names(&text, &path[start..].join("."))),
-            "roles/build.md does not name {field}"
-        );
-    }
+    brief_fields_exist("build.md", &text, BUILD_BRIEF_FIELDS);
     for (field, values) in [
         (
             "ticket.author.relation",
@@ -290,7 +324,12 @@ fn build_gate_comes_from_the_brief() {
 /// the role reads what it needs from the brief. File names are skipped.
 #[test]
 fn build_dotted_fields_exist() {
-    let text = build_prompt();
+    dotted_fields_exist("build.md", &build_prompt());
+}
+
+/// Every dotted path the prompt in `file` writes as code exists in the brief
+/// or `result.json`; see [`build_dotted_fields_exist`].
+fn dotted_fields_exist(file: &str, text: &str) {
     let schemas: Vec<Value> = ["brief", "result"].into_iter().map(generated).collect();
     let dotted = text
         .split('`')
@@ -318,11 +357,76 @@ fn build_dotted_fields_exist() {
                 .chain(definitions)
                 .any(|start| !resolve(root, start, &path).is_empty())
         });
-        assert!(
-            exists,
-            "roles/build.md names `{code}`, which no contract has"
-        );
+        assert!(exists, "roles/{file} names `{code}`, which no contract has");
         checked += 1;
     }
-    assert!(checked > 0, "no dotted field found in roles/build.md");
+    assert!(checked > 0, "no dotted field found in roles/{file}");
+}
+
+#[test]
+fn answer_check_front_matter_matches_the_contract_formats() {
+    let prompt = answer_check_prompt();
+    strip_role_front_matter(Role::AnswerCheck, &prompt).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        prompt.contains(&format!("JSON with `format` {RESULT_FORMAT},")),
+        "roles/answer_check.md does not say result.json has `format` {RESULT_FORMAT}"
+    );
+}
+
+/// The answer check names what it writes, every class the result schema
+/// allows (the four of architecture section 4), its two statuses, and the
+/// brief fields and author relations it reads.
+#[test]
+fn answer_check_prompt_names_its_fields_classes_and_inputs() {
+    let text = answer_check_prompt();
+    let result = generated("result");
+    let classes: BTreeSet<String> = resolve(&result, &result, &["verdicts", "class"])
+        .into_iter()
+        .flat_map(|node| allowed_values(&result, node))
+        .collect();
+    let four: BTreeSet<String> = ["answered", "partial", "unanswered", "counter_question"]
+        .map(String::from)
+        .into();
+    assert_eq!(classes, four, "the answer check's classes changed");
+    let words = [
+        "format", "status", "summary", "verdicts", "question", "class", "reason", "done", "failed",
+    ];
+    let missing: Vec<_> = words
+        .iter()
+        .map(|w| w.to_string())
+        .chain(classes)
+        .filter(|w| !names(&text, w))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "roles/answer_check.md does not name these result.json fields or values: {missing:?}"
+    );
+    brief_fields_exist("answer_check.md", &text, ANSWER_CHECK_BRIEF_FIELDS);
+    for relation in ["decider", "owlshift", "other"] {
+        assert!(
+            names(&text, relation),
+            "roles/answer_check.md does not name {relation}"
+        );
+    }
+}
+
+#[test]
+fn answer_check_example_result_parses() {
+    let text = answer_check_prompt();
+    let blocks = json_examples(&text);
+    assert_eq!(
+        blocks.len(),
+        1,
+        "roles/answer_check.md holds one json example"
+    );
+    let result = RunResult::parse(blocks[0]).unwrap_or_else(|e| {
+        panic!("the example in roles/answer_check.md is not a valid result.json: {e}")
+    });
+    assert_eq!(result.status, owlshift_contracts::result::Status::Done);
+    assert!(!result.verdicts.is_empty(), "the example gives no verdict");
+}
+
+#[test]
+fn answer_check_dotted_fields_exist() {
+    dotted_fields_exist("answer_check.md", &answer_check_prompt());
 }

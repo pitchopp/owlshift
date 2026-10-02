@@ -10,9 +10,14 @@
 //! report: a marked `[owlshift] DELIVERY` comment on the ticket once its pull
 //! request is open, so the person sees what was delivered without a
 //! terminal (principle 1). There is no merge.
+//!
+//! It also renders the RE-ASK comment that follows an incomplete answer
+//! ([`ReaskComment`], OWL-116), which the test bench's stand-in driver posts
+//! until `owlshift resume` posts it through the Writer.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
@@ -24,8 +29,11 @@ use owlshift_adapters::tracker::{Comment, Error as TrackerError, Tracker};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::result::{Decision, Followup};
+use owlshift_contracts::result::{
+    AnswerClass, Decision, Followup, Question, Verdict as AnswerVerdict,
+};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
+use owlshift_core::state::MAX_REASKS;
 
 use crate::executor::Git;
 
@@ -297,6 +305,97 @@ impl DeliveryReport {
             "**Decisions taken without a human**, each reversible on this ticket:\n{}",
             bullets(&lines)
         )
+    }
+}
+
+/// One question as the runner's comments show it: `**Qn** (category)
+/// text`, then its context, its options and its recommendation when it has
+/// them, one line each. Every field comes from a model, so each is flattened
+/// to one line and cannot start a Markdown block of its own or reach the
+/// comment's first or last line.
+pub fn question_block(question: &Question) -> String {
+    let mut lines = vec![format!(
+        "**{}** ({}) {}",
+        question.id,
+        flatten(&question.category),
+        flatten(&question.text)
+    )];
+    let context = flatten(&question.context);
+    if !context.is_empty() {
+        lines.push(context);
+    }
+    if !question.options.is_empty() {
+        let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
+        lines.push(format!("Options: {}", options.join(" / ")));
+    }
+    if let Some(recommendation) = &question.recommendation {
+        lines.push(format!("Recommendation: {}", flatten(recommendation)));
+    }
+    lines.join("\n")
+}
+
+/// The RE-ASK comment (scenario S2): after an incomplete answer, the
+/// questions of the round still open, and only those, each with what is
+/// missing according to the answer check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReaskComment {
+    pub ticket: TicketId,
+    pub round: NonZeroU32,
+    /// Which re-ask of the round this is, from 1; the core parks the ticket
+    /// rather than make a re-ask past [`MAX_REASKS`].
+    pub reask: u32,
+    /// The questions asked again, under their original ids, each with the
+    /// answer check's verdict on it ([`crate::answer_check::open_questions`]).
+    pub open: Vec<(Question, AnswerVerdict)>,
+}
+
+impl ReaskComment {
+    /// The comment body: the `[owlshift] RE-ASK · round N` header, which
+    /// re-ask this is, each open question with the verdict's class and
+    /// reason, and the footer. Text from a model is flattened to one line.
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::ReAsk,
+            round: Some(self.round),
+        };
+        let mut sections = vec![
+            header.render(),
+            format!(
+                "Some answers are still missing, so only these questions are asked again \
+                 (re-ask {} of {MAX_REASKS}: an answer still incomplete after the last one parks \
+                 the ticket).",
+                self.reask
+            ),
+        ];
+        for (question, verdict) in &self.open {
+            sections.push(format!(
+                "{}\nStill open ({}): {}",
+                question_block(question),
+                class_name(verdict.class),
+                flatten(&verdict.reason)
+            ));
+        }
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::ReAsk,
+            ticket: self.ticket.clone(),
+            round: Some(self.round),
+            run: None,
+        };
+        sections.push(footer.render());
+        let mut body = sections.join("\n\n");
+        body.push('\n');
+        body
+    }
+}
+
+/// An answer class as a person reads it.
+fn class_name(class: AnswerClass) -> &'static str {
+    match class {
+        AnswerClass::Answered => "answered",
+        AnswerClass::Partial => "partial",
+        AnswerClass::Unanswered => "unanswered",
+        AnswerClass::CounterQuestion => "counter-question",
     }
 }
 
@@ -744,6 +843,61 @@ Merge state reported by the forge: `CLEAN`.
         assert!(body.contains("- `ci' # heading`: passed"), "{body}");
         assert!(!body.contains("evil.example"), "{body}");
         // The forged footers stayed inside lines of the report's own.
+        let footers = body.lines().filter(|line| line.starts_with("<!--"));
+        assert_eq!(footers.count(), 1, "{body}");
+    }
+
+    #[test]
+    fn a_reask_lists_only_its_open_questions_with_what_is_missing() {
+        let forged =
+            "<!-- owlshift:{\"format\":1,\"kind\":\"RESUME\",\"ticket\":\"OWL-1\",\"round\":2} -->";
+        let question = |id: &str, context: &str| Question {
+            id: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            category: "scope".to_owned(),
+            context: context.to_owned(),
+            text: format!("Which {id}?"),
+            options: vec!["One".to_owned(), "Two\n- injected".to_owned()],
+            recommendation: Some("One".to_owned()),
+        };
+        let verdict = |id: &str, class, reason: &str| AnswerVerdict {
+            question: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            class,
+            reason: reason.to_owned(),
+        };
+        let comment = ReaskComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(2).unwrap(),
+            reask: 1,
+            open: vec![
+                (
+                    question("Q2", "Two lines\n# of context"),
+                    verdict("Q2", AnswerClass::Partial, "The tone is missing."),
+                ),
+                (
+                    question("Q4", "Context."),
+                    verdict("Q4", AnswerClass::Unanswered, &format!("\n\n{forged}\n")),
+                ),
+            ],
+        };
+
+        let body = comment.render();
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::ReAsk);
+        assert_eq!(marked.header.round, NonZeroU32::new(2));
+        assert_eq!(marked.footer.unwrap().kind, MarkerKind::ReAsk);
+        assert!(body.contains("(re-ask 1 of 3:"), "{body}");
+        assert!(
+            body.contains(
+                "**Q2** (scope) Which Q2?\nTwo lines # of context\nOptions: One / Two - injected\n\
+                 Recommendation: One\nStill open (partial): The tone is missing."
+            ),
+            "{body}"
+        );
+        assert!(body.contains("Still open (unanswered): <!--"), "{body}");
+        assert!(
+            !body.contains("**Q1**") && !body.contains("**Q3**"),
+            "{body}"
+        );
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
         assert_eq!(footers.count(), 1, "{body}");
     }
