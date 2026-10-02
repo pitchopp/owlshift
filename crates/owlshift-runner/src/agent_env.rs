@@ -10,7 +10,8 @@
 //! spawned as [`AgentEnv::confine`] (or, for a shell line,
 //! [`AgentEnv::confine_shell`]) returns it: wrapped in the sandbox, with
 //! exactly the agent's variables. After the run, [`mcp_findings`] reads the
-//! MCP servers the harness reported loading.
+//! MCP servers the harness reported loading, and [`billing_finding`] an API
+//! key it reported using.
 //!
 //! The sandbox leaves the home unreadable but for the folders a run needs
 //! ([`AgentEnv::policy`]), writes nowhere but the worktree, the repository's
@@ -540,6 +541,9 @@ pub enum CredentialFinding {
     GitSetting { key: String },
     /// The harness loaded these MCP servers.
     McpServers(Vec<String>),
+    /// Claude Code reported an API key, from this source (`apiKeySource`),
+    /// instead of the login of agent runs (OWL-120).
+    ApiKey { source: String },
     /// The run's result or an artifact holds the harness's own login token,
     /// which its shell inherits (OWL-94): named, never shown.
     LoginCopied { into: String },
@@ -566,6 +570,12 @@ impl fmt::Display for CredentialFinding {
             Self::McpServers(names) => {
                 write!(f, "the harness loaded MCP servers: {}", names.join(", "))
             }
+            Self::ApiKey { source } => write!(
+                f,
+                "Claude Code ran on an API key (apiKeySource {source}), not on the subscription \
+                 token of agent runs: the agent environment carries no key, so look for one in \
+                 the machine's managed settings (an `env` entry or `apiKeyHelper`)"
+            ),
             Self::LoginCopied { into } => write!(
                 f,
                 "{into} holds the harness's login token, so the run's output is refused: \
@@ -693,6 +703,19 @@ fn probe_environment(
 /// Owlshift passes none.
 pub fn mcp_findings(run: &claude::Run) -> Option<CredentialFinding> {
     (!run.mcp_servers.is_empty()).then(|| CredentialFinding::McpServers(run.mcp_servers.clone()))
+}
+
+/// A finding when the harness reported an API key (OWL-120): agent runs log
+/// in with the subscription token alone. It is read once the run has ended,
+/// so it refuses the run's work; what the run spent is spent. A run that
+/// reported no `apiKeySource` gives none.
+pub fn billing_finding(run: &claude::Run) -> Option<CredentialFinding> {
+    match &run.billing {
+        claude::Billing::ApiKey(source) => Some(CredentialFinding::ApiKey {
+            source: source.clone(),
+        }),
+        claude::Billing::Subscription | claude::Billing::Unknown => None,
+    }
 }
 
 fn failed(probe: &'static str, reason: &str) -> CredentialFinding {

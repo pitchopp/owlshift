@@ -39,7 +39,8 @@ pub const NO_CREDENTIAL: &str = "owlshift-agent-has-no-credential";
 /// `DISPLAY` (they locate the Secret Service), and every variable of Claude
 /// Code (`CLAUDECODE`, `ANTHROPIC_*`, `CLAUDE_*`): a confined Claude Code run
 /// gets its login and a configuration folder of its own from the runner, on
-/// the harness command alone (OWL-94).
+/// the harness command alone (OWL-94). No project declares one of those
+/// either ([`HARNESS_VARIABLE_PREFIXES`]).
 pub const INHERITED: &[&str] = &[
     // Running programs.
     "PATH",
@@ -156,6 +157,9 @@ pub enum AgentEnvError {
     /// `LD_PRELOAD` or a `DYLD_` name: the sandbox program would load it
     /// before the sandbox applies (OWL-41).
     Loader(String),
+    /// A declared variable of Claude Code's own ([`HARNESS_VARIABLE_PREFIXES`]),
+    /// which can send a run to another provider or login (OWL-120).
+    Harness(String),
     /// A declared name that cannot name a variable: empty, or holding `=` or
     /// NUL. A project declares names only; the values come from the runner's
     /// environment.
@@ -187,6 +191,12 @@ impl fmt::Display for AgentEnvError {
                 "{name} cannot be passed to an agent: it makes the dynamic loader load \
                  code into the sandbox program before the sandbox applies"
             ),
+            Self::Harness(name) => write!(
+                f,
+                "{name} cannot be passed to an agent: Claude Code reads it to choose which \
+                 provider, gateway or login a run uses, and agent runs log in only with the \
+                 subscription token `owlshift init` keeps"
+            ),
             Self::NotAllowed(names) => write!(
                 f,
                 "{} may not reach an agent on this machine: the operator allows a name in \
@@ -208,6 +218,16 @@ impl fmt::Display for AgentEnvError {
 /// Names that make the dynamic loader load code into a program: they never
 /// reach an agent. Every `DYLD_` name is refused too.
 pub const LOADER_VARIABLES: &[&str] = &["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"];
+
+/// The prefixes of Claude Code's own variables: no name starting with one,
+/// nor `CLAUDECODE`, reaches an agent through a declaration (OWL-120).
+/// Claude Code reads from them where a run sends its requests and with which
+/// login: `ANTHROPIC_BASE_URL` names a gateway, which then receives the
+/// run's subscription token, and `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX` and
+/// `_FOUNDRY` switch to another provider's account; none of these shows in
+/// the run's `apiKeySource`. A prefix, not a list, since new names come with
+/// new releases. The runner sets the few a run needs itself.
+pub const HARNESS_VARIABLE_PREFIXES: &[&str] = &["ANTHROPIC_", "CLAUDE_"];
 
 impl std::error::Error for AgentEnvError {}
 
@@ -275,8 +295,10 @@ pub fn check_declared(declared: &[&str], allowed: &[&str]) -> Result<(), AgentEn
 
 /// Checks names that would reach an agent, whoever names them: a name that
 /// is not a variable name, a credential variable, a `GIT_` name or an
-/// override, or a dynamic-loader variable is refused, in any letter case.
-/// Neither a project's declaration nor the operator's allow-list passes one.
+/// override, a dynamic-loader variable, or a variable of Claude Code's own
+/// ([`HARNESS_VARIABLE_PREFIXES`]) is refused, in any letter case, in that
+/// order. Neither a project's declaration nor the operator's allow-list
+/// passes one.
 pub fn check_names(names: &[&str]) -> Result<(), AgentEnvError> {
     if let Some(name) = names
         .iter()
@@ -290,6 +312,9 @@ pub fn check_names(names: &[&str]) -> Result<(), AgentEnvError> {
     }
     if let Some(name) = names.iter().find(|name| is_loader(name)) {
         return Err(AgentEnvError::Loader((*name).to_owned()));
+    }
+    if let Some(name) = names.iter().find(|name| is_harness_variable(name)) {
+        return Err(AgentEnvError::Harness((*name).to_owned()));
     }
     Ok(())
 }
@@ -336,6 +361,13 @@ fn is_loader(name: &str) -> bool {
         || LOADER_VARIABLES
             .iter()
             .any(|loader| loader.eq_ignore_ascii_case(name))
+}
+
+fn is_harness_variable(name: &str) -> bool {
+    name.eq_ignore_ascii_case("CLAUDECODE")
+        || HARNESS_VARIABLE_PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_case(name, prefix))
 }
 
 fn starts_with_ignore_case(name: &str, prefix: &str) -> bool {
@@ -485,6 +517,46 @@ mod tests {
                 "{name}"
             );
         }
+        // OWL-120: Claude Code's own variables, which route a run to a
+        // gateway or another provider, by prefix or by name.
+        for name in [
+            "ANTHROPIC_BASE_URL",
+            "claude_code_use_bedrock",
+            "Claude_Code_Use_Vertex",
+            "CLAUDE_",
+            "ClaudeCode",
+        ] {
+            assert_eq!(
+                agent_environment(Vec::new(), &[name], &[name]),
+                Err(AgentEnvError::Harness(name.to_owned())),
+                "{name}"
+            );
+        }
+        // The floor's credentials among them keep the floor's refusal.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "Anthropic_Auth_Token",
+            "claude_code_oauth_token",
+            "AWS_BEARER_TOKEN_BEDROCK",
+        ] {
+            assert_eq!(
+                check_names(&[name]),
+                Err(AgentEnvError::Floor(FloorViolation::CredentialVariables(
+                    vec![name.to_owned()]
+                ))),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            check_names(&["MY_ANTHROPIC_FLAG", "CLAUDE", "ANTHROPICX", "CLAUDECODEX"]),
+            Ok(())
+        );
+        assert_eq!(
+            AgentEnvError::Harness("ANTHROPIC_BASE_URL".into()).to_string(),
+            "ANTHROPIC_BASE_URL cannot be passed to an agent: Claude Code reads it to choose \
+             which provider, gateway or login a run uses, and agent runs log in only with the \
+             subscription token `owlshift init` keeps"
+        );
         for name in ["", "FEATURE=on", "A\0B"] {
             assert_eq!(
                 agent_environment(Vec::new(), &[name], &[name]),

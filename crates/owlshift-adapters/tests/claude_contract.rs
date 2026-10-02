@@ -481,6 +481,8 @@ fn repository_settings_cannot_widen_a_role_on_every_launch() {
         run.outcome
     );
     assert_eq!(run.permission_denials, ["Bash", "Write"]);
+    // The stand-in's made-up key, as a real run reports one (OWL-120).
+    assert_eq!(run.billing, Billing::ApiKey("ANTHROPIC_API_KEY".into()));
 }
 
 /// Every recorded fixture carries a version listed in `harness/tested.rs`,

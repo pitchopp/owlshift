@@ -459,14 +459,24 @@ pub enum RateLimitStatus {
     Unknown,
 }
 
-/// What the run is billed to, from the CLI's `apiKeySource`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Whether the run used an API key, from the CLI's `apiKeySource`.
+///
+/// Checked live with Claude Code 2.1.284 (OWL-120, recorded under OWL-22 in
+/// `docs/design/build-plan.md`): the CLI reports `none` for a login, such as
+/// the subscription token of agent runs, and also when a gateway
+/// (`ANTHROPIC_BASE_URL`) or Bedrock, Vertex or Foundry routing is set, so
+/// this does not tell which provider served the run: the agent environment
+/// keeps those variables out. It names the key's source otherwise, whether
+/// the key came from the environment or a settings file's `env`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Billing {
-    /// No API key: the user's subscription login.
+    /// `none`: no API key, the run logged in.
     Subscription,
-    /// `ANTHROPIC_API_KEY`.
-    ApiKey,
-    /// Not reported, or a source C1 did not record.
+    /// An API key, from the source the CLI names: `ANTHROPIC_API_KEY`,
+    /// `apiKeyHelper`, or any other value but `none`, a value that is not a
+    /// string included (kept as JSON text).
+    ApiKey(String),
+    /// Not reported: no `init` event, or one without `apiKeySource`.
     Unknown,
 }
 
@@ -679,11 +689,17 @@ impl Transcript {
     fn init(&mut self, event: &Value) {
         self.harness_version = str_field(event, "claude_code_version").map(str::to_owned);
         self.model = str_field(event, "model").map(str::to_owned);
-        self.billing = Some(match str_field(event, "apiKeySource") {
-            Some("none") => Billing::Subscription,
-            Some("ANTHROPIC_API_KEY") => Billing::ApiKey,
-            _ => Billing::Unknown,
-        });
+        let billing = match event.get("apiKeySource") {
+            None => Billing::Unknown,
+            Some(Value::String(source)) if source == "none" => Billing::Subscription,
+            Some(Value::String(source)) => Billing::ApiKey(source.clone()),
+            Some(other) => Billing::ApiKey(other.to_string()),
+        };
+        // An API key once reported stays reported: a later `init` does not
+        // clear it.
+        if !matches!(self.billing, Some(Billing::ApiKey(_))) {
+            self.billing = Some(billing);
+        }
         // Live shape (OWL-22): `[{"name":…,"status":"failed","source":"dynamic"}]`.
         self.mcp_servers = event["mcp_servers"]
             .as_array()
@@ -1091,6 +1107,37 @@ mod tests {
         assert_eq!(
             replay(&[init, OK], Some(0)).mcp_servers,
             ["owlshift-probe", "unnamed"]
+        );
+    }
+
+    /// OWL-120: any reported source but `none` is an API key, and stays one
+    /// whatever a later `init` says.
+    #[test]
+    fn an_api_key_source_is_reported_and_sticks() {
+        let init = |source: &str| {
+            format!(r#"{{"type":"system","subtype":"init","mcp_servers":[]{source}}}"#)
+        };
+        let billing = |sources: &[&str]| {
+            let lines: Vec<String> = sources.iter().map(|source| init(source)).collect();
+            let lines: Vec<&str> = lines.iter().map(String::as_str).chain([OK]).collect();
+            replay(&lines, Some(0)).billing
+        };
+        let none = r#","apiKeySource":"none""#;
+        let helper = r#","apiKeySource":"apiKeyHelper""#;
+        assert_eq!(billing(&[none]), Billing::Subscription);
+        assert_eq!(billing(&[""]), Billing::Unknown);
+        assert_eq!(billing(&[helper]), Billing::ApiKey("apiKeyHelper".into()));
+        assert_eq!(
+            billing(&[r#","apiKeySource":null"#]),
+            Billing::ApiKey("null".into())
+        );
+        assert_eq!(
+            billing(&[helper, none, ""]),
+            Billing::ApiKey("apiKeyHelper".into())
+        );
+        assert_eq!(
+            billing(&[none, helper]),
+            Billing::ApiKey("apiKeyHelper".into())
         );
     }
 
