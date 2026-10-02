@@ -6,12 +6,14 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use owlshift_contracts::ContractError;
-use owlshift_contracts::brief::Brief;
+use owlshift_contracts::brief::{Brief, ThreadEntry};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
 use owlshift_contracts::event::Event;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Claim, PersistedState, claim_ref, ticket_ref};
+use owlshift_contracts::refs::{
+    AskKind, Claim, PersistedState, TicketQuestions, claim_ref, ticket_ref,
+};
 use owlshift_contracts::result::{AnswerClass, RunResult, Status};
 use serde_json::{Value, json};
 
@@ -115,6 +117,16 @@ fn every_contract_round_trips() {
         PersistedState::parse,
         PersistedState::render,
     );
+    let asked = round_trip(
+        "ticket-questions.json",
+        TicketQuestions::parse,
+        TicketQuestions::render,
+    );
+    assert_eq!(asked.asks[1].kind, AskKind::Reask);
+    assert!(matches!(
+        asked.asks[1].entry(),
+        ThreadEntry::Reask { questions, .. } if questions.len() == 1
+    ));
     round_trip("footer.json", Footer::parse_payload, |f| {
         serde_json::to_string(f).unwrap()
     });
@@ -549,6 +561,49 @@ fn event_claim_and_state_rejections() {
         state(|v| v["extra"] = json!(1)),
         "unknown field `extra`",
     );
+
+    let asked =
+        |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
+    rejects(
+        "newer questions",
+        asked(|v| v["format"] = json!(2)),
+        "upgrade Owlshift",
+    );
+    rejects(
+        "an ask without its comment",
+        asked(|v| v["asks"][1]["comment"] = json!(" ")),
+        "an ask of round 1 names no comment",
+    );
+    rejects(
+        "a re-ask of a round not asked",
+        asked(|v| v["asks"][1]["round"] = json!(2)),
+        "re-ask of round 2, which is not earlier in the thread",
+    );
+    rejects(
+        "a round out of order",
+        asked(|v| {
+            let mut later = v["asks"][0].clone();
+            later["round"] = json!(1);
+            v["asks"].as_array_mut().unwrap().push(later);
+        }),
+        "round 1 comes after round 1",
+    );
+    rejects(
+        "an ask with no question",
+        asked(|v| v["asks"][0]["questions"] = json!([])),
+        "round 1 has no question",
+    );
+
+    // An answer must be newer than the latest ask and than what the last
+    // answer check read.
+    let at = |text: &str| text.parse::<jiff::Timestamp>().unwrap();
+    let mut questions = TicketQuestions::parse(&fixture("ticket-questions.json")).unwrap();
+    assert_eq!(questions.answers_after(), Some(at("2026-09-28T11:00:00Z")));
+    questions.checked_through = Some(at("2026-09-28T09:30:00Z"));
+    assert_eq!(questions.answers_after(), Some(at("2026-09-28T10:00:00Z")));
+    questions.checked_through = None;
+    assert_eq!(questions.answers_after(), Some(at("2026-09-28T10:00:00Z")));
+    assert_eq!(TicketQuestions::new().answers_after(), None);
 }
 
 #[test]

@@ -1,0 +1,42 @@
+{
+  "format": 1,
+  "asks": [
+    {
+      "kind": "questions",
+      "round": 1,
+      "at": "2026-09-28T09:00:00Z",
+      "comment": "c-questions-1",
+      "questions": [
+        {
+          "id": "Q1",
+          "category": "scope",
+          "context": "The ticket asks for a greeting file but names no language.",
+          "text": "Which language should the greeting use?",
+          "options": ["English", "French"],
+          "recommendation": "English"
+        },
+        {
+          "id": "Q2",
+          "category": "scope",
+          "context": "The ticket names neither the words nor how the greeting ends.",
+          "text": "What should the greeting say?"
+        }
+      ]
+    },
+    {
+      "kind": "reask",
+      "round": 1,
+      "at": "2026-09-28T10:00:00Z",
+      "comment": "c-reask-1",
+      "questions": [
+        {
+          "id": "Q2",
+          "category": "scope",
+          "context": "The ticket names neither the words nor how the greeting ends.",
+          "text": "What should the greeting say?"
+        }
+      ]
+    }
+  ],
+  "checked_through": "2026-09-28T11:00:00Z"
+}

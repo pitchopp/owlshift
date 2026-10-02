@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket questions",
+  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and what the last answer check read.",
+  "type": "object",
+  "properties": {
+    "asks": {
+      "description": "Every ask the runner posted on the ticket, oldest first.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Ask"
+      }
+    },
+    "checked_through": {
+      "description": "The newest last-edit time among the decider's comments that the last\nanswer check to give its verdicts read. Only a decider comment newer\nthan this, and than the latest ask, is a new answer: an answer already\njudged is never judged again on its own.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ],
+  "$defs": {
+    "Ask": {
+      "description": "One ask: a round's questions, or the questions of a round asked again.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "description": "When the comment was posted, as the tracker recorded it.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "comment": {
+          "description": "The tracker's identifier of the runner's comment that posted it.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "kind": {
+          "$ref": "#/$defs/AskKind"
+        },
+        "questions": {
+          "description": "The questions, under their ids in the round.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Question"
+          },
+          "minItems": 1
+        },
+        "round": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "round",
+        "at",
+        "comment",
+        "questions"
+      ]
+    },
+    "AskKind": {
+      "description": "What an ask is.",
+      "oneOf": [
+        {
+          "description": "A round of questions, numbered Q1..Qn.",
+          "type": "string",
+          "const": "questions"
+        },
+        {
+          "description": "Questions of a round left open, asked again under their ids.",
+          "type": "string",
+          "const": "reask"
+        }
+      ]
+    },
+    "Question": {
+      "description": "A question for the decider, understandable without any transcript.",
+      "type": "object",
+      "properties": {
+        "category": {
+          "description": "What the question is about, such as `scope` or `security`.",
+          "type": "string"
+        },
+        "context": {
+          "description": "What the reader needs to know to answer.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/QuestionId"
+        },
+        "options": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "recommendation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "context",
+        "text"
+      ]
+    },
+    "QuestionId": {
+      "description": "A question's identifier within a round: Q1, Q2, and so on.",
+      "type": "string",
+      "pattern": "^Q[1-9][0-9]*$"
+    }
+  }
+}
