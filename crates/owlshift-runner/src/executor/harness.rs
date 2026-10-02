@@ -301,7 +301,8 @@ pub struct ClaudeHarness {
     pub prompt: String,
     pub model: Option<String>,
     pub effort: Option<Effort>,
-    /// A dollar cap, only for a CLI configured for API billing.
+    /// A dollar cap on each run, passed as `--max-budget-usd`: the personal
+    /// file's `budget_usd`, set whatever the billing.
     pub max_budget_usd: Option<f64>,
     /// The token agent runs log in with, made by `claude setup-token` and
     /// read by the runner from the keychain ([`CLAUDE_AGENT_ACCOUNT`]).

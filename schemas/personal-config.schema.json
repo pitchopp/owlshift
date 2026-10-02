@@ -70,7 +70,7 @@
       "type": "object",
       "properties": {
         "budget_usd": {
-          "description": "A dollar budget, only for a harness configured for API billing.",
+          "description": "A dollar cap on each run of a harness, not on a day's total, whatever\nthe billing. Owlshift passes it to Claude Code as `--max-budget-usd`,\nwhich counts a run's cost at list price on a subscription too and\nstops the run once its cost is above the cap, so a run can end above\nit. A run stopped by it alone is a failed run. Codex has no such\noption, so nothing enforces it there.",
           "type": [
             "number",
             "null"
