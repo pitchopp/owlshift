@@ -128,6 +128,61 @@ always_human = []
     assert!(stdout(&output).contains("upgrade Owlshift"));
 }
 
+#[test]
+fn config_show_lists_the_always_human_categories_with_their_origin() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    fs::write(
+        repo.path().join("owlshift.toml"),
+        r#"requires = ">=0.0"
+[tracker]
+kind = "markdown"
+admit = "delegation"
+states = { ready = "ready", working = "working", needs_input = "needs input", review = "review" }
+[stack]
+gate = ["cargo test"]
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+[models]
+[policy]
+always_human = ["Billing!", "Data Loss", "", "billing"]
+"#,
+    )
+    .unwrap();
+
+    let output = owlshift(repo.path(), config_dir.path(), &["config", "show"]);
+    let shown = stdout(&output);
+    assert!(output.status.success(), "{shown}");
+    for token in [
+        "security",
+        "data_loss",
+        "money",
+        "legal",
+        "irreversible",
+        "scope",
+    ] {
+        assert!(shown.contains(&format!("  {token}  (floor)\n")), "{shown}");
+    }
+    // The tempdir may be reached through a symlink (`/private` on macOS), so
+    // the origin is checked by its file name, not its full path.
+    let billing = shown
+        .lines()
+        .find(|line| line.starts_with("  billing  ("))
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert!(billing.ends_with("owlshift.toml)"), "{shown}");
+    // Normalized as the gate reads it, listed once, blank dropped; an
+    // addition the floor already covers says so.
+    assert_eq!(shown.matches("\n  billing  (").count(), 1, "{shown}");
+    assert!(
+        shown.contains("  data_loss  (")
+            && shown.contains("owlshift.toml)  already covered by the floor\n"),
+        "{shown}"
+    );
+    assert!(!shown.contains("\n    ("), "{shown}");
+}
+
 /// The acceptance criterion for OWL-30: a personal file present under
 /// `OWLSHIFT_CONFIG_DIR` is actually read, on every platform (including
 /// Windows, where nothing but this override redirects
