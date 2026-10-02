@@ -14,11 +14,13 @@
 //! | Pipeline, stage | [`pipeline`], with the stages in [`vocab`] |
 //! | Ticket state machine | [`state`] |
 //! | Gate | [`gate`]; an open gate is [`state::Status::NeedsInput`] |
+//! | Decider, who answers a ticket's gates | [`decider`] |
 //! | Resource | [`resource`] |
 //! | Scheduler | [`schedule`] |
 //! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
 
 pub mod agent_env;
+pub mod decider;
 pub mod floor;
 pub mod gate;
 pub mod pipeline;

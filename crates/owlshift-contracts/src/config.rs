@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use owlshift_core::agent_env::{check_declared, check_names};
+use owlshift_core::decider::ZoneOwners;
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,10 @@ pub struct ProjectConfig {
     pub pipeline: Pipeline,
     pub models: Models,
     pub policy: Policy,
+    /// Code zones, keyed by their folder from the repository's root, such as
+    /// `backend/billing`: who owns each.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub zones: BTreeMap<String, ZoneSettings>,
 }
 
 /// The tracker and how Owlshift maps onto it.
@@ -195,6 +200,16 @@ pub struct Policy {
     pub always_human: Vec<String>,
 }
 
+/// The settings of one code zone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneSettings {
+    /// The tracker account that decides the tickets without an assignee
+    /// touching this zone: its identifier as the tracker reports it (a
+    /// Linear user's id, the name on the Markdown tracker), written exactly.
+    pub owner: String,
+}
+
 impl ProjectConfig {
     /// Parses and validates `owlshift.toml`.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
@@ -224,7 +239,21 @@ impl ProjectConfig {
         self.stack
             .check_rules()
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.rules: {reason}")))?;
+        self.zone_owners()?;
         check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
+    }
+
+    /// The owners `zones` names, checked: each key a folder from the
+    /// repository's root, no two naming the same zone, each owner neither
+    /// blank nor padded (`owlshift_core::decider::ZoneOwners::new`). On a
+    /// parsed file it cannot fail; it checks again for one built otherwise.
+    pub fn zone_owners(&self) -> Result<ZoneOwners, ContractError> {
+        ZoneOwners::new(
+            self.zones
+                .iter()
+                .map(|(zone, settings)| (zone.as_str(), settings.owner.as_str())),
+        )
+        .map_err(|error| ContractError::invalid(PROJECT, format!("zones: {error}")))
     }
 
     /// Checks `stack.gate_env` against the names the operator allows for
@@ -565,6 +594,12 @@ mod tests {
     }
 
     fn project_with_stack(stack: &str) -> Result<ProjectConfig, ContractError> {
+        project(stack, "")
+    }
+
+    /// A project file with `stack` added to its `[stack]` table and `tail`
+    /// after its last table.
+    fn project(stack: &str, tail: &str) -> Result<ProjectConfig, ContractError> {
         ProjectConfig::parse(&format!(
             r#"
             requires = ">=0.1"
@@ -581,8 +616,69 @@ mod tests {
             [models]
             [policy]
             always_human = []
+            {tail}
             "#
         ))
+    }
+
+    #[test]
+    fn zones_name_their_owners() {
+        let absent = project_with_stack("").unwrap();
+        assert!(absent.zones.is_empty());
+        assert!(!absent.render().contains("zones"));
+
+        let config = project(
+            "",
+            r#"
+            [zones."backend/billing"]
+            owner = "u-bob"
+            [zones."backend/billing/tax"]
+            owner = "u-tia"
+            "#,
+        )
+        .unwrap();
+        let owners = config.zone_owners().unwrap();
+        assert_eq!(owners.owner_of("backend/billing/api"), Some("u-bob"));
+        assert_eq!(owners.owner_of("backend/billing/tax/vat"), Some("u-tia"));
+        let rendered = config.render();
+        assert!(
+            rendered.contains("[zones.\"backend/billing\"]\nowner = \"u-bob\""),
+            "{rendered}"
+        );
+        assert_eq!(ProjectConfig::parse(&rendered).unwrap(), config);
+
+        // The core's refusals reach the file's reader under `zones`.
+        let error = project(
+            "",
+            r#"
+            [zones.Billing]
+            owner = "u-bob"
+            [zones."billing/"]
+            owner = "u-tia"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "invalid owlshift.toml: zones: \"Billing\" and \"billing/\" name the same zone"
+        );
+
+        // A configuration built in code is checked when its owners are read.
+        let mut built = config;
+        built.zones.insert(
+            "../secrets".to_owned(),
+            ZoneSettings {
+                owner: "u-eve".to_owned(),
+            },
+        );
+        assert!(
+            built
+                .zone_owners()
+                .unwrap_err()
+                .to_string()
+                .contains("`.` or `..`")
+        );
     }
 
     fn project_with_gate_env(names: &str) -> Result<ProjectConfig, ContractError> {
