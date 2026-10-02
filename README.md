@@ -18,7 +18,7 @@ Early development. Steps P0 and P1 of the roadmap are built: the CLI runs one ti
 - `owlshift config show`: print the effective configuration and the file each value comes from.
 - `owlshift init`: write a commented `owlshift.toml` for this repository, then store the tracker and forge secrets and the agent runs' Claude Code token that `owlshift do` needs in the system keychain.
 - `owlshift do TICKET`: run one ticket to a verified pull request, in the foreground.
-- `owlshift logs [TICKET] [--follow]`: print the events `owlshift do` recorded, oldest first, optionally only one ticket's, and keep printing new ones with `--follow`.
+- `owlshift logs [TICKET] [--last N] [--follow]`: print the events `owlshift do` recorded, oldest first, optionally only one ticket's, only the last N with `--last N`, and keep printing new ones with `--follow`.
 
 There is no packaged release yet. Install from source:
 
