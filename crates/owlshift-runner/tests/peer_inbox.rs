@@ -9,6 +9,7 @@ use std::process::Command;
 
 use owlshift_adapters::harness::claude::PEER_INBOX_ENV;
 use owlshift_core::agent_env::AgentEnvError;
+use owlshift_core::vocab::Harness;
 use owlshift_runner::agent_env::{AgentEnv, RunPaths};
 
 /// Set in the helper's environment only.
@@ -92,7 +93,10 @@ fn helper_reports_the_agent_value() {
     assert_eq!(std::env::var(name).as_deref(), Ok("1"));
     assert_eq!(
         AgentEnv::from_runner(&[name], &[name]),
-        Err(AgentEnvError::Harness(name.to_owned()))
+        Err(AgentEnvError::Harness {
+            harness: Harness::Claude,
+            name: name.to_owned()
+        })
     );
     let agent = AgentEnv::from_runner(&[], &[]).unwrap();
     let (value, entries) = inbox(&agent);
