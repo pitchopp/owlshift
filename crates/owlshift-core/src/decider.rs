@@ -47,6 +47,27 @@ pub fn declared_zones<'a>(
     Ok(zones)
 }
 
+/// The zones a ticket's `zone:` labels declare, as the brief lists them: the
+/// folders of the well-formed labels, in the labels' order, each once as
+/// written. Unlike [`declared_zones`] it leaves a malformed label out instead
+/// of refusing it, since it informs an agent and chooses no decider: a ticket
+/// with an assignee is not refused for a label its decider never reads.
+pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut zones: Vec<String> = Vec::new();
+    for label in labels {
+        if let Ok(declared) = declared_zones([label]) {
+            for resource in declared {
+                if let Resource::Zone(zone) = resource
+                    && !zones.contains(&zone)
+                {
+                    zones.push(zone);
+                }
+            }
+        }
+    }
+    zones
+}
+
 /// A `zone:` label that names no folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZoneLabelError {
@@ -428,6 +449,22 @@ mod tests {
             assert!(text.contains(reason), "{label}: {text}");
             assert!(text.contains(&format!("{label:?}")), "{text}");
         }
+    }
+
+    #[test]
+    fn the_brief_lists_the_well_formed_zone_labels_only() {
+        assert_eq!(
+            brief_zones([
+                "Feature",
+                "zone:backend/billing",
+                "ZONE: web ",
+                "zone:../secrets",
+                "zone:backend/billing",
+                "zone:",
+            ]),
+            ["backend/billing", "web"]
+        );
+        assert!(brief_zones(["agent", "zones:web"]).is_empty());
     }
 
     #[test]

@@ -1378,6 +1378,7 @@ version = "0.0.0"
 dependencies = [
  "jiff",
  "owlshift-contracts",
+ "owlshift-core",
  "serde",
  "serde_json",
  "tempfile",

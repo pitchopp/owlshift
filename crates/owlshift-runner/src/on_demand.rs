@@ -54,7 +54,7 @@ use owlshift_contracts::result::{
     self, AnswerClass, Decision, Followup, Question, RunResult, Verdict as AnswerVerdict,
 };
 use owlshift_contracts::{Role, Stage, Variant};
-use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, declared_zones};
+use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::Resource;
 use owlshift_core::state::{Event, MAX_REASKS, ParkReason, Status, TicketState, Transition};
@@ -1281,7 +1281,7 @@ impl OnDemand<'_> {
             decider: in_force,
             thread: thread(comments, &asks, current),
             checkpoint: if build { checkpoint(&p.worktree) } else { None },
-            zones: Vec::new(),
+            zones: brief_zones(p.found.labels.iter().map(String::as_str)),
             resources: Vec::new(),
             rules: rules.to_vec(),
             permissions: Permissions {
