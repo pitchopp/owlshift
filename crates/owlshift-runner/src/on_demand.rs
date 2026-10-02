@@ -18,10 +18,12 @@
 //! A Build that asks questions opens a round: the Writer posts them as a
 //! QUESTIONS comment, and the ticket ref keeps the ask and the core state.
 //! While they wait, `do` is refused; `resume` runs the answer check once the
-//! decider has answered ([`crate::answer_check`]), then resumes the Build,
-//! asks again what is missing, or parks the ticket. In this version the
-//! build stage is the whole pipeline, and the tracker's visible stage is not
-//! moved.
+//! decider has answered ([`crate::answer_check`]), then resumes the Build
+//! after a RESUME comment of what was understood, asks again what is
+//! missing, or parks the ticket. Every park, of a Build or of an answer
+//! check, posts a PARKED comment saying why and what restarts it. In this
+//! version the build stage is the whole pipeline, and the tracker's visible
+//! stage is not moved.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -68,7 +70,10 @@ use crate::executor::{
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
-use crate::writer::{DeliveryReport, Gate, QuestionsComment, ReaskComment, Writer};
+use crate::writer::{
+    DeliveryReport, Gate, ParkedComment, QuestionsComment, ReaskComment, Restart, ResumeComment,
+    Writer, park_reason,
+};
 
 /// How long one Build run may take before its process tree is stopped.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -268,8 +273,13 @@ pub enum Stop {
     },
     /// The answer check failed; it runs again on the same answers.
     CheckFailed { ticket: TicketId, detail: String },
-    /// The core machine parked the ticket.
-    Parked { reason: ParkReason, detail: String },
+    /// The core machine parked the ticket. `unposted` says why the PARKED
+    /// comment is not on the ticket, when it is not.
+    Parked {
+        reason: ParkReason,
+        detail: String,
+        unposted: Option<String>,
+    },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
     /// The run was done and its gate passed, but its delivery failed.
@@ -379,12 +389,22 @@ impl fmt::Display for Stop {
                 "The answer check failed: {detail}. Run `owlshift resume {ticket}` to check the \
                  same answers again; a second failure parks the ticket."
             ),
-            Self::Parked { reason, detail } => {
-                write!(f, "Parked: {}: {detail}", describe(*reason))?;
+            Self::Parked {
+                reason,
+                detail,
+                unposted,
+            } => {
+                write!(f, "Parked: {}: {detail}", park_reason(*reason))?;
                 if *reason == ParkReason::IsolationBreach {
                     f.write_str(
                         "\nThe project is refused until a person looks: see the `unverified` \
                          file in its folder.",
+                    )?;
+                }
+                if let Some(why) = unposted {
+                    write!(
+                        f,
+                        "\nThe PARKED comment could not be posted on the ticket: {why}."
                     )?;
                 }
                 Ok(())
@@ -405,15 +425,6 @@ impl fmt::Display for Stop {
                  worktree keeps the work; run again to retry the delivery."
             ),
         }
-    }
-}
-
-fn describe(reason: ParkReason) -> &'static str {
-    match reason {
-        ParkReason::FailedRuns => "a second run failed",
-        ParkReason::Reasks => "the answers stayed incomplete",
-        ParkReason::Blocked => "the run is blocked",
-        ParkReason::IsolationBreach => "the run broke isolation and is quarantined",
     }
 }
 
@@ -796,7 +807,7 @@ impl OnDemand<'_> {
                 Ok(Transition::Parked {
                     state: parked,
                     reason,
-                }) => return Err(self.park(p, &parked, reason, &ran, sink)),
+                }) => return Err(self.park(p, &parked, reason, &ran, None, Vec::new(), sink)),
                 other => return Err(core_error(other)),
             }
             match state.status() {
@@ -889,6 +900,7 @@ impl OnDemand<'_> {
             comment: posted.id.clone(),
             questions: result.questions.clone(),
             decider,
+            verdicts: Vec::new(),
         });
         if let Err(error) = self.store(p, state, questions) {
             return Stop::Refused(format!(
@@ -953,8 +965,12 @@ impl OnDemand<'_> {
         let verdicts: Vec<AnswerVerdict> = match (event, result) {
             (Event::Answered | Event::Incomplete | Event::CounterQuestion, Some(result)) => {
                 // The answers this check read are judged: only a newer
-                // comment of the decider is a new answer.
+                // comment of the decider is a new answer. Its verdicts are
+                // kept with the ask they judge, for the round's RESUME.
                 questions.checked_through = read_through.max(questions.checked_through);
+                if let Some(ask) = questions.asks.last_mut() {
+                    ask.verdicts.clone_from(&result.verdicts);
+                }
                 result.verdicts.clone()
             }
             _ => Vec::new(),
@@ -965,9 +981,12 @@ impl OnDemand<'_> {
                 state: parked,
                 reason,
             }) => {
-                self.store(p, &parked, questions)
-                    .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
-                return Err(self.park(p, &parked, reason, &ran, sink));
+                let open = if reason == ParkReason::Reasks {
+                    answer_check::open_questions(&brief, &verdicts)
+                } else {
+                    Vec::new()
+                };
+                return Err(self.park(p, &parked, reason, &ran, Some(questions), open, sink));
             }
             other => return Err(core_error(other)),
         };
@@ -981,8 +1000,38 @@ impl OnDemand<'_> {
         };
         match event {
             Event::Answered => {
-                self.store(p, &next, questions)
-                    .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
+                // RESUME before the state is kept, as a RE-ASK: when the
+                // post fails, nothing of this check is kept and the next
+                // `resume` checks the same answers again.
+                let round = NonZeroU32::new(next.round())
+                    .ok_or_else(|| Stop::Refused("no question round is open".to_owned()))?;
+                let resume = ResumeComment {
+                    ticket: ticket.clone(),
+                    round,
+                    understood: answer_check::understood(
+                        questions
+                            .asks
+                            .iter()
+                            .filter(|ask| ask.round == round)
+                            .map(|ask| (&ask.questions[..], &ask.verdicts[..])),
+                    ),
+                };
+                let posted = Writer::new(self.tracker)
+                    .post_resume(&resume)
+                    .map_err(|e| refused("posting the resume on the ticket", e))?;
+                sink.emit(
+                    &ticket,
+                    Some(&ran.run),
+                    EventKind::TrackerWrite,
+                    comment_written("RESUME", &posted),
+                );
+                self.store(p, &next, questions).map_err(|e| {
+                    Stop::Refused(format!(
+                        "the resume is on the ticket (comment {}), but keeping the answered state \
+                         in the ticket's ref failed: {e}",
+                        posted.id
+                    ))
+                })?;
                 sink.emit(
                     &ticket,
                     Some(&ran.run),
@@ -1023,6 +1072,7 @@ impl OnDemand<'_> {
                     comment: posted.id.clone(),
                     questions: open.iter().map(|(question, _)| question.clone()).collect(),
                     decider: asked,
+                    verdicts: Vec::new(),
                 });
                 self.store(p, &next, questions).map_err(|e| {
                     Stop::Refused(format!(
@@ -1078,13 +1128,23 @@ impl OnDemand<'_> {
     }
 
     /// Parks the ticket: keeps its parked state when it has a ticket ref,
-    /// records the decision, and returns the stop that says why.
+    /// with `questions` when the answer check changed them, posts the PARKED
+    /// comment, records the decision, and returns the stop that says why.
+    /// `open` holds the questions still open at the re-ask limit.
+    ///
+    /// The comment is posted even when keeping the state failed, as when a
+    /// run that broke isolation moved the ticket ref: the ticket stopped
+    /// either way, and the person learns it on the ticket. A post that
+    /// failed leaves the park as it is and is said in the stop.
+    #[allow(clippy::too_many_arguments)]
     fn park(
         &self,
         p: &mut Prepared,
         parked: &TicketState,
         reason: ParkReason,
         ran: &Ran,
+        questions: Option<TicketQuestions>,
+        open: Vec<(Question, AnswerVerdict)>,
         sink: &mut EventSink<'_>,
     ) -> Stop {
         let detail = if ran.breaches.is_empty() {
@@ -1092,9 +1152,44 @@ impl OnDemand<'_> {
         } else {
             ran.breaches.join("; ")
         };
-        if let Err(stop) = self.keep(p, parked) {
-            return stop;
-        }
+        // A ticket without a ref keeps nothing: a ref is made only once a
+        // question round opens.
+        let questions = questions.or_else(|| p.stored.as_ref().map(|_| p.questions()));
+        let kept = match questions {
+            Some(questions) => self
+                .store(p, parked, questions)
+                .map_err(|e| format!("keeping the ticket's state in its ref failed: {e}")),
+            None => Ok(()),
+        };
+        let comment = ParkedComment {
+            ticket: p.ticket.clone(),
+            reason,
+            // A breach's details describe this machine: they stay here.
+            detail: if reason == ParkReason::IsolationBreach {
+                String::new()
+            } else {
+                detail.clone()
+            },
+            round: NonZeroU32::new(parked.round()).filter(|_| reason == ParkReason::Reasks),
+            open,
+            restart: if p.stored.is_some() {
+                Restart::Resume
+            } else {
+                Restart::Do
+            },
+        };
+        let unposted = match Writer::new(self.tracker).post_parked(&comment) {
+            Ok(posted) => {
+                sink.emit(
+                    &p.ticket,
+                    Some(&ran.run),
+                    EventKind::TrackerWrite,
+                    comment_written("PARKED", &posted),
+                );
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
         sink.emit(
             &p.ticket,
             Some(&ran.run),
@@ -1104,7 +1199,22 @@ impl OnDemand<'_> {
                 ("detail", json!(detail)),
             ]),
         );
-        Stop::Parked { reason, detail }
+        if let Err(why) = kept {
+            let posted = match &unposted {
+                None => "the PARKED comment is on the ticket".to_owned(),
+                Some(error) => format!("the PARKED comment could not be posted: {error}"),
+            };
+            return Stop::Refused(format!(
+                "{} parked ({}: {detail}), but {why}; {posted}",
+                p.ticket,
+                park_reason(reason)
+            ));
+        }
+        Stop::Parked {
+            reason,
+            detail,
+            unposted,
+        }
     }
 
     /// Keeps `state` in the ticket's ref, when the ticket has one: a ref is
@@ -1874,6 +1984,7 @@ mod tests {
                 account: "u1".into(),
                 by: DeciderRule::Assignee,
             },
+            verdicts: Vec::new(),
         };
         let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
         let comments = [
@@ -1949,6 +2060,7 @@ mod tests {
                 account: by.into(),
                 by: DeciderRule::ZoneOwner,
             },
+            verdicts: Vec::new(),
         };
         // Round 1 went to the zone owner `bob`, round 2 to `tia`; the
         // ticket was since assigned to `ann`.

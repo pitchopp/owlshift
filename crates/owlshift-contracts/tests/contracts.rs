@@ -140,6 +140,8 @@ fn every_contract_round_trips() {
         asked.asks[1].entry(),
         ThreadEntry::Reask { questions, .. } if questions.len() == 1
     ));
+    assert_eq!(asked.asks[0].verdicts[1].class, AnswerClass::Partial);
+    assert!(asked.asks[1].verdicts.is_empty());
     round_trip("footer.json", Footer::parse_payload, |f| {
         serde_json::to_string(f).unwrap()
     });
@@ -618,9 +620,57 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(3)),
+        asked(|v| v["format"] = json!(4)),
         "upgrade Owlshift",
     );
+    rejects(
+        "older questions",
+        asked(|v| v["format"] = json!(1)),
+        "unknown format 1",
+    );
+    rejects(
+        "a format-2 document with verdicts",
+        asked(|v| v["format"] = json!(2)),
+        "format 2 keeps no verdicts",
+    );
+    rejects(
+        "a verdict on a question the ask did not ask",
+        asked(|v| v["asks"][1]["verdicts"] = json!([{"question": "Q1", "class": "answered", "reason": "r"}])),
+        "an ask of round 1 keeps a verdict for Q1, which it did not ask",
+    );
+    rejects(
+        "a repeated verdict",
+        asked(|v| v["asks"][0]["verdicts"][1]["question"] = json!("Q1")),
+        "the verdict for Q1 is repeated or out of order",
+    );
+    rejects(
+        "a verdict without a reason",
+        asked(|v| v["asks"][0]["verdicts"][0]["reason"] = json!(" ")),
+        "the verdict for Q1 has no reason",
+    );
+    rejects(
+        "a counter-question kept without its reply",
+        asked(|v| v["asks"][0]["verdicts"][1]["class"] = json!("counter_question")),
+        "the verdict for Q2 is a counter-question without a reply",
+    );
+    rejects(
+        "unknown ask field",
+        asked(|v| v["asks"][0]["extra"] = json!(1)),
+        "unknown field `extra`",
+    );
+
+    // A format-2 document, written before the asks kept their verdicts, is
+    // read as format 3 without them, and written back as format 3.
+    let format_2 = edited("ticket-questions.json", |v| {
+        v["format"] = json!(2);
+        for ask in v["asks"].as_array_mut().unwrap() {
+            ask.as_object_mut().unwrap().remove("verdicts");
+        }
+    });
+    let read = TicketQuestions::parse(&format_2).unwrap();
+    assert_eq!(read.asks.len(), 2);
+    assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
+    assert!(read.render().starts_with("{\n  \"format\": 3,"));
     rejects(
         "an ask without its comment",
         asked(|v| v["asks"][1]["comment"] = json!(" ")),
