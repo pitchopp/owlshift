@@ -227,7 +227,8 @@ impl fmt::Display for AgentEnvError {
                 f,
                 "{name} cannot be passed to an agent: it is one of Codex's own variables \
                  (`CODEX_*`, `OPENAI_*`), which choose the server, login or token endpoint a \
-                 Codex run uses, and agent runs keep those of the user's Codex configuration"
+                 Codex run uses, and agent runs use Codex's own servers with the login of the \
+                 user's Codex (`CODEX_HOME`)"
             ),
             Self::NotAllowed(names) => write!(
                 f,
@@ -266,7 +267,9 @@ pub const LOADER_VARIABLES: &[&str] = &["GCONV_PATH"];
 /// Codex binary, so that code could set any of Codex's own variables
 /// ([`HARNESS_VARIABLE_PREFIXES`]). Other interpreters' start-up variables
 /// (`PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `ENV`) reach only interpreters that
-/// start inside the sandbox and stay declarable.
+/// start inside the sandbox and stay declarable: `ENV` is read by interactive
+/// shells only, which the runner's `executor::git` tests check on Unix
+/// (OWL-130).
 pub const STARTUP_CODE_VARIABLES: &[&str] = &["BASH_ENV", "NODE_OPTIONS"];
 
 /// The prefixes of the harnesses' own variables: no name starting with one,
@@ -688,8 +691,8 @@ mod tests {
             .to_string(),
             "CODEX_EXEC_SERVER_URL cannot be passed to an agent: it is one of Codex's own \
              variables (`CODEX_*`, `OPENAI_*`), which choose the server, login or token \
-             endpoint a Codex run uses, and agent runs keep those of the user's Codex \
-             configuration"
+             endpoint a Codex run uses, and agent runs use Codex's own servers with the login \
+             of the user's Codex (`CODEX_HOME`)"
         );
         assert_eq!(
             AgentEnvError::StartupCode("NODE_OPTIONS".into()).to_string(),
