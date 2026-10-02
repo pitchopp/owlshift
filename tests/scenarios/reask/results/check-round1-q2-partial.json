@@ -1,0 +1,9 @@
+{
+  "format": 2,
+  "status": "done",
+  "summary": "The decider chose English and gave the words; the sign-off is still open.",
+  "verdicts": [
+    { "question": "Q1", "class": "answered", "reason": "English, the recommendation." },
+    { "question": "Q2", "class": "partial", "reason": "The words are given, but not whether the greeting ends with a sign-off." }
+  ]
+}

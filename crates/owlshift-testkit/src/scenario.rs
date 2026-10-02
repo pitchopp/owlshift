@@ -6,7 +6,7 @@
 //! the operator's personal file, whose `allow_gate_env` the project's
 //! `stack.gate_env` is checked against as when the configuration is loaded. Each `[[step]]` does one thing
 //! (`dispatch = true`, `run = <reply>`, `comment = { author, body }` or
-//! `answer = "answered"`) and may carry an `expect` table, checked right
+//! `answer = <reply>`) and may carry an `expect` table, checked right
 //! after it. Time is virtual: step `n` happens `n` minutes after `start`.
 //!
 //! # The stand-in driver
@@ -21,18 +21,26 @@
 //! pushes the branch. It keeps the latest failure of the gate the executor
 //! runs after a Build `done`, and hands it to the next Build brief. That
 //! part is a stand-in: the writer replaces it, and
-//! the scenario files stay. What it leaves out on purpose:
+//! the scenario files stay.
 //!
-//! - the brief's thread carries every tracker comment as a plain `comment`
-//!   entry, the runner's own QUESTIONS comment included, where the executor
-//!   will give each question round its own `questions` entry;
+//! A `run` step runs the current stage's role; an `answer` step runs the
+//! answer check (OWL-116) while the ticket waits for input, once answers
+//! arrived: a decider comment newer than the latest ask, or than the last
+//! check that found a counter-question. A failed or interrupted check is
+//! retried on the same answers. Its outcome maps onto one core event
+//! (`owlshift_runner::answer_check::event`): an answer settles the round
+//! and the ticket resumes; an incomplete one posts a RE-ASK comment with
+//! only the open questions (`owlshift_runner::writer::ReaskComment`); a
+//! counter-question changes nothing yet. Each ask the driver posts, a
+//! round's questions or a re-ask, is kept in memory and takes the place of
+//! its comment in every brief's thread, as a `questions` or `reask` entry.
+//! What it leaves out on purpose:
+//!
 //! - no intake, admission, claim or ticket ref; the pipeline is the project's
-//!   default variant;
-//! - the answer check is not run: an `answer` step gives its verdict, and
-//!   only `answered` until the answer-check role arrives in P2;
-//! - a run's outcome maps onto the core event as `owlshift do` maps it
-//!   (`owlshift_runner::on_demand::core_event`), and no PARKED, RE-ASK,
-//!   RESUME or DELIVERY comment is written.
+//!   default variant, and the asks live in memory, not in the ticket ref;
+//! - a stage run's outcome maps onto the core event as `owlshift do` maps it
+//!   (`owlshift_runner::on_demand::core_event`), and no PARKED, RESUME,
+//!   REPLY or DELIVERY comment is written.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -49,7 +57,7 @@ use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::brief::{
     Author, Brief, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
 };
-use owlshift_contracts::comment::{Footer, Header, MarkerKind};
+use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
@@ -58,8 +66,10 @@ use owlshift_contracts::{Role, Stage};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
+use owlshift_runner::answer_check;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::core_event;
+use owlshift_runner::writer::{ReaskComment, question_block};
 
 use crate::git::{GitEnv, Remote, seed};
 use crate::harness::FakeHarness;
@@ -112,8 +122,9 @@ pub struct Step {
     pub run: Option<Reply>,
     /// A person comments on the ticket.
     pub comment: Option<CommentStep>,
-    /// The answer check's verdict on the open question round.
-    pub answer: Option<Verdict>,
+    /// The answer check runs on the fake harness, with this reply, on the
+    /// open question round.
+    pub answer: Option<Reply>,
     #[serde(default)]
     pub expect: Expect,
 }
@@ -123,13 +134,6 @@ pub struct Step {
 pub struct CommentStep {
     pub author: String,
     pub body: String,
-}
-
-/// The answer check's verdict; only `answered` until P2.
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    Answered,
 }
 
 /// What must hold after a step. A key left out is not checked.
@@ -143,6 +147,8 @@ pub struct Expect {
     /// `none`, `needs_input` or `parked`.
     pub waiting: Option<String>,
     pub round: Option<u32>,
+    /// Re-asks of the current round.
+    pub reasks: Option<u32>,
     pub failed_runs: Option<u32>,
     /// The tracker's visible stage.
     pub tracker_stage: Option<String>,
@@ -156,6 +162,9 @@ pub struct Expect {
     pub branch_files: BTreeMap<String, String>,
     /// The authors' relations in the thread of the last brief, in order.
     pub brief_thread: Option<Vec<Relation>>,
+    /// The question ids of the latest ask in the last brief's thread: the
+    /// ones an answer check gives its verdicts on.
+    pub brief_latest_ask: Option<Vec<String>>,
     /// The gate failure of the step's run: `none`, or a text its command,
     /// reason or output contains.
     pub gate_failure: Option<String>,
@@ -174,6 +183,9 @@ pub struct LastComment {
     /// Texts the body must contain.
     #[serde(default)]
     pub contains: Vec<String>,
+    /// Texts the body must not contain.
+    #[serde(default)]
+    pub lacks: Vec<String>,
 }
 
 /// Why a scenario failed: its name, the step, and what went wrong; for a run
@@ -267,7 +279,7 @@ enum Action<'a> {
     Dispatch,
     Run(&'a Reply),
     Comment(&'a CommentStep),
-    Answer(Verdict),
+    Answer(&'a Reply),
 }
 
 impl Action<'_> {
@@ -289,7 +301,7 @@ impl Step {
         }
         actions.extend(self.run.as_ref().map(Action::Run));
         actions.extend(self.comment.as_ref().map(Action::Comment));
-        actions.extend(self.answer.map(Action::Answer));
+        actions.extend(self.answer.as_ref().map(Action::Answer));
         match <[_; 1]>::try_from(actions) {
             Ok([action]) => Ok(action),
             Err(_) => Err("a step does exactly one of dispatch, run, comment or answer".to_owned()),
@@ -319,6 +331,12 @@ struct Driver {
     state: TicketState,
     now: Timestamp,
     runs: u32,
+    /// The asks the driver posted, oldest first: each round's `questions`
+    /// and each `reask`, in the order of their comments.
+    asks: Vec<ThreadEntry>,
+    /// While questions wait: a decider comment after this time is a new
+    /// answer for the answer check.
+    answers_since: Option<Timestamp>,
     last_brief: Option<Brief>,
     last_run: Option<RunReport>,
 }
@@ -414,6 +432,8 @@ impl Driver {
             state,
             now: scenario.start,
             runs: 0,
+            asks: Vec::new(),
+            answers_since: None,
             last_brief: None,
             last_run: None,
             tmp,
@@ -438,11 +458,7 @@ impl Driver {
                     .map_err(|e| e.to_string())?;
                 Ok(None)
             }
-            Action::Answer(Verdict::Answered) => {
-                self.apply(Event::Answered)?;
-                self.set_stage(&self.states.working.clone())?;
-                Ok(Some(Event::Answered))
-            }
+            Action::Answer(reply) => self.answer(reply).map(Some),
         }
     }
 
@@ -478,6 +494,115 @@ impl Driver {
         let role = stage
             .default_role()
             .ok_or_else(|| format!("no role runs at {}", name(&stage)))?;
+        let report = self.execute(role, reply)?;
+        let (event, result) = core_event(&report.outcome);
+        let result = result.cloned();
+        self.last_run = Some(report);
+
+        self.apply(event)?;
+        if let (Event::Questions, Some(result)) = (event, &result) {
+            let round = NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
+            let body = self.questions_comment(round, result);
+            let at = self.post(&body)?;
+            self.asks.push(ThreadEntry::Questions {
+                round,
+                at,
+                questions: result.questions.clone(),
+            });
+            self.answers_since = Some(at);
+            self.set_stage(&self.states.needs_input.clone())?;
+        }
+        if matches!(event, Event::Completed | Event::Questions) {
+            self.push_if_ahead(&self.worktree())?;
+        }
+        Ok(event)
+    }
+
+    /// Runs the answer check through the executor, on the fake harness,
+    /// once answers arrived, and acts on its one core event: the ticket
+    /// resumes, or the open questions are asked again. A counter-question
+    /// waits for the decider's next comment; its reply is not written yet.
+    fn answer(&mut self, reply: &Reply) -> Result<Event, String> {
+        if !matches!(self.state.status(), Status::NeedsInput { .. }) {
+            return Err(format!(
+                "no answer check runs while the ticket is {:?}",
+                self.state.status()
+            ));
+        }
+        self.require_new_answer()?;
+        let report = self.execute(Role::AnswerCheck, reply)?;
+        let (event, result) = answer_check::event(&report.outcome);
+        let result = result.cloned();
+        self.last_run = Some(report);
+
+        self.apply(event)?;
+        match (event, self.state.status()) {
+            (Event::Answered, _) => self.set_stage(&self.states.working.clone())?,
+            // Still waiting: past the re-ask limit, the core parked it.
+            (Event::Incomplete, Status::NeedsInput { .. }) => {
+                let result = result.ok_or("an incomplete answer comes from a result")?;
+                let brief = self.last_brief.as_ref().ok_or("no brief")?;
+                let open = answer_check::open_questions(brief, &result.verdicts);
+                let round =
+                    NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
+                let questions = open.iter().map(|(question, _)| question.clone()).collect();
+                let body = ReaskComment {
+                    ticket: self.id.clone(),
+                    round,
+                    reask: self.state.reasks(),
+                    open,
+                }
+                .render();
+                let at = self.post(&body)?;
+                self.asks.push(ThreadEntry::Reask {
+                    round,
+                    at,
+                    questions,
+                });
+                self.answers_since = Some(at);
+            }
+            (Event::CounterQuestion, _) => self.answers_since = Some(self.now),
+            _ => {}
+        }
+        Ok(event)
+    }
+
+    /// The answer check runs when answers arrive: a comment of the decider
+    /// after the latest ask, or after the last check that found a
+    /// counter-question. A failed or interrupted check moves nothing, so it
+    /// is retried on the same answers.
+    fn require_new_answer(&self) -> Result<(), String> {
+        let since = self
+            .answers_since
+            .ok_or("no question waits for an answer")?;
+        let decider = self
+            .tracker
+            .ticket(&self.id)
+            .map_err(|e| e.to_string())?
+            .assignee
+            .ok_or("the ticket has no assignee to act as its decider")?;
+        let comments = self.tracker.comments(&self.id).map_err(|e| e.to_string())?;
+        if comments.iter().any(|c| c.author == decider && c.at > since) {
+            Ok(())
+        } else {
+            Err(format!(
+                "no comment from the decider since {since}: the answer check runs once answers arrive"
+            ))
+        }
+    }
+
+    /// Posts a comment of the runner's own at the step's time; returns the
+    /// time the tracker recorded.
+    fn post(&self, body: &str) -> Result<Timestamp, String> {
+        self.tracker
+            .post_comment(&self.id, OWLSHIFT_AUTHOR, self.now, body)
+            .map(|comment| comment.at)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Runs `role` through the executor, on the fake harness, with `reply`;
+    /// keeps the brief, and the failure of the gate the run ended with.
+    fn execute(&mut self, role: Role, reply: &Reply) -> Result<RunReport, String> {
         self.runs += 1;
         let dir = self.tmp.path().join("runs").join(self.runs.to_string());
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -514,26 +639,11 @@ impl Driver {
         if let Some(gate) = &report.gate {
             self.gate_failure = gate.failure.clone();
         }
-        let own_failure = report.exit_code == Some(OWN_FAILURE);
-        let (event, result) = core_event(&report.outcome);
-        let result = result.cloned();
-        self.last_run = Some(report);
-        if own_failure {
+        if report.exit_code == Some(OWN_FAILURE) {
+            self.last_run = Some(report);
             return Err("the fake harness could not do what the reply says".to_owned());
         }
-
-        self.apply(event)?;
-        if let (Event::Questions, Some(result)) = (event, &result) {
-            let body = self.questions_comment(result)?;
-            self.tracker
-                .post_comment(&self.id, OWLSHIFT_AUTHOR, self.now, &body)
-                .map_err(|e| e.to_string())?;
-            self.set_stage(&self.states.needs_input.clone())?;
-        }
-        if matches!(event, Event::Completed | Event::Questions) {
-            self.push_if_ahead(&worktree)?;
-        }
-        Ok(event)
+        Ok(report)
     }
 
     /// The ticket's worktree, beside the main checkout; the executor creates
@@ -558,17 +668,27 @@ impl Driver {
             },
             name,
         };
-        let thread = self
-            .tracker
-            .comments(&self.id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|comment| ThreadEntry::Comment {
-                at: comment.at,
-                author: author(comment.author),
-                body: comment.body,
-            })
-            .collect();
+        // Each ask takes the place of the comment the driver posted it in,
+        // in the tracker's order; every other comment stays one.
+        let mut asks = self.asks.iter();
+        let mut thread = Vec::new();
+        for comment in self.tracker.comments(&self.id).map_err(|e| e.to_string())? {
+            if comment.author == OWLSHIFT_AUTHOR && is_ask(&comment.body) {
+                let ask = asks
+                    .next()
+                    .ok_or_else(|| format!("no ask recorded for the comment at {}", comment.at))?;
+                thread.push(ask.clone());
+            } else {
+                thread.push(ThreadEntry::Comment {
+                    at: comment.at,
+                    author: author(comment.author),
+                    body: comment.body,
+                });
+            }
+        }
+        if asks.next().is_some() {
+            return Err("an ask was recorded without its comment".to_owned());
+        }
         Ok(Brief {
             format: Format,
             role,
@@ -608,24 +728,14 @@ impl Driver {
     }
 
     /// The QUESTIONS comment of the round just opened.
-    fn questions_comment(&self, result: &RunResult) -> Result<String, String> {
-        let round = NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
+    fn questions_comment(&self, round: NonZeroU32, result: &RunResult) -> String {
         let header = Header {
             kind: MarkerKind::Questions,
             round: Some(round),
         };
         let mut body = format!("{}\n\n{}\n", header.render(), result.summary);
         for question in &result.questions {
-            body.push_str(&format!(
-                "\n**{}** ({}) {}\n{}\n",
-                question.id, question.category, question.text, question.context
-            ));
-            if !question.options.is_empty() {
-                body.push_str(&format!("Options: {}\n", question.options.join(" / ")));
-            }
-            if let Some(recommendation) = &question.recommendation {
-                body.push_str(&format!("Recommendation: {recommendation}\n"));
-            }
+            body.push_str(&format!("\n{}\n", question_block(question)));
         }
         let footer = Footer {
             format: Format,
@@ -635,7 +745,7 @@ impl Driver {
             run: None,
         };
         body.push_str(&format!("\n{}\n", footer.render()));
-        Ok(body)
+        body
     }
 
     fn push_if_ahead(&self, worktree: &Path) -> Result<(), String> {
@@ -671,6 +781,9 @@ impl Driver {
         if let Some(expected) = expect.round {
             same("round", expected, self.state.round())?;
         }
+        if let Some(expected) = expect.reasks {
+            same("reasks", expected, self.state.reasks())?;
+        }
         if let Some(expected) = expect.failed_runs {
             same("failed_runs", expected, self.state.failed_runs())?;
         }
@@ -698,6 +811,14 @@ impl Driver {
                     if !comment.body.contains(text.as_str()) {
                         return Err(format!(
                             "expected last_comment to contain {text:?}, found {:?}",
+                            comment.body
+                        ));
+                    }
+                }
+                for text in &last.lacks {
+                    if comment.body.contains(text.as_str()) {
+                        return Err(format!(
+                            "expected last_comment not to contain {text:?}, found {:?}",
                             comment.body
                         ));
                     }
@@ -744,6 +865,21 @@ impl Driver {
                 })
                 .collect();
             same("brief_thread", names(expected), names(&found))?;
+        }
+        if let Some(expected) = &expect.brief_latest_ask {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            let found: Vec<&str> = brief
+                .latest_ask()
+                .map(|(_, questions)| questions.iter().map(|q| q.id.as_str()).collect())
+                .unwrap_or_default();
+            same(
+                "brief_latest_ask",
+                format!("{expected:?}"),
+                format!("{found:?}"),
+            )?;
         }
         if let Some(expected) = &expect.gate_failure {
             let found = self
@@ -798,6 +934,15 @@ impl Driver {
             )
         })
     }
+}
+
+/// Whether a comment is a QUESTIONS or a RE-ASK comment.
+fn is_ask(body: &str) -> bool {
+    matches!(
+        MarkedComment::parse(body),
+        Ok(Some(MarkedComment { header, .. }))
+            if matches!(header.kind, MarkerKind::Questions | MarkerKind::ReAsk)
+    )
 }
 
 /// Checks a gate failure against `none` or a text it contains.

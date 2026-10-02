@@ -1,0 +1,8 @@
+{
+  "format": 2,
+  "status": "done",
+  "summary": "The decider asked what a sign-off means instead of answering.",
+  "verdicts": [
+    { "question": "Q2", "class": "counter_question", "reason": "The decider asks what a sign-off means." }
+  ]
+}

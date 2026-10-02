@@ -54,6 +54,44 @@ fn smoke_confined() {
     }
 }
 
+/// OWL-116's acceptance, the P2 exit gate in small: an incomplete answer is
+/// re-asked, the open question alone, over two question rounds.
+#[test]
+fn reask() {
+    if let Err(error) = play(&scenarios().join("reask.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
+/// The answer check runs once answers arrive: with no comment from the
+/// decider since the questions, an `answer` step is refused before any run.
+#[test]
+fn an_answer_check_waits_for_an_answer() {
+    let early = r#"
+        description = "The answer check is asked for before the decider replied."
+        ticket = "DEMO-3"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { result = "results/questions-round1.json" }
+
+        [[step]]
+        comment = { author = "reporter", body = "Q1: French, surely.\n" }
+
+        [[step]]
+        answer = { result = "results/check-round1-q2-partial.json" }
+    "#;
+    let error = play_str("early", early, &scenarios().join("reask"), fake_harness()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "early, step 4 (answer): no comment from the decider since 2026-09-28T09:02:00Z: the \
+         answer check runs once answers arrive"
+    );
+}
+
 /// OWL-16's acceptance: the gate fails first and passes after a fix run.
 #[test]
 fn gate() {
