@@ -238,4 +238,80 @@ mod tests {
         let folder = hooks.strip_prefix("core.hooksPath=").unwrap();
         assert!(fs::symlink_metadata(folder).is_err(), "{folder} exists");
     }
+
+    /// OWL-130: git started for the agent, outside the sandbox, runs no
+    /// shell start-up file, on the CI's Linux and macOS legs alike. `ENV`, which
+    /// a project may declare, is read by interactive shells only; `BASH_ENV`,
+    /// which bash reads in a script, is refused as a declaration and dropped
+    /// from the runner's environment (`owlshift_core::agent_env`).
+    #[cfg(unix)]
+    #[test]
+    fn git_started_for_the_agent_runs_no_shell_start_up_file() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mark = dir.join("start-up file ran");
+        let startup = dir.join("startup.sh");
+        fs::write(&startup, format!(": > '{}'\n", mark.display())).unwrap();
+        // Git found on the agent's `PATH` can be a wrapper script (an asdf or
+        // pyenv shim, Nix's `makeWrapper`).
+        let wrapper = |name: &str, shebang: &str| {
+            let path = dir.join(name);
+            fs::write(&path, format!("#!{shebang}\nexec git \"$@\"\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let sh_wrapper = wrapper("git-sh", "/bin/sh");
+        let bash_wrapper = wrapper("git-bash", "/usr/bin/env bash");
+
+        let mut parent: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| name == "PATH" || name == "HOME")
+            .collect();
+        parent.push(("ENV".into(), startup.clone().into()));
+        parent.push(("BASH_ENV".into(), startup.clone().into()));
+        let agent = AgentEnv::for_project(parent, &["ENV"], &["ENV"])
+            .unwrap()
+            .without_confinement();
+        assert!(agent.var("ENV").is_some());
+        assert_eq!(agent.var("BASH_ENV"), None);
+
+        for program in [&sh_wrapper, &bash_wrapper] {
+            // The `&&` makes git start the alias through `sh -c`.
+            let alias_ran = dir.join("alias ran");
+            let alias = format!("alias.probe=!: > '{}' && true", alias_ran.display());
+            Git::new(program)
+                .as_agent(&agent)
+                .run(dir, &["-c", alias.as_str(), "probe"])
+                .unwrap();
+            assert!(alias_ran.exists(), "{program:?}: the alias did not run");
+            assert!(!mark.exists(), "{program:?} ran the start-up file");
+            fs::remove_file(&alias_ran).unwrap();
+        }
+
+        // Controls, so that the absence of the mark above means something:
+        // bash runs `BASH_ENV`'s file in a script, and this system's `sh`
+        // reads `ENV`'s when interactive.
+        let control = |program: &Path, args: &[&str], variable: &str| {
+            let status = Command::new(program)
+                .args(args)
+                .env_clear()
+                .env("PATH", agent.var("PATH").unwrap())
+                .env(variable, &startup)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{program:?} {args:?}: {status}");
+            let ran = mark.exists();
+            if ran {
+                fs::remove_file(&mark).unwrap();
+            }
+            ran
+        };
+        assert!(control(&bash_wrapper, &["--version"], "BASH_ENV"));
+        assert!(control(Path::new("/bin/sh"), &["-i", "-c", "true"], "ENV"));
+    }
 }

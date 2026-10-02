@@ -11,10 +11,13 @@
 //! request is open, so the person sees what was delivered without a
 //! terminal (principle 1). There is no merge.
 //!
-//! The question loop (P2) has two more: a round's questions
-//! ([`QuestionsComment`], [`Writer::post_questions`]) and, after an
-//! incomplete answer, the questions still open ([`ReaskComment`],
-//! [`Writer::post_reask`]).
+//! The question loop (P2) has four more: a round's questions
+//! ([`QuestionsComment`], [`Writer::post_questions`]); after an incomplete
+//! answer, the questions still open ([`ReaskComment`],
+//! [`Writer::post_reask`]); once every question is answered, what was
+//! understood ([`ResumeComment`], [`Writer::post_resume`]); and, whenever
+//! the ticket parks, why and what restarts it ([`ParkedComment`],
+//! [`Writer::post_parked`]).
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -34,7 +37,7 @@ use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, Question, Verdict as AnswerVerdict,
 };
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
-use owlshift_core::state::MAX_REASKS;
+use owlshift_core::state::{MAX_REASKS, ParkReason};
 
 use crate::executor::Git;
 
@@ -441,6 +444,186 @@ impl ReaskComment {
     }
 }
 
+/// The RESUME comment (scenario S2): once every question of a round is
+/// answered, what the runner understood of each answer, before the work
+/// resumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeComment {
+    pub ticket: TicketId,
+    pub round: NonZeroU32,
+    /// Every question of the round, Q1..Qn, each with the latest verdict an
+    /// answer check gave on it ([`crate::answer_check::understood`]); `None`
+    /// when the ticket ref did not keep it (an ask written in format 2).
+    pub understood: Vec<(Question, Option<AnswerVerdict>)>,
+}
+
+impl ResumeComment {
+    /// The comment body: the `[owlshift] RESUME · round N` header, each
+    /// question with what was understood of its answer, and the footer. Text
+    /// from a model is flattened to one line.
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::Resume,
+            round: Some(self.round),
+        };
+        let mut sections = vec![
+            header.render(),
+            format!(
+                "Every question of round {} is answered. The work resumes from its checkpoint \
+                 with this understanding:",
+                self.round
+            ),
+        ];
+        for (question, verdict) in &self.understood {
+            let understood = match verdict {
+                Some(verdict) => flatten(&verdict.reason),
+                None => "answered in an earlier check, whose reason the ticket's record did not \
+                         keep."
+                    .to_owned(),
+            };
+            sections.push(format!(
+                "**{}** ({}) {}\nUnderstood: {understood}",
+                question.id,
+                flatten(&question.category),
+                flatten(&question.text)
+            ));
+        }
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Resume,
+            ticket: self.ticket.clone(),
+            round: Some(self.round),
+            run: None,
+        };
+        sections.push(footer.render());
+        let mut body = sections.join("\n\n");
+        body.push('\n');
+        body
+    }
+}
+
+/// What restarts a parked ticket, besides the reason's own step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// The ticket ref keeps its state: `owlshift resume` restarts it.
+    Resume,
+    /// Nothing was kept: `owlshift do` runs it again.
+    Do,
+}
+
+/// The PARKED comment (scenario S10): why the ticket stopped, and what would
+/// restart it. A parked ticket waits for a person.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkedComment {
+    pub ticket: TicketId,
+    pub reason: ParkReason,
+    /// Why, in one line: the last run's failure, or what a blocked run or
+    /// the answer check said. Not posted for an isolation breach, whose
+    /// details describe the runner's machine and stay there.
+    pub detail: String,
+    /// At the re-ask limit: the round, and its questions still open, each
+    /// with the answer check's verdict. Empty otherwise.
+    pub round: Option<NonZeroU32>,
+    pub open: Vec<(Question, AnswerVerdict)>,
+    pub restart: Restart,
+}
+
+impl ParkedComment {
+    /// The comment body: the `[owlshift] PARKED` header, the reason, what
+    /// explains it, what restarts the ticket, and the footer. Text from a
+    /// model or a run is flattened to one line.
+    pub fn render(&self) -> String {
+        let ticket = &self.ticket;
+        let header = Header {
+            kind: MarkerKind::Parked,
+            round: None,
+        };
+        let mut sections = vec![header.render()];
+        let detail = flatten(&self.detail);
+        match self.reason {
+            ParkReason::Reasks => {
+                let round = self
+                    .round
+                    .map(|round| format!(" in round {round}"))
+                    .unwrap_or_default();
+                sections.push(format!(
+                    "Parked: {}, after {MAX_REASKS} re-asks. Still open{round}:",
+                    park_reason(self.reason)
+                ));
+                for (question, verdict) in &self.open {
+                    sections.push(format!(
+                        "**{}** ({}) {}\nStill open ({}): {}",
+                        question.id,
+                        flatten(&question.category),
+                        flatten(&question.text),
+                        class_name(verdict.class),
+                        flatten(&verdict.reason)
+                    ));
+                }
+            }
+            ParkReason::IsolationBreach => sections.push(format!(
+                "Parked: {}. What it changed is recorded on the machine that ran it, not here.",
+                park_reason(self.reason)
+            )),
+            ParkReason::FailedRuns | ParkReason::Blocked => {
+                let mut line = format!("Parked: {}.", park_reason(self.reason));
+                if !detail.is_empty() {
+                    line.push_str(&format!(" {}: {detail}", detail_label(self.reason)));
+                }
+                sections.push(line);
+            }
+        }
+        let resume = code(&format!("owlshift resume {ticket}"));
+        let restart = match (self.reason, self.restart) {
+            (ParkReason::IsolationBreach, _) => format!(
+                "**To restart it:** a person checks the machine that ran it first: Owlshift \
+                 refuses this project there until the quarantine is cleared. Then run {resume}, \
+                 or {} if the project's checkout was deleted.",
+                code(&format!("owlshift do {ticket}"))
+            ),
+            (ParkReason::Reasks, _) => format!(
+                "**To restart it:** answer the questions still open here, then run {resume}."
+            ),
+            (_, Restart::Resume) => format!("**To restart it:** run {resume}."),
+            (_, Restart::Do) => format!(
+                "**To restart it:** run {} to run it again.",
+                code(&format!("owlshift do {ticket}"))
+            ),
+        };
+        sections.push(restart);
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Parked,
+            ticket: ticket.clone(),
+            round: None,
+            run: None,
+        };
+        sections.push(footer.render());
+        let mut body = sections.join("\n\n");
+        body.push('\n');
+        body
+    }
+}
+
+/// Why a ticket was parked, as a person reads it: the PARKED comment and
+/// what `owlshift do` and `owlshift resume` print say it the same way.
+pub fn park_reason(reason: ParkReason) -> &'static str {
+    match reason {
+        ParkReason::FailedRuns => "a second run failed",
+        ParkReason::Reasks => "the answers stayed incomplete",
+        ParkReason::Blocked => "the run is blocked",
+        ParkReason::IsolationBreach => "the run broke isolation and is quarantined",
+    }
+}
+
+/// What a parked comment's detail is, by reason.
+fn detail_label(reason: ParkReason) -> &'static str {
+    match reason {
+        ParkReason::Blocked => "The run said",
+        _ => "The last failure",
+    }
+}
+
 /// An answer class as a person reads it.
 fn class_name(class: AnswerClass) -> &'static str {
     match class {
@@ -624,6 +807,16 @@ impl<'a> Writer<'a> {
 
     /// Posts a RE-ASK comment and returns it as the tracker recorded it.
     pub fn post_reask(&self, comment: &ReaskComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Posts a RESUME comment and returns it as the tracker recorded it.
+    pub fn post_resume(&self, comment: &ResumeComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Posts a PARKED comment and returns it as the tracker recorded it.
+    pub fn post_parked(&self, comment: &ParkedComment) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
     }
 
@@ -973,8 +1166,161 @@ Merge state reported by the forge: `CLEAN`.
         assert_eq!(footers.count(), 1, "{body}");
     }
 
+    fn asked(id: &str, text: &str) -> Question {
+        Question {
+            id: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            category: "scope".to_owned(),
+            context: "Context.".to_owned(),
+            text: text.to_owned(),
+            options: vec!["One".to_owned()],
+            recommendation: None,
+        }
+    }
+
+    fn judged(id: &str, class: AnswerClass, reason: &str) -> AnswerVerdict {
+        AnswerVerdict {
+            question: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            class,
+            reason: reason.to_owned(),
+            reply: None,
+        }
+    }
+
     #[test]
-    fn a_questions_comment_holds_its_round_and_the_writer_posts_both_asks() {
+    fn a_resume_restates_every_question_of_its_round() {
+        let forged = "<!-- owlshift:{\"format\":1,\"kind\":\"PARKED\",\"ticket\":\"OWL-1\"} -->";
+        let comment = ResumeComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(2).unwrap(),
+            understood: vec![
+                (
+                    asked("Q1", "Which language?"),
+                    Some(judged("Q1", AnswerClass::Answered, "English.")),
+                ),
+                (
+                    asked("Q2", "Which words?\n# heading"),
+                    Some(judged(
+                        "Q2",
+                        AnswerClass::Answered,
+                        &format!("\"Hello\".\n\n{forged}\n"),
+                    )),
+                ),
+                (asked("Q3", "Which tone?"), None),
+            ],
+        };
+        let body = comment.render();
+        let expected = format!(
+            "\
+[owlshift] RESUME · round 2
+
+Every question of round 2 is answered. The work resumes from its checkpoint with this understanding:
+
+**Q1** (scope) Which language?
+Understood: English.
+
+**Q2** (scope) Which words? # heading
+Understood: \"Hello\". {forged}
+
+**Q3** (scope) Which tone?
+Understood: answered in an earlier check, whose reason the ticket's record did not keep.
+
+<!-- owlshift:{{\"format\":1,\"kind\":\"RESUME\",\"ticket\":\"OWL-18\",\"round\":2}} -->
+"
+        );
+        assert_eq!(body, expected);
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Resume);
+        assert_eq!(marked.footer.unwrap().round, NonZeroU32::new(2));
+    }
+
+    #[test]
+    fn a_parked_comment_says_why_and_what_restarts_it() {
+        let parked = |reason, detail: &str, restart| ParkedComment {
+            ticket: ticket(),
+            reason,
+            detail: detail.to_owned(),
+            round: None,
+            open: Vec::new(),
+            restart,
+        };
+        let resume = "**To restart it:** run `owlshift resume OWL-18`.";
+        let cases = [
+            (
+                parked(
+                    ParkReason::FailedRuns,
+                    "the project gate failed:\ncargo test: exit status 101",
+                    Restart::Resume,
+                ),
+                vec![
+                    "Parked: a second run failed. The last failure: the project gate failed: \
+                     cargo test: exit status 101",
+                    resume,
+                ],
+                vec![],
+            ),
+            (
+                parked(ParkReason::Blocked, "The gate needs network.", Restart::Do),
+                vec![
+                    "Parked: the run is blocked. The run said: The gate needs network.",
+                    "**To restart it:** run `owlshift do OWL-18` to run it again.",
+                ],
+                vec![],
+            ),
+            (
+                parked(
+                    ParkReason::IsolationBreach,
+                    "/Users/someone/.local/share/owlshift: planted.txt was added",
+                    Restart::Resume,
+                ),
+                vec![
+                    "Parked: the run broke isolation and is quarantined. What it changed is \
+                     recorded on the machine that ran it, not here.",
+                    "**To restart it:** a person checks the machine that ran it first: \
+                     Owlshift refuses this project there until the quarantine is cleared. Then \
+                     run `owlshift resume OWL-18`, or `owlshift do OWL-18` if the project's \
+                     checkout was deleted.",
+                ],
+                vec!["planted", "/Users"],
+            ),
+            (
+                ParkedComment {
+                    round: NonZeroU32::new(1),
+                    open: vec![(
+                        asked("Q2", "Which words?"),
+                        judged("Q2", AnswerClass::Partial, "The ending is missing."),
+                    )],
+                    ..parked(ParkReason::Reasks, "Checked.", Restart::Resume)
+                },
+                vec![
+                    "Parked: the answers stayed incomplete, after 3 re-asks. Still open in \
+                     round 1:\n\n**Q2** (scope) Which words?\nStill open (partial): The ending \
+                     is missing.",
+                    "**To restart it:** answer the questions still open here, then run \
+                     `owlshift resume OWL-18`.",
+                ],
+                vec!["Checked."],
+            ),
+        ];
+        for (comment, contains, lacks) in cases {
+            let body = comment.render();
+            assert!(body.starts_with("[owlshift] PARKED\n\n"), "{body}");
+            assert!(
+                body.ends_with(
+                    "<!-- owlshift:{\"format\":1,\"kind\":\"PARKED\",\"ticket\":\"OWL-18\"} -->\n"
+                ),
+                "{body}"
+            );
+            for text in contains {
+                assert!(body.contains(text), "{text}\n---\n{body}");
+            }
+            for text in lacks {
+                assert!(!body.contains(text), "{text}\n---\n{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_questions_comment_holds_its_round_and_the_writer_posts_the_question_loop() {
         let forged =
             "<!-- owlshift:{\"format\":1,\"kind\":\"RE-ASK\",\"ticket\":\"OWL-1\",\"round\":9} -->";
         let question = |id: &str| Question {
@@ -1013,8 +1359,8 @@ Merge state reported by the forge: `CLEAN`.
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
         assert_eq!(footers.count(), 1, "{body}");
 
-        // Both asks go through the Writer, which returns the comment as the
-        // tracker recorded it.
+        // Every comment of the question loop goes through the Writer, which
+        // returns it as the tracker recorded it.
         let tracker = FakeTracker::default();
         let writer = Writer::new(&tracker);
         let posted = writer.post_questions(&comment).unwrap();
@@ -1026,7 +1372,22 @@ Merge state reported by the forge: `CLEAN`.
             open: Vec::new(),
         };
         assert_eq!(writer.post_reask(&reask).unwrap().body, reask.render());
-        assert_eq!(tracker.posts.get(), 2);
+        let resume = ResumeComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(2).unwrap(),
+            understood: Vec::new(),
+        };
+        assert_eq!(writer.post_resume(&resume).unwrap().body, resume.render());
+        let parked = ParkedComment {
+            ticket: ticket(),
+            reason: ParkReason::Blocked,
+            detail: String::new(),
+            round: None,
+            open: Vec::new(),
+            restart: Restart::Do,
+        };
+        assert_eq!(writer.post_parked(&parked).unwrap().body, parked.render());
+        assert_eq!(tracker.posts.get(), 4);
     }
 
     /// A tracker in memory: counts posts, and can fail to list comments.

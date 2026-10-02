@@ -20,7 +20,7 @@ use crate::format::{
     self, CLAIM_FORMAT, ContractError, Format, QUESTIONS_FORMAT, TICKET_STATE_FORMAT,
 };
 use crate::ids::TicketId;
-use crate::result::Question;
+use crate::result::{Question, Verdict, check_verdicts};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -221,6 +221,12 @@ pub struct Ask {
     /// Who answers it: resolved when the round was asked, and its decider
     /// for good (architecture section 4); a re-ask keeps its round's.
     pub decider: AskDecider,
+    /// The verdicts of the latest answer check that gave verdicts on this
+    /// ask, one per question it named, in question order (format 3): what a
+    /// RESUME comment restates once the round is answered. Empty until a
+    /// check gives them, and on an ask read from format 2.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verdicts: Vec<Verdict>,
 }
 
 /// The decider of an ask.
@@ -275,10 +281,40 @@ impl TicketQuestions {
         }
     }
 
+    /// Parses `questions.json`. A format-2 document, written before the
+    /// asks kept their verdicts (OWL-123), is read as format 3 with no
+    /// verdict, and the next write gives it format 3.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let questions: Self = format::parse_json(Self::CONTRACT, QUESTIONS_FORMAT, input)?;
+        let questions: Self = match Self::from_format_2(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, QUESTIONS_FORMAT, input)?,
+        };
         questions.validate()?;
         Ok(questions)
+    }
+
+    /// A format-2 document read as format 3, or `None` for any other.
+    fn from_format_2(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        if document.get("format").and_then(serde_json::Value::as_u64) != Some(2) {
+            return None;
+        }
+        let with_verdicts = document["asks"]
+            .as_array()
+            .is_some_and(|asks| asks.iter().any(|ask| ask.get("verdicts").is_some()));
+        if with_verdicts {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "format 2 keeps no verdicts",
+            )));
+        }
+        document["format"] = QUESTIONS_FORMAT.into();
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {
@@ -286,9 +322,10 @@ impl TicketQuestions {
     }
 
     /// Checks the rules the types alone do not carry: each ask names its
-    /// comment and its decider's account, and the asks follow a brief
-    /// thread's rules (rounds increase, a round's questions are Q1..Qn, a
-    /// re-ask names questions of an earlier round, in order).
+    /// comment and its decider's account, its verdicts keep the rules of
+    /// `result.json`'s and name questions of that ask, and the asks follow a
+    /// brief thread's rules (rounds increase, a round's questions are
+    /// Q1..Qn, a re-ask names questions of an earlier round, in order).
     pub fn validate(&self) -> Result<(), ContractError> {
         for ask in &self.asks {
             let missing = if ask.comment.trim().is_empty() {
@@ -304,7 +341,24 @@ impl TicketQuestions {
             ));
         }
         let entries: Vec<ThreadEntry> = self.asks.iter().map(Ask::entry).collect();
-        validate_thread(Self::CONTRACT, &entries)
+        validate_thread(Self::CONTRACT, &entries)?;
+        for ask in &self.asks {
+            check_verdicts(Self::CONTRACT, &ask.verdicts)?;
+            if let Some(verdict) = ask
+                .verdicts
+                .iter()
+                .find(|v| !ask.questions.iter().any(|q| q.id == v.question))
+            {
+                return Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!(
+                        "an ask of round {} keeps a verdict for {}, which it did not ask",
+                        ask.round, verdict.question
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The latest ask, if any.

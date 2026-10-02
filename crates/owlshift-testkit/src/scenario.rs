@@ -28,19 +28,23 @@
 //! arrived: a decider comment newer than the latest ask, or than the last
 //! check that found a counter-question. A failed or interrupted check is
 //! retried on the same answers. Its outcome maps onto one core event
-//! (`owlshift_runner::answer_check::event`): an answer settles the round
-//! and the ticket resumes; an incomplete one posts a RE-ASK comment with
-//! only the open questions (`owlshift_runner::writer::ReaskComment`); a
-//! counter-question changes nothing yet. Each ask the driver posts, a
-//! round's questions or a re-ask, is kept in memory and takes the place of
-//! its comment in every brief's thread, as a `questions` or `reask` entry.
-//! What it leaves out on purpose:
+//! (`owlshift_runner::answer_check::event`): an answer settles the round,
+//! a RESUME comment restates what was understood of each of its questions
+//! (`owlshift_runner::writer::ResumeComment`) and the ticket resumes; an
+//! incomplete one posts a RE-ASK comment with only the open questions
+//! (`owlshift_runner::writer::ReaskComment`); a counter-question changes
+//! nothing yet. Each ask the driver posts, a round's questions or a re-ask,
+//! is kept in memory with the verdicts of the latest check on it, and takes
+//! the place of its comment in every brief's thread, as a `questions` or
+//! `reask` entry. Whenever the core parks the ticket, after a run or an
+//! answer check, the driver posts a PARKED comment
+//! (`owlshift_runner::writer::ParkedComment`). What it leaves out on purpose:
 //!
 //! - no intake, admission, claim or ticket ref; the pipeline is the project's
 //!   default variant, and the asks live in memory, not in the ticket ref;
 //! - a stage run's outcome maps onto the core event as `owlshift do` maps it
-//!   (`owlshift_runner::on_demand::core_event`), and no PARKED, RESUME,
-//!   REPLY or DELIVERY comment is written.
+//!   (`owlshift_runner::on_demand::core_event`), and no REPLY or DELIVERY
+//!   comment is written.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -61,16 +65,18 @@ use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::result::Status as ResultStatus;
+use owlshift_contracts::result::{Question, Status as ResultStatus, Verdict};
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::decider::brief_zones;
 use owlshift_core::pipeline::Pipeline;
-use owlshift_core::state::{Event, Status, TicketState, Transition};
+use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::core_event;
-use owlshift_runner::writer::{QuestionsComment, ReaskComment};
+use owlshift_runner::writer::{
+    ParkedComment, QuestionsComment, ReaskComment, Restart, ResumeComment,
+};
 
 use crate::git::{GitEnv, Remote, seed};
 use crate::harness::FakeHarness;
@@ -335,6 +341,9 @@ struct Driver {
     /// The asks the driver posted, oldest first: each round's `questions`
     /// and each `reask`, in the order of their comments.
     asks: Vec<ThreadEntry>,
+    /// The verdicts of the latest answer check on each ask, in the order of
+    /// `asks`: what a RESUME restates.
+    verdicts: Vec<Vec<Verdict>>,
     /// While questions wait: a decider comment after this time is a new
     /// answer for the answer check.
     answers_since: Option<Timestamp>,
@@ -434,6 +443,7 @@ impl Driver {
             now: scenario.start,
             runs: 0,
             asks: Vec::new(),
+            verdicts: Vec::new(),
             answers_since: None,
             last_brief: None,
             last_run: None,
@@ -463,18 +473,52 @@ impl Driver {
         }
     }
 
-    fn apply(&mut self, event: Event) -> Result<(), String> {
-        self.state = match self
+    /// Applies `event` to the core state; returns why the ticket parked,
+    /// when it did.
+    fn apply(&mut self, event: Event) -> Result<Option<ParkReason>, String> {
+        let (state, parked) = match self
             .state
             .apply(self.pipeline, event)
             .map_err(|e| e.to_string())?
         {
-            Transition::To(state) | Transition::Parked { state, .. } => state,
+            Transition::To(state) => (state, None),
+            Transition::Parked { state, reason } => (state, Some(reason)),
             Transition::Finished(finish) => {
                 return Err(format!("the ticket left the machine ({finish:?})"));
             }
         };
-        Ok(())
+        self.state = state;
+        Ok(parked)
+    }
+
+    /// Posts the PARKED comment of a park, after `report`'s run. A ticket
+    /// that asked questions would have a ticket ref, so `resume` restarts
+    /// it; one that never asked runs again with `do`.
+    fn post_parked(
+        &self,
+        reason: ParkReason,
+        report: &RunReport,
+        open: Vec<(Question, Verdict)>,
+    ) -> Result<(), String> {
+        let detail = match &report.outcome {
+            Outcome::Failed(failure) => failure.to_string(),
+            Outcome::Finished { result, .. } => result.summary.clone(),
+            Outcome::Quarantined(_) | Outcome::UsageLimit { .. } => String::new(),
+        };
+        let body = ParkedComment {
+            ticket: self.id.clone(),
+            reason,
+            detail,
+            round: NonZeroU32::new(self.state.round()).filter(|_| reason == ParkReason::Reasks),
+            open,
+            restart: if self.asks.is_empty() {
+                Restart::Do
+            } else {
+                Restart::Resume
+            },
+        }
+        .render();
+        self.post(&body).map(|_| ())
     }
 
     fn set_stage(&self, stage: &str) -> Result<(), String> {
@@ -498,9 +542,11 @@ impl Driver {
         let report = self.execute(role, reply)?;
         let (event, result) = core_event(&report.outcome);
         let result = result.cloned();
+        let parked = self.apply(event)?;
+        if let Some(reason) = parked {
+            self.post_parked(reason, &report, Vec::new())?;
+        }
         self.last_run = Some(report);
-
-        self.apply(event)?;
         if let (Event::Questions, Some(result)) = (event, &result) {
             let round = NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
             let body = QuestionsComment {
@@ -517,6 +563,7 @@ impl Driver {
                 at,
                 questions: result.questions.clone(),
             });
+            self.verdicts.push(Vec::new());
             self.answers_since = Some(at);
             self.set_stage(&self.states.needs_input.clone())?;
         }
@@ -541,11 +588,54 @@ impl Driver {
         let report = self.execute(Role::AnswerCheck, reply)?;
         let (event, result) = answer_check::event(&report.outcome);
         let result = result.cloned();
-        self.last_run = Some(report);
+        // A check with verdicts keeps them with the ask they judge.
+        if let (Event::Answered | Event::Incomplete | Event::CounterQuestion, Some(result)) =
+            (event, &result)
+            && let Some(kept) = self.verdicts.last_mut()
+        {
+            kept.clone_from(&result.verdicts);
+        }
 
-        self.apply(event)?;
+        let parked = self.apply(event)?;
+        if let Some(reason) = parked {
+            let open = match (reason, &result, &self.last_brief) {
+                (ParkReason::Reasks, Some(result), Some(brief)) => {
+                    answer_check::open_questions(brief, &result.verdicts)
+                }
+                _ => Vec::new(),
+            };
+            self.post_parked(reason, &report, open)?;
+        }
+        self.last_run = Some(report);
         match (event, self.state.status()) {
-            (Event::Answered, _) => self.set_stage(&self.states.working.clone())?,
+            (Event::Answered, _) => {
+                let round =
+                    NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
+                let understood =
+                    answer_check::understood(self.asks.iter().zip(&self.verdicts).filter_map(
+                        |(ask, verdicts)| match ask {
+                            ThreadEntry::Questions {
+                                round: asked,
+                                questions,
+                                ..
+                            }
+                            | ThreadEntry::Reask {
+                                round: asked,
+                                questions,
+                                ..
+                            } if *asked == round => Some((&questions[..], &verdicts[..])),
+                            _ => None,
+                        },
+                    ));
+                let body = ResumeComment {
+                    ticket: self.id.clone(),
+                    round,
+                    understood,
+                }
+                .render();
+                self.post(&body)?;
+                self.set_stage(&self.states.working.clone())?;
+            }
             // Still waiting: past the re-ask limit, the core parked it.
             (Event::Incomplete, Status::NeedsInput { .. }) => {
                 let result = result.ok_or("an incomplete answer comes from a result")?;
@@ -567,6 +657,7 @@ impl Driver {
                     at,
                     questions,
                 });
+                self.verdicts.push(Vec::new());
                 self.answers_since = Some(at);
             }
             (Event::CounterQuestion, _) => self.answers_since = Some(self.now),

@@ -23,7 +23,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     }
   },
   "additionalProperties": false,
@@ -31,6 +31,31 @@
     "format"
   ],
   "$defs": {
+    "AnswerClass": {
+      "description": "How the decider's answers left one question.",
+      "oneOf": [
+        {
+          "description": "The answers settle the question.",
+          "type": "string",
+          "const": "answered"
+        },
+        {
+          "description": "The answers settle part of the question; the rest is missing.",
+          "type": "string",
+          "const": "partial"
+        },
+        {
+          "description": "No answer from the decider addresses the question.",
+          "type": "string",
+          "const": "unanswered"
+        },
+        {
+          "description": "The decider answered with a question of their own.",
+          "type": "string",
+          "const": "counter_question"
+        }
+      ]
+    },
     "Ask": {
       "description": "One ask: a round's questions, or the questions of a round asked again.",
       "type": "object",
@@ -64,6 +89,13 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 1
+        },
+        "verdicts": {
+          "description": "The verdicts of the latest answer check that gave verdicts on this\nask, one per question it named, in question order (format 3): what a\nRESUME comment restates once the round is answered. Empty until a\ncheck gives them, and on an ask read from format 2.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Verdict"
+          }
         }
       },
       "additionalProperties": false,
@@ -170,6 +202,56 @@
       "description": "A question's identifier within a round: Q1, Q2, and so on.",
       "type": "string",
       "pattern": "^Q[1-9][0-9]*$"
+    },
+    "Verdict": {
+      "description": "The answer check's verdict on one question: how the decider's answers\nleft it.",
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/AnswerClass"
+        },
+        "question": {
+          "$ref": "#/$defs/QuestionId"
+        },
+        "reason": {
+          "description": "Why, from the answers: what settled the question, or what is still\nmissing. Not empty and not only whitespace.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "reply": {
+          "description": "The answer to the decider's counter-question, which the runner posts\nin the thread as written. Required with `class: counter_question`,\nrefused with any other class; not empty and not only whitespace.",
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "else": {
+        "not": {
+          "required": [
+            "reply"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "class": {
+            "const": "counter_question"
+          }
+        },
+        "required": [
+          "class"
+        ]
+      },
+      "required": [
+        "question",
+        "class",
+        "reason"
+      ],
+      "then": {
+        "required": [
+          "reply"
+        ]
+      }
     }
   }
 }
