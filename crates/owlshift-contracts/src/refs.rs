@@ -9,6 +9,7 @@
 use std::num::NonZeroU32;
 
 use jiff::Timestamp;
+use owlshift_core::decider::DeciderRule;
 use owlshift_core::state::{Status, TicketState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -185,7 +186,8 @@ impl TryFrom<&PersistedState> for TicketState {
 
 /// The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each
 /// ask with the comment that posted it, so a brief's thread shows the ask in
-/// that comment's place, and what the last answer check read.
+/// that comment's place, and its decider, and what the last answer check
+/// read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift ticket questions")]
@@ -216,6 +218,20 @@ pub struct Ask {
     /// The questions, under their ids in the round.
     #[schemars(length(min = 1))]
     pub questions: Vec<Question>,
+    /// Who answers it: resolved when the round was asked, and its decider
+    /// for good (architecture section 4); a re-ask keeps its round's.
+    pub decider: AskDecider,
+}
+
+/// The decider of an ask.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AskDecider {
+    /// The tracker account's identifier, compared as written.
+    #[schemars(regex(pattern = r"\S"))]
+    pub account: String,
+    /// The rule that made them the decider.
+    pub by: DeciderRule,
 }
 
 /// What an ask is.
@@ -270,14 +286,21 @@ impl TicketQuestions {
     }
 
     /// Checks the rules the types alone do not carry: each ask names its
-    /// comment, and the asks follow a brief thread's rules (rounds increase,
-    /// a round's questions are Q1..Qn, a re-ask names questions of an earlier
-    /// round, in order).
+    /// comment and its decider's account, and the asks follow a brief
+    /// thread's rules (rounds increase, a round's questions are Q1..Qn, a
+    /// re-ask names questions of an earlier round, in order).
     pub fn validate(&self) -> Result<(), ContractError> {
-        if let Some(ask) = self.asks.iter().find(|ask| ask.comment.trim().is_empty()) {
+        for ask in &self.asks {
+            let missing = if ask.comment.trim().is_empty() {
+                "comment"
+            } else if ask.decider.account.trim().is_empty() {
+                "decider"
+            } else {
+                continue;
+            };
             return Err(ContractError::invalid(
                 Self::CONTRACT,
-                format!("an ask of round {} names no comment", ask.round),
+                format!("an ask of round {} names no {missing}", ask.round),
             ));
         }
         let entries: Vec<ThreadEntry> = self.asks.iter().map(Ask::entry).collect();

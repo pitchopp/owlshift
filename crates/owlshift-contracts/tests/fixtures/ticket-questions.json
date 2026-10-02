@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "asks": [
     {
       "kind": "questions",
@@ -21,7 +21,11 @@
           "context": "The ticket names neither the words nor how the greeting ends.",
           "text": "What should the greeting say?"
         }
-      ]
+      ],
+      "decider": {
+        "account": "u-maintainer",
+        "by": "assignee"
+      }
     },
     {
       "kind": "reask",
@@ -35,7 +39,11 @@
           "context": "The ticket names neither the words nor how the greeting ends.",
           "text": "What should the greeting say?"
         }
-      ]
+      ],
+      "decider": {
+        "account": "u-maintainer",
+        "by": "assignee"
+      }
     }
   ],
   "checked_through": "2026-09-28T11:00:00Z"

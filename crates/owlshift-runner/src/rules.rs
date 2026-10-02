@@ -21,6 +21,9 @@ const DEFAULT_RULE_FILE: &str = "AGENTS.md";
 /// The most bytes the rules take, all files together.
 const MAX_RULE_BYTES: u64 = 64 * 1024;
 
+/// What the rules are, in a refusal.
+const RULES: &str = "the project's rules";
+
 /// The project's rules at `base`, as the dedicated `checkout` knows it after
 /// a fetch: one rule for the whole repository (`applies_to` empty) per file
 /// `stack.rules` names, in order, or, when it names none, per root
@@ -48,7 +51,7 @@ pub fn project_rules(
     let mut entries = Vec::with_capacity(files.len());
     for file in files {
         let at = format!("{file} on {}", base.remote_ref);
-        match entry(git, checkout, base, file, &at)? {
+        match entry(git, checkout, base, file, &at, RULES)? {
             Some(entry) => entries.push((file, entry)),
             None if required => {
                 return Err(format!(
@@ -84,22 +87,63 @@ pub fn project_rules(
     let mut rules = Vec::with_capacity(entries.len());
     for (file, entry) in entries {
         let at = format!("{file} on {}", base.remote_ref);
-        let bytes = git
-            .run(checkout, &["cat-file", "blob", entry.oid.as_str()])
-            .map_err(|e| format!("reading {at}: {}", e.detail))?;
-        let text = String::from_utf8(bytes)
-            .map_err(|_| format!("{at} is not UTF-8 text: Owlshift passes rules as text only"))?;
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let text = read_blob(git, checkout, &entry, &at, RULES)?;
         if text.trim().is_empty() {
             continue;
         }
         rules.push(Rule {
             applies_to: Vec::new(),
             source: file.to_owned(),
-            text: text.to_owned(),
+            text,
         });
     }
     Ok(rules)
+}
+
+/// The text of `file` at `base.commit`, read as the rules are, `None` when
+/// the commit has no such file: a regular file of at most `limit` bytes, in
+/// UTF-8, its byte-order mark dropped. Anything else is a refusal naming the
+/// file and, for a file that is not regular or not text, `what` Owlshift
+/// reads from it.
+pub(crate) fn text_at_base(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+    file: &str,
+    limit: u64,
+    what: &str,
+) -> Result<Option<String>, String> {
+    let at = format!("{file} on {}", base.remote_ref);
+    let Some(entry) = entry(git, checkout, base, file, &at, what)? else {
+        return Ok(None);
+    };
+    if entry.size > limit {
+        return Err(format!(
+            "{at} holds {} bytes, over the {limit} Owlshift reads",
+            entry.size
+        ));
+    }
+    read_blob(git, checkout, &entry, &at, what).map(Some)
+}
+
+/// The blob of `entry` as text: UTF-8, a leading byte-order mark dropped,
+/// read with no filter, text conversion or hook.
+fn read_blob(
+    git: &Git,
+    checkout: &Path,
+    entry: &Entry,
+    at: &str,
+    what: &str,
+) -> Result<String, String> {
+    let bytes = git
+        .run(checkout, &["cat-file", "blob", entry.oid.as_str()])
+        .map_err(|e| format!("reading {at}: {}", e.detail))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("{at} is not UTF-8 text: Owlshift reads {what} as text only"))?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_owned(),
+        None => text,
+    })
 }
 
 /// The base commit's entry for `file`, `None` when it has none, or a
@@ -111,6 +155,7 @@ fn entry(
     base: &Base,
     file: &str,
     at: &str,
+    what: &str,
 ) -> Result<Option<Entry>, String> {
     let listing = git
         .run(
@@ -134,8 +179,8 @@ fn entry(
     };
     if entry.kind != "blob" || !matches!(entry.mode.as_str(), "100644" | "100755") {
         return Err(format!(
-            "{at} is not a regular file (mode {}, {}): Owlshift reads the project's rules from a \
-             regular file only",
+            "{at} is not a regular file (mode {}, {}): Owlshift reads {what} from a regular file \
+             only",
             entry.mode, entry.kind
         ));
     }

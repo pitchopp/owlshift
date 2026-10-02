@@ -40,9 +40,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use owlshift_adapters::forge::Repo;
+use owlshift_contracts::config::{ProjectConfig, check_requires};
 use owlshift_contracts::ids::TicketId;
+use owlshift_core::decider::ZoneOwners;
+use semver::Version;
 
+use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
 use crate::executor::Git;
+use crate::rules;
 
 /// The variables that point git at another repository, index or object
 /// store than the one of its working directory. The runner's own git drops
@@ -436,6 +441,36 @@ pub fn sync_checkout_within(
         branch,
         commit,
     })
+}
+
+/// The most bytes of the project file read at the base commit.
+const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024;
+
+/// The zone owners of the project file as the base commit holds it, read in
+/// the dedicated `checkout` as the project's rules are
+/// ([`rules::project_rules`]): never the person's checkout, which may differ
+/// from what the forge's default branch holds, nor a worktree, which agents
+/// write, so a run cannot choose who instructs it (architecture section 4).
+/// No project file at the base means no owners. A file over 64 KiB, not
+/// text, requiring a newer Owlshift or invalid is an error naming it.
+pub fn zone_owners_at(git: &Git, checkout: &Path, base: &Base) -> Result<ZoneOwners, String> {
+    let file = PROJECT_FILE;
+    let Some(text) = rules::text_at_base(
+        git,
+        checkout,
+        base,
+        file,
+        MAX_PROJECT_FILE_BYTES,
+        "the project file",
+    )?
+    else {
+        return Ok(ZoneOwners::default());
+    };
+    let current = Version::parse(OWLSHIFT_VERSION).expect("the crate version is semver");
+    check_requires(&text, &current)
+        .and_then(|()| ProjectConfig::parse(&text))
+        .and_then(|config| config.zone_owners())
+        .map_err(|e| format!("{file} on {}: {e}", base.remote_ref))
 }
 
 /// `git remote set-head origin --auto`: asks the forge for its default

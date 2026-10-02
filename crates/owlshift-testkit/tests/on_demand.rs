@@ -30,7 +30,8 @@ use owlshift_contracts::brief::{Brief, PermissionLevel, Relation, ThreadEntry};
 use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::refs::Waiting;
+use owlshift_contracts::refs::{AskDecider, Waiting};
+use owlshift_core::decider::DeciderRule;
 use owlshift_core::state::ParkReason;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{EventLog, EventSink};
@@ -265,6 +266,18 @@ impl Bench {
 
     /// A bench whose ticket was created by `author`.
     fn by(assignee: bool, author: &str) -> Self {
+        let assignee = if assignee {
+            "assignee = \"maintainer\"\n"
+        } else {
+            ""
+        };
+        Self::with(author, assignee, "")
+    }
+
+    /// A bench whose ticket was created by `author`, with `front` added to
+    /// its front matter, and `zones` added to the project file the remote
+    /// holds.
+    fn with(author: &str, front: &str, zones: &str) -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("owlshift do ")
             .tempdir()
@@ -274,23 +287,21 @@ impl Bench {
         fs::create_dir_all(&ticket).unwrap();
         fs::write(
             project.join("owlshift.toml"),
-            "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = \"delegation\"\n\
-             states = { ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\" }\n\
-             [stack]\ngate = [\"git grep -q Hello -- GREETING.md\"]\n\
-             [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n",
+            format!(
+                "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = \"delegation\"\n\
+                 states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\" }}\n\
+                 [stack]\ngate = [\"git grep -q Hello -- GREETING.md\"]\n\
+                 [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n\
+                 {zones}"
+            ),
         )
         .unwrap();
         fs::write(project.join("AGENTS.md"), AGENTS).unwrap();
-        let assignee = if assignee {
-            "assignee = \"maintainer\"\n"
-        } else {
-            ""
-        };
         fs::write(
             ticket.join("ticket.md"),
             format!(
                 "+++\ntitle = \"Add a greeting\"\nauthor = \"{author}\"\nstage = \"Todo\"\n\
-                 {assignee}+++\n\nAdd GREETING.md saying Hello.\n"
+                 {front}+++\n\nAdd GREETING.md saying Hello.\n"
             ),
         )
         .unwrap();
@@ -351,9 +362,23 @@ impl Bench {
 
     /// The decider comments on the ticket, at the next minute.
     fn answer(&self, body: &str) {
+        self.comment_as("maintainer", body);
+    }
+
+    /// `author` comments on the ticket, at the next minute.
+    fn comment_as(&self, author: &str, body: &str) {
         MarkdownTracker::new(&self.remote.checkout)
-            .post_comment(&ticket(), "maintainer", tick(&self.clock), body)
+            .post_comment(&ticket(), author, tick(&self.clock), body)
             .unwrap();
+    }
+
+    /// The ticket's file on the tracker, which a person edits.
+    fn ticket_file(&self) -> PathBuf {
+        self.remote
+            .checkout
+            .join("tickets")
+            .join(TICKET)
+            .join("ticket.md")
     }
 
     /// What the ticket ref holds.
@@ -789,14 +814,18 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
         }
     }
 
-    // A ticket without a decider is refused before anything runs.
+    // A ticket with neither an assignee nor a declared zone has no decider,
+    // whatever the owners: refused before anything is cloned.
     let bench = Bench::new(false);
     let (outcome, _) = bench.run(Vec::new(), None);
     assert!(
-        matches!(&outcome, Err(Stop::Refused(reason)) if reason.contains("no assignee")),
+        matches!(&outcome, Err(Stop::Refused(reason))
+            if reason.contains("DEMO-1 has no decider: the ticket has no assignee and touches no zone with an owner")
+                && reason.contains("label it `zone:<folder>`")),
         "{outcome:?}"
     );
     assert!(bench.events().is_empty());
+    assert!(!bench.dirs().checkout().exists());
 }
 
 /// A run that broke isolation leaves the project refused, whatever the
@@ -1324,4 +1353,107 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
         "{printed}"
     );
     assert_eq!(bench.comments().len(), 3);
+}
+
+/// The project file the remote holds for the zone-owner tests: `docs` is
+/// owned by `owner`.
+const DOCS_OWNED: &str = "[zones.docs]\nowner = \"owner\"\n";
+
+/// A ticket without an assignee, labelled with the zone `docs`.
+const ZONE_LABEL: &str = "labels = [\"zone:docs\"]\n";
+
+/// OWL-124: a ticket without an assignee that declares an owned zone is
+/// decided by that zone's owner, from `do` to the delivery. The ask records
+/// the owner; the ticket author's comment is no answer, even once the label
+/// is gone, since waiting needs the recorded decider alone; the owner's
+/// answer is checked; Build waits for the ticket to have a decider again,
+/// then delivers.
+#[test]
+fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
+    let bench = Bench::with("maintainer", ZONE_LABEL, DOCS_OWNED);
+    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let build = bench.briefs().pop().unwrap();
+    assert_eq!(build.decider, "owner");
+    assert_eq!(build.ticket.author.relation, Relation::Other);
+    let asks = bench.record().questions.asks;
+    assert_eq!(
+        asks[0].decider,
+        AskDecider {
+            account: "owner".to_owned(),
+            by: DeciderRule::ZoneOwner,
+        }
+    );
+
+    // The label is removed: waiting needs no decider now, and the ticket
+    // author's comment does not start the answer check.
+    let labelled = fs::read_to_string(bench.ticket_file()).unwrap();
+    fs::write(bench.ticket_file(), labelled.replace(ZONE_LABEL, "")).unwrap();
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
+    let (waiting, _) = bench.resume(Vec::new());
+    assert!(
+        matches!(&waiting, Err(Stop::Waiting { decider, .. }) if decider == "owner"),
+        "{waiting:?}"
+    );
+    let (refused, _) = bench.run(Vec::new(), None);
+    assert!(
+        matches!(&refused, Err(Stop::Refused(why)) if why.contains("has no decider")),
+        "{refused:?}"
+    );
+
+    // The owner answers: the check reads their comment as the decider's and
+    // the author's as another's. Build, which may ask a new round, waits for
+    // a decider now.
+    bench.comment_as(
+        "owner",
+        "Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n",
+    );
+    let answered = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
+    ]);
+    let (outcome, printed) = bench.resume(vec![bench.reply(None, Some(&answered))]);
+    assert!(
+        matches!(&outcome, Err(Stop::Refused(why))
+            if why.contains("DEMO-1 has no decider: the ticket has no assignee")),
+        "{outcome:?}\n{printed}"
+    );
+    let check_brief = bench.briefs().pop().unwrap();
+    assert_eq!(check_brief.role, Role::AnswerCheck);
+    assert_eq!(check_brief.decider, "owner");
+    assert_eq!(shape(&check_brief), ["questions", "Other", "Decider"]);
+    assert_eq!(bench.record().state.waiting, None);
+
+    // Labelled again, the ticket resumes at Build, whose brief keeps the
+    // owner's answers as instructions, and delivers.
+    fs::write(bench.ticket_file(), labelled).unwrap();
+    let (delivered, printed) = bench.resume(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let build = bench.briefs().pop().unwrap();
+    assert_eq!(build.role, Role::Build);
+    assert_eq!(shape(&build), ["questions", "Other", "Decider"]);
+}
+
+/// The owners are read from the project file the base commit holds: an
+/// owner named only in the person's own, unpushed `owlshift.toml` decides
+/// nothing.
+#[test]
+fn a_zone_owner_named_only_in_the_persons_checkout_decides_nothing() {
+    let bench = Bench::with("maintainer", ZONE_LABEL, "");
+    let file = bench.remote.checkout.join("owlshift.toml");
+    let mut text = fs::read_to_string(&file).unwrap();
+    text.push_str(DOCS_OWNED);
+    fs::write(&file, text).unwrap();
+    let (outcome, _) = bench.run(Vec::new(), None);
+    assert!(
+        matches!(&outcome, Err(Stop::Refused(why))
+            if why.contains("DEMO-1 has no decider: the ticket has no assignee and touches no zone with an owner")),
+        "{outcome:?}"
+    );
+    // Refused once the fetch gave the base, before anything ran.
+    assert!(bench.dirs().checkout().exists());
+    assert!(bench.events().is_empty());
 }
