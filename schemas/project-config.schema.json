@@ -22,6 +22,13 @@
     },
     "tracker": {
       "$ref": "#/$defs/Tracker"
+    },
+    "zones": {
+      "description": "Code zones, keyed by their folder from the repository's root, such as\n`backend/billing`: who owns each.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ZoneSettings"
+      }
     }
   },
   "additionalProperties": false,
@@ -275,6 +282,20 @@
         "trivial",
         "standard",
         "risky"
+      ]
+    },
+    "ZoneSettings": {
+      "description": "The settings of one code zone.",
+      "type": "object",
+      "properties": {
+        "owner": {
+          "description": "The tracker account that decides the tickets without an assignee\ntouching this zone: its identifier as the tracker reports it (a\nLinear user's id, the name on the Markdown tracker), written exactly.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "owner"
       ]
     }
   }

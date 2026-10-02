@@ -142,7 +142,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 *On a shared project, each developer's runner works the tickets that developer delegated, on that developer's subscription, and only the ticket's decider can unblock it.*
 
 - A runner never takes a ticket its operator did not delegate; a team-server runner takes every admitted ticket.
-- Only the decider's answers (assignee by default, or the zone owner) count; other comments are context, and the answer check says so.
+- Only the decider's answers (the assignee, or for a ticket without one, the owner of its zones) count; other comments are context, and the answer check says so.
 - A PR review comment and a ticket comment from the same person count as one decider, through the identity map.
 - Two runners on two machines never claim the same ticket.
 

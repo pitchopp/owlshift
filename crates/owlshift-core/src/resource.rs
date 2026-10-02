@@ -30,11 +30,7 @@ impl Resource {
         match (self, other) {
             (Resource::Zone(a), Resource::Zone(b)) => {
                 let (a, b) = (segments(a), segments(b));
-                let shared = a.len().min(b.len());
-                a[..shared]
-                    .iter()
-                    .zip(&b[..shared])
-                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+                contains(&a, &b) || contains(&b, &a)
             }
             (Resource::Named(a), Resource::Named(b)) => a == b,
             (Resource::Browser, Resource::Browser) => true,
@@ -43,10 +39,21 @@ impl Resource {
     }
 }
 
-fn segments(zone: &str) -> Vec<&str> {
+/// A zone's segments, without the empty and `.` ones.
+pub(crate) fn segments(zone: &str) -> Vec<&str> {
     zone.split('/')
         .filter(|segment| !segment.is_empty() && *segment != ".")
         .collect()
+}
+
+/// Whether the zone of segments `outer` contains the zone of segments
+/// `inner`, itself included, comparing segments in any ASCII case.
+pub(crate) fn contains(outer: &[&str], inner: &[&str]) -> bool {
+    outer.len() <= inner.len()
+        && outer
+            .iter()
+            .zip(inner)
+            .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 #[cfg(test)]
