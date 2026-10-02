@@ -618,13 +618,18 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(2)),
+        asked(|v| v["format"] = json!(3)),
         "upgrade Owlshift",
     );
     rejects(
         "an ask without its comment",
         asked(|v| v["asks"][1]["comment"] = json!(" ")),
         "an ask of round 1 names no comment",
+    );
+    rejects(
+        "an ask without its decider",
+        asked(|v| v["asks"][0]["decider"]["account"] = json!("")),
+        "an ask of round 1 names no decider",
     );
     rejects(
         "a re-ask of a round not asked",

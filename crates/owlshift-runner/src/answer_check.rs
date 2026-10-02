@@ -131,8 +131,9 @@ mod tests {
             body: body.into(),
         };
         let mut asked = TicketQuestions::parse(
-            r#"{"format":1,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T10:10:00Z",
-                "comment":"c10","questions":[{"id":"Q1","category":"scope","context":"c","text":"t"}]}]}"#,
+            r#"{"format":2,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T10:10:00Z",
+                "comment":"c10","questions":[{"id":"Q1","category":"scope","context":"c","text":"t"}],
+                "decider":{"account":"u1","by":"assignee"}}]}"#,
         )
         .unwrap();
         let marked = "[owlshift] DELIVERY\n\nDone.\n";

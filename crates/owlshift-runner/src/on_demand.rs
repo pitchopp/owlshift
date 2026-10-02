@@ -49,12 +49,14 @@ use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::refs::{Ask, AskKind, PersistedState, TicketQuestions};
+use owlshift_contracts::refs::{Ask, AskDecider, AskKind, PersistedState, TicketQuestions};
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, Followup, Question, RunResult, Verdict as AnswerVerdict,
 };
 use owlshift_contracts::{Role, Stage, Variant};
+use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, declared_zones};
 use owlshift_core::pipeline::Pipeline;
+use owlshift_core::resource::Resource;
 use owlshift_core::state::{Event, MAX_REASKS, ParkReason, Status, TicketState, Transition};
 
 use crate::agent_env::AgentEnv;
@@ -470,7 +472,11 @@ struct Prepared {
     _lock: ProjectLock,
     ticket: TicketId,
     found: Ticket,
-    decider: Person,
+    /// The ticket's decider when the command started ([`pending_decider`],
+    /// [`decide`]), or why it has none. `do` refuses a ticket without one;
+    /// `resume` only once Build is about to run, since waiting, the answer
+    /// check and a re-ask need the decider recorded on the latest ask alone.
+    decider: Result<AskDecider, String>,
     base: Base,
     checkout: PathBuf,
     worktree: PathBuf,
@@ -487,6 +493,21 @@ impl Prepared {
             .as_ref()
             .map(|stored| stored.record.questions.clone())
             .unwrap_or_default()
+    }
+
+    /// The ticket's decider when the command started, which a Build and a
+    /// new round need: the refusal that says why when it has none.
+    fn current(&self) -> Result<&AskDecider, Stop> {
+        self.decider
+            .as_ref()
+            .map_err(|why| Stop::Refused(why.clone()))
+    }
+
+    /// The decider recorded on the latest ask, by name, for messages.
+    fn asked_of(&self) -> Option<String> {
+        self.questions()
+            .latest()
+            .map(|ask| name_of(&ask.decider, &self.found))
     }
 }
 
@@ -519,7 +540,7 @@ impl OnDemand<'_> {
                         "the questions of round {} on {ticket} wait for {}: answer them on the \
                          ticket, then run `owlshift resume {ticket}`",
                         state.round(),
-                        p.decider.name
+                        p.asked_of().unwrap_or_else(|| "the decider".to_owned())
                     )));
                 }
                 state.round()
@@ -574,6 +595,8 @@ impl OnDemand<'_> {
                 stage_name(state.stage())
             )));
         }
+        // Build may ask a new round, which goes to the decider now.
+        p.current()?;
         let dispatched = self.dispatch(&p, Command::Resume, sink)?;
         self.build(&mut p, &dispatched, state, sink)
     }
@@ -625,15 +648,26 @@ impl OnDemand<'_> {
             .tracker
             .ticket(ticket)
             .map_err(|e| refused(&format!("reading {ticket}"), e))?;
-        let decider = found.assignee.clone().ok_or_else(|| {
-            Stop::Refused(format!(
-                "{ticket} has no assignee: assign it to the person who decides its questions"
-            ))
-        })?;
+        // `do` needs a decider: refused before anything is cloned when the
+        // ticket alone says it has none.
+        let pending = pending_decider(&found);
+        if let (Command::Do, Err(why)) = (command, &pending) {
+            return Err(Stop::Refused(why.clone()));
+        }
 
         let git = &self.executor.git;
         let base =
             project::sync_checkout(git, self.dirs, self.remote_url).map_err(Stop::Refused)?;
+        // Zone owners come from the project file at the base commit, read
+        // only for a ticket without an assignee that declares zones.
+        let decider = pending.and_then(|pending| match pending {
+            Pending::Known(decider) => Ok(decider),
+            Pending::Owners(declared) => project::zone_owners_at(git, &checkout, &base)
+                .and_then(|owners| decide(&found, &declared, &owners)),
+        });
+        if let (Command::Do, Err(why)) = (command, &decider) {
+            return Err(Stop::Refused(why.clone()));
+        }
         let worktree = self.dirs.worktree(ticket);
         // A worktree kept from an earlier `do` is trusted only while its
         // `.git` still links it to the checkout. The executor refuses such a
@@ -652,8 +686,15 @@ impl OnDemand<'_> {
                 text,
             });
         }
-        let stored = ticket_ref::read(git, &checkout, ticket)
-            .map_err(|e| refused("reading the ticket's ref", e))?;
+        let stored = ticket_ref::read(git, &checkout, ticket).map_err(|e| {
+            let name = owlshift_contracts::refs::ticket_ref(ticket);
+            Stop::Refused(format!(
+                "reading the ticket's ref: {e}. To start {ticket} over, delete {name} in {} \
+                 (`git update-ref -d {name}`): its comments stay on the ticket, and its rounds \
+                 restart from 1",
+                checkout.display()
+            ))
+        })?;
         Ok(Prepared {
             _lock: lock,
             ticket: ticket.clone(),
@@ -722,6 +763,7 @@ impl OnDemand<'_> {
         mut state: TicketState,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
+        let current = person(p.current()?, &p.found);
         self.keep(p, &state)?;
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
@@ -734,6 +776,7 @@ impl OnDemand<'_> {
                 &comments,
                 &dispatched.rules,
                 gathered.gate_failure.clone(),
+                &current,
             );
             let ran = self.execute(p, self.executor, self.build, &brief, attempt, sink)?;
             if let Some(gate) = &ran.report.gate {
@@ -816,6 +859,11 @@ impl OnDemand<'_> {
         if result.questions.is_empty() {
             return stop(Err("the run asked no question".to_owned()));
         }
+        // The round goes to the decider this command resolved, for good.
+        let decider = match &p.decider {
+            Ok(decider) => decider.clone(),
+            Err(why) => return stop(Err(why.clone())),
+        };
         let comment = QuestionsComment {
             ticket: ticket.clone(),
             round,
@@ -840,6 +888,7 @@ impl OnDemand<'_> {
             at: posted.created_at,
             comment: posted.id.clone(),
             questions: result.questions.clone(),
+            decider,
         });
         if let Err(error) = self.store(p, state, questions) {
             return Stop::Refused(format!(
@@ -865,21 +914,32 @@ impl OnDemand<'_> {
         let ticket = p.ticket.clone();
         let mut questions = p.questions();
         let comments = self.comments(&ticket)?;
-        let Some(since) = questions.answers_after() else {
+        let (Some(since), Some(latest)) = (questions.answers_after(), questions.latest()) else {
             return Err(Stop::Refused(format!(
                 "the ticket's ref of {ticket} waits for answers but keeps no ask"
             )));
         };
-        if answer_check::new_answer(&comments, &p.decider, &questions).is_none() {
+        // Only the decider recorded on the ask answers it, whoever decides
+        // the ticket now; a re-ask keeps its round's decider.
+        let asked = latest.decider.clone();
+        let asked_of = person(&asked, &p.found);
+        if answer_check::new_answer(&comments, &asked_of, &questions).is_none() {
             return Err(Stop::Waiting {
                 ticket,
                 round: state.round(),
-                decider: p.decider.name.clone(),
+                decider: name_of(&asked, &p.found),
                 since,
             });
         }
-        let read_through = answer_check::newest_decider_edit(&comments, &p.decider);
-        let brief = self.brief(p, Role::AnswerCheck, &comments, &[], None);
+        let read_through = answer_check::newest_decider_edit(&comments, &asked_of);
+        // The ticket's author is judged against the decider now, or the
+        // asked one when the ticket has none now: the description is
+        // context for the answer check either way.
+        let current = p
+            .decider
+            .as_ref()
+            .map_or(asked_of, |decider| person(decider, &p.found));
+        let brief = self.brief(p, Role::AnswerCheck, &comments, &[], None, &current);
         let executor = Executor {
             timeout: ANSWER_CHECK_TIMEOUT,
             ..self.executor.clone()
@@ -962,6 +1022,7 @@ impl OnDemand<'_> {
                     at: posted.created_at,
                     comment: posted.id.clone(),
                     questions: open.iter().map(|(question, _)| question.clone()).collect(),
+                    decider: asked,
                 });
                 self.store(p, &next, questions).map_err(|e| {
                     Stop::Refused(format!(
@@ -1186,7 +1247,10 @@ impl OnDemand<'_> {
     /// The brief of one run of `role`: Build writes in the worktree and
     /// resumes from the plan it left; the answer check only reads, and gets
     /// no rule, its context kept to the ticket, the questions and the
-    /// answers (architecture section 9).
+    /// answers (architecture section 9). `current` is the ticket's decider
+    /// now, which the ticket's author and the comments before any ask are
+    /// judged against ([`thread`]); the brief's `decider` is the one in
+    /// force at the end of the thread.
     fn brief(
         &self,
         p: &Prepared,
@@ -1194,8 +1258,14 @@ impl OnDemand<'_> {
         comments: &[Comment],
         rules: &[Rule],
         gate_failure: Option<GateFailure>,
+        current: &Person,
     ) -> Brief {
         let build = role == Role::Build;
+        let asks = p.questions().asks;
+        let in_force = asks.last().map_or_else(
+            || current.name.clone(),
+            |ask| name_of(&ask.decider, &p.found),
+        );
         Brief {
             format: Format,
             role,
@@ -1205,11 +1275,11 @@ impl OnDemand<'_> {
                 title: p.found.title.clone(),
                 url: None,
                 labels: p.found.labels.clone(),
-                author: account_author(&p.found.author, &p.decider),
+                author: account_author(&p.found.author, current),
                 description: p.found.description.clone(),
             },
-            decider: p.decider.name.clone(),
-            thread: thread(comments, &p.questions().asks, &p.decider),
+            decider: in_force,
+            thread: thread(comments, &asks, current),
             checkpoint: if build { checkpoint(&p.worktree) } else { None },
             zones: Vec::new(),
             resources: Vec::new(),
@@ -1374,25 +1444,115 @@ impl OnDemand<'_> {
 /// time or earlier, so one whose comment is gone from the tracker still
 /// takes its place; a comment posted in the same second as an ask reads as
 /// before it.
-pub(crate) fn thread(comments: &[Comment], asks: &[Ask], decider: &Person) -> Vec<ThreadEntry> {
+///
+/// A comment is the decider's when its author is the decider recorded on
+/// the latest ask before it, or, before any ask, `current`, the ticket's
+/// decider now (build plan, "Who answers which ask"): the answers a check
+/// accepted stay instructions for the Build they unblock, and a person who
+/// became the decider after an ask cannot answer it.
+pub(crate) fn thread(comments: &[Comment], asks: &[Ask], current: &Person) -> Vec<ThreadEntry> {
     let posted: HashSet<&str> = asks.iter().map(|ask| ask.comment.as_str()).collect();
     let mut asks = asks.iter().peekable();
     let mut thread = Vec::new();
+    let mut in_force = current.clone();
     for comment in comments {
         if posted.contains(comment.id.as_str()) {
             continue;
         }
         while let Some(ask) = asks.next_if(|ask| ask.at < comment.created_at) {
+            // Only the account is matched, never a name.
+            in_force = Person {
+                id: ask.decider.account.clone(),
+                name: String::new(),
+            };
             thread.push(ask.entry());
         }
         thread.push(ThreadEntry::Comment {
             at: comment.created_at,
-            author: comment_author(comment, decider),
+            author: comment_author(comment, &in_force),
             body: comment.body.clone(),
         });
     }
     thread.extend(asks.map(Ask::entry));
     thread
+}
+
+/// Who decides a ticket, as far as the ticket alone tells.
+enum Pending {
+    /// Its decider: the assignee.
+    Known(AskDecider),
+    /// No assignee: the one owner of these declared zones decides, by the
+    /// owners of the project file at the base commit.
+    Owners(Vec<Resource>),
+}
+
+/// The first half of the decider's resolution (architecture section 4),
+/// which needs no project file: the assignee when the ticket has one; else
+/// the zones its `zone:` labels declare, whose owners decide. A malformed
+/// `zone:` label, and a ticket with neither an assignee nor a declared zone,
+/// which no owner could change, have no decider: the reason.
+fn pending_decider(ticket: &Ticket) -> Result<Pending, String> {
+    let assignee = ticket.assignee.as_ref().map(|person| person.id.as_str());
+    // Labels play no part for a ticket with an assignee.
+    if let Ok(found) = decider::decider(assignee, &[], &ZoneOwners::default()) {
+        return Ok(Pending::Known(recorded(found)));
+    }
+    let declared = declared_zones(ticket.labels.iter().map(String::as_str))
+        .map_err(|error| format!("{} has no decider: {error}", ticket.id))?;
+    if declared.is_empty() {
+        return decide(ticket, &declared, &ZoneOwners::default()).map(Pending::Known);
+    }
+    Ok(Pending::Owners(declared))
+}
+
+/// The decider of `ticket` with `declared` zones and the zone `owners` of
+/// the project file at the base commit, or why it has none and how to give
+/// it one.
+fn decide(
+    ticket: &Ticket,
+    declared: &[Resource],
+    owners: &ZoneOwners,
+) -> Result<AskDecider, String> {
+    let assignee = ticket.assignee.as_ref().map(|person| person.id.as_str());
+    decider::decider(assignee, declared, owners)
+        .map(recorded)
+        .map_err(|why| {
+            let hint = match why {
+                NoDecider::NoOwnedZone => {
+                    "; or label it `zone:<folder>` for each zone it touches, which `[zones]` in \
+                     owlshift.toml on the forge's default branch gives an owner"
+                }
+                NoDecider::SeveralOwners(_) => "",
+            };
+            format!("{} has no decider: {why}{hint}", ticket.id)
+        })
+}
+
+/// A decider as an ask records it.
+fn recorded(found: Decider<'_>) -> AskDecider {
+    AskDecider {
+        account: found.account().to_owned(),
+        by: found.rule(),
+    }
+}
+
+/// A recorded decider as the tracker's person, named by [`name_of`].
+fn person(decider: &AskDecider, ticket: &Ticket) -> Person {
+    Person {
+        id: decider.account.clone(),
+        name: name_of(decider, ticket),
+    }
+}
+
+/// A recorded decider's name: the assignee's when it is their account,
+/// else the account itself, the one way a zone owner is known until the
+/// identity map (P10).
+fn name_of(decider: &AskDecider, ticket: &Ticket) -> String {
+    ticket
+        .assignee
+        .as_ref()
+        .filter(|assignee| assignee.id == decider.account)
+        .map_or_else(|| decider.account.clone(), |assignee| assignee.name.clone())
 }
 
 /// The `tracker_write` event of a marked comment the runner posted.
@@ -1607,6 +1767,8 @@ fn path(path: &Path) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use owlshift_core::decider::DeciderRule;
+
     use super::*;
 
     #[test]
@@ -1708,6 +1870,10 @@ mod tests {
                 options: Vec::new(),
                 recommendation: None,
             }],
+            decider: AskDecider {
+                account: "u1".into(),
+                by: DeciderRule::Assignee,
+            },
         };
         let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
         let comments = [
@@ -1744,6 +1910,77 @@ mod tests {
                 "Decider: Q1: all.",
                 "questions 2",
                 "Owlshift: [owlshift] DELIVERY",
+            ]
+        );
+    }
+
+    /// Before any ask the ticket's decider now speaks; after an ask, the
+    /// decider recorded on it, whoever decides the ticket now.
+    #[test]
+    fn a_comment_is_the_deciders_of_the_latest_ask_before_it() {
+        let account = |id: &str| Person {
+            id: id.into(),
+            name: format!("name of {id}"),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let comment = |id: &str, by: &str, minute: u32| Comment {
+            id: id.into(),
+            author: TrackerAuthor::Account(account(by)),
+            created_at: at(minute),
+            edited_at: None,
+            body: format!("{by} at {minute}"),
+        };
+        let ask = |round: u32, minute: u32, by: &str| Ask {
+            kind: AskKind::Questions,
+            round: NonZeroU32::new(round).unwrap(),
+            at: at(minute),
+            comment: format!("ask-{round}"),
+            questions: vec![Question {
+                id: owlshift_contracts::ids::QuestionId::new("Q1").unwrap(),
+                category: "scope".into(),
+                context: "c".into(),
+                text: "t".into(),
+                options: Vec::new(),
+                recommendation: None,
+            }],
+            decider: AskDecider {
+                account: by.into(),
+                by: DeciderRule::ZoneOwner,
+            },
+        };
+        // Round 1 went to the zone owner `bob`, round 2 to `tia`; the
+        // ticket was since assigned to `ann`.
+        let comments = [
+            comment("c1", "ann", 1),
+            comment("c2", "bob", 2),
+            comment("c3", "bob", 11),
+            comment("c4", "ann", 12),
+            comment("c5", "bob", 21),
+            comment("c6", "tia", 22),
+        ];
+        let asks = [ask(1, 10, "bob"), ask(2, 20, "tia")];
+        let marked: Vec<String> = thread(&comments, &asks, &account("ann"))
+            .iter()
+            .map(|entry| match entry {
+                ThreadEntry::Comment { author, body, .. } => {
+                    format!("{body}: {:?}", author.relation)
+                }
+                _ => "ask".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                "ann at 1: Decider",
+                "bob at 2: Other",
+                "ask",
+                "bob at 11: Decider",
+                "ann at 12: Other",
+                "ask",
+                "bob at 21: Other",
+                "tia at 22: Decider",
             ]
         );
     }

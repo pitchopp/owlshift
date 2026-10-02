@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift ticket questions",
-  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and what the last answer check read.",
+  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and its decider, and what the last answer check\nread.",
   "type": "object",
   "properties": {
     "asks": {
@@ -23,7 +23,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     }
   },
   "additionalProperties": false,
@@ -44,6 +44,10 @@
           "description": "The tracker's identifier of the runner's comment that posted it.",
           "type": "string",
           "pattern": "\\S"
+        },
+        "decider": {
+          "description": "Who answers it: resolved when the round was asked, and its decider\nfor good (architecture section 4); a re-ask keeps its round's.",
+          "$ref": "#/$defs/AskDecider"
         },
         "kind": {
           "$ref": "#/$defs/AskKind"
@@ -68,7 +72,28 @@
         "round",
         "at",
         "comment",
-        "questions"
+        "questions",
+        "decider"
+      ]
+    },
+    "AskDecider": {
+      "description": "The decider of an ask.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The tracker account's identifier, compared as written.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "by": {
+          "description": "The rule that made them the decider.",
+          "$ref": "#/$defs/DeciderRule"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "account",
+        "by"
       ]
     },
     "AskKind": {
@@ -83,6 +108,21 @@
           "description": "Questions of a round left open, asked again under their ids.",
           "type": "string",
           "const": "reask"
+        }
+      ]
+    },
+    "DeciderRule": {
+      "description": "The rule that made someone a ticket's decider, as a ticket ref records it.",
+      "oneOf": [
+        {
+          "description": "The ticket's assignee.",
+          "type": "string",
+          "const": "assignee"
+        },
+        {
+          "description": "The one owner of the owned zones a ticket without an assignee declared.",
+          "type": "string",
+          "const": "zone_owner"
         }
       ]
     },

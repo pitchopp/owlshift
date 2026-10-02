@@ -5,10 +5,66 @@
 //! code zones: when the owned zones it declared all belong to one person,
 //! that person decides; otherwise nobody does, and [`NoDecider`] says why.
 //! Accounts are the tracker's identifiers, compared as written.
+//!
+//! Until intake declares zones (P6), a ticket declares them with labels
+//! `zone:<folder>` ([`declared_zones`]).
 
 use std::fmt;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use crate::resource::{Resource, contains, segments};
+
+/// The prefix of a label that declares a zone, such as
+/// `zone:backend/billing`; its case does not matter.
+pub const ZONE_LABEL_PREFIX: &str = "zone:";
+
+/// The zones a ticket declares with its labels: each label `zone:<folder>`,
+/// the prefix in any ASCII case, gives the folder that follows it, without
+/// the spaces around it. Other labels are left out. A `zone:` label whose
+/// folder is not one by the rules of an owned zone ([`ZoneOwners::new`]) is
+/// refused rather than left out, since a dropped declaration would change
+/// who decides unseen.
+pub fn declared_zones<'a>(
+    labels: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<Resource>, ZoneLabelError> {
+    let mut zones = Vec::new();
+    for label in labels {
+        let Some(prefix) = label.get(..ZONE_LABEL_PREFIX.len()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(ZONE_LABEL_PREFIX) {
+            continue;
+        }
+        let zone = label[ZONE_LABEL_PREFIX.len()..].trim();
+        check_zone(zone).map_err(|reason| ZoneLabelError {
+            label: label.to_owned(),
+            reason,
+        })?;
+        zones.push(Resource::Zone(zone.to_owned()));
+    }
+    Ok(zones)
+}
+
+/// A `zone:` label that names no folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZoneLabelError {
+    pub label: String,
+    pub reason: &'static str,
+}
+
+impl fmt::Display for ZoneLabelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the label {:?} declares a zone that {}",
+            self.label, self.reason
+        )
+    }
+}
+
+impl std::error::Error for ZoneLabelError {}
 
 /// The owners a project names for its code zones (`[zones]` in the project
 /// file): each zone a folder from the repository's root, owned by one
@@ -135,6 +191,24 @@ impl<'a> Decider<'a> {
             Self::Assignee(account) | Self::ZoneOwner(account) => account,
         }
     }
+
+    /// The rule that made them the decider.
+    pub const fn rule(self) -> DeciderRule {
+        match self {
+            Self::Assignee(_) => DeciderRule::Assignee,
+            Self::ZoneOwner(_) => DeciderRule::ZoneOwner,
+        }
+    }
+}
+
+/// The rule that made someone a ticket's decider, as a ticket ref records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeciderRule {
+    /// The ticket's assignee.
+    Assignee,
+    /// The one owner of the owned zones a ticket without an assignee declared.
+    ZoneOwner,
 }
 
 /// Why a ticket has no decider.
@@ -316,6 +390,43 @@ mod tests {
             ] {
                 assert_eq!(owned.owner_of(zone), owner, "{zone:?}");
             }
+        }
+    }
+
+    #[test]
+    fn zone_labels_declare_the_zones_that_choose_the_owner() {
+        let declared = declared_zones([
+            "Feature",
+            "zone:billing",
+            "ZONE: Billing/ ",
+            "zones:web",
+            "zone",
+            "é",
+        ])
+        .unwrap();
+        assert_eq!(declared, zones(&["billing", "Billing/"]));
+        // The label's case never changes the owner, and a zone declared twice
+        // is one owner, not several.
+        let owned = owners(&[("billing", "bob"), ("web", "ann")]);
+        assert_eq!(
+            decider(None, &declared, &owned),
+            Ok(Decider::ZoneOwner("bob"))
+        );
+        assert_eq!(Decider::ZoneOwner("bob").rule(), DeciderRule::ZoneOwner);
+        assert_eq!(Decider::Assignee("ann").rule(), DeciderRule::Assignee);
+        assert_eq!(declared_zones(["agent", "Bug"]), Ok(Vec::new()));
+
+        for (label, reason) in [
+            ("zone:", "the whole repository"),
+            ("Zone:../secrets", "`.` or `..`"),
+            ("zone:/billing", "starts with `/`"),
+            ("zone:billing\\tax", "separate folders with `/`"),
+        ] {
+            let error = declared_zones(["zone:web", label]).unwrap_err();
+            assert_eq!(error.label, label);
+            let text = error.to_string();
+            assert!(text.contains(reason), "{label}: {text}");
+            assert!(text.contains(&format!("{label:?}")), "{text}");
         }
     }
 

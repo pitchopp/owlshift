@@ -79,8 +79,9 @@ const WAITING: &str =
 
 fn questions(round: u32) -> String {
     format!(
-        r#"{{"format":1,"asks":[{{"kind":"questions","round":{round},"at":"2026-10-02T09:00:00Z",
-        "comment":"c1","questions":[{{"id":"Q1","category":"scope","context":"c","text":"t"}}]}}]}}"#
+        r#"{{"format":2,"asks":[{{"kind":"questions","round":{round},"at":"2026-10-02T09:00:00Z",
+        "comment":"c1","questions":[{{"id":"Q1","category":"scope","context":"c","text":"t"}}],
+        "decider":{{"account":"maintainer","by":"assignee"}}}}]}}"#
     )
 }
 
