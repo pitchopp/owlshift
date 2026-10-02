@@ -104,6 +104,19 @@ fn every_contract_round_trips() {
         RunResult::render,
     );
     assert_eq!(checked.verdicts[0].class, AnswerClass::Unanswered);
+    assert_eq!(checked.verdicts[0].reply, None);
+    let counter = round_trip(
+        "result-counter-question.json",
+        RunResult::parse,
+        RunResult::render,
+    );
+    assert_eq!(counter.verdicts[0].class, AnswerClass::CounterQuestion);
+    assert!(
+        counter.verdicts[0]
+            .reply
+            .as_deref()
+            .is_some_and(|reply| reply.starts_with("\"Local\" is the reader's"))
+    );
 
     round_trip("brief.json", Brief::parse, Brief::render);
     let event = round_trip("event.json", Event::parse, Event::render);
@@ -192,10 +205,15 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(3);
+            v["format"] = json!(4);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 2, before a verdict carried its reply",
+        parse(|v| v["format"] = json!(2)),
+        "unknown format 2",
     );
     rejects(
         "format 1, before result.json carried verdicts",
@@ -221,20 +239,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 3, "status""#),
+        RunResult::parse(r#"{"format": 4, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 2, "status""#),
+        RunResult::parse(r#"{"format": 3, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(3));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(4));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 3,
-            supported: 2,
+            found: 4,
+            supported: 3,
             ..
         })
     ));
@@ -279,6 +297,37 @@ fn result_rejections() {
         verdicts(|v| v["status"] = json!("blocked")),
         "verdicts are given but status is not done",
     );
+    // A reply goes with a counter-question, always and only, and is not
+    // blank: the runner posts it as written.
+    let counter =
+        |edit: fn(&mut Value)| RunResult::parse(&edited("result-counter-question.json", edit));
+    rejects(
+        "counter-question without a reply",
+        counter(|v| {
+            v["verdicts"][0].as_object_mut().unwrap().remove("reply");
+        }),
+        "the verdict for Q2 is a counter-question without a reply",
+    );
+    rejects(
+        "counter-question with a null reply",
+        counter(|v| v["verdicts"][0]["reply"] = Value::Null),
+        "invalid type: null",
+    );
+    rejects(
+        "blank reply",
+        counter(|v| v["verdicts"][0]["reply"] = json!(" \t\n")),
+        "the verdict for Q2 has a blank reply",
+    );
+    rejects(
+        "reply on an answered question",
+        counter(|v| v["verdicts"][0]["class"] = json!("answered")),
+        "the verdict for Q2 has a reply but is not a counter-question",
+    );
+    rejects(
+        "reply on an unanswered question",
+        verdicts(|v| v["verdicts"][0]["reply"] = json!("Here is what it means.")),
+        "the verdict for Q2 has a reply but is not a counter-question",
+    );
     // Artifact paths come from a model: they must stay inside the worktree.
     for path in BAD_PATHS {
         let input = edited("result-sample.json", |v| {
@@ -311,6 +360,9 @@ fn result_against_the_brief() {
     for class in ["answered", "partial", "unanswered", "counter_question"] {
         let mut value: Value = serde_json::from_str(&fixture("result-answer-check.json")).unwrap();
         value["verdicts"][0]["class"] = json!(class);
+        if class == "counter_question" {
+            value["verdicts"][0]["reply"] = json!("It means the reader's time zone.");
+        }
         let result = RunResult::parse(&value.to_string()).unwrap();
         result.validate_against(&answer_check).unwrap();
     }

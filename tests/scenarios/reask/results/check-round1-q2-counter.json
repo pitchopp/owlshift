@@ -1,8 +1,13 @@
 {
-  "format": 2,
+  "format": 3,
   "status": "done",
   "summary": "The decider asked what a sign-off means instead of answering.",
   "verdicts": [
-    { "question": "Q2", "class": "counter_question", "reason": "The decider asks what a sign-off means." }
+    {
+      "question": "Q2",
+      "class": "counter_question",
+      "reason": "The decider asks what a sign-off means.",
+      "reply": "A sign-off is a closing line after the greeting, such as \"Best regards\". Should the greeting end with one, and what should it say?"
+    }
   ]
 }

@@ -17,7 +17,7 @@ use crate::Role;
 /// The format version of the brief.
 pub const BRIEF_FORMAT: u32 = 3;
 /// The format version of `result.json`.
-pub const RESULT_FORMAT: u32 = 2;
+pub const RESULT_FORMAT: u32 = 3;
 /// The format version of an event.
 pub const EVENT_FORMAT: u32 = 1;
 /// The format version of a claim (`claim.json` on a claim ref).

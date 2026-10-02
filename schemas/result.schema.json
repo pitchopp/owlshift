@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift result.json",
-  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order, verdicts in increasing question order with a reason that is\nnot only whitespace, and, against the run's brief, verdicts from the\nanswer check only, covering exactly its latest ask.",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; and, against the run's brief, verdicts from the\nanswer check only, covering exactly its latest ask.",
   "type": "object",
   "properties": {
     "artifacts": {
@@ -28,7 +28,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "pr": {
       "description": "The pull request to open; only with `status: done`.",
@@ -372,14 +372,41 @@
           "description": "Why, from the answers: what settled the question, or what is still\nmissing. Not empty and not only whitespace.",
           "type": "string",
           "pattern": "\\S"
+        },
+        "reply": {
+          "description": "The answer to the decider's counter-question, which the runner posts\nin the thread as written. Required with `class: counter_question`,\nrefused with any other class; not empty and not only whitespace.",
+          "type": "string",
+          "pattern": "\\S"
         }
       },
       "additionalProperties": false,
+      "else": {
+        "not": {
+          "required": [
+            "reply"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "class": {
+            "const": "counter_question"
+          }
+        },
+        "required": [
+          "class"
+        ]
+      },
       "required": [
         "question",
         "class",
         "reason"
-      ]
+      ],
+      "then": {
+        "required": [
+          "reply"
+        ]
+      }
     }
   }
 }

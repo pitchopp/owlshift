@@ -18,8 +18,9 @@ const CONTRACT: &str = "result.json";
 /// The result of one run, written by the role as `result.json`.
 ///
 /// Beyond this schema, the runner also requires question ids to be Q1, Q2, …
-/// Qn in order, verdicts in increasing question order with a reason that is
-/// not only whitespace, and, against the run's brief, verdicts from the
+/// Qn in order; verdicts in increasing question order, each with a reason
+/// that is not only whitespace and, on a counter-question and nowhere else,
+/// a reply that is not either; and, against the run's brief, verdicts from the
 /// answer check only, covering exactly its latest ask.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +85,7 @@ pub struct Question {
 /// left it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = reply_with_counter_question_only)]
 pub struct Verdict {
     pub question: QuestionId,
     pub class: AnswerClass,
@@ -91,6 +93,24 @@ pub struct Verdict {
     /// missing. Not empty and not only whitespace.
     #[schemars(regex(pattern = r"\S"))]
     pub reason: String,
+    /// The answer to the decider's counter-question, which the runner posts
+    /// in the thread as written. Required with `class: counter_question`,
+    /// refused with any other class; not empty and not only whitespace.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
+    #[schemars(with = "String", regex(pattern = r"\S"))]
+    pub reply: Option<String>,
+}
+
+/// A field that may be left out but, when present, is a string: `null` is
+/// refused, as the schema refuses it.
+fn present_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 /// A decision the role took on its own.
@@ -197,6 +217,36 @@ impl RunResult {
                 CONTRACT,
                 format!("the verdict for {} has no reason", verdict.question),
             ));
+        }
+        for verdict in &self.verdicts {
+            let counter_question = verdict.class == AnswerClass::CounterQuestion;
+            match &verdict.reply {
+                None if counter_question => {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        format!(
+                            "the verdict for {} is a counter-question without a reply",
+                            verdict.question
+                        ),
+                    ));
+                }
+                Some(_) if !counter_question => {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        format!(
+                            "the verdict for {} has a reply but is not a counter-question",
+                            verdict.question
+                        ),
+                    ));
+                }
+                Some(reply) if reply.trim().is_empty() => {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        format!("the verdict for {} has a blank reply", verdict.question),
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -313,4 +363,18 @@ fn result_invariants(schema: &mut Schema) {
         }
     ]);
     schema.insert("allOf".to_owned(), rules);
+}
+
+/// Adds to the verdict's schema the rule of [`RunResult::validate`] on
+/// `reply`: present with `class: counter_question`, absent otherwise.
+fn reply_with_counter_question_only(schema: &mut Schema) {
+    schema.insert(
+        "if".to_owned(),
+        json!({ "properties": { "class": { "const": "counter_question" } }, "required": ["class"] }),
+    );
+    schema.insert("then".to_owned(), json!({ "required": ["reply"] }));
+    schema.insert(
+        "else".to_owned(),
+        json!({ "not": { "required": ["reply"] } }),
+    );
 }

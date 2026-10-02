@@ -1,0 +1,13 @@
+{
+  "format": 3,
+  "status": "done",
+  "summary": "The decider asked which time zone \"local\" means instead of choosing one.",
+  "verdicts": [
+    {
+      "question": "Q2",
+      "class": "counter_question",
+      "reason": "The decider asks whether \"local\" means the server's time zone or the reader's.",
+      "reply": "\"Local\" is the reader's time zone, read from the browser; the server's would be UTC. Which one should the report use?"
+    }
+  ]
+}
