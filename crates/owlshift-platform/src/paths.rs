@@ -35,6 +35,21 @@ pub fn personal_config_file() -> Option<PathBuf> {
 /// `None` when there is no override and the platform reports no data
 /// directory.
 pub fn data_dir() -> Option<PathBuf> {
+    data_dir_and_source().map(|(dir, _)| dir)
+}
+
+/// Where [`data_dir`] comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataDirSource {
+    /// `OWLSHIFT_DATA_DIR`.
+    Override,
+    /// The platform's local data directory.
+    Platform,
+}
+
+/// [`data_dir`], and where it comes from. Reads the environment only: it
+/// never touches the folder.
+pub fn data_dir_and_source() -> Option<(PathBuf, DataDirSource)> {
     resolve_data(
         std::env::var_os("OWLSHIFT_DATA_DIR"),
         dirs::data_local_dir(),
@@ -59,8 +74,14 @@ fn resolve(override_dir: Option<OsString>, config_dir: Option<PathBuf>) -> Optio
 
 /// `override_dir`: `OWLSHIFT_DATA_DIR`; `data_dir`: the platform's local data
 /// directory, as `dirs::data_local_dir()` reports it.
-fn resolve_data(override_dir: Option<OsString>, data_dir: Option<PathBuf>) -> Option<PathBuf> {
-    absolute(override_dir).or_else(|| data_dir.map(|dir| dir.join("owlshift")))
+fn resolve_data(
+    override_dir: Option<OsString>,
+    data_dir: Option<PathBuf>,
+) -> Option<(PathBuf, DataDirSource)> {
+    match absolute(override_dir) {
+        Some(dir) => Some((dir, DataDirSource::Override)),
+        None => data_dir.map(|dir| (dir.join("owlshift"), DataDirSource::Platform)),
+    }
 }
 
 /// An override that counts: set, non-empty and absolute.
@@ -157,12 +178,12 @@ mod tests {
         let local = PathBuf::from(local);
         assert_eq!(
             resolve_data(Some(over.into()), Some(local.clone())),
-            Some(PathBuf::from(over))
+            Some((PathBuf::from(over), DataDirSource::Override))
         );
         for ignored in [None, Some(OsString::new()), Some("relative".into())] {
             assert_eq!(
                 resolve_data(ignored, Some(local.clone())),
-                Some(local.join("owlshift"))
+                Some((local.join("owlshift"), DataDirSource::Platform))
             );
         }
         assert_eq!(resolve_data(None, None), None);

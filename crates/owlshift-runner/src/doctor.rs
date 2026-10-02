@@ -24,7 +24,7 @@ use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
 
 use crate::config::{Effective, FileState, exit_text};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
-use crate::system::{RunError, System, exact_version_of, version_of};
+use crate::system::{DataDirSource, RunError, System, exact_version_of, version_of};
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 
@@ -244,6 +244,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(file_check("project config", &config.project, home));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
+    checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
         FileState::NotApplicable(_) => Next::FromRepository,
@@ -871,6 +872,29 @@ fn tracker_check(config: &Effective) -> Check {
     }
 }
 
+/// Where `owlshift do` keeps its event log, dedicated checkouts and
+/// worktrees (OWL-109). Information only, never a failure or a warning: what
+/// blocks a run is `do`'s own refusal. Only the path is reported: the folder
+/// is never opened, created or listed.
+fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
+    const SUBJECT: &str = "data directory";
+    match system.data_dir() {
+        Some((path, DataDirSource::Override)) => Check::info(
+            Section::Project,
+            SUBJECT,
+            format!("{}, from OWLSHIFT_DATA_DIR", shown(&path, home)),
+        ),
+        Some((path, DataDirSource::Platform)) => {
+            Check::info(Section::Project, SUBJECT, shown(&path, home))
+        }
+        None => Check::info(
+            Section::Project,
+            SUBJECT,
+            "none: this system has no data directory; set OWLSHIFT_DATA_DIR to an absolute path",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1050,6 +1074,7 @@ mod tests {
             (Section::Project, "project config"),
             (Section::Project, "personal config"),
             (Section::Project, "tracker"),
+            (Section::Project, "data directory"),
         ]);
         assert_eq!(sections, expected);
     }
@@ -1670,6 +1695,60 @@ always_human = []
             personal: FileState::NotApplicable("no configuration directory".into()),
         };
         (dir, config)
+    }
+
+    /// OWL-109: the data directory is one information line: the default
+    /// path, a path set by `OWLSHIFT_DATA_DIR`, or none with how to fix it.
+    /// The report's readiness is the same in all three, in text and in JSON.
+    #[cfg(unix)]
+    #[test]
+    fn the_data_directory_is_information_only() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let cases = [
+            (None, "~/.local/share/owlshift", "~/.local/share/owlshift"),
+            (
+                Some(Some((
+                    PathBuf::from("/srv/owlshift-data"),
+                    DataDirSource::Override,
+                ))),
+                "/srv/owlshift-data, from OWLSHIFT_DATA_DIR",
+                "/srv/owlshift-data, from OWLSHIFT_DATA_DIR",
+            ),
+            (
+                Some(None),
+                "none: this system has no data directory; set OWLSHIFT_DATA_DIR to an absolute \
+                 path",
+                "set OWLSHIFT_DATA_DIR to an absolute path",
+            ),
+        ];
+        for (dir, detail, text) in cases {
+            let system = match dir {
+                Some(dir) => ready().data_dir_is(dir),
+                None => ready(),
+            };
+            let report = run(&system, &no_config());
+            let check = line(&report, "data directory");
+            assert_eq!(check.status, Status::Info, "{report}");
+            assert_eq!(check.detail, detail);
+            assert_eq!(check.fix, []);
+            assert!(report.ready(), "{report}");
+            assert_eq!(report.failures(), 0);
+            // The text report wraps long lines.
+            let printed = report.to_string();
+            let flat = printed.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains(text), "{report}");
+            let json = report.to_json();
+            let entry = json["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["subject"] == "data directory")
+                .unwrap();
+            assert_eq!(entry["status"], "info");
+            assert_eq!(entry["section"], "project");
+            assert_eq!(entry["detail"], detail);
+            assert_eq!(json["problems"], 0);
+        }
     }
 
     #[test]
