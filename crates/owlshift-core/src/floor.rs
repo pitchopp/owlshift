@@ -174,7 +174,7 @@ pub fn is_floor_category(category: &str) -> bool {
 /// Normalizes a category: ASCII lowercase words, joined by single `_`, with
 /// every other character a separator. `"Data  Loss"`, `"data-loss"` and
 /// `"DATA_LOSS!"` all become `data_loss`.
-pub(crate) fn normalize(category: &str) -> String {
+pub fn normalize(category: &str) -> String {
     category
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())

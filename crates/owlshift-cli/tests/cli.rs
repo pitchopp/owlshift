@@ -147,7 +147,7 @@ default = "trivial"
 plan_approval = "never"
 [models]
 [policy]
-always_human = ["billing"]
+always_human = ["Billing!", "Data Loss", "", "billing"]
 "#,
     )
     .unwrap();
@@ -172,6 +172,15 @@ always_human = ["billing"]
         .find(|line| line.starts_with("  billing  ("))
         .unwrap_or_else(|| panic!("{shown}"));
     assert!(billing.ends_with("owlshift.toml)"), "{shown}");
+    // Normalized as the gate reads it, listed once, blank dropped; an
+    // addition the floor already covers says so.
+    assert_eq!(shown.matches("\n  billing  (").count(), 1, "{shown}");
+    assert!(
+        shown.contains("  data_loss  (")
+            && shown.contains("owlshift.toml)  already covered by the floor\n"),
+        "{shown}"
+    );
+    assert!(!shown.contains("\n    ("), "{shown}");
 }
 
 /// The acceptance criterion for OWL-30: a personal file present under

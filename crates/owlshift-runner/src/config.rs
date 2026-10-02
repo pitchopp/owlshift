@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ContractError;
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, check_requires, entries};
-use owlshift_core::floor::{FloorCategory, is_floor_category};
+use owlshift_core::floor::{FloorCategory, is_floor_category, normalize};
 use semver::Version;
 
 use crate::system::System;
@@ -287,16 +287,19 @@ impl Effective {
             writeln!(f, "  {}  (floor)", category.token())?;
         }
         if let FileState::Loaded { path, config, .. } = &self.project {
-            for category in &config.policy.always_human {
-                if is_floor_category(category) {
-                    writeln!(
-                        f,
-                        "  {category}  ({}; already covered by the floor)",
-                        path.display()
-                    )?;
-                } else {
-                    writeln!(f, "  {category}  ({})", path.display())?;
+            // As the gate reads them: normalized, blank ones dropped.
+            let mut shown: Vec<String> = Vec::new();
+            for category in config.policy.always_human.iter().map(|c| normalize(c)) {
+                if category.is_empty() || shown.contains(&category) {
+                    continue;
                 }
+                let note = if is_floor_category(&category) {
+                    "  already covered by the floor"
+                } else {
+                    ""
+                };
+                writeln!(f, "  {category}  ({}){note}", path.display())?;
+                shown.push(category);
             }
         }
         Ok(())
