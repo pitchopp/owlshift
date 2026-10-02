@@ -48,8 +48,8 @@ pub fn declared_zones<'a>(
 }
 
 /// The zones a ticket's `zone:` labels declare, as the brief lists them: the
-/// folders of the well-formed labels, in the labels' order, each once as
-/// written. Unlike [`declared_zones`] it leaves a malformed label out instead
+/// folders of the well-formed labels, in the labels' order, each zone once
+/// as its first label wrote it. Unlike [`declared_zones`] it leaves a malformed label out instead
 /// of refusing it, since it informs an agent and chooses no decider: a ticket
 /// with an assignee is not refused for a label its decider never reads.
 pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -57,8 +57,10 @@ pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> Vec<String>
     for label in labels {
         if let Ok(declared) = declared_zones([label]) {
             for resource in declared {
+                // Zones compare part by part, ignoring ASCII case, so
+                // `Web/` repeats `web`.
                 if let Resource::Zone(zone) = resource
-                    && !zones.contains(&zone)
+                    && !zones.iter().any(|seen| same_zone(seen, &zone))
                 {
                     zones.push(zone);
                 }
@@ -66,6 +68,11 @@ pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> Vec<String>
         }
     }
     zones
+}
+
+fn same_zone(a: &str, b: &str) -> bool {
+    let key = |zone: &str| zone.trim_end_matches('/').to_ascii_lowercase();
+    key(a) == key(b)
 }
 
 /// A `zone:` label that names no folder.
@@ -460,6 +467,7 @@ mod tests {
                 "ZONE: web ",
                 "zone:../secrets",
                 "zone:backend/billing",
+                "zone:Web/",
                 "zone:",
             ]),
             ["backend/billing", "web"]
