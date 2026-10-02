@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use owlshift_contracts::format::{
-    BRIEF_FORMAT, CLAIM_FORMAT, EVENT_FORMAT, FOOTER_FORMAT, RESULT_FORMAT, TICKET_STATE_FORMAT,
+    BRIEF_FORMAT, CLAIM_FORMAT, EVENT_FORMAT, FOOTER_FORMAT, QUESTIONS_FORMAT, RESULT_FORMAT,
+    TICKET_STATE_FORMAT,
 };
 use owlshift_runner::config::{Effective, OWLSHIFT_VERSION};
 use owlshift_runner::doctor;
@@ -42,12 +43,21 @@ enum Command {
     /// tracker and forge secrets and the agent runs' Claude Code token
     /// `owlshift do` needs in the system keychain.
     Init(init_cmd::Args),
-    /// Run one ticket to a verified pull request, in the foreground.
+    /// Run one ticket to a verified pull request, in the foreground. Its
+    /// questions are posted on the ticket.
     Do {
         /// The ticket, such as OWL-12.
         ticket: String,
     },
-    /// Print the events `owlshift do` recorded, oldest first.
+    /// Resume a ticket once its decider has answered on it: check the
+    /// answers, then ask again what is missing or run on to a verified pull
+    /// request. Restarts a parked ticket.
+    Resume {
+        /// The ticket, such as OWL-12.
+        ticket: String,
+    },
+    /// Print the events `owlshift do` and `owlshift resume` recorded, oldest
+    /// first.
     Logs {
         /// Only this ticket's events.
         ticket: Option<String>,
@@ -72,7 +82,7 @@ fn long_version() -> String {
     format!(
         "{OWLSHIFT_VERSION}\nformats: brief {BRIEF_FORMAT}, result {RESULT_FORMAT}, \
          event {EVENT_FORMAT}, claim {CLAIM_FORMAT}, ticket state {TICKET_STATE_FORMAT}, \
-         comment footer {FOOTER_FORMAT}"
+         ticket questions {QUESTIONS_FORMAT}, comment footer {FOOTER_FORMAT}"
     )
 }
 
@@ -124,7 +134,8 @@ fn main() -> ExitCode {
             exit_code(config.is_valid())
         }
         Command::Init(args) => init_cmd::run(&args, &config),
-        Command::Do { ticket } => do_cmd::run(&system, &config, &ticket),
+        Command::Do { ticket } => do_cmd::run(&system, &config, &ticket, do_cmd::Mode::Do),
+        Command::Resume { ticket } => do_cmd::run(&system, &config, &ticket, do_cmd::Mode::Resume),
         Command::Logs {
             ticket,
             last,

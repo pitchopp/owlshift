@@ -203,7 +203,9 @@ impl Brief {
         })
     }
 
-    /// Checks the rules the types alone do not carry: see [`validate_thread`].
+    /// Checks the rules the types alone do not carry: rounds increase through
+    /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
+    /// order, distinct questions of an earlier round.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)
     }

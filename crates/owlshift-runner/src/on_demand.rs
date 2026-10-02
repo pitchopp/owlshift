@@ -1,26 +1,33 @@
-//! `owlshift do TICKET`: one ticket turned into a verified pull request, on
-//! demand and in the foreground (roadmap P1, build plan OWL-20).
+//! `owlshift do TICKET` and `owlshift resume TICKET`: one ticket turned into
+//! a verified pull request, on demand and in the foreground (roadmap P1 and
+//! P2, build plan OWL-20 and "The answer check").
 //!
-//! [`OnDemand::run`] takes the project's lock, refuses a project a previous
-//! run may have tampered with ([`crate::project`]), reads the ticket and
-//! brings the dedicated checkout up to date. It checks the forge answers
-//! before an hour of Build, then runs the build role through the executor,
-//! following the core state machine: a failed run, a red project gate
-//! included, gets one more run with the failure in its brief, and a second
-//! one parks the ticket. A Build `done` whose gate passed is delivered by
-//! the Writer: the gated commit pushed to the ticket's branch, the pull
+//! Both take the project's lock, refuse a project a previous run may have
+//! tampered with ([`crate::project`]), read the ticket, bring the dedicated
+//! checkout up to date and read the ticket's ref ([`crate::ticket_ref`]).
+//! Before a Build, the forge is checked to answer and the project's rules are
+//! read at the base commit ([`crate::rules`]). The Build runs through the
+//! executor, following the core state machine: a failed run, a red project
+//! gate included, gets one more run with the failure in its brief, and a
+//! second one parks the ticket. A Build `done` whose gate passed is delivered
+//! by the Writer: the gated commit pushed to the ticket's branch, the pull
 //! request opened or found, its head checked to be that commit, its check
 //! set read, and the delivery report posted on the ticket. Every step is an
 //! event ([`crate::events`]).
 //!
-//! In this version the build stage is the whole pipeline: questions and a
-//! blocked run are printed, not posted (P2), the tracker's visible stage is
-//! not moved. The brief carries the project's rules, read once per `do`
-//! at the base commit ([`crate::rules`]).
+//! A Build that asks questions opens a round: the Writer posts them as a
+//! QUESTIONS comment, and the ticket ref keeps the ask and the core state.
+//! While they wait, `do` is refused; `resume` runs the answer check once the
+//! decider has answered ([`crate::answer_check`]), then resumes the Build,
+//! asks again what is missing, or parks the ticket. In this version the
+//! build stage is the whole pipeline, and the tracker's visible stage is not
+//! moved.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -42,22 +49,31 @@ use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::result::{self, Decision, Followup, Question, RunResult};
+use owlshift_contracts::refs::{Ask, AskKind, PersistedState, TicketQuestions};
+use owlshift_contracts::result::{
+    self, AnswerClass, Decision, Followup, Question, RunResult, Verdict as AnswerVerdict,
+};
 use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::pipeline::Pipeline;
-use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
+use owlshift_core::state::{Event, MAX_REASKS, ParkReason, Status, TicketState, Transition};
 
 use crate::agent_env::AgentEnv;
+use crate::answer_check;
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
     DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport, RunSpec,
 };
-use crate::project::{self, ProjectDirs};
+use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::rules;
-use crate::writer::{DeliveryReport, Gate, Writer};
+use crate::ticket_ref::{self, Stored, TicketRecord};
+use crate::writer::{DeliveryReport, Gate, QuestionsComment, ReaskComment, Writer};
 
 /// How long one Build run may take before its process tree is stopped.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// How long one answer check may take: it reads a brief and writes its
+/// verdicts.
+pub const ANSWER_CHECK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The forge hosts the executor's credential check asks git and gh about.
 pub const FORGE_HOSTS: &[&str] = &["github.com"];
@@ -65,6 +81,9 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 /// How many times the pull request is read before its head must be the
 /// pushed commit: GitHub updates a pull request's head shortly after a push.
 const HEAD_READS: u32 = 5;
+
+/// The pipeline of this version: the build stage alone, in the core machine.
+const PIPELINE: Pipeline = Pipeline::new(Variant::Trivial);
 
 /// The executor of `owlshift do`: `git` for the runner's own commands,
 /// `agent` for the environment of every agent, the credential check on
@@ -150,12 +169,16 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
     }
 }
 
-/// One `owlshift do`: the adapters, the executor and the project.
+/// One `owlshift do` or `owlshift resume`: the adapters, the executor and
+/// the project.
 pub struct OnDemand<'a> {
     pub executor: &'a Executor,
     pub tracker: &'a dyn Tracker,
     pub forge: &'a GitHubForge,
-    pub harness: &'a dyn Harness,
+    /// Runs the build role.
+    pub build: &'a dyn Harness,
+    /// Runs the answer check (`roles/answer_check.md`).
+    pub answer_check: &'a dyn Harness,
     /// What the dedicated checkout clones and fetches: the `origin` of the
     /// person's checkout.
     pub remote_url: &'a str,
@@ -199,7 +222,7 @@ impl fmt::Display for Delivered {
     }
 }
 
-/// Why `owlshift do` stopped short of a delivery.
+/// Why `owlshift do` or `owlshift resume` stopped short of a delivery.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stop {
     /// Another `owlshift do` holds the project.
@@ -208,12 +231,41 @@ pub enum Stop {
     Refused(String),
     /// A previous run's isolation check did not pass, or never ran.
     Unverified { marker: PathBuf, text: String },
-    /// The run asked questions, or found the ticket's premise false.
+    /// The run asked questions, or found the ticket's premise false. `posted`
+    /// is the round the questions were posted as on the ticket, or why they
+    /// were not.
     NeedsInput {
+        ticket: TicketId,
         status: result::Status,
         summary: String,
         questions: Vec<Question>,
+        posted: Result<NonZeroU32, String>,
     },
+    /// Questions wait for the decider, who has not commented since they
+    /// were asked, or since the last answer check read their answers.
+    Waiting {
+        ticket: TicketId,
+        round: u32,
+        decider: String,
+        since: Timestamp,
+    },
+    /// The answers left questions open: they were asked again on the ticket.
+    Reasked {
+        ticket: TicketId,
+        round: NonZeroU32,
+        /// Which re-ask of the round this was, from 1.
+        reask: u32,
+        /// The questions asked again, each with the answer check's verdict.
+        open: Vec<(Question, AnswerVerdict)>,
+    },
+    /// The decider asked a counter-question instead of answering; the
+    /// verdicts that say so.
+    CounterQuestion {
+        ticket: TicketId,
+        asked: Vec<AnswerVerdict>,
+    },
+    /// The answer check failed; it runs again on the same answers.
+    CheckFailed { ticket: TicketId, detail: String },
     /// The core machine parked the ticket.
     Parked { reason: ParkReason, detail: String },
     /// The harness reached its usage limit.
@@ -241,9 +293,11 @@ impl fmt::Display for Stop {
                 marker.display()
             ),
             Self::NeedsInput {
+                ticket,
                 status,
                 summary,
                 questions,
+                posted,
             } => {
                 if *status == result::Status::PremiseFalse {
                     writeln!(f, "Stopped: the run found the ticket's premise false.")?;
@@ -264,12 +318,65 @@ impl fmt::Display for Stop {
                         writeln!(f, "Recommendation: {recommendation}")?;
                     }
                 }
+                match posted {
+                    Ok(round) => write!(
+                        f,
+                        "\nThe questions are on the ticket as round {round}: answer there, then \
+                         run `owlshift resume {ticket}`."
+                    ),
+                    Err(why) => write!(
+                        f,
+                        "\nNothing was posted on the ticket ({why}): answer there, then run \
+                         `owlshift do {ticket}` again; the run resumes from its plan."
+                    ),
+                }
+            }
+            Self::Waiting {
+                ticket,
+                round,
+                decider,
+                since,
+            } => write!(
+                f,
+                "Waiting: the questions of round {round} wait for {decider}, with no new comment \
+                 from them since {since}. Once they answer on the ticket, run `owlshift resume \
+                 {ticket}` again."
+            ),
+            Self::Reasked {
+                ticket,
+                round,
+                reask,
+                open,
+            } => {
+                writeln!(
+                    f,
+                    "Asked again on the ticket (round {round}, re-ask {reask} of {MAX_REASKS}): \
+                     the answers left these questions open."
+                )?;
+                for (question, verdict) in open {
+                    writeln!(f, "{}: {}", question.id, verdict.reason)?;
+                }
                 write!(
                     f,
-                    "\nNothing was posted on the ticket: answer there, then run `owlshift do` \
-                     again; the run resumes from its plan."
+                    "Once the decider answers on the ticket, run `owlshift resume {ticket}` again."
                 )
             }
+            Self::CounterQuestion { ticket, asked } => {
+                writeln!(f, "The decider asked back instead of answering:")?;
+                for verdict in asked {
+                    writeln!(f, "{}: {}", verdict.question, verdict.reason)?;
+                }
+                write!(
+                    f,
+                    "Reply on the ticket (Owlshift does not reply yet); once the decider comments \
+                     again, run `owlshift resume {ticket}` to check the answers."
+                )
+            }
+            Self::CheckFailed { ticket, detail } => write!(
+                f,
+                "The answer check failed: {detail}. Run `owlshift resume {ticket}` to check the \
+                 same answers again; a second failure parks the ticket."
+            ),
             Self::Parked { reason, detail } => {
                 write!(f, "Parked: {}: {detail}", describe(*reason))?;
                 if *reason == ParkReason::IsolationBreach {
@@ -312,7 +419,29 @@ fn refused(what: &str, error: impl fmt::Display) -> Stop {
     Stop::Refused(format!("{what}: {error}"))
 }
 
-/// What the runs of one `owlshift do` gathered for the delivery report.
+fn core_error(error: impl fmt::Debug) -> Stop {
+    Stop::Refused(format!("the core state machine: {error:?}"))
+}
+
+fn nothing_to_resume(ticket: &TicketId) -> Stop {
+    Stop::Refused(format!(
+        "nothing to resume: no question was asked on {ticket}; run `owlshift do {ticket}`"
+    ))
+}
+
+/// Whether the ticket waits for its decider's answers, parked or not.
+fn awaits_input(state: &TicketState) -> bool {
+    matches!(
+        state.status(),
+        Status::NeedsInput { .. }
+            | Status::Parked {
+                awaiting_input: true,
+                ..
+            }
+    )
+}
+
+/// What the runs of one command gathered for the delivery report.
 #[derive(Default)]
 struct Gathered {
     gate_failure: Option<GateFailure>,
@@ -320,16 +449,145 @@ struct Gathered {
     followups: Vec<Followup>,
 }
 
+/// Which command runs.
+#[derive(Clone, Copy)]
+enum Command {
+    Do,
+    Resume,
+}
+
+impl Command {
+    fn name(self) -> &'static str {
+        match self {
+            Command::Do => "do",
+            Command::Resume => "resume",
+        }
+    }
+}
+
+/// What a command holds once the project is its own and the ticket read.
+struct Prepared {
+    _lock: ProjectLock,
+    ticket: TicketId,
+    found: Ticket,
+    decider: Person,
+    base: Base,
+    checkout: PathBuf,
+    worktree: PathBuf,
+    branch: String,
+    /// The ticket ref as read, then as last written; `None` until a question
+    /// round opens.
+    stored: Option<Stored>,
+}
+
+impl Prepared {
+    /// The asks the ticket ref keeps, none without one.
+    fn questions(&self) -> TicketQuestions {
+        self.stored
+            .as_ref()
+            .map(|stored| stored.record.questions.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// What a Build needs beyond the preparation, read just before its first
+/// run.
+struct Dispatched {
+    head: Branch,
+    base_branch: Branch,
+    rules: Vec<Rule>,
+}
+
+/// One run through the executor: its id, its report, and the isolation
+/// breaches it was quarantined for.
+struct Ran {
+    run: String,
+    report: RunReport,
+    breaches: Vec<String>,
+}
+
 impl OnDemand<'_> {
-    /// Runs `ticket` to a delivered pull request; see the module
-    /// documentation.
+    /// `owlshift do`: runs `ticket` to a delivered pull request, from Ready;
+    /// see the module documentation. Refused while its questions wait.
     pub fn run(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
+        let mut p = self.prepare(ticket, Command::Do)?;
+        let round = match &p.stored {
+            Some(stored) => {
+                let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
+                if awaits_input(&state) {
+                    return Err(Stop::Refused(format!(
+                        "the questions of round {} on {ticket} wait for {}: answer them on the \
+                         ticket, then run `owlshift resume {ticket}`",
+                        state.round(),
+                        p.decider.name
+                    )));
+                }
+                state.round()
+            }
+            None => 0,
+        };
+        // From Ready, keeping the rounds already asked: their asks stay in
+        // the thread, and a new round follows them.
+        let ready =
+            TicketState::restore(Status::Active(Stage::Ready), round, 0, 0).map_err(core_error)?;
+        let state = match ready.apply(PIPELINE, Event::Dispatched) {
+            Ok(Transition::To(state)) => state,
+            other => return Err(core_error(other)),
+        };
+        let dispatched = self.dispatch(&p, Command::Do, sink)?;
+        self.build(&mut p, &dispatched, state, sink)
+    }
+
+    /// `owlshift resume`: picks `ticket` up where its ticket ref left it. A
+    /// parked ticket is restarted. While questions wait, the answer check
+    /// runs once the decider has answered, and the ticket resumes, its open
+    /// questions are asked again, or it parks; a ticket at Build runs on to a
+    /// delivery.
+    pub fn resume(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
+        let mut p = self.prepare(ticket, Command::Resume)?;
+        let Some(stored) = &p.stored else {
+            return Err(nothing_to_resume(ticket));
+        };
+        let mut state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
+        // A person typing `resume` on a parked ticket is the restart the
+        // core waits for.
+        if let Status::Parked { at, .. } = state.status() {
+            state = match state.apply(PIPELINE, Event::Restarted) {
+                Ok(Transition::To(state)) => state,
+                other => return Err(core_error(other)),
+            };
+            self.keep(&mut p, &state)?;
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Decision,
+                data([("restarted", json!(true)), ("stage", json!(stage_name(at)))]),
+            );
+        }
+        if let Status::NeedsInput { .. } = state.status() {
+            state = self.check_answers(&mut p, state, sink)?;
+        }
+        if state.status() != Status::Active(Stage::Build) {
+            return Err(Stop::Refused(format!(
+                "nothing to resume: {ticket} is at {} and waits for no answer; run `owlshift do \
+                 {ticket}` to run it again",
+                stage_name(state.stage())
+            )));
+        }
+        let dispatched = self.dispatch(&p, Command::Resume, sink)?;
+        self.build(&mut p, &dispatched, state, sink)
+    }
+
+    /// Everything before a run: the lock, the marker, the confinement, the
+    /// ticket and its decider, the dedicated checkout, the kept worktree's
+    /// link, and the ticket ref.
+    fn prepare(&self, ticket: &TicketId, command: Command) -> Result<Prepared, Stop> {
         check_team(self.config, ticket).map_err(Stop::Refused)?;
         // The lock before the marker: every run writes the marker when it
         // starts, so while another `do` works the project the marker only
         // says a run is in flight. Once the lock is ours, a marker means a
         // run that ended, or was cut off, before its check passed.
-        let _lock = match self.dirs.lock() {
+        let lock = match self.dirs.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return Err(Stop::Busy(self.dirs.root().to_owned())),
             Err(error) => return Err(refused("the project's lock", error)),
@@ -352,9 +610,17 @@ impl OnDemand<'_> {
             .agent
             .sandbox_ready()
             .map_err(|e| Stop::Refused(e.to_string()))?;
-        self.harness
-            .sandbox_needs(&self.executor.agent)
-            .map_err(|e| Stop::Refused(e.to_string()))?;
+        for harness in [self.build, self.answer_check] {
+            harness
+                .sandbox_needs(&self.executor.agent)
+                .map_err(|e| Stop::Refused(e.to_string()))?;
+        }
+        // The ticket ref lives in the dedicated checkout: without one,
+        // nothing was asked yet, and nothing is cloned to find that out.
+        let checkout = self.dirs.checkout();
+        if matches!(command, Command::Resume) && fs::symlink_metadata(&checkout).is_err() {
+            return Err(nothing_to_resume(ticket));
+        }
         let found = self
             .tracker
             .ticket(ticket)
@@ -368,7 +634,6 @@ impl OnDemand<'_> {
         let git = &self.executor.git;
         let base =
             project::sync_checkout(git, self.dirs, self.remote_url).map_err(Stop::Refused)?;
-        let checkout = self.dirs.checkout();
         let worktree = self.dirs.worktree(ticket);
         // A worktree kept from an earlier `do` is trusted only while its
         // `.git` still links it to the checkout. The executor refuses such a
@@ -387,31 +652,53 @@ impl OnDemand<'_> {
                 text,
             });
         }
-        let branch = branch_for(ticket);
-        let head = Branch::new(&branch).map_err(|e| refused("the ticket's branch", e))?;
-        let base_branch = Branch::new(&base.branch).map_err(|e| refused("the base branch", e))?;
-        // The forge is asked before an hour of Build: a refused token or an
-        // unknown repository shows now.
+        let stored = ticket_ref::read(git, &checkout, ticket)
+            .map_err(|e| refused("reading the ticket's ref", e))?;
+        Ok(Prepared {
+            _lock: lock,
+            ticket: ticket.clone(),
+            found,
+            decider,
+            base,
+            checkout,
+            worktree,
+            branch: branch_for(ticket),
+            stored,
+        })
+    }
+
+    /// What a Build needs, read just before its first run: the forge is asked
+    /// before an hour of Build, so a refused token or an unknown repository
+    /// shows now, and the project's rules come from the base commit, after
+    /// the fetch, never from the ticket's branch, which agents write. Every
+    /// Build run of the command gets the same rules.
+    fn dispatch(
+        &self,
+        p: &Prepared,
+        command: Command,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Dispatched, Stop> {
+        let head = Branch::new(&p.branch).map_err(|e| refused("the ticket's branch", e))?;
+        let base_branch = Branch::new(&p.base.branch).map_err(|e| refused("the base branch", e))?;
         let open = self
             .forge
             .find_open_pull_request(&head, &base_branch)
             .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
-        // The rules come from the base commit, after the fetch, never from
-        // the ticket's branch, which agents write; every run of this `do`
-        // gets the same.
-        let rules = rules::project_rules(git, &checkout, &base, &self.config.stack)
-            .map_err(|e| refused("the project's rules", e))?;
+        let rules =
+            rules::project_rules(&self.executor.git, &p.checkout, &p.base, &self.config.stack)
+                .map_err(|e| refused("the project's rules", e))?;
         sink.emit(
-            ticket,
+            &p.ticket,
             None,
             EventKind::Dispatch,
             data([
-                ("title", json!(found.title)),
-                ("branch", json!(branch)),
-                ("base", json!(base.remote_ref)),
-                ("base_commit", json!(base.commit)),
-                ("worktree", path(&worktree)),
-                ("checkout", path(&checkout)),
+                ("command", json!(command.name())),
+                ("title", json!(p.found.title)),
+                ("branch", json!(p.branch)),
+                ("base", json!(p.base.remote_ref)),
+                ("base_commit", json!(p.base.commit)),
+                ("worktree", path(&p.worktree)),
+                ("checkout", path(&p.checkout)),
                 ("pull_request", json!(open.map(|pr| pr.number))),
                 (
                     "rules",
@@ -419,100 +706,41 @@ impl OnDemand<'_> {
                 ),
             ]),
         );
+        Ok(Dispatched {
+            head,
+            base_branch,
+            rules,
+        })
+    }
 
-        // The build stage alone, in the core machine: its breaker gives a
-        // failed run one more run before it parks the ticket.
-        let pipeline = Pipeline::new(Variant::Trivial);
-        let ready = TicketState::restore(Status::Active(Stage::Ready), 0, 0, 0)
-            .map_err(|e| Stop::Refused(format!("the core state machine: {e:?}")))?;
-        let mut state = match ready.apply(pipeline, Event::Dispatched) {
-            Ok(Transition::To(state)) => state,
-            other => return Err(Stop::Refused(format!("the core state machine: {other:?}"))),
-        };
+    /// Runs Build from `state` until it delivers or stops: a failed run gets
+    /// one more run before the core parks the ticket, questions open a round.
+    fn build(
+        &self,
+        p: &mut Prepared,
+        dispatched: &Dispatched,
+        mut state: TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        self.keep(p, &state)?;
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
         let report = loop {
             attempt += 1;
-            let (run, run_dir) = new_run_dir(&self.dirs.runs(ticket))
-                .map_err(|e| refused("the run directory", e))?;
-            let comments = self
-                .tracker
-                .comments(ticket)
-                .map_err(|e| refused(&format!("reading the comments of {ticket}"), e))?;
-            let brief = self.brief(&found, &decider, &comments, &worktree, &rules, &gathered);
-            sink.emit(
-                ticket,
-                Some(&run),
-                EventKind::RunStarted,
-                data([
-                    ("role", json!("build")),
-                    ("attempt", json!(attempt)),
-                    ("run_dir", path(&run_dir)),
-                    ("resumes_plan", json!(brief.checkpoint.is_some())),
-                    ("gate_failure", json!(brief.gate_failure.is_some())),
-                ]),
+            let comments = self.comments(&p.ticket)?;
+            let brief = self.brief(
+                p,
+                Role::Build,
+                &comments,
+                &dispatched.rules,
+                gathered.gate_failure.clone(),
             );
-            let marker = format!(
-                "Run {run} of {ticket} started at {}; its isolation check has not passed.\n",
-                Timestamp::now()
-            );
-            self.dirs
-                .mark_unverified(&marker)
-                .map_err(|e| refused("the project's marker", e))?;
-            let spec = RunSpec {
-                main: &checkout,
-                worktree: &worktree,
-                branch: &branch,
-                // The commit resolved after the fetch, not the name: a run
-                // can move a remote-tracking ref (OWL-51).
-                base: &base.commit,
-                run_dir: &run_dir,
-                brief: &brief,
-            };
-            let report = match self.executor.run(&spec, self.harness) {
-                Ok(report) => report,
-                Err(error) => {
-                    // Nothing was spawned: nothing to verify.
-                    let _ = self.dirs.clear_unverified();
-                    sink.emit(
-                        ticket,
-                        Some(&run),
-                        EventKind::RunEnded,
-                        data([
-                            ("outcome", json!("refused")),
-                            ("reason", json!(error.to_string())),
-                        ]),
-                    );
-                    return Err(refused("the run could not start", error));
-                }
-            };
-            // The executor's isolation check starts with the worktree's
-            // `.git` link: a redirected one is among the violations.
-            let breaches: Vec<String> = match &report.outcome {
-                Outcome::Quarantined(violations) => {
-                    violations.iter().map(ToString::to_string).collect()
-                }
-                _ => Vec::new(),
-            };
-            let marked = if breaches.is_empty() {
-                self.dirs.clear_unverified()
-            } else {
-                let lines: Vec<String> = breaches.iter().map(|b| format!("- {b}")).collect();
-                self.dirs.mark_unverified(&format!(
-                    "Run {run} of {ticket} broke isolation:\n{}\n",
-                    lines.join("\n")
-                ))
-            };
-            marked.map_err(|e| refused("the project's marker", e))?;
-            sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
-            if let Some(usage) = &report.usage {
-                sink.emit(ticket, Some(&run), EventKind::Usage, usage_data(usage));
-            }
-            if let Some(gate) = &report.gate {
+            let ran = self.execute(p, self.executor, self.build, &brief, attempt, sink)?;
+            if let Some(gate) = &ran.report.gate {
                 gathered.gate_failure = gate.failure.clone();
             }
-            let (event, result) = if breaches.is_empty() {
-                core_event(&report.outcome)
+            let (event, result) = if ran.breaches.is_empty() {
+                core_event(&ran.report.outcome)
             } else {
                 (Event::Quarantined, None)
             };
@@ -520,119 +748,498 @@ impl OnDemand<'_> {
                 gather(&mut gathered.decisions, &result.decisions);
                 gather(&mut gathered.followups, &result.followups);
             }
-            match state.apply(pipeline, event) {
+            match state.apply(PIPELINE, event) {
                 Ok(Transition::To(next)) => state = next,
-                Ok(Transition::Parked { reason, .. }) => {
-                    let detail = if breaches.is_empty() {
-                        park_detail(&report.outcome)
-                    } else {
-                        breaches.join("; ")
-                    };
-                    sink.emit(
-                        ticket,
-                        Some(&run),
-                        EventKind::Decision,
-                        data([
-                            ("parked", json!(format!("{reason:?}"))),
-                            ("detail", json!(detail)),
-                        ]),
-                    );
-                    return Err(Stop::Parked { reason, detail });
-                }
-                other => return Err(Stop::Refused(format!("the core state machine: {other:?}"))),
+                Ok(Transition::Parked {
+                    state: parked,
+                    reason,
+                }) => return Err(self.park(p, &parked, reason, &ran, sink)),
+                other => return Err(core_error(other)),
             }
             match state.status() {
                 Status::Active(Stage::Build) => {
-                    if let Outcome::UsageLimit { resets_at } = report.outcome {
+                    self.keep(p, &state)?;
+                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
                         return Err(Stop::UsageLimit { resets_at });
                     }
                 }
                 Status::NeedsInput { .. } => {
-                    let result = result.expect("a question round comes from a result");
-                    sink.emit(
-                        ticket,
-                        Some(&run),
-                        EventKind::Gate,
-                        data([
-                            ("opened", json!("questions")),
-                            ("round", json!(state.round())),
-                            ("status", status_name(result.status)),
-                            ("questions", json!(result.questions.len())),
-                        ]),
-                    );
-                    return Err(Stop::NeedsInput {
-                        status: result.status,
-                        summary: result.summary.clone(),
-                        questions: result.questions.clone(),
-                    });
+                    let result = result.ok_or_else(|| {
+                        Stop::Refused("a question round without a result".to_owned())
+                    })?;
+                    return Err(self.ask(p, &state, result, &ran.run, sink));
                 }
                 // Build completed: in this version, delivery follows.
-                _ => break report,
+                _ => {
+                    self.keep(p, &state)?;
+                    break ran.report;
+                }
             }
         };
-        self.deliver(ticket, &found, &head, &base_branch, report, gathered, sink)
+        self.deliver(p, dispatched, report, gathered, sink)
     }
 
-    /// The build brief of one run.
+    /// Opens a question round: the Writer posts the questions, and the
+    /// ticket ref keeps the ask and the state. Returns the stop that says
+    /// so. A false premise with no question, or a post that failed, keeps
+    /// nothing: the questions are printed.
+    fn ask(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        result: &RunResult,
+        run: &str,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let ticket = p.ticket.clone();
+        sink.emit(
+            &ticket,
+            Some(run),
+            EventKind::Gate,
+            data([
+                ("opened", json!("questions")),
+                ("round", json!(state.round())),
+                ("status", status_name(result.status)),
+                ("questions", json!(result.questions.len())),
+            ]),
+        );
+        let stop = |posted| Stop::NeedsInput {
+            ticket: ticket.clone(),
+            status: result.status,
+            summary: result.summary.clone(),
+            questions: result.questions.clone(),
+            posted,
+        };
+        let Some(round) = NonZeroU32::new(state.round()) else {
+            return stop(Err("no question round is open".to_owned()));
+        };
+        if result.questions.is_empty() {
+            return stop(Err("the run asked no question".to_owned()));
+        }
+        let comment = QuestionsComment {
+            ticket: ticket.clone(),
+            round,
+            summary: result.summary.clone(),
+            questions: result.questions.clone(),
+            premise_false: result.status == result::Status::PremiseFalse,
+        };
+        let posted = match Writer::new(self.tracker).post_questions(&comment) {
+            Ok(posted) => posted,
+            Err(error) => return stop(Err(format!("posting them failed: {error}"))),
+        };
+        sink.emit(
+            &ticket,
+            Some(run),
+            EventKind::TrackerWrite,
+            comment_written("QUESTIONS", &posted),
+        );
+        let mut questions = p.questions();
+        questions.asks.push(Ask {
+            kind: AskKind::Questions,
+            round,
+            at: posted.created_at,
+            comment: posted.id.clone(),
+            questions: result.questions.clone(),
+        });
+        if let Err(error) = self.store(p, state, questions) {
+            return Stop::Refused(format!(
+                "the questions of round {round} are on the ticket (comment {}), but keeping them \
+                 in the ticket's ref failed: {error}; run `owlshift do {ticket}` to ask them again",
+                posted.id
+            ));
+        }
+        stop(Ok(round))
+    }
+
+    /// Runs the answer check once the decider has answered, and acts on its
+    /// one core event: the ticket resumes (the state returned), its open
+    /// questions are asked again, the counter-question waits for a reply, or
+    /// it parks (a stop). A failed or interrupted check moves nothing the
+    /// next one reads, so it is retried on the same answers.
+    fn check_answers(
+        &self,
+        p: &mut Prepared,
+        state: TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketState, Stop> {
+        let ticket = p.ticket.clone();
+        let mut questions = p.questions();
+        let comments = self.comments(&ticket)?;
+        let Some(since) = questions.answers_after() else {
+            return Err(Stop::Refused(format!(
+                "the ticket's ref of {ticket} waits for answers but keeps no ask"
+            )));
+        };
+        if answer_check::new_answer(&comments, &p.decider, &questions).is_none() {
+            return Err(Stop::Waiting {
+                ticket,
+                round: state.round(),
+                decider: p.decider.name.clone(),
+                since,
+            });
+        }
+        let read_through = answer_check::newest_decider_edit(&comments, &p.decider);
+        let brief = self.brief(p, Role::AnswerCheck, &comments, &[], None);
+        let executor = Executor {
+            timeout: ANSWER_CHECK_TIMEOUT,
+            ..self.executor.clone()
+        };
+        let ran = self.execute(p, &executor, self.answer_check, &brief, 1, sink)?;
+        let (event, result) = if ran.breaches.is_empty() {
+            answer_check::event(&ran.report.outcome)
+        } else {
+            (Event::Quarantined, None)
+        };
+        let verdicts: Vec<AnswerVerdict> = match (event, result) {
+            (Event::Answered | Event::Incomplete | Event::CounterQuestion, Some(result)) => {
+                // The answers this check read are judged: only a newer
+                // comment of the decider is a new answer.
+                questions.checked_through = read_through.max(questions.checked_through);
+                result.verdicts.clone()
+            }
+            _ => Vec::new(),
+        };
+        let next = match state.apply(PIPELINE, event) {
+            Ok(Transition::To(next)) => next,
+            Ok(Transition::Parked {
+                state: parked,
+                reason,
+            }) => {
+                self.store(p, &parked, questions)
+                    .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
+                return Err(self.park(p, &parked, reason, &ran, sink));
+            }
+            other => return Err(core_error(other)),
+        };
+        let checked = |outcome: &str| {
+            data([
+                ("answer_check", json!(outcome)),
+                ("round", json!(next.round())),
+                ("reasks", json!(next.reasks())),
+                ("verdicts", verdict_classes(&verdicts)),
+            ])
+        };
+        match event {
+            Event::Answered => {
+                self.store(p, &next, questions)
+                    .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
+                sink.emit(
+                    &ticket,
+                    Some(&ran.run),
+                    EventKind::Gate,
+                    checked("answered"),
+                );
+                Ok(next)
+            }
+            Event::Incomplete => {
+                let round = NonZeroU32::new(next.round())
+                    .ok_or_else(|| Stop::Refused("no question round is open".to_owned()))?;
+                let open = answer_check::open_questions(&brief, &verdicts);
+                if open.is_empty() {
+                    return Err(Stop::Refused(
+                        "the answer check found the answers incomplete but no question open"
+                            .to_owned(),
+                    ));
+                }
+                let reask = ReaskComment {
+                    ticket: ticket.clone(),
+                    round,
+                    reask: next.reasks(),
+                    open: open.clone(),
+                };
+                let posted = Writer::new(self.tracker)
+                    .post_reask(&reask)
+                    .map_err(|e| refused("posting the re-ask on the ticket", e))?;
+                sink.emit(
+                    &ticket,
+                    Some(&ran.run),
+                    EventKind::TrackerWrite,
+                    comment_written("RE-ASK", &posted),
+                );
+                questions.asks.push(Ask {
+                    kind: AskKind::Reask,
+                    round,
+                    at: posted.created_at,
+                    comment: posted.id.clone(),
+                    questions: open.iter().map(|(question, _)| question.clone()).collect(),
+                });
+                self.store(p, &next, questions).map_err(|e| {
+                    Stop::Refused(format!(
+                        "the re-ask is on the ticket (comment {}), but keeping it in the \
+                         ticket's ref failed: {e}",
+                        posted.id
+                    ))
+                })?;
+                sink.emit(
+                    &ticket,
+                    Some(&ran.run),
+                    EventKind::Gate,
+                    checked("incomplete"),
+                );
+                Err(Stop::Reasked {
+                    ticket,
+                    round,
+                    reask: next.reasks(),
+                    open,
+                })
+            }
+            Event::CounterQuestion => {
+                self.store(p, &next, questions)
+                    .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
+                sink.emit(
+                    &ticket,
+                    Some(&ran.run),
+                    EventKind::Gate,
+                    checked("counter_question"),
+                );
+                Err(Stop::CounterQuestion {
+                    ticket,
+                    asked: verdicts
+                        .into_iter()
+                        .filter(|verdict| verdict.class == AnswerClass::CounterQuestion)
+                        .collect(),
+                })
+            }
+            Event::RunFailed => {
+                self.store(p, &next, questions)
+                    .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
+                Err(Stop::CheckFailed {
+                    ticket,
+                    detail: park_detail(&ran.report.outcome),
+                })
+            }
+            Event::Interrupted => match ran.report.outcome {
+                Outcome::UsageLimit { resets_at } => Err(Stop::UsageLimit { resets_at }),
+                _ => Err(core_error(event)),
+            },
+            other => Err(core_error(other)),
+        }
+    }
+
+    /// Parks the ticket: keeps its parked state when it has a ticket ref,
+    /// records the decision, and returns the stop that says why.
+    fn park(
+        &self,
+        p: &mut Prepared,
+        parked: &TicketState,
+        reason: ParkReason,
+        ran: &Ran,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let detail = if ran.breaches.is_empty() {
+            park_detail(&ran.report.outcome)
+        } else {
+            ran.breaches.join("; ")
+        };
+        if let Err(stop) = self.keep(p, parked) {
+            return stop;
+        }
+        sink.emit(
+            &p.ticket,
+            Some(&ran.run),
+            EventKind::Decision,
+            data([
+                ("parked", json!(format!("{reason:?}"))),
+                ("detail", json!(detail)),
+            ]),
+        );
+        Stop::Parked { reason, detail }
+    }
+
+    /// Keeps `state` in the ticket's ref, when the ticket has one: a ref is
+    /// made only once a question round opens.
+    fn keep(&self, p: &mut Prepared, state: &TicketState) -> Result<(), Stop> {
+        if p.stored.is_none() {
+            return Ok(());
+        }
+        let questions = p.questions();
+        self.store(p, state, questions)
+            .map_err(|e| refused("keeping the ticket's state in its ref", e))
+    }
+
+    /// Writes `state` and `questions` as the ticket's ref, unless it already
+    /// holds them.
+    fn store(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        questions: TicketQuestions,
+    ) -> Result<(), String> {
+        let record = TicketRecord {
+            state: PersistedState::from(state),
+            questions,
+        };
+        if p.stored
+            .as_ref()
+            .is_some_and(|stored| stored.record == record)
+        {
+            return Ok(());
+        }
+        let previous = p.stored.as_ref().map(|stored| stored.commit.as_str());
+        let commit = ticket_ref::write(
+            &self.executor.git,
+            &p.checkout,
+            &p.ticket,
+            &record,
+            previous,
+        )?;
+        p.stored = Some(Stored { record, commit });
+        Ok(())
+    }
+
+    /// Runs one role through the executor, between the project's marker
+    /// and the events: `run_started`, `run_ended`, and `usage` when the
+    /// harness reported it.
+    fn execute(
+        &self,
+        p: &Prepared,
+        executor: &Executor,
+        harness: &dyn Harness,
+        brief: &Brief,
+        attempt: u32,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Ran, Stop> {
+        let ticket = &p.ticket;
+        let (run, run_dir) =
+            new_run_dir(&self.dirs.runs(ticket)).map_err(|e| refused("the run directory", e))?;
+        sink.emit(
+            ticket,
+            Some(&run),
+            EventKind::RunStarted,
+            data([
+                ("role", json!(brief.role.as_str())),
+                ("attempt", json!(attempt)),
+                ("run_dir", path(&run_dir)),
+                ("resumes_plan", json!(brief.checkpoint.is_some())),
+                ("gate_failure", json!(brief.gate_failure.is_some())),
+            ]),
+        );
+        let marker = format!(
+            "Run {run} of {ticket} started at {}; its isolation check has not passed.\n",
+            Timestamp::now()
+        );
+        self.dirs
+            .mark_unverified(&marker)
+            .map_err(|e| refused("the project's marker", e))?;
+        let spec = RunSpec {
+            main: &p.checkout,
+            worktree: &p.worktree,
+            branch: &p.branch,
+            // The commit resolved after the fetch, not the name: a run can
+            // move a remote-tracking ref (OWL-51).
+            base: &p.base.commit,
+            run_dir: &run_dir,
+            brief,
+        };
+        let report = match executor.run(&spec, harness) {
+            Ok(report) => report,
+            Err(error) => {
+                // Nothing was spawned: nothing to verify.
+                let _ = self.dirs.clear_unverified();
+                sink.emit(
+                    ticket,
+                    Some(&run),
+                    EventKind::RunEnded,
+                    data([
+                        ("outcome", json!("refused")),
+                        ("reason", json!(error.to_string())),
+                    ]),
+                );
+                return Err(refused("the run could not start", error));
+            }
+        };
+        // The executor's isolation check starts with the worktree's `.git`
+        // link: a redirected one is among the violations.
+        let breaches: Vec<String> = match &report.outcome {
+            Outcome::Quarantined(violations) => {
+                violations.iter().map(ToString::to_string).collect()
+            }
+            _ => Vec::new(),
+        };
+        let marked = if breaches.is_empty() {
+            self.dirs.clear_unverified()
+        } else {
+            let lines: Vec<String> = breaches.iter().map(|b| format!("- {b}")).collect();
+            self.dirs.mark_unverified(&format!(
+                "Run {run} of {ticket} broke isolation:\n{}\n",
+                lines.join("\n")
+            ))
+        };
+        marked.map_err(|e| refused("the project's marker", e))?;
+        sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
+        if let Some(usage) = &report.usage {
+            sink.emit(ticket, Some(&run), EventKind::Usage, usage_data(usage));
+        }
+        Ok(Ran {
+            run,
+            report,
+            breaches,
+        })
+    }
+
+    fn comments(&self, ticket: &TicketId) -> Result<Vec<Comment>, Stop> {
+        self.tracker
+            .comments(ticket)
+            .map_err(|e| refused(&format!("reading the comments of {ticket}"), e))
+    }
+
+    /// The brief of one run of `role`: Build writes in the worktree and
+    /// resumes from the plan it left; the answer check only reads, and gets
+    /// no rule, its context kept to the ticket, the questions and the
+    /// answers (architecture section 9).
     fn brief(
         &self,
-        ticket: &Ticket,
-        decider: &Person,
+        p: &Prepared,
+        role: Role,
         comments: &[Comment],
-        worktree: &Path,
         rules: &[Rule],
-        gathered: &Gathered,
+        gate_failure: Option<GateFailure>,
     ) -> Brief {
-        let thread = comments
-            .iter()
-            .map(|comment| ThreadEntry::Comment {
-                at: comment.created_at,
-                author: comment_author(comment, decider),
-                body: comment.body.clone(),
-            })
-            .collect();
+        let build = role == Role::Build;
         Brief {
             format: Format,
-            role: Role::Build,
+            role,
             project: self.forge.repo().to_string(),
             ticket: TicketBrief {
-                id: ticket.id.clone(),
-                title: ticket.title.clone(),
+                id: p.found.id.clone(),
+                title: p.found.title.clone(),
                 url: None,
-                labels: ticket.labels.clone(),
-                author: account_author(&ticket.author, decider),
-                description: ticket.description.clone(),
+                labels: p.found.labels.clone(),
+                author: account_author(&p.found.author, &p.decider),
+                description: p.found.description.clone(),
             },
-            decider: decider.name.clone(),
-            thread,
-            checkpoint: checkpoint(worktree),
+            decider: p.decider.name.clone(),
+            thread: thread(comments, &p.questions().asks, &p.decider),
+            checkpoint: if build { checkpoint(&p.worktree) } else { None },
             zones: Vec::new(),
             resources: Vec::new(),
             rules: rules.to_vec(),
             permissions: Permissions {
-                level: PermissionLevel::WriteWorktree,
+                level: if build {
+                    PermissionLevel::WriteWorktree
+                } else {
+                    PermissionLevel::ReadOnly
+                },
                 network: false,
                 browser: false,
             },
             gate: self.config.stack.gate.clone(),
-            gate_failure: gathered.gate_failure.clone(),
+            gate_failure,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }
     }
 
     /// Delivers a Build `done` whose gate passed. The push leaves from the
     /// dedicated checkout, never from the worktree (`Writer::push_branch`).
-    #[allow(clippy::too_many_arguments)]
     fn deliver(
         &self,
-        ticket: &TicketId,
-        found: &Ticket,
-        head: &Branch,
-        base: &Branch,
+        p: &Prepared,
+        dispatched: &Dispatched,
         report: RunReport,
         gathered: Gathered,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
+        let (ticket, head, base) = (&p.ticket, &dispatched.head, &dispatched.base_branch);
         let (Outcome::Finished { result, .. }, Some(gate)) = (&report.outcome, &report.gate) else {
             return Err(Stop::Delivery(
                 "the run did not report a passing gate".to_owned(),
@@ -648,9 +1255,8 @@ impl OnDemand<'_> {
         let delivery =
             |what: &str, error: &dyn fmt::Display| Stop::Delivery(format!("{what}: {error}"));
 
-        let checkout = self.dirs.checkout();
         let pushed = writer
-            .push_branch(&self.executor.git, &checkout, "origin", &commit, head)
+            .push_branch(&self.executor.git, &p.checkout, "origin", &commit, head)
             .map_err(|e| delivery("pushing the branch", &e))?;
         sink.emit(
             ticket,
@@ -667,7 +1273,7 @@ impl OnDemand<'_> {
 
         let (title, body) = match &result.pr {
             Some(pr) => (pr.title.clone(), pr.body.clone()),
-            None => (found.title.clone(), result.summary.clone()),
+            None => (p.found.title.clone(), result.summary.clone()),
         };
         let opened = writer
             .open_pull_request(self.forge, head, base, &title, &body)
@@ -762,12 +1368,68 @@ impl OnDemand<'_> {
     }
 }
 
+/// A brief's thread: each comment as [`comment_author`] marks it, but for
+/// the runner's own comments that posted an ask, whose place the ask takes
+/// as a `questions` or `reask` entry. An ask goes after the comments of its
+/// time or earlier, so one whose comment is gone from the tracker still
+/// takes its place; a comment posted in the same second as an ask reads as
+/// before it.
+pub(crate) fn thread(comments: &[Comment], asks: &[Ask], decider: &Person) -> Vec<ThreadEntry> {
+    let posted: HashSet<&str> = asks.iter().map(|ask| ask.comment.as_str()).collect();
+    let mut asks = asks.iter().peekable();
+    let mut thread = Vec::new();
+    for comment in comments {
+        if posted.contains(comment.id.as_str()) {
+            continue;
+        }
+        while let Some(ask) = asks.next_if(|ask| ask.at < comment.created_at) {
+            thread.push(ask.entry());
+        }
+        thread.push(ThreadEntry::Comment {
+            at: comment.created_at,
+            author: comment_author(comment, decider),
+            body: comment.body.clone(),
+        });
+    }
+    thread.extend(asks.map(Ask::entry));
+    thread
+}
+
+/// The `tracker_write` event of a marked comment the runner posted.
+fn comment_written(kind: &str, comment: &Comment) -> Data {
+    data([
+        ("target", json!("tracker")),
+        ("action", json!("comment")),
+        ("kind", json!(kind)),
+        ("comment", json!(comment.id)),
+    ])
+}
+
+/// Each verdict's question and class, for an event; the reasons stay in the
+/// run's result.
+fn verdict_classes(verdicts: &[AnswerVerdict]) -> Value {
+    json!(
+        verdicts
+            .iter()
+            .map(|verdict| json!({ "question": verdict.question.as_str(), "class": verdict.class }))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// A stage's name as the contracts write it, such as `build`.
+fn stage_name(stage: Stage) -> String {
+    serde_json::to_value(stage)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
 /// A comment's author as the brief shows it: the runner's own marked
 /// comments are Owlshift's, whoever posted them (the key's account posts
 /// them on Linear); the decider is the assignee's account; anyone else is
 /// quoted as data. A marker only ever demotes: the decider's text that
 /// looks like one reads as data.
-fn comment_author(comment: &Comment, decider: &Person) -> Author {
+pub(crate) fn comment_author(comment: &Comment, decider: &Person) -> Author {
     let author = account_author(&comment.author, decider);
     if matches!(MarkedComment::parse(&comment.body), Ok(Some(_))) {
         Author {
@@ -1011,6 +1673,78 @@ mod tests {
         assert_eq!(
             check_team(&config("markdown", ""), &ticket("LOC-12")),
             Ok(())
+        );
+    }
+
+    /// Each ask takes the place of the comment that posted it; one whose
+    /// comment is gone still takes its place by time, and a comment of the
+    /// same second as an ask reads before it.
+    #[test]
+    fn each_ask_takes_the_place_of_its_comment_in_the_thread() {
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let comment = |id: &str, minute: u32, body: &str| Comment {
+            id: id.into(),
+            author: TrackerAuthor::Account(decider.clone()),
+            created_at: at(minute),
+            edited_at: None,
+            body: body.into(),
+        };
+        let ask = |kind, round, minute, id: &str| Ask {
+            kind,
+            round: NonZeroU32::new(round).unwrap(),
+            at: at(minute),
+            comment: id.into(),
+            questions: vec![Question {
+                id: owlshift_contracts::ids::QuestionId::new("Q1").unwrap(),
+                category: "scope".into(),
+                context: "c".into(),
+                text: "t".into(),
+                options: Vec::new(),
+                recommendation: None,
+            }],
+        };
+        let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
+        let comments = [
+            comment("q1", 10, asked),
+            comment("a1", 11, "Q1: half."),
+            comment("same", 12, "Q1: in the re-ask's second."),
+            comment("r1", 12, "[owlshift] RE-ASK · round 1\n\nAgain.\n"),
+            comment("a2", 13, "Q1: all."),
+            comment("d1", 14, "[owlshift] DELIVERY\n\nDone.\n"),
+        ];
+        let asks = [
+            ask(AskKind::Questions, 1, 10, "q1"),
+            ask(AskKind::Reask, 1, 12, "r1"),
+            // Its comment was deleted on the tracker.
+            ask(AskKind::Questions, 2, 13, "gone"),
+        ];
+        let entries: Vec<String> = thread(&comments, &asks, &decider)
+            .iter()
+            .map(|entry| match entry {
+                ThreadEntry::Questions { round, .. } => format!("questions {round}"),
+                ThreadEntry::Reask { round, .. } => format!("reask {round}"),
+                ThreadEntry::Comment { author, body, .. } => {
+                    format!("{:?}: {}", author.relation, body.lines().next().unwrap())
+                }
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                "questions 1",
+                "Decider: Q1: half.",
+                "Decider: Q1: in the re-ask's second.",
+                "reask 1",
+                "Decider: Q1: all.",
+                "questions 2",
+                "Owlshift: [owlshift] DELIVERY",
+            ]
         );
     }
 

@@ -47,6 +47,11 @@ impl std::error::Error for RoleLoadError {
 /// matter.
 pub const BUILD_ROLE: &str = include_str!("../../../roles/build.md");
 
+/// The default answer-check role prompt, `roles/answer_check.md`, as this
+/// binary was built with it: what `owlshift resume` hands Claude Code to
+/// classify the decider's answers.
+pub const ANSWER_CHECK_ROLE: &str = include_str!("../../../roles/answer_check.md");
+
 /// Reads `<roles_dir>/<role>.md` and strips its front matter, per
 /// [`owlshift_contracts::format::strip_role_front_matter`].
 pub fn load_role_prompt(roles_dir: &Path, role: Role) -> Result<String, RoleLoadError> {
@@ -84,9 +89,15 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_build_prompt_matches_this_binarys_contracts() {
+    fn the_built_in_prompts_match_this_binarys_contracts() {
         let prompt = format::strip_role_front_matter(Role::Build, BUILD_ROLE).expect("strips");
         assert!(prompt.trim_start().starts_with("# Build"), "{prompt}");
+        let prompt =
+            format::strip_role_front_matter(Role::AnswerCheck, ANSWER_CHECK_ROLE).expect("strips");
+        assert!(
+            prompt.trim_start().starts_with("# Answer check"),
+            "{prompt}"
+        );
     }
 
     #[test]

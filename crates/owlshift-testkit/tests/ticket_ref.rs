@@ -71,6 +71,9 @@ fn ticket() -> TicketId {
     TicketId::new("DEMO-1").unwrap()
 }
 
+/// A tree entry: mode, object, name.
+type Entry<'a> = (&'a str, &'a str, &'a str);
+
 const WAITING: &str =
     r#"{"format":2,"stage":"build","waiting":"needs_input","round":1,"reasks":0,"failed_runs":0}"#;
 
@@ -141,7 +144,7 @@ fn a_broken_ticket_ref_is_refused() {
     let state = repo.blob(WAITING);
     let asked = repo.blob(&questions(1));
     let later = repo.blob(&questions(2));
-    let cases: Vec<(Vec<(&str, &str, &str)>, &str)> = vec![
+    let cases: Vec<(Vec<Entry>, &str)> = vec![
         (
             vec![("100644", &state, "state.json")],
             "has no questions.json",

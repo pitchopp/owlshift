@@ -84,7 +84,8 @@ fn version_lists_the_format_versions() {
         concat!(
             "owlshift ",
             env!("CARGO_PKG_VERSION"),
-            "\nformats: brief 3, result 2, event 1, claim 1, ticket state 2, comment footer 1\n"
+            "\nformats: brief 3, result 2, event 1, claim 1, ticket state 2, ticket questions 1, \
+             comment footer 1\n"
         )
     );
 }
@@ -1042,13 +1043,15 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
     let repo = tempfile::tempdir().unwrap();
     git_init(repo.path());
 
-    let output = owlshift(repo.path(), config_dir.path(), &["do", "OWL-1"]);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("run `owlshift init`"),
-        "{}",
-        stderr(&output)
-    );
+    for command in ["do", "resume"] {
+        let output = owlshift(repo.path(), config_dir.path(), &[command, "OWL-1"]);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("run `owlshift init`"),
+            "{command}: {}",
+            stderr(&output)
+        );
+    }
 
     let init = ["init", "--tracker", "markdown", "--skip-secrets"];
     assert!(
