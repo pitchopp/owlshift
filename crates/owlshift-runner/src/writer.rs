@@ -933,6 +933,7 @@ Merge state reported by the forge: `CLEAN`.
             question: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
             class,
             reason: reason.to_owned(),
+            reply: None,
         };
         let comment = ReaskComment {
             ticket: ticket(),

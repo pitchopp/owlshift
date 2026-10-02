@@ -74,9 +74,10 @@ fn committed_schemas_match_the_types() {
 
 #[test]
 fn fixtures_validate_against_the_committed_schemas() {
-    let cases: [(&str, &str); 10] = [
+    let cases: [(&str, &str); 11] = [
         ("result", "result-sample.json"),
         ("result", "result-answer-check.json"),
+        ("result", "result-counter-question.json"),
         ("brief", "brief.json"),
         ("event", "event.json"),
         ("claim", "claim.json"),
@@ -105,7 +106,7 @@ fn fixtures_validate_against_the_committed_schemas() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
-    let base = |status: &str| json!({ "format": 2, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 3, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -119,7 +120,7 @@ fn result_schema_carries_the_expressible_rules() {
     pr_done["status"] = json!("done");
     assert!(validator.is_valid(&pr_done));
 
-    for format in [1, 3] {
+    for format in [1, 2, 4] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
@@ -143,6 +144,37 @@ fn result_schema_carries_the_expressible_rules() {
     extra["verdicts"] = json!([verdict("r")]);
     extra["verdicts"][0]["extra"] = json!(1);
     assert!(!validator.is_valid(&extra));
+
+    // A reply goes with a counter-question, always and only, and is not
+    // blank; schema and type agree on each case, a null reply included.
+    let parses = |instance: &Value| {
+        owlshift_contracts::result::RunResult::parse(&instance.to_string()).is_ok()
+    };
+    for (class, reply, valid) in [
+        (
+            "counter_question",
+            Some(json!("It means the reader's.")),
+            true,
+        ),
+        ("counter_question", None, false),
+        ("counter_question", Some(Value::Null), false),
+        ("counter_question", Some(json!(" \t\n")), false),
+        ("partial", Some(json!("It means the reader's.")), false),
+        ("partial", Some(Value::Null), false),
+        ("answered", None, true),
+    ] {
+        let mut result = base("done");
+        result["verdicts"] = json!([{ "question": "Q1", "class": class, "reason": "r" }]);
+        if let Some(reply) = reply.clone() {
+            result["verdicts"][0]["reply"] = reply;
+        }
+        assert_eq!(
+            validator.is_valid(&result),
+            valid,
+            "schema: {class} {reply:?}"
+        );
+        assert_eq!(parses(&result), valid, "type: {class} {reply:?}");
+    }
 
     let mut out_of_order = base("questions");
     out_of_order["questions"] = json!([question("Q2")]);

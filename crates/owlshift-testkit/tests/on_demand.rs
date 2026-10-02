@@ -251,7 +251,7 @@ struct Bench {
     clock: Cell<Timestamp>,
 }
 
-const DONE: &str = r#"{"format":2,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const DONE: &str = r#"{"format":3,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "decisions":[{"question":"Tone","decision":"Friendly","basis":"The ticket"}],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
@@ -655,7 +655,7 @@ type Check = fn(&Stop) -> bool;
 /// remote's branch moves only when the push itself went through.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
-    let blocked = r#"{"format":2,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":3,"status":"blocked","summary":"The gate needs network."}"#;
     let reset: jiff::Timestamp = "2026-09-29T15:00:00Z".parse().unwrap();
 
     let cases: Vec<(&str, Setup, Check, Option<EventKind>)> = vec![
@@ -977,7 +977,7 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         ]);
         *planted.borrow_mut() = commit;
     });
-    let blocked = r#"{"format":2,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":3,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], Some(agent));
     assert!(
         matches!(
@@ -1072,7 +1072,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
 }
 
 /// The Build run's first question round.
-const ROUND_1: &str = r#"{"format":2,"status":"questions",
+const ROUND_1: &str = r#"{"format":3,"status":"questions",
 "summary":"The greeting's language and words are not given.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The ticket names no language.",
@@ -1081,15 +1081,20 @@ const ROUND_1: &str = r#"{"format":2,"status":"questions",
   {"id":"Q2","category":"scope","context":"The ticket names neither the words nor the ending.",
    "text":"What should the greeting say, and should it end with a sign-off?"}]}"#;
 
-/// An answer check's result: a verdict per question (id, class, reason).
+/// An answer check's result: a verdict per question (id, class, reason),
+/// with a reply on a counter-question.
 fn check(verdicts: &[(&str, &str, &str)]) -> String {
     let verdicts: Vec<Value> = verdicts
         .iter()
         .map(|(question, class, reason)| {
-            json!({ "question": question, "class": class, "reason": reason })
+            let mut verdict = json!({ "question": question, "class": class, "reason": reason });
+            if *class == "counter_question" {
+                verdict["reply"] = json!("A sign-off is a closing line. Should there be one?");
+            }
+            verdict
         })
         .collect();
-    json!({ "format": 2, "status": "done", "summary": "Checked.", "verdicts": verdicts })
+    json!({ "format": 3, "status": "done", "summary": "Checked.", "verdicts": verdicts })
         .to_string()
 }
 
@@ -1270,7 +1275,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
     assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
 
-    let failed = r#"{"format":2,"status":"failed","summary":"The thread holds no ask."}"#;
+    let failed = r#"{"format":3,"status":"failed","summary":"The thread holds no ask."}"#;
     let (outcome, _) = bench.resume(vec![bench.reply(None, Some(failed))]);
     assert!(
         matches!(&outcome, Err(Stop::CheckFailed { .. })),

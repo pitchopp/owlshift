@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use owlshift_contracts::Role;
 use owlshift_contracts::format::{RESULT_FORMAT, strip_role_front_matter};
-use owlshift_contracts::result::RunResult;
+use owlshift_contracts::result::{AnswerClass, RunResult};
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
 use serde_json::Value;
@@ -22,6 +22,7 @@ const BUILD_MAX_LINES: usize = 120;
 const ANSWER_CHECK_ONLY: &[&str] = &[
     "verdicts",
     "class",
+    "reply",
     "answered",
     "partial",
     "unanswered",
@@ -389,7 +390,8 @@ fn answer_check_prompt_names_its_fields_classes_and_inputs() {
         .into();
     assert_eq!(classes, four, "the answer check's classes changed");
     let words = [
-        "format", "status", "summary", "verdicts", "question", "class", "reason", "done", "failed",
+        "format", "status", "summary", "verdicts", "question", "class", "reason", "reply", "done",
+        "failed",
     ];
     let missing: Vec<_> = words
         .iter()
@@ -424,6 +426,13 @@ fn answer_check_example_result_parses() {
     });
     assert_eq!(result.status, owlshift_contracts::result::Status::Done);
     assert!(!result.verdicts.is_empty(), "the example gives no verdict");
+    assert!(
+        result
+            .verdicts
+            .iter()
+            .any(|v| v.class == AnswerClass::CounterQuestion && v.reply.is_some()),
+        "the example gives no counter-question with its reply"
+    );
 }
 
 #[test]

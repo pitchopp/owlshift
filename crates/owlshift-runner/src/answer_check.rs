@@ -180,14 +180,19 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(n, class)| {
+                let reply = if *class == "counter_question" {
+                    r#","reply":"r""#
+                } else {
+                    ""
+                };
                 format!(
-                    r#"{{"question":"Q{}","class":"{class}","reason":"r"}}"#,
+                    r#"{{"question":"Q{}","class":"{class}","reason":"r"{reply}}}"#,
                     n + 1
                 )
             })
             .collect();
         finished(&format!(
-            r#"{{"format":2,"status":"done","summary":"s","verdicts":[{}]}}"#,
+            r#"{{"format":3,"status":"done","summary":"s","verdicts":[{}]}}"#,
             verdicts.join(",")
         ))
     }
@@ -206,12 +211,12 @@ mod tests {
         assert_eq!(event_of(&done(&[])), Event::RunFailed);
         for status in ["failed", "blocked", "premise_false"] {
             let outcome = finished(&format!(
-                r#"{{"format":2,"status":"{status}","summary":"s"}}"#
+                r#"{{"format":3,"status":"{status}","summary":"s"}}"#
             ));
             assert_eq!(event_of(&outcome), Event::RunFailed, "{status}");
         }
         let asking = finished(
-            r#"{"format":2,"status":"questions","summary":"s","questions":[
+            r#"{"format":3,"status":"questions","summary":"s","questions":[
                 {"id":"Q1","category":"scope","context":"c","text":"t"}]}"#,
         );
         assert_eq!(event_of(&asking), Event::RunFailed);
@@ -256,7 +261,7 @@ mod tests {
             question("Q3"),
         ));
         let verdicts = RunResult::parse(
-            r#"{"format":2,"status":"done","summary":"s","verdicts":[
+            r#"{"format":3,"status":"done","summary":"s","verdicts":[
                 {"question":"Q2","class":"answered","reason":"Settled."},
                 {"question":"Q3","class":"partial","reason":"The tone is missing."}]}"#,
         )
