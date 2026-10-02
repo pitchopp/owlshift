@@ -4,7 +4,8 @@
 description = """
 DEMO-1 on the trivial pipeline, from dispatch to Deliver: a usage limit after a
 delay (an interruption, not a failure), a crash (failure 1 of 2), a question
-round answered by the decider, as the answer check finds, the build committed
+round answered by the decider, as the answer check finds and a RESUME restates,
+the build committed
 and pushed, an invalid
 result at Verify (failure 1 of 2 there), then Verify done."""
 ticket = "DEMO-1"
@@ -48,7 +49,16 @@ expect = { event = "none", comments = 2, last_comment = { author = "maintainer",
 
 [[step]]
 answer = { result = "results/answer-check-q1-answered.json" }
-expect = { event = "answered", stage = "build", waiting = "none", round = 1, failed_runs = 1, tracker_stage = "In Progress", brief_latest_ask = ["Q1"] }
+[step.expect]
+event = "answered"
+stage = "build"
+waiting = "none"
+round = 1
+failed_runs = 1
+tracker_stage = "In Progress"
+brief_latest_ask = ["Q1"]
+comments = 3
+last_comment = { author = "owlshift", first_line = "[owlshift] RESUME · round 1", contains = ["**Q1** (scope) Which language should the greeting use?\nUnderstood: "] }
 
 [[step]]
 [step.run]
@@ -59,7 +69,7 @@ result = "results/build-done.json"
 event = "completed"
 stage = "verify"
 failed_runs = 0
-brief_thread = ["decider"]
+brief_thread = ["decider", "owlshift"]
 branch_pushed = true
 branch_files = { "GREETING.md" = "Hello, reader.\n" }
 
@@ -69,4 +79,4 @@ expect = { event = "run_failed", stage = "verify", failed_runs = 1 }
 
 [[step]]
 run = { result = "results/verify-done.json" }
-expect = { event = "completed", stage = "deliver", waiting = "none", failed_runs = 0, comments = 2 }
+expect = { event = "completed", stage = "deliver", waiting = "none", failed_runs = 0, comments = 3 }

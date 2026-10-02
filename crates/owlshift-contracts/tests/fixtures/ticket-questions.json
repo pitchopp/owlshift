@@ -1,5 +1,5 @@
 {
-  "format": 2,
+  "format": 3,
   "asks": [
     {
       "kind": "questions",
@@ -25,7 +25,11 @@
       "decider": {
         "account": "u-maintainer",
         "by": "assignee"
-      }
+      },
+      "verdicts": [
+        { "question": "Q1", "class": "answered", "reason": "English, the recommendation." },
+        { "question": "Q2", "class": "partial", "reason": "The words are given, not the ending." }
+      ]
     },
     {
       "kind": "reask",

@@ -4,8 +4,9 @@
 //! (architecture section 4, scenario S2).
 //!
 //! It runs once answers arrive ([`new_answer`]). Its verdicts fold into one
-//! core event ([`event`]): the ticket resumes, the questions left open are
-//! asked again ([`open_questions`], posted as a RE-ASK comment,
+//! core event ([`event`]): the ticket resumes, with a RESUME comment of what
+//! was understood ([`understood`], [`crate::writer::ResumeComment`]), the
+//! questions left open are asked again ([`open_questions`], posted as a RE-ASK comment,
 //! [`crate::writer::ReaskComment`]), or the decider's counter-question waits
 //! for a reply. `owlshift resume` runs it ([`crate::on_demand`]); the test
 //! bench's stand-in driver plays the same pieces in the scenarios.
@@ -100,6 +101,39 @@ pub fn open_questions(brief: &Brief, verdicts: &[Verdict]) -> Vec<(Question, Ver
                 .map(|verdict| (question.clone(), verdict.clone()))
         })
         .collect()
+}
+
+/// What a RESUME comment restates ([`crate::writer::ResumeComment`]): every
+/// question of a round, from its first ask, with the latest verdict an
+/// answer check gave on it. `asks` are the round's asks in order, each with
+/// the verdicts kept on it; a re-ask's verdicts follow its round's, so a
+/// question asked again reads its last verdict. `None` for a question no
+/// kept verdict names (an ask read from format 2 of `questions.json`).
+pub fn understood<'a>(
+    asks: impl IntoIterator<Item = (&'a [Question], &'a [Verdict])>,
+) -> Vec<(Question, Option<Verdict>)> {
+    let mut asks = asks.into_iter();
+    let Some((questions, first)) = asks.next() else {
+        return Vec::new();
+    };
+    let mut understood: Vec<(Question, Option<Verdict>)> = questions
+        .iter()
+        .map(|question| {
+            let verdict = first.iter().find(|v| v.question == question.id).cloned();
+            (question.clone(), verdict)
+        })
+        .collect();
+    for (_, verdicts) in asks {
+        for verdict in verdicts {
+            if let Some((_, kept)) = understood
+                .iter_mut()
+                .find(|(question, _)| question.id == verdict.question)
+            {
+                *kept = Some(verdict.clone());
+            }
+        }
+    }
+    understood
 }
 
 #[cfg(test)]
@@ -275,5 +309,40 @@ mod tests {
         assert_eq!(open[0].0.text, "t Q3");
 
         assert!(open_questions(&brief(""), &verdicts).is_empty());
+    }
+
+    #[test]
+    fn a_round_is_understood_from_the_last_verdict_on_each_question() {
+        let question = |id: &str| Question {
+            id: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            category: "scope".into(),
+            context: "c".into(),
+            text: format!("t {id}"),
+            options: Vec::new(),
+            recommendation: None,
+        };
+        let verdict = |id: &str, class, reason: &str| Verdict {
+            question: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            class,
+            reason: reason.into(),
+            reply: None,
+        };
+        let round = [question("Q1"), question("Q2"), question("Q3")];
+        let first = [
+            verdict("Q1", AnswerClass::Answered, "One."),
+            verdict("Q2", AnswerClass::Partial, "Half."),
+        ];
+        let reasked = [question("Q2")];
+        let second = [verdict("Q2", AnswerClass::Answered, "Two.")];
+        let all = understood([(&round[..], &first[..]), (&reasked[..], &second[..])]);
+        let read: Vec<(&str, Option<&str>)> = all
+            .iter()
+            .map(|(q, v)| (q.id.as_str(), v.as_ref().map(|v| v.reason.as_str())))
+            .collect();
+        assert_eq!(
+            read,
+            [("Q1", Some("One.")), ("Q2", Some("Two.")), ("Q3", None)]
+        );
+        assert!(understood([]).is_empty());
     }
 }

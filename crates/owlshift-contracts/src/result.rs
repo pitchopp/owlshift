@@ -206,49 +206,7 @@ impl RunResult {
                 "verdicts are given but status is not done",
             ));
         }
-        if let Some(id) = first_not_ascending(self.verdicts.iter().map(|v| &v.question)) {
-            return Err(ContractError::invalid(
-                CONTRACT,
-                format!("the verdict for {id} is repeated or out of order"),
-            ));
-        }
-        if let Some(verdict) = self.verdicts.iter().find(|v| v.reason.trim().is_empty()) {
-            return Err(ContractError::invalid(
-                CONTRACT,
-                format!("the verdict for {} has no reason", verdict.question),
-            ));
-        }
-        for verdict in &self.verdicts {
-            let counter_question = verdict.class == AnswerClass::CounterQuestion;
-            match &verdict.reply {
-                None if counter_question => {
-                    return Err(ContractError::invalid(
-                        CONTRACT,
-                        format!(
-                            "the verdict for {} is a counter-question without a reply",
-                            verdict.question
-                        ),
-                    ));
-                }
-                Some(_) if !counter_question => {
-                    return Err(ContractError::invalid(
-                        CONTRACT,
-                        format!(
-                            "the verdict for {} has a reply but is not a counter-question",
-                            verdict.question
-                        ),
-                    ));
-                }
-                Some(reply) if reply.trim().is_empty() => {
-                    return Err(ContractError::invalid(
-                        CONTRACT,
-                        format!("the verdict for {} has a blank reply", verdict.question),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        check_verdicts(CONTRACT, &self.verdicts)
     }
 
     /// Checks the rules that need the brief of the run: verdicts come from
@@ -323,6 +281,41 @@ pub(crate) fn first_not_ascending<'a>(
         previous = Some(id);
     }
     None
+}
+
+/// The rules every list of verdicts keeps, in `result.json` and in a ticket
+/// ref's asks alike: in increasing question order, each with a reason that is
+/// not only whitespace and, on a counter-question and nowhere else, a reply
+/// that is not either.
+pub(crate) fn check_verdicts(
+    contract: &'static str,
+    verdicts: &[Verdict],
+) -> Result<(), ContractError> {
+    if let Some(id) = first_not_ascending(verdicts.iter().map(|v| &v.question)) {
+        return Err(ContractError::invalid(
+            contract,
+            format!("the verdict for {id} is repeated or out of order"),
+        ));
+    }
+    for verdict in verdicts {
+        let question = &verdict.question;
+        let counter_question = verdict.class == AnswerClass::CounterQuestion;
+        let broken = if verdict.reason.trim().is_empty() {
+            "has no reason"
+        } else {
+            match &verdict.reply {
+                None if counter_question => "is a counter-question without a reply",
+                Some(_) if !counter_question => "has a reply but is not a counter-question",
+                Some(reply) if reply.trim().is_empty() => "has a blank reply",
+                _ => continue,
+            }
+        };
+        return Err(ContractError::invalid(
+            contract,
+            format!("the verdict for {question} {broken}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Requires question ids Q1..Qn in order.
