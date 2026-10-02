@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ContractError;
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, check_requires, entries};
+use owlshift_core::floor::{FloorCategory, is_floor_category};
 use semver::Version;
 
 use crate::system::System;
@@ -268,6 +269,35 @@ impl fmt::Display for Effective {
         let personal = self.personal.write_entries(f)?;
         if !project && !personal {
             f.write_str("No configuration value is set.\n")?;
+        }
+        self.write_always_human(f)
+    }
+}
+
+impl Effective {
+    /// The categories that always go to a human: the floor's, which no file
+    /// removes, then the project's additions with their file. An addition
+    /// the floor already covers (matching a floor token the way
+    /// [`is_floor_category`] does) is shown as such.
+    fn write_always_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "\nalways-human categories (the floor's never go away; a project adds to them):\n",
+        )?;
+        for category in FloorCategory::ALL {
+            writeln!(f, "  {}  (floor)", category.token())?;
+        }
+        if let FileState::Loaded { path, config, .. } = &self.project {
+            for category in &config.policy.always_human {
+                if is_floor_category(category) {
+                    writeln!(
+                        f,
+                        "  {category}  ({}; already covered by the floor)",
+                        path.display()
+                    )?;
+                } else {
+                    writeln!(f, "  {category}  ({})", path.display())?;
+                }
+            }
         }
         Ok(())
     }
