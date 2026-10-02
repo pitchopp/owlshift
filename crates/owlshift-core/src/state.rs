@@ -10,7 +10,7 @@
 use std::fmt;
 
 use crate::pipeline::Pipeline;
-use crate::vocab::Stage;
+use crate::vocab::{AnswerClass, Stage};
 
 /// Failed runs in one stage that park the ticket: the second one does.
 pub const MAX_FAILED_RUNS: u32 = 2;
@@ -90,6 +90,10 @@ impl Status {
 /// | A human restarted a parked ticket | `Restarted` |
 /// | A human merged the pull request | `Merged` |
 /// | A human canceled, closed or excluded the ticket | `Withdrawn` |
+///
+/// One answer check gives exactly one of `Answered`, `Incomplete` and
+/// `CounterQuestion`, even when it finds its questions in different states:
+/// see [`Event::from_answer_check`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Event {
     Dispatched,
@@ -126,6 +130,39 @@ impl Event {
         Self::Merged,
         Self::Withdrawn,
     ];
+
+    /// The one event of an answer check round, from the class of each
+    /// question it checked.
+    ///
+    /// A counter-question on any question wins: the decider gets a reply and
+    /// nothing is re-asked, so the round does not count toward the re-ask
+    /// limit, and every question of the ask is checked again after the
+    /// decider's next reply. Otherwise a partial or unanswered question makes
+    /// the answer incomplete. Only when every question is answered does the
+    /// ticket resume. Order and repetition do not matter.
+    ///
+    /// The fold sees only the classes it is given: pass those of a `done`
+    /// answer check whose result was checked against its brief, which gives
+    /// one verdict for each question of the latest ask. Every ask has a
+    /// question, so `None`, for no class at all, never comes from such a
+    /// result.
+    pub fn from_answer_check(classes: impl IntoIterator<Item = AnswerClass>) -> Option<Self> {
+        let mut checked = false;
+        let mut missing = false;
+        for class in classes {
+            checked = true;
+            match class {
+                AnswerClass::CounterQuestion => return Some(Self::CounterQuestion),
+                AnswerClass::Partial | AnswerClass::Unanswered => missing = true,
+                AnswerClass::Answered => {}
+            }
+        }
+        match (checked, missing) {
+            (false, _) => None,
+            (true, true) => Some(Self::Incomplete),
+            (true, false) => Some(Self::Answered),
+        }
+    }
 }
 
 /// Why a ticket was parked; the parked comment says so.
@@ -721,6 +758,71 @@ mod tests {
         assert_eq!(to(waiting.apply(STANDARD, Event::CounterQuestion)), waiting);
         let build = state(Status::Active(Stage::Build), 3, 0, 1);
         assert_eq!(to(build.apply(STANDARD, Event::Interrupted)), build);
+    }
+
+    #[test]
+    fn answer_check_classes_fold_into_one_event_with_counter_questions_first() {
+        use AnswerClass::{Answered as A, CounterQuestion as C, Partial as P, Unanswered as U};
+        // Every non-empty combination of the four classes, written out.
+        let table: [(&[AnswerClass], Event); 15] = [
+            (&[A], Event::Answered),
+            (&[P], Event::Incomplete),
+            (&[U], Event::Incomplete),
+            (&[C], Event::CounterQuestion),
+            (&[A, P], Event::Incomplete),
+            (&[A, U], Event::Incomplete),
+            (&[P, U], Event::Incomplete),
+            (&[A, C], Event::CounterQuestion),
+            (&[P, C], Event::CounterQuestion),
+            (&[U, C], Event::CounterQuestion),
+            (&[A, P, U], Event::Incomplete),
+            (&[A, P, C], Event::CounterQuestion),
+            (&[A, U, C], Event::CounterQuestion),
+            (&[P, U, C], Event::CounterQuestion),
+            (&[A, P, U, C], Event::CounterQuestion),
+        ];
+        let combinations: HashSet<Vec<AnswerClass>> =
+            table.iter().map(|(classes, _)| classes.to_vec()).collect();
+        assert_eq!(combinations.len(), 15, "the table repeats a combination");
+
+        for (classes, event) in table {
+            assert_eq!(
+                Event::from_answer_check(classes.iter().copied()),
+                Some(event),
+                "{classes:?}"
+            );
+            // Only which classes appear counts, not their order or repetition.
+            let shuffled = classes.iter().rev().chain(classes).copied();
+            assert_eq!(
+                Event::from_answer_check(shuffled),
+                Some(event),
+                "{classes:?} reversed and repeated"
+            );
+        }
+        assert_eq!(Event::from_answer_check([]), None);
+    }
+
+    #[test]
+    fn a_counter_question_at_the_reask_limit_waits_and_an_incomplete_answer_then_parks() {
+        let limit = state(
+            Status::NeedsInput {
+                return_to: Stage::Build,
+            },
+            1,
+            MAX_REASKS,
+            0,
+        );
+        let mixed =
+            Event::from_answer_check([AnswerClass::Unanswered, AnswerClass::CounterQuestion])
+                .expect("an event");
+        assert_eq!(to(limit.apply(STANDARD, mixed)), limit);
+
+        let incomplete = Event::from_answer_check([AnswerClass::Answered, AnswerClass::Partial])
+            .expect("an event");
+        let Ok(Transition::Parked { reason, .. }) = limit.apply(STANDARD, incomplete) else {
+            panic!("an incomplete answer at the re-ask limit must park the ticket");
+        };
+        assert_eq!(reason, ParkReason::Reasks);
     }
 
     #[test]
