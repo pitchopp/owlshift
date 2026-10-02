@@ -57,11 +57,11 @@ use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::brief::{
     Author, Brief, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
 };
-use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
+use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::result::RunResult;
+use owlshift_contracts::result::Status as ResultStatus;
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
@@ -69,7 +69,7 @@ use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::core_event;
-use owlshift_runner::writer::{ReaskComment, question_block};
+use owlshift_runner::writer::{QuestionsComment, ReaskComment};
 
 use crate::git::{GitEnv, Remote, seed};
 use crate::harness::FakeHarness;
@@ -502,7 +502,14 @@ impl Driver {
         self.apply(event)?;
         if let (Event::Questions, Some(result)) = (event, &result) {
             let round = NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
-            let body = self.questions_comment(round, result);
+            let body = QuestionsComment {
+                ticket: self.id.clone(),
+                round,
+                summary: result.summary.clone(),
+                questions: result.questions.clone(),
+                premise_false: result.status == ResultStatus::PremiseFalse,
+            }
+            .render();
             let at = self.post(&body)?;
             self.asks.push(ThreadEntry::Questions {
                 round,
@@ -725,27 +732,6 @@ impl Driver {
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
         })
-    }
-
-    /// The QUESTIONS comment of the round just opened.
-    fn questions_comment(&self, round: NonZeroU32, result: &RunResult) -> String {
-        let header = Header {
-            kind: MarkerKind::Questions,
-            round: Some(round),
-        };
-        let mut body = format!("{}\n\n{}\n", header.render(), result.summary);
-        for question in &result.questions {
-            body.push_str(&format!("\n{}\n", question_block(question)));
-        }
-        let footer = Footer {
-            format: Format,
-            kind: MarkerKind::Questions,
-            ticket: self.id.clone(),
-            round: Some(round),
-            run: None,
-        };
-        body.push_str(&format!("\n{}\n", footer.render()));
-        body
     }
 
     fn push_if_ahead(&self, worktree: &Path) -> Result<(), String> {

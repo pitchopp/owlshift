@@ -74,13 +74,14 @@ fn committed_schemas_match_the_types() {
 
 #[test]
 fn fixtures_validate_against_the_committed_schemas() {
-    let cases: [(&str, &str); 9] = [
+    let cases: [(&str, &str); 10] = [
         ("result", "result-sample.json"),
         ("result", "result-answer-check.json"),
         ("brief", "brief.json"),
         ("event", "event.json"),
         ("claim", "claim.json"),
         ("ticket-state", "ticket-state.json"),
+        ("ticket-questions", "ticket-questions.json"),
         ("comment-footer", "footer.json"),
         ("project-config", "owlshift.toml"),
         ("personal-config", "personal.toml"),

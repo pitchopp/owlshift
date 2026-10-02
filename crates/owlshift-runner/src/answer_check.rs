@@ -3,19 +3,47 @@
 //! question of a ticket's latest ask once its decider has replied
 //! (architecture section 4, scenario S2).
 //!
-//! Its verdicts fold into one core event ([`event`]): the ticket resumes,
-//! the questions left open are asked again ([`open_questions`], posted as a
-//! RE-ASK comment, [`crate::writer::ReaskComment`]), or the decider's
-//! counter-question waits for a reply. `owlshift do` opens no question round
-//! yet (its questions are printed, not posted), so the test bench's stand-in
-//! driver runs the role and posts the re-ask, until `owlshift resume` does.
+//! It runs once answers arrive ([`new_answer`]). Its verdicts fold into one
+//! core event ([`event`]): the ticket resumes, the questions left open are
+//! asked again ([`open_questions`], posted as a RE-ASK comment,
+//! [`crate::writer::ReaskComment`]), or the decider's counter-question waits
+//! for a reply. `owlshift resume` runs it ([`crate::on_demand`]); the test
+//! bench's stand-in driver plays the same pieces in the scenarios.
 
-use owlshift_contracts::brief::Brief;
+use jiff::Timestamp;
+use owlshift_adapters::tracker::{Comment, Person};
+use owlshift_contracts::brief::{Brief, Relation};
+use owlshift_contracts::refs::TicketQuestions;
 use owlshift_contracts::result::{self, AnswerClass, Question, RunResult, Verdict};
 use owlshift_core::state::Event;
 
 use crate::executor::Outcome;
-use crate::on_demand::core_event;
+use crate::on_demand::{comment_author, core_event};
+
+/// Whether answers arrived: the newest last edit among the decider's
+/// comments when it is later than the latest ask and than what the last
+/// answer check to give its verdicts read
+/// ([`TicketQuestions::answers_after`]), `None` otherwise. Only the tracker's
+/// times are compared, never this machine's clock. A comment is the
+/// decider's as the brief marks it: their account's, and not a marked
+/// comment.
+pub fn new_answer(
+    comments: &[Comment],
+    decider: &Person,
+    asked: &TicketQuestions,
+) -> Option<Timestamp> {
+    let after = asked.answers_after()?;
+    newest_decider_edit(comments, decider).filter(|newest| *newest > after)
+}
+
+/// The newest last edit among the decider's comments, if they wrote any.
+pub fn newest_decider_edit(comments: &[Comment], decider: &Person) -> Option<Timestamp> {
+    comments
+        .iter()
+        .filter(|comment| comment_author(comment, decider).relation == Relation::Decider)
+        .map(Comment::last_edit)
+        .max()
+}
 
 /// The core event an answer check's outcome maps onto, and its result when
 /// it left a valid one.
@@ -81,6 +109,64 @@ mod tests {
     use super::*;
     use crate::artifact::ArtifactContents;
     use crate::executor::Failure;
+    use owlshift_adapters::tracker::Author;
+
+    #[test]
+    fn answers_arrive_with_a_decider_comment_newer_than_the_ask_and_the_last_check() {
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let by = |id: &str, created: u32, edited: Option<u32>, body: &str| Comment {
+            id: format!("c{created}"),
+            author: Author::Account(Person {
+                id: id.into(),
+                name: "someone".into(),
+            }),
+            created_at: at(created),
+            edited_at: edited.map(at),
+            body: body.into(),
+        };
+        let mut asked = TicketQuestions::parse(
+            r#"{"format":1,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T10:10:00Z",
+                "comment":"c10","questions":[{"id":"Q1","category":"scope","context":"c","text":"t"}]}]}"#,
+        )
+        .unwrap();
+        let marked = "[owlshift] DELIVERY\n\nDone.\n";
+        let cases = [
+            (vec![], None),
+            (vec![by("u1", 9, None, "Early.")], None),
+            (vec![by("u1", 10, None, "Same second.")], None),
+            (
+                vec![by("u1", 9, None, "a"), by("u1", 11, None, "b")],
+                Some(11),
+            ),
+            (vec![by("u1", 9, Some(12), "Edited after.")], Some(12)),
+            (vec![by("u2", 11, None, "Not the decider.")], None),
+            (vec![by("u1", 11, None, marked)], None),
+        ];
+        for (comments, expected) in cases {
+            assert_eq!(
+                new_answer(&comments, &decider, &asked),
+                expected.map(at),
+                "{comments:?}"
+            );
+        }
+        // An answer the last check already read is not new.
+        asked.checked_through = Some(at(12));
+        assert_eq!(
+            new_answer(&[by("u1", 11, None, "Read.")], &decider, &asked),
+            None
+        );
+        assert_eq!(
+            new_answer(&[by("u1", 13, None, "New.")], &decider, &asked),
+            Some(at(13))
+        );
+        assert_eq!(new_answer(&[], &decider, &TicketQuestions::new()), None);
+    }
 
     fn finished(result: &str) -> Outcome {
         Outcome::Finished {

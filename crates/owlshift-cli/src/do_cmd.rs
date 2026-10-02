@@ -1,7 +1,7 @@
-//! `owlshift do TICKET`: opens what one run needs, in this order, and hands
-//! it to `owlshift_runner::on_demand`. What `do` itself can refuse without
-//! a credential, a host where agent runs cannot be confined included, is
-//! refused before the keychain is opened.
+//! `owlshift do TICKET` and `owlshift resume TICKET`: open what one run
+//! needs, in this order, and hand it to `owlshift_runner::on_demand`. What
+//! either can refuse without a credential, a host where agent runs cannot be
+//! confined included, is refused before the keychain is opened.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -20,7 +20,7 @@ use owlshift_runner::events::{EventLog, EventSink, printable};
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
-use owlshift_runner::roles::BUILD_ROLE;
+use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE};
 use owlshift_runner::system::System;
 use owlshift_runner::{forge, tracker};
 
@@ -30,8 +30,26 @@ use crate::fail;
 /// push.
 const HEAD_WAIT: Duration = Duration::from_secs(2);
 
-pub fn run(system: &dyn System, config: &Effective, ticket: &str) -> ExitCode {
-    run_with(system, config, ticket, Keychain::system).unwrap_or_else(|refusal| fail(&refusal))
+/// Which command runs: `owlshift do` from Ready, or `owlshift resume` from
+/// where the ticket's ref left it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Do,
+    Resume,
+}
+
+impl Mode {
+    fn command(self) -> &'static str {
+        match self {
+            Mode::Do => "`owlshift do`",
+            Mode::Resume => "`owlshift resume`",
+        }
+    }
+}
+
+pub fn run(system: &dyn System, config: &Effective, ticket: &str, mode: Mode) -> ExitCode {
+    run_with(system, config, ticket, mode, Keychain::system)
+        .unwrap_or_else(|refusal| fail(&refusal))
 }
 
 /// [`run`], with the keychain opened by `open_keychain`: a refusal before
@@ -40,6 +58,7 @@ fn run_with(
     system: &dyn System,
     config: &Effective,
     ticket: &str,
+    mode: Mode,
     open_keychain: fn() -> Result<Keychain, KeychainError>,
 ) -> Result<ExitCode, String> {
     let ticket = TicketId::new(ticket).map_err(|error| error.to_string())?;
@@ -52,7 +71,10 @@ fn run_with(
             ));
         }
         FileState::NotApplicable(reason) => {
-            return Err(format!("`owlshift do` runs in a git repository: {reason}"));
+            return Err(format!(
+                "{} runs in a git repository: {reason}",
+                mode.command()
+            ));
         }
         FileState::Unavailable(reason) => return Err(reason.clone()),
         FileState::Invalid { path, error } => {
@@ -69,8 +91,8 @@ fn run_with(
     let repo = on_demand::check_origin(&remote_url)?;
     // OWL-98: a host where agent runs cannot be confined is refused before
     // the keychain is opened, so it never prompts for or loads a secret for
-    // a run that cannot happen. `do` always confines its agents
-    // (`AgentEnv::from_runner`); `OnDemand::run` checks again.
+    // a run that cannot happen. `do` and `resume` always confine their
+    // agents (`AgentEnv::from_runner`); `OnDemand` checks again.
     system.sandbox().map_err(|error| error.to_string())?;
     let Some(data_dir) = owlshift_platform::paths::data_dir() else {
         return Err(
@@ -86,6 +108,8 @@ fn run_with(
     };
     let prompt = strip_role_front_matter(Role::Build, BUILD_ROLE)
         .map_err(|error| format!("the built-in build role: {error}"))?;
+    let check_prompt = strip_role_front_matter(Role::AnswerCheck, ANSWER_CHECK_ROLE)
+        .map_err(|error| format!("the built-in answer-check role: {error}"))?;
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
@@ -125,13 +149,20 @@ fn run_with(
         max_budget_usd: budget,
         login,
     };
+    // The answer check runs on the same harness, model and login, with its
+    // own prompt.
+    let check = ClaudeHarness {
+        prompt: check_prompt,
+        ..harness.clone()
+    };
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let on_demand = OnDemand {
         executor: &executor,
         tracker: tracker.as_ref(),
         forge: &forge,
-        harness: &harness,
+        build: &harness,
+        answer_check: &check,
         remote_url: &remote_url,
         config: project,
         dirs: &dirs,
@@ -139,7 +170,10 @@ fn run_with(
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
-    let outcome = on_demand.run(&ticket, &mut sink);
+    let outcome = match mode {
+        Mode::Do => on_demand.run(&ticket, &mut sink),
+        Mode::Resume => on_demand.resume(&ticket, &mut sink),
+    };
     Ok(finish(
         system,
         outcome,
@@ -358,7 +392,9 @@ mod refusals {
             personal: FileState::Absent(repo.path().join("config.toml")),
         };
 
-        let refusal = run_with(&NoSandbox, &config, "OWL-1", no_keychain).unwrap_err();
-        assert_eq!(refusal, SandboxError::Unsupported.to_string());
+        for mode in [Mode::Do, Mode::Resume] {
+            let refusal = run_with(&NoSandbox, &config, "OWL-1", mode, no_keychain).unwrap_err();
+            assert_eq!(refusal, SandboxError::Unsupported.to_string(), "{mode:?}");
+        }
     }
 }

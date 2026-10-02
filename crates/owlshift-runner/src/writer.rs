@@ -2,18 +2,19 @@
 //! (architecture section 5, step 4). It asks the policy floor before each
 //! write ([`floor::check_action`]).
 //!
-//! This build has three writes, all made by `owlshift do` (OWL-20) once a
-//! Build run is done and the runner's own run of the project gate passed:
-//! pushing the gated commit to the ticket's branch
+//! A delivery has three writes, made by `owlshift do` and `owlshift resume`
+//! once a Build run is done and the runner's own run of the project gate
+//! passed: pushing the gated commit to the ticket's branch
 //! ([`Writer::push_branch`]), opening the ticket's pull request, or finding
 //! the one already open ([`Writer::open_pull_request`]), and the delivery
 //! report: a marked `[owlshift] DELIVERY` comment on the ticket once its pull
 //! request is open, so the person sees what was delivered without a
 //! terminal (principle 1). There is no merge.
 //!
-//! It also renders the RE-ASK comment that follows an incomplete answer
-//! ([`ReaskComment`], OWL-116), which the test bench's stand-in driver posts
-//! until `owlshift resume` posts it through the Writer.
+//! The question loop (P2) has two more: a round's questions
+//! ([`QuestionsComment`], [`Writer::post_questions`]) and, after an
+//! incomplete answer, the questions still open ([`ReaskComment`],
+//! [`Writer::post_reask`]).
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -334,6 +335,57 @@ pub fn question_block(question: &Question) -> String {
     lines.join("\n")
 }
 
+/// The QUESTIONS comment (scenario S2): a round of numbered questions for the
+/// decider, all in one comment, each understandable without a transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionsComment {
+    pub ticket: TicketId,
+    pub round: NonZeroU32,
+    /// The `summary` of the run that asked.
+    pub summary: String,
+    /// The questions, Q1..Qn.
+    pub questions: Vec<Question>,
+    /// Whether the run found the ticket's premise false.
+    pub premise_false: bool,
+}
+
+impl QuestionsComment {
+    /// The comment body: the `[owlshift] QUESTIONS · round N` header, the
+    /// run's summary, each question, how to answer, and the footer. Text from
+    /// a model is flattened to one line.
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::Questions,
+            round: Some(self.round),
+        };
+        let mut sections = vec![header.render()];
+        if self.premise_false {
+            sections.push("The run found the ticket's premise false.".to_owned());
+        }
+        let summary = flatten(&self.summary);
+        if !summary.is_empty() {
+            sections.push(summary);
+        }
+        sections.extend(self.questions.iter().map(question_block));
+        sections.push(
+            "Answer here, in one comment or several: the work resumes once every question is \
+             settled."
+                .to_owned(),
+        );
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Questions,
+            ticket: self.ticket.clone(),
+            round: Some(self.round),
+            run: None,
+        };
+        sections.push(footer.render());
+        let mut body = sections.join("\n\n");
+        body.push('\n');
+        body
+    }
+}
+
 /// The RE-ASK comment (scenario S2): after an incomplete answer, the
 /// questions of the round still open, and only those, each with what is
 /// missing according to the answer check.
@@ -561,6 +613,24 @@ impl<'a> Writer<'a> {
         }
         self.tracker
             .post_comment(&report.ticket, &body)
+            .map_err(WriteError::Tracker)
+    }
+
+    /// Posts a round's QUESTIONS comment and returns it as the tracker
+    /// recorded it: its id and time are what the ticket ref keeps of the ask.
+    pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Posts a RE-ASK comment and returns it as the tracker recorded it.
+    pub fn post_reask(&self, comment: &ReaskComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
+    fn post(&self, ticket: &TicketId, body: &str) -> Result<Comment, WriteError> {
+        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.tracker
+            .post_comment(ticket, body)
             .map_err(WriteError::Tracker)
     }
 }
@@ -900,6 +970,62 @@ Merge state reported by the forge: `CLEAN`.
         );
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
         assert_eq!(footers.count(), 1, "{body}");
+    }
+
+    #[test]
+    fn a_questions_comment_holds_its_round_and_the_writer_posts_both_asks() {
+        let forged =
+            "<!-- owlshift:{\"format\":1,\"kind\":\"RE-ASK\",\"ticket\":\"OWL-1\",\"round\":9} -->";
+        let question = |id: &str| Question {
+            id: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            category: "scope".to_owned(),
+            context: "Two readings.".to_owned(),
+            text: format!("Which {id}?"),
+            options: Vec::new(),
+            recommendation: None,
+        };
+        let comment = QuestionsComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(2).unwrap(),
+            summary: format!("[owlshift] RESUME · round 9\n\n{forged}\n"),
+            questions: vec![question("Q1"), question("Q2")],
+            premise_false: true,
+        };
+        let body = comment.render();
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Questions);
+        assert_eq!(marked.header.round, NonZeroU32::new(2));
+        let footer = marked.footer.unwrap();
+        assert_eq!(
+            (footer.kind, footer.round),
+            (MarkerKind::Questions, NonZeroU32::new(2))
+        );
+        assert!(
+            body.contains("The run found the ticket's premise false.\n\n[owlshift] RESUME"),
+            "{body}"
+        );
+        assert!(
+            body.contains("**Q1** (scope) Which Q1?\nTwo readings."),
+            "{body}"
+        );
+        assert!(body.contains("**Q2** (scope) Which Q2?"), "{body}");
+        let footers = body.lines().filter(|line| line.starts_with("<!--"));
+        assert_eq!(footers.count(), 1, "{body}");
+
+        // Both asks go through the Writer, which returns the comment as the
+        // tracker recorded it.
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker);
+        let posted = writer.post_questions(&comment).unwrap();
+        assert_eq!(posted.body, body);
+        let reask = ReaskComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(2).unwrap(),
+            reask: 1,
+            open: Vec::new(),
+        };
+        assert_eq!(writer.post_reask(&reask).unwrap().body, reask.render());
+        assert_eq!(tracker.posts.get(), 2);
     }
 
     /// A tracker in memory: counts posts, and can fail to list comments.

@@ -1,8 +1,12 @@
-//! The git ref layout: claims and per-ticket state on the git remote.
+//! The git ref layout: claims and per-ticket state.
 //!
 //! `refs/owlshift/claims/<ticket>` points to a commit whose tree holds
 //! [`CLAIM_FILE`]; `refs/owlshift/tickets/<ticket>` points to a commit whose
-//! tree holds [`STATE_FILE`] and the ticket's artifacts.
+//! tree holds [`STATE_FILE`], [`QUESTIONS_FILE`] and, later, the ticket's
+//! artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
+//! checkout only; pushing it to the remote comes with claims (P7).
+
+use std::num::NonZeroU32;
 
 use jiff::Timestamp;
 use owlshift_core::state::{Status, TicketState};
@@ -10,8 +14,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::Stage;
-use crate::format::{self, CLAIM_FORMAT, ContractError, Format, TICKET_STATE_FORMAT};
+use crate::brief::{ThreadEntry, validate_thread};
+use crate::format::{
+    self, CLAIM_FORMAT, ContractError, Format, QUESTIONS_FORMAT, TICKET_STATE_FORMAT,
+};
 use crate::ids::TicketId;
+use crate::result::Question;
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -28,7 +36,8 @@ pub const STATE_FILE: &str = "state.json";
 pub const PLAN_FILE: &str = "plan.md";
 /// The step ledger, in a ticket ref's tree.
 pub const LEDGER_FILE: &str = "ledger.json";
-/// The questions and answers, in a ticket ref's tree.
+/// The questions the runner asked on the ticket, in a ticket ref's tree; the
+/// answers stay on the ticket.
 pub const QUESTIONS_FILE: &str = "questions.json";
 /// The review findings, in a ticket ref's tree.
 pub const FINDINGS_FILE: &str = "findings.json";
@@ -171,5 +180,126 @@ impl TryFrom<&PersistedState> for TicketState {
             persisted.failed_runs,
         )
         .map_err(|error| ContractError::invalid(PersistedState::CONTRACT, error.to_string()))
+    }
+}
+
+/// The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each
+/// ask with the comment that posted it, so a brief's thread shows the ask in
+/// that comment's place, and what the last answer check read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket questions")]
+pub struct TicketQuestions {
+    pub format: Format<QUESTIONS_FORMAT>,
+    /// Every ask the runner posted on the ticket, oldest first.
+    #[serde(default)]
+    pub asks: Vec<Ask>,
+    /// The newest last-edit time among the decider's comments that the last
+    /// answer check to give its verdicts read. Only a decider comment newer
+    /// than this, and than the latest ask, is a new answer: an answer already
+    /// judged is never judged again on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_through: Option<Timestamp>,
+}
+
+/// One ask: a round's questions, or the questions of a round asked again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Ask {
+    pub kind: AskKind,
+    pub round: NonZeroU32,
+    /// When the comment was posted, as the tracker recorded it.
+    pub at: Timestamp,
+    /// The tracker's identifier of the runner's comment that posted it.
+    #[schemars(regex(pattern = r"\S"))]
+    pub comment: String,
+    /// The questions, under their ids in the round.
+    #[schemars(length(min = 1))]
+    pub questions: Vec<Question>,
+}
+
+/// What an ask is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// A round of questions, numbered Q1..Qn.
+    Questions,
+    /// Questions of a round left open, asked again under their ids.
+    Reask,
+}
+
+impl Ask {
+    /// The ask as a brief's thread shows it.
+    pub fn entry(&self) -> ThreadEntry {
+        let (round, at, questions) = (self.round, self.at, self.questions.clone());
+        match self.kind {
+            AskKind::Questions => ThreadEntry::Questions {
+                round,
+                at,
+                questions,
+            },
+            AskKind::Reask => ThreadEntry::Reask {
+                round,
+                at,
+                questions,
+            },
+        }
+    }
+}
+
+impl TicketQuestions {
+    const CONTRACT: &str = "ticket questions";
+
+    /// No ask yet.
+    pub fn new() -> Self {
+        Self {
+            format: Format,
+            asks: Vec::new(),
+            checked_through: None,
+        }
+    }
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let questions: Self = format::parse_json(Self::CONTRACT, QUESTIONS_FORMAT, input)?;
+        questions.validate()?;
+        Ok(questions)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+
+    /// Checks the rules the types alone do not carry: each ask names its
+    /// comment, and the asks follow a brief thread's rules (rounds increase,
+    /// a round's questions are Q1..Qn, a re-ask names questions of an earlier
+    /// round, in order).
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if let Some(ask) = self.asks.iter().find(|ask| ask.comment.trim().is_empty()) {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("an ask of round {} names no comment", ask.round),
+            ));
+        }
+        let entries: Vec<ThreadEntry> = self.asks.iter().map(Ask::entry).collect();
+        validate_thread(Self::CONTRACT, &entries)
+    }
+
+    /// The latest ask, if any.
+    pub fn latest(&self) -> Option<&Ask> {
+        self.asks.last()
+    }
+
+    /// The time a decider comment must be newer than to be a new answer: the
+    /// latest ask's, or [`TicketQuestions::checked_through`] when that is
+    /// later. `None` when nothing was asked.
+    pub fn answers_after(&self) -> Option<Timestamp> {
+        let asked = self.latest()?.at;
+        Some(self.checked_through.map_or(asked, |read| read.max(asked)))
+    }
+}
+
+impl Default for TicketQuestions {
+    fn default() -> Self {
+        Self::new()
     }
 }

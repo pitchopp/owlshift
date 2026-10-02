@@ -207,68 +207,79 @@ impl Brief {
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
     /// order, distinct questions of an earlier round.
     pub fn validate(&self) -> Result<(), ContractError> {
-        // The number of questions of each round seen so far.
-        let mut rounds: BTreeMap<NonZeroU32, usize> = BTreeMap::new();
-        for entry in &self.thread {
-            match entry {
-                ThreadEntry::Questions {
-                    round, questions, ..
-                } => {
-                    if questions.is_empty() {
-                        return Err(ContractError::invalid(
-                            CONTRACT,
-                            format!("round {round} has no question"),
-                        ));
-                    }
-                    if let Some((last, _)) = rounds.last_key_value()
-                        && last >= round
-                    {
-                        return Err(ContractError::invalid(
-                            CONTRACT,
-                            format!("round {round} comes after round {last}"),
-                        ));
-                    }
-                    check_question_order(CONTRACT, questions)?;
-                    rounds.insert(*round, questions.len());
+        validate_thread(CONTRACT, &self.thread)
+    }
+}
+
+/// Checks the asks of a thread, for the brief and for the asks a ticket ref
+/// keeps: rounds increase through the thread, a round's questions are
+/// Q1..Qn, and a re-ask names, in order, distinct questions of an earlier
+/// round.
+pub(crate) fn validate_thread<'a>(
+    contract: &'static str,
+    thread: impl IntoIterator<Item = &'a ThreadEntry>,
+) -> Result<(), ContractError> {
+    // The number of questions of each round seen so far.
+    let mut rounds: BTreeMap<NonZeroU32, usize> = BTreeMap::new();
+    for entry in thread {
+        match entry {
+            ThreadEntry::Questions {
+                round, questions, ..
+            } => {
+                if questions.is_empty() {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!("round {round} has no question"),
+                    ));
                 }
-                ThreadEntry::Reask {
-                    round, questions, ..
-                } => {
-                    if questions.is_empty() {
+                if let Some((last, _)) = rounds.last_key_value()
+                    && last >= round
+                {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!("round {round} comes after round {last}"),
+                    ));
+                }
+                check_question_order(contract, questions)?;
+                rounds.insert(*round, questions.len());
+            }
+            ThreadEntry::Reask {
+                round, questions, ..
+            } => {
+                if questions.is_empty() {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!("re-ask of round {round} has no question"),
+                    ));
+                }
+                let Some(&asked) = rounds.get(round) else {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!("re-ask of round {round}, which is not earlier in the thread"),
+                    ));
+                };
+                for question in questions {
+                    if usize::try_from(question.id.number()).map_or(true, |n| n > asked) {
                         return Err(ContractError::invalid(
-                            CONTRACT,
-                            format!("re-ask of round {round} has no question"),
-                        ));
-                    }
-                    let Some(&asked) = rounds.get(round) else {
-                        return Err(ContractError::invalid(
-                            CONTRACT,
-                            format!("re-ask of round {round}, which is not earlier in the thread"),
-                        ));
-                    };
-                    for question in questions {
-                        if usize::try_from(question.id.number()).map_or(true, |n| n > asked) {
-                            return Err(ContractError::invalid(
-                                CONTRACT,
-                                format!(
-                                    "re-ask of round {round}: question {} was not asked in that round",
-                                    question.id
-                                ),
-                            ));
-                        }
-                    }
-                    if let Some(id) = first_not_ascending(questions.iter().map(|q| &q.id)) {
-                        return Err(ContractError::invalid(
-                            CONTRACT,
+                            contract,
                             format!(
-                                "re-ask of round {round}: question {id} is repeated or out of order"
+                                "re-ask of round {round}: question {} was not asked in that round",
+                                question.id
                             ),
                         ));
                     }
                 }
-                ThreadEntry::Comment { .. } => {}
+                if let Some(id) = first_not_ascending(questions.iter().map(|q| &q.id)) {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!(
+                            "re-ask of round {round}: question {id} is repeated or out of order"
+                        ),
+                    ));
+                }
             }
+            ThreadEntry::Comment { .. } => {}
         }
-        Ok(())
     }
+    Ok(())
 }
