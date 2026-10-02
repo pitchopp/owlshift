@@ -47,6 +47,34 @@ pub fn declared_zones<'a>(
     Ok(zones)
 }
 
+/// The zones a ticket's `zone:` labels declare, as the brief lists them: the
+/// folders of the well-formed labels, in the labels' order, each zone once
+/// as its first label wrote it. Unlike [`declared_zones`] it leaves a malformed label out instead
+/// of refusing it, since it informs an agent and chooses no decider: a ticket
+/// with an assignee is not refused for a label its decider never reads.
+pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut zones: Vec<String> = Vec::new();
+    for label in labels {
+        if let Ok(declared) = declared_zones([label]) {
+            for resource in declared {
+                // Zones compare part by part, ignoring ASCII case, so
+                // `Web/` repeats `web`.
+                if let Resource::Zone(zone) = resource
+                    && !zones.iter().any(|seen| same_zone(seen, &zone))
+                {
+                    zones.push(zone);
+                }
+            }
+        }
+    }
+    zones
+}
+
+fn same_zone(a: &str, b: &str) -> bool {
+    let key = |zone: &str| zone.trim_end_matches('/').to_ascii_lowercase();
+    key(a) == key(b)
+}
+
 /// A `zone:` label that names no folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZoneLabelError {
@@ -428,6 +456,23 @@ mod tests {
             assert!(text.contains(reason), "{label}: {text}");
             assert!(text.contains(&format!("{label:?}")), "{text}");
         }
+    }
+
+    #[test]
+    fn the_brief_lists_the_well_formed_zone_labels_only() {
+        assert_eq!(
+            brief_zones([
+                "Feature",
+                "zone:backend/billing",
+                "ZONE: web ",
+                "zone:../secrets",
+                "zone:backend/billing",
+                "zone:Web/",
+                "zone:",
+            ]),
+            ["backend/billing", "web"]
+        );
+        assert!(brief_zones(["agent", "zones:web"]).is_empty());
     }
 
     #[test]

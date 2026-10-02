@@ -67,6 +67,7 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::result::{Question, Status as ResultStatus, Verdict};
 use owlshift_contracts::{Role, Stage};
+use owlshift_core::decider::brief_zones;
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
@@ -795,14 +796,14 @@ impl Driver {
                 id: self.id.clone(),
                 title: ticket.title,
                 url: None,
-                labels: ticket.labels,
+                labels: ticket.labels.clone(),
                 author: author(ticket.author),
                 description: ticket.description,
             },
             decider: decider.clone(),
             thread,
             checkpoint: None,
-            zones: Vec::new(),
+            zones: brief_zones(ticket.labels.iter().map(String::as_str)),
             resources: Vec::new(),
             rules: Vec::new(),
             permissions: Permissions {

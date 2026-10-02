@@ -84,7 +84,7 @@
       "$ref": "#/$defs/TicketBrief"
     },
     "zones": {
-      "description": "The code zones the ticket declared at intake.",
+      "description": "The code zones the ticket declares: its `zone:` labels until intake.",
       "type": "array",
       "default": [],
       "items": {

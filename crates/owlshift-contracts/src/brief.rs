@@ -32,7 +32,7 @@ pub struct Brief {
     /// Where an interrupted or resumed ticket starts again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Checkpoint>,
-    /// The code zones the ticket declared at intake.
+    /// The code zones the ticket declares: its `zone:` labels until intake.
     #[serde(default)]
     pub zones: Vec<String>,
     /// The resources the ticket holds.

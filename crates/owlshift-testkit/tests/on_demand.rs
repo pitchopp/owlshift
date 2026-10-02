@@ -679,6 +679,21 @@ fn the_brief_names_the_relation_of_the_ticket_author() {
     }
 }
 
+/// OWL-129: the brief lists the zones the ticket's `zone:` labels declare,
+/// for a ticket with an assignee too. Its decider never reads the labels, so
+/// a malformed one is left out of the list instead of refusing the ticket.
+#[test]
+fn the_brief_lists_the_zones_the_ticket_declares() {
+    let front = "assignee = \"maintainer\"\n\
+                 labels = [\"Feature\", \"zone:docs\", \"Zone:../x\", \"zone:web/cart\"]\n";
+    let bench = Bench::with("maintainer", front, "");
+    let replies = vec![bench.reply(Some("Hello"), Some(DONE))];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let brief = bench.briefs().pop().unwrap();
+    assert_eq!(brief.zones, ["docs", "web/cart"]);
+}
+
 /// How a case prepares its bench and gives its replies.
 type Setup = Box<dyn Fn(&Bench) -> Vec<Reply>>;
 /// Whether a case stopped as it should.
@@ -1567,6 +1582,7 @@ fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
     );
     let build = bench.briefs().pop().unwrap();
     assert_eq!(build.decider, "owner");
+    assert_eq!(build.zones, ["docs"]);
     assert_eq!(build.ticket.author.relation, Relation::Other);
     let asks = bench.record().questions.asks;
     assert_eq!(
