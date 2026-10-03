@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::Tracker;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::Role;
@@ -18,6 +19,7 @@ use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::{EventLog, EventSink, printable};
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
+use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE, RESOLVER_ROLE};
@@ -182,12 +184,20 @@ fn run_with(
         Mode::Do => on_demand.run(&ticket, &mut sink),
         Mode::Continue => on_demand.continue_ticket(&ticket, &mut sink),
     };
-    Ok(finish(
-        system,
-        outcome,
-        &mut io::stdout(),
-        &mut io::stderr(),
-    ))
+    let code = finish(system, &outcome, &mut io::stdout(), &mut io::stderr());
+    // OWL-140: once the outcome is printed, a desktop notification when it
+    // makes the operator the blocker; a failure is a warning event.
+    let desktop = notify::desktop_enabled(&config.personal)
+        .then(|| DesktopNotifier::for_this_machine(system))
+        .flatten();
+    notify::notify_blocker(
+        desktop.as_ref().map(|d| d as &dyn Notifier),
+        tracker.as_ref(),
+        &ticket,
+        &outcome,
+        &mut sink,
+    );
+    Ok(code)
 }
 
 /// The end of a run: the warning of a sentinel that ended during it, or is
@@ -195,7 +205,7 @@ fn run_with(
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn finish(
     system: &dyn System,
-    outcome: Result<Delivered, Stop>,
+    outcome: &Result<Delivered, Stop>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
@@ -271,7 +281,7 @@ mod tests {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let code = finish(
             &Sentinel(sentinel),
-            Err(Stop::Refused("no ticket".to_owned())),
+            &Err(Stop::Refused("no ticket".to_owned())),
             &mut stdout,
             &mut stderr,
         );

@@ -43,6 +43,12 @@
 //! `issueUpdate` with a state's id moves the issue and answers it in that
 //! state, through the same personal API key.
 //!
+//! Checked live on 2026-10-03 (OWL-140): `{ issue(id: "OWL-140") {
+//! identifier url } }` answered the `url`
+//! `https://linear.app/owlshift/issue/OWL-140/notify-the-operator-on-the-desktop-when-they-become-the-blocker`:
+//! the workspace's URL key, the identifier, then a slug of the title. A
+//! notification shows it as the ticket's link.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -289,6 +295,10 @@ impl Tracker for LinearTracker {
             } if now.id == target.id => Ok(()),
             _ => Err(invalid(format!("Linear did not move {id} to {state:?}"))),
         }
+    }
+
+    fn ticket_url(&self, id: &TicketId) -> Option<String> {
+        self.issue_url(id).ok()
     }
 }
 
@@ -586,6 +596,28 @@ struct IssueState {
     state: Option<WorkflowState>,
 }
 
+/// An issue's link, read for a notification only (OWL-140).
+const URL_QUERY: &str = "query TicketUrl($id: String!) { issue(id: $id) { url } }";
+
+impl LinearTracker {
+    /// The link Linear gives an issue, as Linear gives it: whoever shows it
+    /// checks it is fit to show.
+    fn issue_url(&self, id: &TicketId) -> Result<String, Error> {
+        let data: UrlData = self.call(URL_QUERY, json!({ "id": id.as_str() }))?;
+        Ok(data.issue.url)
+    }
+}
+
+#[derive(Deserialize)]
+struct UrlData {
+    issue: IssueUrl,
+}
+
+#[derive(Deserialize)]
+struct IssueUrl {
+    url: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +837,23 @@ mod tests {
         let tracker = LinearTracker::new(key.clone());
         let shown = format!("{key:?} {transport:?} {tracker:?}");
         assert!(!shown.contains("do_not_print"), "{shown}");
+    }
+
+    /// The link of OWL-140 as Linear gave it on 2026-10-03; an issue Linear
+    /// does not know gives none, never an error.
+    #[test]
+    fn a_ticket_link_is_read_and_never_fails_the_caller() {
+        let id = TicketId::new("OWL-140").unwrap();
+        let owl_140 = r#"{"data":{"issue":{"url":"https://linear.app/owlshift/issue/OWL-140/notify-the-operator-on-the-desktop-when-they-become-the-blocker"}}}"#;
+        assert_eq!(
+            tracker(vec![owl_140]).ticket_url(&id).as_deref(),
+            Some(
+                "https://linear.app/owlshift/issue/OWL-140/\
+                 notify-the-operator-on-the-desktop-when-they-become-the-blocker"
+            )
+        );
+        let not_found = r#"{"errors":[{"message":"Entity not found: Issue",
+            "extensions":{"code":"INPUT_ERROR"}}]}"#;
+        assert_eq!(tracker(vec![not_found]).ticket_url(&id), None);
     }
 }
