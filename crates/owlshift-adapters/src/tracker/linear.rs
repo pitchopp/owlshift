@@ -38,6 +38,11 @@
 //! every field compared, and the schema has no field naming the client. So a
 //! ticket's creator is never reported as an account (`ticket_author`).
 //!
+//! Checked live on 2026-10-04 (OWL-137; build plan, check C4): the issue's
+//! team lists its workflow states (nine for `OWL`, one page), and
+//! `issueUpdate` with a state's id moves the issue and answers it in that
+//! state, through the same personal API key.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 

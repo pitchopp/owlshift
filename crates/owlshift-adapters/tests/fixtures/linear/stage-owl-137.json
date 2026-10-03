@@ -1,0 +1,208 @@
+{
+  "recorded": "2026-10-04 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query States($id: String!) { issue(id: $id) { id team { key states(first: 50) { nodes { id name } pageInfo { hasNextPage } } } } }",
+        "variables": {
+          "id": "OWL-137"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "id": "cfcd4320-ee0a-4733-8ff9-f19456c1f892",
+            "team": {
+              "key": "OWL",
+              "states": {
+                "nodes": [
+                  {
+                    "id": "c00d199b-cd25-4ffc-a3cb-cf03f3bb8c5e",
+                    "name": "In Review"
+                  },
+                  {
+                    "id": "9a51b9b2-2efd-4f14-a965-62e1c22a7585",
+                    "name": "Needs Input"
+                  },
+                  {
+                    "id": "ad6dab17-64c9-4d38-86e7-4f01a419a85f",
+                    "name": "Triage"
+                  },
+                  {
+                    "id": "f2c70c33-346b-4c27-a1f2-5c963e51baf6",
+                    "name": "Duplicate"
+                  },
+                  {
+                    "id": "76f46edb-f965-4373-a668-b4a9c1eb1bae",
+                    "name": "Done"
+                  },
+                  {
+                    "id": "6139ffa1-cc94-4e29-838d-e061835bcef4",
+                    "name": "Backlog"
+                  },
+                  {
+                    "id": "50be5363-4cce-4989-9ba9-970c23db5093",
+                    "name": "Todo"
+                  },
+                  {
+                    "id": "50b565a1-0340-4678-9a34-6c5d44ff6be2",
+                    "name": "Canceled"
+                  },
+                  {
+                    "id": "23e8c0a5-dc85-451f-9488-d6227ae8ffb6",
+                    "name": "In Progress"
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "mutation SetStage($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }",
+        "variables": {
+          "id": "cfcd4320-ee0a-4733-8ff9-f19456c1f892",
+          "stateId": "9a51b9b2-2efd-4f14-a965-62e1c22a7585"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issueUpdate": {
+            "issue": {
+              "state": {
+                "id": "9a51b9b2-2efd-4f14-a965-62e1c22a7585",
+                "name": "Needs Input"
+              }
+            },
+            "success": true
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query States($id: String!) { issue(id: $id) { id team { key states(first: 50) { nodes { id name } pageInfo { hasNextPage } } } } }",
+        "variables": {
+          "id": "OWL-137"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "id": "cfcd4320-ee0a-4733-8ff9-f19456c1f892",
+            "team": {
+              "key": "OWL",
+              "states": {
+                "nodes": [
+                  {
+                    "id": "c00d199b-cd25-4ffc-a3cb-cf03f3bb8c5e",
+                    "name": "In Review"
+                  },
+                  {
+                    "id": "9a51b9b2-2efd-4f14-a965-62e1c22a7585",
+                    "name": "Needs Input"
+                  },
+                  {
+                    "id": "ad6dab17-64c9-4d38-86e7-4f01a419a85f",
+                    "name": "Triage"
+                  },
+                  {
+                    "id": "f2c70c33-346b-4c27-a1f2-5c963e51baf6",
+                    "name": "Duplicate"
+                  },
+                  {
+                    "id": "76f46edb-f965-4373-a668-b4a9c1eb1bae",
+                    "name": "Done"
+                  },
+                  {
+                    "id": "6139ffa1-cc94-4e29-838d-e061835bcef4",
+                    "name": "Backlog"
+                  },
+                  {
+                    "id": "50be5363-4cce-4989-9ba9-970c23db5093",
+                    "name": "Todo"
+                  },
+                  {
+                    "id": "50b565a1-0340-4678-9a34-6c5d44ff6be2",
+                    "name": "Canceled"
+                  },
+                  {
+                    "id": "23e8c0a5-dc85-451f-9488-d6227ae8ffb6",
+                    "name": "In Progress"
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "mutation SetStage($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }",
+        "variables": {
+          "id": "cfcd4320-ee0a-4733-8ff9-f19456c1f892",
+          "stateId": "23e8c0a5-dc85-451f-9488-d6227ae8ffb6"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issueUpdate": {
+            "issue": {
+              "state": {
+                "id": "23e8c0a5-dc85-451f-9488-d6227ae8ffb6",
+                "name": "In Progress"
+              }
+            },
+            "success": true
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query States($id: String!) { issue(id: $id) { id team { key states(first: 50) { nodes { id name } pageInfo { hasNextPage } } } } }",
+        "variables": {
+          "id": "OWL-99999"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": null,
+        "errors": [
+          {
+            "extensions": {
+              "code": "INPUT_ERROR",
+              "statusCode": 400,
+              "type": "invalid input",
+              "userError": true,
+              "userPresentableMessage": "Could not find referenced Issue."
+            },
+            "locations": [
+              {
+                "column": 30,
+                "line": 1
+              }
+            ],
+            "message": "Entity not found: Issue",
+            "path": [
+              "issue"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
