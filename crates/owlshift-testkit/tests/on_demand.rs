@@ -205,6 +205,8 @@ struct Clocked<'a> {
     clock: &'a Cell<Timestamp>,
     /// A comment starting with this is refused, as a tracker that fails.
     refuse: Option<&'static str>,
+    /// Every stage write is refused.
+    refuse_stage: bool,
 }
 
 /// The clock's time, then a minute later.
@@ -242,6 +244,16 @@ impl Tracker for Clocked<'_> {
             .pop()
             .ok_or_else(|| other(&"the comment just posted is gone"))
     }
+
+    fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), tracker::Error> {
+        if self.refuse_stage {
+            return Err(tracker::Error::new(
+                tracker::ErrorKind::Other,
+                "the tracker is down",
+            ));
+        }
+        Tracker::set_stage(&self.inner, id, state)
+    }
 }
 
 /// A project seeded into a bare remote, with the person's checkout, and
@@ -256,6 +268,8 @@ struct Bench {
     clock: Cell<Timestamp>,
     /// The runner's comments starting with this are refused by the tracker.
     refuse: Cell<Option<&'static str>>,
+    /// The tracker refuses every stage write.
+    refuse_stage: Cell<bool>,
     /// How long after the time of the next comment `continue` reads this
     /// machine's clock: by default the quiet window, so the decider's
     /// latest comment, a minute older, counts.
@@ -332,6 +346,7 @@ impl Bench {
             github,
             clock: Cell::new("2026-10-02T09:00:00Z".parse().unwrap()),
             refuse: Cell::new(None),
+            refuse_stage: Cell::new(false),
             waited: Cell::new(SignedDuration::from_mins(10)),
         }
     }
@@ -391,6 +406,28 @@ impl Bench {
             .join("tickets")
             .join(TICKET)
             .join("ticket.md")
+    }
+
+    /// The ticket's visible stage on the tracker.
+    fn stage(&self) -> String {
+        MarkdownTracker::new(&self.remote.checkout)
+            .ticket(&ticket())
+            .unwrap()
+            .stage
+    }
+
+    /// The `stage` of each event of `kind`, oldest first: the stage moves
+    /// with `tracker_write`, the refused ones with `warning`.
+    fn stage_events(&self, kind: EventKind) -> Vec<String> {
+        self.events()
+            .iter()
+            .filter(|event| {
+                event.kind == kind
+                    && (event.data.get("action") == Some(&json!("stage"))
+                        || event.data.get("what") == Some(&json!("stage_not_moved")))
+            })
+            .map(|event| event.data["state"].as_str().unwrap().to_owned())
+            .collect()
     }
 
     /// What the ticket ref holds.
@@ -465,6 +502,7 @@ impl Bench {
             inner: MarkdownTracker::new(&self.remote.checkout),
             clock: &self.clock,
             refuse: self.refuse.get(),
+            refuse_stage: self.refuse_stage.get(),
         };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
@@ -583,13 +621,21 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         kinds(&events),
         [
             Dispatch,
+            TrackerWrite,
             RunStarted,
             RunEnded,
+            TrackerWrite,
             TrackerWrite,
             TrackerWrite,
             TrackerWrite
         ]
     );
+    // Working once dispatched, review once the pull request is open.
+    assert_eq!(
+        bench.stage_events(TrackerWrite),
+        ["In Progress", "In Review"]
+    );
+    assert_eq!(bench.stage(), "In Review");
     for event in &events {
         assert!(
             printed.contains(&owlshift_runner::events::format_line(event)),
@@ -1265,6 +1311,12 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
         (Some(Waiting::NeedsInput), 1)
     );
     assert_eq!(record.questions.asks.len(), 1);
+    // The ticket shows it waits for its decider (OWL-137).
+    assert_eq!(bench.stage(), "Needs Input");
+    assert_eq!(
+        bench.stage_events(EventKind::TrackerWrite),
+        ["In Progress", "Needs Input"]
+    );
 
     // While the questions wait, `do` is refused, and `continue` waits for an
     // answer without running anything.
@@ -1347,6 +1399,10 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
             "The words are given, but not the sign-off.",
         ),
     ]);
+    // A person moved the ticket meanwhile: the re-ask puts it back.
+    MarkdownTracker::new(&bench.remote.checkout)
+        .set_stage(&ticket(), "Todo")
+        .unwrap();
     let (reasked, printed) = bench.continue_ticket(vec![bench.reply(None, Some(&partial))]);
     match reasked {
         Err(Stop::Reasked {
@@ -1371,6 +1427,7 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
         reask.starts_with("[owlshift] RE-ASK · round 1\n"),
         "{reask}"
     );
+    assert_eq!(bench.stage(), "Needs Input");
     assert!(reask.contains("(re-ask 1 of 3:"), "{reask}");
     assert!(
         reask.contains("Still open (partial): The words are given, but not the sign-off."),
@@ -1494,6 +1551,18 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
     assert!(comments[7].starts_with("[owlshift] DELIVERY"));
     let record = bench.record();
     assert_eq!((record.state.waiting, record.state.reasks), (None, 0));
+    // Back to working once the answer resumed Build, then in review.
+    assert_eq!(
+        bench.stage_events(EventKind::TrackerWrite),
+        [
+            "In Progress",
+            "Needs Input",
+            "Needs Input",
+            "In Progress",
+            "In Review"
+        ]
+    );
+    assert_eq!(bench.stage(), "In Review");
     let commands: Vec<Value> = bench
         .events()
         .iter()
@@ -1508,6 +1577,65 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
         matches!(&done, Err(Stop::Refused(why)) if why.contains("nothing to continue")),
         "{done:?}"
     );
+}
+
+/// A tracker that refuses every stage write stops nothing: the round is
+/// asked and kept, the re-ask too, and the answer resumes Build to a
+/// delivery. Each refused move is a `warning` event (OWL-137).
+#[test]
+fn a_stage_the_tracker_refuses_stops_neither_a_round_nor_a_delivery() {
+    let bench = Bench::new(true);
+    bench.refuse_stage.set(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    assert_eq!(bench.record().questions.asks.len(), 1);
+
+    bench.answer("Q1: English.\n");
+    let partial = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "unanswered", "Not answered."),
+    ]);
+    let (reasked, _) = bench.continue_ticket(vec![bench.reply(None, Some(&partial))]);
+    assert!(matches!(&reasked, Err(Stop::Reasked { .. })), "{reasked:?}");
+    assert_eq!(bench.record().questions.asks.len(), 2);
+
+    bench.answer("Q2: \"Hello, reader.\" Go.\n");
+    let answered = check(&[("Q2", "answered", "Hello, reader.")]);
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    assert_eq!(
+        bench.stage_events(EventKind::Warning),
+        [
+            "In Progress",
+            "Needs Input",
+            "Needs Input",
+            "In Progress",
+            "In Review"
+        ]
+    );
+    assert!(bench.stage_events(EventKind::TrackerWrite).is_empty());
+    let warning = bench
+        .events()
+        .into_iter()
+        .find(|event| event.kind == EventKind::Warning)
+        .unwrap();
+    assert_eq!(warning.data["stage"], "working");
+    assert!(
+        warning.data["reason"]
+            .as_str()
+            .unwrap()
+            .contains("the tracker is down"),
+        "{:?}",
+        warning.data
+    );
+    assert_eq!(bench.stage(), "Todo");
 }
 
 /// A failed answer check is retried on the same answers; a quarantined one

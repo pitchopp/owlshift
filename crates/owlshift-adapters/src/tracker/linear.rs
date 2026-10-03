@@ -251,8 +251,12 @@ impl Tracker for LinearTracker {
                 team.key
             )));
         }
-        let named: Vec<&WorkflowState> =
-            team.states.nodes.iter().filter(|s| s.name == state).collect();
+        let named: Vec<&WorkflowState> = team
+            .states
+            .nodes
+            .iter()
+            .filter(|s| s.name == state)
+            .collect();
         let target = match named[..] {
             [one] => one,
             [] => {
@@ -278,9 +282,7 @@ impl Tracker for LinearTracker {
                 success: true,
                 issue: Some(IssueState { state: Some(now) }),
             } if now.id == target.id => Ok(()),
-            _ => Err(invalid(format!(
-                "Linear did not move {id} to {state:?}"
-            ))),
+            _ => Err(invalid(format!("Linear did not move {id} to {state:?}"))),
         }
     }
 }
@@ -726,7 +728,9 @@ mod tests {
             .set_stage(&id, "needs input")
             .unwrap_err();
         assert!(
-            unknown.message.contains("must name one of Todo, Needs Input"),
+            unknown
+                .message
+                .contains("must name one of Todo, Needs Input"),
             "{unknown}"
         );
         let twice = states(false, &["Doing", "Doing"]);

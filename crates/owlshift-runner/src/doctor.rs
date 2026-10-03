@@ -829,7 +829,7 @@ fn file_check<T>(subject: &str, state: &FileState<T>, home: Option<&Path>) -> Ch
 /// The configured tracker's adapter and the capabilities it declares
 /// (architecture section 6). A required capability this build does not
 /// implement yet is a warning, not a failure: `owlshift do` needs only to
-/// read tickets and comments, and refusing a project is `init`'s job. The
+/// read tickets and comments and move the visible stage, and refusing a project is `init`'s job. The
 /// check reads the adapter's constants: it opens neither the tracker nor the
 /// keychain.
 fn tracker_check(config: &Effective) -> Check {
@@ -865,7 +865,7 @@ fn tracker_check(config: &Effective) -> Check {
             SUBJECT,
             format!("{detail}; not built yet: {}", list(&missing)),
             format!(
-                "{DOES_NOT_BLOCK} it only reads the ticket and posts comments. The rest comes \
+                "{DOES_NOT_BLOCK} it only reads the ticket, posts comments and moves the stage. The rest comes \
                  with later roadmap steps."
             ),
         )
@@ -1759,8 +1759,8 @@ always_human = []
         assert_eq!(tracker.status, Status::Warn);
         assert_eq!(
             tracker.detail,
-            "`linear`: read a ticket, read and post comments; \
-             not built yet: list admitted tickets, visible stage"
+            "`linear`: read a ticket, read and post comments, visible stage; \
+             not built yet: list admitted tickets"
         );
     }
 }
