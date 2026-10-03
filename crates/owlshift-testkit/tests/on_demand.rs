@@ -32,7 +32,7 @@ use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::refs::{AskDecider, Waiting};
 use owlshift_core::decider::DeciderRule;
-use owlshift_core::state::ParkReason;
+use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::executor::harness::ClaudeHarness;
@@ -1816,7 +1816,11 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
 
     let comments = bench.comments();
     assert_eq!(comments.len(), 2, "{comments:?}");
-    assert!(comments[0].starts_with("[owlshift] DECISION\n"), "{}", comments[0]);
+    assert!(
+        comments[0].starts_with("[owlshift] DECISION\n"),
+        "{}",
+        comments[0]
+    );
     for text in [
         "**Question** (naming) Which file should hold the greeting?",
         "**Decision:** GREETING.md, at the root.",
@@ -1825,10 +1829,16 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
         assert!(comments[0].contains(text), "{text}\n{}", comments[0]);
     }
     let round_1 = &comments[1];
-    assert!(round_1.starts_with("[owlshift] QUESTIONS · round 1\n"), "{round_1}");
+    assert!(
+        round_1.starts_with("[owlshift] QUESTIONS · round 1\n"),
+        "{round_1}"
+    );
     assert!(round_1.contains("**Q1** (scope) What should the greeting say?"));
     assert!(round_1.contains("Owlshift decided one other question of this run itself"));
-    assert!(!round_1.contains("naming") && !round_1.contains("**Q2**"), "{round_1}");
+    assert!(
+        !round_1.contains("naming") && !round_1.contains("**Q2**"),
+        "{round_1}"
+    );
 
     // The resolver read only the discoverable question, read-only, with the
     // project's rules.
@@ -1839,7 +1849,11 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     assert_eq!(resolver.permissions.level, PermissionLevel::ReadOnly);
     assert!(!resolver.permissions.network);
     assert_eq!(resolver.rules.len(), 1);
-    let given: Vec<&str> = resolver.resolve.iter().map(|q| q.category.as_str()).collect();
+    let given: Vec<&str> = resolver
+        .resolve
+        .iter()
+        .map(|q| q.category.as_str())
+        .collect();
     assert_eq!(given, ["naming"]);
 
     let record = bench.record();
@@ -1873,7 +1887,10 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let build = bench.briefs().pop().unwrap();
     assert_eq!(build.role, Role::Build);
-    assert_eq!(shape(&build), ["decision", "questions", "Decider", "Owlshift"]);
+    assert_eq!(
+        shape(&build),
+        ["decision", "questions", "Decider", "Owlshift"]
+    );
     let report = bench.comments().pop().unwrap();
     assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
     assert!(
@@ -1883,4 +1900,166 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
         ),
         "{report}"
     );
+}
+
+/// OWL-138's second acceptance: a run whose questions are all decided goes
+/// on without a Needs Input stop, Build running again in the same command.
+/// Its decision is kept in a ticket ref made without any round, so when that
+/// Build is cut off, `resume` runs Build again from it, the decision in the
+/// brief and in the delivery report.
+#[test]
+fn questions_all_decided_go_on_without_a_stop() {
+    let bench = Bench::new(true);
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            limited,
+        ],
+        None,
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::Resolver, Role::Build]);
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "no round: {comments:?}");
+    assert!(comments[0].starts_with("[owlshift] DECISION\n"));
+    let record = bench.record();
+    assert_eq!((record.state.waiting, record.state.round), (None, 0));
+    assert_eq!(record.questions.decisions.len(), 1);
+    assert!(record.questions.asks.is_empty());
+    assert!(data_of(&bench.events(), EventKind::Gate, "opened").is_empty());
+
+    let (delivered, printed) = bench.resume(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let build = bench.briefs().pop().unwrap();
+    assert_eq!(shape(&build), ["decision"]);
+    assert!(matches!(
+        &build.thread[0],
+        ThreadEntry::Decision { decision, .. } if decision == "GREETING.md, at the root."
+    ));
+    let report = bench.comments().pop().unwrap();
+    assert!(
+        report.contains("**Which file should hold the greeting?**"),
+        "{report}"
+    );
+}
+
+/// The questions a stop asked, by text.
+fn asked_texts(stop: &Stop) -> Vec<String> {
+    match stop {
+        Stop::NeedsInput {
+            posted: Ok(_),
+            questions,
+            ..
+        } => questions.iter().map(|q| q.text.clone()).collect(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A resolver at its usage limit leaves no decision: every question goes to
+/// the decider in a normal round, which says why. A DECISION the tracker
+/// refuses is never applied: its question goes to the decider too.
+#[test]
+fn without_a_logged_decision_every_question_goes_to_the_decider() {
+    let bench = Bench::new(true);
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (outcome, _) = bench.run(vec![bench.reply(None, Some(MIXED)), limited], None);
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop).len(), 2);
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("Owlshift's resolver reached its usage limit"),
+        "{}",
+        comments[0]
+    );
+    let record = bench.record();
+    assert_eq!((record.state.round, record.state.reasks), (1, 0));
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["resolver"], "usage_limit");
+
+    let bench = Bench::new(true);
+    bench.refuse.set(Some("[owlshift] DECISION"));
+    let (outcome, _) = bench.run(
+        vec![
+            bench.reply(None, Some(MIXED)),
+            bench.reply(None, Some(DECIDED_Q1)),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(
+        asked_texts(&stop),
+        [
+            "Which file should hold the greeting?",
+            "What should the greeting say?"
+        ]
+    );
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(!comments[0].contains("decided"), "{}", comments[0]);
+    assert!(bench.record().questions.decisions.is_empty());
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["unposted"], json!(["Q1"]));
+}
+
+/// A Build that keeps asking what the resolver settles runs at most
+/// `MAX_RESOLVED_PASSES` times in a row on decisions alone; the next run's
+/// questions all go to the decider, and the round says why.
+#[test]
+fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
+    let bench = Bench::new(true);
+    let mut replies = Vec::new();
+    for _ in 0..MAX_RESOLVED_PASSES {
+        replies.push(bench.reply(None, Some(NAMING)));
+        replies.push(bench.reply(None, Some(DECIDED_Q1)));
+    }
+    replies.push(bench.reply(None, Some(NAMING)));
+    let (outcome, _) = bench.run(replies, None);
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop), ["Which file should hold the greeting?"]);
+    let comments = bench.comments();
+    let rounds = comments.len() - usize::try_from(MAX_RESOLVED_PASSES).unwrap();
+    assert_eq!(rounds, 1, "{comments:?}");
+    assert!(
+        comments
+            .last()
+            .unwrap()
+            .contains("already settled every question of 3 runs in a row"),
+        "{comments:?}"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved.last().unwrap()["resolver"], "pass_limit");
+}
+
+/// A resolver that breaks isolation is quarantined: the ticket parks, and
+/// none of the run's questions is posted.
+#[test]
+fn a_resolver_that_breaks_isolation_parks_the_ticket() {
+    let bench = Bench::new(true);
+    let mut breaking = bench.reply(None, Some(DECIDED_Q1));
+    breaking
+        .main_checkout
+        .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
+    let (outcome, _) = bench.run(vec![bench.reply(None, Some(MIXED)), breaking], None);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::IsolationBreach,
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].starts_with("[owlshift] PARKED\n"));
 }
