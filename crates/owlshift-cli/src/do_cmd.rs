@@ -1,4 +1,4 @@
-//! `owlshift do TICKET` and `owlshift resume TICKET`: open what one run
+//! `owlshift do TICKET` and `owlshift continue TICKET`: open what one run
 //! needs, in this order, and hand it to `owlshift_runner::on_demand`. What
 //! either can refuse without a credential, a host where agent runs cannot be
 //! confined included, is refused before the keychain is opened.
@@ -30,19 +30,19 @@ use crate::fail;
 /// push.
 const HEAD_WAIT: Duration = Duration::from_secs(2);
 
-/// Which command runs: `owlshift do` from Ready, or `owlshift resume` from
+/// Which command runs: `owlshift do` from Ready, or `owlshift continue` from
 /// where the ticket's ref left it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Do,
-    Resume,
+    Continue,
 }
 
 impl Mode {
     fn command(self) -> &'static str {
         match self {
             Mode::Do => "`owlshift do`",
-            Mode::Resume => "`owlshift resume`",
+            Mode::Continue => "`owlshift continue`",
         }
     }
 }
@@ -91,7 +91,7 @@ fn run_with(
     let repo = on_demand::check_origin(&remote_url)?;
     // OWL-98: a host where agent runs cannot be confined is refused before
     // the keychain is opened, so it never prompts for or loads a secret for
-    // a run that cannot happen. `do` and `resume` always confine their
+    // a run that cannot happen. `do` and `continue` always confine their
     // agents (`AgentEnv::from_runner`); `OnDemand` checks again.
     system.sandbox().map_err(|error| error.to_string())?;
     let Some(data_dir) = owlshift_platform::paths::data_dir() else {
@@ -167,12 +167,13 @@ fn run_with(
         config: project,
         dirs: &dirs,
         head_wait: HEAD_WAIT,
+        clock: &on_demand::system_clock,
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
     let outcome = match mode {
         Mode::Do => on_demand.run(&ticket, &mut sink),
-        Mode::Resume => on_demand.resume(&ticket, &mut sink),
+        Mode::Continue => on_demand.continue_ticket(&ticket, &mut sink),
     };
     Ok(finish(
         system,
@@ -392,7 +393,7 @@ mod refusals {
             personal: FileState::Absent(repo.path().join("config.toml")),
         };
 
-        for mode in [Mode::Do, Mode::Resume] {
+        for mode in [Mode::Do, Mode::Continue] {
             let refusal = run_with(&NoSandbox, &config, "OWL-1", mode, no_keychain).unwrap_err();
             assert_eq!(refusal, SandboxError::Unsupported.to_string(), "{mode:?}");
         }

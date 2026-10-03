@@ -2,7 +2,7 @@
 //! commands (P2, OWL-122). `refs/owlshift/tickets/<ticket>` points to a
 //! commit whose tree holds the ticket's core state ([`STATE_FILE`]) and the
 //! questions the runner asked on it ([`QUESTIONS_FILE`]), so `owlshift
-//! resume` knows the round, its re-asks and failed runs, and which comments
+//! continue` knows the round, its re-asks and failed runs, and which comments
 //! are the runner's asks.
 //!
 //! The ref lives in the dedicated checkout only (decided 2026-10-02): it is

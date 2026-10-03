@@ -485,7 +485,7 @@ impl ReplyComment {
         sections.push(format!(
             "Answer the questions here, then run {}: your next comment is checked again \
              against every question of this ask, and the work resumes once each one is settled.",
-            code(&format!("owlshift resume {}", self.ticket))
+            code(&format!("owlshift continue {}", self.ticket))
         ));
         let footer = Footer {
             format: Format,
@@ -630,7 +630,7 @@ impl ParkedComment {
                 sections.push(line);
             }
         }
-        let resume = code(&format!("owlshift resume {ticket}"));
+        let resume = code(&format!("owlshift continue {ticket}"));
         let restart = match (self.reason, self.restart) {
             (ParkReason::IsolationBreach, _) => format!(
                 "**To restart it:** a person checks the machine that ran it first: Owlshift \
@@ -1352,7 +1352,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             open: Vec::new(),
             restart,
         };
-        let resume = "**To restart it:** run `owlshift resume OWL-18`.";
+        let resume = "**To restart it:** run `owlshift continue OWL-18`.";
         let cases = [
             (
                 parked(
@@ -1386,7 +1386,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                      recorded on the machine that ran it, not here.",
                     "**To restart it:** a person checks the machine that ran it first: \
                      Owlshift refuses this project there until the quarantine is cleared. Then \
-                     run `owlshift resume OWL-18`, or `owlshift do OWL-18` if the project's \
+                     run `owlshift continue OWL-18`, or `owlshift do OWL-18` if the project's \
                      checkout was deleted.",
                 ],
                 vec!["planted", "/Users"],
@@ -1405,7 +1405,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                      round 1:\n\n**Q2** (scope) Which words?\nStill open (partial): The ending \
                      is missing.",
                     "**To restart it:** answer the questions still open here, then run \
-                     `owlshift resume OWL-18`.",
+                     `owlshift continue OWL-18`.",
                 ],
                 vec!["Checked."],
             ),
