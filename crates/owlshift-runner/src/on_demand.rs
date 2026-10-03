@@ -1490,7 +1490,7 @@ impl OnDemand<'_> {
             round: NonZeroU32::new(parked.round()).filter(|_| reason == ParkReason::Reasks),
             open,
             restart: if p.stored.is_some() {
-                Restart::Resume
+                Restart::Continue
             } else {
                 Restart::Do
             },

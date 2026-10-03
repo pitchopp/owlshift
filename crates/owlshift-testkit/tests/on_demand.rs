@@ -1994,8 +1994,7 @@ fn questions_all_decided_go_on_without_a_stop() {
     assert!(record.questions.asks.is_empty());
     assert!(data_of(&bench.events(), EventKind::Gate, "opened").is_empty());
 
-    let (delivered, printed) =
-        bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    let (delivered, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let build = bench.briefs().pop().unwrap();
     assert_eq!(shape(&build), ["decision"]);

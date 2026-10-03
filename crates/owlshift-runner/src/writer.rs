@@ -2,7 +2,7 @@
 //! (architecture section 5, step 4). It asks the policy floor before each
 //! write ([`floor::check_action`]).
 //!
-//! A delivery has three writes, made by `owlshift do` and `owlshift resume`
+//! A delivery has three writes, made by `owlshift do` and `owlshift continue`
 //! once a Build run is done and the runner's own run of the project gate
 //! passed: pushing the gated commit to the ticket's branch
 //! ([`Writer::push_branch`]), opening the ticket's pull request, or finding
@@ -666,8 +666,8 @@ impl ResumeComment {
 /// What restarts a parked ticket, besides the reason's own step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Restart {
-    /// The ticket ref keeps its state: `owlshift resume` restarts it.
-    Resume,
+    /// The ticket ref keeps its state: `owlshift continue` restarts it.
+    Continue,
     /// Nothing was kept: `owlshift do` runs it again.
     Do,
 }
@@ -734,18 +734,19 @@ impl ParkedComment {
                 sections.push(line);
             }
         }
-        let resume = code(&format!("owlshift continue {ticket}"));
+        let continue_cmd = code(&format!("owlshift continue {ticket}"));
         let restart = match (self.reason, self.restart) {
             (ParkReason::IsolationBreach, _) => format!(
                 "**To restart it:** a person checks the machine that ran it first: Owlshift \
-                 refuses this project there until the quarantine is cleared. Then run {resume}, \
-                 or {} if the project's checkout was deleted.",
+                 refuses this project there until the quarantine is cleared. Then run \
+                 {continue_cmd}, or {} if the project's checkout was deleted.",
                 code(&format!("owlshift do {ticket}"))
             ),
             (ParkReason::Reasks, _) => format!(
-                "**To restart it:** answer the questions still open here, then run {resume}."
+                "**To restart it:** answer the questions still open here, then run \
+                 {continue_cmd}."
             ),
-            (_, Restart::Resume) => format!("**To restart it:** run {resume}."),
+            (_, Restart::Continue) => format!("**To restart it:** run {continue_cmd}."),
             (_, Restart::Do) => format!(
                 "**To restart it:** run {} to run it again.",
                 code(&format!("owlshift do {ticket}"))
@@ -767,7 +768,7 @@ impl ParkedComment {
 }
 
 /// Why a ticket was parked, as a person reads it: the PARKED comment and
-/// what `owlshift do` and `owlshift resume` print say it the same way.
+/// what `owlshift do` and `owlshift continue` print say it the same way.
 pub fn park_reason(reason: ParkReason) -> &'static str {
     match reason {
         ParkReason::FailedRuns => "a second run failed",
@@ -1462,18 +1463,18 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             open: Vec::new(),
             restart,
         };
-        let resume = "**To restart it:** run `owlshift continue OWL-18`.";
+        let continue_it = "**To restart it:** run `owlshift continue OWL-18`.";
         let cases = [
             (
                 parked(
                     ParkReason::FailedRuns,
                     "the project gate failed:\ncargo test: exit status 101",
-                    Restart::Resume,
+                    Restart::Continue,
                 ),
                 vec![
                     "Parked: a second run failed. The last failure: the project gate failed: \
                      cargo test: exit status 101",
-                    resume,
+                    continue_it,
                 ],
                 vec![],
             ),
@@ -1489,7 +1490,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 parked(
                     ParkReason::IsolationBreach,
                     "/Users/someone/.local/share/owlshift: planted.txt was added",
-                    Restart::Resume,
+                    Restart::Continue,
                 ),
                 vec![
                     "Parked: the run broke isolation and is quarantined. What it changed is \
@@ -1508,7 +1509,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                         asked("Q2", "Which words?"),
                         judged("Q2", AnswerClass::Partial, "The ending is missing."),
                     )],
-                    ..parked(ParkReason::Reasks, "Checked.", Restart::Resume)
+                    ..parked(ParkReason::Reasks, "Checked.", Restart::Continue)
                 },
                 vec![
                     "Parked: the answers stayed incomplete, after 3 re-asks. Still open in \
