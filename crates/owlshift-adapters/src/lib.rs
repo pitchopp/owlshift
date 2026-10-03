@@ -7,4 +7,5 @@
 pub mod forge;
 pub mod graphql;
 pub mod harness;
+pub mod notifier;
 pub mod tracker;

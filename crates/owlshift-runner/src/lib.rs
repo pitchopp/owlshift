@@ -11,6 +11,7 @@ pub mod events;
 pub mod executor;
 pub mod forge;
 pub mod init;
+pub mod notify;
 pub mod on_demand;
 pub mod project;
 pub mod resolver;

@@ -38,6 +38,13 @@ pub trait Tracker {
     /// fixed set of states refuses a name outside it, never guessing a close
     /// one; the Markdown tracker takes any name.
     fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), Error>;
+
+    /// A link to the ticket that a person can open, for a notification
+    /// (OWL-140). `None` when the tracker has none, and when it could not be
+    /// read: a link is never worth failing for.
+    fn ticket_url(&self, _id: &TicketId) -> Option<String> {
+        None
+    }
 }
 
 /// A row of the tracker capability table in architecture section 6.
