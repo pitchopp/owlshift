@@ -691,6 +691,38 @@ fn the_brief_lists_the_zones_the_ticket_declares() {
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let brief = bench.briefs().pop().unwrap();
     assert_eq!(brief.zones, ["docs", "web/cart"]);
+    // OWL-134: the run log says the malformed label did not reach the agent.
+    let warnings: Vec<Event> = bench
+        .events()
+        .into_iter()
+        .filter(|event| event.kind == EventKind::Warning)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let data = &warnings[0].data;
+    assert_eq!(data["what"], "zone_label_left_out");
+    assert_eq!(data["label"], "Zone:../x");
+    assert!(data["reason"].as_str().is_some_and(|r| !r.is_empty()));
+    let events = bench.events();
+    let started = events
+        .iter()
+        .position(|event| event.kind == EventKind::RunStarted)
+        .unwrap();
+    assert_eq!(events[started + 1].kind, EventKind::Warning);
+    assert_eq!(events[started + 1].run, events[started].run);
+}
+
+/// OWL-134: a malformed `zone:` label still refuses a ticket without an
+/// assignee, before any run, so no warning is recorded.
+#[test]
+fn a_malformed_zone_label_still_refuses_a_ticket_without_an_assignee() {
+    let bench = Bench::with("maintainer", "labels = [\"zone:../x\"]\n", "");
+    let (outcome, _) = bench.run(Vec::new(), None);
+    let stop = outcome.unwrap_err();
+    assert!(
+        matches!(&stop, Stop::Refused(why) if why.contains("declares a zone that")),
+        "{stop}"
+    );
+    assert!(bench.events().is_empty());
 }
 
 /// How a case prepares its bench and gives its replies.

@@ -52,12 +52,26 @@ pub enum EventKind {
     AnswerPosted,
     PrMerged,
     CheckFailed,
+    /// Something was left out or degraded without stopping the run, such as
+    /// a ticket label the brief could not use. `data` names it (`what`) and
+    /// says why.
+    Warning,
 }
 
 impl Event {
     /// Parses an event.
+    ///
+    /// A format-1 event, written before the `warning` kind existed, is read
+    /// as the same event of format 2: format 1 is a strict subset of it.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        format::parse_json(CONTRACT, EVENT_FORMAT, input)
+        let old = serde_json::from_str::<serde_json::Value>(input)
+            .ok()
+            .filter(|v| v.get("format").and_then(serde_json::Value::as_u64) == Some(1));
+        let Some(mut value) = old else {
+            return format::parse_json(CONTRACT, EVENT_FORMAT, input);
+        };
+        value["format"] = EVENT_FORMAT.into();
+        format::parse_json(CONTRACT, EVENT_FORMAT, &value.to_string())
     }
 
     /// Renders an event as pretty JSON.

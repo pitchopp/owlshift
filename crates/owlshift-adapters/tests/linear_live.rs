@@ -44,5 +44,9 @@ fn linear_returns_a_zone_label_as_written() {
     let labels = || ticket.labels.iter().map(String::as_str);
     let declared = declared_zones(labels()).unwrap();
     assert!(declared.contains(&Resource::Zone("backend/billing".to_owned())));
-    assert!(brief_zones(labels()).contains(&"backend/billing".to_owned()));
+    assert!(
+        brief_zones(labels())
+            .zones
+            .contains(&"backend/billing".to_owned())
+    );
 }

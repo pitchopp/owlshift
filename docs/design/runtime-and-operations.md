@@ -193,7 +193,7 @@ fallback = "claude"
 
 Every action is a recorded event, readable from the CLI from P1 and from a local web UI from P8; the tray app of P11 wraps that same UI instead of rebuilding it.
 
-**Events and logs.** Each scan, decision, dispatch, run start and end, usage, gate and tracker write is a structured event in the local store. Each run's full harness output is captured to its own log file. On the ticket, comments give the human-readable trace. Until the local store exists, the events of `owlshift do` go to `events.jsonl` in the data directory, one JSON line each, and `owlshift logs` reads that file. It shows each run's log directory, not the logs themselves (OWL-20).
+**Events and logs.** Each scan, decision, dispatch, run start and end, usage, gate, tracker write and warning (something left out without stopping a run) is a structured event in the local store. Each run's full harness output is captured to its own log file. On the ticket, comments give the human-readable trace. Until the local store exists, the events of `owlshift do` go to `events.jsonl` in the data directory, one JSON line each, and `owlshift logs` reads that file. It shows each run's log directory, not the logs themselves (OWL-20).
 
 | Command | Answers |
 | --- | --- |
