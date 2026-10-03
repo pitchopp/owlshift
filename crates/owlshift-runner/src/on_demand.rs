@@ -1043,10 +1043,13 @@ impl OnDemand<'_> {
     /// ([`crate::resolver`]), the ticket still at Build. Always-human
     /// questions, and every question of a false premise (scenario S8), go to
     /// the decider. The rest go to a resolver run, unless `settled` runs in a
-    /// row already had all theirs decided ([`MAX_RESOLVED_PASSES`]). Each
-    /// decision is posted as a DECISION comment, then kept in the ticket ref,
-    /// one at a time: a decision whose post failed goes to the decider, and a
-    /// post whose keeping failed stops the command, naming the comment.
+    /// row already had all theirs decided ([`MAX_RESOLVED_PASSES`]). A
+    /// decision the resolver's own label does not let stand is refused
+    /// ([`resolver::settle`]) and its question goes to the decider. Each
+    /// other decision is posted as a DECISION comment, then kept in the
+    /// ticket ref, one at a time: a decision whose post failed goes to the
+    /// decider, and a post whose keeping failed stops the command, naming
+    /// the comment.
     /// Returns [`Routing::Settled`] when nothing is left for the decider,
     /// else the round to ask; a resolver that broke isolation parks the
     /// ticket.
@@ -1142,9 +1145,10 @@ impl OnDemand<'_> {
 
         let mut decided: Vec<QuestionId> = Vec::new();
         let mut unposted: Vec<QuestionId> = Vec::new();
-        for (question, decision, basis) in
-            resolver::decisions(&policy, &routed.to_resolver, resolutions)
-        {
+        // A decision whose two labels do not both route to the resolver is
+        // refused here, whatever the resolver decided (OWL-144).
+        let sorted = resolver::settle(&policy, &routed.to_resolver, resolutions);
+        for (question, decision, basis) in sorted.logged {
             let comment = DecisionComment {
                 ticket: ticket.clone(),
                 question: question.clone(),
@@ -1183,6 +1187,16 @@ impl OnDemand<'_> {
             "passed_on".to_owned(),
             json!(
                 resolver::passed_on(resolutions)
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        event.insert(
+            "refused".to_owned(),
+            json!(
+                sorted
+                    .refused
                     .iter()
                     .map(|id| id.as_str())
                     .collect::<Vec<_>>()
