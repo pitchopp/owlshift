@@ -588,7 +588,7 @@ impl Driver {
                 self.state.status()
             ));
         }
-        self.require_new_answer()?;
+        let read_through = self.require_new_answer()?;
         let report = self.execute(Role::AnswerCheck, reply)?;
         let (event, result) = answer_check::event(&report.outcome);
         let result = result.cloned();
@@ -678,8 +678,11 @@ impl Driver {
                     replies,
                 }
                 .render();
-                let at = self.post(&body)?;
-                self.answers_since = Some(at);
+                self.post(&body)?;
+                // As `answer_check::new_answer`: the next answer is a
+                // decider comment newer than the ones this check read, never
+                // measured against the REPLY, which is Owlshift's own.
+                self.answers_since = Some(read_through);
             }
             _ => {}
         }
@@ -687,10 +690,11 @@ impl Driver {
     }
 
     /// The answer check runs when answers arrive: a comment of the decider
-    /// after the latest ask, or after the last check that found a
-    /// counter-question. A failed or interrupted check moves nothing, so it
-    /// is retried on the same answers.
-    fn require_new_answer(&self) -> Result<(), String> {
+    /// after the latest ask, or after the newest decider comment the last
+    /// check that found a counter-question read. A failed or interrupted
+    /// check moves nothing, so it is retried on the same answers. Returns
+    /// the newest decider comment's time: what this check reads through.
+    fn require_new_answer(&self) -> Result<Timestamp, String> {
         let since = self
             .answers_since
             .ok_or("no question waits for an answer")?;
@@ -701,12 +705,16 @@ impl Driver {
             .assignee
             .ok_or("the ticket has no assignee to act as its decider")?;
         let comments = self.tracker.comments(&self.id).map_err(|e| e.to_string())?;
-        if comments.iter().any(|c| c.author == decider && c.at > since) {
-            Ok(())
-        } else {
-            Err(format!(
+        let newest = comments
+            .iter()
+            .filter(|c| c.author == decider)
+            .map(|c| c.at)
+            .max();
+        match newest {
+            Some(newest) if newest > since => Ok(newest),
+            _ => Err(format!(
                 "no comment from the decider since {since}: the answer check runs once answers arrive"
-            ))
+            )),
         }
     }
 
