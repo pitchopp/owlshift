@@ -232,8 +232,9 @@ impl MarkdownTracker {
 /// runner posts as [`MarkdownTracker::AGENT`] at the current time.
 ///
 /// The inherent types carry more than the shared ones (the stage,
-/// blocked-by). They converge when the trait carries the visible stage (P2)
-/// and blocked-by relations; until then the conversion lives only here.
+/// blocked-by). The trait writes the visible stage but does not read it;
+/// they converge when it reads both and blocked-by relations; until then the
+/// conversion lives only here.
 impl shared::Tracker for MarkdownTracker {
     fn capabilities(&self) -> &'static [Capability] {
         Self::CAPABILITIES
@@ -268,11 +269,20 @@ impl shared::Tracker for MarkdownTracker {
             .map(shared_comment)
             .map_err(other)
     }
+
+    fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), shared::Error> {
+        self.require_ticket(id)?;
+        MarkdownTracker::set_stage(self, id, state).map_err(other)
+    }
 }
 
 impl MarkdownTracker {
     /// What the Markdown tracker implements through [`shared::Tracker`].
-    pub const CAPABILITIES: &'static [Capability] = &[Capability::ReadTicket, Capability::Comments];
+    pub const CAPABILITIES: &'static [Capability] = &[
+        Capability::ReadTicket,
+        Capability::Comments,
+        Capability::VisibleStage,
+    ];
 
     /// The author of the comments the runner posts.
     pub const AGENT: &'static str = "owlshift";

@@ -7,7 +7,7 @@ mod support;
 
 use std::fs;
 
-use owlshift_adapters::tracker::linear::LinearTracker;
+use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Author, Capability, ErrorKind, Person, Tracker};
 use owlshift_contracts::Priority;
@@ -110,6 +110,27 @@ fn check(tracker: &dyn Tracker, case: &Case) {
     );
 }
 
+/// The visible stage, checked apart from [`check`] so that each adapter's
+/// recording of it stays separate from the read-and-comment one: the stage
+/// moves to `there`, then back to `back`, and a ticket that does not exist is
+/// not found. Reading the stage back is each adapter's own test.
+fn check_stage(
+    tracker: &dyn Tracker,
+    existing: &TicketId,
+    missing: &TicketId,
+    there: &str,
+    back: &str,
+) {
+    assert!(
+        tracker.capabilities().contains(&Capability::VisibleStage),
+        "VisibleStage is not declared"
+    );
+    tracker.set_stage(existing, there).unwrap();
+    tracker.set_stage(existing, back).unwrap();
+    let missing = tracker.set_stage(missing, there).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
+}
+
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
@@ -149,6 +170,14 @@ fn the_markdown_tracker_conforms() {
     };
     let tracker = MarkdownTracker::new(root.path());
     check(&tracker, &case);
+    check_stage(
+        &tracker,
+        &case.existing,
+        &case.missing,
+        "Needs Input",
+        "In Progress",
+    );
+    assert_eq!(tracker.ticket(&case.existing).unwrap().stage, "In Progress");
     let maintainer = Person {
         id: "maintainer".to_owned(),
         name: "maintainer".to_owned(),
@@ -219,6 +248,101 @@ fn record_conformance_fixture() {
     );
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
+    }
+}
+
+/// The ticket the stage fixture moves, from In Progress to Needs Input and
+/// back: the issue of the change that recorded it.
+const STAGE_TICKET: &str = "OWL-137";
+const STAGE_FIXTURE: &str = "stage-owl-137.json";
+
+#[test]
+fn the_linear_tracker_moves_the_visible_stage() {
+    let replay = Replay::new(STAGE_FIXTURE);
+    check_stage(
+        &LinearTracker::with_transport(replay.clone()),
+        &id(STAGE_TICKET),
+        &linear_case().missing,
+        "Needs Input",
+        "In Progress",
+    );
+    replay.assert_done();
+}
+
+/// Records the stage fixture against the live API. It writes to Linear:
+/// only with `OWLSHIFT_RECORD_WRITES=OWL-137`, on the Owlshift workspace,
+/// and only while OWL-137 is In Progress, where the check leaves it. Once
+/// the issue was found, it is put back in the state it was found in
+/// whatever happens, and the state Linear answers is printed.
+#[test]
+#[ignore = "records against the live Linear API, and moves OWL-137"]
+fn record_stage_fixture() {
+    let key = support::live_key();
+    support::assert_owlshift_workspace(&key);
+    assert_eq!(
+        std::env::var("OWLSHIFT_RECORD_WRITES").ok().as_deref(),
+        Some(STAGE_TICKET),
+        "refusing to move {STAGE_TICKET} without OWLSHIFT_RECORD_WRITES={STAGE_TICKET}"
+    );
+    let found = support::live_query(
+        &key,
+        &format!("{{ issue(id: \"{STAGE_TICKET}\") {{ id state {{ id name }} }} }}"),
+    );
+    let issue = &found["data"]["issue"];
+    assert_eq!(
+        issue["state"]["name"], "In Progress",
+        "{STAGE_TICKET} must be In Progress to record the stage fixture"
+    );
+    let _restore = Restore {
+        key: key.clone(),
+        issue: issue["id"].as_str().unwrap().to_owned(),
+        state: issue["state"]["id"].as_str().unwrap().to_owned(),
+    };
+
+    let recorder = Recorder::new(&key);
+    let tracker = LinearTracker::with_transport(recorder.clone());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_stage(
+            &tracker,
+            &id(STAGE_TICKET),
+            &linear_case().missing,
+            "Needs Input",
+            "In Progress",
+        )
+    }));
+    recorder.write(
+        STAGE_FIXTURE,
+        &format!("{} on the Owlshift workspace, recorded live", today()),
+    );
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Puts the issue back in the state it was found in when dropped, and says
+/// whether Linear confirms it.
+struct Restore {
+    key: ApiKey,
+    issue: String,
+    state: String,
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let (issue, state) = (&self.issue, &self.state);
+        let moved = support::live_query(
+            &self.key,
+            &format!(
+                "mutation {{ issueUpdate(id: \"{issue}\", input: {{ stateId: \"{state}\" }}) \
+                 {{ success issue {{ state {{ id name }} }} }} }}"
+            ),
+        );
+        let now = &moved["data"]["issueUpdate"]["issue"]["state"];
+        if now["id"] == state.as_str() {
+            eprintln!("{STAGE_TICKET} is back in {}", now["name"]);
+        } else {
+            eprintln!("RESTORE FAILED: {STAGE_TICKET} is not back in its state: {moved}");
+        }
     }
 }
 

@@ -21,6 +21,12 @@
 //! understood ([`ResumeComment`], [`Writer::post_resume`]); and, whenever
 //! the ticket parks, why and what restarts it ([`ParkedComment`],
 //! [`Writer::post_parked`]).
+//!
+//! And the ticket's visible stage ([`VisibleStage`], [`Writer::set_stage`]):
+//! working while a Build runs, needs input while questions wait, review once
+//! the pull request is open. [`VisibleStage::after`] says which core event
+//! moves it, for `owlshift do` and `continue` as for the test bench's
+//! stand-in driver.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -34,13 +40,14 @@ use owlshift_adapters::forge::{
 };
 use owlshift_adapters::tracker::{Comment, Error as TrackerError, Tracker};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
+use owlshift_contracts::config::States;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, Question, Verdict as AnswerVerdict,
 };
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
-use owlshift_core::state::{MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason};
+use owlshift_core::state::{Event, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason};
 
 use crate::executor::Git;
 use crate::resolver::Fallback;
@@ -835,6 +842,53 @@ fn bullets(lines: &[String]) -> String {
         .join("\n")
 }
 
+/// A visible stage the runner moves a ticket to (architecture section 6),
+/// which the project names on its tracker under `[tracker].states`. Ready is
+/// a person's gesture, never the runner's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisibleStage {
+    /// A Build runs, or is about to.
+    Working,
+    /// Questions wait for the decider.
+    NeedsInput,
+    /// The pull request is open.
+    Review,
+}
+
+impl VisibleStage {
+    /// The stage a core event moves the ticket to, once what it opens is on
+    /// the ticket: a dispatch or a settled round starts work, a round of
+    /// questions or a re-ask waits for the decider. Review follows no core
+    /// event of this version: the delivery sets it when the pull request
+    /// opens. A counter-question keeps the ticket waiting, and a park leaves
+    /// the stage where it was.
+    pub fn after(event: Event) -> Option<Self> {
+        match event {
+            Event::Dispatched | Event::Answered => Some(Self::Working),
+            Event::Questions | Event::Incomplete => Some(Self::NeedsInput),
+            _ => None,
+        }
+    }
+
+    /// Its key under `[tracker].states`, as events name it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::NeedsInput => "needs_input",
+            Self::Review => "review",
+        }
+    }
+
+    /// The tracker state the project maps it to.
+    pub fn state(self, states: &States) -> &str {
+        match self {
+            Self::Working => &states.working,
+            Self::NeedsInput => &states.needs_input,
+            Self::Review => &states.review,
+        }
+    }
+}
+
 /// Writes to the tracker, and later to the forge, after asking the floor.
 pub struct Writer<'a> {
     tracker: &'a dyn Tracker,
@@ -991,6 +1045,23 @@ impl<'a> Writer<'a> {
     /// Posts a PARKED comment and returns it as the tracker recorded it.
     pub fn post_parked(&self, comment: &ParkedComment) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Moves the ticket's visible stage to the state `states` maps `stage`
+    /// to, and returns that state's name.
+    pub fn set_stage<'s>(
+        &self,
+        ticket: &TicketId,
+        stage: VisibleStage,
+        states: &'s States,
+    ) -> Result<&'s str, WriteError> {
+        floor::check_action(Action::SetVisibleStage, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        let state = stage.state(states);
+        self.tracker
+            .set_stage(ticket, state)
+            .map_err(WriteError::Tracker)?;
+        Ok(state)
     }
 
     fn post(&self, ticket: &TicketId, body: &str) -> Result<Comment, WriteError> {
@@ -1715,6 +1786,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         comments: RefCell<Vec<Comment>>,
         posts: Cell<usize>,
         fail_comments: Cell<bool>,
+        stages: RefCell<Vec<String>>,
     }
 
     impl Tracker for FakeTracker {
@@ -1747,6 +1819,32 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             self.comments.borrow_mut().push(comment.clone());
             Ok(comment)
         }
+
+        fn set_stage(&self, _: &TicketId, state: &str) -> Result<(), TrackerError> {
+            self.stages.borrow_mut().push(state.to_owned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_writer_moves_the_stage_to_the_projects_state_name() {
+        let tracker = FakeTracker::default();
+        let states = States {
+            ready: "Todo".to_owned(),
+            working: "Doing".to_owned(),
+            needs_input: "Asked".to_owned(),
+            review: "Review".to_owned(),
+        };
+        let writer = Writer::new(&tracker);
+        for (stage, name) in [
+            (VisibleStage::Working, "Doing"),
+            (VisibleStage::NeedsInput, "Asked"),
+            (VisibleStage::Review, "Review"),
+        ] {
+            assert_eq!(writer.set_stage(&ticket(), stage, &states).unwrap(), name);
+        }
+        assert_eq!(*tracker.stages.borrow(), ["Doing", "Asked", "Review"]);
+        assert_eq!(tracker.posts.get(), 0);
     }
 
     #[test]

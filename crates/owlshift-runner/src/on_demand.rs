@@ -28,8 +28,12 @@
 //! after a RESUME comment of what was understood, asks again what is
 //! missing, or parks the ticket. Every park, of a Build or of an answer
 //! check, posts a PARKED comment saying why and what restarts it. In this
-//! version the build stage is the whole pipeline, and the tracker's visible
-//! stage is not moved.
+//! version the build stage is the whole pipeline.
+//!
+//! The ticket's visible stage follows (OWL-137, [`VisibleStage`]): working
+//! once `do` dispatched or `continue` resumed after an answer, needs input
+//! once a round or a re-ask is on the ticket, review once the pull request
+//! is open. A stage write that fails is a `warning` event and nothing more.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -84,7 +88,7 @@ use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
     DecisionComment, DeliveryReport, Gate, ParkedComment, QuestionsComment, ReaskComment,
-    ReplyComment, Restart, ResumeComment, Writer, park_reason,
+    ReplyComment, Restart, ResumeComment, VisibleStage, Writer, park_reason,
 };
 
 /// How long one Build run may take before its process tree is stopped.
@@ -646,6 +650,7 @@ impl OnDemand<'_> {
             other => return Err(core_error(other)),
         };
         let dispatched = self.dispatch(&p, Command::Do, sink)?;
+        self.show_after(ticket, None, Event::Dispatched, sink);
         self.build(&mut p, &dispatched, state, sink)
     }
 
@@ -1011,6 +1016,9 @@ impl OnDemand<'_> {
             EventKind::TrackerWrite,
             comment_written("QUESTIONS", &posted),
         );
+        // The questions are on the ticket: it waits for the decider, even if
+        // keeping them below fails.
+        self.show_after(&ticket, Some(run), Event::Questions, sink);
         let mut asked = p.questions();
         asked.asks.push(Ask {
             kind: AskKind::Questions,
@@ -1329,6 +1337,7 @@ impl OnDemand<'_> {
                         posted.id
                     ))
                 })?;
+                self.show_after(&ticket, Some(&ran.run), Event::Answered, sink);
                 sink.emit(
                     &ticket,
                     Some(&ran.run),
@@ -1362,6 +1371,8 @@ impl OnDemand<'_> {
                     EventKind::TrackerWrite,
                     comment_written("RE-ASK", &posted),
                 );
+                // Already at needs input, unless a person moved it meanwhile.
+                self.show_after(&ticket, Some(&ran.run), Event::Incomplete, sink);
                 questions.asks.push(Ask {
                     kind: AskKind::Reask,
                     round,
@@ -1693,6 +1704,54 @@ impl OnDemand<'_> {
         })
     }
 
+    /// Moves the ticket's visible stage through the Writer: a `tracker_write`
+    /// event, or a `warning` when the write failed. Never a stop: the stage is
+    /// for people to read, and the ticket ref and the comments hold what the
+    /// runner needs.
+    fn show(
+        &self,
+        ticket: &TicketId,
+        run: Option<&str>,
+        stage: VisibleStage,
+        sink: &mut EventSink<'_>,
+    ) {
+        let states = &self.config.tracker.states;
+        let (kind, data) = match Writer::new(self.tracker).set_stage(ticket, stage, states) {
+            Ok(state) => (
+                EventKind::TrackerWrite,
+                data([
+                    ("target", json!("tracker")),
+                    ("action", json!("stage")),
+                    ("stage", json!(stage.key())),
+                    ("state", json!(state)),
+                ]),
+            ),
+            Err(error) => (
+                EventKind::Warning,
+                data([
+                    ("what", json!("stage_not_moved")),
+                    ("stage", json!(stage.key())),
+                    ("state", json!(stage.state(states))),
+                    ("reason", json!(error.to_string())),
+                ]),
+            ),
+        };
+        sink.emit(ticket, run, kind, data);
+    }
+
+    /// Moves the visible stage as `event` does ([`VisibleStage::after`]).
+    fn show_after(
+        &self,
+        ticket: &TicketId,
+        run: Option<&str>,
+        event: Event,
+        sink: &mut EventSink<'_>,
+    ) {
+        if let Some(stage) = VisibleStage::after(event) {
+            self.show(ticket, run, stage, sink);
+        }
+    }
+
     fn comments(&self, ticket: &TicketId) -> Result<Vec<Comment>, Stop> {
         self.tracker
             .comments(ticket)
@@ -1819,6 +1878,8 @@ impl OnDemand<'_> {
                 ("opened", json!(opened.opened)),
             ]),
         );
+        // The pull request is open, whatever the steps below find.
+        self.show(ticket, None, VisibleStage::Review, sink);
         let pull_request = self.head_at(opened.pull_request, head, base, &commit)?;
         let checks = self.forge.checks(pull_request.number, &commit);
         if let Err(error) = &checks

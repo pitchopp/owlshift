@@ -17,8 +17,10 @@
 //! No writer (OWL-18) exists yet, so the runner drives the rest itself, and
 //! only as far as the scenarios need: it keeps the core state in memory from
 //! Ready, builds the brief from the tracker, maps the run's outcome onto a
-//! core event, posts the questions comment, sets the visible stage and
-//! pushes the branch. It keeps the latest failure of the gate the executor
+//! core event, posts the questions comment, sets the visible stage after
+//! the same core events as `owlshift do` and `continue`, through the same
+//! Writer (`owlshift_runner::writer::VisibleStage::after`), and pushes the
+//! branch. It keeps the latest failure of the gate the executor
 //! runs after a Build `done`, and hands it to the next Build brief. That
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
@@ -95,7 +97,7 @@ use owlshift_runner::on_demand::core_event;
 use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
     DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
-    ResumeComment,
+    ResumeComment, VisibleStage, Writer,
 };
 
 use crate::git::{GitEnv, Remote, seed};
@@ -506,7 +508,7 @@ impl Driver {
         match action {
             Action::Dispatch => {
                 self.apply(Event::Dispatched)?;
-                self.set_stage(&self.states.working.clone())?;
+                self.show_after(Event::Dispatched)?;
                 Ok(Some(Event::Dispatched))
             }
             Action::Run(reply) => self.run(reply),
@@ -569,9 +571,15 @@ impl Driver {
         self.post(&body).map(|_| ())
     }
 
-    fn set_stage(&self, stage: &str) -> Result<(), String> {
-        self.tracker
-            .set_stage(&self.id, stage)
+    /// Moves the visible stage as `owlshift do` and `continue` do after
+    /// `event`. A failed write fails the scenario, which expects the stage.
+    fn show_after(&self, event: Event) -> Result<(), String> {
+        let Some(stage) = VisibleStage::after(event) else {
+            return Ok(());
+        };
+        Writer::new(&self.tracker)
+            .set_stage(&self.id, stage, &self.states)
+            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
@@ -647,7 +655,7 @@ impl Driver {
         });
         self.verdicts.push(Vec::new());
         self.answers_since = Some(at);
-        self.set_stage(&self.states.needs_input.clone())
+        self.show_after(Event::Questions)
     }
 
     /// Runs the resolver through the executor, on the fake harness, on the
@@ -770,7 +778,7 @@ impl Driver {
                 }
                 .render();
                 self.post(&body)?;
-                self.set_stage(&self.states.working.clone())?;
+                self.show_after(Event::Answered)?;
             }
             // Still waiting: past the re-ask limit, the core parked it.
             (Event::Incomplete, Status::NeedsInput { .. }) => {
@@ -788,6 +796,7 @@ impl Driver {
                 }
                 .render();
                 let at = self.post(&body)?;
+                self.show_after(Event::Incomplete)?;
                 self.asks.push(ThreadEntry::Reask {
                     round,
                     at,
