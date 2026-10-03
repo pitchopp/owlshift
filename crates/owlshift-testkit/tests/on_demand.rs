@@ -1752,3 +1752,135 @@ fn a_zone_owner_named_only_in_the_persons_checkout_decides_nothing() {
     assert!(bench.dirs().checkout().exists());
     assert!(bench.events().is_empty());
 }
+
+/// A Build run's questions: Q1 discoverable (naming), Q2 always human
+/// (scope).
+const MIXED: &str = r#"{"format":4,"status":"questions",
+"summary":"The greeting's file and words are not given.",
+"questions":[
+  {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+   "text":"Which file should hold the greeting?"},
+  {"id":"Q2","category":"scope","context":"The ticket names neither the words nor the ending.",
+   "text":"What should the greeting say?"}]}"#;
+
+/// A Build run's one discoverable question.
+const NAMING: &str = r#"{"format":4,"status":"questions",
+"summary":"The greeting's file is not named.",
+"questions":[
+  {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+   "text":"Which file should hold the greeting?"}]}"#;
+
+/// The resolver decides Q1.
+const DECIDED_Q1: &str = r#"{"format":4,"status":"done","summary":"The ticket names the file.",
+"resolutions":[{"question":"Q1","outcome":"decided","decision":"GREETING.md, at the root.",
+"basis":"The ticket's description."}]}"#;
+
+/// The events of a kind whose data holds `key`.
+fn data_of(events: &[Event], kind: EventKind, key: &str) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| event.kind == kind && event.data.contains_key(key))
+        .map(|event| Value::Object(event.data.clone()))
+        .collect()
+}
+
+/// OWL-138's first acceptance: a discoverable question is decided and
+/// logged in a DECISION comment, and the round holds the always-human one
+/// alone, as Q1; the decision reaches the next Build as a `decision` entry
+/// and the delivery report lists it.
+#[test]
+fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(MIXED)),
+            bench.reply(None, Some(DECIDED_Q1)),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("the always-human question stops the run");
+    let Stop::NeedsInput {
+        posted: Ok(round),
+        questions,
+        ..
+    } = &stop
+    else {
+        panic!("{stop:?}\n{printed}");
+    };
+    assert_eq!(round.get(), 1);
+    let asked: Vec<(&str, &str)> = questions
+        .iter()
+        .map(|q| (q.id.as_str(), q.text.as_str()))
+        .collect();
+    assert_eq!(asked, [("Q1", "What should the greeting say?")]);
+
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(comments[0].starts_with("[owlshift] DECISION\n"), "{}", comments[0]);
+    for text in [
+        "**Question** (naming) Which file should hold the greeting?",
+        "**Decision:** GREETING.md, at the root.",
+        "**Settled by:** The ticket's description.",
+    ] {
+        assert!(comments[0].contains(text), "{text}\n{}", comments[0]);
+    }
+    let round_1 = &comments[1];
+    assert!(round_1.starts_with("[owlshift] QUESTIONS · round 1\n"), "{round_1}");
+    assert!(round_1.contains("**Q1** (scope) What should the greeting say?"));
+    assert!(round_1.contains("Owlshift decided one other question of this run itself"));
+    assert!(!round_1.contains("naming") && !round_1.contains("**Q2**"), "{round_1}");
+
+    // The resolver read only the discoverable question, read-only, with the
+    // project's rules.
+    let briefs = bench.briefs();
+    assert_eq!(briefs.len(), 2);
+    let resolver = &briefs[1];
+    assert_eq!(resolver.role, Role::Resolver);
+    assert_eq!(resolver.permissions.level, PermissionLevel::ReadOnly);
+    assert!(!resolver.permissions.network);
+    assert_eq!(resolver.rules.len(), 1);
+    let given: Vec<&str> = resolver.resolve.iter().map(|q| q.category.as_str()).collect();
+    assert_eq!(given, ["naming"]);
+
+    let record = bench.record();
+    assert_eq!(
+        (record.state.waiting, record.state.round),
+        (Some(Waiting::NeedsInput), 1)
+    );
+    assert_eq!(record.questions.decisions.len(), 1);
+    assert_eq!(record.questions.asks[0].questions.len(), 1);
+    let events = bench.events();
+    let resolved = data_of(&events, EventKind::Gate, "resolver");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0]["resolver"], "done");
+    assert_eq!(resolved[0]["decided"], json!(["Q1"]));
+    assert_eq!(resolved[0]["to_decider"], json!(["Q2"]));
+    let opened = data_of(&events, EventKind::Gate, "opened");
+    assert_eq!(opened[0]["raised_as"], json!(["Q2"]));
+    assert_eq!(
+        data_of(&events, EventKind::TrackerWrite, "question")[0]["kind"],
+        "DECISION"
+    );
+
+    // Answered, the ticket resumes: the decision sits before the round in
+    // every later brief, and the delivery report lists it.
+    bench.answer("Q1: \"Hello, reader.\"\n");
+    let answered = check(&[("Q1", "answered", "Hello, reader.")]);
+    let (delivered, printed) = bench.resume(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let build = bench.briefs().pop().unwrap();
+    assert_eq!(build.role, Role::Build);
+    assert_eq!(shape(&build), ["decision", "questions", "Decider", "Owlshift"]);
+    let report = bench.comments().pop().unwrap();
+    assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
+    assert!(
+        report.contains(
+            "**Which file should hold the greeting?**: GREETING.md, at the root. (basis: The \
+             ticket's description.)"
+        ),
+        "{report}"
+    );
+}
