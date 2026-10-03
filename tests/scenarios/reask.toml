@@ -6,8 +6,8 @@
 description = """
 DEMO-3 through two question rounds. Round 1 asks two questions; the decider
 answers Q1 and half of Q2, so the answer check finds Q2 partial and a RE-ASK
-asks Q2 alone. The decider asks back what it means: a counter-question, nothing
-re-asked. Their answer then settles Q2, a RESUME restates Q1 and Q2 as
+asks Q2 alone. The decider asks back what it means: a counter-question, which a
+REPLY answers with the check's reply, nothing re-asked and no Build run. Their answer then settles Q2, a RESUME restates Q1 and Q2 as
 understood, and the ticket resumes at Build. Round 2 asks one question; a check
 that gives its verdict on round 1's Q2 is refused, a failed run, and is retried
 on the same answer, which settles it, with its own RESUME. The build is then
@@ -62,11 +62,27 @@ expect = { event = "none", comments = 4 }
 
 [[step]]
 answer = { result = "results/check-round1-q2-counter.json" }
-expect = { event = "counter_question", waiting = "needs_input", round = 1, reasks = 1, comments = 4, brief_latest_ask = ["Q2"] }
+[step.expect]
+event = "counter_question"
+stage = "build"
+waiting = "needs_input"
+round = 1
+reasks = 1
+tracker_stage = "Needs Input"
+comments = 5
+brief_latest_ask = ["Q2"]
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] REPLY"
+contains = [
+  "**Q2** (scope) What should the greeting say, and should it end with a sign-off?\nReply: A sign-off is a closing line after the greeting, such as \"Best regards\". Should the greeting end with one, and what should it say?",
+  '<!-- owlshift:{"format":1,"kind":"REPLY","ticket":"DEMO-3"} -->',
+]
+lacks = ["RE-ASK", "**Q1**"]
 
 [[step]]
 comment = { author = "maintainer", body = "Q2: no sign-off then, just \"Hello, reader.\"\n" }
-expect = { event = "none", comments = 5 }
+expect = { event = "none", comments = 6 }
 
 [[step]]
 answer = { result = "results/check-round1-q2-answered.json" }
@@ -77,9 +93,9 @@ waiting = "none"
 round = 1
 reasks = 0
 tracker_stage = "In Progress"
-comments = 6
+comments = 7
 brief_latest_ask = ["Q2"]
-brief_thread = ["decider", "decider", "decider"]
+brief_thread = ["decider", "decider", "owlshift", "decider"]
 [step.expect.last_comment]
 author = "owlshift"
 first_line = "[owlshift] RESUME · round 1"
@@ -98,16 +114,16 @@ waiting = "needs_input"
 round = 2
 reasks = 0
 tracker_stage = "Needs Input"
-comments = 7
+comments = 8
 last_comment = { first_line = "[owlshift] QUESTIONS · round 2", contains = ["**Q1** (scope) Should the README link to the greeting?"] }
 
 [[step]]
 comment = { author = "maintainer", body = "Q1: no.\n" }
-expect = { event = "none", comments = 8 }
+expect = { event = "none", comments = 9 }
 
 [[step]]
 answer = { result = "results/check-round1-q2-answered.json" }
-expect = { event = "run_failed", waiting = "needs_input", round = 2, failed_runs = 1, comments = 8, brief_latest_ask = ["Q1"] }
+expect = { event = "run_failed", waiting = "needs_input", round = 2, failed_runs = 1, comments = 9, brief_latest_ask = ["Q1"] }
 
 [[step]]
 answer = { result = "results/check-round2-q1-answered.json" }
@@ -118,7 +134,7 @@ waiting = "none"
 round = 2
 failed_runs = 1
 tracker_stage = "In Progress"
-comments = 9
+comments = 10
 [step.expect.last_comment]
 first_line = "[owlshift] RESUME · round 2"
 contains = ["**Q1** (scope) Should the README link to the greeting?\nUnderstood: No link, the recommendation."]
@@ -134,6 +150,6 @@ event = "completed"
 stage = "verify"
 failed_runs = 0
 brief_latest_ask = ["Q1"]
-brief_thread = ["decider", "decider", "decider", "owlshift", "decider", "owlshift"]
+brief_thread = ["decider", "decider", "owlshift", "decider", "owlshift", "decider", "owlshift"]
 branch_pushed = true
 branch_files = { "GREETING.md" = "Hello, reader.\n" }

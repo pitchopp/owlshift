@@ -32,8 +32,11 @@
 //! a RESUME comment restates what was understood of each of its questions
 //! (`owlshift_runner::writer::ResumeComment`) and the ticket resumes; an
 //! incomplete one posts a RE-ASK comment with only the open questions
-//! (`owlshift_runner::writer::ReaskComment`); a counter-question changes
-//! nothing yet. Each ask the driver posts, a round's questions or a re-ask,
+//! (`owlshift_runner::writer::ReaskComment`); a counter-question posts a
+//! REPLY comment with the check's reply to it
+//! (`owlshift_runner::writer::ReplyComment`) and the ticket keeps waiting,
+//! the REPLY staying an `owlshift` comment in every later brief's thread.
+//! Each ask the driver posts, a round's questions or a re-ask,
 //! is kept in memory with the verdicts of the latest check on it, and takes
 //! the place of its comment in every brief's thread, as a `questions` or
 //! `reask` entry. Whenever the core parks the ticket, after a run or an
@@ -43,8 +46,8 @@
 //! - no intake, admission, claim or ticket ref; the pipeline is the project's
 //!   default variant, and the asks live in memory, not in the ticket ref;
 //! - a stage run's outcome maps onto the core event as `owlshift do` maps it
-//!   (`owlshift_runner::on_demand::core_event`), and no REPLY or DELIVERY
-//!   comment is written.
+//!   (`owlshift_runner::on_demand::core_event`), and no DELIVERY comment is
+//!   written.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -75,7 +78,7 @@ use owlshift_runner::answer_check;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::core_event;
 use owlshift_runner::writer::{
-    ParkedComment, QuestionsComment, ReaskComment, Restart, ResumeComment,
+    ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart, ResumeComment,
 };
 
 use crate::git::{GitEnv, Remote, seed};
@@ -576,7 +579,8 @@ impl Driver {
     /// Runs the answer check through the executor, on the fake harness,
     /// once answers arrived, and acts on its one core event: the ticket
     /// resumes, or the open questions are asked again. A counter-question
-    /// waits for the decider's next comment; its reply is not written yet.
+    /// gets a REPLY with the check's reply and waits for the decider's next
+    /// comment.
     fn answer(&mut self, reply: &Reply) -> Result<Event, String> {
         if !matches!(self.state.status(), Status::NeedsInput { .. }) {
             return Err(format!(
@@ -660,7 +664,23 @@ impl Driver {
                 self.verdicts.push(Vec::new());
                 self.answers_since = Some(at);
             }
-            (Event::CounterQuestion, _) => self.answers_since = Some(self.now),
+            // A REPLY answers each counter-question; the ticket keeps
+            // waiting for the decider.
+            (Event::CounterQuestion, _) => {
+                let result = result.ok_or("a counter-question comes from a result")?;
+                let brief = self.last_brief.as_ref().ok_or("no brief")?;
+                let replies = answer_check::counter_replies(brief, &result.verdicts);
+                if replies.is_empty() {
+                    return Err("a counter-question without a reply to post".to_owned());
+                }
+                let body = ReplyComment {
+                    ticket: self.id.clone(),
+                    replies,
+                }
+                .render();
+                let at = self.post(&body)?;
+                self.answers_since = Some(at);
+            }
             _ => {}
         }
         Ok(event)
