@@ -125,7 +125,7 @@ fn the_reask_limit_parks_the_ticket_with_a_parked_comment() {
         contains = [
           "Parked: the answers stayed incomplete, after 3 re-asks. Still open in round 1:",
           "**Q2** (scope) What should the greeting say, and should it end with a sign-off?\nStill open (partial): Still no word on the sign-off.",
-          "**To restart it:** answer the questions still open here, then run `owlshift resume DEMO-3`.",
+          "**To restart it:** answer the questions still open here, then run `owlshift continue DEMO-3`.",
           '<!-- owlshift:{{"format":1,"kind":"PARKED","ticket":"DEMO-3"}} -->',
         ]
         lacks = ["**Q1**"]

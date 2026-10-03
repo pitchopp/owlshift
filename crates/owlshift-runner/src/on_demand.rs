@@ -1,4 +1,4 @@
-//! `owlshift do TICKET` and `owlshift resume TICKET`: one ticket turned into
+//! `owlshift do TICKET` and `owlshift continue TICKET`: one ticket turned into
 //! a verified pull request, on demand and in the foreground (roadmap P1 and
 //! P2, build plan OWL-20 and "The answer check").
 //!
@@ -22,8 +22,9 @@
 //! Build runs again without a stop. What is left opens a round: the Writer
 //! posts it as a QUESTIONS comment, and the ticket ref keeps the ask and the
 //! core state.
-//! While they wait, `do` is refused; `resume` runs the answer check once the
-//! decider has answered ([`crate::answer_check`]), then resumes the Build
+//! While they wait, `do` is refused; `continue` runs the answer check once the
+//! decider has answered and their reply counts, after the quiet window or at
+//! once with `go` ([`crate::answer_check`]), then resumes the Build
 //! after a RESUME comment of what was understood, asks again what is
 //! missing, or parks the ticket. Every park, of a Build or of an answer
 //! check, posts a PARKED comment saying why and what restarts it. In this
@@ -66,6 +67,7 @@ use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::GatePolicy;
 use owlshift_core::pipeline::Pipeline;
+use owlshift_core::reply::QUIET_WINDOW;
 use owlshift_core::resource::Resource;
 use owlshift_core::state::{
     Event, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason, Status, TicketState, Transition,
@@ -187,7 +189,12 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
     }
 }
 
-/// One `owlshift do` or `owlshift resume`: the adapters, the executor and
+/// This machine's clock, the one [`OnDemand::clock`] reads outside tests.
+pub fn system_clock() -> Timestamp {
+    Timestamp::now()
+}
+
+/// One `owlshift do` or `owlshift continue`: the adapters, the executor and
 /// the project.
 pub struct OnDemand<'a> {
     pub executor: &'a Executor,
@@ -206,6 +213,9 @@ pub struct OnDemand<'a> {
     pub dirs: &'a ProjectDirs,
     /// How long to wait between two reads of the pull request's head.
     pub head_wait: Duration,
+    /// This machine's clock, read for the quiet window alone
+    /// ([`answer_check::counts_at`]).
+    pub clock: &'a dyn Fn() -> Timestamp,
 }
 
 /// A ticket delivered.
@@ -242,7 +252,7 @@ impl fmt::Display for Delivered {
     }
 }
 
-/// Why `owlshift do` or `owlshift resume` stopped short of a delivery.
+/// Why `owlshift do` or `owlshift continue` stopped short of a delivery.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stop {
     /// Another `owlshift do` holds the project.
@@ -268,6 +278,14 @@ pub enum Stop {
         round: u32,
         decider: String,
         since: Timestamp,
+    },
+    /// The decider has commented since the questions were asked, but their
+    /// latest comment is within the quiet window and does not end with `go`:
+    /// they may still be writing. It counts at `counts_at`.
+    Settling {
+        ticket: TicketId,
+        decider: String,
+        counts_at: Timestamp,
     },
     /// The answers left questions open: they were asked again on the ticket.
     Reasked {
@@ -349,7 +367,7 @@ impl fmt::Display for Stop {
                     Ok(round) => write!(
                         f,
                         "\nThe questions are on the ticket as round {round}: answer there, then \
-                         run `owlshift resume {ticket}`."
+                         run `owlshift continue {ticket}`."
                     ),
                     Err(why) => write!(
                         f,
@@ -366,8 +384,19 @@ impl fmt::Display for Stop {
             } => write!(
                 f,
                 "Waiting: the questions of round {round} wait for {decider}, with no new comment \
-                 from them since {since}. Once they answer on the ticket, run `owlshift resume \
+                 from them since {since}. Once they answer on the ticket, run `owlshift continue \
                  {ticket}` again."
+            ),
+            Self::Settling {
+                ticket,
+                decider,
+                counts_at,
+            } => write!(
+                f,
+                "Waiting: {decider} may still be writing. Their latest comment counts as their \
+                 answer once left unedited for {} minutes, at {counts_at}, or at once if it ends \
+                 with `go`. Run `owlshift continue {ticket}` then.",
+                QUIET_WINDOW.as_secs() / 60
             ),
             Self::Reasked {
                 ticket,
@@ -385,7 +414,7 @@ impl fmt::Display for Stop {
                 }
                 write!(
                     f,
-                    "Once the decider answers on the ticket, run `owlshift resume {ticket}` again."
+                    "Once the decider answers on the ticket, run `owlshift continue {ticket}` again."
                 )
             }
             Self::CounterQuestion {
@@ -406,13 +435,13 @@ impl fmt::Display for Stop {
                 }
                 write!(
                     f,
-                    "Once the decider comments again, run `owlshift resume {ticket}` to check the \
+                    "Once the decider comments again, run `owlshift continue {ticket}` to check the \
                      answers."
                 )
             }
             Self::CheckFailed { ticket, detail } => write!(
                 f,
-                "The answer check failed: {detail}. Run `owlshift resume {ticket}` to check the \
+                "The answer check failed: {detail}. Run `owlshift continue {ticket}` to check the \
                  same answers again; a second failure parks the ticket."
             ),
             Self::Parked {
@@ -462,9 +491,9 @@ fn core_error(error: impl fmt::Debug) -> Stop {
     Stop::Refused(format!("the core state machine: {error:?}"))
 }
 
-fn nothing_to_resume(ticket: &TicketId) -> Stop {
+fn nothing_to_continue(ticket: &TicketId) -> Stop {
     Stop::Refused(format!(
-        "nothing to resume: no question was asked on {ticket}; run `owlshift do {ticket}`"
+        "nothing to continue: no question was asked on {ticket}; run `owlshift do {ticket}`"
     ))
 }
 
@@ -511,14 +540,14 @@ struct Round {
 #[derive(Clone, Copy)]
 enum Command {
     Do,
-    Resume,
+    Continue,
 }
 
 impl Command {
     fn name(self) -> &'static str {
         match self {
             Command::Do => "do",
-            Command::Resume => "resume",
+            Command::Continue => "continue",
         }
     }
 }
@@ -530,7 +559,7 @@ struct Prepared {
     found: Ticket,
     /// The ticket's decider when the command started ([`pending_decider`],
     /// [`decide`]), or why it has none. `do` refuses a ticket without one;
-    /// `resume` only once Build is about to run, since waiting, the answer
+    /// `continue` only once Build is about to run, since waiting, the answer
     /// check and a re-ask need the decider recorded on the latest ask alone.
     decider: Result<AskDecider, String>,
     base: Base,
@@ -594,7 +623,7 @@ impl OnDemand<'_> {
                 if awaits_input(&state) {
                     return Err(Stop::Refused(format!(
                         "the questions of round {} on {ticket} wait for {}: answer them on the \
-                         ticket, then run `owlshift resume {ticket}`",
+                         ticket, then run `owlshift continue {ticket}`",
                         state.round(),
                         p.asked_of().unwrap_or_else(|| "the decider".to_owned())
                     )));
@@ -615,18 +644,23 @@ impl OnDemand<'_> {
         self.build(&mut p, &dispatched, state, sink)
     }
 
-    /// `owlshift resume`: picks `ticket` up where its ticket ref left it. A
-    /// parked ticket is restarted. While questions wait, the answer check
-    /// runs once the decider has answered, and the ticket resumes, its open
+    /// `owlshift continue`: picks `ticket` up where its ticket ref left it. A
+    /// parked ticket is restarted, and the restart kept. While questions
+    /// wait, the answer check runs once the decider has answered and their
+    /// reply counts (the quiet window, or `go`), and the ticket resumes, its open
     /// questions are asked again, or it parks; a ticket at Build runs on to a
     /// delivery.
-    pub fn resume(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
-        let mut p = self.prepare(ticket, Command::Resume)?;
+    pub fn continue_ticket(
+        &self,
+        ticket: &TicketId,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        let mut p = self.prepare(ticket, Command::Continue)?;
         let Some(stored) = &p.stored else {
-            return Err(nothing_to_resume(ticket));
+            return Err(nothing_to_continue(ticket));
         };
         let mut state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
-        // A person typing `resume` on a parked ticket is the restart the
+        // A person typing `continue` on a parked ticket is the restart the
         // core waits for.
         if let Status::Parked { at, .. } = state.status() {
             state = match state.apply(PIPELINE, Event::Restarted) {
@@ -646,14 +680,14 @@ impl OnDemand<'_> {
         }
         if state.status() != Status::Active(Stage::Build) {
             return Err(Stop::Refused(format!(
-                "nothing to resume: {ticket} is at {} and waits for no answer; run `owlshift do \
+                "nothing to continue: {ticket} is at {} and waits for no answer; run `owlshift do \
                  {ticket}` to run it again",
                 stage_name(state.stage())
             )));
         }
         // Build may ask a new round, which goes to the decider now.
         p.current()?;
-        let dispatched = self.dispatch(&p, Command::Resume, sink)?;
+        let dispatched = self.dispatch(&p, Command::Continue, sink)?;
         self.build(&mut p, &dispatched, state, sink)
     }
 
@@ -697,8 +731,8 @@ impl OnDemand<'_> {
         // The ticket ref lives in the dedicated checkout: without one,
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
-        if matches!(command, Command::Resume) && fs::symlink_metadata(&checkout).is_err() {
-            return Err(nothing_to_resume(ticket));
+        if matches!(command, Command::Continue) && fs::symlink_metadata(&checkout).is_err() {
+            return Err(nothing_to_continue(ticket));
         }
         let found = self
             .tracker
@@ -1186,6 +1220,15 @@ impl OnDemand<'_> {
                 since,
             });
         }
+        // Not while the decider may still be writing (the quiet window), so
+        // the check reads the whole answer; nothing is kept meanwhile.
+        if let Some(counts_at) = answer_check::counts_at(&comments, &asked_of, (self.clock)()) {
+            return Err(Stop::Settling {
+                ticket,
+                decider: name_of(&asked, &p.found),
+                counts_at,
+            });
+        }
         let read_through = answer_check::newest_decider_edit(&comments, &asked_of);
         // The ticket's author is judged against the decider now, or the
         // asked one when the ticket has none now: the description is
@@ -1245,7 +1288,7 @@ impl OnDemand<'_> {
             Event::Answered => {
                 // RESUME before the state is kept, as a RE-ASK: when the
                 // post fails, nothing of this check is kept and the next
-                // `resume` checks the same answers again.
+                // `continue` checks the same answers again.
                 let round = NonZeroU32::new(next.round())
                     .ok_or_else(|| Stop::Refused("no question round is open".to_owned()))?;
                 let resume = ResumeComment {
@@ -1340,7 +1383,7 @@ impl OnDemand<'_> {
             Event::CounterQuestion => {
                 // The REPLY before the state is kept, as a RE-ASK: when the
                 // post fails, nothing of this check is kept and the next
-                // `resume` checks the same answers again. The ticket keeps
+                // `continue` checks the same answers again. The ticket keeps
                 // waiting; nothing is asked again.
                 let replies = answer_check::counter_replies(&brief, &verdicts);
                 if replies.is_empty() {
@@ -1447,7 +1490,7 @@ impl OnDemand<'_> {
             round: NonZeroU32::new(parked.round()).filter(|_| reason == ParkReason::Reasks),
             open,
             restart: if p.stored.is_some() {
-                Restart::Resume
+                Restart::Continue
             } else {
                 Restart::Do
             },

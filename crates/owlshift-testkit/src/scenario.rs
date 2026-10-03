@@ -540,7 +540,7 @@ impl Driver {
     }
 
     /// Posts the PARKED comment of a park, after `report`'s run. A ticket
-    /// that asked questions would have a ticket ref, so `resume` restarts
+    /// that asked questions would have a ticket ref, so `continue` restarts
     /// it; one that never asked runs again with `do`.
     fn post_parked(
         &self,
@@ -562,7 +562,7 @@ impl Driver {
             restart: if self.asks.is_empty() {
                 Restart::Do
             } else {
-                Restart::Resume
+                Restart::Continue
             },
         }
         .render();

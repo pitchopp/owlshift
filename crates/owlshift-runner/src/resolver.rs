@@ -13,7 +13,7 @@
 //! it gave the resolver and routed there itself ([`decisions`]), posts each as
 //! a DECISION comment ([`crate::writer::DecisionComment`]) and keeps it in
 //! the ticket ref; the decider gets the rest as a round ([`left_for_decider`]).
-//! `owlshift do` and `owlshift resume` run it ([`crate::on_demand`]); the
+//! `owlshift do` and `owlshift continue` run it ([`crate::on_demand`]); the
 //! test bench's stand-in driver plays the same pieces in the scenarios.
 
 use std::time::Duration;

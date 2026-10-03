@@ -1043,7 +1043,7 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
     let repo = tempfile::tempdir().unwrap();
     git_init(repo.path());
 
-    for command in ["do", "resume"] {
+    for command in ["do", "continue"] {
         let output = owlshift(repo.path(), config_dir.path(), &[command, "OWL-1"]);
         assert!(!output.status.success());
         assert!(
@@ -1052,6 +1052,15 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
             stderr(&output)
         );
     }
+    // OWL-127: `resume` is the background service's dispatch command (P7),
+    // not a ticket's; the ticket command has no other name.
+    let output = owlshift(repo.path(), config_dir.path(), &["resume", "OWL-1"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("unrecognized subcommand 'resume'"),
+        "{}",
+        stderr(&output)
+    );
 
     let init = ["init", "--tracker", "markdown", "--skip-secrets"];
     assert!(

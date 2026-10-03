@@ -1,5 +1,5 @@
 //! The ticket ref (OWL-122): what the runner keeps about a ticket between
-//! `owlshift do` and `owlshift resume`, as a commit in the dedicated
+//! `owlshift do` and `owlshift continue`, as a commit in the dedicated
 //! checkout, read back whole or refused.
 
 use std::fs;

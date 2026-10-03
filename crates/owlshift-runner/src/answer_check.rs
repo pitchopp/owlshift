@@ -3,20 +3,24 @@
 //! question of a ticket's latest ask once its decider has replied
 //! (architecture section 4, scenario S2).
 //!
-//! It runs once answers arrive ([`new_answer`]). Its verdicts fold into one
+//! It runs once answers arrive ([`new_answer`]) and the decider's reply
+//! counts ([`counts_at`]: the quiet window, or `go`). Its verdicts fold into one
 //! core event ([`event`]): the ticket resumes, with a RESUME comment of what
 //! was understood ([`understood`], [`crate::writer::ResumeComment`]), the
 //! questions left open are asked again ([`open_questions`], posted as a RE-ASK comment,
 //! [`crate::writer::ReaskComment`]), or the decider's counter-question gets
 //! the check's reply ([`counter_replies`], posted as a REPLY comment,
-//! [`crate::writer::ReplyComment`]). `owlshift resume` runs it ([`crate::on_demand`]); the test
+//! [`crate::writer::ReplyComment`]). `owlshift continue` runs it ([`crate::on_demand`]); the test
 //! bench's stand-in driver plays the same pieces in the scenarios.
+
+use std::time::Duration;
 
 use jiff::Timestamp;
 use owlshift_adapters::tracker::{Comment, Person};
 use owlshift_contracts::brief::{Brief, Relation};
 use owlshift_contracts::refs::TicketQuestions;
 use owlshift_contracts::result::{self, AnswerClass, Question, RunResult, Verdict};
+use owlshift_core::reply::{self, QUIET_WINDOW, Reply};
 use owlshift_core::state::Event;
 
 use crate::executor::Outcome;
@@ -40,11 +44,40 @@ pub fn new_answer(
 
 /// The newest last edit among the decider's comments, if they wrote any.
 pub fn newest_decider_edit(comments: &[Comment], decider: &Person) -> Option<Timestamp> {
+    newest_decider_comment(comments, decider).map(Comment::last_edit)
+}
+
+/// The decider's comment with the newest last edit, if they wrote any. Of
+/// comments edited last at the same time, the one created last, then the
+/// last the tracker lists.
+pub fn newest_decider_comment<'c>(
+    comments: &'c [Comment],
+    decider: &Person,
+) -> Option<&'c Comment> {
     comments
         .iter()
         .filter(|comment| comment_author(comment, decider).relation == Relation::Decider)
-        .map(Comment::last_edit)
-        .max()
+        .max_by_key(|comment| (comment.last_edit(), comment.created_at))
+}
+
+/// When the decider's reply counts, if it does not yet at `now`: the quiet
+/// window ([`owlshift_core::reply`]) after the last edit of their newest
+/// comment, unless that comment ends with `go`. `None` when it counts, or
+/// when the decider wrote nothing. `now` is this machine's clock, the one
+/// time here that is not the tracker's; a last edit after it counts as left
+/// unedited for no time at all, so the whole window applies from that edit.
+pub fn counts_at(comments: &[Comment], decider: &Person, now: Timestamp) -> Option<Timestamp> {
+    let newest = newest_decider_comment(comments, decider)?;
+    let last_edit = newest.last_edit();
+    let quiet_for = Duration::try_from(now.duration_since(last_edit)).unwrap_or(Duration::ZERO);
+    match reply::counts(quiet_for, reply::ends_with_go(&newest.body), QUIET_WINDOW) {
+        Reply::Counts => None,
+        Reply::Settling => Some(
+            last_edit
+                .checked_add(QUIET_WINDOW)
+                .unwrap_or(Timestamp::MAX),
+        ),
+    }
 }
 
 /// The core event an answer check's outcome maps onto, and its result when
@@ -225,6 +258,87 @@ mod tests {
             Some(at(13))
         );
         assert_eq!(new_answer(&[], &decider, &TicketQuestions::new()), None);
+    }
+
+    #[test]
+    fn the_deciders_newest_comment_counts_after_the_quiet_window_or_with_go() {
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let by = |id: &str, created: u32, edited: Option<u32>, body: &str| Comment {
+            id: format!("c{created}"),
+            author: Author::Account(Person {
+                id: id.into(),
+                name: "someone".into(),
+            }),
+            created_at: at(created),
+            edited_at: edited.map(at),
+            body: body.into(),
+        };
+        let marked = "[owlshift] DELIVERY\n\nDone. go\n";
+        let cases = [
+            // Within the window, then at its end.
+            (vec![by("u1", 10, None, "Q1: yes.")], 15, Some(20)),
+            (vec![by("u1", 10, None, "Q1: yes.")], 20, None),
+            // `go` counts at once.
+            (vec![by("u1", 10, None, "Q1: yes. Go.")], 10, None),
+            // An edit restarts the window, of an older comment too, and an
+            // older `go` does not cover a newer comment.
+            (vec![by("u1", 10, Some(14), "Q1: yes.")], 20, Some(24)),
+            (
+                vec![
+                    by("u1", 5, Some(14), "Q1: yes."),
+                    by("u1", 10, None, "Q2: no."),
+                ],
+                20,
+                Some(24),
+            ),
+            (
+                vec![
+                    by("u1", 10, None, "Q1: yes. go"),
+                    by("u1", 12, None, "Q2: no."),
+                ],
+                15,
+                Some(22),
+            ),
+            // Edited last at the same time: the one created last decides.
+            (
+                vec![
+                    by("u1", 12, None, "Q2: no. go"),
+                    by("u1", 5, Some(12), "Q1: yes."),
+                ],
+                15,
+                None,
+            ),
+            // Only the decider's own comments: not another person's, not a
+            // marked comment, whatever they end with.
+            (
+                vec![by("u1", 10, None, "Q1: yes."), by("u2", 12, None, "go")],
+                15,
+                Some(20),
+            ),
+            (
+                vec![by("u1", 10, None, "Q1: yes."), by("u1", 12, None, marked)],
+                15,
+                Some(20),
+            ),
+            (vec![by("u2", 10, None, "Q1: yes.")], 10, None),
+            // A last edit after this machine's clock waits the whole window
+            // from that edit, the time a retry then counts at.
+            (vec![by("u1", 30, None, "Q1: yes.")], 25, Some(40)),
+            (vec![by("u1", 30, None, "Q1: yes.")], 40, None),
+        ];
+        for (comments, now, expected) in cases {
+            assert_eq!(
+                counts_at(&comments, &decider, at(now)),
+                expected.map(at),
+                "{comments:?} at {now}"
+            );
+        }
     }
 
     fn finished(result: &str) -> Outcome {

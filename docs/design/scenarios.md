@@ -21,7 +21,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 1. The run pushes its branch and checkpoint and returns `questions`. The writer posts numbered questions (Q1 to Qn) with context, options and a recommendation, moves the ticket to needs-input, records the stage to return to, and notifies the decider.
 2. The decider replies in one or several comments.
-3. The reply counts once the decider's last comment is older than the quiet window (an edit restarts it), or immediately if it ends with `go`.
+3. The reply counts once the decider's last comment is older than the quiet window (an edit restarts it), or immediately if it ends with `go`, whether `owlshift continue` or `watch` picks it up.
 4. The answer check classifies each question, and the round has one outcome, the first that applies. A counter-question, even next to missing answers: an answer in the thread, the ticket stays, nothing is re-asked and no re-ask is counted; after the decider's next reply, the answer check classifies every question of the same ask again. Something missing: a *re-ask* comment lists only the open questions and why. All answered: a *resume* comment restates what was understood, the ticket returns to its stage, a fresh run resumes from the checkpoint.
 5. Before delivery the run re-reads the thread. A comment posted after the resume is integrated, or sends the ticket back to needs-input if it contradicts the work.
 

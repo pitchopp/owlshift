@@ -48,12 +48,12 @@ impl std::error::Error for RoleLoadError {
 pub const BUILD_ROLE: &str = include_str!("../../../roles/build.md");
 
 /// The default answer-check role prompt, `roles/answer_check.md`, as this
-/// binary was built with it: what `owlshift resume` hands Claude Code to
+/// binary was built with it: what `owlshift continue` hands Claude Code to
 /// classify the decider's answers.
 pub const ANSWER_CHECK_ROLE: &str = include_str!("../../../roles/answer_check.md");
 
 /// The default resolver role prompt, `roles/resolver.md`, as this binary was
-/// built with it: what `owlshift do` and `owlshift resume` hand Claude Code to
+/// built with it: what `owlshift do` and `owlshift continue` hand Claude Code to
 /// settle the questions a run raised that are not the decider's alone.
 pub const RESOLVER_ROLE: &str = include_str!("../../../roles/resolver.md");
 

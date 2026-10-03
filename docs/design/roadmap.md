@@ -6,7 +6,7 @@ Status: draft, 2026-09-27. Twelve steps (P0 to P11), each shippable, testable an
 | --- | --- | --- |
 | P0 | Foundations | Build and test the project on three platforms; `owlshift doctor` tells you whether a machine is ready |
 | P1 | One ticket, one PR, on demand | `owlshift do OWL-12` turns one ticket into a verified pull request, on your own Claude subscription |
-| P2 | Questions on the ticket | The agent stops and asks on the ticket; you answer there; `owlshift resume` picks up from the checkpoint |
+| P2 | Questions on the ticket | The agent stops and asks on the ticket; you answer there; `owlshift continue` picks up from the checkpoint |
 | P3 | Watch mode | `owlshift watch` notices your answers and resumes by itself, and repairs its own red PRs |
 | P4 | The drain | Owlshift pulls admitted tickets from the ready column, in priority order, respecting blockers, one at a time |
 | P5 | Quality pipeline | Plan, review by another model family, build, verify; plan approval by policy; per-ticket routing |
@@ -50,7 +50,7 @@ A repository that people and agents can build in safely, and a first command tha
 The central bet, used by hand.
 
 - `questions` results become a marked, numbered comment; the ticket moves to Needs Input with its return stage recorded.
-- Checkpoint on a git ref; `owlshift resume OWL-12` restarts from it without redoing finished steps.
+- Checkpoint on a git ref; `owlshift continue OWL-12` restarts from it without redoing finished steps.
 - Answer check (answered, partial, unanswered, counter-question), re-ask of what is missing, late comments re-read before delivery.
 - Resolver: discoverable questions decided and logged as reversible decisions; always-human categories enforced.
 - Being told a question is waiting: the Linear app identity if check C4 passes, otherwise a local desktop notification. Scenarios S2 and S7.
@@ -59,12 +59,12 @@ The central bet, used by hand.
 
 ## P3 · Watch mode
 
-`owlshift watch` in a terminal replaces typing `resume`.
+`owlshift watch` in a terminal replaces typing `continue`.
 
 - Foreground loop over the tickets Owlshift started: quiet window, `go`, automatic resume.
 - After the PR: a red check starts a fix run (two review passes at most); a conflict starts a rebase run. Scenario S9.
 
-**Exit gate.** A full day of use without typing `resume`.
+**Exit gate.** A full day of use without typing `continue`.
 
 ## P4 · The drain
 
