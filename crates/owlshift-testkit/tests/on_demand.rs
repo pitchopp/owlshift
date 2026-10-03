@@ -1939,7 +1939,7 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     // every later brief, and the delivery report lists it.
     bench.answer("Q1: \"Hello, reader.\"\n");
     let answered = check(&[("Q1", "answered", "Hello, reader.")]);
-    let (delivered, printed) = bench.resume(vec![
+    let (delivered, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(Some("Hello"), Some(DONE)),
     ]);
@@ -1964,7 +1964,7 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
 /// OWL-138's second acceptance: a run whose questions are all decided goes
 /// on without a Needs Input stop, Build running again in the same command.
 /// Its decision is kept in a ticket ref made without any round, so when that
-/// Build is cut off, `resume` runs Build again from it, the decision in the
+/// Build is cut off, `continue` runs Build again from it, the decision in the
 /// brief and in the delivery report.
 #[test]
 fn questions_all_decided_go_on_without_a_stop() {
@@ -1994,7 +1994,8 @@ fn questions_all_decided_go_on_without_a_stop() {
     assert!(record.questions.asks.is_empty());
     assert!(data_of(&bench.events(), EventKind::Gate, "opened").is_empty());
 
-    let (delivered, printed) = bench.resume(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    let (delivered, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let build = bench.briefs().pop().unwrap();
     assert_eq!(shape(&build), ["decision"]);
