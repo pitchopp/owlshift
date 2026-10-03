@@ -5,7 +5,7 @@
 //! policy: which questions go to a human rather than the resolver, and when a
 //! human approves the plan.
 
-use crate::floor::{is_floor_category, matches_token, normalize};
+use crate::floor::{is_floor_category, is_token, matches_token, normalize};
 use crate::pipeline::Pipeline;
 use crate::vocab::{PlanApproval, Variant};
 
@@ -70,6 +70,21 @@ impl GatePolicy {
         }
     }
 
+    /// Who settles a question the resolver decided, from the category the
+    /// asking run gave it (`raised`) and the resolver's own label for it
+    /// (`labelled`, written without seeing `raised`): the resolver only when
+    /// both route to it and the label is a token ([`is_token`]). An
+    /// always-human category on either side, or a label the matcher could
+    /// misread, sends the question to the decider: the runner draws that
+    /// consequence, whatever the resolver decided.
+    pub fn route_decided(&self, raised: &str, labelled: &str) -> Route {
+        if !is_token(labelled) || self.always_human(raised) || self.always_human(labelled) {
+            Route::Human
+        } else {
+            Route::Resolver
+        }
+    }
+
     /// Whether a human approves the plan before Build. The risky variant
     /// always requires it; the trivial variant has no plan to approve; the
     /// standard variant follows the project's mode, where `on-fork` requires
@@ -116,6 +131,46 @@ mod tests {
         }
         assert_eq!(policy.route("naming"), Route::Resolver);
         assert_eq!(policy.route("authoring"), Route::Resolver);
+    }
+
+    /// A decision stands only when Build's category and the resolver's own
+    /// label both route to the resolver, the label written as a token: an
+    /// always-human or malformed label on either side sends the question to
+    /// the decider.
+    #[test]
+    fn a_decision_needs_both_labels_to_route_to_the_resolver() {
+        let policy = GatePolicy::new(["billing"], PlanApproval::Never);
+        let cases = [
+            // Labels that merely differ say nothing about the floor.
+            ("naming", "naming", Route::Resolver),
+            ("naming", "file_layout", Route::Resolver),
+            ("Naming", "tone2", Route::Resolver),
+            // Build's own always-human category.
+            ("security", "naming", Route::Human),
+            ("", "naming", Route::Human),
+            // The resolver's label names the floor or a project addition,
+            // as a whole-word token.
+            ("cleanup", "data_loss", Route::Human),
+            ("cleanup", "risk_of_data_loss", Route::Human),
+            ("cleanup", "scope_change", Route::Human),
+            ("cleanup", "billing_address", Route::Human),
+            // A label the matcher could misread is refused, never read.
+            ("cleanup", "Data-Loss", Route::Human),
+            ("cleanup", "dataLoss", Route::Human),
+            ("cleanup", "sécurité", Route::Human),
+            ("cleanup", "data loss", Route::Human),
+            ("cleanup", "data__loss", Route::Human),
+            ("cleanup", "_naming", Route::Human),
+            ("cleanup", "", Route::Human),
+            ("cleanup", " ", Route::Human),
+        ];
+        for (raised, labelled, route) in cases {
+            assert_eq!(
+                policy.route_decided(raised, labelled),
+                route,
+                "{raised:?} labelled {labelled:?}"
+            );
+        }
     }
 
     #[test]
