@@ -3,8 +3,9 @@
 //!
 //! One folder per ticket, `tickets/<ID>/`, holds `ticket.md` (a TOML front
 //! matter between `+++` lines, then the description) and `comments/`, one
-//! file per comment named `<YYYYMMDDTHHMMSSZ>-<author>.md`. The format is
-//! settled in `docs/design/build-plan.md`, "The test tracker".
+//! file per comment named `<YYYYMMDDTHHMMSSZ>[.<n>]-<author>.md`, `.<n>`
+//! marking the n-th comment of a second. The format is settled in
+//! `docs/design/build-plan.md`, "The test tracker".
 
 use std::fmt;
 use std::fs;
@@ -42,6 +43,8 @@ pub struct Ticket {
 /// A comment on a ticket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
+    /// The file name without `.md`: unique on its ticket.
+    pub id: String,
     pub at: Timestamp,
     pub author: String,
     pub body: String,
@@ -98,42 +101,22 @@ impl MarkdownTracker {
     /// not a comment's is an error.
     pub fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, TrackerError> {
         let dir = self.comments_dir(id);
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(error(&dir, e)),
-        };
-        let mut files = Vec::new();
-        for entry in entries {
-            let path = entry.map_err(|e| error(&dir, e))?.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            let Some((at, author)) = comment_name(name) else {
-                return Err(error(
-                    &path,
-                    "not a comment file: expected <YYYYMMDDTHHMMSSZ>-<author>.md",
-                ));
-            };
-            files.push((name.to_owned(), at, author, path));
-        }
-        // The name starts with the time, so its order is the time order.
-        files.sort();
-        files
+        comment_files(&dir)?
             .into_iter()
-            .map(|(_, at, author, path)| {
+            .map(|file| {
                 Ok(Comment {
-                    at,
-                    author,
-                    body: read(&path)?,
+                    id: file.name.strip_suffix(".md").unwrap_or_default().to_owned(),
+                    at: file.at,
+                    author: file.author,
+                    body: read(&dir.join(&file.name))?,
                 })
             })
             .collect()
     }
 
-    /// Adds a comment; a comment by the same author in the same second is
-    /// refused, never overwritten. The time is kept to the second.
+    /// Adds a comment after the others of its second, whoever wrote them.
+    /// The time is kept to the second; a file is never overwritten, so a
+    /// name already taken (by a concurrent poster) is an error.
     pub fn post_comment(
         &self,
         id: &TicketId,
@@ -153,8 +136,20 @@ impl MarkdownTracker {
             ));
         }
         let at = Timestamp::from_second(at.as_second()).map_err(|e| error(&dir, e))?;
+        let nth = match comment_files(&dir)?
+            .iter()
+            .filter(|file| file.at == at)
+            .map(|file| file.nth)
+            .max()
+        {
+            None => 1,
+            Some(last) => last
+                .checked_add(1)
+                .ok_or_else(|| error(&dir, "too many comments in one second"))?,
+        };
         fs::create_dir_all(&dir).map_err(|e| error(&dir, e))?;
-        let path = dir.join(format!("{}-{author}.md", at.strftime(TIME_FORMAT)));
+        let id = stem(at, nth, author);
+        let path = dir.join(format!("{id}.md"));
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -163,6 +158,7 @@ impl MarkdownTracker {
         file.write_all(body.as_bytes())
             .map_err(|e| error(&path, e))?;
         Ok(Comment {
+            id,
             at,
             author: author.to_owned(),
             body: body.to_owned(),
@@ -298,7 +294,7 @@ impl MarkdownTracker {
 /// plan, "The test tracker"), so the last edit is the creation time.
 fn shared_comment(comment: Comment) -> shared::Comment {
     shared::Comment {
-        id: format!("{}-{}", comment.at.strftime(TIME_FORMAT), comment.author),
+        id: comment.id,
         author: account(comment.author),
         created_at: comment.at,
         edited_at: None,
@@ -372,18 +368,81 @@ fn split(input: &str) -> Result<(Range<usize>, &str), String> {
     Err("the front matter is not closed by a `+++` line".to_owned())
 }
 
-/// The time and author of a comment file name, if it is one.
-fn comment_name(name: &str) -> Option<(Timestamp, String)> {
+/// A file of a ticket's `comments/` folder, as its name gives it.
+struct CommentFile {
+    name: String,
+    at: Timestamp,
+    /// Its place among the comments of its second, from 1.
+    nth: u32,
+    author: String,
+}
+
+/// The comment files in `dir`, in reading order: time, then place in the
+/// second, then name, which keeps today's order for files of one second
+/// without a suffix. No folder is no comment; a file whose name is not a
+/// comment's is an error.
+fn comment_files(dir: &Path) -> Result<Vec<CommentFile>, TrackerError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(error(dir, e)),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| error(dir, e))?.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let Some((at, nth, author)) = comment_name(name) else {
+            return Err(error(
+                &path,
+                "not a comment file: expected <YYYYMMDDTHHMMSSZ>[.<n>]-<author>.md",
+            ));
+        };
+        files.push(CommentFile {
+            name: name.to_owned(),
+            at,
+            nth,
+            author,
+        });
+    }
+    files.sort_by(|a, b| (a.at, a.nth, &a.name).cmp(&(b.at, b.nth, &b.name)));
+    Ok(files)
+}
+
+/// A comment's file name without `.md`, which [`comment_name`] reads back.
+fn stem(at: Timestamp, nth: u32, author: &str) -> String {
+    let time = at.strftime(TIME_FORMAT);
+    if nth == 1 {
+        format!("{time}-{author}")
+    } else {
+        format!("{time}.{nth}-{author}")
+    }
+}
+
+/// The time, place in its second and author of a comment file name, if it
+/// is one written as [`stem`] writes it.
+fn comment_name(name: &str) -> Option<(Timestamp, u32, String)> {
     let stem = name.strip_suffix(".md")?;
     let time = stem.get(..16)?;
-    let author = stem.get(16..)?.strip_prefix('-')?;
+    let rest = stem.get(16..)?;
+    let (nth, author) = match rest.strip_prefix('.') {
+        None => (1, rest.strip_prefix('-')?),
+        Some(rest) => {
+            let (digits, author) = rest.split_once('-')?;
+            let nth: u32 = digits.parse().ok()?;
+            // One name per place: no `.1`, `.0`, `.02` or `.+2`.
+            (nth >= 2 && nth.to_string() == digits).then_some((nth, author))?
+        }
+    };
     let at = DateTime::strptime(TIME_FORMAT, time)
         .ok()?
         .to_zoned(TimeZone::UTC)
         .ok()?
         .timestamp();
     let canonical = at.strftime(TIME_FORMAT).to_string() == time;
-    (canonical && valid_author(author)).then(|| (at, author.to_owned()))
+    (canonical && valid_author(author)).then(|| (at, nth, author.to_owned()))
 }
 
 fn valid_author(author: &str) -> bool {
@@ -472,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn comments_come_back_in_time_order_and_are_never_overwritten() {
+    fn comments_come_back_in_time_order() {
         let (_root, tracker, _) = repository(TICKET);
         assert_eq!(tracker.comments(&id()).unwrap(), []);
         tracker
@@ -487,13 +546,6 @@ mod tests {
         assert_eq!(comments[1].author, "maintainer");
         assert_eq!(comments[1].body, "Second.\n");
 
-        let again = tracker.post_comment(&id(), "owlshift", at("2026-09-28T10:01:00Z"), "Again.\n");
-        assert!(
-            again
-                .unwrap_err()
-                .path
-                .ends_with("20260928T100100Z-owlshift.md")
-        );
         for author in ["", "a b", "../x", "a:b"] {
             let refused = tracker.post_comment(&id(), author, at("2026-09-28T11:00:00Z"), "x");
             assert!(refused.is_err(), "{author:?}");
@@ -506,6 +558,86 @@ mod tests {
             .join("notes.md");
         fs::write(&stray, "?").unwrap();
         assert_eq!(tracker.comments(&id()).unwrap_err().path, stray);
+    }
+
+    /// Comments posted back to back in one second are all kept, in posting
+    /// order, whoever wrote them; files of one second written before the
+    /// suffix keep their names, their ids and their order.
+    #[test]
+    fn comments_of_one_second_are_kept_in_posting_order() {
+        let (_root, tracker, _) = repository(TICKET);
+        let comments_dir = tracker.comments_dir(&id());
+        fs::create_dir_all(&comments_dir).unwrap();
+        // Two unsuffixed files of one second read in file-name order (`-`
+        // sorts before `.`), and the next comment of that second is its 2nd.
+        for author in ["a-b", "a"] {
+            fs::write(
+                comments_dir.join(format!("20260928T100000Z-{author}.md")),
+                author,
+            )
+            .unwrap();
+        }
+        let second = at("2026-09-28T10:00:00.700Z");
+        for n in 2..=10 {
+            let author = if n == 4 { "maintainer" } else { "owlshift" };
+            let posted = tracker
+                .post_comment(&id(), author, second, &n.to_string())
+                .unwrap();
+            assert_eq!(posted.id, format!("20260928T100000Z.{n}-{author}"));
+            assert_eq!(posted.at, at("2026-09-28T10:00:00Z"));
+        }
+        // A new second starts again without a suffix.
+        tracker
+            .post_comment(&id(), "owlshift", at("2026-09-28T10:00:01Z"), "next")
+            .unwrap();
+
+        let bodies: Vec<_> = tracker
+            .comments(&id())
+            .unwrap()
+            .into_iter()
+            .map(|comment| comment.body)
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                "a-b", "a", "2", "3", "4", "5", "6", "7", "8", "9", "10", "next"
+            ]
+        );
+        let ids: Vec<_> = shared::Tracker::comments(&tracker, &id())
+            .unwrap()
+            .into_iter()
+            .map(|comment| comment.id)
+            .collect();
+        assert_eq!(ids[0], "20260928T100000Z-a-b");
+        assert_eq!(ids[2], "20260928T100000Z.2-owlshift");
+        assert_eq!(ids[11], "20260928T100001Z-owlshift");
+    }
+
+    #[test]
+    fn a_comment_name_is_read_in_its_one_written_form() {
+        for (name, read) in [
+            ("20260928T100000Z-2-bob.md", Some((1, "2-bob"))),
+            ("20260928T100000Z.2-2-bob.md", Some((2, "2-bob"))),
+            ("20260928T100000Z.12-bob.md", Some((12, "bob"))),
+            ("20260928T100000Z.1-bob.md", None),
+            ("20260928T100000Z.0-bob.md", None),
+            ("20260928T100000Z.02-bob.md", None),
+            ("20260928T100000Z.+2-bob.md", None),
+            ("20260928T100000Z.-bob.md", None),
+            ("20260928T100000Z.2bob.md", None),
+            ("20260928T100000Z.2-.md", None),
+            ("20260928T100000Z.4294967296-bob.md", None),
+        ] {
+            let parsed = comment_name(name).map(|(at, nth, author)| {
+                assert_eq!(stem(at, nth, &author) + ".md", name);
+                (nth, author)
+            });
+            assert_eq!(
+                parsed,
+                read.map(|(nth, author)| (nth, author.to_owned())),
+                "{name}"
+            );
+        }
     }
 
     #[test]

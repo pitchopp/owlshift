@@ -197,9 +197,8 @@ impl Harness for Replies {
 }
 
 /// The Markdown tracker, posting the runner's comments at a virtual clock.
-/// It records times to the second and refuses two comments by one author in
-/// the same second, and the answer check compares the tracker's times only,
-/// so every comment of the bench, the decider's included, takes the next
+/// It records times to the second, and the answer check compares the
+/// tracker's times only, a comment newer than an ask, so every comment of the bench, the decider's included, takes the next
 /// minute of one clock.
 struct Clocked<'a> {
     inner: MarkdownTracker,
