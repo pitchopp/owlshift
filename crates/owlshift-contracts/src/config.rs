@@ -7,9 +7,11 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use owlshift_core::agent_env::{check_declared, check_names};
 use owlshift_core::decider::ZoneOwners;
+use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -198,6 +200,23 @@ pub struct TierModels {
 pub struct Policy {
     /// Question categories always decided by a human, added to the floor.
     pub always_human: Vec<String>,
+    /// How long the decider's latest comment must be left unedited before
+    /// their answer counts, in whole minutes from 1 to 1440 (a day). Absent:
+    /// 10 minutes. Zero is refused: every edit would count at once, which is
+    /// what ending a comment with `go` is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1440))]
+    pub quiet_window_minutes: Option<u16>,
+}
+
+impl Policy {
+    /// The quiet window: the project's, or the default.
+    pub fn quiet_window(&self) -> Duration {
+        self.quiet_window_minutes
+            .map_or(DEFAULT_QUIET_WINDOW, |minutes| {
+                Duration::from_secs(u64::from(minutes) * 60)
+            })
+    }
 }
 
 /// The settings of one code zone.
@@ -239,6 +258,14 @@ impl ProjectConfig {
         self.stack
             .check_rules()
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.rules: {reason}")))?;
+        if let Some(minutes) = self.policy.quiet_window_minutes
+            && !(1..=1440).contains(&minutes)
+        {
+            return Err(ContractError::invalid(
+                PROJECT,
+                "policy.quiet_window_minutes must be a whole number of minutes from 1 to 1440",
+            ));
+        }
         self.zone_owners()?;
         check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
     }
@@ -619,6 +646,32 @@ mod tests {
             {tail}
             "#
         ))
+    }
+
+    #[test]
+    fn the_quiet_window_is_a_policy_key_with_a_default_and_a_range() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.policy.quiet_window_minutes, None);
+        assert_eq!(absent.policy.quiet_window(), Duration::from_secs(10 * 60));
+        assert!(!absent.render().contains("quiet_window"));
+
+        let set = project("", "quiet_window_minutes = 45").unwrap();
+        assert_eq!(set.policy.quiet_window(), Duration::from_secs(45 * 60));
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+
+        for ok in ["1", "1440"] {
+            project("", &format!("quiet_window_minutes = {ok}")).unwrap();
+        }
+        for bad in ["0", "1441", "-5", "10.5", "\"10\""] {
+            assert!(
+                project("", &format!("quiet_window_minutes = {bad}")).is_err(),
+                "{bad}"
+            );
+        }
+        let error = project("", "quiet_window_minutes = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("policy.quiet_window_minutes"), "{error}");
     }
 
     #[test]

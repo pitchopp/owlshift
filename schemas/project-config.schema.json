@@ -148,6 +148,16 @@
           "items": {
             "type": "string"
           }
+        },
+        "quiet_window_minutes": {
+          "description": "How long the decider's latest comment must be left unedited before\ntheir answer counts, in whole minutes from 1 to 1440 (a day). Absent:\n10 minutes. Zero is refused: every edit would count at once, which is\nwhat ending a comment with `go` is for.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 1440,
+          "minimum": 1
         }
       },
       "additionalProperties": false,
