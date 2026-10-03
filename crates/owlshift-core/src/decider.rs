@@ -47,27 +47,53 @@ pub fn declared_zones<'a>(
     Ok(zones)
 }
 
+/// What a ticket's `zone:` labels give the brief ([`brief_zones`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BriefZones {
+    /// The folders of the well-formed labels, in the labels' order, each
+    /// zone once as its first label wrote it.
+    pub zones: Vec<String>,
+    /// The `zone:` labels left out because their folder is malformed, in the
+    /// labels' order, each with the reason. The core only reports them: the
+    /// runner tells whoever reads the run log.
+    pub left_out: Vec<ZoneLabelError>,
+}
+
 /// The zones a ticket's `zone:` labels declare, as the brief lists them: the
 /// folders of the well-formed labels, in the labels' order, each zone once
-/// as its first label wrote it. Unlike [`declared_zones`] it leaves a malformed label out instead
-/// of refusing it, since it informs an agent and chooses no decider: a ticket
-/// with an assignee is not refused for a label its decider never reads.
-pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let mut zones: Vec<String> = Vec::new();
+/// as its first label wrote it. Unlike [`declared_zones`] it leaves a
+/// malformed label out instead of refusing it, since it informs an agent and
+/// chooses no decider: a ticket with an assignee is not refused for a label
+/// its decider never reads. The labels it left out come back in
+/// [`BriefZones::left_out`], so that the omission is not silent.
+pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> BriefZones {
+    let mut found = BriefZones::default();
     for label in labels {
-        if let Ok(declared) = declared_zones([label]) {
-            for resource in declared {
-                // Zones compare part by part, ignoring ASCII case, so
-                // `Web/` repeats `web`.
-                if let Resource::Zone(zone) = resource
-                    && !zones.iter().any(|seen| same_zone(seen, &zone))
-                {
-                    zones.push(zone);
+        match declared_zones([label]) {
+            Ok(declared) => {
+                for resource in declared {
+                    // Zones compare part by part, ignoring ASCII case, so
+                    // `Web/` repeats `web`.
+                    if let Resource::Zone(zone) = resource
+                        && !found.zones.iter().any(|seen| same_zone(seen, &zone))
+                    {
+                        found.zones.push(zone);
+                    }
                 }
             }
+            // A label repeated is reported once, compared as zones are.
+            Err(error)
+                if !found
+                    .left_out
+                    .iter()
+                    .any(|seen| seen.label.trim().eq_ignore_ascii_case(error.label.trim())) =>
+            {
+                found.left_out.push(error);
+            }
+            Err(_) => {}
         }
     }
-    zones
+    found
 }
 
 fn same_zone(a: &str, b: &str) -> bool {
@@ -460,19 +486,21 @@ mod tests {
 
     #[test]
     fn the_brief_lists_the_well_formed_zone_labels_only() {
-        assert_eq!(
-            brief_zones([
-                "Feature",
-                "zone:backend/billing",
-                "ZONE: web ",
-                "zone:../secrets",
-                "zone:backend/billing",
-                "zone:Web/",
-                "zone:",
-            ]),
-            ["backend/billing", "web"]
-        );
-        assert!(brief_zones(["agent", "zones:web"]).is_empty());
+        let brief = brief_zones([
+            "Feature",
+            "zone:backend/billing",
+            "ZONE: web ",
+            "zone:../secrets",
+            "zone:backend/billing",
+            "zone:Web/",
+            "ZONE:../secrets",
+            "zone:",
+        ]);
+        assert_eq!(brief.zones, ["backend/billing", "web"]);
+        let left_out: Vec<&str> = brief.left_out.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(left_out, ["zone:../secrets", "zone:"]);
+        assert!(brief.left_out.iter().all(|e| !e.reason.is_empty()));
+        assert_eq!(brief_zones(["agent", "zones:web"]), BriefZones::default());
     }
 
     #[test]

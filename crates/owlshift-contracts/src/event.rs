@@ -52,6 +52,10 @@ pub enum EventKind {
     AnswerPosted,
     PrMerged,
     CheckFailed,
+    /// Something was left out or degraded without stopping the run, such as
+    /// a ticket label the brief could not use. `data` names it (`what`) and
+    /// says why.
+    Warning,
 }
 
 impl Event {

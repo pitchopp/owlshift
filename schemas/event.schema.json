@@ -96,6 +96,11 @@
           "description": "The writer wrote to the tracker or the forge.",
           "type": "string",
           "const": "tracker_write"
+        },
+        {
+          "description": "Something was left out or degraded without stopping the run, such as\na ticket label the brief could not use. `data` names it (`what`) and\nsays why.",
+          "type": "string",
+          "const": "warning"
         }
       ]
     },
