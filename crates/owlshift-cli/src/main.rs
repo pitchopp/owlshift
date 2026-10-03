@@ -49,14 +49,15 @@ enum Command {
         /// The ticket, such as OWL-12.
         ticket: String,
     },
-    /// Resume a ticket once its decider has answered on it: check the
-    /// answers, then ask again what is missing or run on to a verified pull
-    /// request. Restarts a parked ticket.
-    Resume {
+    /// Continue a ticket once its decider has answered on it: once their
+    /// reply has been left unedited for 10 minutes, or ends with `go`, check
+    /// the answers, then ask again what is missing or run on to a verified
+    /// pull request. Restarts a parked ticket.
+    Continue {
         /// The ticket, such as OWL-12.
         ticket: String,
     },
-    /// Print the events `owlshift do` and `owlshift resume` recorded, oldest
+    /// Print the events `owlshift do` and `owlshift continue` recorded, oldest
     /// first.
     Logs {
         /// Only this ticket's events.
@@ -135,7 +136,9 @@ fn main() -> ExitCode {
         }
         Command::Init(args) => init_cmd::run(&args, &config),
         Command::Do { ticket } => do_cmd::run(&system, &config, &ticket, do_cmd::Mode::Do),
-        Command::Resume { ticket } => do_cmd::run(&system, &config, &ticket, do_cmd::Mode::Resume),
+        Command::Continue { ticket } => {
+            do_cmd::run(&system, &config, &ticket, do_cmd::Mode::Continue)
+        }
         Command::Logs {
             ticket,
             last,

@@ -1,4 +1,4 @@
-//! `owlshift do` (OWL-20) and `owlshift resume` (OWL-122) end to end: the
+//! `owlshift do` (OWL-20) and `owlshift continue` (OWL-122) end to end: the
 //! runner's `on_demand` runs on the Markdown tracker, the fake harness,
 //! hermetic git with a local bare remote standing in for GitHub's git side,
 //! and the real GitHub adapter over a fake transport standing in for its API.
@@ -256,6 +256,10 @@ struct Bench {
     clock: Cell<Timestamp>,
     /// The runner's comments starting with this are refused by the tracker.
     refuse: Cell<Option<&'static str>>,
+    /// How long after the time of the next comment `continue` reads this
+    /// machine's clock: by default the quiet window, so the decider's
+    /// latest comment, a minute older, counts.
+    waited: Cell<SignedDuration>,
 }
 
 const DONE: &str = r#"{"format":3,"status":"done","summary":"Added GREETING.md; the gate passes.",
@@ -328,6 +332,7 @@ impl Bench {
             github,
             clock: Cell::new("2026-10-02T09:00:00Z".parse().unwrap()),
             refuse: Cell::new(None),
+            waited: Cell::new(SignedDuration::from_mins(10)),
         }
     }
 
@@ -361,9 +366,9 @@ impl Bench {
         self.invoke(false, replies, first)
     }
 
-    /// Runs `owlshift resume DEMO-1` with one reply per run, the answer
+    /// Runs `owlshift continue DEMO-1` with one reply per run, the answer
     /// check's included.
-    fn resume(&self, replies: Vec<Reply>) -> (Result<Delivered, Stop>, String) {
+    fn continue_ticket(&self, replies: Vec<Reply>) -> (Result<Delivered, Stop>, String) {
         self.invoke(true, replies, None)
     }
 
@@ -412,7 +417,7 @@ impl Bench {
 
     fn invoke(
         &self,
-        resume: bool,
+        continuing: bool,
         replies: Vec<Reply>,
         first: Option<Agent>,
     ) -> (Result<Delivered, Stop>, String) {
@@ -465,6 +470,7 @@ impl Bench {
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
         let dirs = self.dirs();
         let remote_url = self.remote.bare.to_string_lossy().into_owned();
+        let now = || self.clock.get().checked_add(self.waited.get()).unwrap();
         let on_demand = OnDemand {
             executor: &executor,
             tracker: &tracker,
@@ -476,11 +482,12 @@ impl Bench {
             config: &config,
             dirs: &dirs,
             head_wait: Duration::ZERO,
+            clock: &now,
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
-        let outcome = if resume {
-            on_demand.resume(&ticket(), &mut sink)
+        let outcome = if continuing {
+            on_demand.continue_ticket(&ticket(), &mut sink)
         } else {
             on_demand.run(&ticket(), &mut sink)
         };
@@ -731,7 +738,7 @@ type Setup = Box<dyn Fn(&Bench) -> Vec<Reply>>;
 type Check = fn(&Stop) -> bool;
 
 /// Every way a run stops short of a delivery, questions aside (they are
-/// posted: see the resume tests): nothing reaches the ticket but a park's
+/// posted: see the `continue` tests): nothing reaches the ticket but a park's
 /// PARKED comment, which says to run `do` again since no question round
 /// kept a ticket ref, and the remote's branch moves only when the push
 /// itself went through.
@@ -1157,6 +1164,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         config: &config,
         dirs: &dirs,
         head_wait: Duration::ZERO,
+        clock: &on_demand::system_clock,
     };
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
@@ -1221,11 +1229,11 @@ fn shape(brief: &Brief) -> Vec<String> {
 }
 
 /// P2 through the shipped commands (OWL-122): `do` posts a round's
-/// questions; `resume` waits for an answer, re-asks what an incomplete one
+/// questions; `continue` waits for an answer, re-asks what an incomplete one
 /// left open, replies to a counter-question and waits again, then checks a complete
 /// answer and runs Build to a delivery.
 #[test]
-fn a_question_round_goes_through_resume_to_a_delivery() {
+fn a_question_round_goes_through_continue_to_a_delivery() {
     let bench = Bench::new(true);
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
     let stop = outcome.expect_err("questions stop the run");
@@ -1235,7 +1243,7 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
         "{stop:?}\n{printed}"
     );
     assert!(
-        stop.to_string().contains("run `owlshift resume DEMO-1`"),
+        stop.to_string().contains("run `owlshift continue DEMO-1`"),
         "{stop}"
     );
     let comments = bench.comments();
@@ -1255,21 +1263,49 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     );
     assert_eq!(record.questions.asks.len(), 1);
 
-    // While the questions wait, `do` is refused, and `resume` waits for an
+    // While the questions wait, `do` is refused, and `continue` waits for an
     // answer without running anything.
     let (again, _) = bench.run(Vec::new(), None);
     assert!(
-        matches!(&again, Err(Stop::Refused(why)) if why.contains("`owlshift resume DEMO-1`")),
+        matches!(&again, Err(Stop::Refused(why)) if why.contains("`owlshift continue DEMO-1`")),
         "{again:?}"
     );
-    let (waiting, _) = bench.resume(Vec::new());
+    let (waiting, _) = bench.continue_ticket(Vec::new());
     assert!(
         matches!(&waiting, Err(Stop::Waiting { round: 1, .. })),
         "{waiting:?}"
     );
 
-    // An incomplete answer: the RE-ASK asks Q2 alone.
+    // An answer within the quiet window: the decider may still be writing,
+    // so nothing runs and nothing is kept until it has been left unedited
+    // for 10 minutes (OWL-127).
+    let answered_at = bench.clock.get();
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\"\n");
+    bench.waited.set(SignedDuration::ZERO);
+    let (before, runs) = (bench.record(), bench.briefs().len());
+    let (settling, _) = bench.continue_ticket(Vec::new());
+    let counts_at = answered_at
+        .checked_add(SignedDuration::from_mins(10))
+        .unwrap();
+    match &settling {
+        Err(stop @ Stop::Settling { counts_at: at, .. }) => {
+            assert_eq!(*at, counts_at);
+            let printed = stop.to_string();
+            assert!(
+                printed.contains(&format!("at {counts_at}, or at once if it ends with `go`"))
+                    && printed.contains("Run `owlshift continue DEMO-1` then."),
+                "{printed}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(bench.briefs().len(), runs, "nothing ran");
+    assert_eq!(bench.record(), before, "nothing was kept");
+    assert_eq!(bench.comments().len(), 2);
+    // At the time it counts, the same answer is checked.
+    bench.waited.set(SignedDuration::from_mins(9));
+
+    // An incomplete answer: the RE-ASK asks Q2 alone.
     let partial = check(&[
         ("Q1", "answered", "English, the recommendation."),
         (
@@ -1278,7 +1314,7 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
             "The words are given, but not the sign-off.",
         ),
     ]);
-    let (reasked, printed) = bench.resume(vec![bench.reply(None, Some(&partial))]);
+    let (reasked, printed) = bench.continue_ticket(vec![bench.reply(None, Some(&partial))]);
     match reasked {
         Err(Stop::Reasked {
             round, reask, open, ..
@@ -1313,13 +1349,13 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     assert_eq!(record.questions.asks.len(), 2);
 
     // A counter-question: a REPLY carries the check's reply, nothing is
-    // re-asked or counted, no Build runs, and the next `resume` waits for a
+    // re-asked or counted, no Build runs, and the next `continue` waits for a
     // newer comment of the decider's. A REPLY the tracker refused keeps
-    // nothing of the check, so the next `resume` checks the same answer.
+    // nothing of the check, so the next `continue` checks the same answer.
     bench.answer("Q2: what is a sign-off?\n");
     let counter = check(&[("Q2", "counter_question", "Asks what a sign-off is.")]);
     bench.refuse.set(Some("[owlshift] REPLY"));
-    let (refused, _) = bench.resume(vec![bench.reply(None, Some(&counter))]);
+    let (refused, _) = bench.continue_ticket(vec![bench.reply(None, Some(&counter))]);
     assert!(
         matches!(&refused, Err(Stop::Refused(why)) if why.contains("posting the reply on the ticket")),
         "{refused:?}"
@@ -1329,7 +1365,7 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     assert!(record.questions.asks[1].verdicts.is_empty());
     assert_eq!(bench.comments().len(), 4);
     bench.refuse.set(None);
-    let (asked_back, _) = bench.resume(vec![bench.reply(None, Some(&counter))]);
+    let (asked_back, _) = bench.continue_ticket(vec![bench.reply(None, Some(&counter))]);
     let stop = asked_back.expect_err("a counter-question waits");
     assert!(
         matches!(&stop, Stop::CounterQuestion { asked, .. } if asked.len() == 1),
@@ -1356,22 +1392,24 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
         ),
         "{reply}"
     );
-    assert!(reply.contains("`owlshift resume DEMO-1`"), "{reply}");
+    assert!(reply.contains("`owlshift continue DEMO-1`"), "{reply}");
     let record = bench.record();
     assert_eq!(
         (record.state.waiting, record.state.reasks),
         (Some(Waiting::NeedsInput), 1)
     );
     assert_eq!(record.questions.asks.len(), 2);
-    let (waiting, _) = bench.resume(Vec::new());
+    let (waiting, _) = bench.continue_ticket(Vec::new());
     assert!(matches!(&waiting, Err(Stop::Waiting { .. })), "{waiting:?}");
 
     // A complete answer: the RESUME restates the round, Q1 from the first
     // check and Q2 from the last, and the ticket resumes at Build, which
-    // reads the asks and the answers, and delivers.
-    bench.answer("Q2: no sign-off, just \"Hello, reader.\"\n");
+    // reads the asks and the answers, and delivers. The answer ends with
+    // `go`, so it counts at once.
+    bench.waited.set(SignedDuration::ZERO);
+    bench.answer("Q2: no sign-off, just \"Hello, reader.\" Go.\n");
     let answered = check(&[("Q2", "answered", "No sign-off.")]);
-    let (delivered, printed) = bench.resume(vec![
+    let (delivered, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(Some("Hello"), Some(DONE)),
     ]);
@@ -1423,25 +1461,32 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     assert!(comments[7].starts_with("[owlshift] DELIVERY"));
     let record = bench.record();
     assert_eq!((record.state.waiting, record.state.reasks), (None, 0));
+    let commands: Vec<Value> = bench
+        .events()
+        .iter()
+        .filter(|event| event.kind == EventKind::Dispatch)
+        .map(|event| event.data["command"].clone())
+        .collect();
+    assert_eq!(commands, [json!("do"), json!("continue")]);
 
     // Delivered: nothing is left to resume.
-    let (done, _) = bench.resume(Vec::new());
+    let (done, _) = bench.continue_ticket(Vec::new());
     assert!(
-        matches!(&done, Err(Stop::Refused(why)) if why.contains("nothing to resume")),
+        matches!(&done, Err(Stop::Refused(why)) if why.contains("nothing to continue")),
         "{done:?}"
     );
 }
 
 /// A failed answer check is retried on the same answers; a quarantined one
-/// parks the ticket, which `resume` restarts once the project is cleared,
+/// parks the ticket, which `continue` restarts once the project is cleared,
 /// checking the same answers again.
 #[test]
-fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
+fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     let bench = Bench::new(true);
-    // Nothing asked yet: nothing to resume, and nothing cloned to find out.
-    let (nothing, _) = bench.resume(Vec::new());
+    // Nothing asked yet: nothing to continue, and nothing cloned to find out.
+    let (nothing, _) = bench.continue_ticket(Vec::new());
     assert!(
-        matches!(&nothing, Err(Stop::Refused(why)) if why.contains("nothing to resume")),
+        matches!(&nothing, Err(Stop::Refused(why)) if why.contains("nothing to continue")),
         "{nothing:?}"
     );
     assert!(!bench.dirs().checkout().exists());
@@ -1451,7 +1496,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
 
     let failed = r#"{"format":3,"status":"failed","summary":"The thread holds no ask."}"#;
-    let (outcome, _) = bench.resume(vec![bench.reply(None, Some(failed))]);
+    let (outcome, _) = bench.continue_ticket(vec![bench.reply(None, Some(failed))]);
     assert!(
         matches!(&outcome, Err(Stop::CheckFailed { .. })),
         "{outcome:?}"
@@ -1466,7 +1511,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
     breaking
         .main_checkout
         .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
-    let (outcome, _) = bench.resume(vec![breaking]);
+    let (outcome, _) = bench.continue_ticket(vec![breaking]);
     assert!(
         matches!(
             &outcome,
@@ -1482,21 +1527,21 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_resume() {
         Some(Waiting::ParkedAwaitingInput)
     );
     // The PARKED comment, without what the breach changed: a ticket ref
-    // keeps the round, so `resume` restarts it once the project is cleared.
+    // keeps the round, so `continue` restarts it once the project is cleared.
     let comments = bench.comments();
     assert_eq!(comments.len(), 3, "{comments:?}");
     assert!(comments[2].starts_with("[owlshift] PARKED\n"));
     assert!(
-        comments[2].contains("Then run `owlshift resume DEMO-1`"),
+        comments[2].contains("Then run `owlshift continue DEMO-1`"),
         "{}",
         comments[2]
     );
     assert!(!comments[2].contains("planted"), "{}", comments[2]);
 
-    // A person looked and cleared the project; `resume` restarts the ticket
+    // A person looked and cleared the project; `continue` restarts the ticket
     // and checks the same answers, with no new comment.
     fs::remove_file(bench.dirs().unverified_file()).unwrap();
-    let (delivered, printed) = bench.resume(vec![
+    let (delivered, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(Some("Hello"), Some(DONE)),
     ]);
@@ -1535,7 +1580,7 @@ fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
     ];
     for (n, result) in checks.iter().enumerate() {
         bench.answer(&format!("Q2: answer {n}.\n"));
-        let (outcome, printed) = bench.resume(vec![bench.reply(None, Some(result))]);
+        let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(result))]);
         if n < 3 {
             assert!(
                 matches!(&outcome, Err(Stop::Reasked { reask, .. }) if *reask == n as u32 + 1),
@@ -1565,17 +1610,31 @@ fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
     for text in [
         "Still open in round 1:",
         "Still open (partial): The ending is still missing.",
-        "answer the questions still open here, then run `owlshift resume DEMO-1`",
+        "answer the questions still open here, then run `owlshift continue DEMO-1`",
     ] {
         assert!(parked.contains(text), "{text}\n{parked}");
     }
     assert!(!parked.contains("**Q1**"), "{parked}");
 
-    // Answered at last: `resume` restarts the ticket, and the RESUME takes
-    // Q1 from the first check.
+    // Answered at last, but `continue` is typed within the quiet window: the
+    // ticket is restarted, which is kept, and the answer waits unread.
     bench.answer("Q2: no sign-off.\n");
+    bench.waited.set(SignedDuration::ZERO);
+    let checked_through = bench.record().questions.checked_through;
+    let (settling, _) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&settling, Err(Stop::Settling { .. })),
+        "{settling:?}"
+    );
+    let record = bench.record();
+    assert_eq!(record.state.waiting, Some(Waiting::NeedsInput));
+    assert_eq!(record.questions.checked_through, checked_through);
+
+    // Once it counts, `continue` checks it, and the RESUME takes Q1 from the
+    // first check.
+    bench.waited.set(SignedDuration::from_mins(10));
     let answered = check(&[("Q2", "answered", "No sign-off.")]);
-    let (delivered, printed) = bench.resume(vec![
+    let (delivered, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(Some("Hello"), Some(DONE)),
     ]);
@@ -1595,7 +1654,7 @@ fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
 }
 
 /// A tracker that refuses the RESUME keeps nothing of the check, so the next
-/// `resume` checks the same answers again; one that refuses the PARKED
+/// `continue` checks the same answers again; one that refuses the PARKED
 /// leaves the park as it is, and says so.
 #[test]
 fn a_resume_or_parked_comment_the_tracker_refuses() {
@@ -1608,7 +1667,7 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
         ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
     ]);
     bench.refuse.set(Some("[owlshift] RESUME"));
-    let (refused, _) = bench.resume(vec![bench.reply(None, Some(&answered))]);
+    let (refused, _) = bench.continue_ticket(vec![bench.reply(None, Some(&answered))]);
     assert!(
         matches!(&refused, Err(Stop::Refused(why)) if why.contains("posting the resume on the ticket")),
         "{refused:?}"
@@ -1619,7 +1678,7 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
     assert!(record.questions.asks[0].verdicts.is_empty());
 
     bench.refuse.set(None);
-    let (delivered, printed) = bench.resume(vec![
+    let (delivered, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(Some("Hello"), Some(DONE)),
     ]);
@@ -1685,7 +1744,7 @@ fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
     let labelled = fs::read_to_string(bench.ticket_file()).unwrap();
     fs::write(bench.ticket_file(), labelled.replace(ZONE_LABEL, "")).unwrap();
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
-    let (waiting, _) = bench.resume(Vec::new());
+    let (waiting, _) = bench.continue_ticket(Vec::new());
     assert!(
         matches!(&waiting, Err(Stop::Waiting { decider, .. }) if decider == "owner"),
         "{waiting:?}"
@@ -1707,7 +1766,7 @@ fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
         ("Q1", "answered", "English."),
         ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
     ]);
-    let (outcome, printed) = bench.resume(vec![bench.reply(None, Some(&answered))]);
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(&answered))]);
     assert!(
         matches!(&outcome, Err(Stop::Refused(why))
             if why.contains("DEMO-1 has no decider: the ticket has no assignee")),
@@ -1722,7 +1781,7 @@ fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
     // Labelled again, the ticket resumes at Build, whose brief keeps the
     // owner's answers as instructions, and delivers.
     fs::write(bench.ticket_file(), labelled).unwrap();
-    let (delivered, printed) = bench.resume(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    let (delivered, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let build = bench.briefs().pop().unwrap();
     assert_eq!(build.role, Role::Build);
