@@ -276,7 +276,7 @@ struct Bench {
     waited: Cell<SignedDuration>,
 }
 
-const DONE: &str = r#"{"format":4,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const DONE: &str = r#"{"format":5,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "decisions":[{"question":"Tone","decision":"Friendly","basis":"The ticket"}],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
@@ -791,7 +791,7 @@ type Check = fn(&Stop) -> bool;
 /// itself went through.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
-    let blocked = r#"{"format":4,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":5,"status":"blocked","summary":"The gate needs network."}"#;
     let reset: jiff::Timestamp = "2026-09-29T15:00:00Z".parse().unwrap();
 
     let cases: Vec<(&str, Setup, Check, Option<EventKind>)> = vec![
@@ -1131,7 +1131,7 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         ]);
         *planted.borrow_mut() = commit;
     });
-    let blocked = r#"{"format":4,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":5,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], Some(agent));
     assert!(
         matches!(
@@ -1228,7 +1228,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
 }
 
 /// The Build run's first question round.
-const ROUND_1: &str = r#"{"format":4,"status":"questions",
+const ROUND_1: &str = r#"{"format":5,"status":"questions",
 "summary":"The greeting's language and words are not given.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The ticket names no language.",
@@ -1250,7 +1250,7 @@ fn check(verdicts: &[(&str, &str, &str)]) -> String {
             verdict
         })
         .collect();
-    json!({ "format": 4, "status": "done", "summary": "Checked.", "verdicts": verdicts })
+    json!({ "format": 5, "status": "done", "summary": "Checked.", "verdicts": verdicts })
         .to_string()
 }
 
@@ -1656,7 +1656,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
 
-    let failed = r#"{"format":4,"status":"failed","summary":"The thread holds no ask."}"#;
+    let failed = r#"{"format":5,"status":"failed","summary":"The thread holds no ask."}"#;
     let (outcome, _) = bench.continue_ticket(vec![bench.reply(None, Some(failed))]);
     assert!(
         matches!(&outcome, Err(Stop::CheckFailed { .. })),
@@ -1848,7 +1848,7 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
 
     let bench = Bench::new(true);
     bench.refuse.set(Some("[owlshift] PARKED"));
-    let blocked = r#"{"format":4,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":5,"status":"blocked","summary":"The gate needs network."}"#;
     let (outcome, _) = bench.run(vec![bench.reply(None, Some(blocked))], None);
     let Err(
         stop @ Stop::Parked {
@@ -1972,7 +1972,7 @@ fn a_zone_owner_named_only_in_the_persons_checkout_decides_nothing() {
 
 /// A Build run's questions: Q1 discoverable (naming), Q2 always human
 /// (scope).
-const MIXED: &str = r#"{"format":4,"status":"questions",
+const MIXED: &str = r#"{"format":5,"status":"questions",
 "summary":"The greeting's file and words are not given.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
@@ -1981,15 +1981,15 @@ const MIXED: &str = r#"{"format":4,"status":"questions",
    "text":"What should the greeting say?"}]}"#;
 
 /// A Build run's one discoverable question.
-const NAMING: &str = r#"{"format":4,"status":"questions",
+const NAMING: &str = r#"{"format":5,"status":"questions",
 "summary":"The greeting's file is not named.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
    "text":"Which file should hold the greeting?"}]}"#;
 
 /// The resolver decides Q1.
-const DECIDED_Q1: &str = r#"{"format":4,"status":"done","summary":"The ticket names the file.",
-"resolutions":[{"question":"Q1","outcome":"decided","decision":"GREETING.md, at the root.",
+const DECIDED_Q1: &str = r#"{"format":5,"status":"done","summary":"The ticket names the file.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
 "basis":"The ticket's description."}]}"#;
 
 /// The events of a kind whose data holds `key`.
@@ -2066,12 +2066,8 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     assert_eq!(resolver.permissions.level, PermissionLevel::ReadOnly);
     assert!(!resolver.permissions.network);
     assert_eq!(resolver.rules.len(), 1);
-    let given: Vec<&str> = resolver
-        .resolve
-        .iter()
-        .map(|q| q.category.as_str())
-        .collect();
-    assert_eq!(given, ["naming"]);
+    let given: Vec<&str> = resolver.resolve.iter().map(|q| q.text.as_str()).collect();
+    assert_eq!(given, ["Which file should hold the greeting?"]);
 
     let record = bench.record();
     assert_eq!(
@@ -2225,6 +2221,84 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
     assert!(bench.record().questions.decisions.is_empty());
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
     assert_eq!(resolved[0]["unposted"], json!(["Q1"]));
+}
+
+/// OWL-144's acceptance: Build files a data-loss question under another
+/// category; the resolver, which never sees Build's categories, decides it
+/// but labels it `data_loss`, and the runner refuses that decision: no
+/// DECISION, nothing kept, and the question goes to the decider beside the
+/// one passed on, while the other decision of the same result stands.
+#[test]
+fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
+    let raised = r#"{"format":5,"status":"questions",
+"summary":"The greeting's file, the old greetings and the tone are open.",
+"questions":[
+  {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+   "text":"Which file should hold the greeting?"},
+  {"id":"Q2","category":"cleanup","context":"OLD_GREETINGS.md keeps every greeting sent.",
+   "text":"May the old greetings file be deleted?"},
+  {"id":"Q3","category":"tone","context":"The ticket does not say how formal it is.",
+   "text":"How formal should the greeting be?"}]}"#;
+    let resolved = r#"{"format":5,"status":"done","summary":"The file is named; the rest is not mine.",
+"resolutions":[
+  {"question":"Q1","outcome":"decided","category":"naming",
+   "decision":"GREETING.md, at the root.","basis":"The ticket's description."},
+  {"question":"Q2","outcome":"decided","category":"data_loss",
+   "decision":"Yes, delete it.","basis":"Nothing reads it."},
+  {"question":"Q3","outcome":"passed_on","reason":"A matter of tone."}]}"#;
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(raised)),
+            bench.reply(None, Some(resolved)),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(
+        asked_texts(&stop),
+        [
+            "May the old greetings file be deleted?",
+            "How formal should the greeting be?"
+        ],
+        "{printed}"
+    );
+    let briefs = bench.briefs();
+    let given: Vec<&str> = briefs[1].resolve.iter().map(|q| q.id.as_str()).collect();
+    assert_eq!(given, ["Q1", "Q2", "Q3"]);
+
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[0].starts_with("[owlshift] DECISION\n") && comments[0].contains("GREETING.md"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[1].contains("**Q1** (cleanup) May the old greetings file be deleted?"),
+        "{}",
+        comments[1]
+    );
+    assert!(
+        !comments.iter().any(|c| c.contains("Yes, delete it.")),
+        "{comments:?}"
+    );
+    let record = bench.record();
+    let kept: Vec<&str> = record
+        .questions
+        .decisions
+        .iter()
+        .map(|d| d.question.id.as_str())
+        .collect();
+    assert_eq!(kept, ["Q1"]);
+    let events = bench.events();
+    let resolved = data_of(&events, EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["decided"], json!(["Q1"]));
+    assert_eq!(resolved[0]["refused"], json!(["Q2"]));
+    assert_eq!(resolved[0]["passed_on"], json!(["Q3"]));
+    assert_eq!(resolved[0]["to_decider"], json!(["Q2", "Q3"]));
+    let opened = data_of(&events, EventKind::Gate, "opened");
+    assert_eq!(opened[0]["raised_as"], json!(["Q2", "Q3"]));
 }
 
 /// A Build that keeps asking what the resolver settles runs at most

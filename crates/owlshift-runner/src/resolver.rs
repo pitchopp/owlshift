@@ -9,15 +9,19 @@
 //! network, whose brief lists them in `resolve`. Its outcome ([`outcome`])
 //! either decides or passes on each question, or, when the run gave no usable
 //! result, sends them all to the decider ([`Fallback`]): no other harness can
-//! take over yet. Of its decisions, the runner keeps only those on questions
-//! it gave the resolver and routed there itself ([`decisions`]), posts each as
-//! a DECISION comment ([`crate::writer::DecisionComment`]) and keeps it in
-//! the ticket ref; the decider gets the rest as a round ([`left_for_decider`]).
+//! take over yet. The resolver's brief lists its questions without their
+//! category ([`unlabelled`]), and the resolver labels each one it decides
+//! itself. Of its decisions, the runner keeps only those on questions it gave
+//! the resolver whose two labels, the raising run's and the resolver's, both
+//! route there ([`settle`], OWL-144), posts each as a DECISION comment
+//! ([`crate::writer::DecisionComment`]) and keeps it in the ticket ref; the
+//! decider gets the rest as a round ([`left_for_decider`]).
 //! `owlshift do` and `owlshift continue` run it ([`crate::on_demand`]); the
 //! test bench's stand-in driver plays the same pieces in the scenarios.
 
 use std::time::Duration;
 
+use owlshift_contracts::brief::ToResolve;
 use owlshift_contracts::ids::QuestionId;
 use owlshift_contracts::refs::KeptDecision;
 use owlshift_contracts::result::{Decision, Question, Resolution, Status};
@@ -42,7 +46,8 @@ pub struct Routed {
 /// Routes each question by its category ([`GatePolicy::route`]). The floor's
 /// categories, a blank one and the project's additions go to the decider; a
 /// category is all the runner reads, so a question filed under the wrong one
-/// is routed by that one.
+/// is routed by that one; [`settle`] then checks the resolver's own label
+/// before any decision on it is logged.
 pub fn route(policy: &GatePolicy, questions: &[Question]) -> Routed {
     let mut routed = Routed::default();
     for question in questions {
@@ -52,6 +57,14 @@ pub fn route(policy: &GatePolicy, questions: &[Question]) -> Routed {
         }
     }
     routed
+}
+
+/// The questions as the resolver's brief lists them, without the category
+/// the raising run gave them (OWL-144): the resolver labels each question it
+/// decides from its text and context, so its label is its own reading and
+/// not a copy of the one [`decisions`] checks it against.
+pub fn unlabelled(questions: &[Question]) -> Vec<ToResolve> {
+    questions.iter().map(ToResolve::from).collect()
 }
 
 /// Why the questions meant for the resolver went to the decider; the
@@ -105,33 +118,63 @@ pub fn outcome(outcome: &Outcome) -> Resolved<'_> {
     }
 }
 
-/// The decisions the runner logs, in question order: each a `decided`
-/// resolution on a question of `given`, the questions the runner gave the
-/// resolver, that `policy` still routes to the resolver, with the runner's
-/// own copy of the question. A resolution on any other question, such as an
-/// always-human one, is dropped: the executor already refuses a result
-/// that names a question its brief did not give, and this keeps the floor
-/// independent of that check.
+/// What the runner makes of a resolver's resolutions, each list in question
+/// order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settled<'a> {
+    /// The decisions it logs: the runner's own copy of the question, the
+    /// decision and its basis.
+    pub logged: Vec<(&'a Question, &'a str, &'a str)>,
+    /// The questions whose decision it refused, which go to the decider.
+    pub refused: Vec<&'a QuestionId>,
+}
+
+/// Sorts the `decided` resolutions on questions of `given`, the questions
+/// the runner gave the resolver, by [`GatePolicy::route_decided`] on the
+/// category the raising run gave the question and the resolver's own label
+/// for it (OWL-144). A decision is logged only when both route to the
+/// resolver, the label a token; otherwise it is refused, whatever the
+/// resolver decided, and its question goes to the decider. A resolution on
+/// a question not in `given` is dropped, in neither list: the executor
+/// already refuses a result that names a question its brief did not give,
+/// and this keeps the floor independent of that check.
+pub fn settle<'a>(
+    policy: &GatePolicy,
+    given: &'a [Question],
+    resolutions: &'a [Resolution],
+) -> Settled<'a> {
+    let mut settled = Settled::default();
+    for resolution in resolutions {
+        let Resolution::Decided {
+            question,
+            category,
+            decision,
+            basis,
+        } = resolution
+        else {
+            continue;
+        };
+        let Some(asked) = given.iter().find(|asked| asked.id == *question) else {
+            continue;
+        };
+        match policy.route_decided(&asked.category, category) {
+            Route::Resolver => settled
+                .logged
+                .push((asked, decision.as_str(), basis.as_str())),
+            Route::Human => settled.refused.push(&asked.id),
+        }
+    }
+    settled
+}
+
+/// The decisions the runner logs, in question order, as [`settle`] sorts
+/// them.
 pub fn decisions<'a>(
     policy: &GatePolicy,
     given: &'a [Question],
     resolutions: &'a [Resolution],
 ) -> Vec<(&'a Question, &'a str, &'a str)> {
-    resolutions
-        .iter()
-        .filter_map(|resolution| match resolution {
-            Resolution::Decided {
-                question,
-                decision,
-                basis,
-            } => given
-                .iter()
-                .find(|asked| asked.id == *question)
-                .filter(|asked| policy.route(&asked.category) == Route::Resolver)
-                .map(|asked| (asked, decision.as_str(), basis.as_str())),
-            Resolution::PassedOn { .. } => None,
-        })
-        .collect()
+    settle(policy, given, resolutions).logged
 }
 
 /// The ids of the questions passed on, in question order.
@@ -232,8 +275,12 @@ mod tests {
         assert_eq!(ids(&routed.to_decider), ["Q2"]);
     }
 
-    /// Even a resolver result that decides an always-human question, which
-    /// the executor refuses already, logs no decision on it.
+    /// A decision is logged only when Build's category and the resolver's
+    /// own label both route to the resolver, the label a token (OWL-144);
+    /// any other decision on a question the resolver was given is refused.
+    /// Even a result deciding an always-human question, which the executor
+    /// refuses already, logs nothing on it, and one on a question it was not
+    /// given is dropped.
     #[test]
     fn a_decision_is_logged_only_on_a_question_the_resolver_may_decide() {
         let policy = GatePolicy::new(["billing"], PlanApproval::Never);
@@ -242,35 +289,54 @@ mod tests {
             question("Q2", "money"),
             question("Q3", "billing"),
             question("Q4", "testing"),
+            question("Q5", "cleanup"),
+            question("Q6", "cleanup"),
+            question("Q7", "cleanup"),
+            question("Q8", "naming"),
+            question("Q9", "cleanup"),
         ];
-        let decided = |id: &str| Resolution::Decided {
+        let decided = |id: &str, category: &str| Resolution::Decided {
             question: QuestionId::new(id).unwrap(),
+            category: category.into(),
             decision: format!("decision on {id}"),
             basis: "the ticket".into(),
         };
         let resolutions = [
-            decided("Q1"),
-            decided("Q2"),
-            decided("Q3"),
+            decided("Q1", "naming"),
+            decided("Q2", "naming"),
+            decided("Q3", "naming"),
             Resolution::PassedOn {
                 question: QuestionId::new("Q4").unwrap(),
                 reason: "a matter of taste".into(),
             },
-            decided("Q9"),
+            // The resolver's label names the floor, a spelling the matcher
+            // would misread, or nothing.
+            decided("Q5", "risk_of_data_loss"),
+            decided("Q6", "dataLoss"),
+            decided("Q7", ""),
+            // A label that merely differs from Build's.
+            decided("Q8", "file_layout"),
+            decided("Q9", "billing"),
+            decided("Q10", "naming"),
         ];
-        let logged = decisions(&policy, &given, &resolutions);
-        let found: Vec<(&str, &str)> = logged
+        let settled = settle(&policy, &given, &resolutions);
+        let found: Vec<(&str, &str)> = settled
+            .logged
             .iter()
             .map(|(question, decision, _)| (question.id.as_str(), *decision))
             .collect();
-        assert_eq!(found, [("Q1", "decision on Q1")]);
+        assert_eq!(found, [("Q1", "decision on Q1"), ("Q8", "decision on Q8")]);
         // The runner's own copy of the question, not the model's echo.
-        assert_eq!(logged[0].0.text, "text of Q1");
+        assert_eq!(settled.logged[0].0.text, "text of Q1");
+        let refused: Vec<&str> = settled.refused.iter().map(|id| id.as_str()).collect();
+        assert_eq!(refused, ["Q2", "Q3", "Q5", "Q6", "Q7", "Q9"]);
         let passed: Vec<&str> = passed_on(&resolutions)
             .iter()
             .map(|id| id.as_str())
             .collect();
         assert_eq!(passed, ["Q4"]);
+        // `decisions`, which the stand-in driver plays, logs the same.
+        assert_eq!(decisions(&policy, &given, &resolutions), settled.logged);
     }
 
     #[test]
@@ -307,7 +373,7 @@ mod tests {
         let finished = |status: &str| Outcome::Finished {
             result: Box::new(
                 RunResult::parse(&format!(
-                    r#"{{"format":4,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":5,"status":"{status}","summary":"s"}}"#
                 ))
                 .unwrap(),
             ),

@@ -1,10 +1,11 @@
 {
-  "format": 4,
+  "format": 5,
   "status": "done",
   "summary": "The README lists every file at the root.",
   "resolutions": [
     {
       "question": "Q1",
+      "category": "docs",
       "outcome": "decided",
       "decision": "Yes, in the README's list of files.",
       "basis": "README.md lists every file at the root."

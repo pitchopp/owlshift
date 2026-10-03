@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Role;
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
-use crate::ids::{RelativePath, TicketId};
+use crate::ids::{QuestionId, RelativePath, TicketId};
 use crate::result::{Question, check_question_order, first_not_ascending};
 
 const CONTRACT: &str = "brief";
@@ -33,10 +33,11 @@ pub struct Brief {
     /// decided from what the ticket, the thread, the project's rules or the
     /// repository already establish, or passed on to the decider. In a
     /// resolver's brief only, at least one, under the raising run's ids in
-    /// increasing order; never a question of an always-human category, which
-    /// the runner sends to the decider alone.
+    /// increasing order, without the category that run gave them; never a
+    /// question it filed under an always-human category, which the runner
+    /// sends to the decider alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resolve: Vec<Question>,
+    pub resolve: Vec<ToResolve>,
     /// Where an interrupted or resumed ticket starts again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Checkpoint>,
@@ -62,6 +63,35 @@ pub struct Brief {
     pub gate_failure: Option<GateFailure>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
+}
+
+/// A question the resolver settles, as the raising run asked it but without
+/// its category (OWL-144): the resolver labels each question it decides from
+/// its text and context alone, and the runner checks that label as well as
+/// the raising run's, so the second label is not a copy of the first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToResolve {
+    pub id: QuestionId,
+    /// What the reader needs to know to answer.
+    pub context: String,
+    pub text: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+}
+
+impl From<&Question> for ToResolve {
+    fn from(question: &Question) -> Self {
+        Self {
+            id: question.id.clone(),
+            context: question.context.clone(),
+            text: question.text.clone(),
+            options: question.options.clone(),
+            recommendation: question.recommendation.clone(),
+        }
+    }
 }
 
 /// A failed run of the project's gate by the runner.

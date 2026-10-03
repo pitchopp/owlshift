@@ -175,6 +175,20 @@ pub fn is_floor_category(category: &str) -> bool {
             .any(|floor| matches_token(&category, floor.token()))
 }
 
+/// Whether a category is written as a token: words of ASCII lowercase
+/// letters and digits, joined by single `_`, not blank. A token is its own
+/// normalized form, so the floor's matcher reads it as written; a label
+/// such as `dataLoss` (normalized `dataloss`) or `sécurité` could name a
+/// floor topic the matcher does not see.
+pub fn is_token(category: &str) -> bool {
+    category.split('_').all(|word| {
+        !word.is_empty()
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
 /// Normalizes a category: ASCII lowercase words, joined by single `_`, with
 /// every other character a separator. `"Data  Loss"`, `"data-loss"` and
 /// `"DATA_LOSS!"` all become `data_loss`.

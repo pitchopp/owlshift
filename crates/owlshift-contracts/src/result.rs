@@ -111,9 +111,10 @@ pub struct Verdict {
     pub reply: Option<String>,
 }
 
-/// The resolver's outcome on one question it was given: decided, with the
-/// decision and what settles it, or passed on to the decider, with why.
-/// Every text is not empty and not only whitespace.
+/// The resolver's outcome on one question it was given: decided, with its
+/// own label for the question, the decision and what settles it, or passed
+/// on to the decider, with why. Every text but the label is not empty and
+/// not only whitespace; the runner judges the label.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Resolution {
@@ -122,6 +123,13 @@ pub enum Resolution {
     /// reversible decision.
     Decided {
         question: QuestionId,
+        /// The resolver's own label for the question, read from its text and
+        /// context: a floor token when the question touches a floor topic.
+        /// The runner logs the decision only when this label is a token and
+        /// it and the raising run's category both route to the resolver,
+        /// and otherwise sends the question to the decider
+        /// (`owlshift_core::gate::GatePolicy::route_decided`).
+        category: String,
         #[schemars(regex(pattern = r"\S"))]
         decision: String,
         /// What settles it: the ticket, a rule, a file, an earlier answer.

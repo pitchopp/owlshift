@@ -28,7 +28,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 4
+      "const": 5
     },
     "pr": {
       "description": "The pull request to open; only with `status: done`.",
@@ -375,7 +375,7 @@
       "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
     },
     "Resolution": {
-      "description": "The resolver's outcome on one question it was given: decided, with the\ndecision and what settles it, or passed on to the decider, with why.\nEvery text is not empty and not only whitespace.",
+      "description": "The resolver's outcome on one question it was given: decided, with its\nown label for the question, the decision and what settles it, or passed\non to the decider, with why. Every text but the label is not empty and\nnot only whitespace; the runner judges the label.",
       "oneOf": [
         {
           "description": "Settled by what the ticket, the thread, the project's rules or the\nrepository already establish; the runner logs it on the ticket as a\nreversible decision.",
@@ -385,6 +385,10 @@
               "description": "What settles it: the ticket, a rule, a file, an earlier answer.",
               "type": "string",
               "pattern": "\\S"
+            },
+            "category": {
+              "description": "The resolver's own label for the question, read from its text and\ncontext: a floor token when the question touches a floor topic.\nThe runner logs the decision only when this label is a token and\nit and the raising run's category both route to the resolver,\nand otherwise sends the question to the decider\n(`owlshift_core::gate::GatePolicy::route_decided`).",
+              "type": "string"
             },
             "decision": {
               "type": "string",
@@ -402,6 +406,7 @@
           "required": [
             "outcome",
             "question",
+            "category",
             "decision",
             "basis"
           ]
