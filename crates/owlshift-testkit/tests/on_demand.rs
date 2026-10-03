@@ -1281,7 +1281,7 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
 
     // An answer within the quiet window: the decider may still be writing,
     // so nothing runs and nothing is kept until it has been left unedited
-    // for 10 minutes (OWL-127).
+    // for 10 minutes, the default (OWL-127).
     let answered_at = bench.clock.get();
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\"\n");
     bench.waited.set(SignedDuration::ZERO);
@@ -1305,6 +1305,36 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
     assert_eq!(bench.briefs().len(), runs, "nothing ran");
     assert_eq!(bench.record(), before, "nothing was kept");
     assert_eq!(bench.comments().len(), 2);
+
+    // A project's own window (OWL-145): 15 minutes in, a 30-minute window
+    // still holds the answer, and says so.
+    let config_path = bench.remote.checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        original.replace(
+            "always_human = []",
+            "always_human = []\nquiet_window_minutes = 30",
+        ),
+    )
+    .unwrap();
+    bench.waited.set(SignedDuration::from_mins(15));
+    let (longer, _) = bench.continue_ticket(Vec::new());
+    match &longer {
+        Err(stop @ Stop::Settling { counts_at: at, .. }) => {
+            assert_eq!(
+                *at,
+                answered_at
+                    .checked_add(SignedDuration::from_mins(30))
+                    .unwrap()
+            );
+            assert!(stop.to_string().contains("for 30 minutes"), "{stop}");
+        }
+        other => panic!("{other:?}"),
+    }
+    fs::write(&config_path, original).unwrap();
+    bench.waited.set(SignedDuration::ZERO);
+
     // At the time it counts, the same answer is checked.
     bench.waited.set(SignedDuration::from_mins(9));
 

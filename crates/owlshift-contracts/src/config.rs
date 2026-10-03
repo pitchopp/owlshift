@@ -209,11 +209,19 @@ pub struct Policy {
     pub quiet_window_minutes: Option<u16>,
 }
 
+/// The range of `policy.quiet_window_minutes`, in minutes (the schema
+/// attribute on the field repeats it as literals).
+const QUIET_WINDOW_MINUTES: std::ops::RangeInclusive<u16> = 1..=1440;
+
 impl Policy {
-    /// The quiet window: the project's, or the default.
+    /// The quiet window: the project's, or the default. A value outside
+    /// the range, possible only in a configuration built in code, is
+    /// clamped into it: the window is never zero.
     pub fn quiet_window(&self) -> Duration {
         self.quiet_window_minutes
             .map_or(DEFAULT_QUIET_WINDOW, |minutes| {
+                let minutes =
+                    minutes.clamp(*QUIET_WINDOW_MINUTES.start(), *QUIET_WINDOW_MINUTES.end());
                 Duration::from_secs(u64::from(minutes) * 60)
             })
     }
@@ -259,7 +267,7 @@ impl ProjectConfig {
             .check_rules()
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.rules: {reason}")))?;
         if let Some(minutes) = self.policy.quiet_window_minutes
-            && !(1..=1440).contains(&minutes)
+            && !QUIET_WINDOW_MINUTES.contains(&minutes)
         {
             return Err(ContractError::invalid(
                 PROJECT,
@@ -659,6 +667,12 @@ mod tests {
         assert_eq!(set.policy.quiet_window(), Duration::from_secs(45 * 60));
         assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
 
+        let built = Policy {
+            always_human: Vec::new(),
+            quiet_window_minutes: Some(0),
+        };
+        assert_eq!(built.quiet_window(), Duration::from_secs(60));
+
         for ok in ["1", "1440"] {
             project("", &format!("quiet_window_minutes = {ok}")).unwrap();
         }
@@ -672,6 +686,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("policy.quiet_window_minutes"), "{error}");
+        let error = project("", "quiet_window_minutes = 1441")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("from 1 to 1440"), "{error}");
     }
 
     #[test]

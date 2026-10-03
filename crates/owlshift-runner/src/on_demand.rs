@@ -396,9 +396,12 @@ impl fmt::Display for Stop {
             } => write!(
                 f,
                 "Waiting: {decider} may still be writing. Their latest comment counts as their \
-                 answer once left unedited for {} minutes, at {counts_at}, or at once if it ends \
+                 answer once left unedited for {minutes}, at {counts_at}, or at once if it ends \
                  with `go`. Run `owlshift continue {ticket}` then.",
-                window.as_secs() / 60
+                minutes = match window.as_secs() / 60 {
+                    1 => "1 minute".to_owned(),
+                    n => format!("{n} minutes"),
+                }
             ),
             Self::Reasked {
                 ticket,
