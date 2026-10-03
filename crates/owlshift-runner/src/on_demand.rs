@@ -67,7 +67,6 @@ use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::GatePolicy;
 use owlshift_core::pipeline::Pipeline;
-use owlshift_core::reply::QUIET_WINDOW;
 use owlshift_core::resource::Resource;
 use owlshift_core::state::{
     Event, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason, Status, TicketState, Transition,
@@ -285,6 +284,8 @@ pub enum Stop {
     Settling {
         ticket: TicketId,
         decider: String,
+        /// The project's quiet window.
+        window: Duration,
         counts_at: Timestamp,
     },
     /// The answers left questions open: they were asked again on the ticket.
@@ -390,13 +391,17 @@ impl fmt::Display for Stop {
             Self::Settling {
                 ticket,
                 decider,
+                window,
                 counts_at,
             } => write!(
                 f,
                 "Waiting: {decider} may still be writing. Their latest comment counts as their \
-                 answer once left unedited for {} minutes, at {counts_at}, or at once if it ends \
+                 answer once left unedited for {minutes}, at {counts_at}, or at once if it ends \
                  with `go`. Run `owlshift continue {ticket}` then.",
-                QUIET_WINDOW.as_secs() / 60
+                minutes = match window.as_secs() / 60 {
+                    1 => "1 minute".to_owned(),
+                    n => format!("{n} minutes"),
+                }
             ),
             Self::Reasked {
                 ticket,
@@ -1222,10 +1227,16 @@ impl OnDemand<'_> {
         }
         // Not while the decider may still be writing (the quiet window), so
         // the check reads the whole answer; nothing is kept meanwhile.
-        if let Some(counts_at) = answer_check::counts_at(&comments, &asked_of, (self.clock)()) {
+        if let Some(counts_at) = answer_check::counts_at(
+            &comments,
+            &asked_of,
+            (self.clock)(),
+            self.config.policy.quiet_window(),
+        ) {
             return Err(Stop::Settling {
                 ticket,
                 decider: name_of(&asked, &p.found),
+                window: self.config.policy.quiet_window(),
                 counts_at,
             });
         }

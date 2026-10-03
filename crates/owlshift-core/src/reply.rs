@@ -11,8 +11,9 @@
 use std::time::Duration;
 
 /// How long the decider's latest comment must be left unedited before it
-/// counts: 10 minutes, a constant until the project's policy can set it.
-pub const QUIET_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// counts when the project's policy does not set it
+/// (`policy.quiet_window_minutes`, OWL-145): 10 minutes.
+pub const DEFAULT_QUIET_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// Whether a reply counts now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,9 +55,18 @@ mod tests {
     #[test]
     fn a_reply_counts_once_the_window_has_passed_or_with_go() {
         let minute = Duration::from_secs(60);
-        assert_eq!(counts(9 * minute, false, QUIET_WINDOW), Reply::Settling);
-        assert_eq!(counts(QUIET_WINDOW, false, QUIET_WINDOW), Reply::Counts);
-        assert_eq!(counts(Duration::ZERO, true, QUIET_WINDOW), Reply::Counts);
+        assert_eq!(
+            counts(9 * minute, false, DEFAULT_QUIET_WINDOW),
+            Reply::Settling
+        );
+        assert_eq!(
+            counts(DEFAULT_QUIET_WINDOW, false, DEFAULT_QUIET_WINDOW),
+            Reply::Counts
+        );
+        assert_eq!(
+            counts(Duration::ZERO, true, DEFAULT_QUIET_WINDOW),
+            Reply::Counts
+        );
     }
 
     #[test]

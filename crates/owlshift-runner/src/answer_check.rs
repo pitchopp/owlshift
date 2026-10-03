@@ -20,7 +20,7 @@ use owlshift_adapters::tracker::{Comment, Person};
 use owlshift_contracts::brief::{Brief, Relation};
 use owlshift_contracts::refs::TicketQuestions;
 use owlshift_contracts::result::{self, AnswerClass, Question, RunResult, Verdict};
-use owlshift_core::reply::{self, QUIET_WINDOW, Reply};
+use owlshift_core::reply::{self, Reply};
 use owlshift_core::state::Event;
 
 use crate::executor::Outcome;
@@ -61,22 +61,23 @@ pub fn newest_decider_comment<'c>(
 }
 
 /// When the decider's reply counts, if it does not yet at `now`: the quiet
-/// window ([`owlshift_core::reply`]) after the last edit of their newest
+/// window ([`owlshift_core::reply`], `window`, the project's policy) after the last edit of their newest
 /// comment, unless that comment ends with `go`. `None` when it counts, or
 /// when the decider wrote nothing. `now` is this machine's clock, the one
 /// time here that is not the tracker's; a last edit after it counts as left
 /// unedited for no time at all, so the whole window applies from that edit.
-pub fn counts_at(comments: &[Comment], decider: &Person, now: Timestamp) -> Option<Timestamp> {
+pub fn counts_at(
+    comments: &[Comment],
+    decider: &Person,
+    now: Timestamp,
+    window: Duration,
+) -> Option<Timestamp> {
     let newest = newest_decider_comment(comments, decider)?;
     let last_edit = newest.last_edit();
     let quiet_for = Duration::try_from(now.duration_since(last_edit)).unwrap_or(Duration::ZERO);
-    match reply::counts(quiet_for, reply::ends_with_go(&newest.body), QUIET_WINDOW) {
+    match reply::counts(quiet_for, reply::ends_with_go(&newest.body), window) {
         Reply::Counts => None,
-        Reply::Settling => Some(
-            last_edit
-                .checked_add(QUIET_WINDOW)
-                .unwrap_or(Timestamp::MAX),
-        ),
+        Reply::Settling => Some(last_edit.checked_add(window).unwrap_or(Timestamp::MAX)),
     }
 }
 
@@ -332,13 +333,24 @@ mod tests {
             (vec![by("u1", 30, None, "Q1: yes.")], 25, Some(40)),
             (vec![by("u1", 30, None, "Q1: yes.")], 40, None),
         ];
+        let window = reply::DEFAULT_QUIET_WINDOW;
         for (comments, now, expected) in cases {
             assert_eq!(
-                counts_at(&comments, &decider, at(now)),
+                counts_at(&comments, &decider, at(now), window),
                 expected.map(at),
                 "{comments:?} at {now}"
             );
         }
+
+        // A project's own window replaces the default.
+        let comments = [by("u1", 10, None, "Q1: yes.")];
+        let hour = Duration::from_secs(60 * 60);
+        assert_eq!(
+            counts_at(&comments, &decider, at(15), hour),
+            Some(at(10) + hour)
+        );
+        let two = Duration::from_secs(2 * 60);
+        assert_eq!(counts_at(&comments, &decider, at(12), two), None);
     }
 
     fn finished(result: &str) -> Outcome {
