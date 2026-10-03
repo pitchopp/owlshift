@@ -2223,6 +2223,84 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
     assert_eq!(resolved[0]["unposted"], json!(["Q1"]));
 }
 
+/// OWL-144's acceptance: Build files a data-loss question under another
+/// category; the resolver, which never sees Build's categories, decides it
+/// but labels it `data_loss`, and the runner refuses that decision: no
+/// DECISION, nothing kept, and the question goes to the decider beside the
+/// one passed on, while the other decision of the same result stands.
+#[test]
+fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
+    let raised = r#"{"format":5,"status":"questions",
+"summary":"The greeting's file, the old greetings and the tone are open.",
+"questions":[
+  {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+   "text":"Which file should hold the greeting?"},
+  {"id":"Q2","category":"cleanup","context":"OLD_GREETINGS.md keeps every greeting sent.",
+   "text":"May the old greetings file be deleted?"},
+  {"id":"Q3","category":"tone","context":"The ticket does not say how formal it is.",
+   "text":"How formal should the greeting be?"}]}"#;
+    let resolved = r#"{"format":5,"status":"done","summary":"The file is named; the rest is not mine.",
+"resolutions":[
+  {"question":"Q1","outcome":"decided","category":"naming",
+   "decision":"GREETING.md, at the root.","basis":"The ticket's description."},
+  {"question":"Q2","outcome":"decided","category":"data_loss",
+   "decision":"Yes, delete it.","basis":"Nothing reads it."},
+  {"question":"Q3","outcome":"passed_on","reason":"A matter of tone."}]}"#;
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(raised)),
+            bench.reply(None, Some(resolved)),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(
+        asked_texts(&stop),
+        [
+            "May the old greetings file be deleted?",
+            "How formal should the greeting be?"
+        ],
+        "{printed}"
+    );
+    let briefs = bench.briefs();
+    let given: Vec<&str> = briefs[1].resolve.iter().map(|q| q.id.as_str()).collect();
+    assert_eq!(given, ["Q1", "Q2", "Q3"]);
+
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[0].starts_with("[owlshift] DECISION\n") && comments[0].contains("GREETING.md"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[1].contains("**Q1** (cleanup) May the old greetings file be deleted?"),
+        "{}",
+        comments[1]
+    );
+    assert!(
+        !comments.iter().any(|c| c.contains("Yes, delete it.")),
+        "{comments:?}"
+    );
+    let record = bench.record();
+    let kept: Vec<&str> = record
+        .questions
+        .decisions
+        .iter()
+        .map(|d| d.question.id.as_str())
+        .collect();
+    assert_eq!(kept, ["Q1"]);
+    let events = bench.events();
+    let resolved = data_of(&events, EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["decided"], json!(["Q1"]));
+    assert_eq!(resolved[0]["refused"], json!(["Q2"]));
+    assert_eq!(resolved[0]["passed_on"], json!(["Q3"]));
+    assert_eq!(resolved[0]["to_decider"], json!(["Q2", "Q3"]));
+    let opened = data_of(&events, EventKind::Gate, "opened");
+    assert_eq!(opened[0]["raised_as"], json!(["Q2", "Q3"]));
+}
+
 /// A Build that keeps asking what the resolver settles runs at most
 /// `MAX_RESOLVED_PASSES` times in a row on decisions alone; the next run's
 /// questions all go to the decider, and the round says why.
