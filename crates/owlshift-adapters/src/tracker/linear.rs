@@ -139,7 +139,11 @@ impl fmt::Debug for LinearTracker {
 
 impl LinearTracker {
     /// What the Linear adapter implements in this build.
-    pub const CAPABILITIES: &'static [Capability] = &[Capability::ReadTicket, Capability::Comments];
+    pub const CAPABILITIES: &'static [Capability] = &[
+        Capability::ReadTicket,
+        Capability::Comments,
+        Capability::VisibleStage,
+    ];
 
     /// The adapter over HTTPS with this key.
     pub fn new(key: ApiKey) -> Self {
@@ -231,6 +235,54 @@ impl Tracker for LinearTracker {
             ))),
         }
     }
+
+    /// Two requests: the workflow states of the issue's team, to find the
+    /// one named `state`, then `issueUpdate` with its id. The issue is
+    /// updated by the id Linear gave in the first answer. Nothing is cached:
+    /// a command moves the stage a few times at most.
+    fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), Error> {
+        let data: StatesData = self.call(STATES_QUERY, json!({ "id": id.as_str() }))?;
+        let issue = data.issue;
+        let team = issue.team;
+        if team.states.page_info.has_next_page {
+            return Err(invalid(format!(
+                "team {} has more than {MAX_PAGE} workflow states, which this adapter does not \
+                 read",
+                team.key
+            )));
+        }
+        let named: Vec<&WorkflowState> =
+            team.states.nodes.iter().filter(|s| s.name == state).collect();
+        let target = match named[..] {
+            [one] => one,
+            [] => {
+                let names: Vec<&str> = team.states.nodes.iter().map(|s| s.name.as_str()).collect();
+                return Err(invalid(format!(
+                    "team {} has no workflow state named {state:?}: the project's \
+                     `[tracker].states` must name one of {}",
+                    team.key,
+                    names.join(", ")
+                )));
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "team {} has several workflow states named {state:?}",
+                    team.key
+                )));
+            }
+        };
+        let variables = json!({ "id": issue.id, "stateId": target.id });
+        let data: StageData = self.call(STAGE_MUTATION, variables)?;
+        match data.issue_update {
+            IssueUpdate {
+                success: true,
+                issue: Some(IssueState { state: Some(now) }),
+            } if now.id == target.id => Ok(()),
+            _ => Err(invalid(format!(
+                "Linear did not move {id} to {state:?}"
+            ))),
+        }
+    }
 }
 
 /// The fields read from every comment. No e-mail, no full name: only what the
@@ -259,6 +311,12 @@ const POST_MUTATION: &str = concat!(
     comment_fields!(),
     " } } }"
 );
+
+const STATES_QUERY: &str = "query States($id: String!) { issue(id: $id) { id \
+    team { key states(first: 50) { nodes { id name } pageInfo { hasNextPage } } } } }";
+
+const STAGE_MUTATION: &str = "mutation SetStage($id: String!, $stateId: String!) { \
+    issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }";
 
 /// Reads a GraphQL answer: its errors first, then its `data`.
 fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
@@ -481,6 +539,46 @@ struct CommentCreate {
     comment: Option<LinearComment>,
 }
 
+#[derive(Deserialize)]
+struct StatesData {
+    issue: IssueTeam,
+}
+
+#[derive(Deserialize)]
+struct IssueTeam {
+    id: String,
+    team: Team,
+}
+
+#[derive(Deserialize)]
+struct Team {
+    key: String,
+    states: Connection<WorkflowState>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowState {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StageData {
+    issue_update: IssueUpdate,
+}
+
+#[derive(Deserialize)]
+struct IssueUpdate {
+    success: bool,
+    issue: Option<IssueState>,
+}
+
+#[derive(Deserialize)]
+struct IssueState {
+    state: Option<WorkflowState>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +691,58 @@ mod tests {
 
         let refused = r#"{"data":{"commentCreate":{"success":false,"comment":null}}}"#;
         assert!(tracker(vec![refused]).post_comment(&id, "x").is_err());
+    }
+
+    /// A stage name is matched exactly among the team's states, and the
+    /// update must answer with the state asked for: anything else is an
+    /// error, and nothing is written without exactly one match.
+    #[test]
+    fn a_stage_is_moved_only_to_the_one_state_of_that_name() {
+        let id = TicketId::new("OWL-1").unwrap();
+        let states = |more: bool, names: &[&str]| -> &'static str {
+            let nodes: Vec<Value> = names
+                .iter()
+                .enumerate()
+                .map(|(n, name)| json!({ "id": format!("s{n}"), "name": name }))
+                .collect();
+            let answer = json!({ "data": { "issue": { "id": "i1", "team": { "key": "OWL",
+                "states": { "nodes": nodes, "pageInfo": { "hasNextPage": more } } } } } });
+            answer.to_string().leak()
+        };
+        let moved = |success: bool, state: &str| -> &'static str {
+            let answer = json!({ "data": { "issueUpdate": { "success": success,
+                "issue": { "state": { "id": state, "name": "x" } } } } });
+            answer.to_string().leak()
+        };
+        let both = states(false, &["Todo", "Needs Input"]);
+
+        assert!(
+            tracker(vec![both, moved(true, "s1")])
+                .set_stage(&id, "Needs Input")
+                .is_ok()
+        );
+        // Exact names only: no case folding.
+        let unknown = tracker(vec![both])
+            .set_stage(&id, "needs input")
+            .unwrap_err();
+        assert!(
+            unknown.message.contains("must name one of Todo, Needs Input"),
+            "{unknown}"
+        );
+        let twice = states(false, &["Doing", "Doing"]);
+        assert!(tracker(vec![twice]).set_stage(&id, "Doing").is_err());
+        let truncated = states(true, &["Doing"]);
+        assert!(tracker(vec![truncated]).set_stage(&id, "Doing").is_err());
+        assert!(
+            tracker(vec![both, moved(false, "s1")])
+                .set_stage(&id, "Needs Input")
+                .is_err()
+        );
+        assert!(
+            tracker(vec![both, moved(true, "s0")])
+                .set_stage(&id, "Needs Input")
+                .is_err()
+        );
     }
 
     /// OWL-1 as Linear gave it on 2026-09-29, made by its onboarding

@@ -5,7 +5,8 @@
 //! It was extracted at the second implementation (Linear, after the Markdown
 //! tracker) and is not frozen: principle 8 freezes a contract only once three
 //! implementations exist. It grows with the steps that need more: the
-//! visible stage in P2, listing admitted tickets in P4.
+//! visible stage came with P2 (OWL-137), listing admitted tickets comes in
+//! P4.
 
 pub mod linear;
 pub mod markdown;
@@ -31,6 +32,12 @@ pub trait Tracker {
     /// Posts a comment under the adapter's own identity and returns it as the
     /// tracker recorded it.
     fn post_comment(&self, id: &TicketId, body: &str) -> Result<Comment, Error>;
+
+    /// Moves the ticket's visible stage to `state`, a state name of the
+    /// tracker as the project's `[tracker].states` maps it. A tracker with a
+    /// fixed set of states refuses a name outside it, never guessing a close
+    /// one; the Markdown tracker takes any name.
+    fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), Error>;
 }
 
 /// A row of the tracker capability table in architecture section 6.
