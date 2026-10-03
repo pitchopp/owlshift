@@ -1,0 +1,13 @@
+{
+  "format": 4,
+  "status": "done",
+  "summary": "The ticket names the file.",
+  "resolutions": [
+    {
+      "question": "Q1",
+      "outcome": "decided",
+      "decision": "GREETING.md, at the root.",
+      "basis": "The ticket's description names it."
+    }
+  ]
+}
