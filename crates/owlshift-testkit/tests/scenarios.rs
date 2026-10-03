@@ -63,6 +63,16 @@ fn reask() {
     }
 }
 
+/// OWL-138's acceptance, in the stand-in driver: a discoverable question is
+/// decided and the round holds the always-human one alone; a run whose
+/// questions are all decided goes on without a round.
+#[test]
+fn resolver() {
+    if let Err(error) = play(&scenarios().join("resolver.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-123's acceptance: past the re-ask limit, a fourth incomplete answer
 /// parks the ticket with a PARKED comment naming what is still open and
 /// what restarts it.

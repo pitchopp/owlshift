@@ -1,0 +1,85 @@
+# S7, the resolver deciding (OWL-138), played by
+# crates/owlshift-testkit/tests/scenarios.rs. Its fixture folder is resolver/:
+# the project in repo/, whose policy adds `tone` to the always-human
+# categories, and prepared results in results/. Every resolve step runs the
+# resolver on the fake harness, through the executor.
+
+description = """
+DEMO-4's Build asks which file holds the greeting (naming) and its tone, which
+the project keeps for a human. Only the file question reaches the resolver,
+which decides it: one DECISION comment, then a round holding the tone question
+alone, as Q1. Answered, the ticket resumes; Build then asks whether the README
+links to the greeting, which the resolver decides too: a DECISION and no
+round, the ticket still at Build. The next Build reads both decisions and is
+done."""
+ticket = "DEMO-4"
+start = "2026-10-03T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+run = { result = "results/questions-mixed.json" }
+expect = { event = "none", stage = "build", waiting = "none", round = 0, comments = 0 }
+
+[[step]]
+resolve = { result = "results/resolver-decides-file.json" }
+[step.expect]
+event = "questions"
+waiting = "needs_input"
+round = 1
+tracker_stage = "Needs Input"
+comments = 2
+brief_resolve = ["Q1"]
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] QUESTIONS · round 1"
+contains = [
+  "**Q1** (tone) Should the greeting be formal or casual?",
+  "Owlshift decided one other question of this run itself",
+]
+lacks = ["naming", "**Q2**"]
+
+[[step]]
+comment = { author = "maintainer", body = "Q1: casual.\n" }
+expect = { event = "none", comments = 3 }
+
+[[step]]
+answer = { result = "results/check-tone-answered.json" }
+[step.expect]
+event = "answered"
+stage = "build"
+waiting = "none"
+comments = 4
+brief_decisions = ["GREETING.md, at the root."]
+
+[[step]]
+run = { result = "results/questions-link.json" }
+expect = { event = "none", waiting = "none", round = 1, comments = 4 }
+
+[[step]]
+resolve = { result = "results/resolver-decides-link.json" }
+[step.expect]
+event = "none"
+stage = "build"
+waiting = "none"
+round = 1
+comments = 5
+brief_resolve = ["Q1"]
+brief_decisions = ["GREETING.md, at the root."]
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] DECISION"
+contains = [
+  "**Question** (docs) Should the README link to GREETING.md?",
+  "**Decision:** Yes, in the README's list of files.",
+  "**Settled by:** README.md lists every file at the root.",
+]
+
+[[step]]
+run = { result = "results/build-done.json" }
+[step.expect]
+event = "completed"
+brief_decisions = ["GREETING.md, at the root.", "Yes, in the README's list of files."]
+brief_thread = ["decider", "owlshift"]

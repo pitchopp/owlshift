@@ -1,0 +1,8 @@
+{
+  "format": 4,
+  "status": "done",
+  "summary": "The decider chose a casual greeting.",
+  "verdicts": [
+    { "question": "Q1", "class": "answered", "reason": "Casual." }
+  ]
+}

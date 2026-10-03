@@ -83,6 +83,7 @@ fn a_real_role_runs_through_the_executor() {
         },
         decider: "maintainer".into(),
         thread: Vec::new(),
+        resolve: Vec::new(),
         checkpoint: None,
         zones: Vec::new(),
         resources: Vec::new(),

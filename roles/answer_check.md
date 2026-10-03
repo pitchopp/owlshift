@@ -1,7 +1,7 @@
 +++
 role = "answer_check"
-brief_format = 3
-result_format = 3
+brief_format = 4
+result_format = 4
 +++
 
 # Answer check
@@ -14,7 +14,8 @@ The brief is a JSON file from the runner, and all you need: read no other file a
 
 - `questions` entries: a `round` of questions, each with its `id` (`Q1`, `Q2`, …), `category`, `context`, `text`, and when given `options` and a `recommendation`;
 - `reask` entries: questions of an earlier `round` asked again, under their original `id`;
-- `comment` entries: what people wrote on the ticket, with the `body` and the `author.relation` of who wrote it.
+- `comment` entries: what people wrote on the ticket, with the `body` and the `author.relation` of who wrote it;
+- `decision` entries: questions of a run that the runner decided without the decider. They are context, never an answer to a question of an ask.
 
 The latest ask is the last `questions` or `reask` entry. You give a verdict on each of its questions, and on no other.
 
@@ -39,7 +40,7 @@ A `counter_question` verdict also has a `reply`: the answer to what the decider 
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 3, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 4, rejected if it carries any field not listed here:
 
 - `status`: `done` once every question of the latest ask has its verdict; `failed` when you cannot give them, for instance when the `thread` holds no ask. No other status is yours: anything else fails the run.
 - `summary`: one or two sentences on what the decider's answers settled.
@@ -49,7 +50,7 @@ Leave out `questions`, `decisions`, `followups`, `artifacts` and `pr`: they belo
 
 ```json
 {
-  "format": 3,
+  "format": 4,
   "status": "done",
   "summary": "The decider chose English and gave the words; they asked what a sign-off is before saying whether the greeting ends with one.",
   "verdicts": [

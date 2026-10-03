@@ -1,0 +1,18 @@
+{
+  "format": 4,
+  "status": "done",
+  "summary": "The ticket names the file; whether to sign off is the decider's call.",
+  "resolutions": [
+    {
+      "outcome": "decided",
+      "question": "Q1",
+      "decision": "GREETING.md, at the repository root.",
+      "basis": "The ticket's description names GREETING.md."
+    },
+    {
+      "outcome": "passed_on",
+      "question": "Q3",
+      "reason": "Nothing in the ticket, the rules or the repository says how the greeting ends."
+    }
+  ]
+}

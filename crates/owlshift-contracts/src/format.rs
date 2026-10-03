@@ -14,10 +14,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::Role;
 
-/// The format version of the brief.
-pub const BRIEF_FORMAT: u32 = 3;
-/// The format version of `result.json`.
-pub const RESULT_FORMAT: u32 = 3;
+/// The format version of the brief. Format 4 added the resolver's `resolve`
+/// field and the thread's `decision` entries (OWL-138).
+pub const BRIEF_FORMAT: u32 = 4;
+/// The format version of `result.json`. Format 4 added the resolver's
+/// `resolutions` (OWL-138).
+pub const RESULT_FORMAT: u32 = 4;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -27,7 +29,9 @@ pub const CLAIM_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).
 pub const TICKET_STATE_FORMAT: u32 = 2;
 /// The format version of a ticket's asks (`questions.json` on a ticket ref).
-pub const QUESTIONS_FORMAT: u32 = 3;
+/// Format 4 added the resolver's kept `decisions` (OWL-138); formats 2 and 3
+/// are still read.
+pub const QUESTIONS_FORMAT: u32 = 4;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

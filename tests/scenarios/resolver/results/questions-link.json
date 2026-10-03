@@ -1,0 +1,13 @@
+{
+  "format": 4,
+  "status": "questions",
+  "summary": "Whether the README links to the greeting is not said.",
+  "questions": [
+    {
+      "id": "Q1",
+      "category": "docs",
+      "context": "The README lists the repository's files.",
+      "text": "Should the README link to GREETING.md?"
+    }
+  ]
+}

@@ -29,6 +29,14 @@ pub struct Brief {
     /// The question-and-answer thread, oldest first.
     #[serde(default)]
     pub thread: Vec<ThreadEntry>,
+    /// The questions a run just raised that the resolver settles: each
+    /// decided from what the ticket, the thread, the project's rules or the
+    /// repository already establish, or passed on to the decider. In a
+    /// resolver's brief only, at least one, under the raising run's ids in
+    /// increasing order; never a question of an always-human category, which
+    /// the runner sends to the decider alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolve: Vec<Question>,
     /// Where an interrupted or resumed ticket starts again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Checkpoint>,
@@ -134,6 +142,19 @@ pub enum ThreadEntry {
         author: Author,
         body: String,
     },
+    /// A question a run raised that the resolver decided without the
+    /// decider, in the place of the DECISION comment that logged it. The
+    /// runner writes it from its own record, never from a comment's text, so
+    /// a comment that only looks like a decision stays a `comment`. It
+    /// settles that question and nothing else, and yields to the decider.
+    Decision {
+        at: Timestamp,
+        /// The question as the raising run asked it, under that run's id.
+        question: Question,
+        decision: String,
+        /// What settles it: the ticket, a rule, a file, an earlier answer.
+        basis: String,
+    },
 }
 
 /// Where the ticket starts again: paths relative to the worktree.
@@ -199,15 +220,38 @@ impl Brief {
             | ThreadEntry::Reask {
                 round, questions, ..
             } => Some((*round, questions.as_slice())),
-            ThreadEntry::Comment { .. } => None,
+            ThreadEntry::Comment { .. } | ThreadEntry::Decision { .. } => None,
         })
     }
 
     /// Checks the rules the types alone do not carry: rounds increase through
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
-    /// order, distinct questions of an earlier round.
+    /// order, distinct questions of an earlier round; a resolver's brief has
+    /// questions to `resolve`, in increasing order, and no other brief has
+    /// any.
     pub fn validate(&self) -> Result<(), ContractError> {
-        validate_thread(CONTRACT, &self.thread)
+        validate_thread(CONTRACT, &self.thread)?;
+        match (self.role == Role::Resolver, self.resolve.is_empty()) {
+            (true, true) => Err(ContractError::invalid(
+                CONTRACT,
+                "a resolver's brief has no question to resolve",
+            )),
+            (false, false) => Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "questions to resolve are given but the role is {}, not {}",
+                    self.role.as_str(),
+                    Role::Resolver.as_str()
+                ),
+            )),
+            _ => match first_not_ascending(self.resolve.iter().map(|q| &q.id)) {
+                Some(id) => Err(ContractError::invalid(
+                    CONTRACT,
+                    format!("question {id} to resolve is repeated or out of order"),
+                )),
+                None => Ok(()),
+            },
+        }
     }
 }
 
@@ -278,7 +322,7 @@ pub(crate) fn validate_thread<'a>(
                     ));
                 }
             }
-            ThreadEntry::Comment { .. } => {}
+            ThreadEntry::Comment { .. } | ThreadEntry::Decision { .. } => {}
         }
     }
     Ok(())

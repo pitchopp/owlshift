@@ -187,7 +187,7 @@ impl TryFrom<&PersistedState> for TicketState {
 /// The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each
 /// ask with the comment that posted it, so a brief's thread shows the ask in
 /// that comment's place, and its decider, and what the last answer check
-/// read.
+/// read; and the decisions the resolver took instead of asking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift ticket questions")]
@@ -202,6 +202,45 @@ pub struct TicketQuestions {
     /// judged is never judged again on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_through: Option<Timestamp>,
+    /// The decisions the resolver took on questions of the ticket's runs,
+    /// oldest first, each kept once its DECISION comment was posted (format
+    /// 4), so a brief's thread shows it in that comment's place. Kept apart
+    /// from the asks: a decision has no round and no decider, and must never
+    /// move the latest ask that answers are timed against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<KeptDecision>,
+}
+
+/// A decision the resolver took without the decider, as the ticket ref
+/// keeps it: what the brief's `decision` entry is built from, so only the
+/// runner's own record, never a comment's text, reaches a run as a decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeptDecision {
+    /// When the DECISION comment was posted, as the tracker recorded it.
+    pub at: Timestamp,
+    /// The tracker's identifier of the runner's DECISION comment.
+    #[schemars(regex(pattern = r"\S"))]
+    pub comment: String,
+    /// The question as the raising run asked it, under that run's id.
+    pub question: Question,
+    #[schemars(regex(pattern = r"\S"))]
+    pub decision: String,
+    /// What settles it.
+    #[schemars(regex(pattern = r"\S"))]
+    pub basis: String,
+}
+
+impl KeptDecision {
+    /// The decision as a brief's thread shows it.
+    pub fn entry(&self) -> ThreadEntry {
+        ThreadEntry::Decision {
+            at: self.at,
+            question: self.question.clone(),
+            decision: self.decision.clone(),
+            basis: self.basis.clone(),
+        }
+    }
 }
 
 /// One ask: a round's questions, or the questions of a round asked again.
@@ -278,14 +317,16 @@ impl TicketQuestions {
             format: Format,
             asks: Vec::new(),
             checked_through: None,
+            decisions: Vec::new(),
         }
     }
 
     /// Parses `questions.json`. A format-2 document, written before the
-    /// asks kept their verdicts (OWL-123), is read as format 3 with no
-    /// verdict, and the next write gives it format 3.
+    /// asks kept their verdicts (OWL-123), and a format-3 one, written before
+    /// the resolver's decisions were kept (OWL-138), are read as format 4
+    /// with what they lack empty, and the next write gives them format 4.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let questions: Self = match Self::from_format_2(input) {
+        let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
             None => format::parse_json(Self::CONTRACT, QUESTIONS_FORMAT, input)?,
         };
@@ -293,20 +334,23 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 document read as format 3, or `None` for any other.
-    fn from_format_2(input: &str) -> Option<Result<Self, ContractError>> {
+    /// A format-2 or format-3 document read as format 4, or `None` for any
+    /// other. Each older format is a strict subset of the next.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
-        if document.get("format").and_then(serde_json::Value::as_u64) != Some(2) {
-            return None;
-        }
-        let with_verdicts = document["asks"]
-            .as_array()
-            .is_some_and(|asks| asks.iter().any(|ask| ask.get("verdicts").is_some()));
-        if with_verdicts {
-            return Some(Err(ContractError::invalid(
-                Self::CONTRACT,
-                "format 2 keeps no verdicts",
-            )));
+        let refused = match document.get("format").and_then(serde_json::Value::as_u64) {
+            Some(2) => document["asks"]
+                .as_array()
+                .is_some_and(|asks| asks.iter().any(|ask| ask.get("verdicts").is_some()))
+                .then_some("format 2 keeps no verdicts"),
+            Some(3) => document
+                .get("decisions")
+                .is_some()
+                .then_some("format 3 keeps no decisions"),
+            _ => return None,
+        };
+        if let Some(reason) = refused {
+            return Some(Err(ContractError::invalid(Self::CONTRACT, reason)));
         }
         document["format"] = QUESTIONS_FORMAT.into();
         Some(
@@ -325,8 +369,29 @@ impl TicketQuestions {
     /// comment and its decider's account, its verdicts keep the rules of
     /// `result.json`'s and name questions of that ask, and the asks follow a
     /// brief thread's rules (rounds increase, a round's questions are
-    /// Q1..Qn, a re-ask names questions of an earlier round, in order).
+    /// Q1..Qn, a re-ask names questions of an earlier round, in order); each
+    /// decision names its comment, a decision and a basis, in time order.
     pub fn validate(&self) -> Result<(), ContractError> {
+        for (n, kept) in self.decisions.iter().enumerate() {
+            let missing = if kept.comment.trim().is_empty() {
+                "comment"
+            } else if kept.decision.trim().is_empty() {
+                "decision"
+            } else if kept.basis.trim().is_empty() {
+                "basis"
+            } else if n > 0 && self.decisions[n - 1].at > kept.at {
+                return Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!("decision {} is older than the one before it", n + 1),
+                ));
+            } else {
+                continue;
+            };
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("decision {} names no {missing}", n + 1),
+            ));
+        }
         for ask in &self.asks {
             let missing = if ask.comment.trim().is_empty() {
                 "comment"

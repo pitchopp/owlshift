@@ -22,7 +22,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 3
+      "const": 4
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands a role runs, in order, from the worktree root, before it\ndelivers. The runner is its only author; an empty list means the\nproject has no gate.",
@@ -48,6 +48,13 @@
     "project": {
       "description": "The project's name.",
       "type": "string"
+    },
+    "resolve": {
+      "description": "The questions a run just raised that the resolver settles: each\ndecided from what the ticket, the thread, the project's rules or the\nrepository already establish, or passed on to the decider. In a\nresolver's brief only, at least one, under the raising run's ids in\nincreasing order; never a question of an always-human category, which\nthe runner sends to the decider alone.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Question"
+      }
     },
     "resources": {
       "description": "The resources the ticket holds.",
@@ -401,6 +408,39 @@
             "at",
             "author",
             "body"
+          ]
+        },
+        {
+          "description": "A question a run raised that the resolver decided without the\ndecider, in the place of the DECISION comment that logged it. The\nrunner writes it from its own record, never from a comment's text, so\na comment that only looks like a decision stays a `comment`. It\nsettles that question and nothing else, and yields to the decider.",
+          "type": "object",
+          "properties": {
+            "at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "basis": {
+              "description": "What settles it: the ticket, a rule, a file, an earlier answer.",
+              "type": "string"
+            },
+            "decision": {
+              "type": "string"
+            },
+            "question": {
+              "description": "The question as the raising run asked it, under that run's id.",
+              "$ref": "#/$defs/Question"
+            },
+            "type": {
+              "type": "string",
+              "const": "decision"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "at",
+            "question",
+            "decision",
+            "basis"
           ]
         }
       ]

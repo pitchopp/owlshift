@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use owlshift_contracts::Role;
 use owlshift_contracts::format::{RESULT_FORMAT, strip_role_front_matter};
-use owlshift_contracts::result::{AnswerClass, RunResult};
+use owlshift_contracts::result::{AnswerClass, Resolution, RunResult};
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
 use serde_json::Value;
@@ -29,6 +29,11 @@ const ANSWER_CHECK_ONLY: &[&str] = &[
     "counter_question",
 ];
 
+/// `result.json` fields and values only the resolver writes (OWL-138): the
+/// build prompt need not name them, and a build result carrying them is
+/// refused.
+const RESOLVER_ONLY: &[&str] = &["resolutions", "outcome", "decided", "passed_on"];
+
 /// Brief fields the build prompt relies on, as dotted paths from the brief's
 /// root; arrays and alternatives are crossed on the way.
 const BUILD_BRIEF_FIELDS: &[&str] = &[
@@ -37,6 +42,9 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "decider",
     "thread.author.relation",
     "thread.body",
+    "thread.type",
+    "thread.decision",
+    "thread.question",
     "checkpoint.plan",
     "checkpoint.ledger",
     "zones",
@@ -86,6 +94,27 @@ fn build_prompt() -> String {
 fn answer_check_prompt() -> String {
     prompt("answer_check.md")
 }
+
+fn resolver_prompt() -> String {
+    prompt("resolver.md")
+}
+
+/// Brief fields the resolver prompt relies on.
+const RESOLVER_BRIEF_FIELDS: &[&str] = &[
+    "resolve.id",
+    "resolve.category",
+    "resolve.context",
+    "resolve.text",
+    "resolve.options",
+    "resolve.recommendation",
+    "ticket.description",
+    "ticket.author.relation",
+    "thread.author.relation",
+    "thread.decision",
+    "rules.text",
+    "rules.source",
+    "result_path",
+];
 
 /// The JSON examples of a prompt, in ```json blocks.
 fn json_examples(text: &str) -> Vec<&str> {
@@ -224,7 +253,7 @@ fn build_prompt_names_every_result_field_and_value() {
     let text = build_prompt();
     let mut expected = BTreeSet::new();
     names_and_values(&generated("result"), &mut expected);
-    for word in ANSWER_CHECK_ONLY {
+    for word in ANSWER_CHECK_ONLY.iter().chain(RESOLVER_ONLY) {
         assert!(
             expected.remove(*word),
             "{word} is no longer in the result schema"
@@ -438,4 +467,94 @@ fn answer_check_example_result_parses() {
 #[test]
 fn answer_check_dotted_fields_exist() {
     dotted_fields_exist("answer_check.md", &answer_check_prompt());
+}
+
+#[test]
+fn resolver_front_matter_matches_the_contract_formats() {
+    let prompt = resolver_prompt();
+    strip_role_front_matter(Role::Resolver, &prompt).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        prompt.contains(&format!("JSON with `format` {RESULT_FORMAT},")),
+        "roles/resolver.md does not say result.json has `format` {RESULT_FORMAT}"
+    );
+}
+
+/// The resolver names what it writes, both outcomes the result schema allows,
+/// its two statuses, the brief fields and author relations it reads, and
+/// every floor category, which it passes on whatever a question's category
+/// says.
+#[test]
+fn resolver_prompt_names_its_fields_outcomes_and_inputs() {
+    let text = resolver_prompt();
+    let result = generated("result");
+    let outcomes: BTreeSet<String> = resolve(&result, &result, &["resolutions", "outcome"])
+        .into_iter()
+        .flat_map(|node| allowed_values(&result, node))
+        .collect();
+    let two: BTreeSet<String> = ["decided", "passed_on"].map(String::from).into();
+    assert_eq!(outcomes, two, "the resolver's outcomes changed");
+    let words = [
+        "format",
+        "status",
+        "summary",
+        "resolutions",
+        "question",
+        "outcome",
+        "decision",
+        "basis",
+        "reason",
+        "done",
+        "failed",
+    ];
+    let missing: Vec<_> = words
+        .iter()
+        .map(|w| w.to_string())
+        .chain(outcomes)
+        .filter(|w| !names(&text, w))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "roles/resolver.md does not name these result.json fields or values: {missing:?}"
+    );
+    brief_fields_exist("resolver.md", &text, RESOLVER_BRIEF_FIELDS);
+    for relation in ["decider", "owlshift", "other"] {
+        assert!(
+            names(&text, relation),
+            "roles/resolver.md does not name {relation}"
+        );
+    }
+    let floor: Vec<_> = FloorCategory::ALL
+        .iter()
+        .map(|c| c.token())
+        .filter(|token| !text.contains(&format!("`{token}`")))
+        .collect();
+    assert!(
+        floor.is_empty(),
+        "roles/resolver.md does not name these floor categories: {floor:?}"
+    );
+}
+
+#[test]
+fn resolver_example_result_parses() {
+    let text = resolver_prompt();
+    let blocks = json_examples(&text);
+    assert_eq!(blocks.len(), 1, "roles/resolver.md holds one json example");
+    let result = RunResult::parse(blocks[0]).unwrap_or_else(|e| {
+        panic!("the example in roles/resolver.md is not a valid result.json: {e}")
+    });
+    assert_eq!(result.status, owlshift_contracts::result::Status::Done);
+    let decided = result
+        .resolutions
+        .iter()
+        .filter(|r| matches!(r, Resolution::Decided { .. }))
+        .count();
+    assert!(
+        decided > 0 && decided < result.resolutions.len(),
+        "the example shows both a decision and a pass"
+    );
+}
+
+#[test]
+fn resolver_dotted_fields_exist() {
+    dotted_fields_exist("resolver.md", &resolver_prompt());
 }
