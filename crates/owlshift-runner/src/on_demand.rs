@@ -1304,8 +1304,9 @@ impl OnDemand<'_> {
     }
 
     /// Runs one role through the executor, between the project's marker
-    /// and the events: `run_started`, `run_ended`, and `usage` when the
-    /// harness reported it.
+    /// and the events: `run_started`, a `warning` for each `zone:` label the
+    /// brief leaves out, `run_ended`, and `usage` when the harness reported
+    /// it.
     fn execute(
         &self,
         p: &Prepared,
@@ -1330,6 +1331,22 @@ impl OnDemand<'_> {
                 ("gate_failure", json!(brief.gate_failure.is_some())),
             ]),
         );
+        // The brief leaves a malformed `zone:` label out (`brief` takes the
+        // same labels); the run log says so.
+        let labels = brief.ticket.labels.iter().map(String::as_str);
+        for left_out in brief_zones(labels).left_out {
+            sink.emit(
+                ticket,
+                Some(&run),
+                EventKind::Warning,
+                data([
+                    ("what", json!("zone_label_left_out")),
+                    ("role", json!(brief.role.as_str())),
+                    ("label", json!(left_out.label)),
+                    ("reason", json!(left_out.reason)),
+                ]),
+            );
+        }
         let marker = format!(
             "Run {run} of {ticket} started at {}; its isolation check has not passed.\n",
             Timestamp::now()
@@ -1436,7 +1453,7 @@ impl OnDemand<'_> {
             decider: in_force,
             thread: thread(comments, &asks, current),
             checkpoint: if build { checkpoint(&p.worktree) } else { None },
-            zones: brief_zones(p.found.labels.iter().map(String::as_str)),
+            zones: brief_zones(p.found.labels.iter().map(String::as_str)).zones,
             resources: Vec::new(),
             rules: rules.to_vec(),
             permissions: Permissions {

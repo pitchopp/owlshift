@@ -18,8 +18,10 @@ use crate::Role;
 pub const BRIEF_FORMAT: u32 = 3;
 /// The format version of `result.json`.
 pub const RESULT_FORMAT: u32 = 3;
-/// The format version of an event.
-pub const EVENT_FORMAT: u32 = 1;
+/// The format version of an event. Format 2 added the `warning` kind (OWL-134);
+/// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
+/// still reads the format-1 lines already written.
+pub const EVENT_FORMAT: u32 = 2;
 /// The format version of a claim (`claim.json` on a claim ref).
 pub const CLAIM_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).

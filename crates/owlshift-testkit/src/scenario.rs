@@ -831,7 +831,7 @@ impl Driver {
             decider: decider.clone(),
             thread,
             checkpoint: None,
-            zones: brief_zones(ticket.labels.iter().map(String::as_str)),
+            zones: brief_zones(ticket.labels.iter().map(String::as_str)).zones,
             resources: Vec::new(),
             rules: Vec::new(),
             permissions: Permissions {
