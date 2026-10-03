@@ -7,8 +7,9 @@
 //! core event ([`event`]): the ticket resumes, with a RESUME comment of what
 //! was understood ([`understood`], [`crate::writer::ResumeComment`]), the
 //! questions left open are asked again ([`open_questions`], posted as a RE-ASK comment,
-//! [`crate::writer::ReaskComment`]), or the decider's counter-question waits
-//! for a reply. `owlshift resume` runs it ([`crate::on_demand`]); the test
+//! [`crate::writer::ReaskComment`]), or the decider's counter-question gets
+//! the check's reply ([`counter_replies`], posted as a REPLY comment,
+//! [`crate::writer::ReplyComment`]). `owlshift resume` runs it ([`crate::on_demand`]); the test
 //! bench's stand-in driver plays the same pieces in the scenarios.
 
 use jiff::Timestamp;
@@ -99,6 +100,29 @@ pub fn open_questions(brief: &Brief, verdicts: &[Verdict]) -> Vec<(Question, Ver
                         )
                 })
                 .map(|verdict| (question.clone(), verdict.clone()))
+        })
+        .collect()
+}
+
+/// What a REPLY comment answers ([`crate::writer::ReplyComment`]): the
+/// questions of the brief's latest ask whose verdict is a counter-question,
+/// in question order, each with the reply the check wrote on that verdict.
+/// A valid result has a reply on every counter-question verdict
+/// (`result::RunResult::validate`), so none is left out.
+pub fn counter_replies(brief: &Brief, verdicts: &[Verdict]) -> Vec<(Question, String)> {
+    let Some((_, asked)) = brief.latest_ask() else {
+        return Vec::new();
+    };
+    asked
+        .iter()
+        .filter_map(|question| {
+            verdicts
+                .iter()
+                .find(|verdict| {
+                    verdict.question == question.id && verdict.class == AnswerClass::CounterQuestion
+                })
+                .and_then(|verdict| verdict.reply.clone())
+                .map(|reply| (question.clone(), reply))
         })
         .collect()
 }
@@ -272,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn the_open_questions_are_the_latest_asks_partial_and_unanswered_ones() {
+    fn the_open_questions_and_the_replies_follow_the_latest_asks_verdicts() {
         let question = |id: &str| {
             format!(r#"{{"id":"{id}","category":"scope","context":"c {id}","text":"t {id}"}}"#)
         };
@@ -309,6 +333,31 @@ mod tests {
         assert_eq!(open[0].0.text, "t Q3");
 
         assert!(open_questions(&brief(""), &verdicts).is_empty());
+
+        // A REPLY answers the latest ask's counter-questions, in question
+        // order, each with its own reply, and nothing else.
+        let asked = brief(&format!(
+            r#"{{"type":"questions","round":1,"at":"2026-09-28T09:00:00Z","questions":[{},{},{}]}}"#,
+            question("Q1"),
+            question("Q2"),
+            question("Q3"),
+        ));
+        let verdicts = RunResult::parse(
+            r#"{"format":3,"status":"done","summary":"s","verdicts":[
+                {"question":"Q1","class":"counter_question","reason":"Asks back.","reply":"R1"},
+                {"question":"Q2","class":"unanswered","reason":"Nothing."},
+                {"question":"Q3","class":"counter_question","reason":"Asks back.","reply":"R3"}]}"#,
+        )
+        .unwrap()
+        .verdicts;
+        let replies = counter_replies(&asked, &verdicts);
+        let pairs: Vec<(&str, &str)> = replies
+            .iter()
+            .map(|(q, reply)| (q.id.as_str(), reply.as_str()))
+            .collect();
+        assert_eq!(pairs, [("Q1", "R1"), ("Q3", "R3")]);
+        assert_eq!(replies[1].0.text, "t Q3");
+        assert!(counter_replies(&brief(""), &verdicts).is_empty());
     }
 
     #[test]

@@ -71,8 +71,8 @@ use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
-    DeliveryReport, Gate, ParkedComment, QuestionsComment, ReaskComment, Restart, ResumeComment,
-    Writer, park_reason,
+    DeliveryReport, Gate, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
+    ResumeComment, Writer, park_reason,
 };
 
 /// How long one Build run may take before its process tree is stopped.
@@ -265,10 +265,12 @@ pub enum Stop {
         /// The questions asked again, each with the answer check's verdict.
         open: Vec<(Question, AnswerVerdict)>,
     },
-    /// The decider asked a counter-question instead of answering; the
-    /// verdicts that say so.
+    /// The decider asked a counter-question instead of answering: the
+    /// verdicts that say so, each with its reply, and the REPLY comment
+    /// that posted them on the ticket.
     CounterQuestion {
         ticket: TicketId,
+        replied: String,
         asked: Vec<AnswerVerdict>,
     },
     /// The answer check failed; it runs again on the same answers.
@@ -373,15 +375,26 @@ impl fmt::Display for Stop {
                     "Once the decider answers on the ticket, run `owlshift resume {ticket}` again."
                 )
             }
-            Self::CounterQuestion { ticket, asked } => {
-                writeln!(f, "The decider asked back instead of answering:")?;
+            Self::CounterQuestion {
+                ticket,
+                replied,
+                asked,
+            } => {
+                writeln!(
+                    f,
+                    "The decider asked back instead of answering; the reply is on the ticket \
+                     (comment {replied}):"
+                )?;
                 for verdict in asked {
                     writeln!(f, "{}: {}", verdict.question, verdict.reason)?;
+                    if let Some(reply) = &verdict.reply {
+                        writeln!(f, "Reply: {reply}")?;
+                    }
                 }
                 write!(
                     f,
-                    "Reply on the ticket (Owlshift does not reply yet); once the decider comments \
-                     again, run `owlshift resume {ticket}` to check the answers."
+                    "Once the decider comments again, run `owlshift resume {ticket}` to check the \
+                     answers."
                 )
             }
             Self::CheckFailed { ticket, detail } => write!(
@@ -914,7 +927,8 @@ impl OnDemand<'_> {
 
     /// Runs the answer check once the decider has answered, and acts on its
     /// one core event: the ticket resumes (the state returned), its open
-    /// questions are asked again, the counter-question waits for a reply, or
+    /// questions are asked again, the counter-question gets the check's
+    /// reply and the ticket keeps waiting, or
     /// it parks (a stop). A failed or interrupted check moves nothing the
     /// next one reads, so it is retried on the same answers.
     fn check_answers(
@@ -1095,8 +1109,38 @@ impl OnDemand<'_> {
                 })
             }
             Event::CounterQuestion => {
-                self.store(p, &next, questions)
-                    .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
+                // The REPLY before the state is kept, as a RE-ASK: when the
+                // post fails, nothing of this check is kept and the next
+                // `resume` checks the same answers again. The ticket keeps
+                // waiting; nothing is asked again.
+                let replies = answer_check::counter_replies(&brief, &verdicts);
+                if replies.is_empty() {
+                    // A valid result has a reply on every counter-question
+                    // verdict, so this is a check of no question asked.
+                    return Err(Stop::Refused(
+                        "the answer check found a counter-question but no reply to post".to_owned(),
+                    ));
+                }
+                let reply = ReplyComment {
+                    ticket: ticket.clone(),
+                    replies,
+                };
+                let posted = Writer::new(self.tracker)
+                    .post_reply(&reply)
+                    .map_err(|e| refused("posting the reply on the ticket", e))?;
+                sink.emit(
+                    &ticket,
+                    Some(&ran.run),
+                    EventKind::TrackerWrite,
+                    comment_written("REPLY", &posted),
+                );
+                self.store(p, &next, questions).map_err(|e| {
+                    Stop::Refused(format!(
+                        "the reply is on the ticket (comment {}), but keeping the check in the \
+                         ticket's ref failed: {e}",
+                        posted.id
+                    ))
+                })?;
                 sink.emit(
                     &ticket,
                     Some(&ran.run),
@@ -1105,6 +1149,7 @@ impl OnDemand<'_> {
                 );
                 Err(Stop::CounterQuestion {
                     ticket,
+                    replied: posted.id,
                     asked: verdicts
                         .into_iter()
                         .filter(|verdict| verdict.class == AnswerClass::CounterQuestion)

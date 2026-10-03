@@ -1222,7 +1222,7 @@ fn shape(brief: &Brief) -> Vec<String> {
 
 /// P2 through the shipped commands (OWL-122): `do` posts a round's
 /// questions; `resume` waits for an answer, re-asks what an incomplete one
-/// left open, waits again after a counter-question, then checks a complete
+/// left open, replies to a counter-question and waits again, then checks a complete
 /// answer and runs Build to a delivery.
 #[test]
 fn a_question_round_goes_through_resume_to_a_delivery() {
@@ -1312,18 +1312,57 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     assert_eq!((record.state.round, record.state.reasks), (1, 1));
     assert_eq!(record.questions.asks.len(), 2);
 
-    // A counter-question: nothing is posted or counted, and the next
-    // `resume` waits for a newer comment.
+    // A counter-question: a REPLY carries the check's reply, nothing is
+    // re-asked or counted, no Build runs, and the next `resume` waits for a
+    // newer comment of the decider's. A REPLY the tracker refused keeps
+    // nothing of the check, so the next `resume` checks the same answer.
     bench.answer("Q2: what is a sign-off?\n");
     let counter = check(&[("Q2", "counter_question", "Asks what a sign-off is.")]);
-    let (asked_back, _) = bench.resume(vec![bench.reply(None, Some(&counter))]);
+    bench.refuse.set(Some("[owlshift] REPLY"));
+    let (refused, _) = bench.resume(vec![bench.reply(None, Some(&counter))]);
     assert!(
-        matches!(&asked_back, Err(Stop::CounterQuestion { asked, .. }) if asked.len() == 1),
-        "{asked_back:?}"
+        matches!(&refused, Err(Stop::Refused(why)) if why.contains("posting the reply on the ticket")),
+        "{refused:?}"
     );
-    assert_eq!(latest_ask(&bench.briefs().pop().unwrap()), ["Q2"]);
+    let record = bench.record();
+    assert_eq!(record.questions.asks.len(), 2);
+    assert!(record.questions.asks[1].verdicts.is_empty());
     assert_eq!(bench.comments().len(), 4);
-    assert_eq!(bench.record().state.reasks, 1);
+    bench.refuse.set(None);
+    let (asked_back, _) = bench.resume(vec![bench.reply(None, Some(&counter))]);
+    let stop = asked_back.expect_err("a counter-question waits");
+    assert!(
+        matches!(&stop, Stop::CounterQuestion { asked, .. } if asked.len() == 1),
+        "{stop:?}"
+    );
+    let printed = stop.to_string();
+    assert!(
+        printed.contains("the reply is on the ticket (comment")
+            && printed.contains("Reply: A sign-off is a closing line. Should there be one?")
+            && !printed.contains("does not reply yet"),
+        "{printed}"
+    );
+    let check_brief = bench.briefs().pop().unwrap();
+    assert_eq!(check_brief.role, Role::AnswerCheck, "no Build ran");
+    assert_eq!(latest_ask(&check_brief), ["Q2"]);
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 5, "{comments:?}");
+    let reply = &comments[4];
+    assert!(reply.starts_with("[owlshift] REPLY\n"), "{reply}");
+    assert!(
+        reply.contains(
+            "**Q2** (scope) What should the greeting say, and should it end with a sign-off?\n\
+             Reply: A sign-off is a closing line. Should there be one?"
+        ),
+        "{reply}"
+    );
+    assert!(reply.contains("`owlshift resume DEMO-1`"), "{reply}");
+    let record = bench.record();
+    assert_eq!(
+        (record.state.waiting, record.state.reasks),
+        (Some(Waiting::NeedsInput), 1)
+    );
+    assert_eq!(record.questions.asks.len(), 2);
     let (waiting, _) = bench.resume(Vec::new());
     assert!(matches!(&waiting, Err(Stop::Waiting { .. })), "{waiting:?}");
 
@@ -1337,7 +1376,23 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
         bench.reply(Some("Hello"), Some(DONE)),
     ]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let build = bench.briefs().pop().unwrap();
+    // The REPLY reads as Owlshift's in the thread, before the answer it
+    // led to.
+    let mut briefs = bench.briefs();
+    let build = briefs.pop().unwrap();
+    let last_check = briefs.pop().unwrap();
+    assert_eq!(last_check.role, Role::AnswerCheck);
+    assert_eq!(
+        shape(&last_check),
+        [
+            "questions",
+            "Decider",
+            "reask",
+            "Decider",
+            "Owlshift",
+            "Decider"
+        ]
+    );
     assert_eq!(build.role, Role::Build);
     assert_eq!(
         shape(&build),
@@ -1346,14 +1401,15 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
             "Decider",
             "reask",
             "Decider",
+            "Owlshift",
             "Decider",
             "Owlshift"
         ]
     );
     assert_eq!(latest_ask(&build), ["Q2"]);
     let comments = bench.comments();
-    assert_eq!(comments.len(), 7, "{comments:?}");
-    let resume = &comments[5];
+    assert_eq!(comments.len(), 8, "{comments:?}");
+    let resume = &comments[6];
     assert!(
         resume.starts_with("[owlshift] RESUME · round 1\n"),
         "{resume}"
@@ -1364,7 +1420,7 @@ fn a_question_round_goes_through_resume_to_a_delivery() {
     ] {
         assert!(resume.contains(text), "{text}\n{resume}");
     }
-    assert!(comments[6].starts_with("[owlshift] DELIVERY"));
+    assert!(comments[7].starts_with("[owlshift] DELIVERY"));
     let record = bench.record();
     assert_eq!((record.state.waiting, record.state.reasks), (None, 0));
 
