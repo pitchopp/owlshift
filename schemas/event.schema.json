@@ -16,7 +16,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "kind": {
       "$ref": "#/$defs/EventKind"

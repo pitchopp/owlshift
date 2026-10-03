@@ -587,6 +587,20 @@ fn event_claim_and_state_rejections() {
         "invalid type",
     );
 
+    // The log is append-only: a line of format 1 still reads, as format 2.
+    let old = Event::parse(&edited("event.json", |v| v["format"] = json!(1))).unwrap();
+    assert_eq!(old, Event::parse(&fixture("event.json")).unwrap());
+    rejects(
+        "newer event",
+        event(|v| v["format"] = json!(3)),
+        "upgrade Owlshift",
+    );
+    rejects(
+        "unknown event format",
+        event(|v| v["format"] = json!(0)),
+        "unknown format 0",
+    );
+
     let claim = |edit: fn(&mut Value)| Claim::parse(&edited("claim.json", edit));
     rejects(
         "unknown claim field",
