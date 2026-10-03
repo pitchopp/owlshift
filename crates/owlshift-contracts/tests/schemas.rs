@@ -74,10 +74,11 @@ fn committed_schemas_match_the_types() {
 
 #[test]
 fn fixtures_validate_against_the_committed_schemas() {
-    let cases: [(&str, &str); 11] = [
+    let cases: [(&str, &str); 12] = [
         ("result", "result-sample.json"),
         ("result", "result-answer-check.json"),
         ("result", "result-counter-question.json"),
+        ("result", "result-resolver.json"),
         ("brief", "brief.json"),
         ("event", "event.json"),
         ("claim", "claim.json"),
@@ -106,7 +107,7 @@ fn fixtures_validate_against_the_committed_schemas() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
-    let base = |status: &str| json!({ "format": 3, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 4, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -120,10 +121,58 @@ fn result_schema_carries_the_expressible_rules() {
     pr_done["status"] = json!("done");
     assert!(validator.is_valid(&pr_done));
 
-    for format in [1, 2, 4] {
+    for format in [1, 2, 3, 5] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
+    }
+
+    // Resolutions go with `done` only; a decision carries a decision and a
+    // basis, a pass a reason, none of them blank; schema and type agree.
+    let parse_ok = |instance: &Value| {
+        owlshift_contracts::result::RunResult::parse(&instance.to_string()).is_ok()
+    };
+    for (resolution, done, valid) in [
+        (
+            json!({ "outcome": "decided", "question": "Q1", "decision": "d", "basis": "b" }),
+            true,
+            true,
+        ),
+        (
+            json!({ "outcome": "decided", "question": "Q1", "decision": "d", "basis": "b" }),
+            false,
+            false,
+        ),
+        (
+            json!({ "outcome": "decided", "question": "Q1", "decision": "d", "basis": " " }),
+            true,
+            false,
+        ),
+        (
+            json!({ "outcome": "decided", "question": "Q1", "decision": "d" }),
+            true,
+            false,
+        ),
+        (
+            json!({ "outcome": "passed_on", "question": "Q1", "reason": "r" }),
+            true,
+            true,
+        ),
+        (
+            json!({ "outcome": "passed_on", "question": "Q1", "reason": "r", "basis": "b" }),
+            true,
+            false,
+        ),
+        (json!({ "question": "Q1", "reason": "r" }), true, false),
+    ] {
+        let mut result = base(if done { "done" } else { "failed" });
+        result["resolutions"] = json!([resolution.clone()]);
+        assert_eq!(
+            validator.is_valid(&result),
+            valid,
+            "schema: {resolution} {done}"
+        );
+        assert_eq!(parse_ok(&result), valid, "type: {resolution} {done}");
     }
 
     // Verdicts go with `done` only, each with a reason that is not blank.

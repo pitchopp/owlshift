@@ -20,8 +20,10 @@ const CONTRACT: &str = "result.json";
 /// Beyond this schema, the runner also requires question ids to be Q1, Q2, …
 /// Qn in order; verdicts in increasing question order, each with a reason
 /// that is not only whitespace and, on a counter-question and nowhere else,
-/// a reply that is not either; and, against the run's brief, verdicts from the
-/// answer check only, covering exactly its latest ask.
+/// a reply that is not either; resolutions in increasing question order; and,
+/// against the run's brief, verdicts from the answer check only, covering
+/// exactly its latest ask, and resolutions from the resolver only, covering
+/// exactly the questions it was given.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift result.json", transform = result_invariants)]
@@ -52,6 +54,10 @@ pub struct RunResult {
     /// done`.
     #[serde(default)]
     pub verdicts: Vec<Verdict>,
+    /// The resolver's outcome on each question of its brief's `resolve`, in
+    /// question order; only from the resolver, and only with `status: done`.
+    #[serde(default)]
+    pub resolutions: Vec<Resolution>,
 }
 
 /// How a run ended.
@@ -103,6 +109,41 @@ pub struct Verdict {
     )]
     #[schemars(with = "String", regex(pattern = r"\S"))]
     pub reply: Option<String>,
+}
+
+/// The resolver's outcome on one question it was given: decided, with the
+/// decision and what settles it, or passed on to the decider, with why.
+/// Every text is not empty and not only whitespace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Resolution {
+    /// Settled by what the ticket, the thread, the project's rules or the
+    /// repository already establish; the runner logs it on the ticket as a
+    /// reversible decision.
+    Decided {
+        question: QuestionId,
+        #[schemars(regex(pattern = r"\S"))]
+        decision: String,
+        /// What settles it: the ticket, a rule, a file, an earlier answer.
+        #[schemars(regex(pattern = r"\S"))]
+        basis: String,
+    },
+    /// Not settled by anything the resolver may rely on: the question goes
+    /// to the decider.
+    PassedOn {
+        question: QuestionId,
+        #[schemars(regex(pattern = r"\S"))]
+        reason: String,
+    },
+}
+
+impl Resolution {
+    /// The question it resolves.
+    pub fn question(&self) -> &QuestionId {
+        match self {
+            Self::Decided { question, .. } | Self::PassedOn { question, .. } => question,
+        }
+    }
 }
 
 /// A field that may be left out but, when present, is a string: `null` is
@@ -206,7 +247,14 @@ impl RunResult {
                 "verdicts are given but status is not done",
             ));
         }
-        check_verdicts(CONTRACT, &self.verdicts)
+        if !self.resolutions.is_empty() && self.status != Status::Done {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                "resolutions are given but status is not done",
+            ));
+        }
+        check_verdicts(CONTRACT, &self.verdicts)?;
+        check_resolutions(&self.resolutions)
     }
 
     /// Checks the rules that need the brief of the run: verdicts come from
@@ -220,6 +268,7 @@ impl RunResult {
     /// questions are then both in increasing order, so the same ids make the
     /// same sequence.
     pub fn validate_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        self.resolutions_against(brief)?;
         if brief.role != Role::AnswerCheck {
             if !self.verdicts.is_empty() {
                 return Err(ContractError::invalid(
@@ -266,6 +315,87 @@ impl RunResult {
         }
         Ok(())
     }
+
+    /// Resolutions come from the resolver only, and a `done` resolver gives
+    /// one for each question of its brief's `resolve`, no more: a decision on
+    /// a question it was not given, such as one of an always-human category,
+    /// is refused.
+    fn resolutions_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        if brief.role != Role::Resolver {
+            if self.resolutions.is_empty() {
+                return Ok(());
+            }
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "resolutions are given but the run's role is {}, not {}",
+                    brief.role.as_str(),
+                    Role::Resolver.as_str()
+                ),
+            ));
+        }
+        if self.status != Status::Done {
+            return Ok(());
+        }
+        if let Some(resolution) = self
+            .resolutions
+            .iter()
+            .find(|r| !brief.resolve.iter().any(|q| q.id == *r.question()))
+        {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "the resolution of {} names a question the resolver was not given",
+                    resolution.question()
+                ),
+            ));
+        }
+        if let Some(question) = brief
+            .resolve
+            .iter()
+            .find(|q| !self.resolutions.iter().any(|r| *r.question() == q.id))
+        {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!("no resolution for {}", question.id),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The rules of the resolver's resolutions: in increasing question order,
+/// each text not only whitespace.
+fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
+    if let Some(id) = first_not_ascending(resolutions.iter().map(Resolution::question)) {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            format!("the resolution of {id} is repeated or out of order"),
+        ));
+    }
+    for resolution in resolutions {
+        let blank = match resolution {
+            Resolution::Decided {
+                decision, basis, ..
+            } => {
+                if decision.trim().is_empty() {
+                    Some("decision")
+                } else if basis.trim().is_empty() {
+                    Some("basis")
+                } else {
+                    None
+                }
+            }
+            Resolution::PassedOn { reason, .. } => reason.trim().is_empty().then_some("reason"),
+        };
+        if let Some(field) = blank {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!("the resolution of {} has no {field}", resolution.question()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The first id not greater than the one before it: repeated or out of
@@ -338,7 +468,7 @@ pub(crate) fn check_question_order(
     Ok(())
 }
 
-/// Adds to the schema the three rules of [`RunResult::validate`] that JSON
+/// Adds to the schema the four rules of [`RunResult::validate`] that JSON
 /// Schema can express.
 fn result_invariants(schema: &mut Schema) {
     let rules = json!([
@@ -352,6 +482,10 @@ fn result_invariants(schema: &mut Schema) {
         },
         {
             "if": { "properties": { "verdicts": { "minItems": 1 } }, "required": ["verdicts"] },
+            "then": { "properties": { "status": { "const": "done" } } }
+        },
+        {
+            "if": { "properties": { "resolutions": { "minItems": 1 } }, "required": ["resolutions"] },
             "then": { "properties": { "status": { "const": "done" } } }
         }
     ]);

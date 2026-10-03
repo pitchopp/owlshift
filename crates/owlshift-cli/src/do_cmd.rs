@@ -20,7 +20,7 @@ use owlshift_runner::events::{EventLog, EventSink, printable};
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
-use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE};
+use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE, RESOLVER_ROLE};
 use owlshift_runner::system::System;
 use owlshift_runner::{forge, tracker};
 
@@ -110,6 +110,8 @@ fn run_with(
         .map_err(|error| format!("the built-in build role: {error}"))?;
     let check_prompt = strip_role_front_matter(Role::AnswerCheck, ANSWER_CHECK_ROLE)
         .map_err(|error| format!("the built-in answer-check role: {error}"))?;
+    let resolver_prompt = strip_role_front_matter(Role::Resolver, RESOLVER_ROLE)
+        .map_err(|error| format!("the built-in resolver role: {error}"))?;
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
@@ -155,6 +157,10 @@ fn run_with(
         prompt: check_prompt,
         ..harness.clone()
     };
+    let resolver = ClaudeHarness {
+        prompt: resolver_prompt,
+        ..harness.clone()
+    };
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let on_demand = OnDemand {
@@ -163,6 +169,7 @@ fn run_with(
         forge: &forge,
         build: &harness,
         answer_check: &check,
+        resolver: &resolver,
         remote_url: &remote_url,
         config: project,
         dirs: &dirs,

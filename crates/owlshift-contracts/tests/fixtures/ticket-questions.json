@@ -1,5 +1,5 @@
 {
-  "format": 3,
+  "format": 4,
   "asks": [
     {
       "kind": "questions",
@@ -50,5 +50,19 @@
       }
     }
   ],
-  "checked_through": "2026-09-28T11:00:00Z"
+  "checked_through": "2026-09-28T11:00:00Z",
+  "decisions": [
+    {
+      "at": "2026-09-28T08:59:00Z",
+      "comment": "c-decision-1",
+      "question": {
+        "id": "Q3",
+        "category": "naming",
+        "context": "The repository holds a README.md and nothing else at its root.",
+        "text": "What should the greeting file be called?"
+      },
+      "decision": "GREETING.md, at the repository root.",
+      "basis": "The ticket's description names GREETING.md."
+    }
+  ]
 }

@@ -13,6 +13,7 @@ pub mod forge;
 pub mod init;
 pub mod on_demand;
 pub mod project;
+pub mod resolver;
 pub mod roles;
 pub mod rules;
 pub mod system;
