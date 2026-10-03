@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use owlshift_contracts::brief::ToResolve;
 use owlshift_contracts::ids::QuestionId;
 use owlshift_contracts::refs::KeptDecision;
 use owlshift_contracts::result::{Decision, Question, Resolution, Status};
@@ -52,6 +53,14 @@ pub fn route(policy: &GatePolicy, questions: &[Question]) -> Routed {
         }
     }
     routed
+}
+
+/// The questions as the resolver's brief lists them, without the category
+/// the raising run gave them (OWL-144): the resolver labels each question it
+/// decides from its text and context, so its label is its own reading and
+/// not a copy of the one [`decisions`] checks it against.
+pub fn unlabelled(questions: &[Question]) -> Vec<ToResolve> {
+    questions.iter().map(ToResolve::from).collect()
 }
 
 /// Why the questions meant for the resolver went to the decider; the
@@ -124,6 +133,7 @@ pub fn decisions<'a>(
                 question,
                 decision,
                 basis,
+                ..
             } => given
                 .iter()
                 .find(|asked| asked.id == *question)
@@ -245,6 +255,7 @@ mod tests {
         ];
         let decided = |id: &str| Resolution::Decided {
             question: QuestionId::new(id).unwrap(),
+            category: "naming".into(),
             decision: format!("decision on {id}"),
             basis: "the ticket".into(),
         };
@@ -307,7 +318,7 @@ mod tests {
         let finished = |status: &str| Outcome::Finished {
             result: Box::new(
                 RunResult::parse(&format!(
-                    r#"{{"format":4,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":5,"status":"{status}","summary":"s"}}"#
                 ))
                 .unwrap(),
             ),

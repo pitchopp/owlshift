@@ -229,10 +229,15 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(5);
+            v["format"] = json!(6);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 4, before a decision carried the resolver's category",
+        parse(|v| v["format"] = json!(4)),
+        "unknown format 4",
     );
     rejects(
         "format 3, before result.json carried resolutions",
@@ -268,20 +273,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 5, "status""#),
+        RunResult::parse(r#"{"format": 6, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 4, "status""#),
+        RunResult::parse(r#"{"format": 5, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(5));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(6));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 5,
-            supported: 4,
+            found: 6,
+            supported: 5,
             ..
         })
     ));
@@ -454,13 +459,14 @@ fn result_against_the_brief() {
         .unwrap();
 }
 
-/// The resolver's brief carries the questions it settles, and its result one
+/// The resolver's brief carries the questions it settles, without the
+/// category the raising run gave them (OWL-144), and its result one
 /// resolution for each of them, no more (OWL-138): a decision on a question
 /// it was not given, such as an always-human one the runner kept from it, is
 /// refused.
 #[test]
 fn resolutions_against_the_brief() {
-    let question = |id: &str, category: &str| json!({ "id": id, "category": category, "context": "c", "text": "t" });
+    let question = |id: &str| json!({ "id": id, "context": "c", "text": "t" });
     let resolver = |resolve: Value| {
         Brief::parse(
             &edited("brief.json", |v| {
@@ -473,7 +479,7 @@ fn resolutions_against_the_brief() {
             ),
         )
     };
-    let given = resolver(json!([question("Q1", "naming"), question("Q3", "testing")])).unwrap();
+    let given = resolver(json!([question("Q1"), question("Q3")])).unwrap();
     assert_eq!(given.resolve.len(), 2);
     let resolved =
         |edit: fn(&mut Value)| RunResult::parse(&edited("result-resolver.json", edit)).unwrap();
@@ -513,14 +519,18 @@ fn resolutions_against_the_brief() {
     );
     rejects(
         "questions to resolve out of order",
-        resolver(json!([question("Q3", "naming"), question("Q1", "naming")])),
+        resolver(json!([question("Q3"), question("Q1")])),
         "question Q1 to resolve is repeated or out of order",
+    );
+    rejects(
+        "a question to resolve with the raising run's category",
+        resolver(json!([{ "id": "Q1", "category": "naming", "context": "c", "text": "t" }])),
+        "unknown field `category`",
     );
     rejects(
         "questions to resolve in a build brief",
         Brief::parse(&edited("brief.json", |v| {
-            v["resolve"] =
-                json!([{ "id": "Q1", "category": "naming", "context": "c", "text": "t" }]);
+            v["resolve"] = json!([{ "id": "Q1", "context": "c", "text": "t" }]);
         })),
         "questions to resolve are given but the role is build, not resolver",
     );
@@ -537,6 +547,24 @@ fn resolutions_against_the_brief() {
         parse(|v| v["resolutions"][1]["question"] = json!("Q1")),
         "the resolution of Q1 is repeated or out of order",
     );
+    rejects(
+        "a decision without the resolver's category",
+        parse(|v| {
+            v["resolutions"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("category");
+        }),
+        "missing field `category`",
+    );
+    // The label's form is the runner's to judge, per question
+    // (`GatePolicy::route_decided`): any string parses.
+    for category in ["", "Data-Loss", "sécurité"] {
+        let input = edited("result-resolver.json", |v| {
+            v["resolutions"][0]["category"] = json!(category);
+        });
+        RunResult::parse(&input).unwrap_or_else(|e| panic!("{category:?}: {e}"));
+    }
     rejects(
         "a decision without a basis",
         parse(|v| v["resolutions"][0]["basis"] = json!("  ")),
@@ -649,8 +677,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(5)),
+        parse(|v| v["format"] = json!(6)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 4, before the questions to resolve left out their category",
+        parse(|v| v["format"] = json!(4)),
+        "unknown format 4",
     );
     rejects(
         "format 3, before the brief carried decisions and questions to resolve",

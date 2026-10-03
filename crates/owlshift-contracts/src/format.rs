@@ -15,11 +15,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::Role;
 
 /// The format version of the brief. Format 4 added the resolver's `resolve`
-/// field and the thread's `decision` entries (OWL-138).
-pub const BRIEF_FORMAT: u32 = 4;
+/// field and the thread's `decision` entries (OWL-138); format 5 leaves the
+/// raising run's category out of `resolve` (OWL-144).
+pub const BRIEF_FORMAT: u32 = 5;
 /// The format version of `result.json`. Format 4 added the resolver's
-/// `resolutions` (OWL-138).
-pub const RESULT_FORMAT: u32 = 4;
+/// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
+/// decision (OWL-144).
+pub const RESULT_FORMAT: u32 = 5;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.

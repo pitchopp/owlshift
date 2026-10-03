@@ -983,7 +983,7 @@ impl Driver {
             decider: decider.clone(),
             thread,
             resolve: if role == Role::Resolver {
-                self.resolving.clone()
+                resolver::unlabelled(&self.resolving)
             } else {
                 Vec::new()
             },

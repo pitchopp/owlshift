@@ -1108,7 +1108,7 @@ impl OnDemand<'_> {
 
         let comments = self.comments(&ticket)?;
         let mut brief = self.brief(p, Role::Resolver, &comments, rules, None, current);
-        brief.resolve.clone_from(&routed.to_resolver);
+        brief.resolve = resolver::unlabelled(&routed.to_resolver);
         let executor = Executor {
             timeout: resolver::RESOLVER_TIMEOUT,
             ..self.executor.clone()

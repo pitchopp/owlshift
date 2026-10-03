@@ -11,6 +11,8 @@ use owlshift_contracts::format::{RESULT_FORMAT, strip_role_front_matter};
 use owlshift_contracts::result::{AnswerClass, Resolution, RunResult};
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
+use owlshift_core::gate::{GatePolicy, Route};
+use owlshift_core::vocab::PlanApproval;
 use serde_json::Value;
 
 /// The line budget of the build prompt, which the harness re-reads every run.
@@ -102,7 +104,6 @@ fn resolver_prompt() -> String {
 /// Brief fields the resolver prompt relies on.
 const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "resolve.id",
-    "resolve.category",
     "resolve.context",
     "resolve.text",
     "resolve.options",
@@ -500,6 +501,7 @@ fn resolver_prompt_names_its_fields_outcomes_and_inputs() {
         "resolutions",
         "question",
         "outcome",
+        "category",
         "decision",
         "basis",
         "reason",
@@ -552,6 +554,18 @@ fn resolver_example_result_parses() {
         decided > 0 && decided < result.resolutions.len(),
         "the example shows both a decision and a pass"
     );
+    // The example's labels are ones the runner lets stand: a token, outside
+    // the floor.
+    let policy = GatePolicy::new(Vec::<String>::new(), PlanApproval::Never);
+    for resolution in &result.resolutions {
+        if let Resolution::Decided { category, .. } = resolution {
+            assert_eq!(
+                policy.route_decided("naming", category),
+                Route::Resolver,
+                "the example labels a decision {category:?}"
+            );
+        }
+    }
 }
 
 #[test]

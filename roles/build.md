@@ -1,7 +1,7 @@
 +++
 role = "build"
-brief_format = 4
-result_format = 4
+brief_format = 5
+result_format = 5
 +++
 
 # Build
@@ -63,7 +63,7 @@ After your `done`, the runner runs `gate` itself, on your last commit, and a red
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 4, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 5, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: every step committed, the gate green. Give `pr`: `branch` (the worktree's branch), `title` (imperative, per `rules`), `body` (what changed, why, the gate commands you ran and their result).
 - `questions`: at least one question; the run resumes after the decider answers.
@@ -75,7 +75,7 @@ Your last action is writing `result.json` at `result_path`, whatever the outcome
 
 ```json
 {
-  "format": 4,
+  "format": 5,
   "status": "done",
   "summary": "Added the logs command with its tests; the gate passes.",
   "questions": [],
