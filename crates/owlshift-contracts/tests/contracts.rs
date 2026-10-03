@@ -14,7 +14,7 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
     AskKind, Claim, PersistedState, TicketQuestions, claim_ref, ticket_ref,
 };
-use owlshift_contracts::result::{AnswerClass, RunResult, Status};
+use owlshift_contracts::result::{AnswerClass, Resolution, RunResult, Status};
 use serde_json::{Value, json};
 
 /// Artifact paths that could leave the worktree, on any platform.
@@ -118,7 +118,20 @@ fn every_contract_round_trips() {
             .is_some_and(|reply| reply.starts_with("\"Local\" is the reader's"))
     );
 
-    round_trip("brief.json", Brief::parse, Brief::render);
+    let resolved = round_trip("result-resolver.json", RunResult::parse, RunResult::render);
+    assert!(matches!(
+        &resolved.resolutions[..],
+        [Resolution::Decided { .. }, Resolution::PassedOn { .. }]
+    ));
+    assert_eq!(resolved.resolutions[1].question().as_str(), "Q3");
+
+    let brief = round_trip("brief.json", Brief::parse, Brief::render);
+    assert!(matches!(
+        brief.thread.last(),
+        Some(ThreadEntry::Decision { question, .. }) if question.category == "naming"
+    ));
+    // A decision is not an ask: the latest ask is still the re-ask of Q2.
+    assert_eq!(brief.latest_ask().map(|(_, q)| q.len()), Some(1));
     let event = round_trip("event.json", Event::parse, Event::render);
     // One line of the event log reads back as the same event.
     let line = event.render_line();
@@ -142,6 +155,15 @@ fn every_contract_round_trips() {
     ));
     assert_eq!(asked.asks[0].verdicts[1].class, AnswerClass::Partial);
     assert!(asked.asks[1].verdicts.is_empty());
+    assert!(matches!(
+        asked.decisions[0].entry(),
+        ThreadEntry::Decision { decision, .. } if decision.starts_with("GREETING.md")
+    ));
+    // A kept decision never moves the time answers are measured against.
+    assert_eq!(
+        asked.answers_after(),
+        Some("2026-09-28T11:00:00Z".parse().unwrap())
+    );
     round_trip("footer.json", Footer::parse_payload, |f| {
         serde_json::to_string(f).unwrap()
     });
@@ -207,10 +229,15 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(4);
+            v["format"] = json!(5);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 3, before result.json carried resolutions",
+        parse(|v| v["format"] = json!(3)),
+        "unknown format 3",
     );
     rejects(
         "format 2, before a verdict carried its reply",
@@ -241,20 +268,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 4, "status""#),
+        RunResult::parse(r#"{"format": 5, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 3, "status""#),
+        RunResult::parse(r#"{"format": 4, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(4));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(5));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 4,
-            supported: 3,
+            found: 5,
+            supported: 4,
             ..
         })
     ));
@@ -427,6 +454,111 @@ fn result_against_the_brief() {
         .unwrap();
 }
 
+/// The resolver's brief carries the questions it settles, and its result one
+/// resolution for each of them, no more (OWL-138): a decision on a question
+/// it was not given, such as an always-human one the runner kept from it, is
+/// refused.
+#[test]
+fn resolutions_against_the_brief() {
+    let question = |id: &str, category: &str| json!({ "id": id, "category": category, "context": "c", "text": "t" });
+    let resolver = |resolve: Value| {
+        Brief::parse(
+            &edited("brief.json", |v| {
+                v["role"] = json!("resolver");
+                v["permissions"]["level"] = json!("read_only");
+            })
+            .replace(
+                "\"role\":\"resolver\"",
+                &format!("\"role\":\"resolver\",\"resolve\":{resolve}"),
+            ),
+        )
+    };
+    let given = resolver(json!([question("Q1", "naming"), question("Q3", "testing")])).unwrap();
+    assert_eq!(given.resolve.len(), 2);
+    let resolved =
+        |edit: fn(&mut Value)| RunResult::parse(&edited("result-resolver.json", edit)).unwrap();
+    resolved(|_| {}).validate_against(&given).unwrap();
+    rejects(
+        "a decision on a question the resolver was not given",
+        resolved(|v| v["resolutions"][1]["question"] = json!("Q2")).validate_against(&given),
+        "the resolution of Q2 names a question the resolver was not given",
+    );
+    rejects(
+        "a question left without a resolution",
+        resolved(|v| {
+            v["resolutions"].as_array_mut().unwrap().pop();
+        })
+        .validate_against(&given),
+        "no resolution for Q3",
+    );
+    // A resolver that did not finish resolves nothing, and needs not.
+    resolved(|v| {
+        v["status"] = json!("failed");
+        v["resolutions"] = json!([]);
+    })
+    .validate_against(&given)
+    .unwrap();
+    rejects(
+        "resolutions from the build role",
+        resolved(|_| {}).validate_against(&Brief::parse(&fixture("brief.json")).unwrap()),
+        "resolutions are given but the run's role is build, not resolver",
+    );
+
+    // The brief: questions to resolve in a resolver's brief only, at least
+    // one, in increasing order.
+    rejects(
+        "a resolver's brief with nothing to resolve",
+        resolver(json!([])),
+        "a resolver's brief has no question to resolve",
+    );
+    rejects(
+        "questions to resolve out of order",
+        resolver(json!([question("Q3", "naming"), question("Q1", "naming")])),
+        "question Q1 to resolve is repeated or out of order",
+    );
+    rejects(
+        "questions to resolve in a build brief",
+        Brief::parse(&edited("brief.json", |v| {
+            v["resolve"] =
+                json!([{ "id": "Q1", "category": "naming", "context": "c", "text": "t" }]);
+        })),
+        "questions to resolve are given but the role is build, not resolver",
+    );
+
+    // The result's own rules.
+    let parse = |edit: fn(&mut Value)| RunResult::parse(&edited("result-resolver.json", edit));
+    rejects(
+        "resolutions without done",
+        parse(|v| v["status"] = json!("failed")),
+        "resolutions are given but status is not done",
+    );
+    rejects(
+        "resolutions out of order",
+        parse(|v| v["resolutions"][1]["question"] = json!("Q1")),
+        "the resolution of Q1 is repeated or out of order",
+    );
+    rejects(
+        "a decision without a basis",
+        parse(|v| v["resolutions"][0]["basis"] = json!("  ")),
+        "the resolution of Q1 has no basis",
+    );
+    rejects(
+        "a pass without a reason",
+        parse(|v| v["resolutions"][1]["reason"] = json!("")),
+        "the resolution of Q3 has no reason",
+    );
+    rejects(
+        "a pass with a decision",
+        parse(|v| v["resolutions"][1]["decision"] = json!("d")),
+        "unknown field `decision`",
+    );
+    rejects(
+        "an unknown outcome",
+        parse(|v| v["resolutions"][0]["outcome"] = json!("guessed")),
+        "unknown variant `guessed`",
+    );
+}
+
 #[test]
 fn brief_rejections() {
     let parse = |edit: fn(&mut Value)| Brief::parse(&edited("brief.json", edit));
@@ -517,8 +649,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(4)),
+        parse(|v| v["format"] = json!(5)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 3, before the brief carried decisions and questions to resolve",
+        parse(|v| v["format"] = json!(3)),
+        "unknown format 3",
     );
     rejects(
         "format 1, before the brief carried the gate",
@@ -634,7 +771,7 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(4)),
+        asked(|v| v["format"] = json!(5)),
         "upgrade Owlshift",
     );
     rejects(
@@ -676,10 +813,16 @@ fn event_claim_and_state_rejections() {
         "unknown field `extra`",
     );
 
+    rejects(
+        "a format-3 document with decisions",
+        asked(|v| v["format"] = json!(3)),
+        "format 3 keeps no decisions",
+    );
     // A format-2 document, written before the asks kept their verdicts, is
-    // read as format 3 without them, and written back as format 3.
+    // read as format 4 without them, and written back as format 4.
     let format_2 = edited("ticket-questions.json", |v| {
         v["format"] = json!(2);
+        v.as_object_mut().unwrap().remove("decisions");
         for ask in v["asks"].as_array_mut().unwrap() {
             ask.as_object_mut().unwrap().remove("verdicts");
         }
@@ -687,7 +830,41 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 3,"));
+    assert!(read.render().starts_with("{\n  \"format\": 4,"));
+    // A format-3 document, written before the resolver's decisions were
+    // kept, is read as format 4 with none, its verdicts kept.
+    let format_3 = edited("ticket-questions.json", |v| {
+        v["format"] = json!(3);
+        v.as_object_mut().unwrap().remove("decisions");
+    });
+    let read = TicketQuestions::parse(&format_3).unwrap();
+    assert!(read.decisions.is_empty());
+    assert_eq!(read.asks[0].verdicts.len(), 2);
+    assert!(read.render().starts_with("{\n  \"format\": 4,"));
+    rejects(
+        "a decision without its comment",
+        asked(|v| v["decisions"][0]["comment"] = json!(" ")),
+        "decision 1 names no comment",
+    );
+    rejects(
+        "a decision without a basis",
+        asked(|v| v["decisions"][0]["basis"] = json!("")),
+        "decision 1 names no basis",
+    );
+    rejects(
+        "decisions out of time order",
+        asked(|v| {
+            let mut earlier = v["decisions"][0].clone();
+            earlier["at"] = json!("2026-09-28T08:00:00Z");
+            v["decisions"].as_array_mut().unwrap().push(earlier);
+        }),
+        "decision 2 is older than the one before it",
+    );
+    rejects(
+        "unknown decision field",
+        asked(|v| v["decisions"][0]["round"] = json!(1)),
+        "unknown field `round`",
+    );
     rejects(
         "an ask without its comment",
         asked(|v| v["asks"][1]["comment"] = json!(" ")),

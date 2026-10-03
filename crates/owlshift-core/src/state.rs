@@ -19,6 +19,12 @@ pub const MAX_FAILED_RUNS: u32 = 2;
 /// incomplete after the third re-ask parks it instead of a fourth.
 pub const MAX_REASKS: u32 = 3;
 
+/// Runs in a row whose questions the resolver all decided, so that the stage
+/// ran again without a stop, before the questions of the next run go to the
+/// decider without the resolver: a stage that keeps asking what the
+/// repository settles cannot loop without bound (architecture, section 4).
+pub const MAX_RESOLVED_PASSES: u32 = 3;
+
 /// Where a ticket stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Status {

@@ -52,6 +52,11 @@ pub const BUILD_ROLE: &str = include_str!("../../../roles/build.md");
 /// classify the decider's answers.
 pub const ANSWER_CHECK_ROLE: &str = include_str!("../../../roles/answer_check.md");
 
+/// The default resolver role prompt, `roles/resolver.md`, as this binary was
+/// built with it: what `owlshift do` and `owlshift resume` hand Claude Code to
+/// settle the questions a run raised that are not the decider's alone.
+pub const RESOLVER_ROLE: &str = include_str!("../../../roles/resolver.md");
+
 /// Reads `<roles_dir>/<role>.md` and strips its front matter, per
 /// [`owlshift_contracts::format::strip_role_front_matter`].
 pub fn load_role_prompt(roles_dir: &Path, role: Role) -> Result<String, RoleLoadError> {
@@ -98,6 +103,9 @@ mod tests {
             prompt.trim_start().starts_with("# Answer check"),
             "{prompt}"
         );
+        let prompt =
+            format::strip_role_front_matter(Role::Resolver, RESOLVER_ROLE).expect("strips");
+        assert!(prompt.trim_start().starts_with("# Resolver"), "{prompt}");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! the operator's personal file, whose `allow_gate_env` the project's
 //! `stack.gate_env` is checked against as when the configuration is loaded. Each `[[step]]` does one thing
 //! (`dispatch = true`, `run = <reply>`, `comment = { author, body }` or
-//! `answer = <reply>`) and may carry an `expect` table, checked right
+//! `answer = <reply>` or `resolve = <reply>`) and may carry an `expect` table, checked right
 //! after it. Time is virtual: step `n` happens `n` minutes after `start`.
 //!
 //! # The stand-in driver
@@ -23,7 +23,18 @@
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
 //!
-//! A `run` step runs the current stage's role; an `answer` step runs the
+//! A `run` step runs the current stage's role. When it asks questions, they
+//! are routed as `owlshift do` routes them (`owlshift_runner::resolver`):
+//! always-human ones, and every question of a false premise, go to the
+//! decider; when any is left for the resolver, nothing is posted and the core
+//! state does not move until a `resolve` step runs the resolver on them. It
+//! posts each decision as a DECISION comment
+//! (`owlshift_runner::writer::DecisionComment`), kept in memory to take that
+//! comment's place in every later brief's thread as a `decision` entry, and
+//! opens a round of what is left, renumbered Q1..Qn; when nothing is left,
+//! the ticket stays at its stage for the next `run`. A resolver without a
+//! usable result sends every question to the decider, and one that breaks
+//! isolation parks the ticket. An `answer` step runs the
 //! answer check (OWL-116) while the ticket waits for input, once answers
 //! arrived: a decider comment newer than the latest ask, or than the last
 //! check that found a counter-question. A failed or interrupted check is
@@ -47,7 +58,10 @@
 //!   default variant, and the asks live in memory, not in the ticket ref;
 //! - a stage run's outcome maps onto the core event as `owlshift do` maps it
 //!   (`owlshift_runner::on_demand::core_event`), and no DELIVERY comment is
-//!   written.
+//!   written;
+//! - no bound on the runs in a row whose questions the resolver all decided
+//!   (`owlshift_core::state::MAX_RESOLVED_PASSES`), which `owlshift do` counts
+//!   per command: a scenario has no command, and plays each run by hand.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -68,17 +82,20 @@ use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::result::{Question, Status as ResultStatus, Verdict};
+use owlshift_contracts::result::{Question, RunResult, Status as ResultStatus, Verdict};
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::decider::brief_zones;
+use owlshift_core::gate::GatePolicy;
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::core_event;
+use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
-    ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart, ResumeComment,
+    DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
+    ResumeComment,
 };
 
 use crate::git::{GitEnv, Remote, seed};
@@ -135,6 +152,9 @@ pub struct Step {
     /// The answer check runs on the fake harness, with this reply, on the
     /// open question round.
     pub answer: Option<Reply>,
+    /// The resolver runs on the fake harness, with this reply, on the
+    /// questions the last run left for it.
+    pub resolve: Option<Reply>,
     #[serde(default)]
     pub expect: Expect,
 }
@@ -175,6 +195,11 @@ pub struct Expect {
     /// The question ids of the latest ask in the last brief's thread: the
     /// ones an answer check gives its verdicts on.
     pub brief_latest_ask: Option<Vec<String>>,
+    /// The `decision` of each `decision` entry of the last brief's thread,
+    /// in order.
+    pub brief_decisions: Option<Vec<String>>,
+    /// The ids of the questions the last brief gave the resolver.
+    pub brief_resolve: Option<Vec<String>>,
     /// The gate failure of the step's run: `none`, or a text its command,
     /// reason or output contains.
     pub gate_failure: Option<String>,
@@ -290,6 +315,7 @@ enum Action<'a> {
     Run(&'a Reply),
     Comment(&'a CommentStep),
     Answer(&'a Reply),
+    Resolve(&'a Reply),
 }
 
 impl Action<'_> {
@@ -299,6 +325,7 @@ impl Action<'_> {
             Action::Run(_) => "run",
             Action::Comment(_) => "comment",
             Action::Answer(_) => "answer",
+            Action::Resolve(_) => "resolve",
         }
     }
 }
@@ -312,9 +339,12 @@ impl Step {
         actions.extend(self.run.as_ref().map(Action::Run));
         actions.extend(self.comment.as_ref().map(Action::Comment));
         actions.extend(self.answer.as_ref().map(Action::Answer));
+        actions.extend(self.resolve.as_ref().map(Action::Resolve));
         match <[_; 1]>::try_from(actions) {
             Ok([action]) => Ok(action),
-            Err(_) => Err("a step does exactly one of dispatch, run, comment or answer".to_owned()),
+            Err(_) => Err(
+                "a step does exactly one of dispatch, run, comment, answer or resolve".to_owned(),
+            ),
         }
     }
 }
@@ -350,6 +380,16 @@ struct Driver {
     /// While questions wait: a decider comment after this time is a new
     /// answer for the answer check.
     answers_since: Option<Timestamp>,
+    /// The project's gate policy, which routes a run's questions.
+    policy: GatePolicy,
+    /// The result of the last run, while its questions wait for a
+    /// `resolve` step.
+    pending: Option<RunResult>,
+    /// The questions the resolver's brief gives it.
+    resolving: Vec<Question>,
+    /// The decisions the driver posted, oldest first, as `decision` entries,
+    /// in the order of their comments.
+    decisions: Vec<ThreadEntry>,
     last_brief: Option<Brief>,
     last_run: Option<RunReport>,
 }
@@ -438,6 +478,10 @@ impl Driver {
             tracker: MarkdownTracker::new(&remote.checkout),
             states: config.tracker.states,
             pipeline: Pipeline::new(config.pipeline.default),
+            policy: GatePolicy::new(&config.policy.always_human, config.pipeline.plan_approval),
+            pending: None,
+            resolving: Vec::new(),
+            decisions: Vec::new(),
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             gate_failure: None,
             branch: format!("owlshift/{}", scenario.ticket),
@@ -465,7 +509,7 @@ impl Driver {
                 self.set_stage(&self.states.working.clone())?;
                 Ok(Some(Event::Dispatched))
             }
-            Action::Run(reply) => self.run(reply).map(Some),
+            Action::Run(reply) => self.run(reply),
             Action::Comment(comment) => {
                 self.tracker
                     .post_comment(&self.id, &comment.author, self.now, &comment.body)
@@ -473,6 +517,7 @@ impl Driver {
                 Ok(None)
             }
             Action::Answer(reply) => self.answer(reply).map(Some),
+            Action::Resolve(reply) => self.resolve(reply),
         }
     }
 
@@ -531,8 +576,12 @@ impl Driver {
     }
 
     /// Runs the current stage's role through the executor, on the fake
-    /// harness.
-    fn run(&mut self, reply: &Reply) -> Result<Event, String> {
+    /// harness. Questions some of which the resolver settles first move
+    /// nothing until a `resolve` step: no event.
+    fn run(&mut self, reply: &Reply) -> Result<Option<Event>, String> {
+        if self.pending.is_some() {
+            return Err("the last run's questions wait for a `resolve` step".to_owned());
+        }
         let Status::Active(stage) = self.state.status() else {
             return Err(format!(
                 "no stage role runs while the ticket is {:?}",
@@ -545,35 +594,118 @@ impl Driver {
         let report = self.execute(role, reply)?;
         let (event, result) = core_event(&report.outcome);
         let result = result.cloned();
+        if let (Event::Questions, Some(result)) = (event, &result)
+            && result.status != ResultStatus::PremiseFalse
+            && !resolver::route(&self.policy, &result.questions)
+                .to_resolver
+                .is_empty()
+        {
+            self.last_run = Some(report);
+            self.pending = Some(result.clone());
+            self.push_if_ahead(&self.worktree())?;
+            return Ok(None);
+        }
         let parked = self.apply(event)?;
         if let Some(reason) = parked {
             self.post_parked(reason, &report, Vec::new())?;
         }
         self.last_run = Some(report);
         if let (Event::Questions, Some(result)) = (event, &result) {
-            let round = NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
-            let body = QuestionsComment {
-                ticket: self.id.clone(),
-                round,
-                summary: result.summary.clone(),
-                questions: result.questions.clone(),
-                premise_false: result.status == ResultStatus::PremiseFalse,
-            }
-            .render();
-            let at = self.post(&body)?;
-            self.asks.push(ThreadEntry::Questions {
-                round,
-                at,
-                questions: result.questions.clone(),
-            });
-            self.verdicts.push(Vec::new());
-            self.answers_since = Some(at);
-            self.set_stage(&self.states.needs_input.clone())?;
+            let questions = left(&result.questions, &[]);
+            self.post_round(result, questions, 0, None)?;
         }
         if matches!(event, Event::Completed | Event::Questions) {
             self.push_if_ahead(&self.worktree())?;
         }
-        Ok(event)
+        Ok(Some(event))
+    }
+
+    /// Posts the QUESTIONS comment of a round just opened, and keeps the ask.
+    fn post_round(
+        &mut self,
+        result: &RunResult,
+        questions: Vec<Question>,
+        decided: usize,
+        fallback: Option<Fallback>,
+    ) -> Result<(), String> {
+        let round = NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
+        let body = QuestionsComment {
+            ticket: self.id.clone(),
+            round,
+            summary: result.summary.clone(),
+            questions: questions.clone(),
+            premise_false: result.status == ResultStatus::PremiseFalse,
+            decided,
+            fallback,
+        }
+        .render();
+        let at = self.post(&body)?;
+        self.asks.push(ThreadEntry::Questions {
+            round,
+            at,
+            questions,
+        });
+        self.verdicts.push(Vec::new());
+        self.answers_since = Some(at);
+        self.set_stage(&self.states.needs_input.clone())
+    }
+
+    /// Runs the resolver through the executor, on the fake harness, on the
+    /// questions the last run left for it, and acts on what it left: each
+    /// decision posted as a DECISION comment, then a round of what is left,
+    /// or nothing when every question was decided (no event).
+    fn resolve(&mut self, reply: &Reply) -> Result<Option<Event>, String> {
+        let result = self
+            .pending
+            .take()
+            .ok_or("no run's questions wait for the resolver")?;
+        let given = resolver::route(&self.policy, &result.questions).to_resolver;
+        self.resolving.clone_from(&given);
+        let report = self.execute(Role::Resolver, reply);
+        self.resolving.clear();
+        let report = report?;
+        let (decided, fallback) = match resolver::outcome(&report.outcome) {
+            Resolved::Quarantined => {
+                if let Some(reason) = self.apply(Event::Quarantined)? {
+                    self.post_parked(reason, &report, Vec::new())?;
+                }
+                self.last_run = Some(report);
+                return Ok(Some(Event::Quarantined));
+            }
+            Resolved::Fallback(fallback) => (Vec::new(), Some(fallback)),
+            Resolved::Done(resolutions) => {
+                let mut decided = Vec::new();
+                for (question, decision, basis) in
+                    resolver::decisions(&self.policy, &given, resolutions)
+                {
+                    let body = DecisionComment {
+                        ticket: self.id.clone(),
+                        question: question.clone(),
+                        decision: decision.to_owned(),
+                        basis: basis.to_owned(),
+                        run: None,
+                    }
+                    .render();
+                    let at = self.post(&body)?;
+                    self.decisions.push(ThreadEntry::Decision {
+                        at,
+                        question: question.clone(),
+                        decision: decision.to_owned(),
+                        basis: basis.to_owned(),
+                    });
+                    decided.push(question.id.clone());
+                }
+                (decided, None)
+            }
+        };
+        self.last_run = Some(report);
+        let questions = left(&result.questions, &decided);
+        if questions.is_empty() {
+            return Ok(None);
+        }
+        self.apply(Event::Questions)?;
+        self.post_round(&result, questions, decided.len(), fallback)?;
+        Ok(Some(Event::Questions))
     }
 
     /// Runs the answer check through the executor, on the fake harness,
@@ -795,16 +927,24 @@ impl Driver {
             },
             name,
         };
-        // Each ask takes the place of the comment the driver posted it in,
-        // in the tracker's order; every other comment stays one.
+        // Each ask and each decision takes the place of the comment the
+        // driver posted it in, in the tracker's order; every other comment,
+        // one that only looks like the driver's included, stays one.
         let mut asks = self.asks.iter();
+        let mut decisions = self.decisions.iter();
         let mut thread = Vec::new();
         for comment in self.tracker.comments(&self.id).map_err(|e| e.to_string())? {
-            if comment.author == OWLSHIFT_AUTHOR && is_ask(&comment.body) {
+            let kind = marker(&comment.body).filter(|_| comment.author == OWLSHIFT_AUTHOR);
+            if matches!(kind, Some(MarkerKind::Questions | MarkerKind::ReAsk)) {
                 let ask = asks
                     .next()
                     .ok_or_else(|| format!("no ask recorded for the comment at {}", comment.at))?;
                 thread.push(ask.clone());
+            } else if kind == Some(MarkerKind::Decision) {
+                let decision = decisions.next().ok_or_else(|| {
+                    format!("no decision recorded for the comment at {}", comment.at)
+                })?;
+                thread.push(decision.clone());
             } else {
                 thread.push(ThreadEntry::Comment {
                     at: comment.at,
@@ -815,6 +955,9 @@ impl Driver {
         }
         if asks.next().is_some() {
             return Err("an ask was recorded without its comment".to_owned());
+        }
+        if decisions.next().is_some() {
+            return Err("a decision was recorded without its comment".to_owned());
         }
         Ok(Brief {
             format: Format,
@@ -830,6 +973,11 @@ impl Driver {
             },
             decider: decider.clone(),
             thread,
+            resolve: if role == Role::Resolver {
+                self.resolving.clone()
+            } else {
+                Vec::new()
+            },
             checkpoint: None,
             zones: brief_zones(ticket.labels.iter().map(String::as_str)).zones,
             resources: Vec::new(),
@@ -967,7 +1115,9 @@ impl Driver {
                 .iter()
                 .filter_map(|entry| match entry {
                     ThreadEntry::Comment { author, .. } => Some(author.relation),
-                    ThreadEntry::Questions { .. } | ThreadEntry::Reask { .. } => None,
+                    ThreadEntry::Questions { .. }
+                    | ThreadEntry::Reask { .. }
+                    | ThreadEntry::Decision { .. } => None,
                 })
                 .collect();
             same("brief_thread", names(expected), names(&found))?;
@@ -983,6 +1133,37 @@ impl Driver {
                 .unwrap_or_default();
             same(
                 "brief_latest_ask",
+                format!("{expected:?}"),
+                format!("{found:?}"),
+            )?;
+        }
+        if let Some(expected) = &expect.brief_decisions {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            let found: Vec<&str> = brief
+                .thread
+                .iter()
+                .filter_map(|entry| match entry {
+                    ThreadEntry::Decision { decision, .. } => Some(decision.as_str()),
+                    _ => None,
+                })
+                .collect();
+            same(
+                "brief_decisions",
+                format!("{expected:?}"),
+                format!("{found:?}"),
+            )?;
+        }
+        if let Some(expected) = &expect.brief_resolve {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            let found: Vec<&str> = brief.resolve.iter().map(|q| q.id.as_str()).collect();
+            same(
+                "brief_resolve",
                 format!("{expected:?}"),
                 format!("{found:?}"),
             )?;
@@ -1043,12 +1224,21 @@ impl Driver {
 }
 
 /// Whether a comment is a QUESTIONS or a RE-ASK comment.
-fn is_ask(body: &str) -> bool {
-    matches!(
-        MarkedComment::parse(body),
-        Ok(Some(MarkedComment { header, .. }))
-            if matches!(header.kind, MarkerKind::Questions | MarkerKind::ReAsk)
-    )
+/// The kind of a marked comment, `None` for any other.
+fn marker(body: &str) -> Option<MarkerKind> {
+    match MarkedComment::parse(body) {
+        Ok(Some(MarkedComment { header, .. })) => Some(header.kind),
+        _ => None,
+    }
+}
+
+/// The questions a round asks of a run's: all but those `decided`,
+/// renumbered Q1..Qn.
+fn left(raised: &[Question], decided: &[owlshift_contracts::ids::QuestionId]) -> Vec<Question> {
+    resolver::left_for_decider(raised, decided)
+        .into_iter()
+        .map(|(_, question)| question)
+        .collect()
 }
 
 /// Checks a gate failure against `none` or a text it contains.

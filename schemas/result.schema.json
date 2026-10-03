@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift result.json",
-  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; and, against the run's brief, verdicts from the\nanswer check only, covering exactly its latest ask.",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, and resolutions from the resolver only, covering\nexactly the questions it was given.",
   "type": "object",
   "properties": {
     "artifacts": {
@@ -28,7 +28,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 3
+      "const": 4
     },
     "pr": {
       "description": "The pull request to open; only with `status: done`.",
@@ -48,6 +48,14 @@
       "default": [],
       "items": {
         "$ref": "#/$defs/Question"
+      }
+    },
+    "resolutions": {
+      "description": "The resolver's outcome on each question of its brief's `resolve`, in\nquestion order; only from the resolver, and only with `status: done`.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Resolution"
       }
     },
     "status": {
@@ -118,6 +126,25 @@
         },
         "required": [
           "verdicts"
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "done"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "resolutions": {
+            "minItems": 1
+          }
+        },
+        "required": [
+          "resolutions"
         ]
       },
       "then": {
@@ -346,6 +373,63 @@
       "description": "A path relative to the worktree: '/'-separated segments, none empty or '..', with no backslash or colon.",
       "type": "string",
       "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
+    },
+    "Resolution": {
+      "description": "The resolver's outcome on one question it was given: decided, with the\ndecision and what settles it, or passed on to the decider, with why.\nEvery text is not empty and not only whitespace.",
+      "oneOf": [
+        {
+          "description": "Settled by what the ticket, the thread, the project's rules or the\nrepository already establish; the runner logs it on the ticket as a\nreversible decision.",
+          "type": "object",
+          "properties": {
+            "basis": {
+              "description": "What settles it: the ticket, a rule, a file, an earlier answer.",
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "decision": {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "outcome": {
+              "type": "string",
+              "const": "decided"
+            },
+            "question": {
+              "$ref": "#/$defs/QuestionId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "outcome",
+            "question",
+            "decision",
+            "basis"
+          ]
+        },
+        {
+          "description": "Not settled by anything the resolver may rely on: the question goes\nto the decider.",
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "const": "passed_on"
+            },
+            "question": {
+              "$ref": "#/$defs/QuestionId"
+            },
+            "reason": {
+              "type": "string",
+              "pattern": "\\S"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "outcome",
+            "question",
+            "reason"
+          ]
+        }
+      ]
     },
     "Status": {
       "description": "How a run ended.",
