@@ -37,7 +37,7 @@ The build plan fixes some messages word for word, such as doctor's summary ([bui
 
 `{o,o}`: the ASCII owl, braces for the head, two `o` for the eyes, a comma for the beak. It says "a tool you run in a terminal" and "an owl" at once, and survives at 16 px, where it reads as a warm `{oo}` on a dark tile.
 
-It is drawn on a 100-unit square: a tile with corners of radius 22; the braces and the eyes stroked 6 units wide with round caps and joins; the eyes centred at (38.5, 47) and (61.5, 47) with a radius of 7.5; a filled comma below and between them. The braces are always the light or dark contrast colour, the eyes and the comma always the accent.
+It is drawn on a 100-unit square: a tile with corners of radius 22; the braces and the eyes stroked 6 units wide with round caps and joins; the eyes centred at (38.5, 47) and (61.5, 47) with a radius of 7.5; a filled comma below and between them. The braces are always the light or dark contrast colour, the eyes and the comma always the accent. `owlshift-mark.svg` is the reference for the paths of the braces and the comma; every other file draws the mark with the same elements.
 
 | File | Tile | Braces | Eyes and comma | Use |
 | --- | --- | --- | --- | --- |
@@ -49,7 +49,9 @@ It is drawn on a 100-unit square: a tile with corners of radius 22; the braces a
 
 The wordmark is `owlshift_`, always lowercase, set in JetBrains Mono Medium and outlined, so no file needs the font. The underscore is a cursor and the wordmark's only colour: `apricot` on a dark background, `apricot-burnt` on a light one.
 
-A lockup sets the mark before the wordmark, centred on the same line: the mark as tall as the wordmark from its ascenders to its descenders, a quarter of the mark's width between them.
+A lockup sets the mark before the wordmark, on the same line: the mark as tall as the wordmark's outline, from the top of its ascenders to the bottom of the underscore, and a quarter of the mark's width between the tile and the first letter. Both lockups use the default mark: on a dark page its tile melts in and the braces and eyes keep their own contrast (section 4, "Contrast").
+
+The outlines were drawn once from JetBrains Mono Medium, version 2.305 (`JetBrainsMono-Medium.ttf` from [JetBrains/JetBrainsMono](https://github.com/JetBrains/JetBrainsMono), SHA-256 `d16e6dc99672734698d629705f617c79f6eb6040f5113efe3a145204dc988109`), with fontTools 4.66.1, on 2026-10-04 (OWL-162); nothing needs the font afterwards.
 
 | File | Wordmark | Cursor | Use |
 | --- | --- | --- | --- |
