@@ -10,7 +10,9 @@
 //! questions left open are asked again ([`open_questions`], posted as a RE-ASK comment,
 //! [`crate::writer::ReaskComment`]), or the decider's counter-question gets
 //! the check's reply ([`counter_replies`], posted as a REPLY comment,
-//! [`crate::writer::ReplyComment`]). `owlshift continue` runs it ([`crate::on_demand`]); the test
+//! [`crate::writer::ReplyComment`]). Before delivery, the decider's comments
+//! a Build run did not see are its late comments ([`late_comments`]).
+//! `owlshift continue` runs it ([`crate::on_demand`]); the test
 //! bench's stand-in driver plays the same pieces in the scenarios.
 
 use std::time::Duration;
@@ -54,10 +56,34 @@ pub fn newest_decider_comment<'c>(
     comments: &'c [Comment],
     decider: &Person,
 ) -> Option<&'c Comment> {
+    decider_comments(comments, decider)
+        .max_by_key(|comment| (comment.last_edit(), comment.created_at))
+}
+
+/// The decider's comments a Build run did not see (OWL-139): those of `now`
+/// whose last edit is newer than the newest decider edit among `read`, the
+/// comments its brief was built from; all of them when `read` held none. A
+/// comment of the same second as that edit is missed, as by [`new_answer`].
+pub fn late_comments<'c>(
+    read: &[Comment],
+    now: &'c [Comment],
+    decider: &Person,
+) -> Vec<&'c Comment> {
+    let seen = newest_decider_edit(read, decider);
+    decider_comments(now, decider)
+        .filter(|comment| seen.is_none_or(|seen| comment.last_edit() > seen))
+        .collect()
+}
+
+/// The decider's own comments, as the brief marks them: their account's,
+/// and not a marked comment.
+fn decider_comments<'c>(
+    comments: &'c [Comment],
+    decider: &Person,
+) -> impl Iterator<Item = &'c Comment> {
     comments
         .iter()
-        .filter(|comment| comment_author(comment, decider).relation == Relation::Decider)
-        .max_by_key(|comment| (comment.last_edit(), comment.created_at))
+        .filter(move |comment| comment_author(comment, decider).relation == Relation::Decider)
 }
 
 /// When the decider's reply counts, if it does not yet at `now`: the quiet
@@ -351,6 +377,44 @@ mod tests {
         );
         let two = Duration::from_secs(2 * 60);
         assert_eq!(counts_at(&comments, &decider, at(12), two), None);
+    }
+
+    #[test]
+    fn late_comments_are_the_deciders_edited_after_what_the_run_read() {
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let by = |id: &str, created: u32, edited: Option<u32>, body: &str| Comment {
+            id: format!("c{created}"),
+            author: Author::Account(Person {
+                id: id.into(),
+                name: "someone".into(),
+            }),
+            created_at: at(created),
+            edited_at: edited.map(at),
+            body: body.into(),
+        };
+        let ids = |late: Vec<&Comment>| -> Vec<String> {
+            late.into_iter().map(|c| c.id.clone()).collect()
+        };
+        let read = [by("u1", 5, None, "Q1: yes."), by("u2", 6, None, "Nice.")];
+        // Nothing new, and what others or the runner wrote since: none.
+        assert!(late_comments(&read, &read, &decider).is_empty());
+        let mut now = read.to_vec();
+        now.push(by("u2", 8, None, "Also French?"));
+        now.push(by("u1", 9, None, "[owlshift] DELIVERY\n\nDone.\n"));
+        assert!(late_comments(&read, &now, &decider).is_empty());
+        // A new comment of the decider, and an edit of an old one.
+        now.push(by("u1", 10, None, "Also say Bonjour."));
+        assert_eq!(ids(late_comments(&read, &now, &decider)), ["c10"]);
+        now[0] = by("u1", 5, Some(11), "Q1: yes, in bold.");
+        assert_eq!(ids(late_comments(&read, &now, &decider)), ["c5", "c10"]);
+        // A brief that held no comment of the decider saw none of them.
+        assert_eq!(ids(late_comments(&[], &now, &decider)), ["c5", "c10"]);
     }
 
     fn finished(result: &str) -> Outcome {

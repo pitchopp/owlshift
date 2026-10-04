@@ -30,6 +30,12 @@
 //! check, posts a PARKED comment saying why and what restarts it. In this
 //! version the build stage is the whole pipeline.
 //!
+//! Before a ticket that went through a round is delivered, the thread is
+//! read again (OWL-139): a decider comment the done Build run did not see
+//! gets one more Build run, whose questions go to the decider without the
+//! resolver; a further one after that run opens a round instead of a
+//! delivery.
+//!
 //! The ticket's visible stage follows (OWL-137, [`VisibleStage`]): working
 //! once `do` dispatched or `continue` resumed after an answer, needs input
 //! once a round or a re-ask is on the ticket, review once the pull request
@@ -876,6 +882,9 @@ impl OnDemand<'_> {
         let mut attempt = 0u32;
         // Runs in a row whose questions the resolver all decided.
         let mut settled = 0u32;
+        // The late comments a Build run of this command was given to
+        // integrate (OWL-139): one such run per delivery.
+        let mut integrating: Option<Vec<Comment>> = None;
         let report = loop {
             attempt += 1;
             let comments = self.comments(&p.ticket)?;
@@ -906,6 +915,18 @@ impl OnDemand<'_> {
             let mut round = None;
             if event == Event::Questions
                 && let Some(result) = result
+                && integrating.is_some()
+            {
+                // A run given late comments asks because it cannot follow
+                // them without the decider: the resolver never settles that
+                // in their place.
+                round = Some(Round {
+                    questions: resolver::left_for_decider(&result.questions, &[]),
+                    decided: 0,
+                    fallback: None,
+                });
+            } else if event == Event::Questions
+                && let Some(result) = result
             {
                 match self.resolve(
                     p,
@@ -922,6 +943,43 @@ impl OnDemand<'_> {
                         continue;
                     }
                     Routing::Ask(asked) => round = Some(asked),
+                }
+            }
+            // Before delivery, the thread again: a decider comment this run
+            // did not see gets one more Build run, once (OWL-139).
+            if event == Event::Completed {
+                let late = self.late(p, &comments)?;
+                if !late.is_empty() {
+                    let ids: Vec<&str> = late.iter().map(|c| c.id.as_str()).collect();
+                    let outcome = if integrating.is_none() {
+                        "integrate"
+                    } else {
+                        "ask"
+                    };
+                    sink.emit(
+                        &p.ticket,
+                        Some(&ran.run),
+                        EventKind::Gate,
+                        data([("late_comments", json!(ids)), ("outcome", json!(outcome))]),
+                    );
+                    if integrating.is_none() {
+                        gather(&mut gathered.decisions, &[late_decision(&late)]);
+                        integrating = Some(late);
+                        continue;
+                    }
+                    let asked = match state.apply(PIPELINE, Event::Questions) {
+                        Ok(Transition::To(asked)) => asked,
+                        other => return Err(core_error(other)),
+                    };
+                    return Err(self.ask(
+                        p,
+                        &asked,
+                        result::Status::Questions,
+                        LATE_SUMMARY,
+                        late_round(&late),
+                        &ran.run,
+                        sink,
+                    ));
                 }
             }
             match state.apply(PIPELINE, event) {
@@ -945,7 +1003,26 @@ impl OnDemand<'_> {
                             "a question round without its questions".to_owned(),
                         ));
                     };
-                    return Err(self.ask(p, &state, result, round, &ran.run, sink));
+                    // A run given late comments says which it could not
+                    // follow.
+                    let summary = match &integrating {
+                        Some(late) => format!(
+                            "Comments of yours posted or edited after the resume, at {}, went to \
+                             one more Build run, which asks before it can follow them. {}",
+                            late_times(late),
+                            result.summary
+                        ),
+                        None => result.summary.clone(),
+                    };
+                    return Err(self.ask(
+                        p,
+                        &state,
+                        result.status,
+                        &summary,
+                        round,
+                        &ran.run,
+                        sink,
+                    ));
                 }
                 // Build completed: in this version, delivery follows.
                 _ => {
@@ -958,15 +1035,18 @@ impl OnDemand<'_> {
     }
 
     /// Opens a question round of what the resolver left for the decider
-    /// ([`Round`]): the Writer posts the questions, and the ticket ref keeps
-    /// the ask and the state. Returns the stop that says so. A false premise
-    /// with no question, or a post that failed, keeps nothing: the questions
-    /// are printed.
+    /// ([`Round`]), under the `status` and `summary` of the run that asked:
+    /// the Writer posts the questions, and the ticket ref keeps the ask and
+    /// the state. Returns the stop that says so. A false premise with no
+    /// question, or a post that failed, keeps nothing: the questions are
+    /// printed.
+    #[allow(clippy::too_many_arguments)]
     fn ask(
         &self,
         p: &mut Prepared,
         state: &TicketState,
-        result: &RunResult,
+        status: result::Status,
+        summary: &str,
         left: Round,
         run: &str,
         sink: &mut EventSink<'_>,
@@ -981,15 +1061,15 @@ impl OnDemand<'_> {
             data([
                 ("opened", json!("questions")),
                 ("round", json!(state.round())),
-                ("status", status_name(result.status)),
+                ("status", status_name(status)),
                 ("questions", json!(questions.len())),
                 ("raised_as", question_ids(&raised)),
             ]),
         );
         let stop = |posted| Stop::NeedsInput {
             ticket: ticket.clone(),
-            status: result.status,
-            summary: result.summary.clone(),
+            status,
+            summary: summary.to_owned(),
             questions: questions.clone(),
             posted,
         };
@@ -1007,9 +1087,9 @@ impl OnDemand<'_> {
         let comment = QuestionsComment {
             ticket: ticket.clone(),
             round,
-            summary: result.summary.clone(),
+            summary: summary.to_owned(),
             questions: questions.clone(),
-            premise_false: result.status == result::Status::PremiseFalse,
+            premise_false: status == result::Status::PremiseFalse,
             decided: left.decided,
             fallback: left.fallback,
         };
@@ -1783,6 +1863,27 @@ impl OnDemand<'_> {
             .map_err(|e| refused(&format!("reading the comments of {ticket}"), e))
     }
 
+    /// The late comments of a Build run that is done (OWL-139): the comments
+    /// read again, those of the latest ask's decider newer than what `read`,
+    /// the run's brief, held ([`answer_check::late_comments`]). None for a
+    /// ticket whose ref keeps no ask, which is delivered as it was read. The
+    /// thread unread is a failed delivery: no comment of the decider is
+    /// ignored.
+    fn late(&self, p: &Prepared, read: &[Comment]) -> Result<Vec<Comment>, Stop> {
+        let Some(ask) = p.questions().latest().cloned() else {
+            return Ok(Vec::new());
+        };
+        let now = self
+            .tracker
+            .comments(&p.ticket)
+            .map_err(|e| Stop::Delivery(format!("re-reading the comments before delivery: {e}")))?;
+        let decider = person(&ask.decider, &p.found);
+        Ok(answer_check::late_comments(read, &now, &decider)
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
     /// The brief of one run of `role`: Build writes in the worktree and
     /// resumes from the plan it left; the answer check only reads, and gets
     /// no rule, its context kept to the ticket, the questions and the
@@ -2281,6 +2382,65 @@ fn gather<T: Clone + PartialEq>(into: &mut Vec<T>, items: &[T]) {
             into.push(item.clone());
         }
     }
+}
+
+/// The summary of the round a late comment after the integrating run opens
+/// ([`late_round`]).
+const LATE_SUMMARY: &str =
+    "Comments arrived after the work was revised for a late comment; nothing was delivered.";
+
+/// The round a decider comment opens when it comes after the one Build run
+/// of a delivery that integrates late comments (OWL-139): one always-human
+/// question naming their times, so the decider says whether the work takes
+/// them into account before it is delivered.
+fn late_round(late: &[Comment]) -> Round {
+    let question = Question {
+        id: QuestionId::nth(1),
+        category: "scope".to_owned(),
+        context: format!(
+            "After your answers were understood, Build revised the work once for a comment of \
+             yours it had not seen. Comments of yours posted or edited after that revision \
+             started, at {}, came too late for it: Owlshift revises the work once per delivery \
+             for late comments, so nothing was pushed and no pull request was opened.",
+            late_times(late)
+        ),
+        text: "Should the work take these comments into account before it is delivered?".to_owned(),
+        options: vec![
+            "Yes: revise the work for them, then deliver".to_owned(),
+            "No: deliver the work as it stands".to_owned(),
+        ],
+        recommendation: Some("Yes: revise the work for them, then deliver".to_owned()),
+    };
+    Round {
+        questions: vec![(question.id.clone(), question)],
+        decided: 0,
+        fallback: None,
+    }
+}
+
+/// The decision the delivery report lists for late comments a Build run
+/// was given to integrate.
+fn late_decision(late: &[Comment]) -> Decision {
+    Decision {
+        question: "Late comment".to_owned(),
+        decision: "Given to one more Build run before delivery, to integrate".to_owned(),
+        basis: format!(
+            "The decider's comments posted or edited at {}, after the work had read the thread",
+            late_times(late)
+        ),
+    }
+}
+
+/// When late comments were last edited, oldest first, for a message.
+fn late_times(late: &[Comment]) -> String {
+    let mut times: Vec<Timestamp> = late.iter().map(Comment::last_edit).collect();
+    times.sort();
+    times.dedup();
+    times
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Why a parked run failed, in one line.
