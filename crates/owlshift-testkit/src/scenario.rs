@@ -19,8 +19,8 @@
 //! Ready, builds the brief from the tracker, maps the run's outcome onto a
 //! core event, posts the questions comment, sets the visible stage after
 //! the same core events as `owlshift do` and `continue`, through the same
-//! Writer (`owlshift_runner::writer::VisibleStage::after`), and pushes the
-//! branch. It keeps the latest failure of the gate the executor
+//! Writer (`owlshift_runner::writer::VisibleStage::after`), and to parked on
+//! a park, and pushes the branch. It keeps the latest failure of the gate the executor
 //! runs after a Build `done`, and hands it to the next Build brief. That
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
@@ -541,9 +541,11 @@ impl Driver {
         Ok(parked)
     }
 
-    /// Posts the PARKED comment of a park, after `report`'s run. A ticket
-    /// that asked questions would have a ticket ref, so `continue` restarts
-    /// it; one that never asked runs again with `do`.
+    /// Posts the PARKED comment of a park, after `report`'s run, and moves
+    /// the visible stage to parked, as `owlshift do` and `continue` do
+    /// (`owlshift_runner::on_demand`, `park`). A ticket that asked questions
+    /// would have a ticket ref, so `continue` restarts it; one that never
+    /// asked runs again with `do`. A failed write fails the scenario.
     fn post_parked(
         &self,
         reason: ParkReason,
@@ -568,7 +570,11 @@ impl Driver {
             },
         }
         .render();
-        self.post(&body).map(|_| ())
+        self.post(&body)?;
+        Writer::new(&self.tracker)
+            .set_stage(&self.id, VisibleStage::Parked, &self.states)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Moves the visible stage as `owlshift do` and `continue` do after

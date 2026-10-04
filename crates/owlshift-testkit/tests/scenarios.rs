@@ -75,7 +75,8 @@ fn resolver() {
 
 /// OWL-123's acceptance: past the re-ask limit, a fourth incomplete answer
 /// parks the ticket with a PARKED comment naming what is still open and
-/// what restarts it.
+/// what restarts it. The project names a parked state, which the ticket
+/// shows (OWL-148).
 #[test]
 fn the_reask_limit_parks_the_ticket_with_a_parked_comment() {
     let answered_again = |n: u32| {
@@ -119,6 +120,7 @@ fn the_reask_limit_parks_the_ticket_with_a_parked_comment() {
         waiting = "parked"
         round = 1
         comments = 9
+        tracker_stage = "Parked"
         [step.expect.last_comment]
         author = "owlshift"
         first_line = "[owlshift] PARKED"
@@ -144,7 +146,8 @@ fn the_reask_limit_parks_the_ticket_with_a_parked_comment() {
 }
 
 /// OWL-123's acceptance: a second failed run parks the ticket with a PARKED
-/// comment; no question round was asked, so `do` runs it again.
+/// comment; no question round was asked, so `do` runs it again. The project
+/// names no parked state, so the ticket shows needs input (OWL-148).
 #[test]
 fn a_second_failed_run_parks_the_ticket_with_a_parked_comment() {
     play_on_smoke(
@@ -167,6 +170,7 @@ fn a_second_failed_run_parks_the_ticket_with_a_parked_comment() {
         event = "run_failed"
         waiting = "parked"
         comments = 1
+        tracker_stage = "Needs Input"
         [step.expect.last_comment]
         author = "owlshift"
         first_line = "[owlshift] PARKED"

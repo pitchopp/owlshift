@@ -142,6 +142,7 @@ kind = "linear"
 team = "LOC"
 admit = { label = "agent" }
 states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+# optional: parked = "Parked", the state a parked ticket shows; needs_input without it
 
 [stack]
 gate = ["make lint", "make test"]
