@@ -1,6 +1,11 @@
-# Owlshift
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/owlshift-lockup-on-dark.svg">
+    <img alt="Owlshift" src="assets/brand/owlshift-lockup.svg" width="360">
+  </picture>
+</h1>
 
-**Your backlog works the night shift.**
+<p align="center"><strong>Your backlog works the night shift.</strong></p>
 
 Owlshift is an open-source runner that works a team's existing backlog continuously with coding agents. It pulls ready tickets from your tracker, takes each one through a plan-review-build-verify pipeline, stops and asks **on the ticket** whenever a decision is yours, and delivers a verified pull request. Humans merge.
 
@@ -37,6 +42,7 @@ The "Development" section of [CONTRIBUTING.md](CONTRIBUTING.md#development) cove
 | [Runtime & operations](docs/design/runtime-and-operations.md) | How it runs, platforms, install and uninstall, updates, configuration, observability, testing |
 | [Roadmap](docs/design/roadmap.md) | Twelve shippable steps, P0 to P11, with their exit gates |
 | [Build plan](docs/design/build-plan.md) | Checks to run first, workspace layout, contracts, CLI, tasks for P0 and P1 |
+| [Visual identity](docs/design/visual-identity.md) | Personality, voice, logo, colours, typefaces, and how each surface applies them |
 
 ## Project tracking
 
