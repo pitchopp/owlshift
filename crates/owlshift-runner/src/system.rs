@@ -10,6 +10,8 @@ pub use owlshift_platform::process::{Captured, RunError};
 pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
+pub use crate::tracker::StatesError;
+
 /// How long a probe such as `git --version` may take. C8 measured about
 /// 0.1 s for the harness status commands.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,6 +47,14 @@ pub trait System {
         owlshift_platform::keychain::Keychain::system()
             .and_then(|keychain| keychain.contains(account))
             .map_err(|error| error.to_string())
+    }
+    /// The names of the workflow states of the Linear team `team`, read
+    /// over the network with the Linear API key in the system keychain
+    /// (OWL-147). Only `owlshift doctor` asks, and only for a Linear project.
+    fn linear_states(&self, team: &str) -> Result<Vec<String>, StatesError> {
+        owlshift_platform::keychain::Keychain::system()
+            .map_err(|error| StatesError::Keychain(error.to_string()))
+            .and_then(|keychain| crate::tracker::linear_team_states(&keychain, team))
     }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
@@ -140,6 +150,9 @@ pub(crate) mod fake {
         unstored: Vec<String>,
         /// Why the keychain cannot be read; `None`: it can.
         keychain_error: Option<String>,
+        /// What Linear answers for a team's workflow states, the key being
+        /// stored; `None`: it cannot be reached.
+        linear_states: Option<Result<Vec<String>, owlshift_adapters::tracker::Error>>,
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
@@ -185,6 +198,16 @@ pub(crate) mod fake {
         /// The keychain cannot be read, for this reason.
         pub(crate) fn keychain_fails(mut self, reason: &str) -> Self {
             self.keychain_error = Some(reason.to_owned());
+            self
+        }
+
+        /// Linear answers so for a team's workflow states.
+        pub(crate) fn linear_states_are(
+            mut self,
+            answer: Result<&[&str], owlshift_adapters::tracker::Error>,
+        ) -> Self {
+            let answer = answer.map(|names| names.iter().map(|&n| n.to_owned()).collect());
+            self.linear_states = Some(answer);
             self
         }
 
@@ -252,6 +275,23 @@ pub(crate) mod fake {
             match &self.keychain_error {
                 Some(reason) => Err(reason.clone()),
                 None => Ok(!self.unstored.iter().any(|unstored| unstored == account)),
+            }
+        }
+
+        /// The key's presence follows [`Self::unstored`] and
+        /// [`Self::keychain_fails`]; never the network.
+        fn linear_states(&self, _team: &str) -> Result<Vec<String>, StatesError> {
+            use owlshift_adapters::tracker::{Error, ErrorKind};
+            match self.secret_stored(crate::tracker::LINEAR_ACCOUNT) {
+                Err(reason) => Err(StatesError::Keychain(reason)),
+                Ok(false) => Err(StatesError::NoKey),
+                Ok(true) => self
+                    .linear_states
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Err(Error::new(ErrorKind::Other, "Linear: no network in tests"))
+                    })
+                    .map_err(StatesError::Tracker),
             }
         }
 

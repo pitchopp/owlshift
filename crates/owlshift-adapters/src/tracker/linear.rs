@@ -43,6 +43,11 @@
 //! `issueUpdate` with a state's id moves the issue and answers it in that
 //! state, through the same personal API key.
 //!
+//! Checked live on 2026-10-04 (OWL-147; build plan, check C4): `teams(filter:
+//! { key: { eq: "OWL" } })` answers the one team of that key with its nine
+//! workflow states in one page, and an unknown key (`NOPE`) answers
+//! `nodes: []`, HTTP 200, no error.
+//!
 //! Checked live on 2026-10-03 (OWL-140): `{ issue(id: "OWL-140") {
 //! identifier url } }` answered the `url`
 //! `https://linear.app/owlshift/issue/OWL-140/notify-the-operator-on-the-desktop-when-they-become-the-blocker`:
@@ -187,6 +192,68 @@ impl LinearTracker {
     }
 }
 
+impl LinearTracker {
+    /// The names of the workflow states of the team whose key is `team`, as
+    /// Linear lists them: what `owlshift doctor` checks `[tracker].states`
+    /// against (OWL-147). Read only. The key is sent upper case, as Linear
+    /// writes team keys, since `owlshift do` compares it without regard to
+    /// case. No team of that key is [`ErrorKind::NotFound`]; more than
+    /// [`MAX_PAGE`] states are refused, as [`Tracker::set_stage`] refuses them.
+    pub fn team_states(&self, team: &str) -> Result<Vec<String>, Error> {
+        let key = team.to_ascii_uppercase();
+        let data: TeamsData = self.call(TEAM_STATES_QUERY, json!({ "key": key }))?;
+        let Some(team) = data.teams.nodes.into_iter().next() else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("Linear has no team with the key {key:?}"),
+            ));
+        };
+        one_page(&team)?;
+        Ok(team.states.nodes.into_iter().map(|s| s.name).collect())
+    }
+}
+
+/// Why no single workflow state answers to a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateMismatch {
+    /// No state has that name.
+    Missing,
+    /// Several states have it.
+    Ambiguous,
+}
+
+/// Where, among a team's workflow state names, the one named `wanted` is.
+/// The name must match exactly, case included, and only once: the rule by
+/// which the stage moves, and by which `owlshift doctor` checks the
+/// project's `[tracker].states`.
+pub fn find_state<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    wanted: &str,
+) -> Result<usize, StateMismatch> {
+    let mut found = None;
+    for (at, name) in names.into_iter().enumerate() {
+        if name == wanted {
+            if found.is_some() {
+                return Err(StateMismatch::Ambiguous);
+            }
+            found = Some(at);
+        }
+    }
+    found.ok_or(StateMismatch::Missing)
+}
+
+/// A team's workflow states are read in one page, never truncated.
+fn one_page<S>(team: &Team<S>) -> Result<(), Error> {
+    if team.states.page_info.has_next_page {
+        return Err(invalid(format!(
+            "team {} has more than {MAX_PAGE} workflow states, which this adapter does not \
+             read",
+            team.key
+        )));
+    }
+    Ok(())
+}
+
 impl Tracker for LinearTracker {
     fn capabilities(&self) -> &'static [Capability] {
         Self::CAPABILITIES
@@ -255,23 +322,12 @@ impl Tracker for LinearTracker {
         let data: StatesData = self.call(STATES_QUERY, json!({ "id": id.as_str() }))?;
         let issue = data.issue;
         let team = issue.team;
-        if team.states.page_info.has_next_page {
-            return Err(invalid(format!(
-                "team {} has more than {MAX_PAGE} workflow states, which this adapter does not \
-                 read",
-                team.key
-            )));
-        }
-        let named: Vec<&WorkflowState> = team
-            .states
-            .nodes
-            .iter()
-            .filter(|s| s.name == state)
-            .collect();
-        let target = match named[..] {
-            [one] => one,
-            [] => {
-                let names: Vec<&str> = team.states.nodes.iter().map(|s| s.name.as_str()).collect();
+        one_page(&team)?;
+        let nodes = &team.states.nodes;
+        let target = match find_state(nodes.iter().map(|s| s.name.as_str()), state) {
+            Ok(at) => &nodes[at],
+            Err(StateMismatch::Missing) => {
+                let names: Vec<&str> = nodes.iter().map(|s| s.name.as_str()).collect();
                 return Err(invalid(format!(
                     "team {} has no workflow state named {state:?}: the project's \
                      `[tracker].states` must name one of {}",
@@ -279,7 +335,7 @@ impl Tracker for LinearTracker {
                     names.join(", ")
                 )));
             }
-            _ => {
+            Err(StateMismatch::Ambiguous) => {
                 return Err(invalid(format!(
                     "team {} has several workflow states named {state:?}",
                     team.key
@@ -331,6 +387,10 @@ const POST_MUTATION: &str = concat!(
 
 const STATES_QUERY: &str = "query States($id: String!) { issue(id: $id) { id \
     team { key states(first: 50) { nodes { id name } pageInfo { hasNextPage } } } } }";
+
+const TEAM_STATES_QUERY: &str = "query TeamStates($key: String!) { \
+    teams(filter: { key: { eq: $key } }) { \
+    nodes { key states(first: 50) { nodes { name } pageInfo { hasNextPage } } } } }";
 
 const STAGE_MUTATION: &str = "mutation SetStage($id: String!, $stateId: String!) { \
     issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }";
@@ -564,13 +624,28 @@ struct StatesData {
 #[derive(Deserialize)]
 struct IssueTeam {
     id: String,
-    team: Team,
+    team: Team<WorkflowState>,
 }
 
 #[derive(Deserialize)]
-struct Team {
+struct Team<S> {
     key: String,
-    states: Connection<WorkflowState>,
+    states: Connection<S>,
+}
+
+#[derive(Deserialize)]
+struct TeamsData {
+    teams: Teams,
+}
+
+#[derive(Deserialize)]
+struct Teams {
+    nodes: Vec<Team<StateName>>,
+}
+
+#[derive(Deserialize)]
+struct StateName {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -784,6 +859,23 @@ mod tests {
                 .set_stage(&id, "Needs Input")
                 .is_err()
         );
+    }
+
+    /// The rule doctor and the stage move share: exact, once. More states
+    /// than one page holds is refused, not truncated; it cannot be recorded
+    /// on a workspace whose team has nine.
+    #[test]
+    fn team_states_are_one_page_and_names_match_exactly_once() {
+        let names = ["Todo", "Doing", "Doing"];
+        assert_eq!(find_state(names, "Todo"), Ok(0));
+        assert_eq!(find_state(names, "todo"), Err(StateMismatch::Missing));
+        assert_eq!(find_state(names, "Doing"), Err(StateMismatch::Ambiguous));
+
+        let more = r#"{"data":{"teams":{"nodes":[{"key":"OWL","states":{
+            "nodes":[{"name":"Todo"}],"pageInfo":{"hasNextPage":true}}}]}}}"#;
+        let error = tracker(vec![more]).team_states("OWL").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert!(error.message.contains("more than 50"), "{error}");
     }
 
     /// OWL-1 as Linear gave it on 2026-09-29, made by its onboarding

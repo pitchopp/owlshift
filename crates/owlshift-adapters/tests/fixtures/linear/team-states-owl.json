@@ -1,0 +1,75 @@
+{
+  "recorded": "2026-10-04 on the Owlshift workspace, recorded live with the adapter's request (OWL-147)",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query TeamStates($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { key states(first: 50) { nodes { name } pageInfo { hasNextPage } } } } }",
+        "variables": {
+          "key": "OWL"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "teams": {
+            "nodes": [
+              {
+                "key": "OWL",
+                "states": {
+                  "nodes": [
+                    {
+                      "name": "In Review"
+                    },
+                    {
+                      "name": "Needs Input"
+                    },
+                    {
+                      "name": "Triage"
+                    },
+                    {
+                      "name": "Duplicate"
+                    },
+                    {
+                      "name": "Done"
+                    },
+                    {
+                      "name": "Backlog"
+                    },
+                    {
+                      "name": "Todo"
+                    },
+                    {
+                      "name": "Canceled"
+                    },
+                    {
+                      "name": "In Progress"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query TeamStates($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { key states(first: 50) { nodes { name } pageInfo { hasNextPage } } } } }",
+        "variables": {
+          "key": "NOPE"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "teams": {
+            "nodes": []
+          }
+        }
+      }
+    }
+  ]
+}
