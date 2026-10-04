@@ -68,7 +68,9 @@ fn posts_the_delivery_report_on_a_real_ticket() {
     let keychain = Keychain::in_memory();
     keychain.store(LINEAR_ACCOUNT, &linear_key()).unwrap();
     keychain.store(GITHUB_ACCOUNT, &github_token()).unwrap();
-    let tracker = linear(&keychain).unwrap();
+    // No Linear app is stored here: the report goes through the key.
+    let team = ticket.as_str().rsplit_once('-').unwrap().0;
+    let tracker = linear(&keychain, team).unwrap();
     let forge = github(&keychain, repo).unwrap();
 
     assert_eq!(tracker.ticket(&ticket).unwrap().id, ticket);

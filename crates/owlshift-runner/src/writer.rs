@@ -22,6 +22,10 @@
 //! the ticket parks, why and what restarts it ([`ParkedComment`],
 //! [`Writer::post_parked`]).
 //!
+//! QUESTIONS, RE-ASK and REPLY wait for the decider: a Writer made
+//! [`Writer::mentioning`] them adds a line that mentions them, so the
+//! tracker notifies them (OWL-157).
+//!
 //! And the ticket's visible stage ([`VisibleStage`], [`Writer::set_stage`]):
 //! working while a Build runs, needs input while questions wait, review once
 //! the pull request is open, parked once Owlshift stopped on the ticket.
@@ -913,11 +917,27 @@ impl VisibleStage {
 /// Writes to the tracker, and later to the forge, after asking the floor.
 pub struct Writer<'a> {
     tracker: &'a dyn Tracker,
+    /// The account the comments that wait for a person mention.
+    decider: Option<String>,
 }
 
 impl<'a> Writer<'a> {
     pub fn new(tracker: &'a dyn Tracker) -> Self {
-        Self { tracker }
+        Self {
+            tracker,
+            decider: None,
+        }
+    }
+
+    /// The same Writer, mentioning the account `decider` in the comments
+    /// that wait for them: QUESTIONS, RE-ASK and REPLY (OWL-157). Right after
+    /// the header, a `Waiting for <mention>` line names them in the
+    /// tracker's own way, so a tracker that notifies on a mention tells them
+    /// even when they do not follow the ticket. A tracker with no mention,
+    /// or one it could not read, gets the comment as rendered.
+    pub fn mentioning(mut self, decider: &str) -> Self {
+        self.decider = Some(decider.to_owned());
+        self
     }
 
     /// Pushes exactly `commit` to `branch` on `remote`, with the runner's own
@@ -1039,7 +1059,7 @@ impl<'a> Writer<'a> {
     /// Posts a round's QUESTIONS comment and returns it as the tracker
     /// recorded it: its id and time are what the ticket ref keeps of the ask.
     pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Comment, WriteError> {
-        self.post(&comment.ticket, &comment.render())
+        self.post(&comment.ticket, &self.waiting(comment.render()))
     }
 
     /// Posts a DECISION comment and returns it as the tracker recorded it:
@@ -1050,12 +1070,12 @@ impl<'a> Writer<'a> {
 
     /// Posts a RE-ASK comment and returns it as the tracker recorded it.
     pub fn post_reask(&self, comment: &ReaskComment) -> Result<Comment, WriteError> {
-        self.post(&comment.ticket, &comment.render())
+        self.post(&comment.ticket, &self.waiting(comment.render()))
     }
 
     /// Posts a REPLY comment and returns it as the tracker recorded it.
     pub fn post_reply(&self, comment: &ReplyComment) -> Result<Comment, WriteError> {
-        self.post(&comment.ticket, &comment.render())
+        self.post(&comment.ticket, &self.waiting(comment.render()))
     }
 
     /// Posts a RESUME comment and returns it as the tracker recorded it.
@@ -1090,6 +1110,22 @@ impl<'a> Writer<'a> {
         self.tracker
             .post_comment(ticket, body)
             .map_err(WriteError::Tracker)
+    }
+
+    /// `body`, a marked comment, with the line naming whom it waits for as
+    /// its second section, when there is someone the tracker can mention.
+    /// The tracker is asked at each post: a few times a ticket.
+    fn waiting(&self, body: String) -> String {
+        let mention = self
+            .decider
+            .as_deref()
+            .and_then(|account| self.tracker.mention(account));
+        match (mention, body.split_once("\n\n")) {
+            (Some(mention), Some((header, rest))) => {
+                format!("{header}\n\nWaiting for {mention}\n\n{rest}")
+            }
+            _ => body,
+        }
     }
 }
 
@@ -1845,6 +1881,105 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             self.stages.borrow_mut().push(state.to_owned());
             Ok(())
         }
+
+        /// Any account but `nobody`, which it cannot mention.
+        fn mention(&self, account: &str) -> Option<String> {
+            (account != "nobody").then(|| format!("<mention of {account}>"))
+        }
+    }
+
+    /// The comments that wait for the decider mention them right after the
+    /// header (OWL-157), and stay marked comments; the others never do; and
+    /// a mention the tracker cannot give leaves the body as rendered.
+    #[test]
+    fn the_comments_that_wait_for_the_decider_mention_them() {
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker).mentioning("u1");
+        let question = Question {
+            id: owlshift_contracts::ids::QuestionId::new("Q1").unwrap(),
+            category: "scope".to_owned(),
+            context: String::new(),
+            text: "Which?".to_owned(),
+            options: Vec::new(),
+            recommendation: None,
+        };
+        let round = NonZeroU32::new(1).unwrap();
+        let questions = QuestionsComment {
+            ticket: ticket(),
+            round,
+            summary: String::new(),
+            questions: vec![question.clone()],
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+        };
+        let reask = ReaskComment {
+            ticket: ticket(),
+            round,
+            reask: 1,
+            open: Vec::new(),
+        };
+        let reply = ReplyComment {
+            ticket: ticket(),
+            replies: vec![(question.clone(), "This one.".to_owned())],
+        };
+        let waiting = [
+            (writer.post_questions(&questions), MarkerKind::Questions),
+            (writer.post_reask(&reask), MarkerKind::ReAsk),
+            (writer.post_reply(&reply), MarkerKind::Reply),
+        ];
+        for (posted, kind) in waiting {
+            let body = posted.unwrap().body;
+            let (_, rest) = body.split_once("\n\n").unwrap();
+            assert!(
+                rest.starts_with("Waiting for <mention of u1>\n\n"),
+                "{body}"
+            );
+            let marked = MarkedComment::parse(&body).unwrap().unwrap();
+            assert_eq!(marked.header.kind, kind);
+            assert_eq!(marked.footer.unwrap().kind, kind);
+        }
+
+        let decision = DecisionComment {
+            ticket: ticket(),
+            question,
+            decision: "This one.".to_owned(),
+            basis: "The ticket.".to_owned(),
+            run: None,
+        };
+        let resume = ResumeComment {
+            ticket: ticket(),
+            round,
+            understood: Vec::new(),
+        };
+        let parked = ParkedComment {
+            ticket: ticket(),
+            reason: ParkReason::Blocked,
+            detail: String::new(),
+            round: None,
+            open: Vec::new(),
+            restart: Restart::Do,
+        };
+        let delivery = report(Err(forge::Error::new(
+            ErrorKind::Unauthorized,
+            "not read",
+        )));
+        assert_eq!(
+            writer.post_decision(&decision).unwrap().body,
+            decision.render()
+        );
+        assert_eq!(writer.post_resume(&resume).unwrap().body, resume.render());
+        assert_eq!(writer.post_parked(&parked).unwrap().body, parked.render());
+        assert_eq!(
+            writer.post_delivery_report(&delivery).unwrap().body,
+            delivery.render()
+        );
+
+        let unmentioned = Writer::new(&tracker).mentioning("nobody");
+        assert_eq!(
+            unmentioned.post_questions(&questions).unwrap().body,
+            questions.render()
+        );
     }
 
     #[test]

@@ -1161,7 +1161,8 @@ impl OnDemand<'_> {
             decided: left.decided,
             fallback: left.fallback,
         };
-        let posted = match Writer::new(self.tracker).post_questions(&comment) {
+        let writer = Writer::new(self.tracker).mentioning(&decider.account);
+        let posted = match writer.post_questions(&comment) {
             Ok(posted) => posted,
             Err(error) => return stop(Err(format!("posting them failed: {error}"))),
         };
@@ -1538,6 +1539,7 @@ impl OnDemand<'_> {
                     open: open.clone(),
                 };
                 let posted = Writer::new(self.tracker)
+                    .mentioning(&asked.account)
                     .post_reask(&reask)
                     .map_err(|e| refused("posting the re-ask on the ticket", e))?;
                 sink.emit(
@@ -1596,6 +1598,7 @@ impl OnDemand<'_> {
                     replies,
                 };
                 let posted = Writer::new(self.tracker)
+                    .mentioning(&asked.account)
                     .post_reply(&reply)
                     .map_err(|e| refused("posting the reply on the ticket", e))?;
                 sink.emit(
@@ -2912,6 +2915,14 @@ mod tests {
                 TrackerAuthor::Other { name: "bot".into() },
                 "Hi.",
                 Relation::Other,
+            ),
+            // Owlshift's own comment, posted as the Linear app user (OWL-157).
+            (
+                TrackerAuthor::Other {
+                    name: "owlshiftbot".into(),
+                },
+                marked,
+                Relation::Owlshift,
             ),
         ];
         for (author, body, relation) in cases {

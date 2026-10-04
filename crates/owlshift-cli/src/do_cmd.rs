@@ -141,8 +141,17 @@ fn run_with(
 
     // From here on, the credentials: the runner's own, never an agent's.
     let keychain = open_keychain().map_err(|error| error.to_string())?;
+    // With the Linear app stored, its token is requested here, before any
+    // work, and revoked when the tracker is dropped (OWL-157).
     let tracker: Box<dyn Tracker> = match project.tracker.kind {
-        TrackerKind::Linear => Box::new(tracker::linear(&keychain)?),
+        TrackerKind::Linear => {
+            let team = project
+                .tracker
+                .team
+                .as_deref()
+                .ok_or("a Linear project names its team in `tracker.team`")?;
+            Box::new(tracker::linear(&keychain, team)?)
+        }
         TrackerKind::Markdown => Box::new(MarkdownTracker::new(root)),
     };
     let forge = forge::github(&keychain, repo.clone())?;

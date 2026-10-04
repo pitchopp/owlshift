@@ -280,6 +280,11 @@ impl Tracker for Clocked<'_> {
         }
         Tracker::set_stage(&self.inner, id, state)
     }
+
+    /// A tracker that notifies on a mention, as Linear does (OWL-157).
+    fn mention(&self, account: &str) -> Option<String> {
+        Some(format!("@{account}"))
+    }
 }
 
 /// A project seeded into a bare remote, with the person's checkout, and
@@ -1444,7 +1449,11 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
     let comments = bench.comments();
     assert_eq!(comments.len(), 1, "{comments:?}");
     assert!(comments[0].starts_with("[owlshift] QUESTIONS · round 1\n"));
+    // The questions mention their decider (OWL-157), as do the RE-ASK and
+    // the REPLY below.
+    let mentioned = "\n\nWaiting for @maintainer\n\n";
     for text in [
+        mentioned,
         "**Q1** (scope)",
         "**Q2** (scope)",
         "Recommendation: English",
@@ -1545,10 +1554,22 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
             "The words are given, but not the sign-off.",
         ),
     ]);
-    // A person moved the ticket meanwhile: the re-ask puts it back.
+    // A person moved the ticket meanwhile: the re-ask puts it back. Another
+    // person is its assignee now, until the REPLY below: the RE-ASK and the
+    // REPLY still mention the decider the round was asked of.
     MarkdownTracker::new(&bench.remote.checkout)
         .set_stage(&ticket(), "Todo")
         .unwrap();
+    let assign = |from: &str, to: &str| {
+        let text = fs::read_to_string(bench.ticket_file()).unwrap();
+        let changed = text.replace(
+            &format!("assignee = \"{from}\""),
+            &format!("assignee = \"{to}\""),
+        );
+        assert_ne!(changed, text);
+        fs::write(bench.ticket_file(), changed).unwrap();
+    };
+    assign("maintainer", "deputy");
     let (reasked, printed) = bench.continue_ticket(vec![bench.reply(None, Some(&partial))]);
     match reasked {
         Err(Stop::Reasked {
@@ -1574,6 +1595,7 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
         "{reask}"
     );
     assert_eq!(bench.stage(), "Needs Input");
+    assert!(reask.contains(mentioned), "{reask}");
     assert!(reask.contains("(re-ask 1 of 3:"), "{reask}");
     assert!(
         reask.contains("Still open (partial): The words are given, but not the sign-off."),
@@ -1629,6 +1651,8 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
         "{reply}"
     );
     assert!(reply.contains("`owlshift continue DEMO-1`"), "{reply}");
+    assert!(reply.contains(mentioned), "{reply}");
+    assign("deputy", "maintainer");
     let record = bench.record();
     assert_eq!(
         (record.state.waiting, record.state.reasks),
