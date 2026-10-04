@@ -29,7 +29,7 @@ Every text of the product is written in English, as the rest of the repository i
 | An empty log | `Nothing in the log yet. The night is young.` |
 | A sober failure | `✗ Agent isolation: bwrap is missing. I run no agent without it.` |
 
-The build plan fixes some messages word for word, such as doctor's summary ([build plan](build-plan.md#cli-surface-for-p0-and-p1), "How `doctor` reports"), and tests check them. That wording stands until the follow-up that gives the CLI this voice rewrites it, in the build plan first (section 6).
+The build plan fixes some messages word for word, such as doctor's summary ([build plan](build-plan.md#cli-surface-for-p0-and-p1), "How `doctor` reports"), and tests check them. That wording stands until the follow-up that gives the CLI this voice rewrites it, in the build plan first (OWL-163).
 
 ## 3. Logo
 
@@ -166,7 +166,7 @@ Two pairs fail and are therefore ruled out: `apricot` as text on a light backgro
 A terminal has its user's theme, light or dark, and its user's palette. Owlshift respects both.
 
 - **States keep the 16 standard ANSI colours,** as doctor does already ([build plan](build-plan.md#cli-surface-for-p0-and-p1), "How `doctor` reports"): green `✓`, yellow `!`, red `✗`, the default foreground for `·`, bold for headings. The user's theme decides how they look, so they stay legible on a light terminal as on a dark one; the brand's exact hues would not.
-- **The brand appears only in the `{o,o}` signature,** its eyes `o,o` in `apricot`, its braces in the default foreground: in 24-bit colour (`ESC[38;2;255;142;94m`) when `COLORTERM` is `truecolor` or `24bit`; otherwise in colour 209 of the 256-colour palette (`#ff875f`) when `TERM` names a 256-colour terminal; otherwise without colour. What these variables say on each terminal Owlshift supports is checked live by the follow-up that builds the signature (section 6), before code depends on it.
+- **The brand appears only in the `{o,o}` signature,** its eyes `o,o` in `apricot`, its braces in the default foreground: in 24-bit colour (`ESC[38;2;255;142;94m`) when `COLORTERM` is `truecolor` or `24bit`; otherwise in colour 209 of the 256-colour palette (`#ff875f`) when `TERM` names a 256-colour terminal; otherwise without colour. What these variables say on each terminal Owlshift supports is checked live by the follow-up that builds the signature (OWL-164), before code depends on it.
 - **Every rule that turns colour off turns the signature's off too:** standard output not a terminal, `NO_COLOR` set, `TERM=dumb`, native Windows.
 - On a white terminal the eyes reach 2.26:1 (2.36:1 in colour 209). That is acceptable because the signature is decoration: it carries no meaning, and the same characters read without their colour.
 
@@ -188,11 +188,11 @@ A terminal has its user's theme, light or dark, and its user's palette. Owlshift
 | Surface | What applies | Status |
 | --- | --- | --- |
 | README and GitHub | The README opens with the lockup in a `<picture>` that follows GitHub's light or dark theme (`prefers-color-scheme`), alternative text "Owlshift", then the tagline. The repository's social preview is `owlshift-social.png` (below), which the maintainer uploads in the repository's settings | This change (OWL-162) |
-| CLI: the voice | Section 2 applied to every message of `doctor`, `init`, `do`, `continue`, `watch`, `logs` and `config show`, and to desktop notifications; the build plan's fixed wording and the tests that check it change with it | Follow-up |
-| CLI: the signature | `{o,o}` in the header of the CLI's reports, its eyes coloured as section 4 says | Follow-up |
-| Ticket comments | The voice applies to their human-readable text, with a light hand since a whole team reads them; their markers, numbering and structure stay as they are (section 2, rule 4) | With the CLI's voice |
-| Local web UI (P8) | The themes and both typefaces, carried in the binary; the mark as favicon | Follow-up, P8 |
-| Menu-bar app (P11) | The app icon from the dark mark on macOS's icon grid; the menu-bar icon from the one-colour mark as a template image (black with transparency, which macOS tints) | Follow-up, P11 |
+| CLI: the voice | Section 2 applied to every message of `doctor`, `init`, `do`, `continue`, `watch`, `logs` and `config show`, and to desktop notifications; the build plan's fixed wording and the tests that check it change with it | Follow-up, OWL-163 |
+| CLI: the signature | `{o,o}` in the header of the CLI's reports, its eyes coloured as section 4 says | Follow-up, OWL-164 |
+| Ticket comments | The voice applies to their human-readable text, with a light hand since a whole team reads them; their markers, numbering and structure stay as they are (section 2, rule 4) | With the CLI's voice, OWL-163 |
+| Local web UI (P8) | The themes and both typefaces, carried in the binary; the mark as favicon | Follow-up, P8, OWL-165 |
+| Menu-bar app (P11) | The app icon from the dark mark on macOS's icon grid; the menu-bar icon from the one-colour mark as a template image (black with transparency, which macOS tints) | Follow-up, P11, OWL-166 |
 | Public site | The themes and typefaces of the web UI, the lockups, the social preview's art direction | When a site is planned; no issue yet |
 
 **GitHub, checked live on 2026-10-04.** GitHub keeps a `<picture>` with a `<source media="(prefers-color-scheme: dark)">` in a README: `gh api markdown` (mode `gfm`) on the README's header returned it intact, wrapped in GitHub's own `<themed-picture>`. GitHub has no API to set a repository's social preview: the mutations of its GraphQL schema hold none for a social, Open Graph or preview image, and `repository { usesCustomOpenGraphImage }` read `false`. The repository was already public (`visibility: PUBLIC`), so the preview can be uploaded now rather than when the repository opens.
