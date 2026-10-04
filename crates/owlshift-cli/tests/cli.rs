@@ -1045,12 +1045,12 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
     let repo = tempfile::tempdir().unwrap();
     git_init(repo.path());
 
-    for command in ["do", "continue"] {
-        let output = owlshift(repo.path(), config_dir.path(), &[command, "OWL-1"]);
+    for args in [&["do", "OWL-1"][..], &["continue", "OWL-1"], &["watch"]] {
+        let output = owlshift(repo.path(), config_dir.path(), args);
         assert!(!output.status.success());
         assert!(
             stderr(&output).contains("run `owlshift init`"),
-            "{command}: {}",
+            "{args:?}: {}",
             stderr(&output)
         );
     }

@@ -12,14 +12,15 @@ Owlshift is an open-source runner that works a team's existing backlog continuou
 
 ## Status
 
-Early development. Steps P0 and P1 of the roadmap are built: the CLI runs one ticket to a verified pull request in the foreground. P2, questions on the ticket, is in progress: a run's questions are posted on the ticket, and `owlshift continue` picks the ticket up once they are answered. The commands available today:
+Early development. Steps P0 and P1 of the roadmap are built: the CLI runs one ticket to a verified pull request in the foreground. P2, questions on the ticket, is in progress: a run's questions are posted on the ticket, and `owlshift continue` picks the ticket up once they are answered. P3 has started with `owlshift watch`, which does that by itself. The commands available today:
 
 - `owlshift doctor`: check whether this machine is ready (git, the harness CLIs and their logins, the agent runs' isolation and Claude Code token, the configuration files), and say why each problem matters and how to fix it.
 - `owlshift config show`: print the effective configuration and the file each value comes from.
 - `owlshift init`: write a commented `owlshift.toml` for this repository, then store the tracker and forge secrets and the agent runs' Claude Code token that `owlshift do` needs in the system keychain.
 - `owlshift do TICKET`: run one ticket to a verified pull request, in the foreground; questions the run needs answered are posted on the ticket.
 - `owlshift continue TICKET`: once the ticket's questions are answered there and the answer has been left unedited for 10 minutes, or the project's `policy.quiet_window_minutes` (or ends with `go`), check the answers, then ask again what is missing or run on to a verified pull request; restarts a parked ticket.
-- `owlshift logs [TICKET] [--last N] [--follow]`: print the events `owlshift do` and `owlshift continue` recorded, oldest first, optionally only one ticket's, only the last N with `--last N`, and keep printing new ones with `--follow`.
+- `owlshift watch`: in the foreground, continue each ticket whose questions wait, as `owlshift continue` would, once its decider's reply counts, until Ctrl-C. A parked ticket, or one left at Build, still needs `owlshift continue`.
+- `owlshift logs [TICKET] [--last N] [--follow]`: print the events `owlshift do`, `owlshift continue` and `owlshift watch` recorded, oldest first, optionally only one ticket's, only the last N with `--last N`, and keep printing new ones with `--follow`.
 
 There is no packaged release yet. Install from source:
 
