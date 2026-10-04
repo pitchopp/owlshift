@@ -1,9 +1,12 @@
 //! The Linear tracker: Linear's GraphQL API over HTTPS, authenticated with a
-//! personal API key that the runner reads from the system keychain.
+//! personal API key that the runner reads from the system keychain, and,
+//! when the workspace has given Owlshift an OAuth app, writing as that app's
+//! user ([`app`], decision D8).
 //!
 //! The adapter talks through a [`Transport`], one GraphQL request at a time:
 //! [`HttpTransport`] in production, a replay of recorded exchanges in tests
-//! (see [`crate::graphql`]).
+//! (see [`crate::graphql`]). Writes go through a second one when
+//! [`LinearTracker::writing_as_app`] set it: [`app::AppTransport`].
 //!
 //! What the adapter relies on was checked live on the Owlshift workspace on
 //! 2026-09-28 (OWL-13; build plan, check C4):
@@ -58,8 +61,19 @@
 //! the workspace's URL key, the identifier, then a slug of the title. A
 //! notification shows it as the ticket's link.
 //!
+//! Checked live on 2026-10-04 (OWL-157; build plan, check C4), through an
+//! OAuth app's client credentials token: a comment posted with it comes from
+//! the app user, `user.app` true, with no bot actor or external user, so the
+//! adapter reads `app` and never takes such a comment for an account's; the
+//! decider got an `issueCommentMention` from the app user for a comment
+//! holding the line `Waiting for <their User.url>`, which Linear stored and
+//! answered verbatim; `issueUpdate` moved a stage with it; an `issueCreate`
+//! through it made an issue whose creator is the app user, `app` true.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
+
+pub mod app;
 
 use std::fmt;
 use std::time::Duration;
@@ -113,14 +127,8 @@ impl fmt::Debug for HttpTransport {
 
 impl HttpTransport {
     pub fn new(key: ApiKey) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            // A 401 carries a GraphQL error body worth reading.
-            .http_status_as_error(false)
-            .user_agent(concat!("owlshift/", env!("CARGO_PKG_VERSION")))
-            .build();
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: http_agent(),
             key,
         }
     }
@@ -128,24 +136,51 @@ impl HttpTransport {
 
 impl Transport for HttpTransport {
     fn send(&self, request: &Value) -> Result<Response, String> {
-        let mut response = self
-            .agent
-            .post(ENDPOINT)
-            .header("Authorization", &self.key.0)
-            .send_json(request)
-            .map_err(|e| e.to_string())?;
-        let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| e.to_string())?;
-        Ok(Response { status, body })
+        post_graphql(&self.agent, &self.key.0, request)
     }
 }
 
-/// A Linear workspace, as seen through one API key.
+/// The HTTP agent of every call to Linear, the app's included: 30 seconds
+/// at most, and the body of an error status read rather than dropped.
+fn http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        // A 401 carries a GraphQL error body worth reading.
+        .http_status_as_error(false)
+        .user_agent(concat!("owlshift/", env!("CARGO_PKG_VERSION")))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+/// Posts one GraphQL request to [`ENDPOINT`] with `authorization` as the
+/// header's value: an API key as it is, or `Bearer` and an app's token. A
+/// transport error names no header.
+fn post_graphql(
+    agent: &ureq::Agent,
+    authorization: &str,
+    request: &Value,
+) -> Result<Response, String> {
+    let mut response = agent
+        .post(ENDPOINT)
+        .header("Authorization", authorization)
+        .send_json(request)
+        .map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    Ok(Response { status, body })
+}
+
+type Shared = Box<dyn Transport + Send + Sync>;
+
+/// A Linear workspace, as seen through one API key, writing through an app
+/// user when one is set.
 pub struct LinearTracker {
-    transport: Box<dyn Transport + Send + Sync>,
+    transport: Shared,
+    /// The app's transport, for every write, when one is set.
+    writes: Option<Shared>,
     comment_page: u32,
 }
 
@@ -153,8 +188,16 @@ impl fmt::Debug for LinearTracker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinearTracker")
             .field("comment_page", &self.comment_page)
+            .field("writes_as_app", &self.writes.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// The app user a tracker writes as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppUser {
+    /// The name Linear shows on its comments.
+    pub name: String,
 }
 
 impl LinearTracker {
@@ -174,8 +217,52 @@ impl LinearTracker {
     pub fn with_transport(transport: impl Transport + Send + Sync + 'static) -> Self {
         Self {
             transport: Box::new(transport),
+            writes: None,
             comment_page: MAX_PAGE,
         }
+    }
+
+    /// The adapter writing its comments and stage moves through `app`, the
+    /// transport of the workspace's OAuth app ([`app::AppTransport`] in
+    /// production), so they come from its app user and Linear notifies the
+    /// people they concern (decision D8); reads stay on the first transport.
+    ///
+    /// Checked first, with one request through each: `app` must act as an
+    /// app user, of the workspace the reads see, that sees the team whose key
+    /// is `team`. An app reaches the workspace's public teams only, and app
+    /// credentials of another workspace would write to the issue of that
+    /// workspace with the same identifier. Refused otherwise, with the
+    /// reason; nothing is written either way.
+    pub fn writing_as_app(
+        mut self,
+        app: impl Transport + Send + Sync + 'static,
+        team: &str,
+    ) -> Result<(Self, AppUser), Error> {
+        let key = team.to_ascii_uppercase();
+        let seen: AppSeen = call(&app, APP_QUERY, json!({ "key": key }))?;
+        let ours: Workspace = self.call(WORKSPACE_QUERY, json!({}))?;
+        let name = seen.viewer.display_name;
+        if !seen.viewer.app {
+            return Err(invalid(format!(
+                "the Linear app's token acts as {name:?}, which is not an app user"
+            )));
+        }
+        if seen.organization.id != ours.organization.id {
+            return Err(invalid(format!(
+                "the Linear app {name:?} belongs to another workspace than the Linear API key"
+            )));
+        }
+        if seen.teams.nodes.is_empty() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!(
+                    "the Linear app {name:?} does not see team {key:?}: an app reaches the \
+                     workspace's public teams only"
+                ),
+            ));
+        }
+        self.writes = Some(Box::new(app));
+        Ok((self, AppUser { name }))
     }
 
     /// Reads comments `size` at a time (1 to [`MAX_PAGE`], the default), so a
@@ -185,15 +272,29 @@ impl LinearTracker {
         self
     }
 
-    /// Sends one request and returns its `data`, decoded.
+    /// Sends one read and returns its `data`, decoded.
     fn call<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T, Error> {
-        let request = json!({ "query": query, "variables": variables });
-        let response = self
-            .transport
-            .send(&request)
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Linear: {e}")))?;
-        decode(&response)
+        call(self.transport.as_ref(), query, variables)
     }
+
+    /// Sends one write, through the app when one is set.
+    fn write<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T, Error> {
+        let transport = self.writes.as_ref().unwrap_or(&self.transport);
+        call(transport.as_ref(), query, variables)
+    }
+}
+
+/// Sends one request through `transport` and returns its `data`, decoded.
+fn call<T: DeserializeOwned>(
+    transport: &(dyn Transport + Send + Sync),
+    query: &str,
+    variables: Value,
+) -> Result<T, Error> {
+    let request = json!({ "query": query, "variables": variables });
+    let response = transport
+        .send(&request)
+        .map_err(|e| Error::new(ErrorKind::Other, format!("Linear: {e}")))?;
+    decode(&response)
 }
 
 impl LinearTracker {
@@ -306,7 +407,7 @@ impl Tracker for LinearTracker {
 
     fn post_comment(&self, id: &TicketId, body: &str) -> Result<Comment, Error> {
         let variables = json!({ "issueId": id.as_str(), "body": body });
-        let data: PostData = self.call(POST_MUTATION, variables)?;
+        let data: PostData = self.write(POST_MUTATION, variables)?;
         match data.comment_create {
             CommentCreate {
                 success: true,
@@ -319,9 +420,10 @@ impl Tracker for LinearTracker {
     }
 
     /// Two requests: the workflow states of the issue's team, to find the
-    /// one named `state`, then `issueUpdate` with its id. The issue is
-    /// updated by the id Linear gave in the first answer. Nothing is cached:
-    /// a command moves the stage a few times at most.
+    /// one named `state`, then `issueUpdate` with its id, through the app
+    /// when one is set. The issue is updated by the id Linear gave in the
+    /// first answer. Nothing is cached: a command moves the stage a few times
+    /// at most.
     fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), Error> {
         let data: StatesData = self.call(STATES_QUERY, json!({ "id": id.as_str() }))?;
         let issue = data.issue;
@@ -347,7 +449,7 @@ impl Tracker for LinearTracker {
             }
         };
         let variables = json!({ "id": issue.id, "stateId": target.id });
-        let data: StageData = self.call(STAGE_MUTATION, variables)?;
+        let data: StageData = self.write(STAGE_MUTATION, variables)?;
         match data.issue_update {
             IssueUpdate {
                 success: true,
@@ -360,13 +462,32 @@ impl Tracker for LinearTracker {
     fn ticket_url(&self, id: &TicketId) -> Option<String> {
         self.issue_url(id).ok()
     }
+
+    /// The account's profile link (`User.url`), which Linear turns into a
+    /// mention of them (checked 2026-10-04, OWL-157). Read each time, a few
+    /// times a ticket: a person may rename their profile while `watch`
+    /// runs. Left out when it cannot be read, or is not a plain
+    /// `https://linear.app/` link that Markdown would leave whole.
+    fn mention(&self, account: &str) -> Option<String> {
+        let data: UserData = self.call(USER_QUERY, json!({ "id": account })).ok()?;
+        profile_link(&data.user.url)
+    }
+}
+
+/// `url` when it is a Linear link with nothing Markdown reads as syntax.
+fn profile_link(url: &str) -> Option<String> {
+    let plain = url
+        .chars()
+        .all(|c| !c.is_whitespace() && !c.is_control() && !"()[]<>\"'`\\".contains(c));
+    (url.starts_with("https://linear.app/") && plain).then(|| url.to_owned())
 }
 
 /// The fields read from every comment. No e-mail, no full name: only what the
-/// contract carries.
+/// contract carries, and whether the user is an app (OWL-157).
 macro_rules! comment_fields {
     () => {
-        "id body createdAt editedAt user { id displayName } botActor { name } externalUser { name }"
+        "id body createdAt editedAt user { id displayName app } botActor { name } \
+         externalUser { name }"
     };
 }
 
@@ -398,6 +519,16 @@ const TEAM_STATES_QUERY: &str = "query TeamStates($key: String!) { \
 
 const STAGE_MUTATION: &str = "mutation SetStage($id: String!, $stateId: String!) { \
     issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }";
+
+/// What [`LinearTracker::writing_as_app`] asks through the app.
+const APP_QUERY: &str = "query App($key: String!) { viewer { displayName app } \
+    organization { id } teams(filter: { key: { eq: $key } }) { nodes { id } } }";
+
+/// What [`LinearTracker::writing_as_app`] asks through the API key.
+const WORKSPACE_QUERY: &str = "query Workspace { organization { id } }";
+
+/// A mention's link (OWL-157).
+const USER_QUERY: &str = "query Mention($id: String!) { user(id: $id) { url } }";
 
 /// Reads a GraphQL answer: its errors first, then its `data`.
 fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
@@ -523,6 +654,9 @@ struct Label {
 struct User {
     id: String,
     display_name: String,
+    /// An app user, such as Owlshift's own (OWL-157); read on comments only.
+    #[serde(default)]
+    app: bool,
 }
 
 impl User {
@@ -547,10 +681,12 @@ struct Named {
 /// does. Nobody named (a deleted account) is [`Author::unknown`].
 ///
 /// A comment posted through an account's personal API key is that account's
-/// too: a limit accepted for comments, which are how the decider answers.
+/// too: a limit accepted for comments, which are how the decider answers. An
+/// app user, Owlshift's own or another integration's, is never an account: no
+/// person holds it (OWL-157).
 fn author(user: Option<User>, bot: Option<Named>, external: Option<Named>) -> Author {
     match (user, bot, external) {
-        (Some(user), None, None) => Author::Account(user.into_person()),
+        (Some(user), None, None) if !user.app => Author::Account(user.into_person()),
         (user, bot, external) => bot
             .and_then(|b| b.name)
             .or_else(|| external.and_then(|e| e.name))
@@ -639,12 +775,12 @@ struct Team<S> {
 
 #[derive(Deserialize)]
 struct TeamsData {
-    teams: Teams,
+    teams: Teams<Team<StateName>>,
 }
 
 #[derive(Deserialize)]
-struct Teams {
-    nodes: Vec<Team<StateName>>,
+struct Teams<T> {
+    nodes: Vec<T>,
 }
 
 #[derive(Deserialize)]
@@ -690,6 +826,40 @@ impl LinearTracker {
 #[derive(Deserialize)]
 struct UrlData {
     issue: IssueUrl,
+}
+
+#[derive(Deserialize)]
+struct UserData {
+    user: UserUrl,
+}
+
+#[derive(Deserialize)]
+struct UserUrl {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct AppSeen {
+    viewer: AppViewer,
+    organization: Organization,
+    teams: Teams<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppViewer {
+    display_name: String,
+    app: bool,
+}
+
+#[derive(Deserialize)]
+struct Workspace {
+    organization: Organization,
+}
+
+#[derive(Deserialize)]
+struct Organization {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -780,6 +950,173 @@ mod tests {
             comment(None, None, None).into_comment().author,
             other("unknown")
         );
+    }
+
+    /// Owlshift's own comment as Linear answered it on 2026-10-04 (OWL-157),
+    /// posted through the app: a user with `app` true and nothing beside
+    /// it. An app user is never an account, so never the decider.
+    #[test]
+    fn an_app_users_comment_is_never_an_accounts() {
+        let page = r#"{"data":{"issue":{"comments":{"nodes":[
+            {"id":"c2","body":"b","createdAt":"2026-10-04T21:01:00Z","editedAt":null,
+             "user":{"id":"u1","displayName":"person-1","app":false},
+             "botActor":null,"externalUser":null},
+            {"id":"c1","body":"b","createdAt":"2026-10-04T21:00:00Z","editedAt":null,
+             "user":{"id":"u2","displayName":"owlshiftbot","app":true},
+             "botActor":null,"externalUser":null}],
+            "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}"#;
+        let comments = tracker(vec![page])
+            .comments(&TicketId::new("OWL-1").unwrap())
+            .unwrap();
+        assert_eq!(
+            comments[0].author,
+            Author::Other {
+                name: "owlshiftbot".to_owned()
+            }
+        );
+        assert!(
+            matches!(&comments[1].author, Author::Account(person) if person.id == "u1"),
+            "{comments:?}"
+        );
+    }
+
+    /// Answers each request by its operation's name, and keeps the names.
+    struct Scripted {
+        answers: Vec<(&'static str, Value)>,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Scripted {
+        fn new(answers: Vec<(&'static str, Value)>) -> Self {
+            Self {
+                answers,
+                asked: Default::default(),
+            }
+        }
+    }
+
+    impl Transport for Scripted {
+        fn send(&self, request: &Value) -> Result<Response, String> {
+            let query = request["query"].as_str().unwrap();
+            let name = query.split([' ', '(']).nth(1).unwrap().to_owned();
+            let data = self
+                .answers
+                .iter()
+                .find(|(answers, _)| *answers == name)
+                .map(|(_, data)| data.clone())
+                .unwrap_or_else(|| panic!("unexpected {name}"));
+            self.asked.lock().unwrap().push(name);
+            Ok(answer(200, &json!({ "data": data }).to_string()))
+        }
+    }
+
+    fn app_seen(app: bool, organization: &str, teams: usize) -> Value {
+        json!({ "viewer": { "displayName": "owlshiftbot", "app": app },
+            "organization": { "id": organization },
+            "teams": { "nodes": vec![json!({ "id": "t1" }); teams] } })
+    }
+
+    /// With an app, comments and stage moves go through it; reading, the
+    /// workflow states and mentions included, stays on the key.
+    #[test]
+    fn writes_go_through_the_app_and_reads_through_the_key() {
+        let comment = json!({ "id": "c1", "body": "x", "createdAt": "2026-10-04T21:00:00Z",
+            "editedAt": null, "user": { "id": "u2", "displayName": "owlshiftbot", "app": true },
+            "botActor": null, "externalUser": null });
+        let key = Scripted::new(vec![
+            ("Workspace", json!({ "organization": { "id": "org-1" } })),
+            (
+                "Comments",
+                json!({ "issue": { "comments": { "nodes": [],
+                    "pageInfo": { "hasNextPage": false, "endCursor": null } } } }),
+            ),
+            (
+                "States",
+                json!({ "issue": { "id": "i1", "team": { "key": "OWL", "states": {
+                    "nodes": [{ "id": "s1", "name": "Needs Input" }],
+                    "pageInfo": { "hasNextPage": false } } } } }),
+            ),
+            (
+                "Mention",
+                json!({ "user": { "url": "https://linear.app/owlshift/profiles/person-1" } }),
+            ),
+        ]);
+        let app = Scripted::new(vec![
+            ("App", app_seen(true, "org-1", 1)),
+            (
+                "PostComment",
+                json!({ "commentCreate": { "success": true, "comment": comment } }),
+            ),
+            (
+                "SetStage",
+                json!({ "issueUpdate": { "success": true,
+                    "issue": { "state": { "id": "s1", "name": "Needs Input" } } } }),
+            ),
+        ]);
+        let (by_key, by_app) = (key.asked.clone(), app.asked.clone());
+        let (tracker, user) = LinearTracker::with_transport(key)
+            .writing_as_app(app, "owl")
+            .unwrap();
+        assert_eq!(user.name, "owlshiftbot");
+        let id = TicketId::new("OWL-1").unwrap();
+        tracker.comments(&id).unwrap();
+        let posted = tracker.post_comment(&id, "x").unwrap();
+        tracker.set_stage(&id, "Needs Input").unwrap();
+        assert_eq!(
+            tracker.mention("u1").as_deref(),
+            Some("https://linear.app/owlshift/profiles/person-1")
+        );
+        assert!(matches!(posted.author, Author::Other { .. }));
+        assert_eq!(
+            *by_key.lock().unwrap(),
+            ["Workspace", "Comments", "States", "Mention"]
+        );
+        assert_eq!(*by_app.lock().unwrap(), ["App", "PostComment", "SetStage"]);
+    }
+
+    /// An app that is not an app user, belongs to another workspace than the
+    /// key, or does not see the project's team is refused.
+    #[test]
+    fn an_app_of_another_workspace_or_blind_to_the_team_is_refused() {
+        for (seen, kind, says) in [
+            (app_seen(false, "org-1", 1), ErrorKind::Other, "not an app user"),
+            (app_seen(true, "org-2", 1), ErrorKind::Other, "another workspace"),
+            (app_seen(true, "org-1", 0), ErrorKind::NotFound, "public teams only"),
+        ] {
+            let key = Scripted::new(vec![(
+                "Workspace",
+                json!({ "organization": { "id": "org-1" } }),
+            )]);
+            let app = Scripted::new(vec![("App", seen)]);
+            let error = LinearTracker::with_transport(key)
+                .writing_as_app(app, "OWL")
+                .unwrap_err();
+            assert_eq!(error.kind, kind, "{error}");
+            assert!(error.message.contains(says), "{error}");
+        }
+    }
+
+    /// A mention is a plain link to Linear, or nothing: never a failure.
+    #[test]
+    fn a_mention_is_a_plain_linear_link_or_nothing() {
+        let user = |url: &str| -> &'static str {
+            json!({ "data": { "user": { "url": url } } })
+                .to_string()
+                .leak()
+        };
+        let mention = |body: &'static str| tracker(vec![body]).mention("u1");
+        assert_eq!(
+            mention(user("https://linear.app/owlshift/profiles/person-1")).as_deref(),
+            Some("https://linear.app/owlshift/profiles/person-1")
+        );
+        assert_eq!(mention(user("https://example.com/profiles/person-1")), None);
+        assert_eq!(
+            mention(user("https://linear.app/owlshift/profiles/a)b")),
+            None
+        );
+        let unknown = r#"{"errors":[{"message":"Entity not found: User",
+            "extensions":{"code":"INPUT_ERROR"}}]}"#;
+        assert_eq!(mention(unknown), None);
     }
 
     /// Answers with prepared bodies, in order.
@@ -908,6 +1245,7 @@ mod tests {
             Some(User {
                 id: "u1".to_owned(),
                 display_name: "person-1".to_owned(),
+                app: false,
             })
         };
         let named = |name: Option<&str>| {

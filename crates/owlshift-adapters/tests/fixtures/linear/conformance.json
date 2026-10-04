@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-09-29 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
+  "recorded": "2026-09-29 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`); amended by script on 2026-10-05 (OWL-157), not recorded: the comment query reads `user.app`, given here as false, which is what C4 observed for comments posted through the API key",
   "exchanges": [
     {
       "request": {
@@ -78,7 +78,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -100,7 +100,8 @@
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "user": {
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001"
+                    "id": "00000000-0000-4000-8000-000000000001",
+                    "app": false
                   }
                 },
                 {
@@ -112,7 +113,8 @@
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "user": {
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001"
+                    "id": "00000000-0000-4000-8000-000000000001",
+                    "app": false
                   }
                 }
               ],
@@ -127,7 +129,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -162,7 +164,7 @@
     },
     {
       "request": {
-        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } } }",
+        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } } }",
         "variables": {
           "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
           "issueId": "OWL-99999"
@@ -196,7 +198,7 @@
     },
     {
       "request": {
-        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } } }",
+        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } } }",
         "variables": {
           "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
           "issueId": "OWL-13"
@@ -215,7 +217,8 @@
               "id": "00000000-0000-4000-8000-00000000c001",
               "user": {
                 "displayName": "person-1",
-                "id": "00000000-0000-4000-8000-000000000001"
+                "id": "00000000-0000-4000-8000-000000000001",
+                "app": false
               }
             },
             "success": true
@@ -226,7 +229,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -248,7 +251,8 @@
                   "id": "00000000-0000-4000-8000-00000000c001",
                   "user": {
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001"
+                    "id": "00000000-0000-4000-8000-000000000001",
+                    "app": false
                   }
                 },
                 {
@@ -260,7 +264,8 @@
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "user": {
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001"
+                    "id": "00000000-0000-4000-8000-000000000001",
+                    "app": false
                   }
                 },
                 {
@@ -272,7 +277,8 @@
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "user": {
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001"
+                    "id": "00000000-0000-4000-8000-000000000001",
+                    "app": false
                   }
                 }
               ],
