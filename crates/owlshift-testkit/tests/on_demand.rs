@@ -152,19 +152,31 @@ fn leave_plan(worktree: &Path) {
     fs::write(dir.join("ledger.json"), "{\"steps\":[]}\n").unwrap();
 }
 
+/// What happens elsewhere while a run of a command works: its number in
+/// the command, from 1, and the act, such as a person commenting.
+type During = (usize, Box<dyn FnOnce()>);
+
 /// The fake harness, one reply per run in order, with what the agent does
-/// first.
+/// first, and what happens while given runs work.
 struct Replies {
     program: PathBuf,
     replies: RefCell<VecDeque<PathBuf>>,
     current: RefCell<Option<FakeHarness>>,
     first: RefCell<Option<Agent>>,
+    during: RefCell<Vec<During>>,
+    started: Cell<usize>,
 }
 
 impl Harness for Replies {
     fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         if let Some(agent) = self.first.borrow_mut().take() {
             agent(run.worktree);
+        }
+        // The brief is written: what happens now, the run never reads.
+        self.started.set(self.started.get() + 1);
+        let mut during = self.during.borrow_mut();
+        if let Some(at) = during.iter().position(|(n, _)| *n == self.started.get()) {
+            (during.remove(at).1)();
         }
         let reply = self
             .replies
@@ -265,7 +277,7 @@ struct Bench {
     data: PathBuf,
     github: Arc<FakeGitHub>,
     /// The time of the next comment on the ticket.
-    clock: Cell<Timestamp>,
+    clock: Rc<Cell<Timestamp>>,
     /// The runner's comments starting with this are refused by the tracker.
     refuse: Cell<Option<&'static str>>,
     /// The tracker refuses every stage write.
@@ -360,7 +372,7 @@ impl Bench {
             env,
             remote,
             github,
-            clock: Cell::new("2026-10-02T09:00:00Z".parse().unwrap()),
+            clock: Rc::new(Cell::new("2026-10-02T09:00:00Z".parse().unwrap())),
             refuse: Cell::new(None),
             refuse_stage: Cell::new(false),
             waited: Cell::new(SignedDuration::from_mins(10)),
@@ -394,13 +406,37 @@ impl Bench {
     /// Runs `owlshift do DEMO-1` with one reply per run; returns its outcome
     /// and what it printed.
     fn run(&self, replies: Vec<Reply>, first: Option<Agent>) -> (Result<Delivered, Stop>, String) {
-        self.invoke(false, replies, first)
+        self.invoke(false, replies, first, Vec::new())
     }
 
     /// Runs `owlshift continue DEMO-1` with one reply per run, the answer
     /// check's included.
     fn continue_ticket(&self, replies: Vec<Reply>) -> (Result<Delivered, Stop>, String) {
-        self.invoke(true, replies, None)
+        self.invoke(true, replies, None, Vec::new())
+    }
+
+    /// Runs `owlshift continue DEMO-1` as `continue_ticket`, with `during`
+    /// happening while the runs it names work.
+    fn continue_during(
+        &self,
+        replies: Vec<Reply>,
+        during: Vec<During>,
+    ) -> (Result<Delivered, Stop>, String) {
+        self.invoke(true, replies, None, during)
+    }
+
+    /// `author` commenting on the ticket while the `run`th run of a command
+    /// works, at the next minute of the bench's clock.
+    fn comment_during(&self, run: usize, author: &'static str, body: &'static str) -> During {
+        let (checkout, clock) = (self.remote.checkout.clone(), self.clock.clone());
+        (
+            run,
+            Box::new(move || {
+                MarkdownTracker::new(&checkout)
+                    .post_comment(&ticket(), author, tick(&clock), body)
+                    .unwrap();
+            }),
+        )
     }
 
     /// The decider comments on the ticket, at the next minute.
@@ -473,6 +509,7 @@ impl Bench {
         continuing: bool,
         replies: Vec<Reply>,
         first: Option<Agent>,
+        during: Vec<During>,
     ) -> (Result<Delivered, Stop>, String) {
         // One `do` at a time in this process. A run forks children (the
         // gate's `sh`, the agent's `git`: a command that sets PATH and names
@@ -497,6 +534,8 @@ impl Bench {
             replies: RefCell::new(replies),
             current: RefCell::new(None),
             first: RefCell::new(first),
+            during: RefCell::new(during),
+            started: Cell::new(0),
         };
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
@@ -549,6 +588,10 @@ impl Bench {
         assert!(
             harness.replies.borrow().is_empty(),
             "a reply was left unused: {outcome:?}"
+        );
+        assert!(
+            harness.during.borrow().is_empty(),
+            "a run expected to work did not: {outcome:?}"
         );
         (outcome, String::from_utf8(out).unwrap())
     }
@@ -1593,6 +1636,190 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
         matches!(&done, Err(Stop::Refused(why)) if why.contains("nothing to continue")),
         "{done:?}"
     );
+}
+
+/// A round asked by `do` and answered at once, with `go`: the next
+/// `continue` checks it (one run) and resumes Build (the second).
+fn answered_round(bench: &Bench) -> Reply {
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\" Go.\n");
+    bench.reply(
+        None,
+        Some(&check(&[
+            ("Q1", "answered", "English."),
+            ("Q2", "answered", "Hello, reader."),
+        ])),
+    )
+}
+
+/// The `outcome` of each `gate` event about late comments, oldest first.
+fn late_outcomes(bench: &Bench) -> Vec<Value> {
+    bench
+        .events()
+        .iter()
+        .filter(|event| event.kind == EventKind::Gate && event.data.contains_key("late_comments"))
+        .map(|event| event.data["outcome"].clone())
+        .collect()
+}
+
+/// The decider's comments in a brief's thread, by body.
+fn decider_says(brief: &Brief) -> Vec<String> {
+    brief
+        .thread
+        .iter()
+        .filter_map(|entry| match entry {
+            ThreadEntry::Comment { author, body, .. } if author.relation == Relation::Decider => {
+                Some(body.trim().to_owned())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Scenario S2, step 5 (OWL-139): a decider comment posted while the
+/// resumed Build works gets one more Build run, whose work the pull request
+/// carries; someone else's comment during that run counts for nothing.
+#[test]
+fn a_late_comment_gets_one_more_build_run_and_reaches_the_pull_request() {
+    let bench = Bench::new(true);
+    let check = answered_round(&bench);
+    let (delivered, printed) = bench.continue_during(
+        vec![
+            check,
+            bench.reply(Some("Hello"), Some(DONE)),
+            bench.reply(Some("Hello and Bonjour"), Some(DONE)),
+        ],
+        vec![
+            bench.comment_during(2, "maintainer", "Also say Bonjour."),
+            bench.comment_during(3, "visitor", "Bonjour is French, by the way."),
+        ],
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    let mut briefs = bench.briefs();
+    let integrating = briefs.pop().unwrap();
+    let first = briefs.pop().unwrap();
+    assert_eq!((first.role, integrating.role), (Role::Build, Role::Build));
+    assert!(!decider_says(&first).contains(&"Also say Bonjour.".to_owned()));
+    assert_eq!(
+        decider_says(&integrating).last().map(String::as_str),
+        Some("Also say Bonjour.")
+    );
+    assert_eq!(late_outcomes(&bench), [json!("integrate")]);
+    let pushed = bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["show", &format!("{BRANCH}:GREETING.md")],
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(pushed).unwrap(),
+        "Hello and Bonjour, reader.\n"
+    );
+    assert_eq!(bench.github.created.lock().unwrap().len(), 1);
+    let report = bench.comments().pop().unwrap();
+    assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
+    assert!(report.contains("Late comment"), "{report}");
+    assert_eq!(bench.stage(), "In Review");
+}
+
+/// A late comment the integrating run cannot follow without the decider:
+/// its questions go to the decider without the resolver, in a round that
+/// names the late comment, and nothing is delivered.
+#[test]
+fn a_late_comment_the_build_cannot_follow_stops_in_needs_input() {
+    let bench = Bench::new(true);
+    let check = answered_round(&bench);
+    // Not an always-human category: only the integration sends it to the
+    // decider without a resolver run, which would need a reply of its own.
+    let asks = r#"{"format":5,"status":"questions",
+        "summary":"The greeting cannot say both Hello and Goodbye.",
+        "questions":[{"id":"Q1","category":"wording","context":"Q2 was answered Hello; a later comment says Goodbye.",
+          "text":"Hello or Goodbye?","options":["Hello","Goodbye"]}]}"#;
+    let (stopped, printed) = bench.continue_during(
+        vec![
+            check,
+            bench.reply(Some("Hello"), Some(DONE)),
+            bench.reply(None, Some(asks)),
+        ],
+        vec![bench.comment_during(2, "maintainer", "Actually, make it Goodbye.")],
+    );
+    assert!(
+        matches!(&stopped, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 2),
+        "{stopped:?}\n{printed}"
+    );
+    let asked = bench.comments().pop().unwrap();
+    assert!(
+        asked.starts_with("[owlshift] QUESTIONS · round 2\n"),
+        "{asked}"
+    );
+    assert!(asked.contains("went to one more Build run"), "{asked}");
+    assert!(asked.contains("Hello or Goodbye?"), "{asked}");
+    let record = bench.record();
+    assert_eq!(
+        (record.state.waiting, record.state.round),
+        (Some(Waiting::NeedsInput), 2)
+    );
+    assert_eq!(late_outcomes(&bench), [json!("integrate")]);
+    assert_eq!(bench.remote_branch(), None);
+    assert!(bench.github.created.lock().unwrap().is_empty());
+    assert_eq!(bench.stage(), "Needs Input");
+}
+
+/// One Build run per delivery integrates late comments: another comment of
+/// the decider during it opens a round of one always-human question naming
+/// it, and nothing is delivered.
+#[test]
+fn a_comment_after_the_integrating_run_stops_in_needs_input() {
+    let bench = Bench::new(true);
+    let check = answered_round(&bench);
+    let (stopped, printed) = bench.continue_during(
+        vec![
+            check,
+            bench.reply(Some("Hello"), Some(DONE)),
+            bench.reply(Some("Hello and Bonjour"), Some(DONE)),
+        ],
+        vec![
+            bench.comment_during(2, "maintainer", "Also say Bonjour."),
+            bench.comment_during(3, "maintainer", "And Hola."),
+        ],
+    );
+    match &stopped {
+        Err(Stop::NeedsInput {
+            posted: Ok(round),
+            questions,
+            ..
+        }) => {
+            assert_eq!(round.get(), 2);
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].category, "scope");
+        }
+        other => panic!("{other:?}\n{printed}"),
+    }
+    assert_eq!(late_outcomes(&bench), [json!("integrate"), json!("ask")]);
+    let asked = bench.comments().pop().unwrap();
+    assert!(
+        asked.starts_with("[owlshift] QUESTIONS · round 2\n"),
+        "{asked}"
+    );
+    assert!(
+        asked.contains("Should the work take these comments into account"),
+        "{asked}"
+    );
+    let record = bench.record();
+    assert_eq!(
+        (record.state.waiting, record.state.round),
+        (Some(Waiting::NeedsInput), 2)
+    );
+    assert_eq!(record.questions.asks.len(), 2);
+    assert_eq!(bench.remote_branch(), None);
+    assert!(bench.github.created.lock().unwrap().is_empty());
+    assert_eq!(bench.stage(), "Needs Input");
 }
 
 /// A tracker that refuses every stage write stops nothing: the round is
