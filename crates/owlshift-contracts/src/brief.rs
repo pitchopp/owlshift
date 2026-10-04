@@ -56,6 +56,14 @@ pub struct Brief {
     /// delivers. The runner is its only author; an empty list means the
     /// project has no gate.
     pub gate: Vec<String>,
+    /// The always-human categories the project adds to the floor's six
+    /// (`policy.always_human`, OWL-151): normalized (lowercase words joined by
+    /// `_`), each once, without the ones the floor already covers. A question
+    /// filed under one of them, or whose category contains it as whole words,
+    /// goes to the decider and never to the resolver. Written in Build's and
+    /// the resolver's briefs, empty when the project adds none; the runner is
+    /// its only author.
+    pub always_human: Vec<String>,
     /// The runner ran `gate` itself after the ticket's previous Build `done`,
     /// and it failed (OWL-16): what the next Build run fixes first. Absent
     /// when no gate run of the runner has failed since the last green one.

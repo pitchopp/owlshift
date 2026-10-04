@@ -21,7 +21,7 @@ expect = { event = "dispatched", stage = "build" }
 
 [[step]]
 run = { result = "results/questions-mixed.json" }
-expect = { event = "none", stage = "build", waiting = "none", round = 0, comments = 0 }
+expect = { event = "none", stage = "build", waiting = "none", round = 0, comments = 0, brief_always_human = ["tone"] }
 
 [[step]]
 resolve = { result = "results/resolver-decides-file.json" }
@@ -32,6 +32,7 @@ round = 1
 tracker_stage = "Needs Input"
 comments = 2
 brief_resolve = ["Q1"]
+brief_always_human = ["tone"]
 [step.expect.last_comment]
 author = "owlshift"
 first_line = "[owlshift] QUESTIONS · round 1"

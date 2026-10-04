@@ -750,7 +750,7 @@ mod tests {
             r#"{{"format":{},"role":"build","project":"p",
                 "ticket":{{"id":"T-1","title":"t","author":{{"name":"a","relation":"decider"}},"description":"d"}},
                 "decider":"a","permissions":{{"level":"write_worktree","network":false,"browser":false}},
-                "gate":[],"result_path":"result.json"}}"#,
+                "gate":[],"always_human":[],"result_path":"result.json"}}"#,
             owlshift_contracts::format::BRIEF_FORMAT
         ))
         .unwrap();

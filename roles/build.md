@@ -1,6 +1,6 @@
 +++
 role = "build"
-brief_format = 5
+brief_format = 6
 result_format = 5
 +++
 
@@ -51,7 +51,7 @@ For each step, in order: implement it, run the checks it touches, commit it, the
 
 ## Deciding and asking
 
-Decide what can be discovered (from the ticket, the thread, the code, the docs, a check you can run) and record each such choice in `decisions`, with the `question`, the `decision` and its `basis`. Ask the decider only what is theirs to decide. A question in these categories always goes to the decider, however sure you are: `security`, `data_loss`, `money`, `legal`, `irreversible`, `scope`. Write that token as the question's `category`; for any other question, a short word of your own. A question of any other category goes first to the runner's resolver, which decides what the ticket, the rules or the repository settle: you then run again, its decisions in the `thread`, and only the rest reaches the decider.
+Decide what can be discovered (from the ticket, the thread, the code, the docs, a check you can run) and record each such choice in `decisions`, with the `question`, the `decision` and its `basis`. Ask the decider only what is theirs to decide. A question in these categories always goes to the decider, however sure you are: `security`, `data_loss`, `money`, `legal`, `irreversible`, `scope`. Write that token as the question's `category`. The brief's `always_human` lists the categories this project adds to those six, possibly none: a question about one of them goes to the decider too, so file it under that category exactly as listed, or under a floor token when it touches one of the six, whose token comes first; a category that contains a listed one as whole words counts as it. For any other question, a short word of your own, never one from `always_human` unless the question is about it. A question of any other category goes first to the runner's resolver, which decides what the ticket, the rules or the repository settle: you then run again, its decisions in the `thread`, and only the rest reaches the decider.
 
 To ask, commit the finished steps, update the ledger, and end with status `questions`. Ask everything open at once, numbered `Q1`, `Q2`, … in order. Each question has an `id`, a `category`, a `context` that stands alone (the decider has not seen your session), a `text`, and, when useful, `options` and a `recommendation`.
 

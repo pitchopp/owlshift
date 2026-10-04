@@ -2223,6 +2223,61 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
     assert_eq!(resolved[0]["unposted"], json!(["Q1"]));
 }
 
+/// OWL-151's acceptance: the project's added always-human categories reach
+/// Build's brief and the resolver's, normalized, once each and without what
+/// the floor already covers; a question Build files under one goes to the
+/// decider and the resolver is never run.
+#[test]
+fn the_added_always_human_categories_reach_build_and_the_resolver() {
+    let raised = r#"{"format":5,"status":"questions",
+"summary":"The tone and the file are open.",
+"questions":[
+  {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+   "text":"Which file should hold the greeting?"},
+  {"id":"Q2","category":"Brand Voice","context":"The ticket does not say how formal it is.",
+   "text":"How formal should the greeting be?"}]}"#;
+    let resolved = r#"{"format":5,"status":"done","summary":"The file is named.",
+"resolutions":[
+  {"question":"Q1","outcome":"decided","category":"naming",
+   "decision":"GREETING.md, at the root.","basis":"The ticket's description."}]}"#;
+    let bench = Bench::new(true);
+    let config_path = bench.remote.checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        original.replace(
+            "always_human = []",
+            r#"always_human = ["Brand-Voice", "brand voice", "Data Loss", ""]"#,
+        ),
+    )
+    .unwrap();
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(raised)),
+            bench.reply(None, Some(resolved)),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(
+        asked_texts(&stop),
+        ["How formal should the greeting be?"],
+        "{printed}"
+    );
+    let briefs = bench.briefs();
+    assert_eq!(briefs.len(), 2, "{printed}");
+    assert_eq!(briefs[0].role, Role::Build);
+    assert_eq!(briefs[0].always_human, ["brand_voice"]);
+    assert_eq!(briefs[1].role, Role::Resolver);
+    assert_eq!(briefs[1].always_human, ["brand_voice"]);
+    let given: Vec<&str> = briefs[1].resolve.iter().map(|q| q.id.as_str()).collect();
+    assert_eq!(
+        given,
+        ["Q1"],
+        "the added category's question never reaches it"
+    );
+}
+
 /// OWL-144's acceptance: Build files a data-loss question under another
 /// category; the resolver, which never sees Build's categories, decides it
 /// but labels it `data_loss`, and the runner refuses that decision: no

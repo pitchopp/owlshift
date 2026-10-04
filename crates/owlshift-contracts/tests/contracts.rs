@@ -677,8 +677,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(6)),
+        parse(|v| v["format"] = json!(7)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 5, before the brief carried the project's always-human categories",
+        parse(|v| v["format"] = json!(5)),
+        "unknown format 5",
     );
     rejects(
         "format 4, before the questions to resolve left out their category",
@@ -711,6 +716,13 @@ fn brief_rejections() {
             v.as_object_mut().unwrap().remove("gate");
         }),
         "missing field `gate`",
+    );
+    rejects(
+        "missing always-human categories",
+        parse(|v| {
+            v.as_object_mut().unwrap().remove("always_human");
+        }),
+        "missing field `always_human`",
     );
     // The checkpoint's paths and the result path come from the runner, but
     // are checked the same way as a model's artifact paths (OWL-25).

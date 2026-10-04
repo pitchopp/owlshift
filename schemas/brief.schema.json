@@ -4,6 +4,13 @@
   "description": "The brief of one run, written by the runner before it launches the role.",
   "type": "object",
   "properties": {
+    "always_human": {
+      "description": "The always-human categories the project adds to the floor's six\n(`policy.always_human`, OWL-151): normalized (lowercase words joined by\n`_`), each once, without the ones the floor already covers. A question\nfiled under one of them, or whose category contains it as whole words,\ngoes to the decider and never to the resolver. Written in Build's and\nthe resolver's briefs, empty when the project adds none; the runner is\nits only author.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "checkpoint": {
       "description": "Where an interrupted or resumed ticket starts again.",
       "anyOf": [
@@ -22,7 +29,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 5
+      "const": 6
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands a role runs, in order, from the worktree root, before it\ndelivers. The runner is its only author; an empty list means the\nproject has no gate.",
@@ -108,6 +115,7 @@
     "decider",
     "permissions",
     "gate",
+    "always_human",
     "result_path"
   ],
   "$defs": {

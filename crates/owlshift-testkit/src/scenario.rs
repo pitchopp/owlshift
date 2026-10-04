@@ -202,6 +202,8 @@ pub struct Expect {
     pub brief_decisions: Option<Vec<String>>,
     /// The ids of the questions the last brief gave the resolver.
     pub brief_resolve: Option<Vec<String>>,
+    /// The always-human categories the last brief carried.
+    pub brief_always_human: Option<Vec<String>>,
     /// The gate failure of the step's run: `none`, or a text its command,
     /// reason or output contains.
     pub gate_failure: Option<String>,
@@ -1001,6 +1003,11 @@ impl Driver {
                 browser: false,
             },
             gate: self.gate.clone(),
+            always_human: if matches!(role, Role::Build | Role::Resolver) {
+                self.policy.additions()
+            } else {
+                Vec::new()
+            },
             gate_failure: if role == Role::Build {
                 self.gate_failure.clone()
             } else {
@@ -1175,6 +1182,17 @@ impl Driver {
                 "brief_resolve",
                 format!("{expected:?}"),
                 format!("{found:?}"),
+            )?;
+        }
+        if let Some(expected) = &expect.brief_always_human {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            same(
+                "brief_always_human",
+                format!("{expected:?}"),
+                format!("{:?}", brief.always_human),
             )?;
         }
         if let Some(expected) = &expect.gate_failure {
