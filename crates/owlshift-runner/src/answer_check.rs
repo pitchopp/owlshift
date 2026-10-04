@@ -107,6 +107,40 @@ pub fn counts_at(
     }
 }
 
+/// Where the decider's reply to the questions stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    /// No comment of the decider is newer than `since`, the latest ask or
+    /// what the last answer check read ([`new_answer`]).
+    Waiting { since: Timestamp },
+    /// The decider answered, but may still be writing: the reply counts at
+    /// `counts_at` ([`counts_at`]).
+    Settling { counts_at: Timestamp },
+    /// The answer check may read the reply.
+    Counts,
+}
+
+/// Whether the answer check may run on the decider's reply to `asked`, at
+/// `now` by this machine's clock with the project's quiet `window`: what
+/// `owlshift continue` checks before it runs one, and `owlshift watch`
+/// before it continues a ticket (OWL-152). `None` when nothing was asked.
+pub fn readiness(
+    comments: &[Comment],
+    decider: &Person,
+    asked: &TicketQuestions,
+    now: Timestamp,
+    window: Duration,
+) -> Option<Readiness> {
+    let since = asked.answers_after()?;
+    Some(if new_answer(comments, decider, asked).is_none() {
+        Readiness::Waiting { since }
+    } else if let Some(counts_at) = counts_at(comments, decider, now, window) {
+        Readiness::Settling { counts_at }
+    } else {
+        Readiness::Counts
+    })
+}
+
 /// The core event an answer check's outcome maps onto, and its result when
 /// it left a valid one.
 ///

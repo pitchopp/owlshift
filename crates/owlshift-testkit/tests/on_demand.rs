@@ -42,6 +42,7 @@ use owlshift_runner::executor::{
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
+use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_testkit::gh;
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 use owlshift_testkit::harness::FakeHarness;
@@ -216,9 +217,11 @@ struct Clocked<'a> {
     inner: MarkdownTracker,
     clock: &'a Cell<Timestamp>,
     /// A comment starting with this is refused, as a tracker that fails.
-    refuse: Option<&'static str>,
+    refuse: &'a Cell<Option<&'static str>>,
     /// Every stage write is refused.
     refuse_stage: bool,
+    /// How many of the next comment reads fail, as a tracker that is down.
+    fail_reads: &'a Cell<u32>,
 }
 
 /// The clock's time, then a minute later.
@@ -238,6 +241,13 @@ impl Tracker for Clocked<'_> {
     }
 
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, tracker::Error> {
+        if self.fail_reads.get() > 0 {
+            self.fail_reads.set(self.fail_reads.get() - 1);
+            return Err(tracker::Error::new(
+                tracker::ErrorKind::Other,
+                "the tracker is down",
+            ));
+        }
         Tracker::comments(&self.inner, id)
     }
 
@@ -245,7 +255,11 @@ impl Tracker for Clocked<'_> {
         let other = |e: &dyn std::fmt::Display| {
             tracker::Error::new(tracker::ErrorKind::Other, e.to_string())
         };
-        if self.refuse.is_some_and(|start| body.starts_with(start)) {
+        if self
+            .refuse
+            .get()
+            .is_some_and(|start| body.starts_with(start))
+        {
             return Err(other(&"the tracker is down"));
         }
         self.inner
@@ -282,6 +296,8 @@ struct Bench {
     refuse: Cell<Option<&'static str>>,
     /// The tracker refuses every stage write.
     refuse_stage: Cell<bool>,
+    /// How many of the next comment reads the tracker refuses.
+    fail_reads: Cell<u32>,
     /// How long after the time of the next comment `continue` reads this
     /// machine's clock: by default the quiet window, so the decider's
     /// latest comment, a minute older, counts.
@@ -375,6 +391,7 @@ impl Bench {
             clock: Rc::new(Cell::new("2026-10-02T09:00:00Z".parse().unwrap())),
             refuse: Cell::new(None),
             refuse_stage: Cell::new(false),
+            fail_reads: Cell::new(0),
             waited: Cell::new(SignedDuration::from_mins(10)),
         }
     }
@@ -511,6 +528,62 @@ impl Bench {
         first: Option<Agent>,
         during: Vec<During>,
     ) -> (Result<Delivered, Stop>, String) {
+        self.with_on_demand(replies, first, during, |on_demand, sink| {
+            if continuing {
+                on_demand.continue_ticket(&ticket(), sink)
+            } else {
+                on_demand.run(&ticket(), sink)
+            }
+        })
+    }
+
+    /// Runs `owlshift watch` (OWL-152) with one reply per run, `sleep`
+    /// called after each pass; returns each continue's outcome, watch's own
+    /// lines, and the events printed.
+    fn watch(
+        &self,
+        replies: Vec<Reply>,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) -> (Vec<Result<Delivered, Stop>>, String, String) {
+        let ((outcomes, lines), printed) =
+            self.with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+                let (mut outcomes, mut lines) = (Vec::new(), Vec::new());
+                let watch = Watch {
+                    on_demand,
+                    interval: POLL_INTERVAL,
+                };
+                watch.run(
+                    sink,
+                    &mut lines,
+                    &mut |_, outcome, _| outcomes.push(outcome.clone()),
+                    sleep,
+                );
+                (outcomes, String::from_utf8(lines).unwrap())
+            });
+        (outcomes, lines, printed)
+    }
+
+    /// The commit the ticket ref points to.
+    fn ref_commit(&self) -> String {
+        let env = self.env.clone();
+        let git = Git::with_setup("git", move |command| env.apply(command));
+        ticket_ref::read(&git, &self.dirs().checkout(), &ticket())
+            .unwrap()
+            .expect("a ticket ref")
+            .commit
+    }
+
+    /// `act` on the `OnDemand` of this bench, with one reply per run, the
+    /// answer check's and the resolver's included, and `during` happening
+    /// while the runs it names work; returns what `act` returned and what
+    /// was printed.
+    fn with_on_demand<R>(
+        &self,
+        replies: Vec<Reply>,
+        first: Option<Agent>,
+        during: Vec<During>,
+        act: impl FnOnce(&OnDemand<'_>, &mut EventSink<'_>) -> R,
+    ) -> (R, String) {
         // One `do` at a time in this process. A run forks children (the
         // gate's `sh`, the agent's `git`: a command that sets PATH and names
         // a bare program is forked, not spawned), and a child forked by one
@@ -556,8 +629,9 @@ impl Bench {
         let tracker = Clocked {
             inner: MarkdownTracker::new(&self.remote.checkout),
             clock: &self.clock,
-            refuse: self.refuse.get(),
+            refuse: &self.refuse,
             refuse_stage: self.refuse_stage.get(),
+            fail_reads: &self.fail_reads,
         };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
@@ -580,20 +654,17 @@ impl Bench {
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
-        let outcome = if continuing {
-            on_demand.continue_ticket(&ticket(), &mut sink)
-        } else {
-            on_demand.run(&ticket(), &mut sink)
-        };
+        let acted = act(&on_demand, &mut sink);
+        let printed = String::from_utf8(out).unwrap();
         assert!(
             harness.replies.borrow().is_empty(),
-            "a reply was left unused: {outcome:?}"
+            "a reply was left unused:\n{printed}"
         );
         assert!(
             harness.during.borrow().is_empty(),
-            "a run expected to work did not: {outcome:?}"
+            "a run expected to work did not:\n{printed}"
         );
-        (outcome, String::from_utf8(out).unwrap())
+        (acted, printed)
     }
 
     fn events(&self) -> Vec<Event> {
@@ -1638,6 +1709,136 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
     );
 }
 
+/// OWL-152's acceptance: `owlshift watch` resumes a ticket once its
+/// decider's answer counts, with no `continue` typed. Its passes wait for
+/// the answer, live through a tracker that cannot list the comments, hold a
+/// reply within the project's own quiet window, skip a project another
+/// command holds and one a person must look at, then continue the ticket
+/// to a delivery through `continue`'s path.
+#[test]
+fn an_answer_on_the_ticket_resumes_it_under_watch() {
+    let bench = Bench::new(true);
+    let config_path = bench.remote.checkout.join("owlshift.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        config.replace(
+            "always_human = []",
+            "always_human = []\nquiet_window_minutes = 20",
+        ),
+    )
+    .unwrap();
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let ran = || bench.briefs().len();
+    let warnings = || {
+        data_of(&bench.events(), EventKind::Warning, "what")
+            .iter()
+            .filter(|data| data["what"] == "watch_unreadable")
+            .count()
+    };
+
+    let dirs = bench.dirs();
+    let mut lock = None;
+    let mut pass = 0;
+    let mut sleep = |interval: Duration| {
+        assert_eq!(interval, POLL_INTERVAL);
+        pass += 1;
+        match pass {
+            // No answer yet: nothing ran. The decider answers, a minute
+            // before this machine's clock, and the tracker then fails to
+            // list the comments once.
+            1 => {
+                assert_eq!(ran(), 1);
+                bench.answer("Q1: English.\nQ2: \"Hello, reader.\"\n");
+                bench.waited.set(SignedDuration::ZERO);
+                bench.fail_reads.set(1);
+            }
+            // A warning, and the loop goes on. Eleven minutes after the
+            // answer, within the project's 20-minute window.
+            2 => {
+                assert_eq!(warnings(), 1);
+                bench.waited.set(SignedDuration::from_mins(10));
+            }
+            // Still settling: nothing ran. Past the window now, but another
+            // command holds the project.
+            3 => {
+                assert_eq!(ran(), 1);
+                bench.waited.set(SignedDuration::from_mins(20));
+                lock = Some(dirs.lock().unwrap().expect("the project is free"));
+            }
+            // Skipped. Then a run's isolation check left the project
+            // unverified.
+            4 => {
+                assert_eq!(ran(), 1);
+                drop(lock.take());
+                fs::write(dirs.unverified_file(), "A run was cut off.\n").unwrap();
+            }
+            // Nothing is continued until a person clears it.
+            5 => {
+                assert_eq!(ran(), 1);
+                fs::remove_file(dirs.unverified_file()).unwrap();
+            }
+            // Continued: the answer check and Build ran. The next pass finds
+            // no question waiting.
+            6 => assert_eq!(ran(), 3),
+            _ => return false,
+        }
+        true
+    };
+    let (outcomes, lines, printed) = bench.watch(
+        vec![
+            bench.reply(
+                None,
+                Some(&check(&[
+                    ("Q1", "answered", "English."),
+                    ("Q2", "answered", "Hello, reader."),
+                ])),
+            ),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        &mut sleep,
+    );
+    assert_eq!(pass, 7, "{lines}\n{printed}");
+    match &outcomes[..] {
+        [Ok(delivered)] => assert!(delivered.opened, "{delivered:?}"),
+        other => panic!("{other:?}\n{lines}\n{printed}"),
+    }
+    // The answer check, then Build, after `do`'s Build; one warning only.
+    let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
+    assert_eq!(roles, [Role::Build, Role::AnswerCheck, Role::Build]);
+    assert_eq!(warnings(), 1);
+    let comments = bench.comments();
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.starts_with("[owlshift] RESUME · round 1\n")),
+        "{comments:?}"
+    );
+    assert_eq!(bench.stage(), "In Review");
+    let decided = data_of(&bench.events(), EventKind::Decision, "watch");
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["watch"], "continue");
+    for line in [
+        "watch: questions wait for an answer on DEMO-1",
+        "watch: another command is working the project",
+        "watch: a run's isolation check did not pass",
+        "watch: no ticket's questions wait for an answer",
+    ] {
+        assert!(lines.contains(line), "{line}\n{lines}");
+    }
+    // Printed when it changed only: at the first pass, and once the project
+    // was cleared.
+    assert_eq!(
+        lines.matches("questions wait for an answer on").count(),
+        2,
+        "{lines}"
+    );
+}
+
 /// A round asked by `do` and answered at once, with `go`: the next
 /// `continue` checks it (one run) and resumes Build (the second).
 fn answered_round(bench: &Bench) -> Reply {
@@ -1906,6 +2107,8 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
         "{outcome:?}"
     );
     assert_eq!(bench.record().state.failed_runs, 1);
+    // What a watch pass reads now, before the `continue` below parks it.
+    let watched_at = bench.ref_commit();
 
     let answered = check(&[
         ("Q1", "answered", "English."),
@@ -1945,6 +2148,17 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     // A person looked and cleared the project; `continue` restarts the ticket
     // and checks the same answers, with no new comment.
     fs::remove_file(bench.dirs().unverified_file()).unwrap();
+    // A watch that read the ticket before the park never restarts it
+    // (OWL-152): the ticket ref is not the one it read, so nothing runs.
+    let (stale, _) = bench.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
+        on_demand.continue_seen(&ticket(), &watched_at, sink)
+    });
+    assert!(stale.is_none(), "{stale:?}");
+    assert_eq!(
+        bench.record().state.waiting,
+        Some(Waiting::ParkedAwaitingInput)
+    );
+    assert_eq!(bench.comments().len(), 3);
     let (delivered, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(Some("Hello"), Some(DONE)),

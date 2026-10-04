@@ -25,7 +25,7 @@ use std::path::Path;
 
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    PersistedState, QUESTIONS_FILE, STATE_FILE, TicketQuestions, ticket_ref,
+    PersistedState, QUESTIONS_FILE, STATE_FILE, TICKETS_PREFIX, TicketQuestions, ticket_ref,
 };
 use owlshift_core::state::{Status, TicketState};
 
@@ -110,6 +110,23 @@ pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stor
         record: TicketRecord { state, questions },
         commit,
     }))
+}
+
+/// The tickets that have a ticket ref in `checkout`, in the order git lists
+/// the refs (OWL-152). A ref below the namespace whose name is not a ticket
+/// id is left out: no ticket's ref is named so.
+pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
+    let listed = git
+        .run(
+            checkout,
+            &["for-each-ref", "--format=%(refname)", TICKETS_PREFIX],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&listed)
+        .lines()
+        .filter_map(|name| name.strip_prefix(TICKETS_PREFIX))
+        .filter_map(|id| TicketId::new(id).ok())
+        .collect())
 }
 
 /// Writes `record` as the ticket ref of `ticket` in `checkout` and returns

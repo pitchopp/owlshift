@@ -85,7 +85,7 @@ use owlshift_core::state::{
 };
 
 use crate::agent_env::AgentEnv;
-use crate::answer_check;
+use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
     DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport, RunSpec,
@@ -266,7 +266,7 @@ impl fmt::Display for Delivered {
 /// Why `owlshift do` or `owlshift continue` stopped short of a delivery.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stop {
-    /// Another `owlshift do` holds the project.
+    /// Another `owlshift do`, `continue` or `watch` holds the project.
     Busy(PathBuf),
     /// Nothing ran, or nothing more could: the reason and its fix.
     Refused(String),
@@ -337,7 +337,8 @@ impl fmt::Display for Stop {
         match self {
             Self::Busy(root) => write!(
                 f,
-                "Another `owlshift do` is working this project ({}); run again once it ends.",
+                "Another `owlshift do`, `continue` or `watch` is working this project ({}); run \
+                 again once it ends.",
                 root.display()
             ),
             Self::Refused(reason) => write!(f, "Not run: {reason}"),
@@ -673,7 +674,40 @@ impl OnDemand<'_> {
         ticket: &TicketId,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
-        let mut p = self.prepare(ticket, Command::Continue)?;
+        let p = self.prepare(ticket, Command::Continue)?;
+        self.continue_prepared(p, sink)
+    }
+
+    /// `owlshift continue` for `owlshift watch` (OWL-152): run only while
+    /// the ticket ref, read under the project's lock, is still `seen`, the
+    /// commit watch read it at; `None`, with nothing run or kept, once it
+    /// moved. Watch continues a ticket whose questions wait, and a command
+    /// typed meanwhile may have parked it or resumed it to Build: continuing
+    /// it then would restart it or build it, which only a person's
+    /// `continue` does.
+    pub fn continue_seen(
+        &self,
+        ticket: &TicketId,
+        seen: &str,
+        sink: &mut EventSink<'_>,
+    ) -> Option<Result<Delivered, Stop>> {
+        let p = match self.prepare(ticket, Command::Continue) {
+            Ok(p) => p,
+            Err(stop) => return Some(Err(stop)),
+        };
+        if p.stored.as_ref().map(|stored| stored.commit.as_str()) != Some(seen) {
+            return None;
+        }
+        Some(self.continue_prepared(p, sink))
+    }
+
+    /// [`Self::continue_ticket`] once the command holds the project.
+    fn continue_prepared(
+        &self,
+        mut p: Prepared,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        let ticket = &p.ticket.clone();
         let Some(stored) = &p.stored else {
             return Err(nothing_to_continue(ticket));
         };
@@ -1317,37 +1351,39 @@ impl OnDemand<'_> {
         let ticket = p.ticket.clone();
         let mut questions = p.questions();
         let comments = self.comments(&ticket)?;
-        let (Some(since), Some(latest)) = (questions.answers_after(), questions.latest()) else {
-            return Err(Stop::Refused(format!(
+        let no_ask = || {
+            Stop::Refused(format!(
                 "the ticket's ref of {ticket} waits for answers but keeps no ask"
-            )));
+            ))
         };
+        let latest = questions.latest().ok_or_else(no_ask)?;
         // Only the decider recorded on the ask answers it, whoever decides
         // the ticket now; a re-ask keeps its round's decider.
         let asked = latest.decider.clone();
         let asked_of = person(&asked, &p.found);
-        if answer_check::new_answer(&comments, &asked_of, &questions).is_none() {
-            return Err(Stop::Waiting {
-                ticket,
-                round: state.round(),
-                decider: name_of(&asked, &p.found),
-                since,
-            });
-        }
         // Not while the decider may still be writing (the quiet window), so
         // the check reads the whole answer; nothing is kept meanwhile.
-        if let Some(counts_at) = answer_check::counts_at(
-            &comments,
-            &asked_of,
-            (self.clock)(),
-            self.config.policy.quiet_window(),
-        ) {
-            return Err(Stop::Settling {
-                ticket,
-                decider: name_of(&asked, &p.found),
-                window: self.config.policy.quiet_window(),
-                counts_at,
-            });
+        // `owlshift watch` asks the same before it continues a ticket.
+        let window = self.config.policy.quiet_window();
+        match answer_check::readiness(&comments, &asked_of, &questions, (self.clock)(), window) {
+            None => return Err(no_ask()),
+            Some(Readiness::Waiting { since }) => {
+                return Err(Stop::Waiting {
+                    ticket,
+                    round: state.round(),
+                    decider: name_of(&asked, &p.found),
+                    since,
+                });
+            }
+            Some(Readiness::Settling { counts_at }) => {
+                return Err(Stop::Settling {
+                    ticket,
+                    decider: name_of(&asked, &p.found),
+                    window,
+                    counts_at,
+                });
+            }
+            Some(Readiness::Counts) => {}
         }
         let read_through = answer_check::newest_decider_edit(&comments, &asked_of);
         // The ticket's author is judged against the decider now, or the
