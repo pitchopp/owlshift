@@ -4,7 +4,9 @@
 //! `owlshift do` and `owlshift continue` hand the outcome of their run to
 //! [`notify_blocker`] once it is printed. Only the outcomes where a person
 //! must act notify: a question round, a re-ask, a reply to the decider's
-//! counter-question, a parked ticket, the harness at its usage limit. Never
+//! counter-question, a parked ticket, any of those whose comment reached the
+//! ticket although keeping Owlshift's state then failed, the harness at its
+//! usage limit. Never
 //! progress, a delivery or a green check. A notification that cannot be
 //! shown is a warning event, never an error: the run's outcome and exit code
 //! stay as they were.
@@ -22,7 +24,7 @@ use owlshift_contracts::result;
 
 use crate::config::FileState;
 use crate::events::{EventSink, data};
-use crate::on_demand::{Delivered, Stop};
+use crate::on_demand::{Delivered, Landed, Stop};
 use crate::system::System;
 
 /// The title every desktop notification shows.
@@ -61,9 +63,12 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// reset time only: never text from a model or the tracker.
 ///
 /// Every variant is listed, so a new way to stop must say whether it
-/// notifies. A stop that is a refusal, even one that says a question or a
-/// park reached the ticket before something else failed, does not notify:
-/// its message in the terminal says what to do.
+/// notifies. A refusal does not, since nothing it names reached the ticket
+/// and its message in the terminal says what to do. A comment that asks a
+/// person to act and is on the ticket does, even when keeping the state
+/// failed after it ([`Stop::NotKept`]): the line says so, since the next run
+/// may post that comment again. The decision and the resume comments ask
+/// nothing of anyone, so a failure to keep their state stays a refusal.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
     Some(match stop {
         Stop::NeedsInput { status, posted, .. } => match (status, posted) {
@@ -86,6 +91,15 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
             format!("{ticket}: the decider's question has a reply on the ticket; answers wait")
         }
         Stop::Parked { .. } => format!("{ticket} is parked: a person must look"),
+        Stop::NotKept { landed, .. } => {
+            let what = match landed {
+                Landed::Questions => "questions wait for an answer on the ticket",
+                Landed::Reask => "questions were asked again on the ticket",
+                Landed::Reply => "the decider's question has a reply on the ticket",
+                Landed::Parked => "the ticket is parked: a person must look",
+            };
+            format!("{ticket}: {what}, but Owlshift's state was not kept; see the terminal")
+        }
         Stop::UsageLimit { resets_at } => match resets_at {
             Some(at) => {
                 format!("{ticket}: stopped at the harness's usage limit, which resets at {at}")
@@ -361,6 +375,13 @@ mod tests {
         }
     }
 
+    fn not_kept(landed: Landed) -> Stop {
+        Stop::NotKept {
+            landed,
+            message: "model text".to_owned(),
+        }
+    }
+
     /// What `notify_blocker` shows and records for `outcome`: the lines,
     /// how often the tracker was asked for the link, the events logged.
     fn notify(
@@ -433,6 +454,26 @@ mod tests {
                 "OWL-7 is parked: a person must look",
             ),
             (
+                not_kept(Landed::Questions),
+                "OWL-7: questions wait for an answer on the ticket, but Owlshift's state was \
+                 not kept; see the terminal",
+            ),
+            (
+                not_kept(Landed::Reask),
+                "OWL-7: questions were asked again on the ticket, but Owlshift's state was not \
+                 kept; see the terminal",
+            ),
+            (
+                not_kept(Landed::Reply),
+                "OWL-7: the decider's question has a reply on the ticket, but Owlshift's state \
+                 was not kept; see the terminal",
+            ),
+            (
+                not_kept(Landed::Parked),
+                "OWL-7: the ticket is parked: a person must look, but Owlshift's state was not \
+                 kept; see the terminal",
+            ),
+            (
                 Stop::UsageLimit {
                     resets_at: Some(at()),
                 },
@@ -465,7 +506,9 @@ mod tests {
         let outcomes = [
             Ok(delivered),
             Err(Stop::Busy(PathBuf::from("/p"))),
-            Err(Stop::Refused("the re-ask is on the ticket, but".to_owned())),
+            Err(Stop::Refused(
+                "OWL-7 parked (re-asks), but the PARKED comment could not be posted".to_owned(),
+            )),
             Err(Stop::Unverified {
                 marker: PathBuf::from("/p/unverified"),
                 text: "t".to_owned(),

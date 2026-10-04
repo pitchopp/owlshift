@@ -39,7 +39,7 @@ use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
 };
-use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
+use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
 use owlshift_testkit::gh;
@@ -435,6 +435,22 @@ impl Bench {
                 MarkdownTracker::new(&checkout)
                     .post_comment(&ticket(), author, tick(&clock), body)
                     .unwrap();
+            }),
+        )
+    }
+
+    /// Holds the ticket ref's lock file in Owlshift's checkout once the
+    /// `run`th run of a command works, so that keeping a state after it
+    /// fails, whatever comment was posted before (OWL-149). The lock is no
+    /// ref, so the isolation check does not see it.
+    fn lock_ticket_ref_during(&self, run: usize) -> During {
+        let checkout = self.dirs().checkout();
+        (
+            run,
+            Box::new(move || {
+                let path = checkout.join(".git/refs/owlshift/tickets/DEMO-1.lock");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "").unwrap();
             }),
         )
     }
@@ -2710,4 +2726,103 @@ fn a_resolver_that_breaks_isolation_parks_the_ticket() {
     let comments = bench.comments();
     assert_eq!(comments.len(), 1, "{comments:?}");
     assert!(comments[0].starts_with("[owlshift] PARKED\n"));
+}
+
+/// OWL-149: a comment that asks a person to act reached the ticket, but
+/// keeping the state failed (the ticket's ref is locked):
+/// the stop says which comment landed, so that the operator is notified.
+#[test]
+fn a_comment_on_the_ticket_whose_state_is_not_kept_is_a_stop_that_notifies() {
+    fn not_kept(outcome: &Result<Delivered, Stop>, expected: Landed, comment: &str) {
+        match outcome {
+            Err(Stop::NotKept { landed, message }) if *landed == expected => {
+                assert!(message.contains("but keeping"), "{message}");
+                assert!(message.contains(comment), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let partial = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "partial", "The ending is missing."),
+    ]);
+
+    let only_q2 = check(&[("Q2", "partial", "The ending is missing.")]);
+
+    // The first round of questions.
+    let bench = Bench::new(true);
+    let (outcome, _) = bench.invoke(
+        false,
+        vec![bench.reply(None, Some(ROUND_1))],
+        None,
+        vec![bench.lock_ticket_ref_during(1)],
+    );
+    not_kept(&outcome, Landed::Questions, "the questions of round 1");
+    assert!(bench.comments().last().unwrap().contains("Which language"));
+
+    // A re-ask.
+    let bench = Bench::new(true);
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    bench.answer("Q2: words.\n");
+    let (outcome, _) = bench.continue_during(
+        vec![bench.reply(None, Some(&partial))],
+        vec![bench.lock_ticket_ref_during(1)],
+    );
+    not_kept(&outcome, Landed::Reask, "the re-ask is on the ticket");
+    assert!(bench.comments().last().unwrap().contains("re-ask 1"));
+
+    // A reply to a counter-question.
+    let bench = Bench::new(true);
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    bench.answer("Q2: what is a sign-off?\n");
+    let counter = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "counter_question", "Asks what a sign-off is."),
+    ]);
+    let (outcome, _) = bench.continue_during(
+        vec![bench.reply(None, Some(&counter))],
+        vec![bench.lock_ticket_ref_during(1)],
+    );
+    not_kept(&outcome, Landed::Reply, "the reply is on the ticket");
+    assert!(
+        bench
+            .comments()
+            .last()
+            .unwrap()
+            .starts_with("[owlshift] REPLY")
+    );
+
+    // A park at the re-ask limit, its PARKED comment posted.
+    let bench = Bench::parking();
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    for n in 0..4 {
+        bench.answer(&format!("Q2: answer {n}.\n"));
+        let during = if n == 3 {
+            vec![bench.lock_ticket_ref_during(1)]
+        } else {
+            Vec::new()
+        };
+        // Q1 is answered by the first check; the next ones judge Q2 alone.
+        let result = if n == 0 { &partial } else { &only_q2 };
+        let (outcome, _) = bench.continue_during(vec![bench.reply(None, Some(result))], during);
+        if n == 3 {
+            not_kept(
+                &outcome,
+                Landed::Parked,
+                "the PARKED comment is on the ticket",
+            );
+        } else {
+            assert!(matches!(&outcome, Err(Stop::Reasked { .. })), "{outcome:?}");
+        }
+    }
+    assert!(
+        bench
+            .comments()
+            .last()
+            .unwrap()
+            .starts_with("[owlshift] PARKED")
+    );
 }
