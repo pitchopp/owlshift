@@ -69,6 +69,10 @@
 //! holding the line `Waiting for <their User.url>`, which Linear stored and
 //! answered verbatim; `issueUpdate` moved a stage with it; an `issueCreate`
 //! through it made an issue whose creator is the app user, `app` true.
+//! Checked again on 2026-10-05 through the runner's own code
+//! (`owlshift-runner/tests/linear_app_live.rs`): a QUESTIONS round through
+//! the app gave the decider an `issueCommentMention` from the app user, and
+//! revoking one app token left another of the same scopes valid.
 //!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.

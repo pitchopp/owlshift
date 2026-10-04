@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-09-28 on the Owlshift workspace, recorded live; amended by script on 2026-10-05 (OWL-157), not recorded: the comment query reads `user.app`, given here as false, which is what C4 observed for comments posted through the API key",
+  "recorded": "2026-10-05 on the Owlshift workspace, recorded live",
   "exchanges": [
     {
       "request": {
@@ -24,9 +24,9 @@
                   "externalUser": null,
                   "id": "ed8e53d4-2827-451e-9504-964016ee00b1",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001",
-                    "app": false
+                    "id": "00000000-0000-4000-8000-000000000001"
                   }
                 }
               ],
@@ -62,9 +62,9 @@
                   "externalUser": null,
                   "id": "f006bf77-ac01-4615-a444-c59671caea15",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001",
-                    "app": false
+                    "id": "00000000-0000-4000-8000-000000000001"
                   }
                 }
               ],

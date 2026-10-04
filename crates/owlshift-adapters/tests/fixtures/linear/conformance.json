@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-09-29 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`); amended by script on 2026-10-05 (OWL-157), not recorded: the comment query reads `user.app`, given here as false, which is what C4 observed for comments posted through the API key",
+  "recorded": "2026-10-05 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
   "exchanges": [
     {
       "request": {
@@ -99,9 +99,9 @@
                   "externalUser": null,
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001",
-                    "app": false
+                    "id": "00000000-0000-4000-8000-000000000001"
                   }
                 },
                 {
@@ -112,9 +112,9 @@
                   "externalUser": null,
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001",
-                    "app": false
+                    "id": "00000000-0000-4000-8000-000000000001"
                   }
                 }
               ],
@@ -211,14 +211,14 @@
             "comment": {
               "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
               "botActor": null,
-              "createdAt": "2026-09-29T11:28:54.335Z",
+              "createdAt": "2026-10-04T22:21:23.002Z",
               "editedAt": null,
               "externalUser": null,
               "id": "00000000-0000-4000-8000-00000000c001",
               "user": {
+                "app": false,
                 "displayName": "person-1",
-                "id": "00000000-0000-4000-8000-000000000001",
-                "app": false
+                "id": "00000000-0000-4000-8000-000000000001"
               }
             },
             "success": true
@@ -245,14 +245,14 @@
                 {
                   "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
                   "botActor": null,
-                  "createdAt": "2026-09-29T11:28:54.335Z",
+                  "createdAt": "2026-10-04T22:21:23.002Z",
                   "editedAt": null,
                   "externalUser": null,
                   "id": "00000000-0000-4000-8000-00000000c001",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001",
-                    "app": false
+                    "id": "00000000-0000-4000-8000-000000000001"
                   }
                 },
                 {
@@ -263,9 +263,9 @@
                   "externalUser": null,
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001",
-                    "app": false
+                    "id": "00000000-0000-4000-8000-000000000001"
                   }
                 },
                 {
@@ -276,9 +276,9 @@
                   "externalUser": null,
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
-                    "id": "00000000-0000-4000-8000-000000000001",
-                    "app": false
+                    "id": "00000000-0000-4000-8000-000000000001"
                   }
                 }
               ],
