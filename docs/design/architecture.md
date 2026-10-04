@@ -211,7 +211,7 @@ Shared state lives where every participant already has access, the tracker and t
 
 **In flight** means everything claimed by any runner, every ticket a human has in progress, and every open PR; resources are computed across all of them, so an agent never starts on a zone a colleague is editing by hand.
 
-**Identities.** A person maps to a tracker account and a forge account in the project config, so a PR review comment and a ticket comment count as the same decider. The runner posts under a distinct agent identity wherever the tracker offers one: Linear app users can be delegated issues while the human assignee stays the owner, and are not billed as seats ([Linear docs](https://linear.app/docs/agents-in-linear)); on GitHub, a GitHub App. Elsewhere, the `[agent]` marker applies.
+**Identities.** A person maps to a tracker account and a forge account in the project config, so a PR review comment and a ticket comment count as the same decider. The runner posts under a distinct agent identity wherever the tracker offers one: Linear app users can be delegated issues while the human assignee stays the owner, and are not billed as seats ([Linear docs](https://linear.app/docs/agents-in-linear)); Owlshift's own polls, so it takes neither delegation nor mentions (D8); on GitHub, a GitHub App. Elsewhere, the `[agent]` marker applies.
 
 ## 8. Policy, security & trust
 
@@ -296,7 +296,7 @@ Owlshift works on its own backlog, in a dedicated Linear workspace, from P1; the
 
 ## 12. Decisions
 
-D1, D2, D3, D5, D7, D9, D10 and D11 are agreed; four decisions remain open, none of them blocking P0. Also settled: open source under Apache-2.0, repository content in English, tracker, forge and harness as adapters.
+D1, D2, D3, D5, D7, D8, D9, D10 and D11 are agreed; three decisions remain open, none of them blocking P0. Also settled: open source under Apache-2.0, repository content in English, tracker, forge and harness as adapters.
 
 | # | Decision | Outcome or recommendation | Status |
 | --- | --- | --- | --- |
@@ -307,7 +307,7 @@ D1, D2, D3, D5, D7, D9, D10 and D11 are agreed; four decisions remain open, none
 | D5 | Config format | TOML (decided 2026-09-27): a product-owned `owlshift.toml` for pipeline, routing and policy; importing a Symphony-style `WORKFLOW.md` stays an optional later addition | Agreed |
 | D6 | Second validation project for P9 | A project on another stack, ideally on GitHub Issues; to name | Open |
 | D7 | Default runner location | The developer's machine; a team server is a P10 mode | Agreed |
-| D8 | Agent identity on Linear from P2 | Create a Linear app user, after check C4 confirms it works with polling and no public webhook endpoint; the `[agent]` marker otherwise | Open |
+| D8 | Agent identity on Linear from P2 | A Linear app user (decided 2026-10-04, OWL-141, once [check C4](build-plan.md#results) confirmed it works with polling and no public endpoint): an OAuth app the workspace creates with client credentials, no webhook and no mention or delegation scope, whose token the runner requests for each run. In the check, Linear notified the decider of its comment and of its mention of them, and not of a comment posted through their own key; a decider not subscribed to the issue is reached by a mention. The desktop notification stays the operator's channel on their machine. Until it is built, comments go through the personal API key | Agreed |
 | D9 | Windows scope | WSL2 from P1; native Windows only when a user needs it. Decided 2026-09-29: native Windows confinement is set aside; a confined run is refused there and WSL2 is the supported path. The live checks (OWL-72: a plain AppContainer cannot run git, a restricted token was compared, [build plan](build-plan.md#results)) are the starting point if native Windows comes back; the `owlshift-launch` launcher that OWL-71 built for it was removed (2026-09-30, OWL-89) | Agreed |
 | D10 | Contribution terms | Developer Certificate of Origin sign-off on every commit, no CLA (decided 2026-09-28): light for contributors, authorship still traced; see `CONTRIBUTING.md` | Agreed |
 | D11 | Where the code lives | `~/Projects/owlshift`, on the personal GitHub account (`pitchopp/owlshift`), no dedicated organisation | Agreed |

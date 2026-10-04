@@ -53,7 +53,7 @@ The central bet, used by hand.
 - Checkpoint on a git ref; `owlshift continue OWL-12` restarts from it without redoing finished steps.
 - Answer check (answered, partial, unanswered, counter-question), re-ask of what is missing, late comments re-read before delivery.
 - Resolver: discoverable questions decided and logged as reversible decisions; always-human categories enforced.
-- Being told a question is waiting: the Linear app identity if check C4 passes, otherwise a local desktop notification. Scenarios S2 and S7.
+- Being told a question is waiting: both, since check C4 passed (decision D8). Owlshift comments as a Linear app user, so Linear notifies the decider on the channels they chose there, and a local desktop notification tells the operator on their machine. Scenarios S2 and S7.
 
 **Exit gate.** Three tickets through at least two question rounds, one of them with an incomplete answer correctly re-asked.
 
