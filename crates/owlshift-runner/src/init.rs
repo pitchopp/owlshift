@@ -5,8 +5,9 @@
 //! overwritten: it is committed, and a person edits it from there. The
 //! secrets go to the system keychain, never to a file, an argument, an
 //! event or a message: the tracker's (a Linear API key, when the tracker is
-//! Linear), the forge's (a GitHub token) and the token agent runs log in to
-//! Claude Code with (OWL-94). The command line asks for them on a terminal
+//! Linear, and optionally the client ID and secret of the Linear app Owlshift
+//! writes as, OWL-157), the forge's (a GitHub token) and the token agent runs
+//! log in to Claude Code with (OWL-94). The command line asks for them on a terminal
 //! only; this module decides which are missing and stores what it is given.
 
 use std::fmt;
@@ -22,7 +23,7 @@ use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::forge::{GITHUB_ACCOUNT, GITHUB_TOKEN_HELP};
-use crate::tracker::LINEAR_ACCOUNT;
+use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 
 /// The values of a new project file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +211,25 @@ pub const CLAUDE_TOKEN: SecretSpec = SecretSpec {
            `claude setup-token` and paste the token it prints",
 };
 
+/// The client ID of the Linear OAuth app Owlshift writes as (decision D8,
+/// OWL-157): optional, and asked with [`LINEAR_APP_SECRET`] by
+/// [`store_app_credentials`].
+pub const LINEAR_APP_ID: SecretSpec = SecretSpec {
+    account: LINEAR_APP_ID_ACCOUNT,
+    label: "Linear app client ID",
+    help: "optional: the client ID of the OAuth application a workspace admin creates in \
+           Linear's API settings, with client credentials on, so that Owlshift comments as its \
+           app user and Linear notifies the decider; leave it empty to comment through the API \
+           key, whose holder Linear does not notify",
+};
+
+/// That app's client secret.
+pub const LINEAR_APP_SECRET: SecretSpec = SecretSpec {
+    account: LINEAR_APP_SECRET_ACCOUNT,
+    label: "Linear app client secret",
+    help: "the client secret of that OAuth application",
+};
+
 /// The secrets `owlshift do` needs for a project on `tracker`: the forge's
 /// and the agent runs' Claude Code token always, since `do` runs Claude
 /// Code, and the tracker's for Linear.
@@ -267,6 +287,62 @@ pub fn store_secrets(
         }
     }
     Ok(report)
+}
+
+/// What [`store_app_credentials`] did with the Linear app's pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppStored {
+    /// Both given, and stored.
+    Stored,
+    /// Both already in the keychain, and left there.
+    Kept,
+    /// No client ID given: nothing stored, and Owlshift writes through the
+    /// API key unless a pair is in the keychain.
+    Skipped,
+    /// A client ID given without its secret: neither stored.
+    Incomplete,
+    /// One of the two not one word ([`Secret::is_one_word`]): neither stored.
+    Refused,
+}
+
+/// Stores the Linear app's client ID and secret together or not at all
+/// (OWL-157). A stored pair is kept unless `replace`. Otherwise `ask` gives
+/// the client ID, then, when one was given, the secret; both, each one word,
+/// are stored, and anything less stores nothing, keeping what the keychain
+/// holds. Whether it then holds a usable pair is
+/// [`crate::tracker::app_credentials`]'s to say. Neither value is ever part
+/// of the answer or of an error.
+pub fn store_app_credentials(
+    keychain: &Keychain,
+    replace: bool,
+    ask: &mut dyn FnMut(&SecretSpec) -> Option<Secret>,
+) -> Result<AppStored, KeychainError> {
+    let paired =
+        keychain.contains(LINEAR_APP_ID.account)? && keychain.contains(LINEAR_APP_SECRET.account)?;
+    if paired && !replace {
+        return Ok(AppStored::Kept);
+    }
+    let mut given = |spec: &SecretSpec| {
+        ask(spec)
+            .map(|secret| Secret::new(secret.expose().trim()))
+            .filter(|secret| !secret.expose().is_empty())
+    };
+    let Some(id) = given(&LINEAR_APP_ID) else {
+        return Ok(if paired {
+            AppStored::Kept
+        } else {
+            AppStored::Skipped
+        });
+    };
+    let Some(secret) = given(&LINEAR_APP_SECRET) else {
+        return Ok(AppStored::Incomplete);
+    };
+    if !(id.is_one_word() && secret.is_one_word()) {
+        return Ok(AppStored::Refused);
+    }
+    keychain.store(LINEAR_APP_ID.account, &id)?;
+    keychain.store(LINEAR_APP_SECRET.account, &secret)?;
+    Ok(AppStored::Stored)
 }
 
 #[cfg(test)]
@@ -391,6 +467,63 @@ mod tests {
                 .unwrap()
                 .expose(),
             SENTINEL
+        );
+    }
+
+    /// The Linear app's pair is stored whole or not at all: a client ID
+    /// alone, or one pasted across lines, stores nothing; no answer skips
+    /// the app; a stored pair is kept unless replaced.
+    #[test]
+    fn the_linear_apps_pair_is_stored_whole_or_not_at_all() {
+        let keychain = Keychain::in_memory();
+        let store = |replace, answers: [Option<&str>; 2]| {
+            let mut answers = answers.into_iter();
+            let mut asked = Vec::new();
+            let stored = store_app_credentials(&keychain, replace, &mut |spec| {
+                asked.push(spec.account);
+                answers.next().flatten().map(Secret::new)
+            })
+            .unwrap();
+            (stored, asked)
+        };
+        let is_stored = |account| keychain.contains(account).unwrap();
+
+        assert_eq!(
+            store(false, [None, None]),
+            (AppStored::Skipped, vec![LINEAR_APP_ID_ACCOUNT])
+        );
+        assert_eq!(
+            store(false, [Some("id"), None]).0,
+            AppStored::Incomplete
+        );
+        assert_eq!(
+            store(false, [Some("id"), Some("two\nlines")]).0,
+            AppStored::Refused
+        );
+        assert!(!is_stored(LINEAR_APP_ID_ACCOUNT));
+        assert!(!is_stored(LINEAR_APP_SECRET_ACCOUNT));
+
+        assert_eq!(
+            store(false, [Some(" id "), Some("secret")]),
+            (
+                AppStored::Stored,
+                vec![LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT]
+            )
+        );
+        assert_eq!(
+            keychain.read(LINEAR_APP_ID_ACCOUNT).unwrap().unwrap().expose(),
+            "id"
+        );
+        assert_eq!(store(false, [Some("x"), Some("y")]), (AppStored::Kept, vec![]));
+        assert_eq!(store(true, [None, None]).0, AppStored::Kept);
+        assert_eq!(store(true, [Some("id"), None]).0, AppStored::Incomplete);
+        assert_eq!(
+            keychain
+                .read(LINEAR_APP_SECRET_ACCOUNT)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "secret"
         );
     }
 }

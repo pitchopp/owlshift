@@ -10,7 +10,8 @@ pub use owlshift_platform::process::{Captured, RunError};
 pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
-pub use crate::tracker::StatesError;
+pub use crate::tracker::{AppError, StatesError};
+pub use owlshift_adapters::tracker::linear::AppUser;
 
 /// How long a probe such as `git --version` may take. C8 measured about
 /// 0.1 s for the harness status commands.
@@ -55,6 +56,16 @@ pub trait System {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| StatesError::Keychain(error.to_string()))
             .and_then(|keychain| crate::tracker::linear_team_states(&keychain, team))
+    }
+    /// The Linear app user Owlshift writes as, with the credentials in the
+    /// system keychain, checked over the network as `owlshift do` checks it
+    /// for team `team`, its token revoked after: `None` when no app is
+    /// stored (OWL-157). Only `owlshift doctor` asks, and only for a Linear
+    /// project.
+    fn linear_app(&self, team: &str) -> Result<Option<AppUser>, AppError> {
+        owlshift_platform::keychain::Keychain::system()
+            .map_err(|error| AppError::Keychain(error.to_string()))
+            .and_then(|keychain| crate::tracker::linear_app_user(&keychain, team))
     }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
@@ -153,6 +164,9 @@ pub(crate) mod fake {
         /// What Linear answers for a team's workflow states, the key being
         /// stored; `None`: it cannot be reached.
         linear_states: Option<Result<Vec<String>, owlshift_adapters::tracker::Error>>,
+        /// What checking the Linear app gives, both of its entries being
+        /// stored; `None`: no app is stored.
+        linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
@@ -208,6 +222,15 @@ pub(crate) mod fake {
         ) -> Self {
             let answer = answer.map(|names| names.iter().map(|&n| n.to_owned()).collect());
             self.linear_states = Some(answer);
+            self
+        }
+
+        /// Checking the Linear app gives its user's name, or this error.
+        pub(crate) fn linear_app_is(
+            mut self,
+            answer: Result<&str, owlshift_adapters::tracker::Error>,
+        ) -> Self {
+            self.linear_app = Some(answer.map(str::to_owned));
             self
         }
 
@@ -292,6 +315,32 @@ pub(crate) mod fake {
                         Err(Error::new(ErrorKind::Other, "Linear: no network in tests"))
                     })
                     .map_err(StatesError::Tracker),
+            }
+        }
+
+        /// No app unless [`Self::linear_app_is`] gave one; then its entries
+        /// follow [`Self::unstored`] and [`Self::keychain_fails`]. Never the
+        /// network.
+        fn linear_app(&self, _team: &str) -> Result<Option<AppUser>, AppError> {
+            use crate::tracker::{LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
+            let Some(answer) = self.linear_app.clone() else {
+                return Ok(None);
+            };
+            let stored = |account| self.secret_stored(account).map_err(AppError::Keychain);
+            match (
+                stored(LINEAR_APP_ID_ACCOUNT)?,
+                stored(LINEAR_APP_SECRET_ACCOUNT)?,
+            ) {
+                (false, false) => Ok(None),
+                (true, false) => Err(AppError::Incomplete {
+                    missing: LINEAR_APP_SECRET_ACCOUNT,
+                }),
+                (false, true) => Err(AppError::Incomplete {
+                    missing: LINEAR_APP_ID_ACCOUNT,
+                }),
+                (true, true) => answer
+                    .map(|name| Some(AppUser { name }))
+                    .map_err(AppError::Tracker),
             }
         }
 

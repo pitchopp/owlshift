@@ -76,8 +76,11 @@ pub const CREDENTIAL_VARIABLES: &[&str] = &[
     "CODEX_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
-    // Tracker.
+    // Tracker. The Linear app's pair, as its maintainer's dotenv names it:
+    // the runner keeps it in the keychain and its token in memory (OWL-157).
     "LINEAR_API_KEY",
+    "LINEAR_APP_CLIENT_ID",
+    "LINEAR_APP_CLIENT_SECRET",
     "JIRA_API_TOKEN",
     "ATLASSIAN_API_TOKEN",
     // Forge.

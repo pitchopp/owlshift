@@ -30,10 +30,12 @@ use serde_json::Value;
 
 use crate::config::{Effective, FileState, exit_text};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
-use crate::system::{DataDirSource, RunError, StatesError, System, exact_version_of, version_of};
+use crate::system::{
+    AppError, DataDirSource, RunError, StatesError, System, exact_version_of, version_of,
+};
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
-use crate::tracker::LINEAR_ACCOUNT;
+use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -252,6 +254,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
     checks.extend(tracker_states_check(system, config));
+    checks.extend(tracker_identity_check(system, config));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
@@ -1023,6 +1026,83 @@ fn state_entries(states: Value) -> Vec<(String, String)> {
 /// worktrees (OWL-109). Information only, never a failure or a warning: what
 /// blocks a run is `do`'s own refusal. Only the path is reported: the folder
 /// is never opened, created or listed.
+/// Who Owlshift writes as on Linear (OWL-157): the Linear app's user,
+/// checked as `owlshift do` checks it when it opens the tracker, or the API
+/// key's account. No app is a warning: Owlshift then writes through the key,
+/// as before. An app `do` would refuse fails: half of it stored, Linear
+/// refusing it or not answering, since `do` never falls back to the key.
+/// None for a Markdown project or none loaded.
+fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "tracker identity";
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
+        return None;
+    };
+    let place = format!(
+        "in the system keychain (service `{SERVICE}`, accounts `{LINEAR_APP_ID_ACCOUNT}` and \
+         `{LINEAR_APP_SECRET_ACCOUNT}`)"
+    );
+    let why = "With the Linear app stored, `owlshift do` writes as its app user, checked before \
+               any work, and refuses rather than write through the API key.";
+    let store_both = || {
+        vec![Step::run_noting(
+            "owlshift init --replace-secrets",
+            "give the Linear app's client ID and secret when asked",
+        )]
+    };
+    let fail = |detail: String, fix: Vec<Step>| {
+        Check::fail(Section::Project, SUBJECT, detail, why, fix)
+    };
+    Some(match system.linear_app(team) {
+        Ok(Some(user)) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!("Owlshift writes on Linear as the app user `{}`", user.name),
+        ),
+        Ok(None) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("no Linear app {place}: Owlshift writes through the API key"),
+            format!(
+                "{DOES_NOT_BLOCK} Linear does not notify a person of what their own API key \
+                 writes, so a decider who holds the key learns of a question from this \
+                 machine's desktop notification alone. A workspace admin can create an OAuth \
+                 application with client credentials in Linear's API settings; `owlshift init` \
+                 stores its client ID and secret."
+            ),
+        ),
+        Err(AppError::NoKey) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: no Linear API key, which the Linear app's check needs",
+        ),
+        Err(AppError::Keychain(reason)) => fail(
+            format!("not checked: could not read the Linear app's credentials {place}: {reason}"),
+            vec![Step::act(KEYCHAIN_FIX)],
+        ),
+        Err(AppError::Incomplete { missing }) => fail(
+            format!(
+                "half of the Linear app is stored: nothing under service `{SERVICE}`, account \
+                 `{missing}`"
+            ),
+            store_both(),
+        ),
+        Err(AppError::Tracker(error)) => fail(
+            format!("the Linear app stored {place} cannot be used: {error}"),
+            match error.kind {
+                ErrorKind::Other => vec![Step::act(
+                    "Check that Linear is reachable from this machine, then run `owlshift \
+                     doctor` again; or delete both of the app's keychain entries to write \
+                     through the API key",
+                )],
+                ErrorKind::Unauthorized | ErrorKind::NotFound => store_both(),
+            },
+        ),
+    })
+}
+
 fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
     const SUBJECT: &str = "data directory";
     match system.data_dir() {
@@ -2008,6 +2088,58 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
         assert_eq!(offline.status, Status::Warn);
         assert_eq!(offline.detail, "not checked: Linear: no network in tests");
         assert!(report.ready(), "{report}");
+    }
+
+    /// OWL-157: the Linear app Owlshift writes as. None stored warns, since
+    /// writing through the key still works; what `do` would refuse fails.
+    #[test]
+    fn the_linear_app_is_checked_as_do_checks_it() {
+        use owlshift_adapters::tracker::Error;
+
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, owl) = linear_project();
+        let identity = |system: &FakeSystem| {
+            let report = run(system, &owl);
+            (line(&report, "tracker identity").clone(), report.ready())
+        };
+
+        let (found, ready_to_run) = identity(&ready().linear_app_is(Ok("owlshiftbot")));
+        assert_eq!(found.status, Status::Ok, "{found:?}");
+        assert_eq!(
+            found.detail,
+            "Owlshift writes on Linear as the app user `owlshiftbot`"
+        );
+        assert!(ready_to_run);
+
+        let (none, ready_to_run) = identity(&ready());
+        assert_eq!(none.status, Status::Warn, "{none:?}");
+        assert!(
+            none.detail.ends_with("Owlshift writes through the API key"),
+            "{none:?}"
+        );
+        assert!(ready_to_run);
+
+        let refused = Error::new(ErrorKind::Unauthorized, "refused");
+        let offline = Error::new(ErrorKind::Other, "Linear: no network");
+        let failures: [(FakeSystem, &[&str]); 3] = [
+            (
+                ready()
+                    .linear_app_is(Ok("owlshiftbot"))
+                    .unstored(LINEAR_APP_SECRET_ACCOUNT),
+                &["owlshift init --replace-secrets"],
+            ),
+            (
+                ready().linear_app_is(Err(refused)),
+                &["owlshift init --replace-secrets"],
+            ),
+            (ready().linear_app_is(Err(offline)), &[]),
+        ];
+        for (system, expected) in failures {
+            let (failed, ready_to_run) = identity(&system);
+            assert_eq!(failed.status, Status::Fail, "{failed:?}");
+            assert_eq!(commands(&failed.fix), expected, "{failed:?}");
+            assert!(!ready_to_run);
+        }
     }
 
     /// A Markdown project names states the adapter writes as they are: no
