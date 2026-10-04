@@ -147,6 +147,10 @@ pub struct Comment {
     /// The tracker's identifier for the comment.
     pub id: String,
     pub author: Author,
+    /// When the tracker recorded it. The times order a ticket's comments as
+    /// the tracker lists them, those of one second included: a tracker that
+    /// keeps whole seconds gives each comment of a second its own time, in
+    /// its own order (OWL-136), since the runner compares times only.
     pub created_at: Timestamp,
     /// When its author last edited it; `None` if never edited.
     pub edited_at: Option<Timestamp>,

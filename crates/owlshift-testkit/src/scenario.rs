@@ -841,8 +841,10 @@ impl Driver {
     /// The answer check runs when answers arrive: a comment of the decider
     /// after the latest ask, or after the newest decider comment the last
     /// check that found a counter-question read. A failed or interrupted
-    /// check moves nothing, so it is retried on the same answers. Returns
-    /// the newest decider comment's time: what this check reads through.
+    /// check moves nothing, so it is retried on the same answers. As in
+    /// `answer_check::new_answer`, only the tracker's times are compared,
+    /// and they order the comments of one second (OWL-136). Returns the
+    /// newest decider comment's time: what this check reads through.
     fn require_new_answer(&self) -> Result<Timestamp, String> {
         let since = self
             .answers_since

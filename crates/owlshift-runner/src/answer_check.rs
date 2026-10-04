@@ -32,9 +32,10 @@ use crate::on_demand::{comment_author, core_event};
 /// comments when it is later than the latest ask and than what the last
 /// answer check to give its verdicts read
 /// ([`TicketQuestions::answers_after`]), `None` otherwise. Only the tracker's
-/// times are compared, never this machine's clock. A comment is the
-/// decider's as the brief marks it: their account's, and not a marked
-/// comment.
+/// times are compared, at their own precision, never this machine's clock:
+/// they order the comments of one second (OWL-136), so an answer posted in
+/// its ask's second is newer. A comment is the decider's as the brief marks
+/// it: their account's, and not a marked comment.
 pub fn new_answer(
     comments: &[Comment],
     decider: &Person,
@@ -63,7 +64,7 @@ pub fn newest_decider_comment<'c>(
 /// The decider's comments a Build run did not see (OWL-139): those of `now`
 /// whose last edit is newer than the newest decider edit among `read`, the
 /// comments its brief was built from; all of them when `read` held none. A
-/// comment of the same second as that edit is missed, as by [`new_answer`].
+/// comment of the same time as that edit is missed, as by [`new_answer`].
 pub fn late_comments<'c>(
     read: &[Comment],
     now: &'c [Comment],
@@ -292,7 +293,7 @@ mod tests {
         let cases = [
             (vec![], None),
             (vec![by("u1", 9, None, "Early.")], None),
-            (vec![by("u1", 10, None, "Same second.")], None),
+            (vec![by("u1", 10, None, "Same time.")], None),
             (
                 vec![by("u1", 9, None, "a"), by("u1", 11, None, "b")],
                 Some(11),

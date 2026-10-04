@@ -6,6 +6,11 @@
 //! file per comment named `<YYYYMMDDTHHMMSSZ>[.<n>]-<author>.md`, `.<n>`
 //! marking the n-th comment of a second. The format is settled in
 //! `docs/design/build-plan.md`, "The test tracker".
+//!
+//! A comment's time is its second plus a microsecond for each comment of
+//! that second before it by n (OWL-136): the times then order the comments
+//! as the tracker lists them, as Linear's do, which the runner's comparisons
+//! need. It is not the instant the comment was written, only its place.
 
 use std::fmt;
 use std::fs;
@@ -13,9 +18,9 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use jiff::Timestamp;
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
 use owlshift_contracts::Priority;
@@ -45,6 +50,8 @@ pub struct Ticket {
 pub struct Comment {
     /// The file name without `.md`: unique on its ticket.
     pub id: String,
+    /// Its second, plus a microsecond per comment of that second before it
+    /// (see the module).
     pub at: Timestamp,
     pub author: String,
     pub body: String,
@@ -106,7 +113,7 @@ impl MarkdownTracker {
             .map(|file| {
                 Ok(Comment {
                     id: file.name.strip_suffix(".md").unwrap_or_default().to_owned(),
-                    at: file.at,
+                    at: time(file.second, file.nth).map_err(|e| error(&dir, e))?,
                     author: file.author,
                     body: read(&dir.join(&file.name))?,
                 })
@@ -114,9 +121,11 @@ impl MarkdownTracker {
             .collect()
     }
 
-    /// Adds a comment after the others of its second, whoever wrote them.
-    /// The time is kept to the second; a file is never overwritten, so a
-    /// name already taken (by a concurrent poster) is an error.
+    /// Adds a comment after the others of its second, whoever wrote them,
+    /// and returns it as [`MarkdownTracker::comments`] reads it. The file
+    /// keeps `at` to the second; a second holds a million comments at most.
+    /// A file is never overwritten, so a name already taken (by a
+    /// concurrent poster) is an error.
     pub fn post_comment(
         &self,
         id: &TicketId,
@@ -135,20 +144,20 @@ impl MarkdownTracker {
                 format!("invalid comment author {author:?}: expected {AUTHOR_PATTERN}"),
             ));
         }
-        let at = Timestamp::from_second(at.as_second()).map_err(|e| error(&dir, e))?;
+        let second = Timestamp::from_second(at.as_second()).map_err(|e| error(&dir, e))?;
         let nth = match comment_files(&dir)?
             .iter()
-            .filter(|file| file.at == at)
+            .filter(|file| file.second == second)
             .map(|file| file.nth)
             .max()
         {
             None => 1,
-            Some(last) => last
-                .checked_add(1)
-                .ok_or_else(|| error(&dir, "too many comments in one second"))?,
+            Some(last) if last < MAX_PER_SECOND => last + 1,
+            Some(_) => return Err(error(&dir, "too many comments in one second")),
         };
+        let at = time(second, nth).map_err(|e| error(&dir, e))?;
         fs::create_dir_all(&dir).map_err(|e| error(&dir, e))?;
-        let id = stem(at, nth, author);
+        let id = stem(second, nth, author);
         let path = dir.join(format!("{id}.md"));
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -331,6 +340,10 @@ const TIME_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 /// Who may sign a comment: a name that is safe in a file name.
 const AUTHOR_PATTERN: &str = "1 to 64 ASCII letters, digits, `_` or `-`";
 
+/// The most comments one second holds: the n-th reads n − 1 microseconds
+/// after its second ([`time`]), which keeps it within that second.
+const MAX_PER_SECOND: u32 = 1_000_000;
+
 /// The front matter of `ticket.md`.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -381,13 +394,20 @@ fn split(input: &str) -> Result<(Range<usize>, &str), String> {
 /// A file of a ticket's `comments/` folder, as its name gives it.
 struct CommentFile {
     name: String,
-    at: Timestamp,
+    /// The second its name holds; the comment reads at [`time`].
+    second: Timestamp,
     /// Its place among the comments of its second, from 1.
     nth: u32,
     author: String,
 }
 
-/// The comment files in `dir`, in reading order: time, then place in the
+/// When the `nth` comment of `second` reads: n − 1 microseconds after it, so
+/// the comments of one second read in the order they were posted.
+fn time(second: Timestamp, nth: u32) -> Result<Timestamp, jiff::Error> {
+    second.checked_add(SignedDuration::from_micros(i64::from(nth) - 1))
+}
+
+/// The comment files in `dir`, in reading order: second, then place in the
 /// second, then name, which keeps today's order for files of one second
 /// without a suffix. No folder is no comment; a file whose name is not a
 /// comment's is an error.
@@ -404,7 +424,7 @@ fn comment_files(dir: &Path) -> Result<Vec<CommentFile>, TrackerError> {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        let Some((at, nth, author)) = comment_name(name) else {
+        let Some((second, nth, author)) = comment_name(name) else {
             return Err(error(
                 &path,
                 "not a comment file: expected <YYYYMMDDTHHMMSSZ>[.<n>]-<author>.md",
@@ -412,18 +432,18 @@ fn comment_files(dir: &Path) -> Result<Vec<CommentFile>, TrackerError> {
         };
         files.push(CommentFile {
             name: name.to_owned(),
-            at,
+            second,
             nth,
             author,
         });
     }
-    files.sort_by(|a, b| (a.at, a.nth, &a.name).cmp(&(b.at, b.nth, &b.name)));
+    files.sort_by(|a, b| (a.second, a.nth, &a.name).cmp(&(b.second, b.nth, &b.name)));
     Ok(files)
 }
 
 /// A comment's file name without `.md`, which [`comment_name`] reads back.
-fn stem(at: Timestamp, nth: u32, author: &str) -> String {
-    let time = at.strftime(TIME_FORMAT);
+fn stem(second: Timestamp, nth: u32, author: &str) -> String {
+    let time = second.strftime(TIME_FORMAT);
     if nth == 1 {
         format!("{time}-{author}")
     } else {
@@ -431,8 +451,8 @@ fn stem(at: Timestamp, nth: u32, author: &str) -> String {
     }
 }
 
-/// The time, place in its second and author of a comment file name, if it
-/// is one written as [`stem`] writes it.
+/// The second, place in it and author of a comment file name, if it is one
+/// written as [`stem`] writes it.
 fn comment_name(name: &str) -> Option<(Timestamp, u32, String)> {
     let stem = name.strip_suffix(".md")?;
     let time = stem.get(..16)?;
@@ -443,7 +463,8 @@ fn comment_name(name: &str) -> Option<(Timestamp, u32, String)> {
             let (digits, author) = rest.split_once('-')?;
             let nth: u32 = digits.parse().ok()?;
             // One name per place: no `.1`, `.0`, `.02` or `.+2`.
-            (nth >= 2 && nth.to_string() == digits).then_some((nth, author))?
+            ((2..=MAX_PER_SECOND).contains(&nth) && nth.to_string() == digits)
+                .then_some((nth, author))?
         }
     };
     let at = DateTime::strptime(TIME_FORMAT, time)
@@ -571,8 +592,9 @@ mod tests {
     }
 
     /// Comments posted back to back in one second are all kept, in posting
-    /// order, whoever wrote them; files of one second written before the
-    /// suffix keep their names, their ids and their order.
+    /// order, whoever wrote them, and read at times in that order (OWL-136);
+    /// files of one second written before the suffix keep their names, their
+    /// ids and their order, and share the second's time.
     #[test]
     fn comments_of_one_second_are_kept_in_posting_order() {
         let (_root, tracker, _) = repository(TICKET);
@@ -588,39 +610,54 @@ mod tests {
             .unwrap();
         }
         let second = at("2026-09-28T10:00:00.700Z");
+        let mut posted = Vec::new();
         for n in 2..=10 {
             let author = if n == 4 { "maintainer" } else { "owlshift" };
-            let posted = tracker
+            let comment = tracker
                 .post_comment(&id(), author, second, &n.to_string())
                 .unwrap();
-            assert_eq!(posted.id, format!("20260928T100000Z.{n}-{author}"));
-            assert_eq!(posted.at, at("2026-09-28T10:00:00Z"));
+            assert_eq!(comment.id, format!("20260928T100000Z.{n}-{author}"));
+            assert_eq!(
+                comment.at,
+                at(&format!("2026-09-28T10:00:00.{:06}Z", n - 1))
+            );
+            posted.push(comment);
         }
         // A new second starts again without a suffix.
         tracker
             .post_comment(&id(), "owlshift", at("2026-09-28T10:00:01Z"), "next")
             .unwrap();
 
-        let bodies: Vec<_> = tracker
-            .comments(&id())
-            .unwrap()
-            .into_iter()
-            .map(|comment| comment.body)
-            .collect();
+        let comments = tracker.comments(&id()).unwrap();
+        let bodies: Vec<_> = comments.iter().map(|comment| &comment.body).collect();
         assert_eq!(
             bodies,
             [
                 "a-b", "a", "2", "3", "4", "5", "6", "7", "8", "9", "10", "next"
             ]
         );
-        let ids: Vec<_> = shared::Tracker::comments(&tracker, &id())
-            .unwrap()
-            .into_iter()
-            .map(|comment| comment.id)
-            .collect();
-        assert_eq!(ids[0], "20260928T100000Z-a-b");
-        assert_eq!(ids[2], "20260928T100000Z.2-owlshift");
-        assert_eq!(ids[11], "20260928T100001Z-owlshift");
+        // Each comment reads back as it was posted.
+        assert_eq!(comments[2..11], posted[..]);
+        let shared = shared::Tracker::comments(&tracker, &id()).unwrap();
+        assert_eq!(shared[0].id, "20260928T100000Z-a-b");
+        assert_eq!(shared[2].id, "20260928T100000Z.2-owlshift");
+        assert_eq!(shared[11].id, "20260928T100001Z-owlshift");
+        let times: Vec<_> = shared.iter().map(|comment| comment.created_at).collect();
+        assert_eq!(times[0], times[1]);
+        assert!(times[1..].is_sorted_by(|a, b| a < b), "{times:?}");
+
+        // A second holds a million comments at most.
+        fs::write(comments_dir.join("20260928T100002Z.1000000-a.md"), "last").unwrap();
+        let full = tracker.post_comment(&id(), "a", at("2026-09-28T10:00:02Z"), "x");
+        assert!(
+            full.unwrap_err()
+                .reason
+                .contains("too many comments in one second"),
+        );
+        assert_eq!(
+            tracker.comments(&id()).unwrap().last().unwrap().at,
+            at("2026-09-28T10:00:02.999999Z")
+        );
     }
 
     #[test]
@@ -636,6 +673,8 @@ mod tests {
             ("20260928T100000Z.-bob.md", None),
             ("20260928T100000Z.2bob.md", None),
             ("20260928T100000Z.2-.md", None),
+            ("20260928T100000Z.1000000-bob.md", Some((1_000_000, "bob"))),
+            ("20260928T100000Z.1000001-bob.md", None),
             ("20260928T100000Z.4294967296-bob.md", None),
         ] {
             let parsed = comment_name(name).map(|(at, nth, author)| {
