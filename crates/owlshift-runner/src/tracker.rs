@@ -4,6 +4,7 @@
 //! the system keychain and hands them to the adapter, never to an agent
 //! (architecture section 8).
 
+use owlshift_adapters::tracker;
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
 use owlshift_platform::keychain::{Keychain, SERVICE};
 
@@ -15,14 +16,44 @@ pub const LINEAR_ACCOUNT: &str = "linear";
 /// reads the ticket with it and hands it to the [writer](crate::writer);
 /// `owlshift init` stores the key.
 pub fn linear(keychain: &Keychain) -> Result<LinearTracker, String> {
-    match keychain.read(LINEAR_ACCOUNT) {
-        Ok(Some(key)) => Ok(LinearTracker::new(ApiKey::new(key.expose()))),
-        Ok(None) => Err(format!(
+    match read_key(keychain)? {
+        Some(key) => Ok(LinearTracker::new(key)),
+        None => Err(format!(
             "no Linear API key in the system keychain: run `owlshift init` in a terminal, or \
              store one under service `{SERVICE}`, account `{LINEAR_ACCOUNT}`"
         )),
-        Err(error) => Err(error.to_string()),
     }
+}
+
+/// Why `owlshift doctor` could not read the Linear team's workflow states.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StatesError {
+    /// No Linear API key is stored.
+    NoKey,
+    /// The keychain could not be read, for this reason.
+    Keychain(String),
+    /// Linear answered with an error, or did not answer.
+    Tracker(tracker::Error),
+}
+
+/// The names of the workflow states of the Linear team `team`, read with
+/// the key in `keychain` (OWL-147). The key is read once: on macOS each read
+/// may ask to allow the access.
+pub fn linear_team_states(keychain: &Keychain, team: &str) -> Result<Vec<String>, StatesError> {
+    match read_key(keychain) {
+        Ok(Some(key)) => LinearTracker::new(key)
+            .team_states(team)
+            .map_err(StatesError::Tracker),
+        Ok(None) => Err(StatesError::NoKey),
+        Err(reason) => Err(StatesError::Keychain(reason)),
+    }
+}
+
+fn read_key(keychain: &Keychain) -> Result<Option<ApiKey>, String> {
+    keychain
+        .read(LINEAR_ACCOUNT)
+        .map(|key| key.map(|key| ApiKey::new(key.expose())))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -38,6 +69,10 @@ mod tests {
         assert!(
             missing.contains("service `owlshift`, account `linear`"),
             "{missing}"
+        );
+        assert_eq!(
+            linear_team_states(&keychain, "OWL"),
+            Err(StatesError::NoKey)
         );
 
         keychain

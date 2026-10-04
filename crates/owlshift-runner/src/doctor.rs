@@ -5,6 +5,11 @@
 //! rebuilt from its digits and a login label from a fixed list (live check
 //! C8 in `docs/design/build-plan.md`).
 //!
+//! The one check that leaves the machine is a Linear project's
+//! `tracker states` (OWL-147): it reads the Linear API key in the system
+//! keychain and the team's workflow states from Linear, and reports state
+//! names and Linear's error text only, never the key.
+//!
 //! Each check carries its own texts: a failure says why the check exists and
 //! the steps that fix it, a warning says why it does not block `owlshift do`.
 //! How the report is laid out, as text or JSON, is [`render`]'s (OWL-99).
@@ -14,17 +19,21 @@ pub mod render;
 use std::path::{MAIN_SEPARATOR, Path};
 
 use owlshift_adapters::harness::{self, Login, tested};
-use owlshift_adapters::tracker::Capability;
-use owlshift_adapters::tracker::linear::LinearTracker;
+use owlshift_adapters::tracker::linear::{LinearTracker, StateMismatch, find_state};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
+use owlshift_adapters::tracker::{Capability, ErrorKind};
 use owlshift_contracts::Harness;
-use owlshift_contracts::config::TrackerKind;
+use owlshift_contracts::config::{States, TrackerKind};
 use owlshift_platform::keychain::SERVICE;
 use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
+use serde_json::Value;
 
 use crate::config::{Effective, FileState, exit_text};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
-use crate::system::{DataDirSource, RunError, System, exact_version_of, version_of};
+use crate::system::{
+    DataDirSource, RunError, StatesError, System, exact_version_of, version_of,
+};
+use crate::tracker::LINEAR_ACCOUNT;
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 
@@ -244,6 +253,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(file_check("project config", &config.project, home));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
+    checks.extend(tracker_states_check(system, config));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
@@ -574,13 +584,14 @@ fn agent_login_check(system: &dyn System) -> Check {
             format!("could not tell whether a token for agent runs is stored {place}: {error}"),
             "Owlshift keeps the agent runs' Claude Code token in the system keychain, and \
              `owlshift do` reads it there before each run.",
-            vec![Step::act(
-                "Make the system keychain available: unlock it on macOS; on Linux, start a \
-                 Secret Service such as GNOME Keyring",
-            )],
+            vec![Step::act(KEYCHAIN_FIX)],
         ),
     }
 }
+
+/// The step that fixes a keychain doctor cannot read.
+const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on macOS; on Linux, \
+                            start a Secret Service such as GNOME Keyring";
 
 /// The harnesses declared in the personal file, or both when it declares
 /// none (scenario S15). Codex that is not ready is only a warning until P5: see
@@ -831,7 +842,7 @@ fn file_check<T>(subject: &str, state: &FileState<T>, home: Option<&Path>) -> Ch
 /// implement yet is a warning, not a failure: `owlshift do` needs only to
 /// read tickets and comments and move the visible stage, and refusing a project is `init`'s job. The
 /// check reads the adapter's constants: it opens neither the tracker nor the
-/// keychain.
+/// keychain; [`tracker_states_check`] does, for a Linear project.
 fn tracker_check(config: &Effective) -> Check {
     const SUBJECT: &str = "tracker";
     let FileState::Loaded { config, .. } = &config.project else {
@@ -870,6 +881,141 @@ fn tracker_check(config: &Effective) -> Check {
             ),
         )
     }
+}
+
+/// Whether each state named under `[tracker].states` is exactly one
+/// workflow state of the project's Linear team (OWL-147): the rule by which
+/// the stage moves. A name that matches none or several only keeps the stage
+/// from moving, which never stops `owlshift do`, so it is a warning; what
+/// keeps `do` from reading the ticket at all (no key, a rejected key, a
+/// keychain it cannot read, a team Linear does not know) is a failure. None
+/// for a Markdown project or none loaded: only a Linear project opens the
+/// keychain and the network here, once each.
+fn tracker_states_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "tracker states";
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
+        return None;
+    };
+    let place = format!("in the system keychain (service `{SERVICE}`, account `{LINEAR_ACCOUNT}`)");
+    let fail = |detail: String, why: &str, fix: Vec<Step>| {
+        Some(Check::fail(Section::Project, SUBJECT, detail, why, fix))
+    };
+    let names = match system.linear_states(team) {
+        Ok(names) => names,
+        Err(StatesError::NoKey) => {
+            return fail(
+                format!("not checked: no Linear API key {place}"),
+                "`owlshift do` reads the ticket with the Linear API key Owlshift keeps in the \
+                 system keychain, and doctor reads the team's workflow states with it.",
+                vec![Step::run_noting("owlshift init", "paste the key when asked")],
+            );
+        }
+        Err(StatesError::Keychain(reason)) => {
+            return fail(
+                format!("not checked: could not read the Linear API key {place}: {reason}"),
+                "`owlshift do` reads the Linear API key in the system keychain before each run.",
+                vec![Step::act(KEYCHAIN_FIX)],
+            );
+        }
+        Err(StatesError::Tracker(error)) => {
+            return match error.kind {
+                ErrorKind::Unauthorized => fail(
+                    format!("not checked: Linear refused the API key stored {place}: {error}"),
+                    "`owlshift do` reads the ticket with this key, so Linear would refuse it too.",
+                    vec![Step::run_noting(
+                        "owlshift init --replace-secrets",
+                        "paste a valid Linear API key when asked",
+                    )],
+                ),
+                ErrorKind::NotFound => fail(
+                    format!("not checked: {error}, which `[tracker].team` names (`{team}`)"),
+                    "`owlshift do` runs the tickets of the team `[tracker].team` names, and moves \
+                     their stage among that team's workflow states.",
+                    vec![Step::act(
+                        "Set `team` under `[tracker]` in owlshift.toml to the key your team's \
+                         issue identifiers start with, such as `OWL` for `OWL-12`",
+                    )],
+                ),
+                ErrorKind::Other => Some(Check::warn(
+                    Section::Project,
+                    SUBJECT,
+                    format!("not checked: {error}"),
+                    format!(
+                        "{DOES_NOT_BLOCK} doctor could not read the workflow states of team \
+                         `{team}`. A name under `[tracker].states` that matches none only keeps \
+                         the ticket's visible stage from moving."
+                    ),
+                )),
+            };
+        }
+    };
+    let configured = configured_states(&config.tracker.states);
+    let mut problems = Vec::new();
+    let mut ambiguous = false;
+    for (key, name) in &configured {
+        match find_state(names.iter().map(String::as_str), name) {
+            Ok(_) => {}
+            Err(StateMismatch::Missing) => {
+                problems.push(format!("no state named {name:?} (`{key}`)"));
+            }
+            Err(StateMismatch::Ambiguous) => {
+                ambiguous = true;
+                problems.push(format!("several named {name:?} (`{key}`)"));
+            }
+        }
+    }
+    let keys: Vec<&str> = configured.iter().map(|(key, _)| key.as_str()).collect();
+    if problems.is_empty() {
+        return Some(Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "each of {} is one workflow state of team `{team}`",
+                keys.join(", ")
+            ),
+        ));
+    }
+    let mut why = format!(
+        "{DOES_NOT_BLOCK} a move to a state that matches none, or several, fails with a \
+         `stage_not_moved` warning event, and the ticket's visible stage stays where it was. Set \
+         each under `[tracker].states` in owlshift.toml to one of the team's states, exactly, \
+         case included: {}.",
+        names.join(", ")
+    );
+    if ambiguous {
+        why.push_str(" A name several states share must first be made unique in Linear.");
+    }
+    Some(Check::warn(
+        Section::Project,
+        SUBJECT,
+        format!("team `{team}` has {}", problems.join("; ")),
+        why,
+    ))
+}
+
+/// Each key set under `[tracker].states` and the state it names, keys in
+/// alphabetical order. Read from the configuration as it serializes, so a
+/// key added later is checked once set and an optional one left unset is
+/// not.
+fn configured_states(states: &States) -> Vec<(String, String)> {
+    state_entries(serde_json::to_value(states).expect("the states are strings"))
+}
+
+/// The string fields of `[tracker].states` as JSON: an unset optional key is
+/// `null`, or absent.
+fn state_entries(states: Value) -> Vec<(String, String)> {
+    let Value::Object(map) = states else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter_map(|(key, value)| match value {
+            Value::String(name) => Some((key, name)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Where `owlshift do` keeps its event log, dedicated checkouts and
@@ -1669,16 +1815,24 @@ mod tests {
     }
 
     fn linear_project() -> (tempfile::TempDir, Effective) {
+        project_tracked_by(
+            r#"kind = "linear"
+team = "OWL"
+admit = "delegation"
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }"#,
+        )
+    }
+
+    /// A loaded project whose `[tracker]` table is `tracker`.
+    fn project_tracked_by(tracker: &str) -> (tempfile::TempDir, Effective) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("owlshift.toml");
         std::fs::write(
             &project,
-            r#"requires = ">=0.0"
+            format!(
+                r#"requires = ">=0.0"
 [tracker]
-kind = "linear"
-team = "OWL"
-admit = "delegation"
-states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+{tracker}
 [stack]
 gate = ["cargo test"]
 [pipeline]
@@ -1687,7 +1841,8 @@ plan_approval = "never"
 [models]
 [policy]
 always_human = []
-"#,
+"#
+            ),
         )
         .unwrap();
         let config = Effective {
@@ -1761,6 +1916,128 @@ always_human = []
             tracker.detail,
             "`linear`: read a ticket, read and post comments, visible stage; \
              not built yet: list admitted tickets"
+        );
+    }
+
+    /// Team `OWL`'s workflow states as Linear listed them on 2026-10-04.
+    const OWL_STATES: &[&str] = &[
+        "In Review",
+        "Needs Input",
+        "Triage",
+        "Duplicate",
+        "Done",
+        "Backlog",
+        "Todo",
+        "Canceled",
+        "In Progress",
+    ];
+
+    /// OWL-147: each name under `[tracker].states` must be one workflow
+    /// state of the team. A misnamed or ambiguous one warns, with the valid
+    /// names; what keeps `do` from reading the ticket fails, with its fix;
+    /// Linear out of reach warns that nothing was checked.
+    #[test]
+    fn the_tracker_states_are_checked_against_the_linear_team() {
+        use owlshift_adapters::tracker::Error;
+
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, owl) = linear_project();
+        let states_line = |system: &FakeSystem, config: &Effective| {
+            let report = run(system, config);
+            line(&report, "tracker states").clone()
+        };
+
+        let found = states_line(&ready().linear_states_are(Ok(OWL_STATES)), &owl);
+        assert_eq!(found.status, Status::Ok, "{found:?}");
+        assert_eq!(
+            found.detail,
+            "each of needs_input, ready, review, working is one workflow state of team `OWL`"
+        );
+
+        let (_dir, misnamed) = project_tracked_by(
+            r#"kind = "linear"
+team = "OWL"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", review = "Done" }"#,
+        );
+        let twice: Vec<&str> = OWL_STATES.iter().copied().chain(["Done"]).collect();
+        let report = run(&ready().linear_states_are(Ok(&twice)), &misnamed);
+        let warned = line(&report, "tracker states");
+        assert!(report.ready(), "{report}");
+        assert_eq!(warned.status, Status::Warn);
+        assert_eq!(
+            warned.detail,
+            "team `OWL` has several named \"Done\" (`review`); no state named \"Doing\" (`working`)"
+        );
+        let why = warned.why.as_deref().unwrap();
+        assert!(
+            why.contains("case included: In Review, Needs Input, Triage, Duplicate, Done,"),
+            "{why}"
+        );
+        assert!(why.ends_with("must first be made unique in Linear."), "{why}");
+
+        let not_found = Error::new(ErrorKind::NotFound, "Linear has no team with the key \"OWL\"");
+        let refused = Error::new(ErrorKind::Unauthorized, "Linear: AUTHENTICATION_ERROR: no");
+        let failures: [(FakeSystem, &[&str]); 4] = [
+            (ready().unstored(LINEAR_ACCOUNT), &["owlshift init"]),
+            (ready().keychain_fails("locked"), &[]),
+            (
+                ready().linear_states_are(Err(refused)),
+                &["owlshift init --replace-secrets"],
+            ),
+            (ready().linear_states_are(Err(not_found)), &[]),
+        ];
+        for (system, expected) in failures {
+            let report = run(&system, &owl);
+            let failed = line(&report, "tracker states");
+            assert_eq!(failed.status, Status::Fail, "{report}");
+            assert!(failed.detail.starts_with("not checked: "), "{failed:?}");
+            assert_eq!(commands(&failed.fix), expected, "{failed:?}");
+        }
+
+        // The fake answers as Linear out of reach unless told otherwise.
+        let report = run(&ready(), &owl);
+        let offline = line(&report, "tracker states");
+        assert_eq!(offline.status, Status::Warn);
+        assert_eq!(offline.detail, "not checked: Linear: no network in tests");
+        assert!(report.ready(), "{report}");
+    }
+
+    /// A Markdown project names states the adapter writes as they are: no
+    /// line, no keychain, no network (a project not loaded, as above).
+    #[test]
+    fn a_markdown_project_has_no_tracker_states_line() {
+        let (_dir, markdown) = project_tracked_by(
+            r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#,
+        );
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+            .keychain_fails("must not be read");
+        let report = run(&system, &markdown);
+        assert!(report.checks.iter().all(|c| c.subject != "tracker states"));
+    }
+
+    /// Every key set under `[tracker].states` is checked, one added later
+    /// included; an optional key left unset is not.
+    #[test]
+    fn every_state_key_set_is_checked() {
+        let (_dir, owl) = linear_project();
+        let FileState::Loaded { config, .. } = &owl.project else {
+            panic!("{:?}", owl.project)
+        };
+        let keys: Vec<String> = configured_states(&config.tracker.states)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["needs_input", "ready", "review", "working"]);
+        let later = serde_json::json!({ "ready": "Todo", "parked": "Parked", "gone": null });
+        assert_eq!(
+            state_entries(later),
+            [
+                ("parked".to_owned(), "Parked".to_owned()),
+                ("ready".to_owned(), "Todo".to_owned())
+            ]
         );
     }
 }
