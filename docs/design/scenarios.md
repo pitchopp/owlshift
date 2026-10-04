@@ -23,7 +23,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 2. The decider replies in one or several comments.
 3. The reply counts once the decider's last comment is older than the quiet window (an edit restarts it), or immediately if it ends with `go`, whether `owlshift continue` or `watch` picks it up.
 4. The answer check classifies each question, and the round has one outcome, the first that applies. A counter-question, even next to missing answers: an answer in the thread, the ticket stays, nothing is re-asked and no re-ask is counted; after the decider's next reply, the answer check classifies every question of the same ask again. Something missing: a *re-ask* comment lists only the open questions and why. All answered: a *resume* comment restates what was understood, the ticket returns to its stage, a fresh run resumes from the checkpoint.
-5. Before delivery the run re-reads the thread. A comment posted after the resume is integrated, or sends the ticket back to needs-input if it contradicts the work.
+5. Before delivery the run re-reads the thread. A comment of the decider that the work has not seen gets one more Build run, which integrates it, or sends the ticket back to needs-input when it contradicts the work so that the run cannot follow it without the decider; a further one after that run sends the ticket back to needs-input.
 
 - Every question is understandable without any transcript; all questions of a round sit in one comment.
 - A bare "ok" means the recommendation when there is one, and is ambiguous otherwise.
