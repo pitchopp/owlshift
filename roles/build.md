@@ -37,7 +37,7 @@ Your plan and ledger live at `checkpoint.plan` and `checkpoint.ledger` when the 
 - a commit on the branch whose step is not marked done: mark it done, do not redo it;
 - uncommitted changes are the unfinished next step: keep and finish them if they match it, otherwise stop with `blocked` and describe them.
 
-Then read the `thread` for the decider's answers and the `decision` entries since the last round, and continue from the first step not done. If an answer invalidates the plan, revise the plan first.
+Then read the `thread` for the decider's answers and the `decision` entries since the last round, and continue from the first step not done. If an answer invalidates the plan, revise the plan first. A `decider` comment newer than the runner's latest `[owlshift] RESUME` comment came while the work was under way or done: integrate it, adding or revising steps even when every step is already done, and never end with `done` on work that ignores it; when you cannot follow it without the decider, because it contradicts their answers or the work in a way only they can settle, ask about it with status `questions`.
 
 **Planning.** Before any code, read the ticket, the thread, the `rules` and the code the ticket touches, then write the plan: goal, success criteria, files, small ordered steps (each one commit), how each step is checked, risks. Then write the ledger with every step not yet done, and no commit:
 
