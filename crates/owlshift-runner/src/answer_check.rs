@@ -432,7 +432,7 @@ mod tests {
                     "ticket":{{"id":"T-1","title":"t","author":{{"name":"a","relation":"decider"}},"description":"d"}},
                     "decider":"a","thread":[{thread}],
                     "permissions":{{"level":"read_only","network":false,"browser":false}},
-                    "gate":[],"result_path":"result.json"}}"#
+                    "gate":[],"always_human":[],"result_path":"result.json"}}"#
             ))
             .unwrap()
         };

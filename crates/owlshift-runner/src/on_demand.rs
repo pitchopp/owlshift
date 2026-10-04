@@ -1826,6 +1826,15 @@ impl OnDemand<'_> {
                 browser: false,
             },
             gate: self.config.stack.gate.clone(),
+            always_human: if matches!(role, Role::Build | Role::Resolver) {
+                GatePolicy::new(
+                    &self.config.policy.always_human,
+                    self.config.pipeline.plan_approval,
+                )
+                .additions()
+            } else {
+                Vec::new()
+            },
             gate_failure,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }

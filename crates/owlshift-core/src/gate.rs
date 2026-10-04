@@ -48,6 +48,20 @@ impl GatePolicy {
         }
     }
 
+    /// The categories the project adds to the floor, as the gate reads them:
+    /// normalized, in the project's order, each once, with the blank ones and
+    /// those the floor already covers left out. What the runner tells a run,
+    /// so it can file a question under the word the gate matches.
+    pub fn additions(&self) -> Vec<String> {
+        let mut added: Vec<String> = Vec::new();
+        for category in &self.always_human {
+            if !is_floor_category(category) && !added.contains(category) {
+                added.push(category.clone());
+            }
+        }
+        added
+    }
+
     /// Whether a question of this category always goes to a human: a floor
     /// category (a blank one included), or one the project added.
     pub fn always_human(&self, category: &str) -> bool {
@@ -131,6 +145,24 @@ mod tests {
         }
         assert_eq!(policy.route("naming"), Route::Resolver);
         assert_eq!(policy.route("authoring"), Route::Resolver);
+    }
+
+    #[test]
+    fn additions_are_what_the_project_added_beyond_the_floor() {
+        let policy = GatePolicy::new(
+            [
+                "Billing!",
+                "Data Loss",
+                "",
+                "billing",
+                "tone",
+                "legal_wording",
+            ],
+            PlanApproval::Never,
+        );
+        assert_eq!(policy.additions(), ["billing", "tone"]);
+        let bare = GatePolicy::new(Vec::<String>::new(), PlanApproval::Never);
+        assert!(bare.additions().is_empty());
     }
 
     /// A decision stands only when Build's category and the resolver's own

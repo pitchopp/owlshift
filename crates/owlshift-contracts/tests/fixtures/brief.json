@@ -1,5 +1,5 @@
 {
-  "format": 5,
+  "format": 6,
   "role": "build",
   "project": "owlshift",
   "ticket": {
@@ -83,6 +83,7 @@
   ],
   "permissions": { "level": "write_worktree", "network": false, "browser": false },
   "gate": ["cargo fmt --all -- --check", "cargo test --workspace"],
+  "always_human": ["billing", "auth"],
   "gate_failure": {
     "command": "cargo test --workspace",
     "reason": "exit status 101",

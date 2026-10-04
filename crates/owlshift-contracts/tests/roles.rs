@@ -57,6 +57,7 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "permissions.network",
     "permissions.browser",
     "gate",
+    "always_human",
     "gate_failure.command",
     "gate_failure.reason",
     "gate_failure.output",
@@ -114,6 +115,7 @@ const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "thread.decision",
     "rules.text",
     "rules.source",
+    "always_human",
     "result_path",
 ];
 
