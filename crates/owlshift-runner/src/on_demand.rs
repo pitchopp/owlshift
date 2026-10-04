@@ -586,6 +586,9 @@ struct Prepared {
     /// The ticket ref as read, then as last written; `None` until a question
     /// round opens.
     stored: Option<Stored>,
+    /// The project's gate policy, built once for the command: it routes the
+    /// questions and gives the brief the project's additions.
+    policy: GatePolicy,
 }
 
 impl Prepared {
@@ -818,6 +821,10 @@ impl OnDemand<'_> {
             worktree,
             branch: branch_for(ticket),
             stored,
+            policy: GatePolicy::new(
+                &self.config.policy.always_human,
+                self.config.pipeline.plan_approval,
+            ),
         })
     }
 
@@ -1153,11 +1160,7 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Routing, Stop> {
         let ticket = p.ticket.clone();
-        let policy = GatePolicy::new(
-            &self.config.policy.always_human,
-            self.config.pipeline.plan_approval,
-        );
-        let routed = resolver::route(&policy, &result.questions);
+        let routed = resolver::route(&p.policy, &result.questions);
         let all = |fallback| {
             Routing::Ask(Round {
                 questions: resolver::left_for_decider(&result.questions, &[]),
@@ -1234,7 +1237,7 @@ impl OnDemand<'_> {
         let mut unposted: Vec<QuestionId> = Vec::new();
         // A decision whose two labels do not both route to the resolver is
         // refused here, whatever the resolver decided (OWL-144).
-        let sorted = resolver::settle(&policy, &routed.to_resolver, resolutions);
+        let sorted = resolver::settle(&p.policy, &routed.to_resolver, resolutions);
         for (question, decision, basis) in sorted.logged {
             let comment = DecisionComment {
                 ticket: ticket.clone(),
@@ -1939,11 +1942,7 @@ impl OnDemand<'_> {
             },
             gate: self.config.stack.gate.clone(),
             always_human: if matches!(role, Role::Build | Role::Resolver) {
-                GatePolicy::new(
-                    &self.config.policy.always_human,
-                    self.config.pipeline.plan_approval,
-                )
-                .additions()
+                p.policy.additions()
             } else {
                 Vec::new()
             },
