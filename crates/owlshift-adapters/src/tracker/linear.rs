@@ -48,6 +48,10 @@
 //! workflow states in one page, and an unknown key (`NOPE`) answers
 //! `nodes: []`, HTTP 200, no error.
 //!
+//! Checked live on 2026-10-04 (OWL-153): that key filter is case-sensitive,
+//! `eq: "OWL"` answers the team and `eq: "owl"` answers `nodes: []`, HTTP
+//! 200, so the key is sent upper case.
+//!
 //! Checked live on 2026-10-03 (OWL-140): `{ issue(id: "OWL-140") {
 //! identifier url } }` answered the `url`
 //! `https://linear.app/owlshift/issue/OWL-140/notify-the-operator-on-the-desktop-when-they-become-the-blocker`:
