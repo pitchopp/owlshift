@@ -1079,9 +1079,21 @@ mod tests {
     #[test]
     fn an_app_of_another_workspace_or_blind_to_the_team_is_refused() {
         for (seen, kind, says) in [
-            (app_seen(false, "org-1", 1), ErrorKind::Other, "not an app user"),
-            (app_seen(true, "org-2", 1), ErrorKind::Other, "another workspace"),
-            (app_seen(true, "org-1", 0), ErrorKind::NotFound, "public teams only"),
+            (
+                app_seen(false, "org-1", 1),
+                ErrorKind::Other,
+                "not an app user",
+            ),
+            (
+                app_seen(true, "org-2", 1),
+                ErrorKind::Other,
+                "another workspace",
+            ),
+            (
+                app_seen(true, "org-1", 0),
+                ErrorKind::NotFound,
+                "public teams only",
+            ),
         ] {
             let key = Scripted::new(vec![(
                 "Workspace",

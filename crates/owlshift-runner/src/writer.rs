@@ -1960,10 +1960,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             open: Vec::new(),
             restart: Restart::Do,
         };
-        let delivery = report(Err(forge::Error::new(
-            ErrorKind::Unauthorized,
-            "not read",
-        )));
+        let delivery = report(Err(forge::Error::new(ErrorKind::Unauthorized, "not read")));
         assert_eq!(
             writer.post_decision(&decision).unwrap().body,
             decision.render()

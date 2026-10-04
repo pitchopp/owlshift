@@ -129,10 +129,7 @@ impl OAuth for HttpOAuth {
             .send_form(form)
             .map_err(unreachable)?;
         let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(unreachable)?;
+        let body = response.body_mut().read_to_string().map_err(unreachable)?;
         token_answer(status, &body)
     }
 
@@ -354,7 +351,9 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.sent_with,
-            ["token-1", "token-1", "token-2", "token-2", "token-3", "token-3"]
+            [
+                "token-1", "token-1", "token-2", "token-2", "token-3", "token-3"
+            ]
         );
         assert_eq!(seen.minted, 3);
         assert_eq!(seen.revoked, ["token-3"]);
@@ -401,15 +400,24 @@ mod tests {
         };
         let wrong = refused(400, "invalid_client");
         assert_eq!(wrong.kind, ErrorKind::Unauthorized);
-        assert!(wrong.message.ends_with("HTTP 400, invalid_client"), "{wrong}");
+        assert!(
+            wrong.message.ends_with("HTTP 400, invalid_client"),
+            "{wrong}"
+        );
         assert_eq!(refused(400, "invalid_scope").kind, ErrorKind::Other);
         let echoed = refused(400, SENTINEL);
-        assert!(echoed.message.ends_with("an unrecognised error"), "{echoed}");
+        assert!(
+            echoed.message.ends_with("an unrecognised error"),
+            "{echoed}"
+        );
         assert_eq!(refused(401, "x").kind, ErrorKind::Unauthorized);
 
         for (status, body) in [
             (200, json!({ "access_token": "a b" }).to_string()),
-            (200, json!({ "access_token": "x", "token_type": "mac" }).to_string()),
+            (
+                200,
+                json!({ "access_token": "x", "token_type": "mac" }).to_string(),
+            ),
             (200, "not json".to_owned()),
             (503, SENTINEL.to_owned()),
         ] {

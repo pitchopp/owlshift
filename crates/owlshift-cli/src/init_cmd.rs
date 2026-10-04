@@ -134,8 +134,8 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         Ok(report) => report,
         Err(error) => return fail(&error.to_string()),
     };
-    let app_ready = tracker != TrackerKind::Linear
-        || linear_app(&keychain, args.replace_secrets, &mut ask);
+    let app_ready =
+        tracker != TrackerKind::Linear || linear_app(&keychain, args.replace_secrets, &mut ask);
     for spec in &report.stored {
         println!("Stored the {spec}.");
     }

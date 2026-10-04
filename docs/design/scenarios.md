@@ -66,7 +66,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 - Configurable caps on concurrent runs and on open PRs awaiting review; above either, nothing new starts.
 - A daily digest: tickets waiting for an answer and what they block, PRs to review, follow-ups to triage.
-- A notification goes out only when a human becomes the blocker (question, re-ask, parked ticket, every harness at its usage limit), never for progress or a green check.
+- A notification goes out only when a human becomes the blocker (question, re-ask, parked ticket, every harness at its usage limit), never for progress or a green check. This binds the notifications Owlshift sends itself (the desktop one, later the webhook and the digest). A tracker tells people of Owlshift's comments by its own settings: on Linear, every comment of Owlshift's app user reaches the issue's subscribers, progress included, since Linear has no comment that notifies no one; the ones that wait for the decider (a question, a re-ask, a reply to their counter-question) mention them, which Linear files apart, as a mention (decision D8, OWL-157).
 
 ## Exceptions
 

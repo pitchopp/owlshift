@@ -1052,9 +1052,8 @@ fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Che
             "give the Linear app's client ID and secret when asked",
         )]
     };
-    let fail = |detail: String, fix: Vec<Step>| {
-        Check::fail(Section::Project, SUBJECT, detail, why, fix)
-    };
+    let fail =
+        |detail: String, fix: Vec<Step>| Check::fail(Section::Project, SUBJECT, detail, why, fix);
     Some(match system.linear_app(team) {
         Ok(Some(user)) => Check::ok(
             Section::Project,

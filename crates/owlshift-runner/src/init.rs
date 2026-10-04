@@ -317,8 +317,8 @@ pub fn store_app_credentials(
     replace: bool,
     ask: &mut dyn FnMut(&SecretSpec) -> Option<Secret>,
 ) -> Result<AppStored, KeychainError> {
-    let paired =
-        keychain.contains(LINEAR_APP_ID.account)? && keychain.contains(LINEAR_APP_SECRET.account)?;
+    let paired = keychain.contains(LINEAR_APP_ID.account)?
+        && keychain.contains(LINEAR_APP_SECRET.account)?;
     if paired && !replace {
         return Ok(AppStored::Kept);
     }
@@ -492,10 +492,7 @@ mod tests {
             store(false, [None, None]),
             (AppStored::Skipped, vec![LINEAR_APP_ID_ACCOUNT])
         );
-        assert_eq!(
-            store(false, [Some("id"), None]).0,
-            AppStored::Incomplete
-        );
+        assert_eq!(store(false, [Some("id"), None]).0, AppStored::Incomplete);
         assert_eq!(
             store(false, [Some("id"), Some("two\nlines")]).0,
             AppStored::Refused
@@ -511,10 +508,17 @@ mod tests {
             )
         );
         assert_eq!(
-            keychain.read(LINEAR_APP_ID_ACCOUNT).unwrap().unwrap().expose(),
+            keychain
+                .read(LINEAR_APP_ID_ACCOUNT)
+                .unwrap()
+                .unwrap()
+                .expose(),
             "id"
         );
-        assert_eq!(store(false, [Some("x"), Some("y")]), (AppStored::Kept, vec![]));
+        assert_eq!(
+            store(false, [Some("x"), Some("y")]),
+            (AppStored::Kept, vec![])
+        );
         assert_eq!(store(true, [None, None]).0, AppStored::Kept);
         assert_eq!(store(true, [Some("id"), None]).0, AppStored::Incomplete);
         assert_eq!(

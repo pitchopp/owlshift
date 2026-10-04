@@ -103,12 +103,12 @@ pub fn app_credentials(keychain: &Keychain) -> Result<Option<ClientCredentials>,
             .read(account)
             .map_err(|error| AppError::Keychain(error.to_string()))
     };
-    match (read(LINEAR_APP_ID_ACCOUNT)?, read(LINEAR_APP_SECRET_ACCOUNT)?) {
+    match (
+        read(LINEAR_APP_ID_ACCOUNT)?,
+        read(LINEAR_APP_SECRET_ACCOUNT)?,
+    ) {
         (None, None) => Ok(None),
-        (Some(id), Some(secret)) => Ok(Some(ClientCredentials::new(
-            id.expose(),
-            secret.expose(),
-        ))),
+        (Some(id), Some(secret)) => Ok(Some(ClientCredentials::new(id.expose(), secret.expose()))),
         (Some(_), None) => Err(AppError::Incomplete {
             missing: LINEAR_APP_SECRET_ACCOUNT,
         }),
@@ -139,9 +139,7 @@ fn open_app(
     team: &str,
 ) -> Result<(LinearTracker, AppUser), AppError> {
     let app = AppTransport::connect(HttpOAuth::new(credentials)).map_err(AppError::Tracker)?;
-    tracker
-        .writing_as_app(app, team)
-        .map_err(AppError::Tracker)
+    tracker.writing_as_app(app, team).map_err(AppError::Tracker)
 }
 
 /// Why `owlshift doctor` could not read the Linear team's workflow states.
