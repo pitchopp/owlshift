@@ -269,6 +269,8 @@ impl fmt::Display for Delivered {
 pub enum Landed {
     /// The questions of a round.
     Questions,
+    /// The round of a run that found the ticket's premise false.
+    PremiseFalse,
     /// A re-ask of open questions.
     Reask,
     /// The reply to the decider's counter-question.
@@ -1139,7 +1141,11 @@ impl OnDemand<'_> {
         });
         if let Err(error) = self.store(p, state, asked) {
             return Stop::NotKept {
-                landed: Landed::Questions,
+                landed: if status == result::Status::PremiseFalse {
+                    Landed::PremiseFalse
+                } else {
+                    Landed::Questions
+                },
                 message: format!(
                     "the questions of round {round} are on the ticket (comment {}), but keeping \
                      them in the ticket's ref failed: {error}; run `owlshift do {ticket}` to ask \

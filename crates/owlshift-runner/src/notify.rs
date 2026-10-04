@@ -94,6 +94,9 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         Stop::NotKept { landed, .. } => {
             let what = match landed {
                 Landed::Questions => "questions wait for an answer on the ticket",
+                Landed::PremiseFalse => {
+                    "the run found the ticket's premise false; a decision waits on the ticket"
+                }
                 Landed::Reask => "questions were asked again on the ticket",
                 Landed::Reply => "the decider's question has a reply on the ticket",
                 Landed::Parked => "the ticket is parked: a person must look",
@@ -457,6 +460,11 @@ mod tests {
                 not_kept(Landed::Questions),
                 "OWL-7: questions wait for an answer on the ticket, but Owlshift's state was \
                  not kept; see the terminal",
+            ),
+            (
+                not_kept(Landed::PremiseFalse),
+                "OWL-7: the run found the ticket's premise false; a decision waits on the \
+                 ticket, but Owlshift's state was not kept; see the terminal",
             ),
             (
                 not_kept(Landed::Reask),
