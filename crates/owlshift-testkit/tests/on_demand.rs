@@ -3044,3 +3044,117 @@ fn a_comment_on_the_ticket_whose_state_is_not_kept_is_a_stop_that_notifies() {
             .starts_with("[owlshift] PARKED")
     );
 }
+
+// ---------------------------------------------------------------------------
+// OWL-158: watch and a comment whose state is not kept.
+// ---------------------------------------------------------------------------
+
+/// OWL-158's acceptance: under `owlshift watch`, a re-ask that reached the
+/// ticket while keeping its state failed (the ticket's ref is locked) is not
+/// posted again. Without a hold of its own, every pass past the 10-minute
+/// retry would run the answer check again and post the re-ask again; with
+/// it, the ticket waits for a person: here the decider, answering the
+/// re-ask. Keeping fails a second time on that answer, which gets its own
+/// re-ask, once, and once the ref can be written the third answer's re-ask
+/// is kept: no ticket stays held.
+#[test]
+fn a_reask_whose_state_is_not_kept_is_posted_once_under_watch() {
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let asked_at = bench.ref_commit();
+    bench.answer("Q2: words.\n");
+    let lock = bench
+        .dirs()
+        .checkout()
+        .join(".git/refs/owlshift/tickets/DEMO-1.lock");
+    fs::write(&lock, "").unwrap();
+
+    let ran = || bench.briefs().len();
+    let reasks = || {
+        bench
+            .comments()
+            .iter()
+            .filter(|c| c.starts_with("[owlshift] RE-ASK"))
+            .count()
+    };
+    let mut pass = 0;
+    let mut sleep = |_: Duration| {
+        pass += 1;
+        // This machine's clock only moves forward: `waited` is how far past
+        // the next comment's time it reads.
+        match pass {
+            // The answer check ran and posted the re-ask; its state was not
+            // kept.
+            1 => {
+                assert_eq!((ran(), reasks()), (2, 1));
+                bench.waited.set(SignedDuration::from_mins(40));
+            }
+            // Past the 10-minute retry, then hours later: nothing ran and
+            // nothing was posted again.
+            2 => {
+                assert_eq!((ran(), reasks()), (2, 1));
+                bench.waited.set(SignedDuration::from_hours(3));
+            }
+            3 => {
+                assert_eq!((ran(), reasks()), (2, 1));
+                assert_eq!(bench.ref_commit(), asked_at);
+                bench.answer("Q2: more words.\n");
+            }
+            // The decider's answer lifted the hold: checked, re-asked, and
+            // keeping failed a second time.
+            4 => {
+                assert_eq!((ran(), reasks()), (3, 2));
+                bench.waited.set(SignedDuration::from_hours(24));
+            }
+            5 => {
+                assert_eq!((ran(), reasks()), (3, 2));
+                fs::remove_file(&lock).unwrap();
+                bench.answer("Q2: final words.\n");
+            }
+            // The ref can be written again: the re-ask is kept.
+            6 => {
+                assert_eq!((ran(), reasks()), (4, 3));
+                assert_ne!(bench.ref_commit(), asked_at);
+                return false;
+            }
+            _ => unreachable!(),
+        }
+        true
+    };
+    let partial = || {
+        bench.reply(
+            None,
+            Some(&check(&[
+                ("Q1", "answered", "English."),
+                ("Q2", "partial", "The ending is missing."),
+            ])),
+        )
+    };
+    let (outcomes, lines, printed) = bench.watch(vec![partial(), partial(), partial()], &mut sleep);
+    assert_eq!(pass, 6, "{lines}\n{printed}");
+    match &outcomes[..] {
+        [
+            Err(Stop::NotKept {
+                landed: Landed::Reask,
+                ..
+            }),
+            Err(Stop::NotKept {
+                landed: Landed::Reask,
+                ..
+            }),
+            Err(Stop::Reasked { .. }),
+        ] => {}
+        other => panic!("{other:?}\n{lines}\n{printed}"),
+    }
+    // One line per hold, and no 10-minute retry.
+    assert_eq!(
+        lines.matches("its state was not kept").count(),
+        2,
+        "{lines}"
+    );
+    assert!(!lines.contains("continues it again at"), "{lines}");
+}

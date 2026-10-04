@@ -16,7 +16,9 @@
 //! continue that left the ticket ref as it was is held for [`RETRY_AFTER`],
 //! and a usage limit with a reset time holds every continue until then
 //! ([`Holds`]), so a tracker that refuses writes does not cost an answer
-//! check every pass.
+//! check every pass. A continue that left a comment on the ticket whose
+//! state was not kept ([`Stop::NotKept`]) is held until a person acts
+//! (OWL-158), so the comment is not posted again at each retry.
 
 use std::collections::HashMap;
 use std::fs;
@@ -40,7 +42,8 @@ use crate::ticket_ref::{self, Stored};
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long a continue that left the ticket ref as it was holds that ticket
-/// back, unless the decider edits a comment or the ref moves meanwhile.
+/// back, unless the decider edits a comment or the ref moves meanwhile. One
+/// that stopped with [`Stop::NotKept`] is held until then, with no end.
 pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// Whether watch continues a ticket in `status`: one whose questions wait
@@ -65,7 +68,7 @@ pub enum Admit {
     /// Its last continue, from the same ticket ref and answer, left the ref
     /// as it was.
     Held {
-        until: Timestamp,
+        until: Until,
     },
     /// The harness reached its usage limit, which resets then.
     Paused {
@@ -73,12 +76,32 @@ pub enum Admit {
     },
 }
 
+/// Until when a ticket is held, unless its decider edits a comment or its
+/// ticket ref moves first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Until {
+    /// [`RETRY_AFTER`] past the continue.
+    At(Timestamp),
+    /// No end: the continue left a comment on the ticket whose state was not
+    /// kept ([`Stop::NotKept`]), which asks a person to act (OWL-158).
+    Person,
+}
+
+impl Until {
+    fn holds_at(self, now: Timestamp) -> bool {
+        match self {
+            Until::At(until) => now < until,
+            Until::Person => true,
+        }
+    }
+}
+
 /// What holds continues back between passes. Pure: the caller reads the
 /// clock and the ticket refs.
 #[derive(Debug, Default)]
 pub struct Holds {
     paused_until: Option<Timestamp>,
-    held: HashMap<TicketId, (Seen, Timestamp)>,
+    held: HashMap<TicketId, (Seen, Until)>,
 }
 
 impl Holds {
@@ -92,7 +115,9 @@ impl Holds {
             self.paused_until = None;
         }
         match self.held.get(ticket) {
-            Some((held, until)) if held == seen && now < *until => Admit::Held { until: *until },
+            Some((held, until)) if held == seen && until.holds_at(now) => {
+                Admit::Held { until: *until }
+            }
             Some(_) => {
                 self.held.remove(ticket);
                 Admit::Go
@@ -106,10 +131,13 @@ impl Holds {
     /// unreadable), at `now`. Returns the hold or the pause it set, if any.
     ///
     /// A busy project ran nothing: no hold. A usage limit with a reset time
-    /// pauses every continue until then. Otherwise a ticket ref left as it was
-    /// holds the ticket for [`RETRY_AFTER`]; one that moved is progress, which
-    /// the next pass reads. No other way to stop is told apart, so a way added
-    /// later is held exactly when it leaves the ref as it was.
+    /// pauses every continue until then. A comment whose state was not kept
+    /// ([`Stop::NotKept`]) holds the ticket until a person acts, unless the
+    /// ref was read moved: an unreadable ref is no reason to post the comment
+    /// again. Otherwise a ticket ref left as it was holds the ticket for
+    /// [`RETRY_AFTER`]; one that moved is progress, which the next pass reads.
+    /// No other way to stop is told apart, so a way added later is held
+    /// exactly when it leaves the ref as it was.
     pub fn after(
         &mut self,
         ticket: &TicketId,
@@ -130,19 +158,22 @@ impl Holds {
             self.paused_until = Some(until);
             return Some(Admit::Paused { until });
         }
-        if commit == Some(seen.commit.as_str()) {
-            let until = now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX);
-            self.held.insert(ticket.clone(), (seen, until));
-            Some(Admit::Held { until })
-        } else {
-            self.held.remove(ticket);
-            None
-        }
+        let as_it_was = commit == Some(seen.commit.as_str());
+        let until = match outcome {
+            Err(Stop::NotKept { .. }) if as_it_was || commit.is_none() => Until::Person,
+            _ if as_it_was => Until::At(now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX)),
+            _ => {
+                self.held.remove(ticket);
+                return None;
+            }
+        };
+        self.held.insert(ticket.clone(), (seen, until));
+        Some(Admit::Held { until })
     }
 
-    /// Forgets the holds of the tickets `waiting` does not name.
-    fn retain(&mut self, waiting: &[TicketId]) {
-        self.held.retain(|ticket, _| waiting.contains(ticket));
+    /// Forgets the holds of the tickets `kept` does not name.
+    fn retain(&mut self, kept: &[TicketId]) {
+        self.held.retain(|ticket, _| kept.contains(ticket));
     }
 }
 
@@ -213,6 +244,9 @@ impl Watch<'_> {
             Err(project) => return self.note(memory, out, project),
         };
         let mut waiting = Vec::new();
+        // A ticket whose ref cannot be read now keeps its hold: only one
+        // read and found not waiting, or gone from the list, loses it.
+        let mut unread = Vec::new();
         for (ticket, stored) in read {
             let state = stored.and_then(|stored| {
                 TicketState::try_from(&stored.record.state)
@@ -224,11 +258,14 @@ impl Watch<'_> {
                 Ok(_) => {
                     memory.failing.remove(&ticket);
                 }
-                Err(reason) => self.unreadable(memory, sink, &ticket, reason),
+                Err(reason) => {
+                    self.unreadable(memory, sink, &ticket, reason);
+                    unread.push(ticket);
+                }
             }
         }
         let ids: Vec<TicketId> = waiting.iter().map(|(ticket, _)| ticket.clone()).collect();
-        memory.holds.retain(&ids);
+        memory.holds.retain(&[&ids[..], &unread[..]].concat());
         self.note(memory, out, Project::Waiting(ids));
         for (ticket, stored) in waiting {
             self.look(memory, sink, out, continued, &ticket, &stored);
@@ -330,11 +367,23 @@ impl Watch<'_> {
             .holds
             .after(ticket, seen, &outcome, commit.as_deref(), now)
         {
-            Some(Admit::Held { until }) => self.line(
+            Some(Admit::Held {
+                until: Until::At(until),
+            }) => self.line(
                 out,
                 &format!(
                     "{ticket} is as it was before that continue: watch continues it again at \
                      {until}, or sooner once its decider edits a comment"
+                ),
+            ),
+            Some(Admit::Held {
+                until: Until::Person,
+            }) => self.line(
+                out,
+                &format!(
+                    "a comment on {ticket} asks a person to act, but its state was not kept: \
+                     watch continues it again only once its decider edits a comment or a \
+                     command moves its ticket ref"
                 ),
             ),
             Some(Admit::Paused { until }) => self.line(
@@ -415,6 +464,7 @@ mod tests {
     use owlshift_contracts::Stage;
 
     use super::*;
+    use crate::on_demand::Landed;
 
     fn at(minute: i64) -> Timestamp {
         Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
@@ -464,10 +514,17 @@ mod tests {
         assert_eq!(holds.admit(&ticket, &seen("c1", 0), at(2)), Admit::Go);
 
         let held = holds.after(&ticket, seen("c1", 0), &refused(), Some("c1"), at(2));
-        assert_eq!(held, Some(Admit::Held { until: at(12) }));
+        assert_eq!(
+            held,
+            Some(Admit::Held {
+                until: Until::At(at(12))
+            })
+        );
         assert_eq!(
             holds.admit(&ticket, &seen("c1", 0), at(11)),
-            Admit::Held { until: at(12) }
+            Admit::Held {
+                until: Until::At(at(12))
+            }
         );
         // A newer edit of the decider's, or a ref moved by a typed command,
         // lifts the hold.
@@ -512,8 +569,68 @@ mod tests {
         let unknown = Err(Stop::UsageLimit { resets_at: None });
         assert_eq!(
             holds.after(&one, seen("c1", 0), &unknown, Some("c1"), at(31)),
-            Some(Admit::Held { until: at(41) })
+            Some(Admit::Held {
+                until: Until::At(at(41))
+            })
         );
         assert_eq!(holds.admit(&two, &seen("d1", 0), at(32)), Admit::Go);
+    }
+
+    /// OWL-158: a continue that left a comment on the ticket whose state was
+    /// not kept is held until a person acts, whichever comment landed, even
+    /// when the ref could not be read after it; a ref read moved is progress.
+    #[test]
+    fn a_comment_whose_state_is_not_kept_is_held_until_a_person_acts() {
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let not_kept = |landed| {
+            Err(Stop::NotKept {
+                landed,
+                message: "the ticket's ref is locked".to_owned(),
+            })
+        };
+        let person = Some(Admit::Held {
+            until: Until::Person,
+        });
+        let mut holds = Holds::default();
+        for landed in [Landed::Reask, Landed::Reply, Landed::Parked] {
+            for commit in [Some("c1"), None] {
+                let outcome = not_kept(landed);
+                assert_eq!(
+                    holds.after(&ticket, seen("c1", 0), &outcome, commit, at(1)),
+                    person,
+                    "{landed:?} {commit:?}"
+                );
+                // A day later, as at once.
+                assert_eq!(
+                    holds.admit(&ticket, &seen("c1", 0), at(24 * 60)),
+                    Admit::Held {
+                        until: Until::Person
+                    }
+                );
+            }
+        }
+        // The decider's edit lifts it, and so does a ref a command moved.
+        assert_eq!(holds.admit(&ticket, &seen("c1", 5), at(2)), Admit::Go);
+        holds.after(
+            &ticket,
+            seen("c1", 0),
+            &not_kept(Landed::Reask),
+            None,
+            at(2),
+        );
+        assert_eq!(holds.admit(&ticket, &seen("c2", 0), at(3)), Admit::Go);
+
+        // A round asked after a RESUME that was kept moved the ref.
+        assert_eq!(
+            holds.after(
+                &ticket,
+                seen("c1", 0),
+                &not_kept(Landed::Questions),
+                Some("c3"),
+                at(4)
+            ),
+            None
+        );
+        assert_eq!(holds.admit(&ticket, &seen("c1", 0), at(5)), Admit::Go);
     }
 }
