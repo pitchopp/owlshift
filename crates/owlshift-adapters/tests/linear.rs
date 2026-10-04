@@ -16,6 +16,35 @@ use support::{Recorder, Replay};
 const TICKET: &str = "ticket-owl-11.json";
 const COMMENTS: &str = "comments-owl-11-paged.json";
 const UNAUTHORIZED: &str = "unauthorized.json";
+const TEAM_STATES: &str = "team-states-owl.json";
+
+/// The team's states as `owlshift doctor` reads them (OWL-147): the nine of
+/// `OWL` in one page, then a key no team has, sent upper case as written in
+/// any case.
+#[test]
+fn reads_a_teams_workflow_states() {
+    let replay = Replay::new(TEAM_STATES);
+    let tracker = LinearTracker::with_transport(replay.clone());
+    let states = tracker.team_states("OWL").unwrap();
+    assert_eq!(
+        states,
+        [
+            "In Review",
+            "Needs Input",
+            "Triage",
+            "Duplicate",
+            "Done",
+            "Backlog",
+            "Todo",
+            "Canceled",
+            "In Progress"
+        ]
+    );
+    let unknown = tracker.team_states("nope").unwrap_err();
+    replay.assert_done();
+    assert_eq!(unknown.kind, ErrorKind::NotFound, "{unknown}");
+    assert!(unknown.message.contains("\"NOPE\""), "{unknown}");
+}
 
 fn owl_11() -> TicketId {
     TicketId::new("OWL-11").unwrap()
@@ -156,4 +185,11 @@ fn record_read_fixtures() {
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Unauthorized, "{error}");
     recorder.write(UNAUTHORIZED, &recorded);
+
+    let recorder = Recorder::new(&key);
+    let tracker = LinearTracker::with_transport(recorder.clone());
+    tracker.team_states("OWL").unwrap();
+    let unknown = tracker.team_states("NOPE").unwrap_err();
+    assert_eq!(unknown.kind, ErrorKind::NotFound, "{unknown}");
+    recorder.write(TEAM_STATES, &recorded);
 }
