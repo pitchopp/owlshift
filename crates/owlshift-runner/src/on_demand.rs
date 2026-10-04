@@ -263,6 +263,22 @@ impl fmt::Display for Delivered {
     }
 }
 
+/// The comment that reached the ticket before its state failed to be kept
+/// ([`Stop::NotKept`]): each one asks a person to act on the ticket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landed {
+    /// The questions of a round.
+    Questions,
+    /// The round of a run that found the ticket's premise false.
+    PremiseFalse,
+    /// A re-ask of open questions.
+    Reask,
+    /// The reply to the decider's counter-question.
+    Reply,
+    /// The PARKED comment.
+    Parked,
+}
+
 /// Why `owlshift do` or `owlshift continue` stopped short of a delivery.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stop {
@@ -326,6 +342,12 @@ pub enum Stop {
         detail: String,
         unposted: Option<String>,
     },
+    /// A comment that makes a person the blocker (`landed`) is on the ticket,
+    /// but keeping Owlshift's own state in the ticket's ref failed, so the
+    /// command stopped with `message`. A refusal that says so, kept apart
+    /// from [`Stop::Refused`] so that the notification can tell it from one
+    /// where nothing reached the ticket (OWL-149).
+    NotKept { landed: Landed, message: String },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
     /// The run was done and its gate passed, but its delivery failed.
@@ -341,6 +363,7 @@ impl fmt::Display for Stop {
                 root.display()
             ),
             Self::Refused(reason) => write!(f, "Not run: {reason}"),
+            Self::NotKept { message, .. } => write!(f, "Not run: {message}"),
             Self::Unverified { marker, text } => write!(
                 f,
                 "Refused: a previous run's isolation check did not pass, so the dedicated \
@@ -1124,11 +1147,19 @@ impl OnDemand<'_> {
             verdicts: Vec::new(),
         });
         if let Err(error) = self.store(p, state, asked) {
-            return Stop::Refused(format!(
-                "the questions of round {round} are on the ticket (comment {}), but keeping them \
-                 in the ticket's ref failed: {error}; run `owlshift do {ticket}` to ask them again",
-                posted.id
-            ));
+            return Stop::NotKept {
+                landed: if status == result::Status::PremiseFalse {
+                    Landed::PremiseFalse
+                } else {
+                    Landed::Questions
+                },
+                message: format!(
+                    "the questions of round {round} are on the ticket (comment {}), but keeping \
+                     them in the ticket's ref failed: {error}; run `owlshift do {ticket}` to ask \
+                     them again",
+                    posted.id
+                ),
+            };
         }
         stop(Ok(round))
     }
@@ -1486,12 +1517,13 @@ impl OnDemand<'_> {
                     decider: asked,
                     verdicts: Vec::new(),
                 });
-                self.store(p, &next, questions).map_err(|e| {
-                    Stop::Refused(format!(
+                self.store(p, &next, questions).map_err(|e| Stop::NotKept {
+                    landed: Landed::Reask,
+                    message: format!(
                         "the re-ask is on the ticket (comment {}), but keeping it in the \
                          ticket's ref failed: {e}",
                         posted.id
-                    ))
+                    ),
                 })?;
                 sink.emit(
                     &ticket,
@@ -1532,12 +1564,13 @@ impl OnDemand<'_> {
                     EventKind::TrackerWrite,
                     comment_written("REPLY", &posted),
                 );
-                self.store(p, &next, questions).map_err(|e| {
-                    Stop::Refused(format!(
+                self.store(p, &next, questions).map_err(|e| Stop::NotKept {
+                    landed: Landed::Reply,
+                    message: format!(
                         "the reply is on the ticket (comment {}), but keeping the check in the \
                          ticket's ref failed: {e}",
                         posted.id
-                    ))
+                    ),
                 })?;
                 sink.emit(
                     &ticket,
@@ -1647,15 +1680,23 @@ impl OnDemand<'_> {
             ]),
         );
         if let Err(why) = kept {
-            let posted = match &unposted {
-                None => "the PARKED comment is on the ticket".to_owned(),
-                Some(error) => format!("the PARKED comment could not be posted: {error}"),
+            let message = |posted: &str| {
+                format!(
+                    "{} parked ({}: {detail}), but {why}; {posted}",
+                    p.ticket,
+                    park_reason(reason)
+                )
             };
-            return Stop::Refused(format!(
-                "{} parked ({}: {detail}), but {why}; {posted}",
-                p.ticket,
-                park_reason(reason)
-            ));
+            return match &unposted {
+                // Nothing reached the ticket: no person was asked to look.
+                Some(error) => Stop::Refused(message(&format!(
+                    "the PARKED comment could not be posted: {error}"
+                ))),
+                None => Stop::NotKept {
+                    landed: Landed::Parked,
+                    message: message("the PARKED comment is on the ticket"),
+                },
+            };
         }
         Stop::Parked {
             reason,
