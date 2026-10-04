@@ -19,13 +19,32 @@ pub enum Route {
     Resolver,
 }
 
+/// The categories of a project's `policy.always_human` as the gate reads
+/// them: normalized, in the project's order, each once, blank ones dropped.
+/// The floor's categories are not filtered out here, so a caller that shows
+/// the list as written can still tell which ones the floor covers
+/// ([`is_floor_category`]); [`GatePolicy::additions`] leaves them out.
+pub fn normalized_categories<S: AsRef<str>>(
+    always_human: impl IntoIterator<Item = S>,
+) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for category in always_human {
+        let category = normalize(category.as_ref());
+        if !category.is_empty() && !kept.contains(&category) {
+            kept.push(category);
+        }
+    }
+    kept
+}
+
 /// A project's gate policy: the always-human categories it adds to the
 /// floor, and its plan-approval mode. Both come from the project file
 /// (`policy.always_human`, `pipeline.plan_approval`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GatePolicy {
-    /// The project's additions, normalized; the floor's categories are always
-    /// included on top.
+    /// The project's categories, normalized, each once, blank ones dropped (a
+    /// floor category may appear: [`GatePolicy::additions`] leaves it out); the
+    /// floor's categories are always included on top.
     always_human: Vec<String>,
     plan_approval: PlanApproval,
 }
@@ -37,13 +56,8 @@ impl GatePolicy {
         always_human: impl IntoIterator<Item = S>,
         plan_approval: PlanApproval,
     ) -> Self {
-        let always_human = always_human
-            .into_iter()
-            .map(|category| normalize(category.as_ref()))
-            .filter(|category| !category.is_empty())
-            .collect();
         Self {
-            always_human,
+            always_human: normalized_categories(always_human),
             plan_approval,
         }
     }
@@ -53,13 +67,11 @@ impl GatePolicy {
     /// those the floor already covers left out. What the runner tells a run,
     /// so it can file a question under the word the gate matches.
     pub fn additions(&self) -> Vec<String> {
-        let mut added: Vec<String> = Vec::new();
-        for category in &self.always_human {
-            if !is_floor_category(category) && !added.contains(category) {
-                added.push(category.clone());
-            }
-        }
-        added
+        self.always_human
+            .iter()
+            .filter(|category| !is_floor_category(category))
+            .cloned()
+            .collect()
     }
 
     /// Whether a question of this category always goes to a human: a floor
@@ -145,6 +157,12 @@ mod tests {
         }
         assert_eq!(policy.route("naming"), Route::Resolver);
         assert_eq!(policy.route("authoring"), Route::Resolver);
+    }
+
+    #[test]
+    fn normalized_categories_keep_floor_ones_but_not_blank_or_repeated() {
+        let kept = normalized_categories(["Billing", " ", "billing", "security", "auth"]);
+        assert_eq!(kept, ["billing", "security", "auth"]);
     }
 
     #[test]
