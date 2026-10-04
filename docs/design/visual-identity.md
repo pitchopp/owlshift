@@ -187,13 +187,17 @@ A terminal has its user's theme, light or dark, and its user's palette. Owlshift
 
 | Surface | What applies | Status |
 | --- | --- | --- |
-| README and GitHub | The README opens with the lockup in a `<picture>` that follows GitHub's light or dark theme (`prefers-color-scheme`), alternative text "Owlshift", then the tagline. The social preview is `owlshift-social.png`, 1280×640 as GitHub recommends, from `owlshift-social.svg`; GitHub has no API for it, so the maintainer uploads it in the repository's settings when the repository opens (P9) | This change (OWL-162) |
+| README and GitHub | The README opens with the lockup in a `<picture>` that follows GitHub's light or dark theme (`prefers-color-scheme`), alternative text "Owlshift", then the tagline. The repository's social preview is `owlshift-social.png` (below), which the maintainer uploads in the repository's settings | This change (OWL-162) |
 | CLI: the voice | Section 2 applied to every message of `doctor`, `init`, `do`, `continue`, `watch`, `logs` and `config show`, and to desktop notifications; the build plan's fixed wording and the tests that check it change with it | Follow-up |
 | CLI: the signature | `{o,o}` in the header of the CLI's reports, its eyes coloured as section 4 says | Follow-up |
 | Ticket comments | The voice applies to their human-readable text, with a light hand since a whole team reads them; their markers, numbering and structure stay as they are (section 2, rule 4) | With the CLI's voice |
 | Local web UI (P8) | The themes and both typefaces, carried in the binary; the mark as favicon | Follow-up, P8 |
 | Menu-bar app (P11) | The app icon from the dark mark on macOS's icon grid; the menu-bar icon from the one-colour mark as a template image (black with transparency, which macOS tints) | Follow-up, P11 |
 | Public site | The themes and typefaces of the web UI, the lockups, the social preview's art direction | When a site is planned; no issue yet |
+
+**GitHub, checked live on 2026-10-04.** GitHub keeps a `<picture>` with a `<source media="(prefers-color-scheme: dark)">` in a README: `gh api markdown` (mode `gfm`) on the README's header returned it intact, wrapped in GitHub's own `<themed-picture>`. GitHub has no API to set a repository's social preview: the mutations of its GraphQL schema hold none for a social, Open Graph or preview image, and `repository { usesCustomOpenGraphImage }` read `false`. The repository was already public (`visibility: PUBLIC`), so the preview can be uploaded now rather than when the repository opens.
+
+**The social preview.** 1280×640, as GitHub recommends, drawn in `owlshift-social.svg` and exported to `owlshift-social.png` by headless Chrome at a device scale of 1. On the `night-deep` page: the lockup on dark, centred, the mark 120 px tall with its top at 140 px; the tagline "Your backlog works the night shift." in `cream`, Bricolage Grotesque at 48 px (`wght` 800, `opsz` 48, `wdth` 100), tracked −0.01 em, shaped and kerned by HarfBuzz, centred on its outline, its baseline at 362 px; at the bottom, a dawn of three discs centred on the bottom edge, `night` (radius 200), `plum-800` (150) and `apricot` (100), bleeding off it. The lockup and the tagline keep 60 px from every edge. The tagline's outlines come from Bricolage Grotesque version 1.001 (`BricolageGrotesque[opsz,wdth,wght].ttf` from [google/fonts](https://github.com/google/fonts/tree/main/ofl/bricolagegrotesque), SHA-256 `413e7357809ddd12fd80a96a8a396de0e401638d4acd3cb3e37532f0472ac682`), shaped with uharfbuzz 0.56.2 and drawn with fontTools 4.66.1, on 2026-10-04 (OWL-162).
 
 ## 7. Decisions
 
@@ -206,5 +210,6 @@ Made with the maintainer on 2026-10-04 (OWL-162), from mock-ups compared side by
 | Palette | Dawn: aubergine and apricot | A mid violet, on which the mark lost its contrast; Phosphor, a night-vision green whose brand colour merges with `✓`; Tawny, a brown and orange close to Rust's own brand, whose orange reads as a warning; Electric midnight, an ink and chartreuse unusable on light backgrounds |
 | Typefaces | Bricolage Grotesque with JetBrains Mono | Nunito, common and childish at large sizes; Recursive, one family for sans and mono but a heavier file; Figtree, safe and forgettable |
 | Voice | The owl speaks in every text, with the four rules of section 2 | A measured wink limited to calm moments; a voice-free product with only a visual personality |
+| Social preview | The lockup and the tagline over a dawn rising from the bottom edge (section 6) | Without the dawn, the lockup and the tagline alone; a larger dawn pushing the text up |
 | Terminal colour | The 16 ANSI colours for states, the brand only in the signature | The brand's own hues for states, unreadable on a light terminal |
 | Where it lives | This document and the source files in `assets/brand/`; a surface's tokens in code arrive with the surface | A `tokens.json` read by a build script from today, tooling written before any reader exists; a brand book published outside the repository, out of review |
