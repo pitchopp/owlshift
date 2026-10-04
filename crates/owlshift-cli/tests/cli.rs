@@ -24,6 +24,8 @@ use std::process::{Command, Output};
 /// `--skip-secrets`, `do` is refused before it opens the keychain, and
 /// `doctor` asks it for the agent runs' token only when `claude` is on the
 /// `PATH`, which these tests keep to a fake `git` and the system folders.
+/// `doctor` also reads the Linear key, and Linear, in a Linear project
+/// (OWL-147): these tests run it outside any project, and must never in one.
 fn owlshift(dir: &Path, config_dir: &Path, args: &[&str]) -> Output {
     command(dir, config_dir, args).output().unwrap()
 }

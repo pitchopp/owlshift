@@ -30,12 +30,10 @@ use serde_json::Value;
 
 use crate::config::{Effective, FileState, exit_text};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
-use crate::system::{
-    DataDirSource, RunError, StatesError, System, exact_version_of, version_of,
-};
-use crate::tracker::LINEAR_ACCOUNT;
+use crate::system::{DataDirSource, RunError, StatesError, System, exact_version_of, version_of};
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
+use crate::tracker::LINEAR_ACCOUNT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -910,7 +908,10 @@ fn tracker_states_check(system: &dyn System, config: &Effective) -> Option<Check
                 format!("not checked: no Linear API key {place}"),
                 "`owlshift do` reads the ticket with the Linear API key Owlshift keeps in the \
                  system keychain, and doctor reads the team's workflow states with it.",
-                vec![Step::run_noting("owlshift init", "paste the key when asked")],
+                vec![Step::run_noting(
+                    "owlshift init",
+                    "paste the key when asked",
+                )],
             );
         }
         Err(StatesError::Keychain(reason)) => {
@@ -1974,9 +1975,15 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
             why.contains("case included: In Review, Needs Input, Triage, Duplicate, Done,"),
             "{why}"
         );
-        assert!(why.ends_with("must first be made unique in Linear."), "{why}");
+        assert!(
+            why.ends_with("must first be made unique in Linear."),
+            "{why}"
+        );
 
-        let not_found = Error::new(ErrorKind::NotFound, "Linear has no team with the key \"OWL\"");
+        let not_found = Error::new(
+            ErrorKind::NotFound,
+            "Linear has no team with the key \"OWL\"",
+        );
         let refused = Error::new(ErrorKind::Unauthorized, "Linear: AUTHENTICATION_ERROR: no");
         let failures: [(FakeSystem, &[&str]); 4] = [
             (ready().unstored(LINEAR_ACCOUNT), &["owlshift init"]),

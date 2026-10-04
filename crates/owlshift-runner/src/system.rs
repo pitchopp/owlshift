@@ -289,10 +289,7 @@ pub(crate) mod fake {
                     .linear_states
                     .clone()
                     .unwrap_or_else(|| {
-                        Err(Error::new(
-                            ErrorKind::Other,
-                            "Linear: no network in tests",
-                        ))
+                        Err(Error::new(ErrorKind::Other, "Linear: no network in tests"))
                     })
                     .map_err(StatesError::Tracker),
             }
