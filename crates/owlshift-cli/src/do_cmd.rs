@@ -1,10 +1,13 @@
-//! `owlshift do TICKET` and `owlshift continue TICKET`: open what one run
-//! needs, in this order, and hand it to `owlshift_runner::on_demand`. What
-//! either can refuse without a credential, a host where agent runs cannot be
+//! `owlshift do TICKET`, `owlshift continue TICKET` and `owlshift watch`:
+//! open what a run needs, in this order, and hand it to
+//! `owlshift_runner::on_demand`, or to `owlshift_runner::watch`, which
+//! continues the tickets whose questions wait until Ctrl-C. What any of them
+//! can refuse without a credential, a host where agent runs cannot be
 //! confined included, is refused before the keychain is opened.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::thread;
 use std::time::Duration;
 
 use owlshift_adapters::notifier::Notifier;
@@ -24,6 +27,7 @@ use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE, RESOLVER_ROLE};
 use owlshift_runner::system::System;
+use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_runner::{forge, tracker};
 
 use crate::fail;
@@ -32,26 +36,36 @@ use crate::fail;
 /// push.
 const HEAD_WAIT: Duration = Duration::from_secs(2);
 
-/// Which command runs: `owlshift do` from Ready, or `owlshift continue` from
-/// where the ticket's ref left it.
+/// Which command runs: `owlshift do` from Ready, `owlshift continue` from
+/// where the ticket's ref left it, each on its ticket, or `owlshift watch`
+/// over the project's tickets whose questions wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Do,
-    Continue,
+pub enum Mode<'a> {
+    Do(&'a str),
+    Continue(&'a str),
+    Watch,
 }
 
-impl Mode {
+impl<'a> Mode<'a> {
     fn command(self) -> &'static str {
         match self {
-            Mode::Do => "`owlshift do`",
-            Mode::Continue => "`owlshift continue`",
+            Mode::Do(_) => "`owlshift do`",
+            Mode::Continue(_) => "`owlshift continue`",
+            Mode::Watch => "`owlshift watch`",
+        }
+    }
+
+    /// The ticket a command names; `watch` names none.
+    fn ticket(self) -> Option<&'a str> {
+        match self {
+            Mode::Do(ticket) | Mode::Continue(ticket) => Some(ticket),
+            Mode::Watch => None,
         }
     }
 }
 
-pub fn run(system: &dyn System, config: &Effective, ticket: &str, mode: Mode) -> ExitCode {
-    run_with(system, config, ticket, mode, Keychain::system)
-        .unwrap_or_else(|refusal| fail(&refusal))
+pub fn run(system: &dyn System, config: &Effective, mode: Mode<'_>) -> ExitCode {
+    run_with(system, config, mode, Keychain::system).unwrap_or_else(|refusal| fail(&refusal))
 }
 
 /// [`run`], with the keychain opened by `open_keychain`: a refusal before
@@ -59,11 +73,14 @@ pub fn run(system: &dyn System, config: &Effective, ticket: &str, mode: Mode) ->
 fn run_with(
     system: &dyn System,
     config: &Effective,
-    ticket: &str,
-    mode: Mode,
+    mode: Mode<'_>,
     open_keychain: fn() -> Result<Keychain, KeychainError>,
 ) -> Result<ExitCode, String> {
-    let ticket = TicketId::new(ticket).map_err(|error| error.to_string())?;
+    let ticket = mode
+        .ticket()
+        .map(TicketId::new)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let (project_file, project) = match &config.project {
         FileState::Loaded { path, config, .. } => (path, config),
         FileState::Absent(path) => {
@@ -86,15 +103,17 @@ fn run_with(
     if !config.is_valid() {
         return Err("the personal configuration is invalid: see `owlshift config show`".to_owned());
     }
-    on_demand::check_team(project, &ticket)?;
+    if let Some(ticket) = &ticket {
+        on_demand::check_team(project, ticket)?;
+    }
     let root = project_file.parent().unwrap_or(project_file);
     let git = project::runner_git();
     let remote_url = project::origin_url(&git, root)?;
     let repo = on_demand::check_origin(&remote_url)?;
     // OWL-98: a host where agent runs cannot be confined is refused before
     // the keychain is opened, so it never prompts for or loads a secret for
-    // a run that cannot happen. `do` and `continue` always confine their
-    // agents (`AgentEnv::from_runner`); `OnDemand` checks again.
+    // a run that cannot happen. `do`, `continue` and `watch` always confine
+    // their agents (`AgentEnv::from_runner`); `OnDemand` checks again.
     system.sandbox().map_err(|error| error.to_string())?;
     let Some(data_dir) = owlshift_platform::paths::data_dir() else {
         return Err(
@@ -180,24 +199,65 @@ fn run_with(
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
-    let outcome = match mode {
-        Mode::Do => on_demand.run(&ticket, &mut sink),
-        Mode::Continue => on_demand.continue_ticket(&ticket, &mut sink),
-    };
-    let code = finish(system, &outcome, &mut io::stdout(), &mut io::stderr());
-    // OWL-140: once the outcome is printed, a desktop notification when it
-    // makes the operator the blocker; a failure is a warning event.
     let desktop = notify::desktop_enabled(&config.personal)
         .then(|| DesktopNotifier::for_this_machine(system))
         .flatten();
-    notify::notify_blocker(
-        desktop.as_ref().map(|d| d as &dyn Notifier),
+    let desktop = desktop.as_ref().map(|d| d as &dyn Notifier);
+    let (ticket, outcome) = match (mode, &ticket) {
+        (Mode::Do(_), Some(ticket)) => (ticket, on_demand.run(ticket, &mut sink)),
+        (Mode::Continue(_), Some(ticket)) => (ticket, on_demand.continue_ticket(ticket, &mut sink)),
+        _ => {
+            // OWL-152: until Ctrl-C ends the process; each continue's outcome
+            // is reported as `continue`'s.
+            let _ = writeln!(
+                io::stdout(),
+                "Watching {repo}: each ticket whose questions wait is continued once its \
+                 decider's reply counts, checked every {} seconds. Ctrl-C stops.",
+                POLL_INTERVAL.as_secs()
+            );
+            let watch = Watch {
+                on_demand: &on_demand,
+                interval: POLL_INTERVAL,
+            };
+            watch.run(
+                &mut sink,
+                &mut io::stdout(),
+                &mut |ticket, outcome, sink| {
+                    report(system, desktop, tracker.as_ref(), ticket, outcome, sink);
+                },
+                &mut |interval| {
+                    thread::sleep(interval);
+                    true
+                },
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
+    Ok(report(
+        system,
+        desktop,
         tracker.as_ref(),
-        &ticket,
+        ticket,
         &outcome,
         &mut sink,
-    );
-    Ok(code)
+    ))
+}
+
+/// The end of one run of a ticket, `do`'s, `continue`'s, or each continue
+/// `watch` runs: its outcome printed ([`finish`]), then (OWL-140) a desktop
+/// notification when it makes the operator the blocker, a failure of which
+/// is a warning event.
+fn report(
+    system: &dyn System,
+    desktop: Option<&dyn Notifier>,
+    tracker: &dyn Tracker,
+    ticket: &TicketId,
+    outcome: &Result<Delivered, Stop>,
+    sink: &mut EventSink<'_>,
+) -> ExitCode {
+    let code = finish(system, outcome, &mut io::stdout(), &mut io::stderr());
+    notify::notify_blocker(desktop, tracker, ticket, outcome, sink);
+    code
 }
 
 /// The end of a run: the warning of a sentinel that ended during it, or is
@@ -410,8 +470,8 @@ mod refusals {
             personal: FileState::Absent(repo.path().join("config.toml")),
         };
 
-        for mode in [Mode::Do, Mode::Continue] {
-            let refusal = run_with(&NoSandbox, &config, "OWL-1", mode, no_keychain).unwrap_err();
+        for mode in [Mode::Do("OWL-1"), Mode::Continue("OWL-1"), Mode::Watch] {
+            let refusal = run_with(&NoSandbox, &config, mode, no_keychain).unwrap_err();
             assert_eq!(refusal, SandboxError::Unsupported.to_string(), "{mode:?}");
         }
     }

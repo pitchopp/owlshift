@@ -57,8 +57,13 @@ enum Command {
         /// The ticket, such as OWL-12.
         ticket: String,
     },
-    /// Print the events `owlshift do` and `owlshift continue` recorded, oldest
-    /// first.
+    /// Watch this project's tickets whose questions wait, in the foreground,
+    /// and continue each one as `owlshift continue` would once its decider's
+    /// reply counts; checked every minute, until Ctrl-C. A parked ticket, or
+    /// one left at Build, still needs `owlshift continue`.
+    Watch,
+    /// Print the events `owlshift do`, `owlshift continue` and `owlshift
+    /// watch` recorded, oldest first.
     Logs {
         /// Only this ticket's events.
         ticket: Option<String>,
@@ -135,10 +140,11 @@ fn main() -> ExitCode {
             exit_code(config.is_valid())
         }
         Command::Init(args) => init_cmd::run(&args, &config),
-        Command::Do { ticket } => do_cmd::run(&system, &config, &ticket, do_cmd::Mode::Do),
+        Command::Do { ticket } => do_cmd::run(&system, &config, do_cmd::Mode::Do(&ticket)),
         Command::Continue { ticket } => {
-            do_cmd::run(&system, &config, &ticket, do_cmd::Mode::Continue)
+            do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket))
         }
+        Command::Watch => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
         Command::Logs {
             ticket,
             last,
