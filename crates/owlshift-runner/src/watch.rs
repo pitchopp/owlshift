@@ -312,13 +312,10 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
         }
-        sink.emit(
-            ticket,
-            None,
-            EventKind::Decision,
-            data([("watch", json!("continue")), ("answer", json!(seen.answer))]),
-        );
-        let Some(outcome) = on_demand.continue_seen(ticket, &seen.commit, sink) else {
+        // Recorded by `continue_seen` once the ticket ref is confirmed under
+        // the lock, so the log never says watch continued a ticket it left.
+        let decision = data([("watch", json!("continue")), ("answer", json!(seen.answer))]);
+        let Some(outcome) = on_demand.continue_seen(ticket, &seen.commit, decision, sink) else {
             // The ticket ref moved since the snapshot: the next pass reads it.
             return;
         };

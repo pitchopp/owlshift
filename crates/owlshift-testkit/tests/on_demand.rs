@@ -34,7 +34,7 @@ use owlshift_contracts::refs::{AskDecider, Waiting};
 use owlshift_core::decider::DeciderRule;
 use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason};
 use owlshift_runner::agent_env::AgentEnv;
-use owlshift_runner::events::{EventLog, EventSink};
+use owlshift_runner::events::{Data, EventLog, EventSink};
 use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
@@ -2149,9 +2149,12 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     // and checks the same answers, with no new comment.
     fs::remove_file(bench.dirs().unverified_file()).unwrap();
     // A watch that read the ticket before the park never restarts it
-    // (OWL-152): the ticket ref is not the one it read, so nothing runs.
+    // (OWL-152): the ticket ref is not the one it read, so nothing runs,
+    // and nothing records that watch continued it.
+    let (runs, events) = (bench.briefs().len(), bench.events().len());
     let (stale, _) = bench.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
-        on_demand.continue_seen(&ticket(), &watched_at, sink)
+        let decision = Data::from_iter([("watch".to_owned(), json!("continue"))]);
+        on_demand.continue_seen(&ticket(), &watched_at, decision, sink)
     });
     assert!(stale.is_none(), "{stale:?}");
     assert_eq!(
@@ -2159,6 +2162,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
         Some(Waiting::ParkedAwaitingInput)
     );
     assert_eq!(bench.comments().len(), 3);
+    assert_eq!((bench.briefs().len(), bench.events().len()), (runs, events));
     let (delivered, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(Some("Hello"), Some(DONE)),

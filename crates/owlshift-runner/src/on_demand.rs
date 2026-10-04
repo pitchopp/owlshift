@@ -680,15 +680,18 @@ impl OnDemand<'_> {
 
     /// `owlshift continue` for `owlshift watch` (OWL-152): run only while
     /// the ticket ref, read under the project's lock, is still `seen`, the
-    /// commit watch read it at; `None`, with nothing run or kept, once it
-    /// moved. Watch continues a ticket whose questions wait, and a command
-    /// typed meanwhile may have parked it or resumed it to Build: continuing
-    /// it then would restart it or build it, which only a person's
-    /// `continue` does.
+    /// commit watch read it at; `None`, with nothing run, kept or recorded,
+    /// once it moved. Watch continues a ticket whose questions wait, and a
+    /// command typed meanwhile may have parked it or resumed it to Build:
+    /// continuing it then would restart it or build it, which only a
+    /// person's `continue` does. `decision`, watch's `decision` event, is
+    /// recorded once the ref is confirmed, before anything runs, so the log
+    /// never says watch continued a ticket it left alone.
     pub fn continue_seen(
         &self,
         ticket: &TicketId,
         seen: &str,
+        decision: Data,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
         let p = match self.prepare(ticket, Command::Continue) {
@@ -698,6 +701,7 @@ impl OnDemand<'_> {
         if p.stored.as_ref().map(|stored| stored.commit.as_str()) != Some(seen) {
             return None;
         }
+        sink.emit(ticket, None, EventKind::Decision, decision);
         Some(self.continue_prepared(p, sink))
     }
 
