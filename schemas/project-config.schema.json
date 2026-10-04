@@ -212,6 +212,13 @@
         "needs_input": {
           "type": "string"
         },
+        "parked": {
+          "description": "The state a parked ticket shows; optional. Without it, a parked\nticket shows `needs_input`, its PARKED comment saying why.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "ready": {
           "type": "string"
         },

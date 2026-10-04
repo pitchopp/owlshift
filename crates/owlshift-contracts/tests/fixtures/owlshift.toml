@@ -5,7 +5,7 @@ requires = ">=0.1"
 kind = "linear"
 team = "LOC"
 admit = { label = "agent" }
-states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review", parked = "Parked" }
 
 [stack]
 gate = ["make lint", "make test"]

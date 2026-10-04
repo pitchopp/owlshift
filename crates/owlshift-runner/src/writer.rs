@@ -24,9 +24,10 @@
 //!
 //! And the ticket's visible stage ([`VisibleStage`], [`Writer::set_stage`]):
 //! working while a Build runs, needs input while questions wait, review once
-//! the pull request is open. [`VisibleStage::after`] says which core event
-//! moves it, for `owlshift do` and `continue` as for the test bench's
-//! stand-in driver.
+//! the pull request is open, parked once Owlshift stopped on the ticket.
+//! [`VisibleStage::after`] says which core event moves it, for `owlshift do`
+//! and `continue` as for the test bench's stand-in driver; a park moves it to
+//! [`VisibleStage::Parked`], and a restart to [`VisibleStage::of`] its status.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -47,7 +48,8 @@ use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, Question, Verdict as AnswerVerdict,
 };
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
-use owlshift_core::state::{Event, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason};
+use owlshift_core::state::{Event, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason, Status};
+use owlshift_core::vocab::Stage;
 
 use crate::executor::Git;
 use crate::resolver::Fallback;
@@ -853,6 +855,9 @@ pub enum VisibleStage {
     NeedsInput,
     /// The pull request is open.
     Review,
+    /// Owlshift stopped on the ticket: a person must look. The project's
+    /// `parked` state, or its `needs_input` one when it names none.
+    Parked,
 }
 
 impl VisibleStage {
@@ -860,13 +865,27 @@ impl VisibleStage {
     /// the ticket: a dispatch or a settled round starts work, a round of
     /// questions or a re-ask waits for the decider. Review follows no core
     /// event of this version: the delivery sets it when the pull request
-    /// opens. A counter-question keeps the ticket waiting, and a park leaves
-    /// the stage where it was.
+    /// opens. A counter-question keeps the ticket waiting. A park follows no
+    /// one event, since several park the ticket: it moves the ticket to
+    /// [`Self::Parked`] once the PARKED comment is posted, and a restart to
+    /// [`Self::of`] the status it lands on.
     pub fn after(event: Event) -> Option<Self> {
         match event {
             Event::Dispatched | Event::Answered => Some(Self::Working),
             Event::Questions | Event::Incomplete => Some(Self::NeedsInput),
             _ => None,
+        }
+    }
+
+    /// The stage a core status shows: working at any stage that runs,
+    /// needs input while questions wait, parked while parked. Ready is a
+    /// person's gesture, never the runner's.
+    pub fn of(status: Status) -> Option<Self> {
+        match status {
+            Status::Active(Stage::Ready) => None,
+            Status::Active(_) => Some(Self::Working),
+            Status::NeedsInput { .. } => Some(Self::NeedsInput),
+            Status::Parked { .. } => Some(Self::Parked),
         }
     }
 
@@ -876,6 +895,7 @@ impl VisibleStage {
             Self::Working => "working",
             Self::NeedsInput => "needs_input",
             Self::Review => "review",
+            Self::Parked => "parked",
         }
     }
 
@@ -885,6 +905,7 @@ impl VisibleStage {
             Self::Working => &states.working,
             Self::NeedsInput => &states.needs_input,
             Self::Review => &states.review,
+            Self::Parked => states.parked.as_deref().unwrap_or(&states.needs_input),
         }
     }
 }
@@ -1834,17 +1855,28 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             working: "Doing".to_owned(),
             needs_input: "Asked".to_owned(),
             review: "Review".to_owned(),
+            parked: Some("Stopped".to_owned()),
         };
         let writer = Writer::new(&tracker);
         for (stage, name) in [
             (VisibleStage::Working, "Doing"),
             (VisibleStage::NeedsInput, "Asked"),
             (VisibleStage::Review, "Review"),
+            (VisibleStage::Parked, "Stopped"),
         ] {
             assert_eq!(writer.set_stage(&ticket(), stage, &states).unwrap(), name);
         }
-        assert_eq!(*tracker.stages.borrow(), ["Doing", "Asked", "Review"]);
+        assert_eq!(
+            *tracker.stages.borrow(),
+            ["Doing", "Asked", "Review", "Stopped"]
+        );
         assert_eq!(tracker.posts.get(), 0);
+        // A project that names no parked state shows a park as needs input.
+        let unnamed = States {
+            parked: None,
+            ..states
+        };
+        assert_eq!(VisibleStage::Parked.state(&unnamed), "Asked");
     }
 
     #[test]

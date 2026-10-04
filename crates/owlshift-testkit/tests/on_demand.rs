@@ -302,6 +302,22 @@ impl Bench {
     /// its front matter, and `zones` added to the project file the remote
     /// holds.
     fn with(author: &str, front: &str, zones: &str) -> Self {
+        Self::build(author, front, zones, "")
+    }
+
+    /// A bench with an assignee whose project names `Parked` as the state a
+    /// parked ticket shows (OWL-148).
+    fn parking() -> Self {
+        Self::build(
+            "maintainer",
+            "assignee = \"maintainer\"\n",
+            "",
+            ", parked = \"Parked\"",
+        )
+    }
+
+    /// [`Self::with`], with `states` added to the project's tracker states.
+    fn build(author: &str, front: &str, zones: &str, states: &str) -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("owlshift do ")
             .tempdir()
@@ -313,7 +329,7 @@ impl Bench {
             project.join("owlshift.toml"),
             format!(
                 "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = \"delegation\"\n\
-                 states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\" }}\n\
+                 states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\"{states} }}\n\
                  [stack]\ngate = [\"git grep -q Hello -- GREETING.md\"]\n\
                  [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n\
                  {zones}"
@@ -1723,10 +1739,11 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
 /// The re-ask limit through the shipped commands: the fourth incomplete
 /// answer parks the ticket with a PARKED comment naming what is still open,
 /// and a restart checks a new answer, whose RESUME restates each question
-/// from the last check that judged it.
+/// from the last check that judged it. The ticket shows the project's parked
+/// state until the restart moves it back to needs input (OWL-148).
 #[test]
 fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
-    let bench = Bench::new(true);
+    let bench = Bench::parking();
     let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
     assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
     let partial = |reason: &'static str| ("Q2", "partial", reason);
@@ -1776,9 +1793,13 @@ fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
         assert!(parked.contains(text), "{text}\n{parked}");
     }
     assert!(!parked.contains("**Q1**"), "{parked}");
+    assert_eq!(bench.stage(), "Parked");
+    let moved = data_of(&bench.events(), EventKind::TrackerWrite, "stage");
+    assert_eq!(moved.last().unwrap()["stage"], "parked");
 
     // Answered at last, but `continue` is typed within the quiet window: the
-    // ticket is restarted, which is kept, and the answer waits unread.
+    // ticket is restarted, which is kept, and the answer waits unread. It no
+    // longer shows parked.
     bench.answer("Q2: no sign-off.\n");
     bench.waited.set(SignedDuration::ZERO);
     let checked_through = bench.record().questions.checked_through;
@@ -1790,6 +1811,7 @@ fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
     let record = bench.record();
     assert_eq!(record.state.waiting, Some(Waiting::NeedsInput));
     assert_eq!(record.questions.checked_through, checked_through);
+    assert_eq!(bench.stage(), "Needs Input");
 
     // Once it counts, `continue` checks it, and the RESUME takes Q1 from the
     // first check.
@@ -1846,8 +1868,10 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(bench.comments()[2].starts_with("[owlshift] RESUME · round 1\n"));
 
+    // The stage is refused too: it is still tried, and the park stands.
     let bench = Bench::new(true);
     bench.refuse.set(Some("[owlshift] PARKED"));
+    bench.refuse_stage.set(true);
     let blocked = r#"{"format":5,"status":"blocked","summary":"The gate needs network."}"#;
     let (outcome, _) = bench.run(vec![bench.reply(None, Some(blocked))], None);
     let Err(
@@ -1864,6 +1888,57 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
         "{stop}"
     );
     assert!(bench.comments().is_empty());
+    assert_eq!(
+        bench.stage_events(EventKind::Warning),
+        ["In Progress", "Needs Input"]
+    );
+    let refused = data_of(&bench.events(), EventKind::Warning, "stage");
+    assert_eq!(refused.last().unwrap()["stage"], "parked");
+    assert_eq!(bench.stage(), "Todo");
+}
+
+/// A ticket parked at Build, its questions answered, shows needs input when
+/// the project names no parked state; `continue` restarts it, which shows it
+/// working again before Build runs to a delivery (OWL-148).
+#[test]
+fn a_restart_at_build_shows_the_ticket_working_again() {
+    let bench = Bench::new(true);
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
+    let answered = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
+    ]);
+    let blocked = r#"{"format":5,"status":"blocked","summary":"The gate needs network."}"#;
+    let (parked, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(None, Some(blocked)),
+    ]);
+    assert!(
+        matches!(
+            &parked,
+            Err(Stop::Parked {
+                reason: ParkReason::Blocked,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    assert_eq!(bench.record().state.waiting, Some(Waiting::Parked));
+    assert_eq!(bench.stage(), "Needs Input");
+
+    let (delivered, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let moves: Vec<Value> = data_of(&bench.events(), EventKind::TrackerWrite, "stage")
+        .iter()
+        .map(|data| data["stage"].clone())
+        .collect();
+    assert_eq!(
+        moves[moves.len() - 3..],
+        [json!("parked"), json!("working"), json!("review")]
+    );
+    assert_eq!(bench.stage(), "In Review");
 }
 
 /// The project file the remote holds for the zone-owner tests: `docs` is

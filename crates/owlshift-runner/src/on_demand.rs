@@ -33,7 +33,9 @@
 //! The ticket's visible stage follows (OWL-137, [`VisibleStage`]): working
 //! once `do` dispatched or `continue` resumed after an answer, needs input
 //! once a round or a re-ask is on the ticket, review once the pull request
-//! is open. A stage write that fails is a `warning` event and nothing more.
+//! is open, parked once the PARKED comment is (OWL-148), and back to what the
+//! ticket waits for when `continue` restarts it. A stage write that fails is a
+//! `warning` event and nothing more.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -684,6 +686,11 @@ impl OnDemand<'_> {
                 EventKind::Decision,
                 data([("restarted", json!(true)), ("stage", json!(stage_name(at)))]),
             );
+            // The ticket leaves the parked stage now: whatever stops this
+            // command next, it no longer shows Owlshift stopped on it.
+            if let Some(stage) = VisibleStage::of(state.status()) {
+                self.show(ticket, None, stage, sink);
+            }
         }
         if let Status::NeedsInput { .. } = state.status() {
             state = self.check_answers(&mut p, state, sink)?;
@@ -1482,13 +1489,16 @@ impl OnDemand<'_> {
 
     /// Parks the ticket: keeps its parked state when it has a ticket ref,
     /// with `questions` when the answer check changed them, posts the PARKED
-    /// comment, records the decision, and returns the stop that says why.
-    /// `open` holds the questions still open at the re-ask limit.
+    /// comment, moves the visible stage to parked, records the decision, and
+    /// returns the stop that says why. `open` holds the questions still open
+    /// at the re-ask limit. The scenario driver parks the same way
+    /// (`owlshift_testkit::scenario`, `post_parked`).
     ///
-    /// The comment is posted even when keeping the state failed, as when a
-    /// run that broke isolation moved the ticket ref: the ticket stopped
-    /// either way, and the person learns it on the ticket. A post that
-    /// failed leaves the park as it is and is said in the stop.
+    /// The comment is posted and the stage moved even when keeping the state
+    /// failed, as when a run that broke isolation moved the ticket ref: the
+    /// ticket stopped either way, and the person learns it on the ticket. A
+    /// post that failed leaves the park as it is and is said in the stop; a
+    /// stage that could not move is a warning.
     #[allow(clippy::too_many_arguments)]
     fn park(
         &self,
@@ -1543,6 +1553,7 @@ impl OnDemand<'_> {
             }
             Err(error) => Some(error.to_string()),
         };
+        self.show(&p.ticket, Some(&ran.run), VisibleStage::Parked, sink);
         sink.emit(
             &p.ticket,
             Some(&ran.run),

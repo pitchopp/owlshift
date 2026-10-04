@@ -84,6 +84,10 @@ pub struct States {
     pub working: String,
     pub needs_input: String,
     pub review: String,
+    /// The state a parked ticket shows; optional. Without it, a parked
+    /// ticket shows `needs_input`, its PARKED comment saying why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -654,6 +658,32 @@ mod tests {
             {tail}
             "#
         ))
+    }
+
+    #[test]
+    fn the_parked_state_is_optional() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.tracker.states.parked, None);
+        assert!(!absent.render().contains("parked"));
+
+        let input = r#"
+            requires = ">=0.1"
+            [tracker]
+            kind = "markdown"
+            admit = { label = "owlshift" }
+            states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review", parked = "Parked" }
+            [stack]
+            gate = []
+            [pipeline]
+            default = "trivial"
+            plan_approval = "never"
+            [models]
+            [policy]
+            always_human = []
+            "#;
+        let set = ProjectConfig::parse(input).unwrap();
+        assert_eq!(set.tracker.states.parked.as_deref(), Some("Parked"));
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
     }
 
     #[test]
