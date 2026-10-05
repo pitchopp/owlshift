@@ -210,9 +210,10 @@ impl Harness for Replies {
 }
 
 /// The Markdown tracker, posting the runner's comments at a virtual clock.
-/// It records times to the second, and the answer check compares the
-/// tracker's times only, a comment newer than an ask, so every comment of the bench, the decider's included, takes the next
-/// minute of one clock.
+/// Every comment of the bench, the decider's included, takes the next
+/// minute of one clock, so its times read plainly and the quiet window is
+/// counted in minutes; `answers_in_the_second_of_their_ask_count` posts
+/// several in one second on purpose.
 struct Clocked<'a> {
     inner: MarkdownTracker,
     clock: &'a Cell<Timestamp>,
@@ -481,6 +482,14 @@ impl Bench {
     fn comment_as(&self, author: &str, body: &str) {
         MarkdownTracker::new(&self.remote.checkout)
             .post_comment(&ticket(), author, tick(&self.clock), body)
+            .unwrap();
+    }
+
+    /// The decider comments on the ticket in the second of `at`, after the
+    /// comments already there, leaving the clock as it is.
+    fn answer_at(&self, at: Timestamp, body: &str) {
+        MarkdownTracker::new(&self.remote.checkout)
+            .post_comment(&ticket(), "maintainer", at, body)
             .unwrap();
     }
 
@@ -1722,6 +1731,56 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
     assert!(
         matches!(&done, Err(Stop::Refused(why)) if why.contains("nothing to continue")),
         "{done:?}"
+    );
+}
+
+/// OWL-136: the comments of one second read in the order they were posted.
+/// An answer posted in its ask's second reads after the ask and counts, and
+/// so does the decider's next answer, posted in the second of the one the
+/// last check read, with that check's REPLY between them.
+#[test]
+fn answers_in_the_second_of_their_ask_count() {
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{asked:?}\n{printed}"
+    );
+    let second = bench.record().questions.asks[0].at;
+    bench.answer_at(second, "Q1: English.\nQ2: what is a sign-off? Go.\n");
+    // The REPLY goes in that second too.
+    bench.clock.set(second);
+    let counter = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "counter_question", "Asks what a sign-off is."),
+    ]);
+    let (asked_back, printed) = bench.continue_ticket(vec![bench.reply(None, Some(&counter))]);
+    assert!(
+        matches!(&asked_back, Err(Stop::CounterQuestion { .. })),
+        "{asked_back:?}\n{printed}"
+    );
+    assert_eq!(
+        shape(&bench.briefs().pop().unwrap()),
+        ["questions", "Decider"]
+    );
+
+    bench.answer_at(second, "Q2: no sign-off. Go.\n");
+    let answered = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "answered", "No sign-off."),
+    ]);
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let mut briefs = bench.briefs();
+    briefs.pop();
+    let last_check = briefs.pop().unwrap();
+    assert_eq!(last_check.role, Role::AnswerCheck);
+    assert_eq!(
+        shape(&last_check),
+        ["questions", "Decider", "Owlshift", "Decider"]
     );
 }
 

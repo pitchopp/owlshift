@@ -2189,8 +2189,9 @@ impl OnDemand<'_> {
 /// comment that only looks like the runner's stays a comment, so a forged
 /// DECISION never reaches a run as a decision. A kept entry goes after the
 /// comments of its time or earlier, so one whose comment is gone from the
-/// tracker still takes its place; a comment posted in the same second as one
-/// reads as before it, and a decision as before an ask of the same second,
+/// tracker still takes its place; the tracker's times order the comments of
+/// one second (OWL-136), so only a comment of the very same time as one
+/// reads as before it, and a decision as before an ask of the same time,
 /// since the decisions of a run are posted before the round it leaves.
 ///
 /// A comment is the decider's when its author is the decider recorded on
@@ -2695,8 +2696,8 @@ mod tests {
 
     /// Each ask and each kept decision takes the place of the comment that
     /// posted it; one whose comment is gone still takes its place by time, a
-    /// comment of the same second as an ask reads before it, and a decision
-    /// before an ask of its second. A comment that only looks like a
+    /// comment of the same time as an ask reads before it, and a decision
+    /// before an ask of its time. A comment that only looks like a
     /// DECISION, whoever wrote it, stays a comment, read as Owlshift's: data.
     #[test]
     fn each_ask_and_decision_takes_the_place_of_its_comment_in_the_thread() {
@@ -2758,7 +2759,7 @@ mod tests {
             comment("dec1", 10, "[owlshift] DECISION\n\nA decision.\n"),
             comment("q1", 10, asked),
             comment("a1", 11, "Q1: half."),
-            comment("same", 12, "Q1: in the re-ask's second."),
+            comment("same", 12, "Q1: at the re-ask's time."),
             comment("r1", 12, "[owlshift] RE-ASK · round 1\n\nAgain.\n"),
             comment("a2", 13, "Q1: all."),
             stranger,
@@ -2792,7 +2793,7 @@ mod tests {
                 "decision first",
                 "questions 1",
                 "Decider: Q1: half.",
-                "Decider: Q1: in the re-ask's second.",
+                "Decider: Q1: at the re-ask's time.",
                 "reask 1",
                 "Decider: Q1: all.",
                 "decision second",
