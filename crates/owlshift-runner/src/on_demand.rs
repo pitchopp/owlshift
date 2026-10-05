@@ -263,8 +263,9 @@ impl fmt::Display for Delivered {
     }
 }
 
-/// The comment that reached the ticket before its state failed to be kept
-/// ([`Stop::NotKept`]): each one asks a person to act on the ticket.
+/// What asks a person to act once keeping the ticket's state failed
+/// ([`Stop::NotKept`]): the comment that reached the ticket before, or, for
+/// [`Landed::ParkedUnposted`] alone, a park whose comment did not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Landed {
     /// The questions of a round.
@@ -277,6 +278,10 @@ pub enum Landed {
     Reply,
     /// The PARKED comment.
     Parked,
+    /// No comment: the PARKED comment could not be posted either. The run
+    /// still parked the ticket, which waits for a person whatever reached it,
+    /// as a park whose state was kept does (OWL-159).
+    ParkedUnposted,
 }
 
 /// Why `owlshift do` or `owlshift continue` stopped short of a delivery.
@@ -343,10 +348,12 @@ pub enum Stop {
         unposted: Option<String>,
     },
     /// A comment that makes a person the blocker (`landed`) is on the ticket,
-    /// but keeping Owlshift's own state in the ticket's ref failed, so the
-    /// command stopped with `message`. A refusal that says so, kept apart
-    /// from [`Stop::Refused`] so that the notification can tell it from one
-    /// where nothing reached the ticket (OWL-149).
+    /// or the ticket was parked without its PARKED comment
+    /// ([`Landed::ParkedUnposted`], OWL-159), but keeping Owlshift's own
+    /// state in the ticket's ref failed, so the command stopped with
+    /// `message`. A refusal that says so, kept apart from [`Stop::Refused`]
+    /// so that the notification can tell it from one that asks nothing of
+    /// anyone (OWL-149).
     NotKept { landed: Landed, message: String },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
@@ -1656,8 +1663,9 @@ impl OnDemand<'_> {
     /// The comment is posted and the stage moved even when keeping the state
     /// failed, as when a run that broke isolation moved the ticket ref: the
     /// ticket stopped either way, and the person learns it on the ticket. A
-    /// post that failed leaves the park as it is and is said in the stop; a
-    /// stage that could not move is a warning.
+    /// post that failed leaves the park as it is and is said in the stop,
+    /// which notifies the operator either way; a stage that could not move is
+    /// a warning.
     #[allow(clippy::too_many_arguments)]
     fn park(
         &self,
@@ -1730,11 +1738,12 @@ impl OnDemand<'_> {
                     park_reason(reason)
                 )
             };
+            // Posted or not, the park waits for a person (OWL-159).
             return match &unposted {
-                // Nothing reached the ticket: no person was asked to look.
-                Some(error) => Stop::Refused(message(&format!(
-                    "the PARKED comment could not be posted: {error}"
-                ))),
+                Some(error) => Stop::NotKept {
+                    landed: Landed::ParkedUnposted,
+                    message: message(&format!("the PARKED comment could not be posted: {error}")),
+                },
                 None => Stop::NotKept {
                     landed: Landed::Parked,
                     message: message("the PARKED comment is on the ticket"),
