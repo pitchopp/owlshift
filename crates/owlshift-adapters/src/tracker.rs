@@ -45,6 +45,14 @@ pub trait Tracker {
     fn ticket_url(&self, _id: &TicketId) -> Option<String> {
         None
     }
+
+    /// The text that, written in a comment, makes the tracker notify the
+    /// account `account` (OWL-157): on Linear, the person's profile link.
+    /// `None` when the tracker has no such text, and when it could not be
+    /// read: the comment still goes, without it.
+    fn mention(&self, _account: &str) -> Option<String> {
+        None
+    }
 }
 
 /// A row of the tracker capability table in architecture section 6.

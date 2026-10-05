@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-09-29 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
+  "recorded": "2026-10-05 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
   "exchanges": [
     {
       "request": {
@@ -78,7 +78,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -99,6 +99,7 @@
                   "externalUser": null,
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
                     "id": "00000000-0000-4000-8000-000000000001"
                   }
@@ -111,6 +112,7 @@
                   "externalUser": null,
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
                     "id": "00000000-0000-4000-8000-000000000001"
                   }
@@ -127,7 +129,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -162,7 +164,7 @@
     },
     {
       "request": {
-        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } } }",
+        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } } }",
         "variables": {
           "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
           "issueId": "OWL-99999"
@@ -196,7 +198,7 @@
     },
     {
       "request": {
-        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } } }",
+        "query": "mutation PostComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } } }",
         "variables": {
           "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
           "issueId": "OWL-13"
@@ -209,11 +211,12 @@
             "comment": {
               "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
               "botActor": null,
-              "createdAt": "2026-09-29T11:28:54.335Z",
+              "createdAt": "2026-10-04T22:21:23.002Z",
               "editedAt": null,
               "externalUser": null,
               "id": "00000000-0000-4000-8000-00000000c001",
               "user": {
+                "app": false,
                 "displayName": "person-1",
                 "id": "00000000-0000-4000-8000-000000000001"
               }
@@ -226,7 +229,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -242,11 +245,12 @@
                 {
                   "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
                   "botActor": null,
-                  "createdAt": "2026-09-29T11:28:54.335Z",
+                  "createdAt": "2026-10-04T22:21:23.002Z",
                   "editedAt": null,
                   "externalUser": null,
                   "id": "00000000-0000-4000-8000-00000000c001",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
                     "id": "00000000-0000-4000-8000-000000000001"
                   }
@@ -259,6 +263,7 @@
                   "externalUser": null,
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
                     "id": "00000000-0000-4000-8000-000000000001"
                   }
@@ -271,6 +276,7 @@
                   "externalUser": null,
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "user": {
+                    "app": false,
                     "displayName": "person-1",
                     "id": "00000000-0000-4000-8000-000000000001"
                   }

@@ -5,8 +5,9 @@
 //! overwritten: it is committed, and a person edits it from there. The
 //! secrets go to the system keychain, never to a file, an argument, an
 //! event or a message: the tracker's (a Linear API key, when the tracker is
-//! Linear), the forge's (a GitHub token) and the token agent runs log in to
-//! Claude Code with (OWL-94). The command line asks for them on a terminal
+//! Linear, and optionally the client ID and secret of the Linear app Owlshift
+//! writes as, OWL-157), the forge's (a GitHub token) and the token agent runs
+//! log in to Claude Code with (OWL-94). The command line asks for them on a terminal
 //! only; this module decides which are missing and stores what it is given.
 
 use std::fmt;
@@ -22,7 +23,7 @@ use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::forge::{GITHUB_ACCOUNT, GITHUB_TOKEN_HELP};
-use crate::tracker::LINEAR_ACCOUNT;
+use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 
 /// The values of a new project file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +211,25 @@ pub const CLAUDE_TOKEN: SecretSpec = SecretSpec {
            `claude setup-token` and paste the token it prints",
 };
 
+/// The client ID of the Linear OAuth app Owlshift writes as (decision D8,
+/// OWL-157): optional, and asked with [`LINEAR_APP_SECRET`] by
+/// [`store_app_credentials`].
+pub const LINEAR_APP_ID: SecretSpec = SecretSpec {
+    account: LINEAR_APP_ID_ACCOUNT,
+    label: "Linear app client ID",
+    help: "optional: the client ID of the OAuth application a workspace admin creates in \
+           Linear's API settings, with client credentials on, so that Owlshift comments as its \
+           app user and Linear notifies the decider; leave it empty to comment through the API \
+           key, whose holder Linear does not notify",
+};
+
+/// That app's client secret.
+pub const LINEAR_APP_SECRET: SecretSpec = SecretSpec {
+    account: LINEAR_APP_SECRET_ACCOUNT,
+    label: "Linear app client secret",
+    help: "the client secret of that OAuth application",
+};
+
 /// The secrets `owlshift do` needs for a project on `tracker`: the forge's
 /// and the agent runs' Claude Code token always, since `do` runs Claude
 /// Code, and the tracker's for Linear.
@@ -267,6 +287,115 @@ pub fn store_secrets(
         }
     }
     Ok(report)
+}
+
+/// What [`store_app_credentials`] did with the Linear app's pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppStored {
+    /// Both given, and stored.
+    Stored,
+    /// Both already in the keychain, and left there.
+    Kept,
+    /// No client ID given: nothing stored, and Owlshift writes through the
+    /// API key unless a pair is in the keychain.
+    Skipped,
+    /// A client ID given without its secret: neither stored.
+    Incomplete,
+    /// One of the two not one word ([`Secret::is_one_word`]): neither stored.
+    Refused,
+}
+
+/// Stores the Linear app's client ID and secret together or not at all
+/// (OWL-157). A stored pair is kept unless `replace`. Otherwise `ask` gives
+/// the client ID, then, when one was given, the secret; both, each one word,
+/// are stored, and anything less stores nothing, keeping what the keychain
+/// holds. Whether it then holds a usable pair is
+/// [`crate::tracker::app_credentials`]'s to say. Neither value is ever part
+/// of the answer or of an error.
+///
+/// The client ID is written first: when writing the secret then fails, the
+/// client ID the keychain held before is put back, or the new one removed
+/// when there was none, and the error is the write's. Should that fail too,
+/// the error says the pair may no longer go together, and how to store it
+/// again.
+pub fn store_app_credentials(
+    keychain: &Keychain,
+    replace: bool,
+    ask: &mut dyn FnMut(&SecretSpec) -> Option<Secret>,
+) -> Result<AppStored, String> {
+    let contains = |account| keychain.contains(account).map_err(|e| e.to_string());
+    let paired = contains(LINEAR_APP_ID.account)? && contains(LINEAR_APP_SECRET.account)?;
+    if paired && !replace {
+        return Ok(AppStored::Kept);
+    }
+    let mut given = |spec: &SecretSpec| {
+        ask(spec)
+            .map(|secret| Secret::new(secret.expose().trim()))
+            .filter(|secret| !secret.expose().is_empty())
+    };
+    let Some(id) = given(&LINEAR_APP_ID) else {
+        return Ok(if paired {
+            AppStored::Kept
+        } else {
+            AppStored::Skipped
+        });
+    };
+    let Some(secret) = given(&LINEAR_APP_SECRET) else {
+        return Ok(AppStored::Incomplete);
+    };
+    if !(id.is_one_word() && secret.is_one_word()) {
+        return Ok(AppStored::Refused);
+    }
+    store_pair(keychain, &id, &secret)?;
+    Ok(AppStored::Stored)
+}
+
+/// What [`store_pair`] needs of a keychain, so that a write that fails can
+/// be tested. Errors are the keychain's messages, which carry no value.
+trait Entries {
+    fn read(&self, account: &str) -> Result<Option<Secret>, String>;
+    fn store(&self, account: &str, secret: &Secret) -> Result<(), String>;
+    fn delete(&self, account: &str) -> Result<(), String>;
+}
+
+impl Entries for Keychain {
+    fn read(&self, account: &str) -> Result<Option<Secret>, String> {
+        Keychain::read(self, account).map_err(|e| e.to_string())
+    }
+
+    fn store(&self, account: &str, secret: &Secret) -> Result<(), String> {
+        Keychain::store(self, account, secret).map_err(|e| e.to_string())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        Keychain::delete(self, account)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Writes the client ID, then the secret; when the secret's write fails,
+/// puts back the client ID found before, or removes the new one.
+fn store_pair(keychain: &dyn Entries, id: &Secret, secret: &Secret) -> Result<(), String> {
+    let (id_account, secret_account) = (LINEAR_APP_ID.account, LINEAR_APP_SECRET.account);
+    let before = keychain.read(id_account)?;
+    keychain.store(id_account, id)?;
+    let Err(stored) = keychain.store(secret_account, secret) else {
+        return Ok(());
+    };
+    let restored = match &before {
+        Some(before) => keychain.store(id_account, before),
+        None => keychain.delete(id_account),
+    };
+    match restored {
+        Ok(()) => Err(stored),
+        Err(restored) => Err(format!(
+            "storing the Linear app's client secret failed ({stored}), and so did putting back \
+             its client ID ({restored}): the keychain may now hold a client ID and a secret that \
+             do not go together (service `{SERVICE}`, accounts `{id_account}` and \
+             `{secret_account}`). Run `owlshift init --replace-secrets` and give both again"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -392,5 +521,154 @@ mod tests {
                 .expose(),
             SENTINEL
         );
+    }
+
+    /// The Linear app's pair is stored whole or not at all: a client ID
+    /// alone, or one pasted across lines, stores nothing; no answer skips
+    /// the app; a stored pair is kept unless replaced.
+    #[test]
+    fn the_linear_apps_pair_is_stored_whole_or_not_at_all() {
+        let keychain = Keychain::in_memory();
+        let store = |replace, answers: [Option<&str>; 2]| {
+            let mut answers = answers.into_iter();
+            let mut asked = Vec::new();
+            let stored = store_app_credentials(&keychain, replace, &mut |spec| {
+                asked.push(spec.account);
+                answers.next().flatten().map(Secret::new)
+            })
+            .unwrap();
+            (stored, asked)
+        };
+        let is_stored = |account| keychain.contains(account).unwrap();
+
+        assert_eq!(
+            store(false, [None, None]),
+            (AppStored::Skipped, vec![LINEAR_APP_ID_ACCOUNT])
+        );
+        assert_eq!(store(false, [Some("id"), None]).0, AppStored::Incomplete);
+        assert_eq!(
+            store(false, [Some("id"), Some("two\nlines")]).0,
+            AppStored::Refused
+        );
+        assert!(!is_stored(LINEAR_APP_ID_ACCOUNT));
+        assert!(!is_stored(LINEAR_APP_SECRET_ACCOUNT));
+
+        assert_eq!(
+            store(false, [Some(" id "), Some("secret")]),
+            (
+                AppStored::Stored,
+                vec![LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT]
+            )
+        );
+        assert_eq!(
+            keychain
+                .read(LINEAR_APP_ID_ACCOUNT)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "id"
+        );
+        assert_eq!(
+            store(false, [Some("x"), Some("y")]),
+            (AppStored::Kept, vec![])
+        );
+        assert_eq!(store(true, [None, None]).0, AppStored::Kept);
+        assert_eq!(store(true, [Some("id"), None]).0, AppStored::Incomplete);
+        assert_eq!(
+            keychain
+                .read(LINEAR_APP_SECRET_ACCOUNT)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "secret"
+        );
+    }
+
+    /// The in-memory keychain, whose writes of the secret fail, and, when
+    /// `rollback_fails`, whatever puts the client ID back.
+    struct SecretFails {
+        inner: Keychain,
+        rollback_fails: bool,
+        id_writes: std::cell::Cell<u32>,
+    }
+
+    impl Entries for SecretFails {
+        fn read(&self, account: &str) -> Result<Option<Secret>, String> {
+            Entries::read(&self.inner, account)
+        }
+
+        fn store(&self, account: &str, secret: &Secret) -> Result<(), String> {
+            if account == LINEAR_APP_SECRET_ACCOUNT {
+                return Err("keychain: the secret's write failed".to_owned());
+            }
+            self.id_writes.set(self.id_writes.get() + 1);
+            if self.rollback_fails && self.id_writes.get() > 1 {
+                return Err("keychain: the rollback failed".to_owned());
+            }
+            Entries::store(&self.inner, account, secret)
+        }
+
+        fn delete(&self, account: &str) -> Result<(), String> {
+            if self.rollback_fails {
+                return Err("keychain: the rollback failed".to_owned());
+            }
+            Entries::delete(&self.inner, account)
+        }
+    }
+
+    /// A secret whose write fails leaves the pair as it was: the client ID
+    /// found before put back, or the new one removed. A rollback that fails
+    /// too says the pair may no longer go together, and how to fix it.
+    #[test]
+    fn a_failed_secret_write_leaves_the_pair_as_it_was() {
+        let keychain = |rollback_fails| SecretFails {
+            inner: Keychain::in_memory(),
+            rollback_fails,
+            id_writes: std::cell::Cell::new(0),
+        };
+        let (id, secret) = (Secret::new("new-id"), Secret::new("new-secret"));
+        let id_of = |k: &SecretFails| {
+            Entries::read(&k.inner, LINEAR_APP_ID_ACCOUNT)
+                .unwrap()
+                .map(|s| s.expose().to_owned())
+        };
+
+        let none = keychain(false);
+        let error = store_pair(&none, &id, &secret).unwrap_err();
+        assert_eq!(error, "keychain: the secret's write failed");
+        assert_eq!(id_of(&none), None);
+
+        let pair = keychain(false);
+        pair.inner
+            .store(LINEAR_APP_ID_ACCOUNT, &Secret::new("old-id"))
+            .unwrap();
+        pair.inner
+            .store(LINEAR_APP_SECRET_ACCOUNT, &Secret::new("old-secret"))
+            .unwrap();
+        let error = store_pair(&pair, &id, &secret).unwrap_err();
+        assert_eq!(error, "keychain: the secret's write failed");
+        assert_eq!(id_of(&pair).as_deref(), Some("old-id"));
+
+        for before in [None, Some("old-id")] {
+            let stuck = keychain(true);
+            if let Some(before) = before {
+                stuck
+                    .inner
+                    .store(LINEAR_APP_ID_ACCOUNT, &Secret::new(before))
+                    .unwrap();
+            }
+            let error = store_pair(&stuck, &id, &secret).unwrap_err();
+            assert!(
+                error.contains("the secret's write failed")
+                    && error.contains("the rollback failed")
+                    && error.contains("do not go together")
+                    && error.ends_with("Run `owlshift init --replace-secrets` and give both again"),
+                "{error}"
+            );
+            assert!(
+                !error.contains("new-id") && !error.contains("old-id"),
+                "{error}"
+            );
+        }
     }
 }

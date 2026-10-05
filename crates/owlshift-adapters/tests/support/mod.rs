@@ -221,7 +221,7 @@ impl Recorder {
     /// Makes up the comments posted on `issue`, attributed to the key's own
     /// account, instead of posting them.
     pub fn synthesizing_posts_on(mut self, key: &ApiKey, issue: &str) -> Self {
-        let viewer = live_query(key, "{ viewer { id displayName } }");
+        let viewer = live_query(key, "{ viewer { id displayName app } }");
         self.synthesize = Some(Synthesize {
             issue: issue.to_owned(),
             author: viewer["data"]["viewer"].clone(),

@@ -10,8 +10,10 @@ use owlshift_contracts::config::TrackerKind;
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::init::{
-    InitOptions, Written, project_file, required_secrets, store_secrets, write_project_file,
+    AppStored, InitOptions, SecretSpec, Written, project_file, required_secrets,
+    store_app_credentials, store_secrets, write_project_file,
 };
+use owlshift_runner::tracker::app_credentials;
 
 use crate::fail;
 
@@ -111,7 +113,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     let terminal = io::stdin().is_terminal();
     let specs = required_secrets(tracker);
     let mut asked = false;
-    let report = store_secrets(&keychain, &specs, args.replace_secrets, &mut |spec| {
+    let mut ask = |spec: &SecretSpec| {
         if !terminal {
             return None;
         }
@@ -126,11 +128,14 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         rpassword::prompt_password(format!("{}: ", spec.label))
             .ok()
             .map(Secret::new)
-    });
+    };
+    let report = store_secrets(&keychain, &specs, args.replace_secrets, &mut ask);
     let report = match report {
         Ok(report) => report,
         Err(error) => return fail(&error.to_string()),
     };
+    let app_ready =
+        tracker != TrackerKind::Linear || linear_app(&keychain, args.replace_secrets, &mut ask);
     for spec in &report.stored {
         println!("Stored the {spec}.");
     }
@@ -143,7 +148,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
              character, as a secret pasted across lines does."
         );
     }
-    if report.missing.is_empty() && report.refused.is_empty() {
+    if report.missing.is_empty() && report.refused.is_empty() && app_ready {
         return next_steps();
     }
     for spec in &report.missing {
@@ -160,6 +165,54 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         );
     }
     ExitCode::FAILURE
+}
+
+/// Stores the Linear app's pair, or not, and says what Owlshift writes as
+/// (OWL-157); `false` when `init` must fail: half a pair given, one pasted
+/// wrong, or half a pair left in the keychain.
+fn linear_app(
+    keychain: &Keychain,
+    replace: bool,
+    ask: &mut dyn FnMut(&SecretSpec) -> Option<Secret>,
+) -> bool {
+    let stored = match store_app_credentials(keychain, replace, ask) {
+        Ok(stored) => stored,
+        Err(error) => {
+            eprintln!("owlshift: {error}");
+            return false;
+        }
+    };
+    match stored {
+        AppStored::Stored => println!(
+            "Stored the Linear app's client ID and secret: Owlshift comments as its app user."
+        ),
+        AppStored::Kept => println!("Kept the Linear app's client ID and secret already stored."),
+        AppStored::Skipped => println!(
+            "No Linear app: Owlshift comments through the Linear API key, and Linear does not \
+             notify that key's holder of those comments."
+        ),
+        AppStored::Incomplete => {
+            eprintln!(
+                "owlshift: not stored: the Linear app's client ID goes with its secret; neither \
+                 was stored."
+            );
+            return false;
+        }
+        AppStored::Refused => {
+            eprintln!(
+                "owlshift: not stored: the Linear app's client ID or secret holds a space or a \
+                 control character, as a secret pasted across lines does; neither was stored."
+            );
+            return false;
+        }
+    }
+    match app_credentials(keychain) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("owlshift: {error}");
+            false
+        }
+    }
 }
 
 fn next_steps() -> ExitCode {
