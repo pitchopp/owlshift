@@ -211,6 +211,93 @@ fn an_answer_check_waits_for_an_answer() {
     );
 }
 
+/// OWL-126: an answer a check read is judged, a counter-question included
+/// (`TicketQuestions::keep_check`), so a second check on it waits for a
+/// newer comment of the decider rather than for one newer than the re-ask.
+#[test]
+fn a_counter_question_once_read_is_not_an_answer_again() {
+    let again = r#"
+        description = "The answer check is asked for again after a counter-question, with no new answer."
+        ticket = "DEMO-3"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { result = "results/questions-round1.json" }
+
+        [[step]]
+        comment = { author = "maintainer", body = "Q1: English.\nQ2: \"Hello, reader.\"\n" }
+
+        [[step]]
+        answer = { result = "results/check-round1-q2-partial.json" }
+
+        [[step]]
+        comment = { author = "maintainer", body = "Q2: what do you mean by a sign-off?\n" }
+
+        [[step]]
+        answer = { result = "results/check-round1-q2-counter.json" }
+        expect = { event = "counter_question" }
+
+        [[step]]
+        answer = { result = "results/check-round1-q2-answered.json" }
+    "#;
+    let error = play_str("again", again, &scenarios().join("reask"), fake_harness()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "again, step 7 (answer): no comment from the decider since 2026-09-28T09:05:00Z: the \
+         answer check runs once answers arrive"
+    );
+}
+
+/// OWL-126: the stand-in's briefs carry the runner's thread
+/// (`on_demand::thread`): each decision and ask in the place of its comment,
+/// a decision before the round it leaves in the same second, and the
+/// runner's other comments as `owlshift`.
+#[test]
+fn decisions_and_asks_take_their_comments_places_in_the_thread() {
+    let thread = r#"
+        description = "A decision and a round, answered, then a decision alone."
+        ticket = "DEMO-4"
+        start = "2026-10-03T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { result = "results/questions-mixed.json" }
+
+        [[step]]
+        resolve = { result = "results/resolver-decides-file.json" }
+
+        [[step]]
+        comment = { author = "maintainer", body = "Q1: casual.\n" }
+
+        [[step]]
+        answer = { result = "results/check-tone-answered.json" }
+        expect = { event = "answered", brief_entries = ["decision", "questions", "decider"] }
+
+        [[step]]
+        run = { result = "results/questions-link.json" }
+
+        [[step]]
+        resolve = { result = "results/resolver-decides-link.json" }
+
+        [[step]]
+        run = { result = "results/build-done.json" }
+        expect = { event = "completed", brief_entries = ["decision", "questions", "decider", "owlshift", "decision"] }
+    "#;
+    if let Err(error) = play_str(
+        "thread",
+        thread,
+        &scenarios().join("resolver"),
+        fake_harness(),
+    ) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-16's acceptance: the gate fails first and passes after a fix run.
 #[test]
 fn gate() {

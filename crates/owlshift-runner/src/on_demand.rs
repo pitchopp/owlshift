@@ -1448,10 +1448,7 @@ impl OnDemand<'_> {
                 // The answers this check read are judged: only a newer
                 // comment of the decider is a new answer. Its verdicts are
                 // kept with the ask they judge, for the round's RESUME.
-                questions.checked_through = read_through.max(questions.checked_through);
-                if let Some(ask) = questions.asks.last_mut() {
-                    ask.verdicts.clone_from(&result.verdicts);
-                }
+                questions.keep_check(read_through, &result.verdicts);
                 result.verdicts.clone()
             }
             _ => Vec::new(),
@@ -1489,13 +1486,7 @@ impl OnDemand<'_> {
                 let resume = ResumeComment {
                     ticket: ticket.clone(),
                     round,
-                    understood: answer_check::understood(
-                        questions
-                            .asks
-                            .iter()
-                            .filter(|ask| ask.round == round)
-                            .map(|ask| (&ask.questions[..], &ask.verdicts[..])),
-                    ),
+                    understood: answer_check::understood(questions.round_asks(round)),
                 };
                 let posted = Writer::new(self.tracker)
                     .post_resume(&resume)
@@ -2202,7 +2193,10 @@ impl OnDemand<'_> {
 /// decider now (build plan, "Who answers which ask"): the answers a check
 /// accepted stay instructions for the Build they unblock, and a person who
 /// became the decider after an ask cannot answer it.
-pub(crate) fn thread(
+///
+/// The test bench's stand-in driver builds its briefs' threads with it too
+/// (`owlshift_testkit::scenario`), from the asks and decisions it keeps.
+pub fn thread(
     comments: &[Comment],
     asks: &[Ask],
     decisions: &[KeptDecision],
@@ -2407,7 +2401,7 @@ pub(crate) fn comment_author(comment: &Comment, decider: &Person) -> Author {
 /// anyone else, or an author the tracker cannot name, is quoted as data. For
 /// a ticket, the author is its creator: an edit of the description by
 /// someone else after its creation is not seen.
-fn account_author(author: &TrackerAuthor, decider: &Person) -> Author {
+pub fn account_author(author: &TrackerAuthor, decider: &Person) -> Author {
     match author {
         TrackerAuthor::Account(person) => Author {
             name: person.name.clone(),

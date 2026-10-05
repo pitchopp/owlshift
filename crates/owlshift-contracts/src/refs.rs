@@ -438,6 +438,30 @@ impl TicketQuestions {
         let asked = self.latest()?.at;
         Some(self.checked_through.map_or(asked, |read| read.max(asked)))
     }
+
+    /// Keeps what an answer check that gave its verdicts read and found: the
+    /// answers it read through are judged, so only a newer comment of the
+    /// decider is a new answer, and its verdicts go with the latest ask, the
+    /// one they judge, for the round's RESUME. `read_through` is the newest
+    /// last edit among the decider's comments the check read.
+    pub fn keep_check(&mut self, read_through: Option<Timestamp>, verdicts: &[Verdict]) {
+        self.checked_through = read_through.max(self.checked_through);
+        if let Some(ask) = self.asks.last_mut() {
+            ask.verdicts = verdicts.to_vec();
+        }
+    }
+
+    /// The asks of `round` in order, its questions and a re-ask's, each with
+    /// the verdicts kept on it: what a RESUME restates.
+    pub fn round_asks(
+        &self,
+        round: NonZeroU32,
+    ) -> impl Iterator<Item = (&[Question], &[Verdict])> + '_ {
+        self.asks
+            .iter()
+            .filter(move |ask| ask.round == round)
+            .map(|ask| (&ask.questions[..], &ask.verdicts[..]))
+    }
 }
 
 impl Default for TicketQuestions {
