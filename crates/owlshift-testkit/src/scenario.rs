@@ -16,7 +16,9 @@
 //! (`timeout_ms`, 60 s by default), result validation and isolation check.
 //! No writer (OWL-18) exists yet, so the runner drives the rest itself, and
 //! only as far as the scenarios need: it keeps the core state in memory from
-//! Ready, builds the brief from the tracker, maps the run's outcome onto a
+//! Ready, builds the brief from the tracker, its ticket and thread read as
+//! `owlshift do` reads them (`owlshift_runner::on_demand::account_author`
+//! and `thread`), maps the run's outcome onto a
 //! core event, posts the questions comment, sets the visible stage after
 //! the same core events as `owlshift do` and `continue`, through the same
 //! Writer (`owlshift_runner::writer::VisibleStage::after`), and to parked on
@@ -31,15 +33,17 @@
 //! decider; when any is left for the resolver, nothing is posted and the core
 //! state does not move until a `resolve` step runs the resolver on them. It
 //! posts each decision as a DECISION comment
-//! (`owlshift_runner::writer::DecisionComment`), kept in memory to take that
-//! comment's place in every later brief's thread as a `decision` entry, and
-//! opens a round of what is left, renumbered Q1..Qn; when nothing is left,
-//! the ticket stays at its stage for the next `run`. A resolver without a
+//! (`owlshift_runner::writer::DecisionComment`), kept to take that comment's
+//! place in every later brief's thread as a `decision` entry, and opens a
+//! round of what is left, renumbered Q1..Qn; when nothing is left, the
+//! ticket stays at its stage for the next `run`. A resolver without a
 //! usable result sends every question to the decider, and one that breaks
 //! isolation parks the ticket. An `answer` step runs the
 //! answer check (OWL-116) while the ticket waits for input, once answers
-//! arrived: a decider comment newer than the latest ask, or than the last
-//! check that found a counter-question. A failed or interrupted check is
+//! arrived, as `owlshift continue` decides it but with no quiet window
+//! (`owlshift_runner::answer_check::readiness`): a comment of the latest
+//! ask's decider newer than that ask and than what the last check with
+//! verdicts read. A failed or interrupted check is
 //! retried on the same answers. Its outcome maps onto one core event
 //! (`owlshift_runner::answer_check::event`): an answer settles the round,
 //! a RESUME comment restates what was understood of each of its questions
@@ -49,10 +53,14 @@
 //! REPLY comment with the check's reply to it
 //! (`owlshift_runner::writer::ReplyComment`) and the ticket keeps waiting,
 //! the REPLY staying an `owlshift` comment in every later brief's thread.
-//! Each ask the driver posts, a round's questions or a re-ask,
-//! is kept in memory with the verdicts of the latest check on it, and takes
-//! the place of its comment in every brief's thread, as a `questions` or
-//! `reask` entry. Whenever the core parks the ticket, after a run or an
+//! The driver keeps its asks and decisions as a ticket ref's
+//! `questions.json` would (`owlshift_contracts::refs::TicketQuestions`), in
+//! memory: each ask, a round's questions or a re-ask, with its comment, its
+//! decider, the ticket's assignee (no zone owner is resolved), and the
+//! verdicts of the latest check on it, kept as `continue` keeps them
+//! (`TicketQuestions::keep_check`); each takes the place of its comment in
+//! every brief's thread, as a `questions` or `reask` entry, as the
+//! runner's own thread places it. Whenever the core parks the ticket, after a run or an
 //! answer check, the driver posts a PARKED comment
 //! (`owlshift_runner::writer::ParkedComment`). What it leaves out on purpose:
 //!
@@ -76,24 +84,25 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use owlshift_adapters::tracker::markdown::MarkdownTracker;
+use owlshift_adapters::tracker::markdown::{self, MarkdownTracker};
+use owlshift_adapters::tracker::{Person, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
+    Brief, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
 };
-use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
+use owlshift_contracts::refs::{Ask, AskDecider, AskKind, KeptDecision, TicketQuestions};
 use owlshift_contracts::result::{Question, RunResult, Status as ResultStatus, Verdict};
 use owlshift_contracts::{Role, Stage};
-use owlshift_core::decider::brief_zones;
+use owlshift_core::decider::{DeciderRule, brief_zones};
 use owlshift_core::gate::GatePolicy;
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
-use owlshift_runner::answer_check;
+use owlshift_runner::answer_check::{self, Readiness};
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
-use owlshift_runner::on_demand::core_event;
+use owlshift_runner::on_demand::{account_author, core_event, thread};
 use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
     DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
@@ -194,6 +203,10 @@ pub struct Expect {
     pub branch_files: BTreeMap<String, String>,
     /// The authors' relations in the thread of the last brief, in order.
     pub brief_thread: Option<Vec<Relation>>,
+    /// Every entry of the last brief's thread, in order: `questions`,
+    /// `reask` or `decision` for what the driver kept, a comment as its
+    /// author's relation (`decider`, `owlshift`, `other`).
+    pub brief_entries: Option<Vec<String>>,
     /// The question ids of the latest ask in the last brief's thread: the
     /// ones an answer check gives its verdicts on.
     pub brief_latest_ask: Option<Vec<String>>,
@@ -375,15 +388,11 @@ struct Driver {
     state: TicketState,
     now: Timestamp,
     runs: u32,
-    /// The asks the driver posted, oldest first: each round's `questions`
-    /// and each `reask`, in the order of their comments.
-    asks: Vec<ThreadEntry>,
-    /// The verdicts of the latest answer check on each ask, in the order of
-    /// `asks`: what a RESUME restates.
-    verdicts: Vec<Vec<Verdict>>,
-    /// While questions wait: a decider comment after this time is a new
-    /// answer for the answer check.
-    answers_since: Option<Timestamp>,
+    /// What a ticket ref's `questions.json` would keep, in memory: each ask
+    /// the driver posted with its comment, its decider and the verdicts of
+    /// the latest check on it, what the last check read, and each decision
+    /// with its comment.
+    questions: TicketQuestions,
     /// The project's gate policy, which routes a run's questions.
     policy: GatePolicy,
     /// The result of the last run, while its questions wait for a
@@ -391,9 +400,6 @@ struct Driver {
     pending: Option<RunResult>,
     /// The questions the resolver's brief gives it.
     resolving: Vec<Question>,
-    /// The decisions the driver posted, oldest first, as `decision` entries,
-    /// in the order of their comments.
-    decisions: Vec<ThreadEntry>,
     last_brief: Option<Brief>,
     last_run: Option<RunReport>,
 }
@@ -485,7 +491,6 @@ impl Driver {
             policy: GatePolicy::new(&config.policy.always_human, config.pipeline.plan_approval),
             pending: None,
             resolving: Vec::new(),
-            decisions: Vec::new(),
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             gate_failure: None,
             branch: format!("owlshift/{}", scenario.ticket),
@@ -493,9 +498,7 @@ impl Driver {
             state,
             now: scenario.start,
             runs: 0,
-            asks: Vec::new(),
-            verdicts: Vec::new(),
-            answers_since: None,
+            questions: TicketQuestions::new(),
             last_brief: None,
             last_run: None,
             tmp,
@@ -546,8 +549,9 @@ impl Driver {
     /// Posts the PARKED comment of a park, after `report`'s run, and moves
     /// the visible stage to parked, as `owlshift do` and `continue` do
     /// (`owlshift_runner::on_demand`, `park`). A ticket that asked questions
-    /// would have a ticket ref, so `continue` restarts it; one that never
-    /// asked runs again with `do`. A failed write fails the scenario.
+    /// or kept a decision would have a ticket ref, so `continue` restarts
+    /// it; one with neither runs again with `do`. A failed write fails the
+    /// scenario.
     fn post_parked(
         &self,
         reason: ParkReason,
@@ -565,7 +569,7 @@ impl Driver {
             detail,
             round: NonZeroU32::new(self.state.round()).filter(|_| reason == ParkReason::Reasks),
             open,
-            restart: if self.asks.is_empty() {
+            restart: if self.questions.asks.is_empty() && self.questions.decisions.is_empty() {
                 Restart::Do
             } else {
                 Restart::Continue
@@ -636,7 +640,9 @@ impl Driver {
         Ok(Some(event))
     }
 
-    /// Posts the QUESTIONS comment of a round just opened, and keeps the ask.
+    /// Posts the QUESTIONS comment of a round just opened, and keeps the ask
+    /// with its comment and its decider, the ticket's assignee: the bench
+    /// resolves no zone owner.
     fn post_round(
         &mut self,
         result: &RunResult,
@@ -655,14 +661,25 @@ impl Driver {
             fallback,
         }
         .render();
-        let at = self.post(&body)?;
-        self.asks.push(ThreadEntry::Questions {
+        let account = self
+            .tracker
+            .ticket(&self.id)
+            .map_err(|e| e.to_string())?
+            .assignee
+            .ok_or("the ticket has no assignee to act as its decider")?;
+        let posted = self.post(&body)?;
+        self.questions.asks.push(Ask {
+            kind: AskKind::Questions,
             round,
-            at,
+            at: posted.at,
+            comment: posted.id,
             questions,
+            decider: AskDecider {
+                account,
+                by: DeciderRule::Assignee,
+            },
+            verdicts: Vec::new(),
         });
-        self.verdicts.push(Vec::new());
-        self.answers_since = Some(at);
         self.show_after(Event::Questions)
     }
 
@@ -702,9 +719,10 @@ impl Driver {
                         run: None,
                     }
                     .render();
-                    let at = self.post(&body)?;
-                    self.decisions.push(ThreadEntry::Decision {
-                        at,
+                    let posted = self.post(&body)?;
+                    self.questions.decisions.push(KeptDecision {
+                        at: posted.at,
+                        comment: posted.id,
                         question: question.clone(),
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
@@ -740,12 +758,12 @@ impl Driver {
         let report = self.execute(Role::AnswerCheck, reply)?;
         let (event, result) = answer_check::event(&report.outcome);
         let result = result.cloned();
-        // A check with verdicts keeps them with the ask they judge.
+        // A check with verdicts keeps what it read and its verdicts, as
+        // `owlshift continue` does.
         if let (Event::Answered | Event::Incomplete | Event::CounterQuestion, Some(result)) =
             (event, &result)
-            && let Some(kept) = self.verdicts.last_mut()
         {
-            kept.clone_from(&result.verdicts);
+            self.questions.keep_check(read_through, &result.verdicts);
         }
 
         let parked = self.apply(event)?;
@@ -763,26 +781,10 @@ impl Driver {
             (Event::Answered, _) => {
                 let round =
                     NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
-                let understood =
-                    answer_check::understood(self.asks.iter().zip(&self.verdicts).filter_map(
-                        |(ask, verdicts)| match ask {
-                            ThreadEntry::Questions {
-                                round: asked,
-                                questions,
-                                ..
-                            }
-                            | ThreadEntry::Reask {
-                                round: asked,
-                                questions,
-                                ..
-                            } if *asked == round => Some((&questions[..], &verdicts[..])),
-                            _ => None,
-                        },
-                    ));
                 let body = ResumeComment {
                     ticket: self.id.clone(),
                     round,
-                    understood,
+                    understood: answer_check::understood(self.questions.round_asks(round)),
                 }
                 .render();
                 self.post(&body)?;
@@ -803,15 +805,24 @@ impl Driver {
                     open,
                 }
                 .render();
-                let at = self.post(&body)?;
+                // A re-ask keeps its round's decider.
+                let decider = self
+                    .questions
+                    .latest()
+                    .ok_or("no ask to ask again")?
+                    .decider
+                    .clone();
+                let posted = self.post(&body)?;
                 self.show_after(Event::Incomplete)?;
-                self.asks.push(ThreadEntry::Reask {
+                self.questions.asks.push(Ask {
+                    kind: AskKind::Reask,
                     round,
-                    at,
+                    at: posted.at,
+                    comment: posted.id,
                     questions,
+                    decider,
+                    verdicts: Vec::new(),
                 });
-                self.verdicts.push(Vec::new());
-                self.answers_since = Some(at);
             }
             // A REPLY answers each counter-question; the ticket keeps
             // waiting for the decider.
@@ -827,54 +838,55 @@ impl Driver {
                     replies,
                 }
                 .render();
+                // The next answer is a decider comment newer than the ones
+                // this check read (kept above), never measured against the
+                // REPLY, which is Owlshift's own.
                 self.post(&body)?;
-                // As `answer_check::new_answer`: the next answer is a
-                // decider comment newer than the ones this check read, never
-                // measured against the REPLY, which is Owlshift's own.
-                self.answers_since = Some(read_through);
             }
             _ => {}
         }
         Ok(event)
     }
 
-    /// The answer check runs when answers arrive: a comment of the decider
-    /// after the latest ask, or after the newest decider comment the last
-    /// check that found a counter-question read. A failed or interrupted
-    /// check moves nothing, so it is retried on the same answers. As in
-    /// `answer_check::new_answer`, only the tracker's times are compared,
-    /// and they order the comments of one second (OWL-136). Returns the
-    /// newest decider comment's time: what this check reads through.
-    fn require_new_answer(&self) -> Result<Timestamp, String> {
-        let since = self
-            .answers_since
-            .ok_or("no question waits for an answer")?;
-        let decider = self
-            .tracker
-            .ticket(&self.id)
-            .map_err(|e| e.to_string())?
-            .assignee
-            .ok_or("the ticket has no assignee to act as its decider")?;
-        let comments = self.tracker.comments(&self.id).map_err(|e| e.to_string())?;
-        let newest = comments
-            .iter()
-            .filter(|c| c.author == decider)
-            .map(|c| c.at)
-            .max();
-        match newest {
-            Some(newest) if newest > since => Ok(newest),
-            _ => Err(format!(
+    /// The answer check runs once answers arrive, as `owlshift continue`
+    /// decides it (`answer_check::readiness`): a comment of the latest ask's
+    /// decider newer than that ask and than what the last check with
+    /// verdicts read. There is no quiet window: a scenario plays each answer
+    /// step by hand. A failed or interrupted check keeps nothing, so it is
+    /// retried on the same answers. Returns what this check reads through,
+    /// the newest last edit among the decider's comments.
+    fn require_new_answer(&self) -> Result<Option<Timestamp>, String> {
+        let waiting = "no question waits for an answer";
+        // A Markdown account's identifier is its name.
+        let account = &self.questions.latest().ok_or(waiting)?.decider.account;
+        let decider = Person {
+            id: account.clone(),
+            name: account.clone(),
+        };
+        let comments = Tracker::comments(&self.tracker, &self.id).map_err(|e| e.to_string())?;
+        match answer_check::readiness(
+            &comments,
+            &decider,
+            &self.questions,
+            self.now,
+            Duration::ZERO,
+        ) {
+            None => Err(waiting.to_owned()),
+            Some(Readiness::Waiting { since }) => Err(format!(
                 "no comment from the decider since {since}: the answer check runs once answers arrive"
             )),
+            Some(Readiness::Settling { counts_at }) => Err(format!(
+                "the decider's reply counts at {counts_at}, with no quiet window"
+            )),
+            Some(Readiness::Counts) => Ok(answer_check::newest_decider_edit(&comments, &decider)),
         }
     }
 
-    /// Posts a comment of the runner's own at the step's time; returns the
-    /// time the tracker recorded.
-    fn post(&self, body: &str) -> Result<Timestamp, String> {
+    /// Posts a comment of the runner's own at the step's time; returns it as
+    /// the tracker recorded it.
+    fn post(&self, body: &str) -> Result<markdown::Comment, String> {
         self.tracker
             .post_comment(&self.id, OWLSHIFT_AUTHOR, self.now, body)
-            .map(|comment| comment.at)
             .map_err(|e| e.to_string())
     }
 
@@ -930,68 +942,41 @@ impl Driver {
         self.tmp.path().join("worktrees").join(self.id.as_str())
     }
 
+    /// The brief of a run of `role`. The ticket and its thread read as
+    /// `owlshift do` and `continue` read them (`owlshift_runner::on_demand`,
+    /// `account_author` and `thread`): the ticket's assignee is the current
+    /// decider, and the brief's decider is the latest ask's, the one in
+    /// force at the end of the thread.
     fn brief(&self, role: Role) -> Result<Brief, String> {
-        let ticket = self.tracker.ticket(&self.id).map_err(|e| e.to_string())?;
-        let decider = ticket
+        let ticket = Tracker::ticket(&self.tracker, &self.id).map_err(|e| e.to_string())?;
+        let current = ticket
             .assignee
             .clone()
             .ok_or("the ticket has no assignee to act as its decider")?;
-        let author = |name: String| Author {
-            relation: if name == OWLSHIFT_AUTHOR {
-                Relation::Owlshift
-            } else if name == decider {
-                Relation::Decider
-            } else {
-                Relation::Other
-            },
-            name,
-        };
-        // Each ask and each decision takes the place of the comment the
-        // driver posted it in, in the tracker's order; every other comment,
-        // one that only looks like the driver's included, stays one.
-        let mut asks = self.asks.iter();
-        let mut decisions = self.decisions.iter();
-        let mut thread = Vec::new();
-        for comment in self.tracker.comments(&self.id).map_err(|e| e.to_string())? {
-            let kind = marker(&comment.body).filter(|_| comment.author == OWLSHIFT_AUTHOR);
-            if matches!(kind, Some(MarkerKind::Questions | MarkerKind::ReAsk)) {
-                let ask = asks
-                    .next()
-                    .ok_or_else(|| format!("no ask recorded for the comment at {}", comment.at))?;
-                thread.push(ask.clone());
-            } else if kind == Some(MarkerKind::Decision) {
-                let decision = decisions.next().ok_or_else(|| {
-                    format!("no decision recorded for the comment at {}", comment.at)
-                })?;
-                thread.push(decision.clone());
-            } else {
-                thread.push(ThreadEntry::Comment {
-                    at: comment.at,
-                    author: author(comment.author),
-                    body: comment.body,
-                });
-            }
-        }
-        if asks.next().is_some() {
-            return Err("an ask was recorded without its comment".to_owned());
-        }
-        if decisions.next().is_some() {
-            return Err("a decision was recorded without its comment".to_owned());
-        }
+        let comments = Tracker::comments(&self.tracker, &self.id).map_err(|e| e.to_string())?;
+        let decider = self
+            .questions
+            .latest()
+            .map_or_else(|| current.name.clone(), |ask| ask.decider.account.clone());
         Ok(Brief {
             format: Format,
             role,
             project: self.scenario.clone(),
             ticket: TicketBrief {
                 id: self.id.clone(),
+                author: account_author(&ticket.author, &current),
                 title: ticket.title,
                 url: None,
                 labels: ticket.labels.clone(),
-                author: author(ticket.author),
                 description: ticket.description,
             },
-            decider: decider.clone(),
-            thread,
+            decider,
+            thread: thread(
+                &comments,
+                &self.questions.asks,
+                &self.questions.decisions,
+                &current,
+            ),
             resolve: if role == Role::Resolver {
                 resolver::unlabelled(&self.resolving)
             } else {
@@ -1146,6 +1131,27 @@ impl Driver {
                 .collect();
             same("brief_thread", names(expected), names(&found))?;
         }
+        if let Some(expected) = &expect.brief_entries {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            let found: Vec<String> = brief
+                .thread
+                .iter()
+                .map(|entry| match entry {
+                    ThreadEntry::Comment { author, .. } => name(&author.relation),
+                    ThreadEntry::Questions { .. } => "questions".to_owned(),
+                    ThreadEntry::Reask { .. } => "reask".to_owned(),
+                    ThreadEntry::Decision { .. } => "decision".to_owned(),
+                })
+                .collect();
+            same(
+                "brief_entries",
+                format!("{expected:?}"),
+                format!("{found:?}"),
+            )?;
+        }
         if let Some(expected) = &expect.brief_latest_ask {
             let brief = self
                 .last_brief
@@ -1255,15 +1261,6 @@ impl Driver {
                 log(&report.stderr_log)
             )
         })
-    }
-}
-
-/// Whether a comment is a QUESTIONS or a RE-ASK comment.
-/// The kind of a marked comment, `None` for any other.
-fn marker(body: &str) -> Option<MarkerKind> {
-    match MarkedComment::parse(body) {
-        Ok(Some(MarkedComment { header, .. })) => Some(header.kind),
-        _ => None,
     }
 }
 
