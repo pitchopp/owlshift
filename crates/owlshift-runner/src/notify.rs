@@ -67,8 +67,10 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// and its message in the terminal says what to do. A comment that asks a
 /// person to act and is on the ticket does, even when keeping the state
 /// failed after it ([`Stop::NotKept`]): the line says so, since the next run
-/// may post that comment again. The decision and the resume comments ask
-/// nothing of anyone, so a failure to keep their state stays a refusal.
+/// may post that comment again. So does a park whose PARKED comment could
+/// not be posted either ([`Landed::ParkedUnposted`]): a park waits for a
+/// person, whatever reached the ticket. The decision and the resume comments
+/// ask nothing of anyone, so a failure to keep their state stays a refusal.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
     Some(match stop {
         Stop::NeedsInput { status, posted, .. } => match (status, posted) {
@@ -92,16 +94,22 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         }
         Stop::Parked { .. } => format!("{ticket} is parked: a person must look"),
         Stop::NotKept { landed, .. } => {
-            let what = match landed {
-                Landed::Questions => "questions wait for an answer on the ticket",
-                Landed::PremiseFalse => {
-                    "the run found the ticket's premise false; a decision waits on the ticket"
-                }
-                Landed::Reask => "questions were asked again on the ticket",
-                Landed::Reply => "the decider's question has a reply on the ticket",
-                Landed::Parked => "the ticket is parked: a person must look",
+            const NOT_KEPT: &str = "Owlshift's state was not kept";
+            let (what, lost) = match landed {
+                Landed::Questions => ("questions wait for an answer on the ticket", NOT_KEPT),
+                Landed::PremiseFalse => (
+                    "the run found the ticket's premise false; a decision waits on the ticket",
+                    NOT_KEPT,
+                ),
+                Landed::Reask => ("questions were asked again on the ticket", NOT_KEPT),
+                Landed::Reply => ("the decider's question has a reply on the ticket", NOT_KEPT),
+                Landed::Parked => ("the ticket is parked: a person must look", NOT_KEPT),
+                Landed::ParkedUnposted => (
+                    "the ticket is parked: a person must look",
+                    "its PARKED comment was not posted and Owlshift's state was not kept",
+                ),
             };
-            format!("{ticket}: {what}, but Owlshift's state was not kept; see the terminal")
+            format!("{ticket}: {what}, but {lost}; see the terminal")
         }
         Stop::UsageLimit { resets_at } => match resets_at {
             Some(at) => {
@@ -480,6 +488,11 @@ mod tests {
                 not_kept(Landed::Parked),
                 "OWL-7: the ticket is parked: a person must look, but Owlshift's state was not \
                  kept; see the terminal",
+            ),
+            (
+                not_kept(Landed::ParkedUnposted),
+                "OWL-7: the ticket is parked: a person must look, but its PARKED comment was not \
+                 posted and Owlshift's state was not kept; see the terminal",
             ),
             (
                 Stop::UsageLimit {

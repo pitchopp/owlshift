@@ -3128,6 +3128,67 @@ fn a_comment_on_the_ticket_whose_state_is_not_kept_is_a_stop_that_notifies() {
     );
 }
 
+/// OWL-159: a park whose state is not kept (the ticket's ref is locked) and
+/// whose PARKED comment and stage the tracker refuses still notifies: the
+/// run parked the ticket, which waits for a person whatever reached it.
+#[test]
+fn a_park_neither_kept_nor_posted_is_a_stop_that_notifies() {
+    let partial = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "partial", "The ending is missing."),
+    ]);
+    let only_q2 = check(&[("Q2", "partial", "The ending is missing.")]);
+    let bench = Bench::parking();
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    let mut outcome = None;
+    for n in 0..4 {
+        bench.answer(&format!("Q2: answer {n}.\n"));
+        let mut during = Vec::new();
+        if n == 3 {
+            during.push(bench.lock_ticket_ref_during(1));
+            bench.refuse.set(Some("[owlshift] PARKED"));
+            bench.refuse_stage.set(true);
+        }
+        let result = if n == 0 { &partial } else { &only_q2 };
+        let (stop, _) = bench.continue_during(vec![bench.reply(None, Some(result))], during);
+        outcome = Some(stop);
+    }
+    let Some(Err(
+        stop @ Stop::NotKept {
+            landed: Landed::ParkedUnposted,
+            ..
+        },
+    )) = &outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    let message = stop.to_string();
+    assert!(message.contains("but keeping"), "{message}");
+    assert!(
+        message.contains("the PARKED comment could not be posted"),
+        "{message}"
+    );
+    // Nothing reached the ticket, and the ref still waits for answers.
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|comment| comment.starts_with("[owlshift] PARKED")),
+        "{:?}",
+        bench.comments()
+    );
+    let refused = data_of(&bench.events(), EventKind::Warning, "stage");
+    assert_eq!(refused.last().unwrap()["stage"], "parked");
+    assert_eq!(bench.record().state.waiting, Some(Waiting::NeedsInput));
+    let line = owlshift_runner::notify::blocker_line(&ticket(), stop);
+    assert!(
+        line.as_deref()
+            .is_some_and(|line| line.contains("its PARKED comment was not posted")),
+        "{line:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // OWL-158: watch and a comment whose state is not kept.
 // ---------------------------------------------------------------------------

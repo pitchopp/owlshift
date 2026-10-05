@@ -82,8 +82,9 @@ pub enum Admit {
 pub enum Until {
     /// [`RETRY_AFTER`] past the continue.
     At(Timestamp),
-    /// No end: the continue left a comment on the ticket whose state was not
-    /// kept ([`Stop::NotKept`]), which asks a person to act (OWL-158).
+    /// No end: the continue left a comment on the ticket, or a park whose
+    /// comment could not be posted, whose state was not kept
+    /// ([`Stop::NotKept`]), which asks a person to act (OWL-158, OWL-159).
     Person,
 }
 
@@ -131,10 +132,10 @@ impl Holds {
     /// unreadable), at `now`. Returns the hold or the pause it set, if any.
     ///
     /// A busy project ran nothing: no hold. A usage limit with a reset time
-    /// pauses every continue until then. A comment whose state was not kept
-    /// ([`Stop::NotKept`]) holds the ticket until a person acts, unless the
-    /// ref was read moved: an unreadable ref is no reason to post the comment
-    /// again. Otherwise a ticket ref left as it was holds the ticket for
+    /// pauses every continue until then. A comment, or a park whose comment
+    /// could not be posted, whose state was not kept ([`Stop::NotKept`])
+    /// holds the ticket until a person acts, unless the ref was read moved:
+    /// an unreadable ref is no reason to post the comment or park again. Otherwise a ticket ref left as it was holds the ticket for
     /// [`RETRY_AFTER`]; one that moved is progress, which the next pass reads.
     /// No other way to stop is told apart, so a way added later is held
     /// exactly when it leaves the ref as it was.
@@ -381,7 +382,7 @@ impl Watch<'_> {
             }) => self.line(
                 out,
                 &format!(
-                    "a comment on {ticket} asks a person to act, but its state was not kept: \
+                    "{ticket} waits for a person to act, but its state was not kept: \
                      watch continues it again only once its decider edits a comment or a \
                      command moves its ticket ref"
                 ),
@@ -592,7 +593,12 @@ mod tests {
             until: Until::Person,
         });
         let mut holds = Holds::default();
-        for landed in [Landed::Reask, Landed::Reply, Landed::Parked] {
+        for landed in [
+            Landed::Reask,
+            Landed::Reply,
+            Landed::Parked,
+            Landed::ParkedUnposted,
+        ] {
             for commit in [Some("c1"), None] {
                 let outcome = not_kept(landed);
                 assert_eq!(
