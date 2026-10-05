@@ -2176,7 +2176,7 @@ impl OnDemand<'_> {
     }
 }
 
-/// A brief's thread: each comment as [`comment_author`] marks it, but for
+/// A brief's thread: each comment as `comment_author` marks it, but for
 /// the runner's own comments that posted an ask or a decision, whose place
 /// the ask takes as a `questions` or `reask` entry, and the decision as a
 /// `decision` entry, both built from the ticket ref's record. Any other
