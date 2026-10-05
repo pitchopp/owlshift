@@ -24,7 +24,9 @@
 //!
 //! QUESTIONS, RE-ASK and REPLY wait for the decider: a Writer made
 //! [`Writer::mentioning`] them adds a line that mentions them, so the
-//! tracker notifies them (OWL-157).
+//! tracker notifies them (OWL-157). A mention the tracker has but could not
+//! give is left out, and the comment returned as [`Posted`] says so, for
+//! the runner to report it (OWL-170).
 //!
 //! And the ticket's visible stage ([`VisibleStage`], [`Writer::set_stage`]):
 //! working while a Build runs, needs input while questions wait, review once
@@ -933,8 +935,9 @@ impl<'a> Writer<'a> {
     /// that wait for them: QUESTIONS, RE-ASK and REPLY (OWL-157). Right after
     /// the header, a `Waiting for <mention>` line names them in the
     /// tracker's own way, so a tracker that notifies on a mention tells them
-    /// even when they do not follow the ticket. A tracker with no mention,
-    /// or one it could not read, gets the comment as rendered.
+    /// even when they do not follow the ticket. A tracker with no mention
+    /// gets the comment as rendered; one that could not give the mention
+    /// too, and the [`Posted`] comment says why it was left out.
     pub fn mentioning(mut self, decider: &str) -> Self {
         self.decider = Some(decider.to_owned());
         self
@@ -1058,8 +1061,8 @@ impl<'a> Writer<'a> {
 
     /// Posts a round's QUESTIONS comment and returns it as the tracker
     /// recorded it: its id and time are what the ticket ref keeps of the ask.
-    pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Comment, WriteError> {
-        self.post(&comment.ticket, &self.waiting(comment.render()))
+    pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Posted, WriteError> {
+        self.post_waiting(&comment.ticket, comment.render())
     }
 
     /// Posts a DECISION comment and returns it as the tracker recorded it:
@@ -1069,13 +1072,13 @@ impl<'a> Writer<'a> {
     }
 
     /// Posts a RE-ASK comment and returns it as the tracker recorded it.
-    pub fn post_reask(&self, comment: &ReaskComment) -> Result<Comment, WriteError> {
-        self.post(&comment.ticket, &self.waiting(comment.render()))
+    pub fn post_reask(&self, comment: &ReaskComment) -> Result<Posted, WriteError> {
+        self.post_waiting(&comment.ticket, comment.render())
     }
 
     /// Posts a REPLY comment and returns it as the tracker recorded it.
-    pub fn post_reply(&self, comment: &ReplyComment) -> Result<Comment, WriteError> {
-        self.post(&comment.ticket, &self.waiting(comment.render()))
+    pub fn post_reply(&self, comment: &ReplyComment) -> Result<Posted, WriteError> {
+        self.post_waiting(&comment.ticket, comment.render())
     }
 
     /// Posts a RESUME comment and returns it as the tracker recorded it.
@@ -1112,20 +1115,35 @@ impl<'a> Writer<'a> {
             .map_err(WriteError::Tracker)
     }
 
-    /// `body`, a marked comment, with the line naming whom it waits for as
-    /// its second section, when there is someone the tracker can mention.
-    /// The tracker is asked at each post: a few times a ticket.
-    fn waiting(&self, body: String) -> String {
-        let mention = self
-            .decider
-            .as_deref()
-            .and_then(|account| self.tracker.mention(account));
-        match (mention, body.split_once("\n\n")) {
+    /// Posts `body`, a marked comment that waits for the decider, with the
+    /// line naming them as its second section when the tracker can mention
+    /// them. The tracker is asked at each post: a few times a ticket. A
+    /// mention it could not give is left out, and said in the result.
+    fn post_waiting(&self, ticket: &TicketId, body: String) -> Result<Posted, WriteError> {
+        let (mention, mention_dropped) = match self.decider.as_deref() {
+            None => (None, None),
+            Some(account) => match self.tracker.mention(account) {
+                Ok(mention) => (mention, None),
+                Err(reason) => (
+                    None,
+                    Some(MentionDropped {
+                        account: account.to_owned(),
+                        reason,
+                    }),
+                ),
+            },
+        };
+        let body = match (mention, body.split_once("\n\n")) {
             (Some(mention), Some((header, rest))) => {
                 format!("{header}\n\nWaiting for {mention}\n\n{rest}")
             }
             _ => body,
-        }
+        };
+        let comment = self.post(ticket, &body)?;
+        Ok(Posted {
+            comment,
+            mention_dropped,
+        })
     }
 }
 
@@ -1136,6 +1154,25 @@ fn is_delivery(body: &str) -> bool {
         MarkedComment::parse(body),
         Ok(Some(MarkedComment { header, .. })) if header.kind == MarkerKind::Delivery
     )
+}
+
+/// A comment that waits for a person, as the tracker recorded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Posted {
+    pub comment: Comment,
+    /// The decider's mention, when the tracker has one but could not give
+    /// it: the comment went without it, so the tracker may not notify them
+    /// (OWL-170).
+    pub mention_dropped: Option<MentionDropped>,
+}
+
+/// A mention left out of a comment that waits for a person.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionDropped {
+    /// The account the comment waits for.
+    pub account: String,
+    /// Why the tracker could not give its mention.
+    pub reason: TrackerError,
 }
 
 /// The ticket's pull request, and whether this call opened it.
@@ -1811,14 +1848,18 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         let tracker = FakeTracker::default();
         let writer = Writer::new(&tracker);
         let posted = writer.post_questions(&comment).unwrap();
-        assert_eq!(posted.body, body);
+        assert_eq!(posted.comment.body, body);
+        assert_eq!(posted.mention_dropped, None);
         let reask = ReaskComment {
             ticket: ticket(),
             round: NonZeroU32::new(2).unwrap(),
             reask: 1,
             open: Vec::new(),
         };
-        assert_eq!(writer.post_reask(&reask).unwrap().body, reask.render());
+        assert_eq!(
+            writer.post_reask(&reask).unwrap().comment.body,
+            reask.render()
+        );
         let resume = ResumeComment {
             ticket: ticket(),
             round: NonZeroU32::new(2).unwrap(),
@@ -1882,15 +1923,21 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             Ok(())
         }
 
-        /// Any account but `nobody`, which it cannot mention.
-        fn mention(&self, account: &str) -> Option<String> {
-            (account != "nobody").then(|| format!("<mention of {account}>"))
+        /// Any account but `nobody`, whose mention it cannot read, and
+        /// `ghost`, which it has none for.
+        fn mention(&self, account: &str) -> Result<Option<String>, TrackerError> {
+            match account {
+                "nobody" => Err(TrackerError::new(TrackerErrorKind::Other, "profile unread")),
+                "ghost" => Ok(None),
+                _ => Ok(Some(format!("<mention of {account}>"))),
+            }
         }
     }
 
     /// The comments that wait for the decider mention them right after the
     /// header (OWL-157), and stay marked comments; the others never do; and
-    /// a mention the tracker cannot give leaves the body as rendered.
+    /// a mention the tracker cannot give leaves the body as rendered, said
+    /// in the result when the tracker has mentions (OWL-170).
     #[test]
     fn the_comments_that_wait_for_the_decider_mention_them() {
         let tracker = FakeTracker::default();
@@ -1929,7 +1976,9 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             (writer.post_reply(&reply), MarkerKind::Reply),
         ];
         for (posted, kind) in waiting {
-            let body = posted.unwrap().body;
+            let posted = posted.unwrap();
+            assert_eq!(posted.mention_dropped, None);
+            let body = posted.comment.body;
             let (_, rest) = body.split_once("\n\n").unwrap();
             assert!(
                 rest.starts_with("Waiting for <mention of u1>\n\n"),
@@ -1972,10 +2021,24 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             delivery.render()
         );
 
-        let unmentioned = Writer::new(&tracker).mentioning("nobody");
+        let unread = Writer::new(&tracker).mentioning("nobody");
+        let dropped = [
+            (unread.post_questions(&questions), questions.render()),
+            (unread.post_reask(&reask), reask.render()),
+            (unread.post_reply(&reply), reply.render()),
+        ];
+        for (posted, rendered) in dropped {
+            let posted = posted.unwrap();
+            assert_eq!(posted.comment.body, rendered);
+            let dropped = posted.mention_dropped.expect("the drop is said");
+            assert_eq!(dropped.account, "nobody");
+            assert_eq!(dropped.reason.message, "profile unread");
+        }
+        let unmentionable = Writer::new(&tracker).mentioning("ghost");
+        let posted = unmentionable.post_questions(&questions).unwrap();
         assert_eq!(
-            unmentioned.post_questions(&questions).unwrap().body,
-            questions.render()
+            (posted.comment.body, posted.mention_dropped),
+            (questions.render(), None)
         );
     }
 

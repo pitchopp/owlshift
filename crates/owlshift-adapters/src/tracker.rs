@@ -48,10 +48,14 @@ pub trait Tracker {
 
     /// The text that, written in a comment, makes the tracker notify the
     /// account `account` (OWL-157): on Linear, the person's profile link.
-    /// `None` when the tracker has no such text, and when it could not be
-    /// read: the comment still goes, without it.
-    fn mention(&self, _account: &str) -> Option<String> {
-        None
+    /// `Ok(None)` when the tracker has no such text. An error when it has
+    /// one but could not give this account's: the comment still goes
+    /// without it, and the runner reports it (OWL-170). Unlike a missing
+    /// [`ticket_url`](Self::ticket_url), which only loses a convenience, a
+    /// missing mention loses the tracker's notification to the person, so
+    /// the operator must be able to tell.
+    fn mention(&self, _account: &str) -> Result<Option<String>, Error> {
+        Ok(None)
     }
 }
 

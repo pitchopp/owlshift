@@ -95,8 +95,8 @@ use crate::resolver::{self, Fallback, Resolved};
 use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
-    DecisionComment, DeliveryReport, Gate, ParkedComment, QuestionsComment, ReaskComment,
-    ReplyComment, Restart, ResumeComment, VisibleStage, Writer, park_reason,
+    DecisionComment, DeliveryReport, Gate, MentionDropped, ParkedComment, Posted, QuestionsComment,
+    ReaskComment, ReplyComment, Restart, ResumeComment, VisibleStage, Writer, park_reason,
 };
 
 /// How long one Build run may take before its process tree is stopped.
@@ -1169,7 +1169,10 @@ impl OnDemand<'_> {
             fallback: left.fallback,
         };
         let writer = Writer::new(self.tracker).mentioning(&decider.account);
-        let posted = match writer.post_questions(&comment) {
+        let Posted {
+            comment: posted,
+            mention_dropped,
+        } = match writer.post_questions(&comment) {
             Ok(posted) => posted,
             Err(error) => return stop(Err(format!("posting them failed: {error}"))),
         };
@@ -1179,6 +1182,14 @@ impl OnDemand<'_> {
             EventKind::TrackerWrite,
             comment_written("QUESTIONS", &posted),
         );
+        if let Some(dropped) = &mention_dropped {
+            sink.emit(
+                &ticket,
+                Some(run),
+                EventKind::Warning,
+                dropped_mention("QUESTIONS", &posted, dropped),
+            );
+        }
         // The questions are on the ticket: it waits for the decider, even if
         // keeping them below fails.
         self.show_after(&ticket, Some(run), Event::Questions, sink);
@@ -1536,7 +1547,10 @@ impl OnDemand<'_> {
                     reask: next.reasks(),
                     open: open.clone(),
                 };
-                let posted = Writer::new(self.tracker)
+                let Posted {
+                    comment: posted,
+                    mention_dropped,
+                } = Writer::new(self.tracker)
                     .mentioning(&asked.account)
                     .post_reask(&reask)
                     .map_err(|e| refused("posting the re-ask on the ticket", e))?;
@@ -1546,6 +1560,14 @@ impl OnDemand<'_> {
                     EventKind::TrackerWrite,
                     comment_written("RE-ASK", &posted),
                 );
+                if let Some(dropped) = &mention_dropped {
+                    sink.emit(
+                        &ticket,
+                        Some(&ran.run),
+                        EventKind::Warning,
+                        dropped_mention("RE-ASK", &posted, dropped),
+                    );
+                }
                 // Already at needs input, unless a person moved it meanwhile.
                 self.show_after(&ticket, Some(&ran.run), Event::Incomplete, sink);
                 questions.asks.push(Ask {
@@ -1595,7 +1617,10 @@ impl OnDemand<'_> {
                     ticket: ticket.clone(),
                     replies,
                 };
-                let posted = Writer::new(self.tracker)
+                let Posted {
+                    comment: posted,
+                    mention_dropped,
+                } = Writer::new(self.tracker)
                     .mentioning(&asked.account)
                     .post_reply(&reply)
                     .map_err(|e| refused("posting the reply on the ticket", e))?;
@@ -1605,6 +1630,14 @@ impl OnDemand<'_> {
                     EventKind::TrackerWrite,
                     comment_written("REPLY", &posted),
                 );
+                if let Some(dropped) = &mention_dropped {
+                    sink.emit(
+                        &ticket,
+                        Some(&ran.run),
+                        EventKind::Warning,
+                        dropped_mention("REPLY", &posted, dropped),
+                    );
+                }
                 self.store(p, &next, questions).map_err(|e| Stop::NotKept {
                     landed: Landed::Reply,
                     message: format!(
@@ -2360,6 +2393,19 @@ fn comment_written(kind: &str, comment: &Comment) -> Data {
         ("action", json!("comment")),
         ("kind", json!(kind)),
         ("comment", json!(comment.id)),
+    ])
+}
+
+/// The `warning` for a comment that waits for `dropped.account` but went
+/// without their mention (OWL-170): the tracker may not notify them, so the
+/// operator may have to.
+fn dropped_mention(kind: &str, comment: &Comment, dropped: &MentionDropped) -> Data {
+    data([
+        ("what", json!("mention_dropped")),
+        ("kind", json!(kind)),
+        ("comment", json!(comment.id)),
+        ("account", json!(dropped.account)),
+        ("reason", json!(dropped.reason.to_string())),
     ])
 }
 

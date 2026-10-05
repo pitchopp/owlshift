@@ -221,6 +221,9 @@ struct Clocked<'a> {
     refuse: &'a Cell<Option<&'static str>>,
     /// Every stage write is refused.
     refuse_stage: bool,
+    /// Every mention is unreadable, as a Linear profile link that cannot be
+    /// read.
+    refuse_mention: bool,
     /// How many of the next comment reads fail, as a tracker that is down.
     fail_reads: &'a Cell<u32>,
 }
@@ -283,8 +286,14 @@ impl Tracker for Clocked<'_> {
     }
 
     /// A tracker that notifies on a mention, as Linear does (OWL-157).
-    fn mention(&self, account: &str) -> Option<String> {
-        Some(format!("@{account}"))
+    fn mention(&self, account: &str) -> Result<Option<String>, tracker::Error> {
+        if self.refuse_mention {
+            return Err(tracker::Error::new(
+                tracker::ErrorKind::Other,
+                "the profile link could not be read",
+            ));
+        }
+        Ok(Some(format!("@{account}")))
     }
 }
 
@@ -302,6 +311,8 @@ struct Bench {
     refuse: Cell<Option<&'static str>>,
     /// The tracker refuses every stage write.
     refuse_stage: Cell<bool>,
+    /// The tracker cannot give any mention.
+    refuse_mention: Cell<bool>,
     /// How many of the next comment reads the tracker refuses.
     fail_reads: Cell<u32>,
     /// How long after the time of the next comment `continue` reads this
@@ -397,6 +408,7 @@ impl Bench {
             clock: Rc::new(Cell::new("2026-10-02T09:00:00Z".parse().unwrap())),
             refuse: Cell::new(None),
             refuse_stage: Cell::new(false),
+            refuse_mention: Cell::new(false),
             fail_reads: Cell::new(0),
             waited: Cell::new(SignedDuration::from_mins(10)),
         }
@@ -661,6 +673,7 @@ impl Bench {
             clock: &self.clock,
             refuse: &self.refuse,
             refuse_stage: self.refuse_stage.get(),
+            refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
         };
         let forge =
@@ -2120,6 +2133,52 @@ fn a_comment_after_the_integrating_run_stops_in_needs_input() {
     assert_eq!(bench.remote_branch(), None);
     assert!(bench.github.created.lock().unwrap().is_empty());
     assert_eq!(bench.stage(), "Needs Input");
+}
+
+/// A mention the tracker cannot give leaves the decider's QUESTIONS without
+/// it, and the run goes on: the round is posted and kept, and a `warning`
+/// right after its write, printed on the command's output, tells the
+/// operator the tracker may not notify the decider (OWL-170).
+#[test]
+fn a_mention_the_tracker_cannot_give_is_reported() {
+    let bench = Bench::new(true);
+    bench.refuse_mention.set(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    assert_eq!(bench.record().questions.asks.len(), 1);
+    let comments = bench.comments();
+    assert!(!comments[0].contains("Waiting for"), "{}", comments[0]);
+
+    let events = bench.events();
+    let written = events
+        .iter()
+        .position(|e| {
+            e.kind == EventKind::TrackerWrite
+                && e.data.get("kind").is_some_and(|k| k == "QUESTIONS")
+        })
+        .expect("the questions were written");
+    let warning = &events[written + 1];
+    assert_eq!(warning.kind, EventKind::Warning, "{events:?}");
+    assert_eq!(warning.data["what"], "mention_dropped");
+    assert_eq!(warning.data["kind"], "QUESTIONS");
+    assert_eq!(warning.data["comment"], events[written].data["comment"]);
+    assert_eq!(warning.data["account"], "maintainer");
+    assert!(
+        warning.data["reason"]
+            .as_str()
+            .unwrap()
+            .contains("the profile link could not be read"),
+        "{warning:?}"
+    );
+    let dropped = events
+        .iter()
+        .filter(|e| e.data.get("what").is_some_and(|w| w == "mention_dropped"))
+        .count();
+    assert_eq!(dropped, 1, "{events:?}");
+    assert!(printed.contains("what=mention_dropped"), "{printed}");
 }
 
 /// A tracker that refuses every stage write stops nothing: the round is

@@ -470,11 +470,16 @@ impl Tracker for LinearTracker {
     /// The account's profile link (`User.url`), which Linear turns into a
     /// mention of them (checked 2026-10-04, OWL-157). Read each time, a few
     /// times a ticket: a person may rename their profile while `watch`
-    /// runs. Left out when it cannot be read, or is not a plain
-    /// `https://linear.app/` link that Markdown would leave whole.
-    fn mention(&self, account: &str) -> Option<String> {
-        let data: UserData = self.call(USER_QUERY, json!({ "id": account })).ok()?;
-        profile_link(&data.user.url)
+    /// runs. An error when it cannot be read, or is not a plain
+    /// `https://linear.app/` link that Markdown would leave whole: the
+    /// comment then goes without it, and the runner says so (OWL-170).
+    fn mention(&self, account: &str) -> Result<Option<String>, Error> {
+        let data: UserData = self.call(USER_QUERY, json!({ "id": account }))?;
+        profile_link(&data.user.url).map(Some).ok_or_else(|| {
+            invalid(format!(
+                "the profile link of account {account} is not a plain https://linear.app/ link"
+            ))
+        })
     }
 }
 
@@ -1067,7 +1072,7 @@ mod tests {
         let posted = tracker.post_comment(&id, "x").unwrap();
         tracker.set_stage(&id, "Needs Input").unwrap();
         assert_eq!(
-            tracker.mention("u1").as_deref(),
+            tracker.mention("u1").unwrap().as_deref(),
             Some("https://linear.app/owlshift/profiles/person-1")
         );
         assert!(matches!(posted.author, Author::Other { .. }));
@@ -1112,9 +1117,11 @@ mod tests {
         }
     }
 
-    /// A mention is a plain link to Linear, or nothing: never a failure.
+    /// A mention is a plain link to Linear. Anything else is an error that
+    /// says why, so the runner can report the mention it leaves out
+    /// (OWL-170).
     #[test]
-    fn a_mention_is_a_plain_linear_link_or_nothing() {
+    fn a_mention_is_a_plain_linear_link_or_an_error() {
         let user = |url: &str| -> &'static str {
             json!({ "data": { "user": { "url": url } } })
                 .to_string()
@@ -1122,17 +1129,22 @@ mod tests {
         };
         let mention = |body: &'static str| tracker(vec![body]).mention("u1");
         assert_eq!(
-            mention(user("https://linear.app/owlshift/profiles/person-1")).as_deref(),
+            mention(user("https://linear.app/owlshift/profiles/person-1"))
+                .unwrap()
+                .as_deref(),
             Some("https://linear.app/owlshift/profiles/person-1")
         );
-        assert_eq!(mention(user("https://example.com/profiles/person-1")), None);
-        assert_eq!(
-            mention(user("https://linear.app/owlshift/profiles/a)b")),
-            None
-        );
+        for url in [
+            "https://example.com/profiles/person-1",
+            "https://linear.app/owlshift/profiles/a)b",
+        ] {
+            let error = mention(user(url)).unwrap_err();
+            assert!(error.message.contains("not a plain"), "{error}");
+        }
         let unknown = r#"{"errors":[{"message":"Entity not found: User",
             "extensions":{"code":"INPUT_ERROR"}}]}"#;
-        assert_eq!(mention(unknown), None);
+        let error = mention(unknown).unwrap_err();
+        assert!(error.message.contains("Entity not found"), "{error}");
     }
 
     /// Answers with prepared bodies, in order.

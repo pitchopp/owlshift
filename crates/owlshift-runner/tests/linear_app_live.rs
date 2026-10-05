@@ -216,6 +216,11 @@ fn a_question_round_through_the_app_reaches_its_decider() {
         .mentioning(&decider)
         .post_questions(&round)
         .unwrap();
+    println!(
+        "decider's mention included: {}",
+        posted.mention_dropped.is_none()
+    );
+    let posted = posted.comment;
     cleanup.comment = Some(posted.id.clone());
     let read = tracker.comments(&ticket).unwrap();
     let back = read.iter().find(|c| c.id == posted.id).expect("read back");
