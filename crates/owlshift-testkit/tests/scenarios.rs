@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use owlshift_testkit::scenario::{play, play_str};
+use owlshift_testkit::scenario::{ScenarioError, play, play_str};
 
 fn fake_harness() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_owlshift-fake-harness"))
@@ -296,6 +296,98 @@ fn decisions_and_asks_take_their_comments_places_in_the_thread() {
     ) {
         panic!("{error}");
     }
+}
+
+/// The marked body of a REPLY comment, as Owlshift posts one, for the
+/// authorship scenarios below (OWL-171). A TOML basic string, ready to sit
+/// in a `comment` step.
+const MARKED_REPLY: &str = r#""[owlshift] REPLY\n\nA word of the runner.\n\n<!-- owlshift:{\"format\":1,\"kind\":\"REPLY\",\"ticket\":\"DEMO-3\"} -->\n""#;
+
+/// Plays the reask fixture up to its first round of questions, then the
+/// `steps` given, as a scenario named `name`.
+fn play_after_questions(name: &str, steps: &str) -> Result<(), ScenarioError> {
+    let scenario = format!(
+        r#"
+        description = "Authorship in the thread of a brief (OWL-171)."
+        ticket = "DEMO-3"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = {{ result = "results/questions-round1.json" }}
+        {steps}
+    "#
+    );
+    play_str(name, &scenario, &scenarios().join("reask"), fake_harness())
+}
+
+/// OWL-171: authorship comes from the marker in the body, not from the
+/// author (`on_demand::comment_author`): a comment a person wrote that
+/// carries an Owlshift marker reads as `owlshift`, the account's own
+/// relation set aside.
+#[test]
+fn a_person_written_comment_with_a_marker_reads_as_owlshift() {
+    let steps = format!(
+        r#"
+        [[step]]
+        comment = {{ author = "reporter", body = {MARKED_REPLY} }}
+
+        [[step]]
+        comment = {{ author = "maintainer", body = "Q1: English.\nQ2: \"Hello, reader.\"\n" }}
+
+        [[step]]
+        answer = {{ result = "results/check-round1-q2-partial.json" }}
+        expect = {{ brief_entries = ["questions", "owlshift", "decider"] }}
+        "#
+    );
+    if let Err(error) = play_after_questions("marked-person", &steps) {
+        panic!("{error}");
+    }
+}
+
+/// OWL-171: a name is never matched. An unmarked comment by an author
+/// named "owlshift" is an ordinary account: not the decider's, so `other`,
+/// where a comment of the decider's account reads as `decider`.
+#[test]
+fn an_unmarked_comment_by_an_author_named_owlshift_reads_as_other() {
+    let steps = r#"
+        [[step]]
+        comment = { author = "owlshift", body = "Q1: Spanish, surely.\n" }
+
+        [[step]]
+        comment = { author = "maintainer", body = "Q1: English.\nQ2: \"Hello, reader.\"\n" }
+
+        [[step]]
+        answer = { result = "results/check-round1-q2-partial.json" }
+        expect = { brief_entries = ["questions", "other", "decider"] }
+        "#;
+    if let Err(error) = play_after_questions("named-owlshift", steps) {
+        panic!("{error}");
+    }
+}
+
+/// OWL-171: a marker only ever demotes (`answer_check::new_answer`): the
+/// decider's own comment that carries a marker reads as `owlshift`, so it is
+/// no answer and the check still waits for one.
+#[test]
+fn the_deciders_own_marked_comment_is_not_an_answer() {
+    let steps = format!(
+        r#"
+        [[step]]
+        comment = {{ author = "maintainer", body = {MARKED_REPLY} }}
+
+        [[step]]
+        answer = {{ result = "results/check-round1-q2-partial.json" }}
+        "#
+    );
+    let error = play_after_questions("marked-decider", &steps).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "marked-decider, step 4 (answer): no comment from the decider since \
+         2026-09-28T09:02:00Z: the answer check runs once answers arrive"
+    );
 }
 
 /// OWL-16's acceptance: the gate fails first and passes after a fix run.
