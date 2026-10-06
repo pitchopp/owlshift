@@ -21,7 +21,7 @@ Early development. Steps P0 and P1 of the roadmap are built: the CLI runs one ti
 
 - `owlshift doctor`: check whether this machine is ready (git, the harness CLIs and their logins, the agent runs' isolation and Claude Code token, the configuration files), and say why each problem matters and how to fix it.
 - `owlshift config show`: print the effective configuration and the file each value comes from.
-- `owlshift init`: write a commented `owlshift.toml` for this repository, then store the tracker and forge secrets and the agent runs' Claude Code token that `owlshift do` needs in the system keychain.
+- `owlshift init`: write a commented `owlshift.toml` for this repository, then store the tracker and forge secrets and the agent runs' Claude Code token that `owlshift do` needs in the system keychain. [`examples/owlshift.toml`](examples/owlshift.toml) shows every key of that file, with comments.
 - `owlshift do TICKET`: run one ticket to a verified pull request, in the foreground; questions the run needs answered are posted on the ticket.
 - `owlshift continue TICKET`: once the ticket's questions are answered there and the answer has been left unedited for 10 minutes, or the project's `policy.quiet_window_minutes` (or ends with `go`), check the answers, then ask again what is missing or run on to a verified pull request; restarts a parked ticket.
 - `owlshift watch`: in the foreground, continue each ticket whose questions wait, as `owlshift continue` would, once its decider's reply counts, until Ctrl-C. A parked ticket, or one left at Build, still needs `owlshift continue`.

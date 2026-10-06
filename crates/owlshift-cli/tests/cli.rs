@@ -1259,6 +1259,17 @@ fn logs_follow_prints_events_as_they_are_recorded() {
     );
 }
 
+/// The example project file under `examples/` parses and validates, so what a
+/// newcomer copies is a configuration Owlshift reads.
+#[test]
+fn the_example_project_file_parses() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = fs::read_to_string(root.join("examples/owlshift.toml")).unwrap();
+    let config = owlshift_contracts::config::ProjectConfig::parse(&text).unwrap();
+    assert_eq!(config.tracker.team.as_deref(), Some("ENG"));
+    assert!(!config.stack.gate.is_empty());
+}
+
 /// The repository's own project file, which `owlshift do` reads on
 /// Owlshift's tickets, parses and gates on what CI runs.
 #[test]

@@ -1,0 +1,72 @@
+# Example Owlshift project configuration, to copy to the root of your own
+# repository as `owlshift.toml` and adapt. `owlshift init` writes a commented
+# file for you; this one shows every key. Commit it: every developer and every
+# runner of the project read this file. It holds no secret: the tracker and
+# forge credentials live in each machine's system keychain (`owlshift init`
+# stores them), and the model logins stay with each harness CLI.
+
+# The Owlshift versions that can read this file.
+requires = ">=0.0"
+
+[tracker]
+# Where the tickets live: "linear", or "markdown" for tickets kept in
+# this repository, one folder per ticket under tickets/.
+kind = "linear"
+# The Linear team key: the prefix of its ticket ids, ENG in ENG-12.
+# Required for Linear.
+team = "ENG"
+# How a person admits a ticket to Owlshift's queue: { label = "..." },
+# { state = "..." } or "delegation". `owlshift do TICKET` does not use
+# it: it runs the ticket it is given.
+admit = { label = "agent" }
+# The tracker states that show where a ticket stands. Create them in your
+# tracker first, named exactly as here. Optionally add `parked = "Parked"`:
+# left out, a parked ticket shows `needs_input`, its PARKED comment saying why.
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+
+[stack]
+# The project's full gate: lint, formatter and tests, run in order from the
+# repository root. The build role runs it before it reports done, then
+# Owlshift runs it again on the commit it delivers. Replace these commands
+# with your own; with no command, the build role stops with `blocked`.
+gate = [
+    "npm run lint",
+    "npm test",
+]
+# Names of environment variables the gate needs, such as a feature flag.
+# Names only, never values. A credential variable is refused.
+# gate_env = ["FEATURE_FLAG"]
+# The files whose text reaches agents as the project's rules, paths from the
+# repository's root. Left out, the rules are the root AGENTS.md when there is
+# one; [] gives no rule.
+# rules = ["AGENTS.md", "docs/conventions.md"]
+
+[pipeline]
+# A ticket's pipeline variant, unless intake or a label picks another:
+# "trivial", "standard" or "risky". In this version, `owlshift do` runs
+# the build stage only.
+default = "standard"
+# When a human approves the plan: "always", "on-fork" or "never".
+plan_approval = "on-fork"
+
+[models]
+# The model of each tier, per harness; left out, a harness runs its own
+# default model. `owlshift do` builds on the standard tier. For example:
+# deep = { claude = "claude-opus-5-5" }
+# standard = { claude = "claude-sonnet-5" }
+# fast = { claude = "claude-haiku-4-5" }
+
+[policy]
+# Question categories always left to a human, on top of the floor's
+# security, data_loss, money, legal, irreversible and scope.
+always_human = []
+# How long the decider's latest comment must be left unedited before their
+# answer counts, in minutes (1 to 1440). Left out: 10. Ending a comment with
+# `go` counts it at once.
+# quiet_window_minutes = 10
+
+# Code zones, keyed by folder from the repository's root: who decides the
+# tickets without an assignee that touch each. The owner is the tracker
+# account's identifier, written exactly.
+# [zones."backend/billing"]
+# owner = "user-id-from-your-tracker"
