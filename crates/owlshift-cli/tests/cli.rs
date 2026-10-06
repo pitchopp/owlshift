@@ -93,6 +93,28 @@ fn version_lists_the_format_versions() {
 }
 
 #[test]
+fn hello_greets_the_world_or_the_name_given() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let hello = |args: &[&str]| {
+        let output = owlshift(config_dir.path(), config_dir.path(), args);
+        assert!(output.status.success());
+        stdout(&output)
+    };
+    assert_eq!(hello(&["hello"]), "Hello, world!\n");
+    assert_eq!(hello(&["hello", ""]), "Hello, world!\n");
+    assert_eq!(hello(&["hello", "  "]), "Hello, world!\n");
+    assert_eq!(hello(&["hello", "Ada"]), "Hello, Ada!\n");
+}
+
+#[test]
+fn hello_is_listed_in_help() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let output = owlshift(config_dir.path(), config_dir.path(), &["--help"]);
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("  hello "));
+}
+
+#[test]
 fn config_show_gives_each_value_its_file() {
     let config_dir = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

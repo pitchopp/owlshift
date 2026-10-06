@@ -1,6 +1,7 @@
 //! The `owlshift` binary.
 
 mod do_cmd;
+mod hello_cmd;
 mod init_cmd;
 mod logs_cmd;
 
@@ -62,6 +63,11 @@ enum Command {
     /// reply counts; checked every minute, until Ctrl-C. A parked ticket, or
     /// one left at Build, still needs `owlshift continue`.
     Watch,
+    /// Greet the user, or NAME when one is given.
+    Hello {
+        /// Who to greet; without one, or when blank, the world.
+        name: Option<String>,
+    },
     /// Print the events `owlshift do`, `owlshift continue` and `owlshift
     /// watch` recorded, oldest first.
     Logs {
@@ -145,6 +151,10 @@ fn main() -> ExitCode {
             do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket))
         }
         Command::Watch => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
+        Command::Hello { name } => {
+            println!("{}", hello_cmd::greeting(name.as_deref()));
+            ExitCode::SUCCESS
+        }
         Command::Logs {
             ticket,
             last,
