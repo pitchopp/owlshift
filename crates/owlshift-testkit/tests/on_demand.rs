@@ -2152,18 +2152,23 @@ fn a_mention_the_tracker_cannot_give_is_reported() {
     let comments = bench.comments();
     assert!(!comments[0].contains("Waiting for"), "{}", comments[0]);
 
+    assert_mention_dropped_after_write(&bench, "QUESTIONS", &printed);
+}
+
+/// Checks that the single `mention_dropped` warning of a run came right
+/// after the write of the `kind` comment, naming it, and was printed.
+fn assert_mention_dropped_after_write(bench: &Bench, kind: &str, printed: &str) {
     let events = bench.events();
     let written = events
         .iter()
         .position(|e| {
-            e.kind == EventKind::TrackerWrite
-                && e.data.get("kind").is_some_and(|k| k == "QUESTIONS")
+            e.kind == EventKind::TrackerWrite && e.data.get("kind").is_some_and(|k| k == kind)
         })
-        .expect("the questions were written");
+        .unwrap_or_else(|| panic!("the {kind} comment was written: {events:?}"));
     let warning = &events[written + 1];
     assert_eq!(warning.kind, EventKind::Warning, "{events:?}");
     assert_eq!(warning.data["what"], "mention_dropped");
-    assert_eq!(warning.data["kind"], "QUESTIONS");
+    assert_eq!(warning.data["kind"], kind);
     assert_eq!(warning.data["comment"], events[written].data["comment"]);
     assert_eq!(warning.data["account"], "maintainer");
     assert!(
@@ -2179,6 +2184,65 @@ fn a_mention_the_tracker_cannot_give_is_reported() {
         .count();
     assert_eq!(dropped, 1, "{events:?}");
     assert!(printed.contains("what=mention_dropped"), "{printed}");
+}
+
+/// The RE-ASK of an incomplete answer, posted while the tracker cannot give
+/// the mention, goes without it, and the round is kept: one `warning` right
+/// after the RE-ASK's write tells the operator (OWL-172).
+#[test]
+fn a_mention_the_tracker_cannot_give_is_reported_on_a_re_ask() {
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    bench.refuse_mention.set(true);
+    bench.answer("Q1: English.\n");
+    let partial = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "partial", "The sign-off is not given."),
+    ]);
+    let (reasked, printed) = bench.continue_ticket(vec![bench.reply(None, Some(&partial))]);
+    assert!(
+        matches!(&reasked, Err(Stop::Reasked { .. })),
+        "{reasked:?}\n{printed}"
+    );
+    let comments = bench.comments();
+    let reask = comments.last().unwrap();
+    assert!(reask.starts_with("[owlshift] RE-ASK"), "{reask}");
+    assert!(!reask.contains("Waiting for"), "{reask}");
+    assert_eq!(bench.record().state.reasks, 1);
+    assert_mention_dropped_after_write(&bench, "RE-ASK", &printed);
+}
+
+/// The REPLY to a counter-question, posted while the tracker cannot give
+/// the mention, goes without it, and the run waits as usual: one `warning`
+/// right after the REPLY's write tells the operator (OWL-172).
+#[test]
+fn a_mention_the_tracker_cannot_give_is_reported_on_a_reply() {
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    bench.refuse_mention.set(true);
+    bench.answer("Q1: English.\nQ2: what is a sign-off?\n");
+    let counter = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "counter_question", "Asks what a sign-off is."),
+    ]);
+    let (asked_back, printed) = bench.continue_ticket(vec![bench.reply(None, Some(&counter))]);
+    assert!(
+        matches!(&asked_back, Err(Stop::CounterQuestion { .. })),
+        "{asked_back:?}\n{printed}"
+    );
+    let comments = bench.comments();
+    let reply = comments.last().unwrap();
+    assert!(reply.starts_with("[owlshift] REPLY"), "{reply}");
+    assert!(!reply.contains("Waiting for"), "{reply}");
+    assert_mention_dropped_after_write(&bench, "REPLY", &printed);
 }
 
 /// A tracker that refuses every stage write stops nothing: the round is
