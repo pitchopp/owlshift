@@ -1,0 +1,55 @@
+# OWL-186's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
+# It plays on the open_points/ fixture folder (the project in repo/, prepared
+# results/): build-done-unasked.json is its own.
+
+fixture = "open_points"
+description = """
+DEMO-5 leaves two points open, to be decided on the ticket. The first Build
+run decides both itself and reports done: its result is refused before the
+gate, a failed run. The next Build run is told why, and that it may not end
+done: it settles one point anyway, in a commit the gate would pass, and
+reports done without asking. That result is refused before the gate too, a
+second failed run: nothing is pushed, and the ticket parks with a PARKED
+comment that quotes the reason."""
+ticket = "DEMO-5"
+start = "2026-10-07T11:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+[step.run]
+files = { "examples/owlshift.toml" = "# Every key, commented.\n" }
+commit = "Add the example configuration"
+result = "results/build-decided.json"
+[step.expect]
+event = "result_refused"
+stage = "build"
+failed_runs = 1
+comments = 0
+branch_pushed = false
+
+# Without the rule, this commit passes the gate and the run is delivered.
+[[step]]
+[step.run]
+files = { "examples/owlshift.toml" = "# The required keys.\nrequired = true\n" }
+commit = "Keep only the required keys"
+result = "results/build-done-unasked.json"
+[step.expect]
+event = "run_failed"
+stage = "build"
+waiting = "parked"
+failed_runs = 2
+tracker_stage = "Needs Input"
+comments = 1
+gate_failure = "none"
+branch_pushed = false
+brief_result_refusal = "ask each of these choices as a question"
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] PARKED"
+contains = [
+  "Parked: a run failed again, with no attempt left. The last failure: ",
+  "status is done, but the previous run's decisions were refused",
+]

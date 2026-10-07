@@ -877,41 +877,55 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
 }
 
 /// OWL-180: a Build run whose `result.json` is refused, here for questions
-/// not numbered from Q1, counts as a failed run, and the next Build run of
-/// the command is told why. Only that one: the run after it, once the
-/// resolver settled its question, and the resolver itself are not.
+/// not numbered from Q1 or for decisions of its own, counts as a failed run,
+/// and the next Build run of the command is told why. Only that one: the run
+/// after it, once the resolver settled its question, and the resolver itself
+/// are not. A refusal of the build role's own decisions also holds that run
+/// to asking (`decisions_refused`, OWL-186), and it asks.
 #[test]
 fn a_refused_result_is_told_to_the_next_build_run_only() {
-    let bench = Bench::new(true);
     let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
-    let (outcome, printed) = bench.run(
-        vec![
-            bench.reply(None, Some(&misnumbered)),
-            bench.reply(None, Some(NAMING)),
-            bench.reply(None, Some(DECIDED_Q1)),
-            bench.reply(Some("Hello"), Some(DONE)),
-        ],
-        None,
+    let decided = DONE.replace(
+        r#""pr":"#,
+        r#""decisions":[{"question":"Which file","decision":"GREETING.md","basis":"b"}],"pr":"#,
     );
-    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    for (first, decisions) in [(&misnumbered, false), (&decided, true)] {
+        let bench = Bench::new(true);
+        let (outcome, printed) = bench.run(
+            vec![
+                bench.reply(None, Some(first)),
+                bench.reply(None, Some(NAMING)),
+                bench.reply(None, Some(DECIDED_Q1)),
+                bench.reply(Some("Hello"), Some(DONE)),
+            ],
+            None,
+        );
+        outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
 
-    let told: Vec<(Role, bool)> = bench
-        .briefs()
-        .iter()
-        .map(|brief| (brief.role, brief.result_refusal.is_some()))
-        .collect();
-    assert_eq!(
-        told,
-        [
-            (Role::Build, false),
-            (Role::Build, true),
-            (Role::Resolver, false),
-            (Role::Build, false),
-        ]
-    );
-    let started = data_of(&bench.events(), EventKind::RunStarted, "result_refusal");
-    let flags: Vec<&Value> = started.iter().map(|data| &data["result_refusal"]).collect();
-    assert_eq!(flags, [false, true, false, false]);
+        let told: Vec<(Role, bool, bool)> = bench
+            .briefs()
+            .iter()
+            .map(|brief| {
+                (
+                    brief.role,
+                    brief.result_refusal.is_some(),
+                    brief.decisions_refused,
+                )
+            })
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (Role::Build, false, false),
+                (Role::Build, true, decisions),
+                (Role::Resolver, false, false),
+                (Role::Build, false, false),
+            ]
+        );
+        let started = data_of(&bench.events(), EventKind::RunStarted, "result_refusal");
+        let flags: Vec<&Value> = started.iter().map(|data| &data["result_refusal"]).collect();
+        assert_eq!(flags, [false, true, false, false]);
+    }
 }
 
 /// OWL-183: after a failed run, a refused result does not spend the last

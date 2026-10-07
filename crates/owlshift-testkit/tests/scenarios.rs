@@ -103,6 +103,19 @@ fn open_points() {
     }
 }
 
+/// OWL-186's acceptance: after a Build `done` refused for its decisions, the
+/// retry, told why, that settles a point and reports `done` without asking
+/// is refused before the gate too, and the ticket parks with nothing pushed.
+#[test]
+fn open_points_unasked() {
+    if let Err(error) = play(
+        &scenarios().join("open_points_unasked.toml"),
+        fake_harness(),
+    ) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-184's acceptance: an answer check whose result is refused is followed
 /// by checks told why, through a usage limit, until one gives its verdicts.
 #[test]

@@ -19,8 +19,8 @@ use crate::Role;
 /// raising run's category out of `resolve` (OWL-144); format 6 adds the
 /// project's `always_human` categories (OWL-151); format 7 Build's
 /// `result_refusal` (OWL-180); format 8 gives it to the answer check too
-/// (OWL-184).
-pub const BRIEF_FORMAT: u32 = 8;
+/// (OWL-184); format 9 adds Build's `decisions_refused` (OWL-186).
+pub const BRIEF_FORMAT: u32 = 9;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role

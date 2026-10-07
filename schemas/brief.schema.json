@@ -26,10 +26,14 @@
       "description": "The person whose answers unblock the ticket's gates.",
       "type": "string"
     },
+    "decisions_refused": {
+      "description": "The previous Build run's `result.json` was refused for the build\nrole's own decisions (OWL-176): the choices it listed are still open,\nand this run may not end `done` (OWL-186). In Build's brief only, with\nthe `result_refusal` that says why; absent otherwise.",
+      "type": "boolean"
+    },
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 8
+      "const": 9
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands a role runs, in order, from the worktree root, before it\ndelivers. The runner is its only author; an empty list means the\nproject has no gate.",
