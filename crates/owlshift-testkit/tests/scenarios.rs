@@ -103,6 +103,15 @@ fn open_points() {
     }
 }
 
+/// OWL-184's acceptance: an answer check whose result is refused is followed
+/// by checks told why, through a usage limit, until one gives its verdicts.
+#[test]
+fn check_refusal() {
+    if let Err(error) = play(&scenarios().join("check_refusal.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-123's acceptance: past the re-ask limit, a fourth incomplete answer
 /// parks the ticket with a PARKED comment naming what is still open and
 /// what restarts it. The project names a parked state, which the ticket

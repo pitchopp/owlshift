@@ -214,6 +214,25 @@ pub enum Failure {
     Gate(Box<GateFailure>),
 }
 
+impl Failure {
+    /// Why the run's `result.json`, or an artifact it names, was refused,
+    /// when that is the run's own mistake to fix: what its next run is told
+    /// (`on_demand::result_refusal`, OWL-180 and OWL-184). `None` for every
+    /// other failure, an artifact the runner could not read included.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Self::InvalidResult(reason) => Some(reason.clone()),
+            Self::Artifact(error) => error.is_the_runs().then(|| error.to_string()),
+            Self::TimedOut
+            | Self::Credentials(_)
+            | Self::Harness(_)
+            | Self::Driver(_)
+            | Self::NoResult
+            | Self::Gate(_) => None,
+        }
+    }
+}
+
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

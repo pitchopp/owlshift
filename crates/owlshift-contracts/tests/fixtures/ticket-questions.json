@@ -1,5 +1,5 @@
 {
-  "format": 4,
+  "format": 5,
   "asks": [
     {
       "kind": "questions",
@@ -47,7 +47,8 @@
       "decider": {
         "account": "u-maintainer",
         "by": "assignee"
-      }
+      },
+      "result_refusal": "invalid result: the verdict for Q1 names a question the latest ask did not ask"
     }
   ],
   "checked_through": "2026-09-28T11:00:00Z",

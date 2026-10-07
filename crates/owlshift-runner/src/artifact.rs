@@ -14,7 +14,7 @@ use std::path::Path;
 
 use owlshift_contracts::ids::RelativePath;
 use owlshift_contracts::result::Artifacts;
-use owlshift_platform::confined::{ConfinedError, read_confined};
+use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 
 /// The most bytes an artifact may hold: 1 MiB. Artifacts are text a model
 /// writes (a plan, a ledger, findings, a report), far below this; a larger
@@ -37,6 +37,31 @@ pub struct ArtifactError {
     /// `report`.
     pub field: &'static str,
     pub source: ConfinedError,
+}
+
+impl ArtifactError {
+    /// Whether the run that named the artifact is the one to fix it, so its
+    /// next run is told (OWL-184): a path that is not plain, a link, a
+    /// second name, something other than a regular file, a missing or too
+    /// large file. A file deleted while the runner read it, a worktree the
+    /// runner cannot use or a failing file system is not the run's mistake.
+    pub fn is_the_runs(&self) -> bool {
+        match &self.source {
+            ConfinedError::InvalidPath { .. } => true,
+            ConfinedError::Refused { reason, .. } => match reason {
+                Refusal::SymbolicLink
+                | Refusal::NotADirectory
+                | Refusal::NotFound
+                | Refusal::NotARegularFile(_)
+                | Refusal::TooLarge(_)
+                | Refusal::HardLink(_) => true,
+                Refusal::Unlinked => false,
+            },
+            ConfinedError::InvalidRoot { .. }
+            | ConfinedError::Root { .. }
+            | ConfinedError::Io { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for ArtifactError {

@@ -26,7 +26,7 @@ use owlshift_core::reply::{self, Reply};
 use owlshift_core::state::Event;
 
 use crate::executor::Outcome;
-use crate::on_demand::{comment_author, core_event};
+use crate::on_demand::{comment_author, core_event, result_refusal};
 
 /// Whether answers arrived: the newest last edit among the decider's
 /// comments when it is later than the latest ask and than what the last
@@ -172,6 +172,42 @@ pub fn event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
         }
         _ => core_event(outcome),
     }
+}
+
+/// Keeps in `questions` what an answer check leaves for the next one, given
+/// its core `event` ([`event`], or a quarantine) and its `outcome`, for
+/// `owlshift continue` and the stand-in driver alike. A check that gave its
+/// verdicts keeps what it read through and its verdicts
+/// ([`TicketQuestions::keep_check`]). The latest ask keeps why the check's
+/// result was refused ([`result_refusal`]), for the next check on it, which
+/// is told (OWL-184); any other outcome clears it, a quarantine included. A
+/// check interrupted by a usage limit keeps nothing, so the next one is told
+/// what this one was. Returns the verdicts kept, none when it gave none.
+pub fn keep(
+    questions: &mut TicketQuestions,
+    read_through: Option<Timestamp>,
+    event: Event,
+    outcome: &Outcome,
+) -> Vec<Verdict> {
+    let verdicts = match (event, outcome) {
+        (Event::Interrupted, _) => return Vec::new(),
+        (
+            Event::Answered | Event::Incomplete | Event::CounterQuestion,
+            Outcome::Finished { result, .. },
+        ) => {
+            // The answers this check read are judged: only a newer comment
+            // of the decider is a new answer.
+            questions.keep_check(read_through, &result.verdicts);
+            result.verdicts.clone()
+        }
+        _ => Vec::new(),
+    };
+    let refusal = match event {
+        Event::Quarantined => None,
+        _ => result_refusal(outcome),
+    };
+    questions.keep_refusal(refusal);
+    verdicts
 }
 
 /// The questions an incomplete answer asks again: those of the brief's

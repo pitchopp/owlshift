@@ -48,7 +48,9 @@
 //! (`owlshift_runner::answer_check::readiness`): a comment of the latest
 //! ask's decider newer than that ask and than what the last check with
 //! verdicts read. A failed or interrupted check is
-//! retried on the same answers. Its outcome maps onto one core event
+//! retried on the same answers, and a check whose result was refused tells
+//! the next one why, kept on the latest ask as `owlshift continue` keeps it
+//! in the ticket ref (`owlshift_runner::answer_check::keep`, OWL-184). Its outcome maps onto one core event
 //! (`owlshift_runner::answer_check::event`): an answer settles the round,
 //! a RESUME comment restates what was understood of each of its questions
 //! (`owlshift_runner::writer::ResumeComment`) and the ticket resumes; an
@@ -61,8 +63,8 @@
 //! `questions.json` would (`owlshift_contracts::refs::TicketQuestions`), in
 //! memory: each ask, a round's questions or a re-ask, with its comment, its
 //! decider, the ticket's assignee (no zone owner is resolved), and the
-//! verdicts of the latest check on it, kept as `continue` keeps them
-//! (`TicketQuestions::keep_check`); each takes the place of its comment in
+//! verdicts of the latest check on it and why its result was refused, kept
+//! as `continue` keeps them (`owlshift_runner::answer_check::keep`); each takes the place of its comment in
 //! every brief's thread, as a `questions` or `reask` entry, as the
 //! runner's own thread places it. Whenever the core parks the ticket, after a run or an
 //! answer check, the driver posts a PARKED comment
@@ -728,6 +730,7 @@ impl Driver {
                 by: DeciderRule::Assignee,
             },
             verdicts: Vec::new(),
+            result_refusal: None,
         });
         self.show_after(Event::Questions)
     }
@@ -807,13 +810,10 @@ impl Driver {
         let report = self.execute(Role::AnswerCheck, reply)?;
         let (event, result) = answer_check::event(&report.outcome);
         let result = result.cloned();
-        // A check with verdicts keeps what it read and its verdicts, as
-        // `owlshift continue` does.
-        if let (Event::Answered | Event::Incomplete | Event::CounterQuestion, Some(result)) =
-            (event, &result)
-        {
-            self.questions.keep_check(read_through, &result.verdicts);
-        }
+        // A check with verdicts keeps what it read and its verdicts, and a
+        // refused one its reason for the next check, as `owlshift continue`
+        // does.
+        answer_check::keep(&mut self.questions, read_through, event, &report.outcome);
 
         let parked = self.apply(event)?;
         if let Some(reason) = parked {
@@ -871,6 +871,7 @@ impl Driver {
                     questions,
                     decider,
                     verdicts: Vec::new(),
+                    result_refusal: None,
                 });
             }
             // A REPLY answers each counter-question; the ticket keeps
@@ -1058,10 +1059,13 @@ impl Driver {
             } else {
                 None
             },
-            result_refusal: if role == Role::Build {
-                self.result_refusal.clone()
-            } else {
-                None
+            result_refusal: match role {
+                Role::Build => self.result_refusal.clone(),
+                Role::AnswerCheck => self
+                    .questions
+                    .latest()
+                    .and_then(|ask| ask.result_refusal.clone()),
+                _ => None,
             },
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),

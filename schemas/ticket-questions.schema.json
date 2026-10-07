@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift ticket questions",
-  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and its decider, and what the last answer check\nread; and the decisions the resolver took instead of asking.",
+  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and its decider, and what the last answer check\nread, and why the last check's result was refused, when it was; and the\ndecisions the resolver took instead of asking.",
   "type": "object",
   "properties": {
     "asks": {
@@ -30,7 +30,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 4
+      "const": 5
     }
   },
   "additionalProperties": false,
@@ -91,6 +91,13 @@
             "$ref": "#/$defs/Question"
           },
           "minItems": 1
+        },
+        "result_refusal": {
+          "description": "Why the runner refused the `result.json` of the latest answer check\non this ask, or a file its `artifacts` name, when it did (format 5,\nOWL-184): what the next check on it is told, in its brief's\n`result_refusal`, whatever command runs it. Any other outcome of a\nkept check clears it; at most [`MAX_RESULT_REFUSAL_BYTES`].",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "round": {
           "type": "integer",
