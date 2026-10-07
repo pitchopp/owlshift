@@ -279,9 +279,28 @@ impl Brief {
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
     /// order, distinct questions of an earlier round; a resolver's brief has
     /// questions to `resolve`, in increasing order, and no other brief has
-    /// any.
+    /// any; only Build's brief has a `result_refusal`, of at most
+    /// [`MAX_RESULT_REFUSAL_BYTES`].
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
+        if let Some(reason) = &self.result_refusal {
+            if self.role != Role::Build {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "a refused result is given but the role is {}, not {}",
+                        self.role.as_str(),
+                        Role::Build.as_str()
+                    ),
+                ));
+            }
+            if reason.len() > MAX_RESULT_REFUSAL_BYTES {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!("the refused result's reason exceeds {MAX_RESULT_REFUSAL_BYTES} bytes"),
+                ));
+            }
+        }
         match (self.role == Role::Resolver, self.resolve.is_empty()) {
             (true, true) => Err(ContractError::invalid(
                 CONTRACT,
