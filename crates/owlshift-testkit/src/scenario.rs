@@ -24,11 +24,15 @@
 //! Writer (`owlshift_runner::writer::VisibleStage::after`), and to parked on
 //! a park, and pushes the branch. It keeps the latest failure of the gate the executor
 //! runs after a Build `done`, and hands it to the next Build brief, as it
-//! hands the next Build run why the last one's `result.json` was refused
+//! hands the next Build runs why a Build `result.json` was refused
 //! (`owlshift_runner::on_demand::result_refusal`, OWL-180), a refusal that
 //! never spends the last attempt when that run was not told of one
 //! (OWL-183), and whether it was the build role's own decisions, which holds
-//! that run to asking (`decisions_refused`, OWL-186). That
+//! them to asking (`decisions_refused`, OWL-186), kept as `owlshift do` and
+//! `continue` keep them in the ticket ref until a Build result is accepted
+//! (`owlshift_runner::on_demand::build_refusal_after`, OWL-192). A
+//! `continue` step is a person's new command: the gate's failure, which a
+//! command holds in memory, is gone, and a parked ticket restarts. That
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
 //!
@@ -67,7 +71,7 @@
 //! verdicts of the latest check on it and why its result was refused, kept
 //! as `continue` keeps them (`owlshift_runner::answer_check::keep`); each takes the place of its comment in
 //! every brief's thread, as a `questions` or `reask` entry, as the
-//! runner's own thread places it. Whenever the core parks the ticket, after a run or an
+//! runner's own thread places it; and Build's kept refusal. Whenever the core parks the ticket, after a run or an
 //! answer check, the driver posts a PARKED comment
 //! (`owlshift_runner::writer::ParkedComment`). What it leaves out on purpose:
 //!
@@ -78,7 +82,8 @@
 //!   written;
 //! - no bound on the runs in a row whose questions the resolver all decided
 //!   (`owlshift_core::state::MAX_RESOLVED_PASSES`), which `owlshift do` counts
-//!   per command: a scenario has no command, and plays each run by hand.
+//!   per command: a scenario's commands are only its `continue` steps, and
+//!   it plays each run by hand.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -110,7 +115,7 @@ use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check::{self, Readiness};
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::{
-    account_author, decisions_refused, result_refusal, stage_event, thread,
+    account_author, build_refusal_after, stage_event, tell_build, thread,
 };
 use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
@@ -179,6 +184,11 @@ pub struct Step {
     /// The resolver runs on the fake harness, with this reply, on the
     /// questions the last run left for it.
     pub resolve: Option<Reply>,
+    /// A person types `owlshift continue`: a new command, so what the last
+    /// one held in memory (the gate's failure) is gone, and a parked ticket
+    /// is restarted. The next steps play what it runs.
+    #[serde(default, rename = "continue")]
+    pub continue_command: bool,
     #[serde(default)]
     pub expect: Expect,
 }
@@ -239,6 +249,9 @@ pub struct Expect {
     /// The refusal of the previous result the last brief carried: `none`,
     /// or a text it contains.
     pub brief_result_refusal: Option<String>,
+    /// Whether the last brief held its Build run to asking
+    /// (`decisions_refused`).
+    pub brief_decisions_refused: Option<bool>,
     /// The commands of the gate the step's run passed.
     pub gate_passed: Option<Vec<String>>,
 }
@@ -382,6 +395,7 @@ enum Action<'a> {
     Comment(&'a CommentStep),
     Answer(&'a Reply),
     Resolve(&'a Reply),
+    Continue,
 }
 
 impl Action<'_> {
@@ -392,6 +406,7 @@ impl Action<'_> {
             Action::Comment(_) => "comment",
             Action::Answer(_) => "answer",
             Action::Resolve(_) => "resolve",
+            Action::Continue => "continue",
         }
     }
 }
@@ -406,10 +421,14 @@ impl Step {
         actions.extend(self.comment.as_ref().map(Action::Comment));
         actions.extend(self.answer.as_ref().map(Action::Answer));
         actions.extend(self.resolve.as_ref().map(Action::Resolve));
+        if self.continue_command {
+            actions.push(Action::Continue);
+        }
         match <[_; 1]>::try_from(actions) {
             Ok([action]) => Ok(action),
             Err(_) => Err(
-                "a step does exactly one of dispatch, run, comment, answer or resolve".to_owned(),
+                "a step does exactly one of dispatch, run, comment, answer, resolve or continue"
+                    .to_owned(),
             ),
         }
     }
@@ -431,12 +450,11 @@ struct Driver {
     /// The latest failure of the gate the executor ran, for the next Build
     /// brief; a passing gate clears it, other outcomes leave it.
     gate_failure: Option<GateFailure>,
-    /// Why the last Build run's `result.json` was refused, for the next
-    /// Build brief only; any other outcome of a Build run clears it.
-    result_refusal: Option<String>,
-    /// Whether that refusal was the build role's own decisions, for the
-    /// same brief (`owlshift_runner::on_demand::decisions_refused`).
-    decisions_refused: bool,
+    /// Whether the ticket would have a ticket ref: made once a round opens,
+    /// a decision is kept or a Build result is refused, and kept after,
+    /// whatever it holds. A `continue` needs one, and a PARKED comment says
+    /// `continue` with one, `do` without.
+    has_ref: bool,
     executor: Executor,
     id: TicketId,
     branch: String,
@@ -548,8 +566,7 @@ impl Driver {
             resolving: Vec::new(),
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             gate_failure: None,
-            result_refusal: None,
-            decisions_refused: false,
+            has_ref: false,
             branch: format!("owlshift/{}", scenario.ticket),
             id: scenario.ticket.clone(),
             state,
@@ -582,7 +599,33 @@ impl Driver {
             }
             Action::Answer(reply) => self.answer(reply).map(Some),
             Action::Resolve(reply) => self.resolve(reply),
+            Action::Continue => self.continue_command(),
         }
+    }
+
+    /// A person's `owlshift continue`, as far as a scenario needs it: refused
+    /// without a ticket ref, as the command is; what the last command held
+    /// in memory is gone; a parked ticket is restarted and shows what it
+    /// waits for again, as `continue` does (`owlshift_runner::on_demand`).
+    /// Whatever the command then runs, the next steps play.
+    fn continue_command(&mut self) -> Result<Option<Event>, String> {
+        if !self.has_ref {
+            return Err("nothing to continue: Owlshift keeps nothing on the ticket".to_owned());
+        }
+        if self.pending.is_some() {
+            return Err("the last run's questions wait for a `resolve` step".to_owned());
+        }
+        self.gate_failure = None;
+        if !matches!(self.state.status(), Status::Parked { .. }) {
+            return Ok(None);
+        }
+        self.apply(Event::Restarted)?;
+        if let Some(stage) = VisibleStage::of(self.state.status()) {
+            Writer::new(&self.tracker)
+                .set_stage(&self.id, stage, &self.states)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(Some(Event::Restarted))
     }
 
     /// Applies `event` to the core state; returns why the ticket parked,
@@ -605,10 +648,10 @@ impl Driver {
 
     /// Posts the PARKED comment of a park, after `report`'s run, and moves
     /// the visible stage to parked, as `owlshift do` and `continue` do
-    /// (`owlshift_runner::on_demand`, `park`). A ticket that asked questions
-    /// or kept a decision would have a ticket ref, so `continue` restarts
-    /// it; one with neither runs again with `do`. A failed write fails the
-    /// scenario.
+    /// (`owlshift_runner::on_demand`, `park`). A ticket that asked questions,
+    /// kept a decision or had a Build result refused would have a ticket
+    /// ref, so `continue` restarts it; one with none runs again with `do`. A
+    /// failed write fails the scenario.
     fn post_parked(
         &self,
         reason: ParkReason,
@@ -626,10 +669,10 @@ impl Driver {
             detail,
             round: NonZeroU32::new(self.state.round()).filter(|_| reason == ParkReason::Reasks),
             open,
-            restart: if self.questions.asks.is_empty() && self.questions.decisions.is_empty() {
-                Restart::Do
-            } else {
+            restart: if self.has_ref {
                 Restart::Continue
+            } else {
+                Restart::Do
             },
         }
         .render();
@@ -726,6 +769,7 @@ impl Driver {
             .assignee
             .ok_or("the ticket has no assignee to act as its decider")?;
         let posted = self.post(&body)?;
+        self.has_ref = true;
         self.questions.asks.push(Ask {
             kind: AskKind::Questions,
             round,
@@ -779,6 +823,7 @@ impl Driver {
                     }
                     .render();
                     let posted = self.post(&body)?;
+                    self.has_ref = true;
                     self.questions.decisions.push(KeptDecision {
                         at: posted.at,
                         comment: posted.id,
@@ -986,9 +1031,12 @@ impl Driver {
         if let Some(gate) = &report.gate {
             self.gate_failure = gate.failure.clone();
         }
-        if role == Role::Build {
-            self.result_refusal = result_refusal(&report.outcome);
-            self.decisions_refused = decisions_refused(&report.outcome);
+        // What the ticket ref keeps for the next Build run, whatever command
+        // runs it, as `owlshift do` and `continue` keep it (OWL-192).
+        if role == Role::Build && !matches!(report.outcome, Outcome::Quarantined(_)) {
+            self.questions.build_refusal =
+                build_refusal_after(self.questions.build_refusal.as_ref(), &report.outcome);
+            self.has_ref |= self.questions.build_refusal.is_some();
         }
         if report.exit_code == Some(OWN_FAILURE) {
             self.last_run = Some(report);
@@ -1019,7 +1067,7 @@ impl Driver {
             .questions
             .latest()
             .map_or_else(|| current.name.clone(), |ask| ask.decider.account.clone());
-        Ok(Brief {
+        let mut brief = Brief {
             format: Format,
             role,
             project: self.scenario.clone(),
@@ -1068,17 +1116,20 @@ impl Driver {
                 None
             },
             result_refusal: match role {
-                Role::Build => self.result_refusal.clone(),
                 Role::AnswerCheck => self
                     .questions
                     .latest()
                     .and_then(|ask| ask.result_refusal.clone()),
                 _ => None,
             },
-            decisions_refused: role == Role::Build && self.decisions_refused,
+            decisions_refused: false,
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
-        })
+        };
+        if role == Role::Build {
+            tell_build(&mut brief, &self.questions);
+        }
+        Ok(brief)
     }
 
     fn push_if_ahead(&self, worktree: &Path) -> Result<(), String> {
@@ -1306,6 +1357,13 @@ impl Driver {
                 expected,
                 brief.result_refusal.as_deref(),
             )?;
+        }
+        if let Some(expected) = expect.brief_decisions_refused {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            same("brief_decisions_refused", expected, brief.decisions_refused)?;
         }
         if let Some(expected) = &expect.gate_passed {
             let gate = self

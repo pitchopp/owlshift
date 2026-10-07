@@ -1,0 +1,83 @@
+# OWL-192's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
+# It plays on the open_points/ fixture folder (the project in repo/, prepared
+# results/), whose results it shares.
+
+fixture = "open_points"
+description = """
+DEMO-5 leaves two points open, to be decided on the ticket. The first Build
+run decides both itself: its result is refused, and the ticket ref keeps why.
+The next Build run, told why and held to asking, stops at a usage limit, which
+ends the command. A person's `continue` is a new command: its Build run is
+still told, quoting the refused choices, and still may not end done; it
+reports done anyway, is refused, and the ticket parks with a PARKED comment
+that says `continue`. The restart is another command, and its Build run is
+told again, and asks."""
+ticket = "DEMO-5"
+start = "2026-10-08T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+[step.run]
+files = { "examples/owlshift.toml" = "# Every key, commented.\n" }
+commit = "Add the example configuration"
+result = "results/build-decided.json"
+[step.expect]
+event = "result_refused"
+failed_runs = 1
+comments = 0
+brief_decisions_refused = false
+
+[[step]]
+run = { usage_limit = "2026-10-08T14:00:00Z" }
+[step.expect]
+event = "interrupted"
+stage = "build"
+waiting = "none"
+failed_runs = 1
+brief_result_refusal = "ask each of these choices as a question"
+brief_decisions_refused = true
+
+# The end of the command: only the ticket ref goes on.
+[[step]]
+continue = true
+expect = { event = "none", stage = "build", waiting = "none" }
+
+# Without the kept refusal, this run is untold and its done is delivered.
+[[step]]
+[step.run]
+files = { "examples/owlshift.toml" = "# The required keys.\nrequired = true\n" }
+commit = "Keep only the required keys"
+result = "results/build-done-unasked.json"
+[step.expect]
+event = "run_failed"
+waiting = "parked"
+failed_runs = 2
+gate_failure = "none"
+branch_pushed = false
+brief_result_refusal = "The choices listed: "
+brief_decisions_refused = true
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] PARKED"
+contains = [
+  "status is done, but the previous run's decisions were refused",
+  "**To restart it:** run `owlshift continue DEMO-5`.",
+]
+
+[[step]]
+continue = true
+expect = { event = "restarted", stage = "build", waiting = "none", failed_runs = 0, tracker_stage = "In Progress" }
+
+# Told the choices first, then the refused done.
+[[step]]
+run = { result = "results/questions-open-points.json" }
+[step.expect]
+event = "none"
+stage = "build"
+waiting = "none"
+comments = 1
+brief_result_refusal = "A later result was refused too: invalid result.json: status is done"
+brief_decisions_refused = true

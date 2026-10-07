@@ -36,8 +36,9 @@ pub const CLAIM_FORMAT: u32 = 1;
 pub const TICKET_STATE_FORMAT: u32 = 2;
 /// The format version of a ticket's asks (`questions.json` on a ticket ref).
 /// Format 4 added the resolver's kept `decisions` (OWL-138); format 5 an
-/// ask's `result_refusal` (OWL-184); formats 2 to 4 are still read.
-pub const QUESTIONS_FORMAT: u32 = 5;
+/// ask's `result_refusal` (OWL-184); format 6 Build's kept `build_refusal`
+/// (OWL-192); formats 2 to 5 are still read.
+pub const QUESTIONS_FORMAT: u32 = 6;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

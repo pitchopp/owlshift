@@ -74,21 +74,24 @@ pub struct Brief {
     /// when no gate run of the runner has failed since the last green one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_failure: Option<GateFailure>,
-    /// Why the runner refused the previous run's `result.json`, or a file
+    /// Why the runner refused an earlier run's `result.json`, or a file
     /// its `artifacts` name: what this run fixes in its own, such as
-    /// questions not numbered from Q1. In Build's brief, the previous Build
-    /// run of the same command (OWL-180); in the answer check's, the
-    /// previous check on the same ask, whatever command ran it, as the
+    /// questions not numbered from Q1. In Build's brief, the latest refused
+    /// Build result since one was accepted (OWL-180), whatever command ran
+    /// it, as the ticket ref keeps it (OWL-192), with the refusal of
+    /// decisions that still holds the run before it; in the answer check's,
+    /// the previous check on the same ask, whatever command ran it, as the
     /// ticket ref keeps it (OWL-184). The runner's message, at most
     /// [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result
-    /// is data. Never in the resolver's brief, and absent when the previous
-    /// run's result was not refused.
+    /// is data. Never in the resolver's brief, and absent when no such
+    /// refusal is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_refusal: Option<String>,
-    /// The previous Build run's `result.json` was refused for the build
-    /// role's own decisions (OWL-176): the choices it listed are still open,
-    /// and this run may not end `done` (OWL-186). In Build's brief only, with
-    /// the `result_refusal` that says why; absent otherwise.
+    /// A Build run's `result.json` was refused for the build role's own
+    /// decisions (OWL-176), and no Build run has asked since: the choices it
+    /// listed are still open, and this run may not end `done` (OWL-186),
+    /// whatever command runs it (OWL-192). In Build's brief only, with the
+    /// `result_refusal` that says why; absent otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decisions_refused: bool,
     /// Where the role writes `result.json`, relative to the worktree.

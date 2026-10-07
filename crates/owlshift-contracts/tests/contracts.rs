@@ -155,6 +155,13 @@ fn every_contract_round_trips() {
     ));
     assert_eq!(asked.asks[0].verdicts[1].class, AnswerClass::Partial);
     assert!(asked.asks[1].verdicts.is_empty());
+    // Build's kept refusal tells the refusal of decisions that holds the
+    // run first, then the latest one (OWL-192).
+    let kept = asked.build_refusal.as_ref().unwrap();
+    let told = kept.told();
+    assert!(told.starts_with("invalid result.json: decisions are given"));
+    assert!(told.ends_with("A later result was refused too: invalid result.json: status is done, but the previous run's decisions were refused"));
+    assert!(told.contains("The choices listed: \"Which file\""));
     assert!(matches!(
         asked.decisions[0].entry(),
         ThreadEntry::Decision { decision, .. } if decision.starts_with("GREETING.md")
@@ -963,7 +970,7 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(6)),
+        asked(|v| v["format"] = json!(7)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1036,10 +1043,19 @@ fn event_claim_and_state_rejections() {
         asked(|v| v["format"] = json!(4)),
         "format 4 keeps no refusal",
     );
+    rejects(
+        "a format-5 document with Build's refusal",
+        asked(|v| {
+            v["format"] = json!(5);
+            v["build_refusal"] = Value::Null;
+        }),
+        "format 5 keeps no Build refusal",
+    );
     // A format-2 document, written before the asks kept their verdicts, is
     // read as the current format without them, and written back as it.
     let format_2 = edited("ticket-questions.json", |v| {
         v["format"] = json!(2);
+        v.as_object_mut().unwrap().remove("build_refusal");
         v.as_object_mut().unwrap().remove("decisions");
         for ask in v["asks"].as_array_mut().unwrap() {
             ask.as_object_mut().unwrap().remove("verdicts");
@@ -1049,11 +1065,12 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 5,"));
+    assert!(read.render().starts_with("{\n  \"format\": 6,"));
     // A format-3 document, written before the resolver's decisions were
     // kept, is read with none, its verdicts kept.
     let format_3 = edited("ticket-questions.json", |v| {
         v["format"] = json!(3);
+        v.as_object_mut().unwrap().remove("build_refusal");
         v.as_object_mut().unwrap().remove("decisions");
         v["asks"][1]
             .as_object_mut()
@@ -1063,11 +1080,12 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_3).unwrap();
     assert!(read.decisions.is_empty());
     assert_eq!(read.asks[0].verdicts.len(), 2);
-    assert!(read.render().starts_with("{\n  \"format\": 5,"));
+    assert!(read.render().starts_with("{\n  \"format\": 6,"));
     // A format-4 document, written before an ask kept its check's refusal,
     // is read with none, its decisions kept.
     let format_4 = edited("ticket-questions.json", |v| {
         v["format"] = json!(4);
+        v.as_object_mut().unwrap().remove("build_refusal");
         v["asks"][1]
             .as_object_mut()
             .unwrap()
@@ -1076,7 +1094,36 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_4).unwrap();
     assert!(read.asks.iter().all(|ask| ask.result_refusal.is_none()));
     assert_eq!(read.decisions.len(), 1);
-    assert!(read.render().starts_with("{\n  \"format\": 5,"));
+    assert!(read.render().starts_with("{\n  \"format\": 6,"));
+    // A format-5 document, written before Build's refusal was kept
+    // (OWL-192), is read with none, its asks' refusals kept.
+    let format_5 = edited("ticket-questions.json", |v| {
+        v["format"] = json!(5);
+        v.as_object_mut().unwrap().remove("build_refusal");
+    });
+    let read = TicketQuestions::parse(&format_5).unwrap();
+    assert_eq!(read.build_refusal, None);
+    assert!(read.asks[1].result_refusal.is_some());
+    assert!(read.render().starts_with("{\n  \"format\": 6,"));
+    // Build's kept refusal keeps the same bounds, and a held refusal of
+    // decisions only with the hold.
+    rejects(
+        "a blank Build refusal",
+        asked(|v| v["build_refusal"]["reason"] = json!("")),
+        "Build's kept refusal reason is blank",
+    );
+    rejects(
+        "a Build refusal of decisions past the cap",
+        asked(|v| {
+            v["build_refusal"]["decisions_reason"] = json!("x".repeat(MAX_RESULT_REFUSAL_BYTES + 1))
+        }),
+        "Build's kept refusal of decisions is over the cap",
+    );
+    rejects(
+        "a refusal of decisions without the hold",
+        asked(|v| v["build_refusal"]["decisions"] = json!(false)),
+        "keeps a refusal of decisions without `decisions`",
+    );
     // A kept refusal is the runner's message: never blank, within the
     // brief's cap.
     rejects(

@@ -928,6 +928,109 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
     }
 }
 
+/// OWL-192: a refusal of Build's decisions is kept in the ticket ref, made
+/// for it, through a usage limit that ends the command and a park: the
+/// Build runs of later commands, `continue` and `do` alike, are told why,
+/// quoting the choices, and may not end `done`, until one asks and its
+/// questions are kept. A told run's refusal is never freed, so the second
+/// command parks.
+#[test]
+fn a_decisions_refusal_is_told_across_commands() {
+    let bench = Bench::new(true);
+    let decided = DONE.replace(
+        r#""pr":"#,
+        r#""decisions":[{"question":"Which file","decision":"GREETING.md","basis":"b"}],"pr":"#,
+    );
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (stopped, printed) = bench.run(vec![bench.reply(None, Some(&decided)), limited], None);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    let first = bench.record().questions.build_refusal.unwrap();
+    assert!(
+        first.decisions && first.reason.contains("Which file"),
+        "{first:?}"
+    );
+
+    let (parked, printed) = bench.continue_ticket(vec![bench.reply(None, Some(DONE))]);
+    assert!(
+        matches!(
+            &parked,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    let kept = bench.record().questions.build_refusal.unwrap();
+    assert!(kept.decisions);
+    assert_eq!(
+        kept.decisions_reason.as_deref(),
+        Some(first.reason.as_str())
+    );
+    assert!(
+        bench
+            .comments()
+            .pop()
+            .unwrap()
+            .contains("run `owlshift continue DEMO-1`")
+    );
+
+    // A run that asks heeds the hold only once its round is kept: a post
+    // that fails leaves the refusal kept.
+    bench.refuse.set(Some("[owlshift] QUESTIONS"));
+    let (unposted, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&unposted, Err(Stop::NeedsInput { posted: Err(_), .. })),
+        "{unposted:?}\n{printed}"
+    );
+    assert_eq!(bench.record().questions.build_refusal, Some(kept));
+    bench.refuse.set(None);
+
+    let (delivered, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = bench.briefs();
+    let told: Vec<(Role, bool, bool)> = briefs
+        .iter()
+        .map(|brief| {
+            (
+                brief.role,
+                brief.result_refusal.is_some(),
+                brief.decisions_refused,
+            )
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (Role::Build, false, false),
+            (Role::Build, true, true),
+            (Role::Build, true, true),
+            (Role::Build, true, true),
+            (Role::Build, true, true),
+            (Role::Resolver, false, false),
+            (Role::Build, false, false),
+        ]
+    );
+    let after_park = briefs[4].result_refusal.as_deref().unwrap();
+    assert!(
+        after_park.starts_with(&first.reason)
+            && after_park.contains("A later result was refused too: "),
+        "{after_park}"
+    );
+    assert_eq!(bench.record().questions.build_refusal, None);
+}
+
 /// OWL-183: after a failed run, a refused result does not spend the last
 /// attempt: the next Build run is told why. That run's own refusal is a
 /// plain failed run, which parks the ticket, so refusals never loop.
