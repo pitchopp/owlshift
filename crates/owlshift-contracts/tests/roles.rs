@@ -83,6 +83,7 @@ const ANSWER_CHECK_BRIEF_FIELDS: &[&str] = &[
     "thread.questions.recommendation",
     "thread.author.relation",
     "thread.body",
+    "result_refusal",
     "result_path",
 ];
 

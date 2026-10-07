@@ -949,6 +949,40 @@ fn a_refused_result_never_spends_the_last_attempt() {
     );
 }
 
+/// OWL-184: a Build result naming an artifact that is not there is refused
+/// as a `result.json` is: after a failed run it does not spend the last
+/// attempt, and the next Build run is told which artifact and why.
+#[test]
+fn a_refused_artifact_is_told_and_never_spends_the_last_attempt() {
+    let bench = Bench::new(true);
+    let missing_plan = DONE.replace(
+        r#""pr":"#,
+        r#""artifacts":{"plan":".owlshift/run/plan.md"},"pr":"#,
+    );
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, None),
+            bench.reply(None, Some(&missing_plan)),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let told: Vec<Option<String>> = bench
+        .briefs()
+        .into_iter()
+        .map(|brief| brief.result_refusal)
+        .collect();
+    assert_eq!(
+        told,
+        [
+            None,
+            None,
+            Some("artifact `plan`: `.owlshift/run/plan.md` does not exist".to_owned())
+        ]
+    );
+}
+
 /// The brief of the first run, and its ticket author's relation: the brief
 /// tells the agent whether the ticket text is the decider's instruction or
 /// quoted data.
@@ -2473,6 +2507,80 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     let comments = bench.comments();
     assert_eq!(comments.len(), 5, "{comments:?}");
     assert!(comments[3].starts_with("[owlshift] RESUME · round 1\n"));
+}
+
+/// OWL-184: an answer check whose result is refused leaves its reason in the
+/// ticket ref, through a park, and the next check, in a later command, is
+/// told why; a check that gives its verdicts clears it. Here a crashed check
+/// counted first, so the refused one parks, and `continue` restarts it.
+#[test]
+fn a_refused_check_is_told_to_the_next_check_across_commands() {
+    let bench = Bench::new(true);
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
+
+    let (crashed, _) = bench.continue_ticket(vec![bench.reply(None, None)]);
+    assert!(
+        matches!(&crashed, Err(Stop::CheckFailed { .. })),
+        "{crashed:?}"
+    );
+    let off_the_ask = check(&[
+        ("Q1", "answered", "English."),
+        ("Q3", "answered", "No sign-off."),
+    ]);
+    let (parked, _) = bench.continue_ticket(vec![bench.reply(None, Some(&off_the_ask))]);
+    assert!(
+        matches!(
+            &parked,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{parked:?}"
+    );
+    let kept = bench
+        .record()
+        .questions
+        .latest()
+        .unwrap()
+        .result_refusal
+        .clone();
+    assert!(
+        kept.as_deref()
+            .is_some_and(|reason| reason.contains("the verdict for Q3 names a question")),
+        "{kept:?}"
+    );
+
+    let answered = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
+    ]);
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let told: Vec<(Role, Option<String>)> = bench
+        .briefs()
+        .into_iter()
+        .map(|brief| (brief.role, brief.result_refusal))
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (Role::Build, None),
+            (Role::AnswerCheck, None),
+            (Role::AnswerCheck, None),
+            (Role::AnswerCheck, kept),
+            (Role::Build, None),
+        ]
+    );
+    assert_eq!(
+        bench.record().questions.latest().unwrap().result_refusal,
+        None
+    );
 }
 
 /// The re-ask limit through the shipped commands: the fourth incomplete

@@ -88,8 +88,7 @@ use crate::agent_env::AgentEnv;
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
-    DEFAULT_GATE_TIMEOUT, Executor, Failure, Git, Harness, Outcome, RESULT_PATH, RUN_DIR,
-    RunReport, RunSpec,
+    DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport, RunSpec,
 };
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::resolver::{self, Fallback, Resolved};
@@ -203,32 +202,36 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
 
 /// The core event of a stage run's outcome, given the brief it ran with, for
 /// `owlshift do` and the scenarios' stand-in driver alike: as [`core_event`],
-/// except that a Build run whose `result.json` was refused, and whose brief
-/// told it of no earlier refusal, is [`Event::ResultRefused`] (OWL-183). Its
-/// count never parks the ticket, since the next Build run is told why; a run
-/// that was told and fails is a plain failed run, so refusals never loop.
+/// except that a Build run whose result was refused ([`result_refusal`]),
+/// and whose brief told it of no earlier refusal, is [`Event::ResultRefused`]
+/// (OWL-183). Its count never parks the ticket, since the next Build run is
+/// told why; a run that was told and fails is a plain failed run, so
+/// refusals never loop.
 pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'a RunResult>) {
-    match outcome {
-        Outcome::Failed(Failure::InvalidResult(_))
-            if brief.role == Role::Build && brief.result_refusal.is_none() =>
-        {
-            (Event::ResultRefused, None)
-        }
-        _ => core_event(outcome),
+    if brief.role == Role::Build
+        && brief.result_refusal.is_none()
+        && result_refusal(outcome).is_some()
+    {
+        return (Event::ResultRefused, None);
     }
+    core_event(outcome)
 }
 
-/// What the next Build run of the same command is told of a run's outcome
-/// (OWL-180): why its `result.json` was refused, cut to
-/// [`MAX_RESULT_REFUSAL_BYTES`] on a character boundary, its beginning
-/// kept. `None` for any other outcome. A result holding the harness's login
-/// is a credential failure, never a refusal, so the reason never quotes it.
+/// What the next run is told of a run's outcome: why its `result.json`, or
+/// an artifact it names, was refused when the run is the one to fix it
+/// ([`crate::executor::Failure::refusal`]), cut to [`MAX_RESULT_REFUSAL_BYTES`] on a
+/// character boundary, its beginning kept. `None` for any other outcome.
+/// The next Build run of the same command gets it (OWL-180); the next
+/// answer check on the same ask, from the ticket ref (OWL-184). A result or
+/// an artifact holding the harness's login is a credential failure, never a
+/// refusal, so the reason never quotes it.
 pub fn result_refusal(outcome: &Outcome) -> Option<String> {
-    let Outcome::Failed(Failure::InvalidResult(reason)) = outcome else {
+    let Outcome::Failed(failure) = outcome else {
         return None;
     };
+    let reason = failure.refusal()?;
     if reason.len() <= MAX_RESULT_REFUSAL_BYTES {
-        return Some(reason.clone());
+        return Some(reason);
     }
     const CUT: &str = " [cut]";
     let mut end = MAX_RESULT_REFUSAL_BYTES - CUT.len();
@@ -1018,7 +1021,8 @@ impl OnDemand<'_> {
                 gathered.gate_failure.clone(),
                 &current,
             );
-            // Build's alone: the other roles' briefs never carry it.
+            // This command's own: the answer check's comes from the ticket
+            // ref, and the resolver's brief never carries one.
             brief.result_refusal = gathered.result_refusal.take();
             let ran = self.execute(p, self.executor, self.build, &brief, attempt, sink)?;
             if let Some(gate) = &ran.report.gate {
@@ -1253,6 +1257,7 @@ impl OnDemand<'_> {
             questions: questions.clone(),
             decider,
             verdicts: Vec::new(),
+            result_refusal: None,
         });
         if let Err(error) = self.store(p, state, asked) {
             return Stop::NotKept {
@@ -1501,27 +1506,27 @@ impl OnDemand<'_> {
             .decider
             .as_ref()
             .map_or(asked_of, |decider| person(decider, &p.found));
-        let brief = self.brief(p, Role::AnswerCheck, &comments, &[], None, &current);
+        let mut brief = self.brief(p, Role::AnswerCheck, &comments, &[], None, &current);
+        // Why the last check on this ask had its result refused, kept in
+        // the ticket ref whatever command ran it (OWL-184).
+        brief.result_refusal = questions
+            .latest()
+            .and_then(|ask| ask.result_refusal.clone());
         let executor = Executor {
             timeout: ANSWER_CHECK_TIMEOUT,
             ..self.executor.clone()
         };
         let ran = self.execute(p, &executor, self.answer_check, &brief, 1, sink)?;
-        let (event, result) = if ran.breaches.is_empty() {
-            answer_check::event(&ran.report.outcome)
+        let event = if ran.breaches.is_empty() {
+            answer_check::event(&ran.report.outcome).0
         } else {
-            (Event::Quarantined, None)
+            Event::Quarantined
         };
-        let verdicts: Vec<AnswerVerdict> = match (event, result) {
-            (Event::Answered | Event::Incomplete | Event::CounterQuestion, Some(result)) => {
-                // The answers this check read are judged: only a newer
-                // comment of the decider is a new answer. Its verdicts are
-                // kept with the ask they judge, for the round's RESUME.
-                questions.keep_check(read_through, &result.verdicts);
-                result.verdicts.clone()
-            }
-            _ => Vec::new(),
-        };
+        // Kept before the state moves, so a park keeps them too: the
+        // verdicts with the ask they judge, for the round's RESUME, and a
+        // refusal's reason for the next check.
+        let verdicts: Vec<AnswerVerdict> =
+            answer_check::keep(&mut questions, read_through, event, &ran.report.outcome);
         let next = match state.apply(PIPELINE, event) {
             Ok(Transition::To(next)) => next,
             Ok(Transition::Parked {
@@ -1629,6 +1634,7 @@ impl OnDemand<'_> {
                     questions: open.iter().map(|(question, _)| question.clone()).collect(),
                     decider: asked,
                     verdicts: Vec::new(),
+                    result_refusal: None,
                 });
                 self.store(p, &next, questions).map_err(|e| Stop::NotKept {
                     landed: Landed::Reask,
@@ -2730,6 +2736,9 @@ fn path(path: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use owlshift_core::decider::DeciderRule;
+    use owlshift_platform::confined::{ConfinedError, Refusal};
+
+    use crate::executor::Failure;
 
     use super::*;
 
@@ -2839,6 +2848,7 @@ mod tests {
                 by: DeciderRule::Assignee,
             },
             verdicts: Vec::new(),
+            result_refusal: None,
         };
         let decision = |minute: u32, id: &str, decided: &str| KeptDecision {
             at: at(minute),
@@ -2946,6 +2956,7 @@ mod tests {
                 by: DeciderRule::ZoneOwner,
             },
             verdicts: Vec::new(),
+            result_refusal: None,
         };
         // Round 1 went to the zone owner `bob`, round 2 to `tia`; the
         // ticket was since assigned to `ann`.
@@ -3101,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_refused_result_is_told_and_a_long_reason_is_cut() {
+    fn only_a_refused_result_or_artifact_is_told_and_a_long_reason_is_cut() {
         let refused = |reason: &str| Outcome::Failed(Failure::InvalidResult(reason.to_owned()));
         assert_eq!(
             result_refusal(&refused("question Q4 is out of order: expected Q1")).as_deref(),
@@ -3112,6 +3123,51 @@ mod tests {
             result_refusal(&Outcome::UsageLimit { resets_at: None }),
             None
         );
+
+        // An artifact the run named wrongly is told (OWL-184); one the
+        // runner could not read is not the run's to fix.
+        let artifact = |source| {
+            Outcome::Failed(Failure::Artifact(crate::artifact::ArtifactError {
+                field: "plan",
+                source,
+            }))
+        };
+        let plan = ".owlshift/run/plan.md";
+        let refused_as = |reason| ConfinedError::Refused {
+            relative: plan.to_owned(),
+            at: plan.to_owned(),
+            reason,
+        };
+        assert_eq!(
+            result_refusal(&artifact(refused_as(Refusal::NotFound))).as_deref(),
+            Some("artifact `plan`: `.owlshift/run/plan.md` does not exist")
+        );
+        for told in [
+            refused_as(Refusal::SymbolicLink),
+            refused_as(Refusal::NotADirectory),
+            refused_as(Refusal::NotARegularFile("directory")),
+            refused_as(Refusal::TooLarge(1024)),
+            refused_as(Refusal::HardLink(2)),
+            ConfinedError::InvalidPath {
+                relative: "../plan.md".to_owned(),
+            },
+        ] {
+            assert!(result_refusal(&artifact(told)).is_some());
+        }
+        for untold in [
+            refused_as(Refusal::Unlinked),
+            ConfinedError::InvalidRoot { root: "/".into() },
+            ConfinedError::Root {
+                root: "wt".into(),
+                reason: Refusal::NotFound,
+            },
+            ConfinedError::Io {
+                relative: plan.to_owned(),
+                source: io::Error::other("disk"),
+            },
+        ] {
+            assert_eq!(result_refusal(&artifact(untold)), None);
+        }
 
         // A two-byte character straddles the limit: the cut falls before it.
         let long = format!("unknown variant `{}`", "é".repeat(MAX_RESULT_REFUSAL_BYTES));

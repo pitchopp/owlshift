@@ -18,8 +18,9 @@ use crate::Role;
 /// field and the thread's `decision` entries (OWL-138); format 5 leaves the
 /// raising run's category out of `resolve` (OWL-144); format 6 adds the
 /// project's `always_human` categories (OWL-151); format 7 Build's
-/// `result_refusal` (OWL-180).
-pub const BRIEF_FORMAT: u32 = 7;
+/// `result_refusal` (OWL-180); format 8 gives it to the answer check too
+/// (OWL-184).
+pub const BRIEF_FORMAT: u32 = 8;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -34,9 +35,9 @@ pub const CLAIM_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).
 pub const TICKET_STATE_FORMAT: u32 = 2;
 /// The format version of a ticket's asks (`questions.json` on a ticket ref).
-/// Format 4 added the resolver's kept `decisions` (OWL-138); formats 2 and 3
-/// are still read.
-pub const QUESTIONS_FORMAT: u32 = 4;
+/// Format 4 added the resolver's kept `decisions` (OWL-138); format 5 an
+/// ask's `result_refusal` (OWL-184); formats 2 to 4 are still read.
+pub const QUESTIONS_FORMAT: u32 = 5;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

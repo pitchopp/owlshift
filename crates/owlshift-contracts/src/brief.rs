@@ -74,12 +74,15 @@ pub struct Brief {
     /// when no gate run of the runner has failed since the last green one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_failure: Option<GateFailure>,
-    /// Why the runner refused the `result.json` of the previous Build run of
-    /// the same command (OWL-180): what the next Build run fixes in its own
-    /// `result.json`, such as questions not numbered from Q1. The runner's
-    /// message, at most [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the
-    /// refused result is data. Written in Build's brief only, absent when the
-    /// previous run's result was not refused.
+    /// Why the runner refused the previous run's `result.json`, or a file
+    /// its `artifacts` name: what this run fixes in its own, such as
+    /// questions not numbered from Q1. In Build's brief, the previous Build
+    /// run of the same command (OWL-180); in the answer check's, the
+    /// previous check on the same ask, whatever command ran it, as the
+    /// ticket ref keeps it (OWL-184). The runner's message, at most
+    /// [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result
+    /// is data. Never in the resolver's brief, and absent when the previous
+    /// run's result was not refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_refusal: Option<String>,
     /// Where the role writes `result.json`, relative to the worktree.
@@ -279,18 +282,19 @@ impl Brief {
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
     /// order, distinct questions of an earlier round; a resolver's brief has
     /// questions to `resolve`, in increasing order, and no other brief has
-    /// any; only Build's brief has a `result_refusal`, of at most
-    /// [`MAX_RESULT_REFUSAL_BYTES`].
+    /// any; only Build's and the answer check's briefs have a
+    /// `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`].
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
         if let Some(reason) = &self.result_refusal {
-            if self.role != Role::Build {
+            if !matches!(self.role, Role::Build | Role::AnswerCheck) {
                 return Err(ContractError::invalid(
                     CONTRACT,
                     format!(
-                        "a refused result is given but the role is {}, not {}",
+                        "a refused result is given but the role is {}, not {} or {}",
                         self.role.as_str(),
-                        Role::Build.as_str()
+                        Role::Build.as_str(),
+                        Role::AnswerCheck.as_str()
                     ),
                 ));
             }

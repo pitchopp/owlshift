@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::Stage;
-use crate::brief::{ThreadEntry, validate_thread};
+use crate::brief::{MAX_RESULT_REFUSAL_BYTES, ThreadEntry, validate_thread};
 use crate::format::{
     self, CLAIM_FORMAT, ContractError, Format, QUESTIONS_FORMAT, TICKET_STATE_FORMAT,
 };
@@ -187,7 +187,8 @@ impl TryFrom<&PersistedState> for TicketState {
 /// The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each
 /// ask with the comment that posted it, so a brief's thread shows the ask in
 /// that comment's place, and its decider, and what the last answer check
-/// read; and the decisions the resolver took instead of asking.
+/// read, and why the last check's result was refused, when it was; and the
+/// decisions the resolver took instead of asking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift ticket questions")]
@@ -266,6 +267,13 @@ pub struct Ask {
     /// check gives them, and on an ask read from format 2.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verdicts: Vec<Verdict>,
+    /// Why the runner refused the `result.json` of the latest answer check
+    /// on this ask, or a file its `artifacts` name, when it did (format 5,
+    /// OWL-184): what the next check on it is told, in its brief's
+    /// `result_refusal`, whatever command runs it. Any other outcome of a
+    /// kept check clears it; at most [`MAX_RESULT_REFUSAL_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_refusal: Option<String>,
 }
 
 /// The decider of an ask.
@@ -322,9 +330,11 @@ impl TicketQuestions {
     }
 
     /// Parses `questions.json`. A format-2 document, written before the
-    /// asks kept their verdicts (OWL-123), and a format-3 one, written before
-    /// the resolver's decisions were kept (OWL-138), are read as format 4
-    /// with what they lack empty, and the next write gives them format 4.
+    /// asks kept their verdicts (OWL-123), a format-3 one, written before
+    /// the resolver's decisions were kept (OWL-138), and a format-4 one,
+    /// written before an ask kept its check's refusal (OWL-184), are read as
+    /// the current format with what they lack empty, and the next write
+    /// gives them the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -334,23 +344,34 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 or format-3 document read as format 4, or `None` for any
-    /// other. Each older format is a strict subset of the next.
+    /// A format-2, 3 or 4 document read as the current format, or `None`
+    /// for any other. Each older format is a strict subset of the next, so
+    /// a field a later format added is refused in it, whatever its value.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
-        let refused = match document.get("format").and_then(serde_json::Value::as_u64) {
-            Some(2) => document["asks"]
+        let format = document.get("format").and_then(serde_json::Value::as_u64)?;
+        if !(2..=4).contains(&format) {
+            return None;
+        }
+        let in_an_ask = |field: &str| {
+            document["asks"]
                 .as_array()
-                .is_some_and(|asks| asks.iter().any(|ask| ask.get("verdicts").is_some()))
-                .then_some("format 2 keeps no verdicts"),
-            Some(3) => document
-                .get("decisions")
-                .is_some()
-                .then_some("format 3 keeps no decisions"),
-            _ => return None,
+                .is_some_and(|asks| asks.iter().any(|ask| ask.get(field).is_some()))
         };
-        if let Some(reason) = refused {
-            return Some(Err(ContractError::invalid(Self::CONTRACT, reason)));
+        let refused = if format == 2 && in_an_ask("verdicts") {
+            Some("verdicts")
+        } else if format <= 3 && document.get("decisions").is_some() {
+            Some("decisions")
+        } else if in_an_ask("result_refusal") {
+            Some("refusal")
+        } else {
+            None
+        };
+        if let Some(field) = refused {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("format {format} keeps no {field}"),
+            )));
         }
         document["format"] = QUESTIONS_FORMAT.into();
         Some(
@@ -369,8 +390,10 @@ impl TicketQuestions {
     /// comment and its decider's account, its verdicts keep the rules of
     /// `result.json`'s and name questions of that ask, and the asks follow a
     /// brief thread's rules (rounds increase, a round's questions are
-    /// Q1..Qn, a re-ask names questions of an earlier round, in order); each
-    /// decision names its comment, a decision and a basis, in time order.
+    /// Q1..Qn, a re-ask names questions of an earlier round, in order), and a
+    /// kept refusal is not blank and at most [`MAX_RESULT_REFUSAL_BYTES`];
+    /// each decision names its comment, a decision and a basis, in time
+    /// order.
     pub fn validate(&self) -> Result<(), ContractError> {
         for (n, kept) in self.decisions.iter().enumerate() {
             let missing = if kept.comment.trim().is_empty() {
@@ -397,6 +420,25 @@ impl TicketQuestions {
                 "comment"
             } else if ask.decider.account.trim().is_empty() {
                 "decider"
+            } else if ask
+                .result_refusal
+                .as_ref()
+                .is_some_and(|r| r.trim().is_empty())
+            {
+                "refusal reason"
+            } else if ask
+                .result_refusal
+                .as_ref()
+                .is_some_and(|r| r.len() > MAX_RESULT_REFUSAL_BYTES)
+            {
+                return Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!(
+                        "an ask of round {} keeps a refusal reason over \
+                         {MAX_RESULT_REFUSAL_BYTES} bytes",
+                        ask.round
+                    ),
+                ));
             } else {
                 continue;
             };
@@ -448,6 +490,14 @@ impl TicketQuestions {
         self.checked_through = read_through.max(self.checked_through);
         if let Some(ask) = self.asks.last_mut() {
             ask.verdicts = verdicts.to_vec();
+        }
+    }
+
+    /// Keeps why the latest answer check's result was refused, on the latest
+    /// ask, for the next check on it; `None` clears it (OWL-184).
+    pub fn keep_refusal(&mut self, reason: Option<String>) {
+        if let Some(ask) = self.asks.last_mut() {
+            ask.result_refusal = reason;
         }
     }
 
