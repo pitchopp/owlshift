@@ -555,6 +555,14 @@ fn helper_replay() {
     }
 }
 
+/// How long the grandchild holds the output pipes open.
+const PIPE_HOLDER_SLEEP: Duration = Duration::from_secs(10);
+
+// The pipe-holder test's upper bound is `PIPE_HOLDER_SLEEP - EXIT_GRACE`: keep
+// it at least two grace periods above the lower bound, or the test could
+// never pass (and the subtraction could underflow).
+const _: () = assert!(PIPE_HOLDER_SLEEP.as_millis() >= 4 * EXIT_GRACE.as_millis());
+
 /// Starts a process that inherits stdout and outlives this one, then exits.
 #[test]
 #[ignore = "helper, run by the tests below"]
@@ -580,7 +588,7 @@ fn helper_leave_a_pipe_holder() {
 #[ignore = "helper, run by the tests below"]
 fn helper_sleep() {
     if helper_requested() {
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(PIPE_HOLDER_SLEEP);
     }
 }
 
@@ -641,11 +649,14 @@ fn drive_does_not_wait_for_a_process_holding_the_output_open() {
         "{:?}",
         run.outcome
     );
-    // The grandchild holds stdout and stderr open for 10 s. The helper exits
-    // right after starting it, so one grace period plus the helper's start-up
-    // is the bound; a second grace period spent on stderr or the prompt
-    // would reach it.
+    // The grandchild holds stdout and stderr open for `PIPE_HOLDER_SLEEP`. The
+    // helper exits right after starting it, so `drive` returns after one grace
+    // period. The upper bound is `PIPE_HOLDER_SLEEP - EXIT_GRACE` (8 s today): well
+    // above a run slowed by a loaded machine (4.6 s seen under a confined
+    // `cargo test --workspace`), and below the at least 10 s a `drive` that
+    // waited for the pipe holder would take. It catches that wait, not a second grace
+    // period spent on stderr or the prompt (that would add only 2 s).
     let elapsed = started.elapsed();
     assert!(elapsed >= EXIT_GRACE, "{elapsed:?}");
-    assert!(elapsed < 2 * EXIT_GRACE, "{elapsed:?}");
+    assert!(elapsed < PIPE_HOLDER_SLEEP - EXIT_GRACE, "{elapsed:?}");
 }
