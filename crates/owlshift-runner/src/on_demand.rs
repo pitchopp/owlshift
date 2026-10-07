@@ -61,8 +61,8 @@ use owlshift_adapters::forge::{Branch, CheckSet, CommitId, ErrorKind, PullReques
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, Checkpoint, GateFailure, MAX_RESULT_REFUSAL_BYTES, PermissionLevel,
-    Permissions, Relation, Rule, ThreadEntry, TicketBrief,
+    Author, Brief, Checkpoint, GateFailure, MAX_RESULT_REFUSAL_BYTES, PermissionLevel, Permissions,
+    Relation, Rule, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
@@ -88,8 +88,8 @@ use crate::agent_env::AgentEnv;
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
-    DEFAULT_GATE_TIMEOUT, Executor, Failure, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport,
-    RunSpec,
+    DEFAULT_GATE_TIMEOUT, Executor, Failure, Git, Harness, Outcome, RESULT_PATH, RUN_DIR,
+    RunReport, RunSpec,
 };
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::resolver::{self, Fallback, Resolved};
