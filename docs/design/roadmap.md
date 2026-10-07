@@ -55,7 +55,7 @@ The central bet, used by hand.
 - Resolver: discoverable questions decided and logged as reversible decisions; always-human categories enforced.
 - Being told a question is waiting: both, since check C4 passed (decision D8). Owlshift comments as a Linear app user, so Linear notifies the decider on the channels they chose there, and a local desktop notification tells the operator on their machine. Scenarios S2 and S7.
 
-**Exit gate.** Three tickets through at least two question rounds, one of them with an incomplete answer correctly re-asked.
+**Exit gate.** Three tickets through at least two question rounds, one of them with an incomplete answer correctly re-asked. Passed on 2026-10-07 (OWL-142); the runs are recorded in the [build plan](build-plan.md) ("P2 tasks & exit gate").
 
 ## P3 · Watch mode
 
