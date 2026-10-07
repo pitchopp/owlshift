@@ -518,6 +518,22 @@ fn a_gate_breaking_isolation_is_quarantined() {
     );
 }
 
+/// OWL-189: a `fixture` that is not a plain sibling folder name fails at
+/// setup, before anything runs.
+#[test]
+fn an_invalid_fixture_name_fails_at_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in ["", ".", "..", "../x", "a/b", "a\\b"] {
+        let file = dir.path().join("bad.toml");
+        std::fs::write(&file, format!("fixture = {bad:?}\n")).unwrap();
+        let error = play(&file, fake_harness()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("bad: invalid scenario: fixture \"{bad}\" is not a folder name"),
+        );
+    }
+}
+
 #[test]
 fn a_wrong_expectation_fails_and_names_the_step() {
     let wrong = r#"
