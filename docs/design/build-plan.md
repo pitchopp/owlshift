@@ -630,3 +630,40 @@ What the runs showed, each with its ticket:
 - A confined process cannot exec a setuid binary on macOS, whatever the profile allows: the project's own tests must not rely on one (OWL-110).
 - The gate runs on the host's platform only, so a change behind `cfg(target_os)` can pass it and fail CI elsewhere; `do` ends with the checks still running and nothing follows a red one. Roadmap P3 already plans a fix run on a red check (OWL-112).
 - The macOS Keychain asks twice per secret for an unsigned binary rebuilt by `cargo`, until "Always Allow" is chosen; it asks again after each rebuild.
+
+## P2 tasks & exit gate
+
+- [x] OWL-114, OWL-115, OWL-116 · Answer-check verdicts, the reply to a counter-question, the answer-check role (2026-10-02, [#98](https://github.com/pitchopp/owlshift/pull/98), [#107](https://github.com/pitchopp/owlshift/pull/107), [#102](https://github.com/pitchopp/owlshift/pull/102))
+- [x] OWL-33, OWL-124 · The decider: the assignee, else the zone owner, wired into the question flow (2026-10-02, [#103](https://github.com/pitchopp/owlshift/pull/103), [#108](https://github.com/pitchopp/owlshift/pull/108))
+- [x] OWL-122, OWL-123 · Questions on the ticket, the answer check from the command, RESUME and PARKED comments (2026-10-02, [#105](https://github.com/pitchopp/owlshift/pull/105), [#111](https://github.com/pitchopp/owlshift/pull/111))
+- [x] OWL-127, OWL-145 · `owlshift continue` and the quiet window, a per-project key (2026-10-03, [#117](https://github.com/pitchopp/owlshift/pull/117), [#119](https://github.com/pitchopp/owlshift/pull/119))
+- [x] OWL-128 · The reply to a counter-question posted on the ticket (2026-10-03, [#114](https://github.com/pitchopp/owlshift/pull/114))
+- [x] OWL-137, OWL-148 · The ticket's visible stage through a round, and a parked ticket's (2026-10-04, [#121](https://github.com/pitchopp/owlshift/pull/121), [#126](https://github.com/pitchopp/owlshift/pull/126))
+- [x] OWL-138, OWL-144, OWL-151 · The resolver before the decider, the floor and the project's always-human categories enforced (2026-10-04, [#118](https://github.com/pitchopp/owlshift/pull/118), [#122](https://github.com/pitchopp/owlshift/pull/122), [#123](https://github.com/pitchopp/owlshift/pull/123))
+- [x] OWL-139 · Late comments re-read before delivery (2026-10-04, [#124](https://github.com/pitchopp/owlshift/pull/124))
+- [x] OWL-140, OWL-157 · Telling a person a question waits: the desktop notification, the Linear app user (2026-10-04 and 2026-10-05, [#120](https://github.com/pitchopp/owlshift/pull/120), [#135](https://github.com/pitchopp/owlshift/pull/135))
+- [x] OWL-142 · The exit gate below (2026-10-07)
+
+The smaller P2 tickets (fixes, notes, tests) are in the Linear project "P2 · Questions on the ticket".
+
+- [x] **Exit gate.** Three tickets through at least two question rounds, one of them with an incomplete answer correctly re-asked. Passed on 2026-10-07 (OWL-142): OWL-175, OWL-178 and OWL-179 below.
+
+A round is what the term means everywhere in this design: one ask by a Build run, posted as `[owlshift] QUESTIONS · round N`. A re-ask and a reply to a counter-question stay inside their round (scenario S10: "Re-asks for an incomplete answer do not count as question rounds"). The test tickets listed their open points and asked for them to be decided on the ticket; the maintainer staged round 2: their answer to round 1 raised one new point and asked to be asked about it, which opened it. The re-ask and the counter-questions were not staged beyond the incomplete answer the ticket called for.
+
+**Runs, 2026-10-06 and 2026-10-07**, on the maintainer's machine (macOS 26.6.2, Claude Code 2.1.284, `claude-sonnet-5-5`), with `owlshift` built from `main` at `4f8e529`, every run based on that commit. No Linear app was stored, so Owlshift wrote through the maintainer's API key and the desktop notification was the only signal. Times and costs are the sum over each ticket's agent runs (answer checks included).
+
+- OWL-175 (CHANGELOG, the incomplete answer): round 1 asked three `scope` questions. The decider answered Q1 alone; the answer check classed Q2 and Q3 `unanswered` and the RE-ASK named those two only, noting that the closing `go` covered Q1 alone. The next answer settled them and raised a new point; the resumed Build asked it as `Q4`, which the runner refused ("question Q4 is out of order: expected Q1"), twice, and the ticket was parked (OWL-180). Restarted with `continue`, the Build asked it as round 2's `Q1`. Answered, delivered as [#143](https://github.com/pitchopp/owlshift/pull/143). 8 runs, 8.4 min, 0.78 USD.
+- OWL-178 (SECURITY.md): round 1 asked Q1 and Q2 as `security`, Q3 as `legal`. The decider asked back on Q3; the answer check classed it `counter_question` and the REPLY proposed a wording and asked Q3 again. Round 2 asked the decider's new point, answered, delivered as [#144](https://github.com/pitchopp/owlshift/pull/144). 6 runs, 7.9 min, 0.55 USD.
+- OWL-179 (README privacy note): round 1 asked two `scope` questions and a `legal` one, answered in full with a new point; round 2 asked it, answered, delivered as [#145](https://github.com/pitchopp/owlshift/pull/145). 5 runs, 7.9 min, 0.51 USD.
+- OWL-173 (`owlshift hello`), not counted: round 1's Q2 drew a counter-question and a REPLY, then the answer; delivered as [#142](https://github.com/pitchopp/owlshift/pull/142) after one round. 4 runs, 11.3 min, 0.46 USD.
+- OWL-174 (example configuration), not counted: the Build run asked nothing. It decided the ticket's three open points itself and listed them in the delivery report under "Decisions taken without a human"; delivered as [#141](https://github.com/pitchopp/owlshift/pull/141). Its first gate failed on a timing bound (OWL-177) and the retry passed. 2 runs, 8.7 min, 0.47 USD.
+- No guardrail breach: the agents committed locally only; the runner pushed, opened the five pull requests and wrote every comment and stage move; nothing was merged. No run recorded a warning event. The five pull requests are test deliveries, closed unmerged once recorded.
+
+What the runs showed, each with its ticket:
+
+- A ticket with no assignee and no zone is not run: `do` names the missing decider before anything starts. The test tickets were assigned to the maintainer.
+- The Build run may decide a ticket's explicit open points itself, matters of taste and scope included, so they reach neither the decider nor the resolver, and the floor never applies to them (OWL-176). The same wording on the other four tickets produced questions.
+- Round 2's numbering: after a round with a re-ask, a Build run continued the numbering (`Q4`), and its retry, not told why the first result was refused, did the same, parking the ticket (OWL-180).
+- `drive_does_not_wait_for_a_process_holding_the_output_open` failed once under the gate's load, 4.58 s against `2 * EXIT_GRACE` (OWL-177).
+- The desktop notification shows on macOS, which the operator could not confirm for OWL-140 on 2026-10-03: shown as Script Editor's, with the ticket and its link; a click opens Script Editor. Owlshift's icon and a click that opens the ticket wait for the P11 menu-bar app (OWL-181). The Linux side is still OWL-150.
+- An answer check takes 7 to 12 s and about 0.05 USD; a round's Build run that only asks, 16 to 27 s.
