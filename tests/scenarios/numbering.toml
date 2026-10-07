@@ -44,7 +44,7 @@ expect = { event = "answered", stage = "build", waiting = "none", round = 1, com
 [[step]]
 run = { result = "results/questions-round2-continued.json" }
 [step.expect]
-event = "run_failed"
+event = "result_refused"
 stage = "build"
 waiting = "none"
 round = 1

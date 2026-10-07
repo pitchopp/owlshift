@@ -99,7 +99,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 *A ticket that goes in circles does not burn a night of usage, and a subscription limit pauses work instead of breaking it.*
 
-- Three re-asks on the same round, or two failed runs, park the ticket with a *parked* comment giving the reason and what would restart it.
+- Three re-asks on the same round, or two failed runs, park the ticket with a *parked* comment giving the reason and what would restart it. A Build result the runner refuses never spends the last attempt: the next run is told why, and the ticket parks if that run fails too.
 - A harness that reports its usage limit is paused until the reset time it reports; its roles switch to their declared fallback meanwhile. With no fallback left, dispatch waits for the earliest reset and the operator is notified once.
 - A run interrupted by a usage limit resumes from its checkpoint after the reset; it is not counted as a failure.
 - `budget_usd` is a dollar cap on each run of a harness, not on a day's total, whatever the billing; Claude Code enforces it, Codex has no such option. A run stopped by it alone counts as a failed run.

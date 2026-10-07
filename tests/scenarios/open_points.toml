@@ -24,7 +24,7 @@ files = { "examples/owlshift.toml" = "# Every key, commented.\n" }
 commit = "Add the example configuration"
 result = "results/build-decided.json"
 [step.expect]
-event = "run_failed"
+event = "result_refused"
 stage = "build"
 failed_runs = 1
 tracker_stage = "In Progress"
