@@ -57,7 +57,7 @@ Ten concepts, owned by the product and independent of any tracker, harness or st
 | Ticket | A unit of work read from the tracker, admitted to the queue by a human gesture | Tracker |
 | Pipeline | A declarative sequence of stages a ticket goes through; a project ships variants (`trivial`, `standard`, `risky`) | Project config |
 | Stage | One step of a pipeline: a role to run, its entry condition, its exit contract, its gates | Project config |
-| Role | What a stage executes: a prompt, required capabilities (browser, network), a permission level (read-only, write in worktree) | Product, overridable per project |
+| Role | What a stage executes: a prompt, required capabilities (browser, network), a permission level (read-only, write in worktree) | Product; a project adds rules to it or overrides it |
 | Run | One execution of a role on one harness, in one worktree; returns a validated `result.json` and a measured cost | Runner, logged to git |
 | Gate | A point where a human decision may be needed: clarification, arbitration or approval | Ticket (questions and answers) |
 | Artifact | What a stage leaves for the next: plan, step ledger, review findings, delivery report | Git (dedicated refs) |
