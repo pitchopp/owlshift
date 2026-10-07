@@ -1,0 +1,15 @@
+{
+  "format": 5,
+  "status": "questions",
+  "summary": "Whether the README links to the greeting is not given.",
+  "questions": [
+    {
+      "id": "Q3",
+      "category": "scope",
+      "context": "The README lists the project's files; the ticket does not say whether the greeting joins them.",
+      "text": "Should the README link to the greeting?",
+      "options": ["Yes", "No"],
+      "recommendation": "No"
+    }
+  ]
+}
