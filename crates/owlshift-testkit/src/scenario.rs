@@ -25,7 +25,9 @@
 //! a park, and pushes the branch. It keeps the latest failure of the gate the executor
 //! runs after a Build `done`, and hands it to the next Build brief, as it
 //! hands the next Build run why the last one's `result.json` was refused
-//! (`owlshift_runner::on_demand::result_refusal`, OWL-180). That
+//! (`owlshift_runner::on_demand::result_refusal`, OWL-180), a refusal that
+//! never spends the last attempt when that run was not told of one
+//! (OWL-183). That
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
 //!
@@ -69,7 +71,7 @@
 //! - no intake, admission, claim or ticket ref; the pipeline is the project's
 //!   default variant, and the asks live in memory, not in the ticket ref;
 //! - a stage run's outcome maps onto the core event as `owlshift do` maps it
-//!   (`owlshift_runner::on_demand::core_event`), and no DELIVERY comment is
+//!   (`owlshift_runner::on_demand::stage_event`), and no DELIVERY comment is
 //!   written;
 //! - no bound on the runs in a row whose questions the resolver all decided
 //!   (`owlshift_core::state::MAX_RESOLVED_PASSES`), which `owlshift do` counts
@@ -104,7 +106,7 @@ use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check::{self, Readiness};
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
-use owlshift_runner::on_demand::{account_author, core_event, result_refusal, thread};
+use owlshift_runner::on_demand::{account_author, result_refusal, stage_event, thread};
 use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
     DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
@@ -621,7 +623,8 @@ impl Driver {
             .default_role()
             .ok_or_else(|| format!("no role runs at {}", name(&stage)))?;
         let report = self.execute(role, reply)?;
-        let (event, result) = core_event(&report.outcome);
+        let brief = self.last_brief.as_ref().ok_or("no brief")?;
+        let (event, result) = stage_event(&report.outcome, brief);
         let result = result.cloned();
         if let (Event::Questions, Some(result)) = (event, &result)
             && result.status != ResultStatus::PremiseFalse

@@ -914,6 +914,41 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
     assert_eq!(flags, [false, true, false, false]);
 }
 
+/// OWL-183: after a failed run, a refused result does not spend the last
+/// attempt: the next Build run is told why. That run's own refusal is a
+/// plain failed run, which parks the ticket, so refusals never loop.
+#[test]
+fn a_refused_result_never_spends_the_last_attempt() {
+    let bench = Bench::new(true);
+    let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, None),
+            bench.reply(None, Some(&misnumbered)),
+            bench.reply(None, Some(&misnumbered)),
+        ],
+        None,
+    );
+    let stop = outcome.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&stop, Stop::Parked { reason: ParkReason::FailedRuns, detail, .. } if detail.contains("out of order")),
+        "{stop:?}\n{printed}"
+    );
+    let told: Vec<(Role, bool)> = bench
+        .briefs()
+        .iter()
+        .map(|brief| (brief.role, brief.result_refusal.is_some()))
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (Role::Build, false),
+            (Role::Build, false),
+            (Role::Build, true)
+        ]
+    );
+}
+
 /// The brief of the first run, and its ticket author's relation: the brief
 /// tells the agent whether the ticket text is the decider's instruction or
 /// quoted data.

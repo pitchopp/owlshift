@@ -73,6 +73,16 @@ fn numbering() {
     }
 }
 
+/// OWL-183's acceptance: with a failed answer check already counted at
+/// Build, a refused Build result does not park the ticket, and the next
+/// Build run, told why, opens round 2 with Q1.
+#[test]
+fn last_attempt() {
+    if let Err(error) = play(&scenarios().join("last_attempt.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-138's acceptance, in the stand-in driver: a discoverable question is
 /// decided and the round holds the always-human one alone; a run whose
 /// questions are all decided goes on without a round.
@@ -195,7 +205,7 @@ fn a_second_failed_run_parks_the_ticket_with_a_parked_comment() {
         author = "owlshift"
         first_line = "[owlshift] PARKED"
         contains = [
-          "Parked: a second run failed. The last failure: ",
+          "Parked: a run failed again, with no attempt left. The last failure: ",
           "**To restart it:** run `owlshift do DEMO-1` to run it again.",
         ]
         "#,

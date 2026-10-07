@@ -201,6 +201,23 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
     }
 }
 
+/// The core event of a stage run's outcome, given the brief it ran with, for
+/// `owlshift do` and the scenarios' stand-in driver alike: as [`core_event`],
+/// except that a Build run whose `result.json` was refused, and whose brief
+/// told it of no earlier refusal, is [`Event::ResultRefused`] (OWL-183). Its
+/// count never parks the ticket, since the next Build run is told why; a run
+/// that was told and fails is a plain failed run, so refusals never loop.
+pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'a RunResult>) {
+    match outcome {
+        Outcome::Failed(Failure::InvalidResult(_))
+            if brief.role == Role::Build && brief.result_refusal.is_none() =>
+        {
+            (Event::ResultRefused, None)
+        }
+        _ => core_event(outcome),
+    }
+}
+
 /// What the next Build run of the same command is told of a run's outcome
 /// (OWL-180): why its `result.json` was refused, cut to
 /// [`MAX_RESULT_REFUSAL_BYTES`] on a character boundary, its beginning
@@ -968,7 +985,8 @@ impl OnDemand<'_> {
     }
 
     /// Runs Build from `state` until it delivers or stops: a failed run gets
-    /// one more run before the core parks the ticket, questions open a round.
+    /// one more run before the core parks the ticket, and a refused result
+    /// never spends that last run ([`stage_event`]); questions open a round.
     fn build(
         &self,
         p: &mut Prepared,
@@ -980,7 +998,11 @@ impl OnDemand<'_> {
         self.keep(p, &state)?;
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
-        // Runs in a row whose questions the resolver all decided.
+        // Runs in a row whose questions the resolver all decided. Neither
+        // this count nor `integrating` below is reset in a command: they also
+        // bound the refused results kept from the last attempt, each followed
+        // by a told run that parks, stops, delivers, or goes on through one
+        // of them (OWL-183).
         let mut settled = 0u32;
         // The late comments a Build run of this command was given to
         // integrate (OWL-139): one such run per delivery.
@@ -1006,7 +1028,7 @@ impl OnDemand<'_> {
             // only, whatever that run's outcome.
             gathered.result_refusal = result_refusal(&ran.report.outcome);
             let (event, result) = if ran.breaches.is_empty() {
-                core_event(&ran.report.outcome)
+                stage_event(&ran.report.outcome, &brief)
             } else {
                 (Event::Quarantined, None)
             };

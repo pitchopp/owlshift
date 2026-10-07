@@ -786,7 +786,7 @@ impl ParkedComment {
 /// what `owlshift do` and `owlshift continue` print say it the same way.
 pub fn park_reason(reason: ParkReason) -> &'static str {
     match reason {
-        ParkReason::FailedRuns => "a second run failed",
+        ParkReason::FailedRuns => "a run failed again, with no attempt left",
         ParkReason::Reasks => "the answers stayed incomplete",
         ParkReason::Blocked => "the run is blocked",
         ParkReason::IsolationBreach => "the run broke isolation and is quarantined",
@@ -1637,7 +1637,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                     Restart::Continue,
                 ),
                 vec![
-                    "Parked: a second run failed. The last failure: the project gate failed: \
+                    "Parked: a run failed again, with no attempt left. The last failure: the project gate failed: \
                      cargo test: exit status 101",
                     continue_it,
                 ],

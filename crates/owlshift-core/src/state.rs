@@ -12,7 +12,8 @@ use std::fmt;
 use crate::pipeline::Pipeline;
 use crate::vocab::{AnswerClass, Stage};
 
-/// Failed runs in one stage that park the ticket: the second one does.
+/// Failed runs in one stage that park the ticket: the second one does. A
+/// refused Build result never brings the count there ([`Event::ResultRefused`]).
 pub const MAX_FAILED_RUNS: u32 = 2;
 
 /// Re-asks of one question round before the ticket parks: an answer still
@@ -90,7 +91,8 @@ impl Status {
 /// | The answer check found every question answered | `Answered` |
 /// | The answer check found questions left open (they are re-asked) | `Incomplete` |
 /// | The decider asked a counter-question (answered in the thread) | `CounterQuestion` |
-/// | A run returned `failed` or no valid `result.json`, whatever its exit code; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
+/// | A run returned `failed` or no valid `result.json`, whatever its exit code, save the row below; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
+/// | A Build run's `result.json` was refused, and the run had not been told of a refused result: the next Build run will be | `ResultRefused` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A human restarted a parked ticket | `Restarted` |
@@ -111,6 +113,15 @@ pub enum Event {
     Incomplete,
     CounterQuestion,
     RunFailed,
+    /// A failed run that never spends the stage's last attempt (OWL-183):
+    /// it counts as [`Event::RunFailed`] below the last attempt, and at the
+    /// last attempt leaves the ticket as it is, so the next Build run,
+    /// told why the result was refused, gets that attempt. Only Build's
+    /// brief carries that reason, so it is valid at Build alone. The bound
+    /// is the runner's to keep: it gives this event only for a run that was
+    /// not itself told of a refused result, so that of two refusals in a
+    /// row, the second is a `RunFailed`.
+    ResultRefused,
     Interrupted,
     Quarantined,
     Restarted,
@@ -120,7 +131,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -130,6 +141,7 @@ impl Event {
         Self::Incomplete,
         Self::CounterQuestion,
         Self::RunFailed,
+        Self::ResultRefused,
         Self::Interrupted,
         Self::Quarantined,
         Self::Restarted,
@@ -174,7 +186,8 @@ impl Event {
 /// Why a ticket was parked; the parked comment says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ParkReason {
-    /// A second run failed in the same stage.
+    /// A run failed in a stage with no attempt left: the second failed run
+    /// counted there.
     FailedRuns,
     /// The answer was still incomplete after three re-asks.
     Reasks,
@@ -380,6 +393,13 @@ impl TicketState {
                     })
                 }
             }
+            (Status::Active(Stage::Build), Event::ResultRefused) => {
+                let failed_runs = (self.failed_runs + 1).min(MAX_FAILED_RUNS - 1);
+                Transition::To(Self {
+                    failed_runs,
+                    ..*self
+                })
+            }
             // A usage limit is not a failure: the run resumes after the reset.
             (status, Event::Interrupted) if status.runs() => Transition::To(*self),
             (status, Event::Quarantined) if status.runs() => {
@@ -565,6 +585,7 @@ mod tests {
             (Status::Active(stage), Event::RunFailed | Event::Interrupted) if stage != Ready => {
                 Expect::To(status)
             }
+            (Status::Active(Build), Event::ResultRefused) => Expect::To(status),
             (Status::Active(stage), Event::Quarantined) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::IsolationBreach)
             }
@@ -748,6 +769,16 @@ mod tests {
                 awaiting_input: false
             }
         );
+    }
+
+    #[test]
+    fn a_refused_result_counts_but_never_spends_the_last_attempt() {
+        let build = state(Status::Active(Stage::Build), 1, 0, 0);
+        let refused = to(build.apply(STANDARD, Event::ResultRefused));
+        assert_eq!(refused, state(Status::Active(Stage::Build), 1, 0, 1));
+        // At the last attempt, it leaves the ticket as it is: the next run,
+        // told why, gets that attempt.
+        assert_eq!(to(refused.apply(STANDARD, Event::ResultRefused)), refused);
     }
 
     #[test]
