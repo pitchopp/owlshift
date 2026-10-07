@@ -1,16 +1,18 @@
 # OWL-183's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
-# Its fixture folder is last_attempt/: the project in repo/, prepared results
-# in results/.
+# It plays on the numbering/ fixture folder (the project in repo/, prepared
+# results/): the three results with q1-only or q2 or q1 in their names are its
+# own.
 
+fixture = "numbering"
 description = """
-DEMO-6 with a failed run already counted when its Build result is refused.
+DEMO-4 with a failed run already counted when its Build result is refused.
 Round 1 asks Q1. The first answer check crashes, a failed run counted at Build,
 the stage it returns to; the second resumes Build. The Build run that follows
 goes on from the thread's numbering and asks its one question as Q2: its result
 is refused at the stage's last attempt. A refused result never spends that
 attempt: nothing is posted or parked, the count stays, and the next Build run,
 told why in its brief, opens round 2 with Q1."""
-ticket = "DEMO-6"
+ticket = "DEMO-4"
 start = "2026-10-07T10:00:00Z"
 
 [[step]]
@@ -18,7 +20,7 @@ dispatch = true
 expect = { event = "dispatched", stage = "build" }
 
 [[step]]
-run = { result = "results/questions-round1.json" }
+run = { result = "results/questions-round1-q1-only.json" }
 expect = { event = "questions", round = 1, failed_runs = 0, comments = 1 }
 
 [[step]]
@@ -29,7 +31,7 @@ answer = { stderr = "fatal: out of memory\n", exit_code = 101 }
 expect = { event = "run_failed", waiting = "needs_input", round = 1, failed_runs = 1, comments = 2 }
 
 [[step]]
-answer = { result = "results/check-round1-answered.json" }
+answer = { result = "results/check-round1-q1-answered.json" }
 [step.expect]
 event = "answered"
 stage = "build"
@@ -41,7 +43,7 @@ last_comment = { first_line = "[owlshift] RESUME · round 1" }
 
 # One failed run counted: this refusal would be the second.
 [[step]]
-run = { result = "results/questions-round2-continued.json" }
+run = { result = "results/questions-round2-continued-q2.json" }
 [step.expect]
 event = "result_refused"
 stage = "build"
