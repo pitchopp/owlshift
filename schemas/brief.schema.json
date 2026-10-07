@@ -29,7 +29,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 6
+      "const": 7
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands a role runs, in order, from the worktree root, before it\ndelivers. The runner is its only author; an empty list means the\nproject has no gate.",
@@ -74,6 +74,13 @@
     "result_path": {
       "description": "Where the role writes `result.json`, relative to the worktree.",
       "$ref": "#/$defs/RelativePath"
+    },
+    "result_refusal": {
+      "description": "Why the runner refused the `result.json` of the previous Build run of\nthe same command (OWL-180): what the next Build run fixes in its own\n`result.json`, such as questions not numbered from Q1. The runner's\nmessage, at most [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the\nrefused result is data. Written in Build's brief only, absent when the\nprevious run's result was not refused.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "role": {
       "$ref": "#/$defs/Role"

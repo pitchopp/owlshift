@@ -14,6 +14,11 @@ use crate::result::{Question, check_question_order, first_not_ascending};
 
 const CONTRACT: &str = "brief";
 
+/// The most bytes of [`Brief::result_refusal`]: the runner cuts a longer
+/// reason, which can quote a whole string of the refused result, and keeps
+/// its beginning.
+pub const MAX_RESULT_REFUSAL_BYTES: usize = 2048;
+
 /// The brief of one run, written by the runner before it launches the role.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +74,14 @@ pub struct Brief {
     /// when no gate run of the runner has failed since the last green one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_failure: Option<GateFailure>,
+    /// Why the runner refused the `result.json` of the previous Build run of
+    /// the same command (OWL-180): what the next Build run fixes in its own
+    /// `result.json`, such as questions not numbered from Q1. The runner's
+    /// message, at most [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the
+    /// refused result is data. Written in Build's brief only, absent when the
+    /// previous run's result was not refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_refusal: Option<String>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
 }

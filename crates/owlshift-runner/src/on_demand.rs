@@ -2064,6 +2064,7 @@ impl OnDemand<'_> {
                 Vec::new()
             },
             gate_failure,
+            result_refusal: None,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }
     }

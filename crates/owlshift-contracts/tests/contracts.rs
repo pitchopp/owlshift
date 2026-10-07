@@ -677,8 +677,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(7)),
+        parse(|v| v["format"] = json!(8)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 6, before the brief carried the refusal of the previous result",
+        parse(|v| v["format"] = json!(6)),
+        "unknown format 6",
     );
     rejects(
         "format 5, before the brief carried the project's always-human categories",

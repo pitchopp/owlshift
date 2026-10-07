@@ -17,8 +17,9 @@ use crate::Role;
 /// The format version of the brief. Format 4 added the resolver's `resolve`
 /// field and the thread's `decision` entries (OWL-138); format 5 leaves the
 /// raising run's category out of `resolve` (OWL-144); format 6 adds the
-/// project's `always_human` categories (OWL-151).
-pub const BRIEF_FORMAT: u32 = 6;
+/// project's `always_human` categories (OWL-151); format 7 Build's
+/// `result_refusal` (OWL-180).
+pub const BRIEF_FORMAT: u32 = 7;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144).

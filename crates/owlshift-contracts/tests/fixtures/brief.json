@@ -1,5 +1,5 @@
 {
-  "format": 6,
+  "format": 7,
   "role": "build",
   "project": "owlshift",
   "ticket": {
@@ -90,5 +90,6 @@
     "output": "test logs::prints_oldest_first ... FAILED\n",
     "truncated": false
   },
+  "result_refusal": "invalid result.json: question Q4 is out of order: expected Q1",
   "result_path": ".owlshift/result.json"
 }

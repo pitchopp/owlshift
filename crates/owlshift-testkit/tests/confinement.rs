@@ -198,6 +198,7 @@ fn brief() -> Brief {
         gate: Vec::new(),
         always_human: Vec::new(),
         gate_failure: None,
+        result_refusal: None,
         result_path: RelativePath::new("result.json").unwrap(),
     }
 }
