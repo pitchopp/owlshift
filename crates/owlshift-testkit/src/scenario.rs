@@ -320,7 +320,7 @@ fn is_folder_name(name: &str) -> bool {
     matches!(
         (components.next(), components.next()),
         (Some(std::path::Component::Normal(_)), None)
-    ) && !name.contains(['/', '\\'])
+    ) && !name.contains(['/', '\\', ':'])
 }
 
 /// Only the `fixture` key of a scenario file; a file that does not parse is

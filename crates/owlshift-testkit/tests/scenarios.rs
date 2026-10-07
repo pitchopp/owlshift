@@ -523,7 +523,7 @@ fn a_gate_breaking_isolation_is_quarantined() {
 #[test]
 fn an_invalid_fixture_name_fails_at_setup() {
     let dir = tempfile::tempdir().unwrap();
-    for bad in ["", ".", "..", "../x", "a/b", "a\\b"] {
+    for bad in ["", ".", "..", "../x", "a/b", "a/", "a\\b", "C:"] {
         let file = dir.path().join("bad.toml");
         std::fs::write(&file, format!("fixture = {bad:?}\n")).unwrap();
         let error = play(&file, fake_harness()).unwrap_err();
