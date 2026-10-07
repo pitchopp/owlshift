@@ -61,8 +61,8 @@ use owlshift_adapters::forge::{Branch, CheckSet, CommitId, ErrorKind, PullReques
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, Relation, Rule,
-    ThreadEntry, TicketBrief,
+    Author, Brief, Checkpoint, GateFailure, MAX_RESULT_REFUSAL_BYTES, PermissionLevel, Permissions,
+    Relation, Rule, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
@@ -88,7 +88,8 @@ use crate::agent_env::AgentEnv;
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
-    DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport, RunSpec,
+    DEFAULT_GATE_TIMEOUT, Executor, Failure, Git, Harness, Outcome, RESULT_PATH, RUN_DIR,
+    RunReport, RunSpec,
 };
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::resolver::{self, Fallback, Resolved};
@@ -198,6 +199,26 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
         Outcome::Failed(_) => (Event::RunFailed, None),
         Outcome::Quarantined(_) => (Event::Quarantined, None),
     }
+}
+
+/// What the next Build run of the same command is told of a run's outcome
+/// (OWL-180): why its `result.json` was refused, cut to
+/// [`MAX_RESULT_REFUSAL_BYTES`] on a character boundary, its beginning
+/// kept. `None` for any other outcome. A result holding the harness's login
+/// is a credential failure, never a refusal, so the reason never quotes it.
+pub fn result_refusal(outcome: &Outcome) -> Option<String> {
+    let Outcome::Failed(Failure::InvalidResult(reason)) = outcome else {
+        return None;
+    };
+    if reason.len() <= MAX_RESULT_REFUSAL_BYTES {
+        return Some(reason.clone());
+    }
+    const CUT: &str = " [cut]";
+    let mut end = MAX_RESULT_REFUSAL_BYTES - CUT.len();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}{CUT}", &reason[..end]))
 }
 
 /// This machine's clock, the one [`OnDemand::clock`] reads outside tests.
@@ -561,6 +582,9 @@ fn awaits_input(state: &TicketState) -> bool {
 #[derive(Default)]
 struct Gathered {
     gate_failure: Option<GateFailure>,
+    /// Why the last run's `result.json` was refused, for the next Build
+    /// brief only ([`result_refusal`]).
+    result_refusal: Option<String>,
     decisions: Vec<Decision>,
     followups: Vec<Followup>,
 }
@@ -963,7 +987,7 @@ impl OnDemand<'_> {
         let report = loop {
             attempt += 1;
             let comments = self.comments(&p.ticket)?;
-            let brief = self.brief(
+            let mut brief = self.brief(
                 p,
                 Role::Build,
                 &comments,
@@ -971,10 +995,15 @@ impl OnDemand<'_> {
                 gathered.gate_failure.clone(),
                 &current,
             );
+            // Build's alone: the other roles' briefs never carry it.
+            brief.result_refusal = gathered.result_refusal.take();
             let ran = self.execute(p, self.executor, self.build, &brief, attempt, sink)?;
             if let Some(gate) = &ran.report.gate {
                 gathered.gate_failure = gate.failure.clone();
             }
+            // Set before any `continue` below, so it reaches the next run
+            // only, whatever that run's outcome.
+            gathered.result_refusal = result_refusal(&ran.report.outcome);
             let (event, result) = if ran.breaches.is_empty() {
                 core_event(&ran.report.outcome)
             } else {
@@ -1848,6 +1877,7 @@ impl OnDemand<'_> {
                 ("run_dir", path(&run_dir)),
                 ("resumes_plan", json!(brief.checkpoint.is_some())),
                 ("gate_failure", json!(brief.gate_failure.is_some())),
+                ("result_refusal", json!(brief.result_refusal.is_some())),
             ]),
         );
         // The brief leaves a malformed `zone:` label out (`brief` takes the
@@ -2064,6 +2094,7 @@ impl OnDemand<'_> {
                 Vec::new()
             },
             gate_failure,
+            result_refusal: None,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }
     }
@@ -3044,5 +3075,26 @@ mod tests {
         let (second, path) = new_run_dir(dir.path()).unwrap();
         assert_ne!(first, second);
         assert!(path.is_dir());
+    }
+
+    #[test]
+    fn only_a_refused_result_is_told_and_a_long_reason_is_cut() {
+        let refused = |reason: &str| Outcome::Failed(Failure::InvalidResult(reason.to_owned()));
+        assert_eq!(
+            result_refusal(&refused("question Q4 is out of order: expected Q1")).as_deref(),
+            Some("question Q4 is out of order: expected Q1")
+        );
+        assert_eq!(result_refusal(&Outcome::Failed(Failure::NoResult)), None);
+        assert_eq!(
+            result_refusal(&Outcome::UsageLimit { resets_at: None }),
+            None
+        );
+
+        // A two-byte character straddles the limit: the cut falls before it.
+        let long = format!("unknown variant `{}`", "é".repeat(MAX_RESULT_REFUSAL_BYTES));
+        let told = result_refusal(&refused(&long)).unwrap();
+        assert!(told.len() <= MAX_RESULT_REFUSAL_BYTES, "{}", told.len());
+        assert!(told.starts_with("unknown variant `é"));
+        assert!(told.ends_with("é [cut]"), "{told}");
     }
 }

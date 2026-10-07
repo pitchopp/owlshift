@@ -63,6 +63,16 @@ fn reask() {
     }
 }
 
+/// OWL-180's acceptance: after a round with a re-ask, a Build run that goes
+/// on from the thread's numbering is refused, and its retry, told why, opens
+/// round 2 with Q1.
+#[test]
+fn numbering() {
+    if let Err(error) = play(&scenarios().join("numbering.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-138's acceptance, in the stand-in driver: a discoverable question is
 /// decided and the round holds the always-human one alone; a run whose
 /// questions are all decided goes on without a round.

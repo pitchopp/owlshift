@@ -1,0 +1,8 @@
+{
+  "format": 5,
+  "status": "done",
+  "summary": "The decider settled the sign-off.",
+  "verdicts": [
+    { "question": "Q2", "class": "answered", "reason": "\"Hello, reader.\" with no sign-off." }
+  ]
+}

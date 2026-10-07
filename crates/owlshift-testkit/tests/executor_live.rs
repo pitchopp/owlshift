@@ -96,6 +96,7 @@ fn a_real_role_runs_through_the_executor() {
         gate: Vec::new(),
         always_human: Vec::new(),
         gate_failure: None,
+        result_refusal: None,
         result_path: RelativePath::new("result.json").unwrap(),
     };
     let spec = RunSpec {

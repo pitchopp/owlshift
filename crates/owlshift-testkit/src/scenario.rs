@@ -23,7 +23,9 @@
 //! the same core events as `owlshift do` and `continue`, through the same
 //! Writer (`owlshift_runner::writer::VisibleStage::after`), and to parked on
 //! a park, and pushes the branch. It keeps the latest failure of the gate the executor
-//! runs after a Build `done`, and hands it to the next Build brief. That
+//! runs after a Build `done`, and hands it to the next Build brief, as it
+//! hands the next Build run why the last one's `result.json` was refused
+//! (`owlshift_runner::on_demand::result_refusal`, OWL-180). That
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
 //!
@@ -102,7 +104,7 @@ use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check::{self, Readiness};
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
-use owlshift_runner::on_demand::{account_author, core_event, thread};
+use owlshift_runner::on_demand::{account_author, core_event, result_refusal, thread};
 use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
     DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
@@ -223,6 +225,9 @@ pub struct Expect {
     /// The gate failure the last brief carried: `none`, or a text its
     /// command, reason or output contains.
     pub brief_gate_failure: Option<String>,
+    /// The refusal of the previous result the last brief carried: `none`,
+    /// or a text it contains.
+    pub brief_result_refusal: Option<String>,
     /// The commands of the gate the step's run passed.
     pub gate_passed: Option<Vec<String>>,
 }
@@ -382,6 +387,9 @@ struct Driver {
     /// The latest failure of the gate the executor ran, for the next Build
     /// brief; a passing gate clears it, other outcomes leave it.
     gate_failure: Option<GateFailure>,
+    /// Why the last Build run's `result.json` was refused, for the next
+    /// Build brief only; any other outcome of a Build run clears it.
+    result_refusal: Option<String>,
     executor: Executor,
     id: TicketId,
     branch: String,
@@ -493,6 +501,7 @@ impl Driver {
             resolving: Vec::new(),
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             gate_failure: None,
+            result_refusal: None,
             branch: format!("owlshift/{}", scenario.ticket),
             id: scenario.ticket.clone(),
             state,
@@ -929,6 +938,9 @@ impl Driver {
         if let Some(gate) = &report.gate {
             self.gate_failure = gate.failure.clone();
         }
+        if role == Role::Build {
+            self.result_refusal = result_refusal(&report.outcome);
+        }
         if report.exit_code == Some(OWN_FAILURE) {
             self.last_run = Some(report);
             return Err("the fake harness could not do what the reply says".to_owned());
@@ -1003,6 +1015,11 @@ impl Driver {
             },
             gate_failure: if role == Role::Build {
                 self.gate_failure.clone()
+            } else {
+                None
+            },
+            result_refusal: if role == Role::Build {
+                self.result_refusal.clone()
             } else {
                 None
             },
@@ -1226,6 +1243,17 @@ impl Driver {
                 .ok_or("expected a brief, found none")?;
             gate_failure_is("brief_gate_failure", expected, brief.gate_failure.as_ref())?;
         }
+        if let Some(expected) = &expect.brief_result_refusal {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            none_or_containing(
+                "brief_result_refusal",
+                expected,
+                brief.result_refusal.as_deref(),
+            )?;
+        }
         if let Some(expected) = &expect.gate_passed {
             let gate = self
                 .last_run
@@ -1273,29 +1301,32 @@ fn left(raised: &[Question], decided: &[owlshift_contracts::ids::QuestionId]) ->
         .collect()
 }
 
-/// Checks a gate failure against `none` or a text it contains.
+/// Checks a gate failure against `none` or a text its command, reason or
+/// output contains.
 fn gate_failure_is(field: &str, expected: &str, found: Option<&GateFailure>) -> Result<(), String> {
+    let text = found.map(|failure| {
+        format!(
+            "{} {} {}",
+            failure.command.as_deref().unwrap_or_default(),
+            failure.reason,
+            failure.output
+        )
+    });
+    none_or_containing(field, expected, text.as_deref())
+}
+
+/// Checks a text against `none` or a text it contains.
+fn none_or_containing(field: &str, expected: &str, found: Option<&str>) -> Result<(), String> {
     match (expected, found) {
         ("none", None) => Ok(()),
-        ("none", Some(failure)) => Err(format!("expected {field} none, found {failure:?}")),
+        ("none", Some(text)) => Err(format!("expected {field} none, found {text:?}")),
         (_, None) => Err(format!(
             "expected {field} containing {expected:?}, found none"
         )),
-        (_, Some(failure)) => {
-            let text = format!(
-                "{} {} {}",
-                failure.command.as_deref().unwrap_or_default(),
-                failure.reason,
-                failure.output
-            );
-            if text.contains(expected) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "expected {field} containing {expected:?}, found {failure:?}"
-                ))
-            }
-        }
+        (_, Some(text)) if text.contains(expected) => Ok(()),
+        (_, Some(text)) => Err(format!(
+            "expected {field} containing {expected:?}, found {text:?}"
+        )),
     }
 }
 

@@ -1,0 +1,70 @@
+# OWL-180's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
+# Its fixture folder is numbering/: the project in repo/, prepared results in
+# results/. A copy of the re-ask scenario's first round, kept apart because
+# that scenario's failed answer check in round 2 would park a ticket that
+# already counts this scenario's failed run.
+
+description = """
+DEMO-4 through a round with a re-ask, then round 2. Round 1 asks Q1 and Q2;
+the decider answers Q1 and half of Q2, a RE-ASK asks Q2 alone, and their answer
+settles it. The Build run that follows goes on from the thread's numbering and
+asks its one question as Q3: its result is refused, a failed run, and nothing is
+posted. The next Build run is told why in its brief, asks the same question as
+Q1, and round 2 opens with Q1."""
+ticket = "DEMO-4"
+start = "2026-10-07T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+run = { result = "results/questions-round1.json" }
+expect = { event = "questions", round = 1, comments = 1 }
+
+[[step]]
+comment = { author = "maintainer", body = "Q1: English.\nQ2: \"Hello, reader.\"\n" }
+
+[[step]]
+answer = { result = "results/check-round1-q2-partial.json" }
+[step.expect]
+event = "incomplete"
+reasks = 1
+comments = 3
+last_comment = { first_line = "[owlshift] RE-ASK · round 1", contains = ["**Q2** (scope)"] }
+
+[[step]]
+comment = { author = "maintainer", body = "Q2: no sign-off, just \"Hello, reader.\"\n" }
+
+[[step]]
+answer = { result = "results/check-round1-q2-answered.json" }
+expect = { event = "answered", stage = "build", waiting = "none", round = 1, comments = 5 }
+
+# The thread's latest ask is the re-ask of Q2: the run goes on from it.
+[[step]]
+run = { result = "results/questions-round2-continued.json" }
+[step.expect]
+event = "run_failed"
+stage = "build"
+waiting = "none"
+round = 1
+failed_runs = 1
+tracker_stage = "In Progress"
+comments = 5
+brief_latest_ask = ["Q2"]
+brief_result_refusal = "none"
+
+[[step]]
+run = { result = "results/questions-round2.json" }
+[step.expect]
+event = "questions"
+waiting = "needs_input"
+round = 2
+tracker_stage = "Needs Input"
+comments = 6
+brief_result_refusal = "question Q3 is out of order: expected Q1"
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] QUESTIONS · round 2"
+contains = ["**Q1** (scope) Should the README link to the greeting?"]
+lacks = ["**Q3**"]

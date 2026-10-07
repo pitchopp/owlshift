@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use owlshift_contracts::ContractError;
-use owlshift_contracts::brief::{Brief, ThreadEntry};
+use owlshift_contracts::brief::{Brief, MAX_RESULT_REFUSAL_BYTES, ThreadEntry};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
 use owlshift_contracts::event::Event;
@@ -385,7 +385,15 @@ fn result_rejections() {
 /// each question of the thread's latest ask (OWL-23).
 #[test]
 fn result_against_the_brief() {
-    let brief = |edit: fn(&mut Value)| Brief::parse(&edited("brief.json", edit)).unwrap();
+    // The fixture is Build's brief: an answer check's carries no refused
+    // result.
+    let brief = |edit: fn(&mut Value)| {
+        let input = edited("brief.json", |v| {
+            v.as_object_mut().unwrap().remove("result_refusal");
+            edit(v);
+        });
+        Brief::parse(&input).unwrap()
+    };
     let answer_check = brief(|v| v["role"] = json!("answer_check"));
     let checked =
         |edit: fn(&mut Value)| RunResult::parse(&edited("result-answer-check.json", edit)).unwrap();
@@ -472,6 +480,7 @@ fn resolutions_against_the_brief() {
             &edited("brief.json", |v| {
                 v["role"] = json!("resolver");
                 v["permissions"]["level"] = json!("read_only");
+                v.as_object_mut().unwrap().remove("result_refusal");
             })
             .replace(
                 "\"role\":\"resolver\"",
@@ -677,8 +686,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(7)),
+        parse(|v| v["format"] = json!(8)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 6, before the brief carried the refusal of the previous result",
+        parse(|v| v["format"] = json!(6)),
+        "unknown format 6",
     );
     rejects(
         "format 5, before the brief carried the project's always-human categories",
@@ -724,6 +738,22 @@ fn brief_rejections() {
         }),
         "missing field `always_human`",
     );
+    // The refusal of the previous result: Build's alone, within its cap
+    // (OWL-180).
+    rejects(
+        "a refused result in an answer check's brief",
+        parse(|v| v["role"] = json!("answer_check")),
+        "a refused result is given but the role is answer_check, not build",
+    );
+    rejects(
+        "a refused result past its cap",
+        parse(|v| v["result_refusal"] = json!("x".repeat(MAX_RESULT_REFUSAL_BYTES + 1))),
+        "the refused result's reason exceeds 2048 bytes",
+    );
+    Brief::parse(&edited("brief.json", |v| {
+        v["result_refusal"] = json!("x".repeat(MAX_RESULT_REFUSAL_BYTES));
+    }))
+    .unwrap();
     // The checkpoint's paths and the result path come from the runner, but
     // are checked the same way as a model's artifact paths (OWL-25).
     for path in BAD_PATHS {

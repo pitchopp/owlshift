@@ -1,6 +1,6 @@
 +++
 role = "resolver"
-brief_format = 6
+brief_format = 7
 result_format = 5
 +++
 
