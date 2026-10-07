@@ -3199,6 +3199,127 @@ fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
     assert_eq!(resolved.last().unwrap()["resolver"], "pass_limit");
 }
 
+/// The role of each run of a bench and whether its brief was told of a
+/// refused result, oldest first.
+fn runs_of(bench: &Bench) -> Vec<(Role, bool)> {
+    bench
+        .briefs()
+        .iter()
+        .map(|brief| (brief.role, brief.result_refusal.is_some()))
+        .collect()
+}
+
+/// OWL-188, the ceiling of OWL-183: a refused Build result is let off once
+/// (the next run is told why), and the told run can ask a question the
+/// resolver settles, after which a new refusal is let off again, so refusals
+/// and resolver passes alternate. `settled` is never reset in a command, so
+/// the alternation ends after `MAX_RESOLVED_PASSES` settled passes, with a
+/// round for the decider.
+///
+/// With N = `MAX_RESOLVED_PASSES` = 3, the runs of the command are:
+///
+/// - N + 1 = 4 refused results, each let off: one before each of the N
+///   settled passes and one before the run whose question hits the limit;
+/// - the 4 told Build runs that ask (the 4th is past the limit, so its
+///   question goes to the decider);
+/// - N = 3 resolver runs.
+///
+/// 2 * (N + 1) + N = 11 runs, then one round. A fourth settled pass, or a
+/// refusal let off after the limit, makes the command run on.
+#[test]
+fn refused_results_and_resolver_passes_alternate_up_to_the_ceiling() {
+    assert_eq!(MAX_RESOLVED_PASSES, 3, "the arithmetic above assumes 3");
+    let bench = Bench::new(true);
+    let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
+    let mut replies = Vec::new();
+    let mut expected = Vec::new();
+    for pass in 0..=MAX_RESOLVED_PASSES {
+        replies.push(bench.reply(None, Some(&misnumbered)));
+        replies.push(bench.reply(None, Some(NAMING)));
+        expected.extend([(Role::Build, false), (Role::Build, true)]);
+        if pass < MAX_RESOLVED_PASSES {
+            replies.push(bench.reply(None, Some(DECIDED_Q1)));
+            expected.push((Role::Resolver, false));
+        }
+    }
+    let (outcome, printed) = bench.run(replies, None);
+    let stop = outcome.expect_err("a round");
+    assert_eq!(
+        asked_texts(&stop),
+        ["Which file should hold the greeting?"],
+        "{printed}"
+    );
+    let runs = runs_of(&bench);
+    assert_eq!(runs.len(), 11, "{runs:?}\n{printed}");
+    assert_eq!(runs, expected, "{printed}");
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    let verdicts: Vec<&str> = resolved
+        .iter()
+        .map(|gate| gate["resolver"].as_str().unwrap())
+        .collect();
+    assert_eq!(verdicts, ["done", "done", "done", "pass_limit"]);
+}
+
+/// OWL-188, with the late-comment bound added: a decider comment made while
+/// the run that completes works gets one integration run (`integrating` is
+/// never reset), whose own refusal is let off once too, and a further late
+/// comment opens a round.
+///
+/// A `continue` after an answered round; the runs of the command, counted
+/// as the bench's `during` hooks count them:
+///
+/// - run 1: the answer check;
+/// - runs 2-10: N = 3 settled passes of (refused, asks, resolver);
+/// - run 11: a refused result let off; run 12: its told retry completes,
+///   while the decider comments late;
+/// - run 13: the integration run, refused and let off; run 14: its told
+///   retry completes, while the decider comments again, which opens a round
+///   instead of delivering.
+///
+/// 1 + 9 + 2 + 2 = 14 runs, the last answered by a round about the comment.
+#[test]
+fn refusals_resolver_passes_and_a_late_comment_stop_at_the_ceiling() {
+    assert_eq!(MAX_RESOLVED_PASSES, 3, "the arithmetic above assumes 3");
+    let bench = Bench::new(true);
+    let check = answered_round(&bench);
+    let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
+    let mut replies = vec![check];
+    let mut expected = vec![(Role::AnswerCheck, false)];
+    for _ in 0..MAX_RESOLVED_PASSES {
+        replies.push(bench.reply(None, Some(&misnumbered)));
+        replies.push(bench.reply(None, Some(NAMING)));
+        replies.push(bench.reply(None, Some(DECIDED_Q1)));
+        expected.extend([
+            (Role::Build, false),
+            (Role::Build, true),
+            (Role::Resolver, false),
+        ]);
+    }
+    for greeting in ["Hello", "Hello and Bonjour"] {
+        replies.push(bench.reply(None, Some(&misnumbered)));
+        replies.push(bench.reply(Some(greeting), Some(DONE)));
+        expected.extend([(Role::Build, false), (Role::Build, true)]);
+    }
+    let (stopped, printed) = bench.continue_during(
+        replies,
+        vec![
+            bench.comment_during(12, "maintainer", "Also say Bonjour."),
+            bench.comment_during(14, "maintainer", "And Hola."),
+        ],
+    );
+    assert!(
+        matches!(&stopped, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 2),
+        "{stopped:?}\n{printed}"
+    );
+    // The first run of the bench is the `do` that asked the round.
+    let runs = runs_of(&bench);
+    assert_eq!(runs.len(), 15, "{runs:?}\n{printed}");
+    assert_eq!(runs[1..], expected, "{printed}");
+    assert_eq!(late_outcomes(&bench), [json!("integrate"), json!("ask")]);
+    assert_eq!(bench.remote_branch(), None);
+    assert!(bench.github.created.lock().unwrap().is_empty());
+}
+
 /// A resolver that breaks isolation is quarantined: the ticket parks, and
 /// none of the run's questions is posted.
 #[test]
