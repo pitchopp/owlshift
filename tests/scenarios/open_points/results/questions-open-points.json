@@ -1,0 +1,22 @@
+{
+  "format": 6,
+  "status": "questions",
+  "summary": "The ticket's two open points are to be decided on the ticket.",
+  "questions": [
+    {
+      "id": "Q1",
+      "category": "scope",
+      "context": "The ticket leaves open what the example shows. examples/owlshift.toml is committed with every key commented, which the answer may change.",
+      "text": "Should the example show every key with comments, or only the required ones?",
+      "options": ["Every key, commented", "Only the required keys"],
+      "recommendation": "Every key, commented"
+    },
+    {
+      "id": "Q2",
+      "category": "docs",
+      "context": "README.md has a Files section that lists every file at the root.",
+      "text": "Where should the README list the example?",
+      "recommendation": "In its Files section"
+    }
+  ]
+}

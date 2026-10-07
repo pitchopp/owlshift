@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift result.json",
-  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, and resolutions from the resolver only, covering\nexactly the questions it was given.",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, resolutions from the resolver only, covering\nexactly the questions it was given, and no decisions from the build role.",
   "type": "object",
   "properties": {
     "artifacts": {
@@ -10,7 +10,7 @@
       "default": {}
     },
     "decisions": {
-      "description": "Decisions taken without a human, each reversible and logged on the\nticket.",
+      "description": "Decisions a role took without a human. No role fills it today: the\nbuild role takes none of its own and asks instead, so a build result\nlisting one is refused (OWL-176); the answer check and the resolver\nare told to leave it out, the resolver's decisions being its\n`resolutions`.",
       "type": "array",
       "default": [],
       "items": {
@@ -28,7 +28,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 5
+      "const": 6
     },
     "pr": {
       "description": "The pull request to open; only with `status: done`.",

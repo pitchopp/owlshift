@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use owlshift_contracts::Role;
+use owlshift_contracts::brief::Brief;
 use owlshift_contracts::format::{RESULT_FORMAT, strip_role_front_matter};
 use owlshift_contracts::result::{AnswerClass, Resolution, RunResult};
 use owlshift_contracts::schema;
@@ -35,6 +36,11 @@ const ANSWER_CHECK_ONLY: &[&str] = &[
 /// build prompt need not name them, and a build result carrying them is
 /// refused.
 const RESOLVER_ONLY: &[&str] = &["resolutions", "outcome", "decided", "passed_on"];
+
+/// `result.json` fields the build prompt need not name since Build takes no
+/// decision of its own (OWL-176): a decision's `basis`, which the resolver's
+/// decisions still carry. The prompt names `decisions` itself, to leave it out.
+const NOT_BUILD: &[&str] = &["basis"];
 
 /// Brief fields the build prompt relies on, as dotted paths from the brief's
 /// root; arrays and alternatives are crossed on the way.
@@ -257,7 +263,11 @@ fn build_prompt_names_every_result_field_and_value() {
     let text = build_prompt();
     let mut expected = BTreeSet::new();
     names_and_values(&generated("result"), &mut expected);
-    for word in ANSWER_CHECK_ONLY.iter().chain(RESOLVER_ONLY) {
+    for word in ANSWER_CHECK_ONLY
+        .iter()
+        .chain(RESOLVER_ONLY)
+        .chain(NOT_BUILD)
+    {
         assert!(
             expected.remove(*word),
             "{word} is no longer in the result schema"
@@ -289,8 +299,15 @@ fn build_example_result_parses() {
     let text = build_prompt();
     let blocks = json_examples(&text);
     assert_eq!(blocks.len(), 1, "roles/build.md holds one json example");
-    if let Err(e) = RunResult::parse(blocks[0]) {
-        panic!("the example in roles/build.md is not a valid result.json: {e}");
+    let result = RunResult::parse(blocks[0]).unwrap_or_else(|e| {
+        panic!("the example in roles/build.md is not a valid result.json: {e}")
+    });
+    // Checked against a Build brief too, so it never lists decisions (OWL-176).
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/brief.json");
+    let brief = Brief::parse(&fs::read_to_string(&fixture).unwrap()).unwrap();
+    assert_eq!(brief.role, Role::Build);
+    if let Err(e) = result.validate_against(&brief) {
+        panic!("the example in roles/build.md is refused from Build: {e}");
     }
 }
 

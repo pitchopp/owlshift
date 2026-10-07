@@ -83,6 +83,16 @@ fn resolver() {
     }
 }
 
+/// OWL-176's acceptance: a ticket's open points reach the resolver or the
+/// decider, never a Build run's own decisions. A Build `done` that decided
+/// them is refused before the gate, and its retry, told why, asks them.
+#[test]
+fn open_points() {
+    if let Err(error) = play(&scenarios().join("open_points.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-123's acceptance: past the re-ask limit, a fourth incomplete answer
 /// parks the ticket with a PARKED comment naming what is still open and
 /// what restarts it. The project names a parked state, which the ticket
