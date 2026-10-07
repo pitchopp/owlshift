@@ -33,13 +33,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use jiff::Timestamp;
 use serde_json::Value;
 
 use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::ids::RelativePath;
+
+use clock::{Clock, Incoming, RealTime};
 
 /// The most bytes kept from standard error; the rest is read and dropped, as
 /// `owlshift_platform::process` does for its probes.
@@ -491,7 +493,7 @@ pub enum Billing {
 /// the child started still holds the output open. To stop a run, stop the
 /// child's process group (its id is `child.id()`, read before this call):
 /// the output then closes and this returns.
-pub fn drive(child: &mut Child, prompt: &str, mut on_line: impl FnMut(&[u8])) -> io::Result<Run> {
+pub fn drive(child: &mut Child, prompt: &str, on_line: impl FnMut(&[u8])) -> io::Result<Run> {
     let not_piped = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -502,14 +504,52 @@ pub fn drive(child: &mut Child, prompt: &str, mut on_line: impl FnMut(&[u8])) ->
     let stdout = child.stdout.take().ok_or_else(not_piped)?;
     let stderr = child.stderr.take().ok_or_else(not_piped)?;
 
-    let prompt_sent = send_prompt(stdin, prompt.as_bytes().to_vec());
-    let frames = read_frames(stdout);
-    let stderr = read_capped(stderr);
+    let prompt_sent = Incoming::new(send_prompt(stdin, prompt.as_bytes().to_vec()));
+    let frames = Incoming::new(read_frames(stdout));
+    let stderr = Incoming::new(read_capped(stderr));
+    drive_with(&RealTime, child, prompt_sent, frames, stderr, on_line)
+}
 
+/// What [`drive`] needs of the child once its streams are taken. A trait so
+/// that a test can hand [`drive_with`] a child that has already exited.
+trait Exiting {
+    /// Whether the child has exited, without waiting for it.
+    fn has_exited(&mut self) -> io::Result<bool>;
+
+    /// Waits for the child to exit and returns its exit code, `None` when a
+    /// signal ended it.
+    fn exit_code(&mut self) -> io::Result<Option<i32>>;
+}
+
+impl Exiting for Child {
+    fn has_exited(&mut self) -> io::Result<bool> {
+        Ok(self.try_wait()?.is_some())
+    }
+
+    fn exit_code(&mut self) -> io::Result<Option<i32>> {
+        Ok(self.wait()?.code())
+    }
+}
+
+/// [`drive`] once the prompt writer and the two readers are started.
+///
+/// It reads and waits only through `clock` (see [`clock`]), so a test counts
+/// the time it spends on a clock of its own, with no wall-clock bound.
+fn drive_with<C: Clock>(
+    clock: &C,
+    child: &mut impl Exiting,
+    prompt_sent: Incoming<io::Result<()>>,
+    frames: Incoming<Frame>,
+    stderr: Incoming<Vec<u8>>,
+    mut on_line: impl FnMut(&[u8]),
+) -> io::Result<Run> {
     let mut transcript = Transcript::default();
-    let mut exited_at = None;
+    // One grace period in all, counted from the exit: the rest of standard
+    // output, then standard error and the prompt share this one deadline, so
+    // what the loop used is not given again to the other streams.
+    let mut deadline = None;
     loop {
-        match frames.recv_timeout(POLL) {
+        match frames.recv_timeout(clock, POLL) {
             Ok(Frame::Line(line)) => {
                 on_line(&line);
                 transcript.feed(&line);
@@ -523,25 +563,98 @@ pub fn drive(child: &mut Child, prompt: &str, mut on_line: impl FnMut(&[u8])) ->
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        if exited_at.is_none() && child.try_wait()?.is_some() {
-            exited_at = Some(Instant::now());
+        if deadline.is_none() && child.has_exited()? {
+            deadline = Some(clock.now() + EXIT_GRACE);
         }
-        if exited_at.is_some_and(|at| at.elapsed() >= EXIT_GRACE) {
+        if deadline.is_some_and(|deadline| clock.until(deadline).is_zero()) {
             break;
         }
     }
-    let status = child.wait()?;
-    // One grace period in all, counted from the exit: what the loop used is
-    // not given again to the other streams.
-    let deadline = exited_at.unwrap_or_else(Instant::now) + EXIT_GRACE;
-    let remaining = || deadline.saturating_duration_since(Instant::now());
-    let stderr = stderr.recv_timeout(remaining()).unwrap_or_default();
-    let mut run = transcript.finish(status.code(), stderr);
-    let delivered = matches!(prompt_sent.recv_timeout(remaining()), Ok(Ok(())));
+    let exit_code = child.exit_code()?;
+    // Standard output closed before the exit was seen: the grace period
+    // starts now, the child having exited.
+    let deadline = deadline.unwrap_or_else(|| clock.now() + EXIT_GRACE);
+    let remaining = || clock.until(deadline);
+    let stderr = stderr.recv_timeout(clock, remaining()).unwrap_or_default();
+    let mut run = transcript.finish(exit_code, stderr);
+    let delivered = matches!(prompt_sent.recv_timeout(clock, remaining()), Ok(Ok(())));
     if !delivered && matches!(run.outcome, Outcome::Completed { .. }) {
         run.outcome = Outcome::Failed(Failure::PromptNotDelivered);
     }
     Ok(run)
+}
+
+/// Time as [`drive_with`] reads it and waits on it.
+///
+/// A module of its own so that `drive_with` cannot step around its clock: it
+/// holds no [`Receiver`] it could wait on directly, only [`Incoming`] ends
+/// waited on through a [`Clock`], and a clock's moments do not mix with
+/// [`std::time::Instant`]. A second grace period can then only be spent on the
+/// clock, where a test sees it.
+mod clock {
+    use std::ops::Add;
+    use std::sync::mpsc::{Receiver, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    pub(super) trait Clock {
+        /// A point in this clock's time.
+        type Moment: Copy + Add<Duration, Output = Self::Moment>;
+
+        fn now(&self) -> Self::Moment;
+
+        /// How long until `deadline`: zero once it has passed.
+        fn until(&self, deadline: Self::Moment) -> Duration;
+
+        /// Waits at most `timeout` for the next value, as
+        /// [`Receiver::recv_timeout`] does.
+        fn recv_timeout<T>(
+            &self,
+            receiver: &Receiver<T>,
+            timeout: Duration,
+        ) -> Result<T, RecvTimeoutError>;
+    }
+
+    /// The monotonic clock [`super::drive`] runs on. Not the tracker-time
+    /// clock of `owlshift_runner::on_demand`: this one only measures delays.
+    pub(super) struct RealTime;
+
+    impl Clock for RealTime {
+        type Moment = Instant;
+
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+
+        fn until(&self, deadline: Instant) -> Duration {
+            deadline.saturating_duration_since(Instant::now())
+        }
+
+        fn recv_timeout<T>(
+            &self,
+            receiver: &Receiver<T>,
+            timeout: Duration,
+        ) -> Result<T, RecvTimeoutError> {
+            receiver.recv_timeout(timeout)
+        }
+    }
+
+    /// The receiving end of one of `drive`'s threads, waited on only through
+    /// a [`Clock`].
+    pub(super) struct Incoming<T>(Receiver<T>);
+
+    impl<T> Incoming<T> {
+        pub(super) fn new(receiver: Receiver<T>) -> Self {
+            Self(receiver)
+        }
+
+        pub(super) fn recv_timeout(
+            &self,
+            clock: &impl Clock,
+            timeout: Duration,
+        ) -> Result<T, RecvTimeoutError> {
+            clock.recv_timeout(&self.0, timeout)
+        }
+    }
 }
 
 /// Writes the prompt on its own thread, so a child that writes before it
@@ -871,7 +984,9 @@ fn count(value: &Value, key: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::ffi::OsStr;
+    use std::sync::mpsc::TryRecvError;
 
     use super::*;
 
@@ -1166,5 +1281,106 @@ mod tests {
             [(LINE_CAP, "first"), (11, "rest"), (18, "line")],
             "every byte arrives, in order"
         );
+    }
+
+    /// A clock that moves only when a wait finds nothing to receive, and then
+    /// by the whole wait: a stream held open never delivers, so waiting on it
+    /// costs exactly the timeout. Its moments count from zero.
+    #[derive(Default)]
+    struct StepClock(Cell<Duration>);
+
+    impl Clock for StepClock {
+        type Moment = Duration;
+
+        fn now(&self) -> Duration {
+            self.0.get()
+        }
+
+        fn until(&self, deadline: Duration) -> Duration {
+            deadline.saturating_sub(self.0.get())
+        }
+
+        fn recv_timeout<T>(
+            &self,
+            receiver: &Receiver<T>,
+            timeout: Duration,
+        ) -> Result<T, RecvTimeoutError> {
+            match receiver.try_recv() {
+                Ok(value) => Ok(value),
+                Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+                Err(TryRecvError::Empty) => {
+                    self.0.set(self.0.get() + timeout);
+                    Err(RecvTimeoutError::Timeout)
+                }
+            }
+        }
+    }
+
+    /// A child that exited with status 0 before `drive` looked.
+    struct Exited;
+
+    impl Exiting for Exited {
+        fn has_exited(&mut self) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn exit_code(&mut self) -> io::Result<Option<i32>> {
+            Ok(Some(0))
+        }
+    }
+
+    /// Drives a child that printed a final record and exited, leaving behind
+    /// a process that holds standard error and standard input open without
+    /// reading the prompt, and standard output too unless `stdout_closes`.
+    /// Returns the run and the time it took on the step clock.
+    fn drive_after_exit(stdout_closes: bool) -> (Run, Duration) {
+        let (stdout, frames) = mpsc::channel();
+        stdout.send(Frame::Line(OK.as_bytes().to_vec())).unwrap();
+        let stdout = if stdout_closes {
+            drop(stdout);
+            None
+        } else {
+            Some(stdout)
+        };
+        let (stderr_held, stderr) = mpsc::channel();
+        let (stdin_held, prompt_sent) = mpsc::channel();
+        let clock = StepClock::default();
+        let run = drive_with(
+            &clock,
+            &mut Exited,
+            Incoming::new(prompt_sent),
+            Incoming::new(frames),
+            Incoming::new(stderr),
+            |_| {},
+        )
+        .unwrap();
+        drop((stdout, stderr_held, stdin_held));
+        (run, clock.now())
+    }
+
+    /// The grace period is one in all, counted from the exit: what standard
+    /// output took is not given again to standard error or the prompt, and
+    /// neither gets one of its own. `drive_does_not_wait_for_a_process_holding_the_output_open`,
+    /// in the contract tests, checks the same on a real process, with a bound
+    /// loose enough for a loaded machine.
+    #[test]
+    fn drive_spends_one_grace_period_not_two_when_the_output_stays_held() {
+        // Standard output held: the grace period runs out while it is read.
+        // Standard output closed at the exit: it runs out on standard error.
+        for stdout_closes in [false, true] {
+            let (run, spent) = drive_after_exit(stdout_closes);
+            let case = format!("stdout closes: {stdout_closes}, spent {spent:?}");
+            assert!(spent >= EXIT_GRACE, "{case}");
+            assert!(
+                spent < EXIT_GRACE + POLL,
+                "{case}: more than one grace period"
+            );
+            assert_eq!(
+                run.outcome,
+                Outcome::Failed(Failure::PromptNotDelivered),
+                "{case}"
+            );
+            assert!(run.stderr.is_empty(), "{case}");
+        }
     }
 }

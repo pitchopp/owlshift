@@ -655,7 +655,9 @@ fn drive_does_not_wait_for_a_process_holding_the_output_open() {
     // above a run slowed by a loaded machine (4.6 s seen under a confined
     // `cargo test --workspace`), and below the at least 10 s a `drive` that
     // waited for the pipe holder would take. It catches that wait, not a second grace
-    // period spent on stderr or the prompt (that would add only 2 s).
+    // period spent on stderr or the prompt (that would add only 2 s): the unit test
+    // `drive_spends_one_grace_period_not_two_when_the_output_stays_held`, in
+    // `src/harness/claude.rs`, catches that one on a clock of its own.
     let elapsed = started.elapsed();
     assert!(elapsed >= EXIT_GRACE, "{elapsed:?}");
     assert!(elapsed < PIPE_HOLDER_SLEEP - EXIT_GRACE, "{elapsed:?}");
