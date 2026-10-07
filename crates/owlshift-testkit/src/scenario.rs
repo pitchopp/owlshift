@@ -299,7 +299,7 @@ pub fn play(path: &Path, fake_harness: &Path) -> Result<(), ScenarioError> {
         .ok()
         .and_then(|key| key.fixture);
     let folder = match named {
-        Some(fixture) if fixture.is_empty() || fixture.contains(['/', '\\']) || fixture == ".." => {
+        Some(fixture) if !is_folder_name(&fixture) => {
             return Err(ScenarioError {
                 scenario: name,
                 step: None,
@@ -311,6 +311,16 @@ pub fn play(path: &Path, fake_harness: &Path) -> Result<(), ScenarioError> {
         None => path.with_extension(""),
     };
     play_str(&name, &input, &folder, fake_harness)
+}
+
+/// Whether a fixture name is a plain sibling folder name: one normal path
+/// component, so not empty, `.`, `..`, a path or a drive prefix.
+fn is_folder_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) && !name.contains(['/', '\\', ':'])
 }
 
 /// Only the `fixture` key of a scenario file; a file that does not parse is
