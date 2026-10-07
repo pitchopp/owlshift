@@ -22,8 +22,9 @@ use crate::Role;
 pub const BRIEF_FORMAT: u32 = 7;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
-/// decision (OWL-144).
-pub const RESULT_FORMAT: u32 = 5;
+/// decision (OWL-144); format 6 refuses `decisions` from the build role
+/// (OWL-176).
+pub const RESULT_FORMAT: u32 = 6;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.

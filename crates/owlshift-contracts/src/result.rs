@@ -22,8 +22,8 @@ const CONTRACT: &str = "result.json";
 /// that is not only whitespace and, on a counter-question and nowhere else,
 /// a reply that is not either; resolutions in increasing question order; and,
 /// against the run's brief, verdicts from the answer check only, covering
-/// exactly its latest ask, and resolutions from the resolver only, covering
-/// exactly the questions it was given.
+/// exactly its latest ask, resolutions from the resolver only, covering
+/// exactly the questions it was given, and no decisions from the build role.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift result.json", transform = result_invariants)]
@@ -36,8 +36,11 @@ pub struct RunResult {
     /// is `questions`.
     #[serde(default)]
     pub questions: Vec<Question>,
-    /// Decisions taken without a human, each reversible and logged on the
-    /// ticket.
+    /// Decisions a role took without a human. No role fills it today: the
+    /// build role takes none of its own and asks instead, so a build result
+    /// listing one is refused (OWL-176); the answer check and the resolver
+    /// are told to leave it out, the resolver's decisions being its
+    /// `resolutions`.
     #[serde(default)]
     pub decisions: Vec<Decision>,
     /// Follow-up tickets proposed to a human; never admitted automatically.
@@ -269,13 +272,15 @@ impl RunResult {
     /// the answer check only, and a `done` answer check gives one verdict for
     /// each question of the latest ask in the thread (its last `questions` or
     /// `reask` entry), no more. After a re-ask, that is the re-asked
-    /// questions only.
+    /// questions only. Resolutions and the build role's decisions have rules
+    /// of their own here too.
     ///
     /// Expects both documents to have passed their own checks, as
     /// [`RunResult::parse`] and [`Brief::parse`] do: verdicts and asked
     /// questions are then both in increasing order, so the same ids make the
     /// same sequence.
     pub fn validate_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        self.decisions_against(brief)?;
         self.resolutions_against(brief)?;
         if brief.role != Role::AnswerCheck {
             if !self.verdicts.is_empty() {
@@ -322,6 +327,28 @@ impl RunResult {
             ));
         }
         Ok(())
+    }
+
+    /// The build role takes no decision of its own, whatever its status
+    /// (OWL-176): a choice it would record is a question, which the resolver
+    /// decides when the ticket, the rules or the repository settle it, and
+    /// which reaches the decider otherwise. The reason is what the next Build
+    /// run reads in its brief's `result_refusal`, so it says what to do.
+    fn decisions_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        if brief.role != Role::Build || self.decisions.is_empty() {
+            return Ok(());
+        }
+        Err(ContractError::invalid(
+            CONTRACT,
+            format!(
+                "decisions are given but the run's role is {}, which takes no decision of its \
+                 own: ask each of these choices as a question, filed under `scope` when its \
+                 answer changes what the ticket delivers; they stay open even though the work \
+                 is committed. List no choice that only follows the decider's word, a \
+                 `decision` entry of the thread, a rule or a fact of the repository",
+                brief.role.as_str()
+            ),
+        ))
     }
 
     /// Resolutions come from the resolver only, and a `done` resolver gives

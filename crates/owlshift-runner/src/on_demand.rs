@@ -585,6 +585,7 @@ struct Gathered {
     /// Why the last run's `result.json` was refused, for the next Build
     /// brief only ([`result_refusal`]).
     result_refusal: Option<String>,
+    /// The runner's note of late comments given to a run ([`late_decision`]).
     decisions: Vec<Decision>,
     followups: Vec<Followup>,
 }
@@ -1010,7 +1011,6 @@ impl OnDemand<'_> {
                 (Event::Quarantined, None)
             };
             if let Some(result) = result {
-                gather(&mut gathered.decisions, &result.decisions);
                 gather(&mut gathered.followups, &result.followups);
             }
             // Questions go through the resolver before any reaches the
@@ -2171,7 +2171,8 @@ impl OnDemand<'_> {
         }
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
         // The resolver's decisions kept on the ticket, an earlier command's
-        // included, then those the runs of this one took themselves.
+        // included, then the runner's own note of late comments this one
+        // gave a run: Build takes no decision of its own (OWL-176).
         let mut decisions: Vec<Decision> = p
             .questions()
             .decisions

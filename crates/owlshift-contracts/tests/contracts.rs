@@ -229,10 +229,15 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(6);
+            v["format"] = json!(7);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 5, before Build's decisions were refused",
+        parse(|v| v["format"] = json!(5)),
+        "unknown format 5",
     );
     rejects(
         "format 4, before a decision carried the resolver's category",
@@ -273,20 +278,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 6, "status""#),
+        RunResult::parse(r#"{"format": 7, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 5, "status""#),
+        RunResult::parse(r#"{"format": 6, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(6));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(7));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 6,
-            supported: 5,
+            found: 7,
+            supported: 6,
             ..
         })
     ));
@@ -461,10 +466,37 @@ fn result_against_the_brief() {
         checked(|_| {}).validate_against(&build),
         "verdicts are given but the run's role is build, not answer_check",
     );
-    RunResult::parse(&fixture("result-sample.json"))
-        .unwrap()
-        .validate_against(&build)
+}
+
+/// The build role takes no decision of its own, whatever its status
+/// (OWL-176): a choice it would record is asked, and the reason it is told
+/// says so. A Build run that only follows the decider's answers or a kept
+/// decision lists nothing, and passes.
+#[test]
+fn decisions_against_the_brief() {
+    let build = Brief::parse(&fixture("brief.json")).unwrap();
+    for status in ["done", "questions", "blocked", "premise_false", "failed"] {
+        let result = RunResult::parse(&edited("result-sample.json", |v| {
+            v["status"] = json!(status)
+        }))
         .unwrap();
+        assert!(!result.decisions.is_empty());
+        let error = result.validate_against(&build).unwrap_err().to_string();
+        for needle in [
+            "decisions are given but the run's role is build",
+            "ask each of these choices as a question",
+            "`scope` when its answer changes what the ticket delivers",
+            "they stay open even though the work is committed",
+        ] {
+            assert!(
+                error.contains(needle),
+                "{status}: {needle:?} not in {error}"
+            );
+        }
+    }
+    let mut followed = RunResult::parse(&fixture("result-sample.json")).unwrap();
+    followed.decisions.clear();
+    followed.validate_against(&build).unwrap();
 }
 
 /// The resolver's brief carries the questions it settles, without the
