@@ -1,0 +1,64 @@
+# OWL-176's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
+# Its fixture folder is open_points/: the project in repo/, whose gate looks
+# for the required keys in the example, and prepared results in results/.
+
+description = """
+DEMO-5, written by its decider, asks for an example configuration listed in
+the README and leaves two points open, to be decided on the ticket. The first
+Build run decides both itself and reports done: its result is refused before
+the gate, a failed run, and nothing is posted or pushed. The next Build run is
+told why and asks both. Where the README lists the example is decided by the
+resolver from the README; whether the example shows every key changes what the
+ticket delivers, so it reaches the decider as round 1's Q1, under scope."""
+ticket = "DEMO-5"
+start = "2026-10-07T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+# The gate would fail on this example: the refused result never reaches it.
+[[step]]
+[step.run]
+files = { "examples/owlshift.toml" = "# Every key, commented.\n" }
+commit = "Add the example configuration"
+result = "results/build-decided.json"
+[step.expect]
+event = "run_failed"
+stage = "build"
+failed_runs = 1
+tracker_stage = "In Progress"
+comments = 0
+gate_failure = "none"
+branch_pushed = false
+brief_result_refusal = "none"
+
+[[step]]
+run = { result = "results/questions-open-points.json" }
+[step.expect]
+event = "none"
+stage = "build"
+waiting = "none"
+round = 0
+failed_runs = 1
+comments = 0
+brief_result_refusal = "ask each of these choices as a question"
+
+[[step]]
+resolve = { result = "results/resolver-decides-placement.json" }
+[step.expect]
+event = "questions"
+waiting = "needs_input"
+round = 1
+tracker_stage = "Needs Input"
+comments = 2
+brief_resolve = ["Q2"]
+brief_result_refusal = "none"
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] QUESTIONS · round 1"
+contains = [
+  "**Q1** (scope) Should the example show every key with comments, or only the required ones?",
+  "Owlshift decided one other question of this run itself",
+]
+lacks = ["**Q2**"]

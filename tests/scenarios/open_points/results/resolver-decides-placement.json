@@ -1,0 +1,14 @@
+{
+  "format": 6,
+  "status": "done",
+  "summary": "The README lists every file at the root in its Files section.",
+  "resolutions": [
+    {
+      "question": "Q2",
+      "category": "docs",
+      "outcome": "decided",
+      "decision": "In the README's Files section, with the other files.",
+      "basis": "README.md lists every file at the root under Files."
+    }
+  ]
+}
