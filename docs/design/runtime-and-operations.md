@@ -127,7 +127,7 @@ Configuration is plain text in two files plus the keychain; every screen that ed
 | Layer | Where | Holds |
 | --- | --- | --- |
 | Floor | Built into the binary | What no configuration can loosen ([architecture](architecture.md), section 8) |
-| Project file `owlshift.toml` | Committed in the repository | Tracker and state mapping, admission gesture, gate commands, resources and zones, pipeline and plan approval, role prompt overrides in `.owlshift/roles/`, tiers mapped to models, policy additions, caps |
+| Project file `owlshift.toml` | Committed in the repository | Tracker and state mapping, admission gesture, gate commands, resources and zones, pipeline and plan approval, rules added per role, role prompt overrides in `.owlshift/roles/`, tiers mapped to models, policy additions, caps |
 | Personal file | The user's config directory, never committed | Identity on tracker and forge, installed harnesses and their fallbacks, concurrent runs, usage caps, an optional dollar cap per run, keep-awake, notifications |
 | Ticket labels | The tracker | One ticket's variant, tier, or exclusion |
 
@@ -147,6 +147,10 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
 [stack]
 gate = ["make lint", "make test"]
 resources = { migrations = "backend/*/migrations/**" }
+rules = ["AGENTS.md"]     # files whose text reaches every role that takes rules
+
+[roles.build]
+rules = ["docs/skills/frontend/SKILL.md"]   # added to stack.rules for this role only
 
 [pipeline]
 default = "standard"
