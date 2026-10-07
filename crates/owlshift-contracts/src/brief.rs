@@ -85,6 +85,12 @@ pub struct Brief {
     /// run's result was not refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_refusal: Option<String>,
+    /// The previous Build run's `result.json` was refused for the build
+    /// role's own decisions (OWL-176): the choices it listed are still open,
+    /// and this run may not end `done` (OWL-186). In Build's brief only, with
+    /// the `result_refusal` that says why; absent otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decisions_refused: bool,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
 }
@@ -283,9 +289,28 @@ impl Brief {
     /// order, distinct questions of an earlier round; a resolver's brief has
     /// questions to `resolve`, in increasing order, and no other brief has
     /// any; only Build's and the answer check's briefs have a
-    /// `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`].
+    /// `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
+    /// Build's, with one, has `decisions_refused`.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
+        if self.decisions_refused {
+            if self.role != Role::Build {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "refused decisions are given but the role is {}, not {}",
+                        self.role.as_str(),
+                        Role::Build.as_str()
+                    ),
+                ));
+            }
+            if self.result_refusal.is_none() {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "refused decisions are given without the refused result's reason",
+                ));
+            }
+        }
         if let Some(reason) = &self.result_refusal {
             if !matches!(self.role, Role::Build | Role::AnswerCheck) {
                 return Err(ContractError::invalid(

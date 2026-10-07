@@ -207,6 +207,11 @@ pub enum Failure {
     /// `result.json` was refused: unreadable, too large, a link, or not a
     /// valid result for this run.
     InvalidResult(String),
+    /// `result.json` was refused for the build role's own decisions: it
+    /// listed some, or ended `done` while its predecessor's were open
+    /// (OWL-176). The next Build run is told so, and may not end `done`
+    /// (`Brief::decisions_refused`, OWL-186).
+    Decisions(String),
     /// An artifact the result names was refused.
     Artifact(ArtifactError),
     /// The role reported `done`, and the project's gate, run by the
@@ -221,7 +226,7 @@ impl Failure {
     /// other failure, an artifact the runner could not read included.
     pub fn refusal(&self) -> Option<String> {
         match self {
-            Self::InvalidResult(reason) => Some(reason.clone()),
+            Self::InvalidResult(reason) | Self::Decisions(reason) => Some(reason.clone()),
             Self::Artifact(error) => error.is_the_runs().then(|| error.to_string()),
             Self::TimedOut
             | Self::Credentials(_)
@@ -241,7 +246,9 @@ impl fmt::Display for Failure {
             Self::Harness(reason) => write!(f, "the harness failed: {reason}"),
             Self::Driver(reason) => write!(f, "the harness's output could not be read: {reason}"),
             Self::NoResult => write!(f, "the role left no {RESULT_PATH}"),
-            Self::InvalidResult(reason) => write!(f, "{RESULT_PATH} was refused: {reason}"),
+            Self::InvalidResult(reason) | Self::Decisions(reason) => {
+                write!(f, "{RESULT_PATH} was refused: {reason}")
+            }
             Self::Artifact(error) => error.fmt(f),
             Self::Gate(failure) => match &failure.command {
                 Some(command) => {
@@ -566,7 +573,7 @@ fn read_result(worktree: &Path, branch: &str, brief: &Brief, hidden: Option<&Sec
     }
     let result = match validate_result(&bytes, branch, brief) {
         Ok(result) => result,
-        Err(reason) => return Outcome::Failed(Failure::InvalidResult(reason)),
+        Err(failure) => return Outcome::Failed(failure),
     };
     match read_artifacts(worktree, &result.artifacts) {
         Ok(artifacts) => {
@@ -592,18 +599,27 @@ fn read_result(worktree: &Path, branch: &str, brief: &Brief, hidden: Option<&Sec
 
 /// Parses `result.json` against its contract and against the run's brief
 /// (verdicts from the answer check only, covering its latest ask), and
-/// requires a pull request to name the run's own branch.
-pub fn validate_result(bytes: &[u8], branch: &str, brief: &Brief) -> Result<RunResult, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_owned())?;
-    let result = RunResult::parse(text).map_err(|e| e.to_string())?;
-    result.validate_against(brief).map_err(|e| e.to_string())?;
+/// requires a pull request to name the run's own branch. A refusal for the
+/// build role's own decisions is [`Failure::Decisions`], any other
+/// [`Failure::InvalidResult`].
+pub fn validate_result(bytes: &[u8], branch: &str, brief: &Brief) -> Result<RunResult, Failure> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Failure::InvalidResult("it is not UTF-8 text".to_owned()))?;
+    let result = RunResult::parse_against(text, brief).map_err(|refused| {
+        let reason = refused.error.to_string();
+        if refused.decisions {
+            Failure::Decisions(reason)
+        } else {
+            Failure::InvalidResult(reason)
+        }
+    })?;
     if let Some(pr) = &result.pr
         && pr.branch != branch
     {
-        return Err(format!(
+        return Err(Failure::InvalidResult(format!(
             "pr.branch is {:?}, not the run's branch {branch:?}",
             pr.branch
-        ));
+        )));
     }
     Ok(result)
 }
@@ -776,7 +792,9 @@ mod tests {
         let done = br#"{"format":6,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
         assert!(validate_result(done, "owlshift/T-1", &brief).is_ok());
 
-        let other = validate_result(done, "owlshift/T-2", &brief).unwrap_err();
+        let other = validate_result(done, "owlshift/T-2", &brief)
+            .unwrap_err()
+            .to_string();
         assert!(other.contains("pr.branch"), "{other}");
         // A contract rule: questions needs a question.
         let empty = br#"{"format":6,"status":"questions","summary":"s","questions":[]}"#;
@@ -784,7 +802,18 @@ mod tests {
         // A rule against the brief: verdicts come from the answer check only.
         let verdicts = br#"{"format":6,"status":"done","summary":"s","verdicts":[{"question":"Q1","class":"answered","reason":"r"}]}"#;
         let refused = validate_result(verdicts, "owlshift/T-1", &brief).unwrap_err();
-        assert!(refused.contains("role is build"), "{refused}");
+        assert!(
+            matches!(&refused, Failure::InvalidResult(reason) if reason.contains("role is build")),
+            "{refused:?}"
+        );
+        // The build role's own decisions are a refusal of their own kind,
+        // which its next run is told of (OWL-186).
+        let decided = br#"{"format":6,"status":"done","summary":"s","decisions":[{"question":"q","decision":"d","basis":"b"}]}"#;
+        let refused = validate_result(decided, "owlshift/T-1", &brief).unwrap_err();
+        assert!(
+            matches!(&refused, Failure::Decisions(reason) if reason.contains("ask each")),
+            "{refused:?}"
+        );
         // Unknown fields are refused, and so is text that is not UTF-8.
         let unknown = br#"{"format":6,"status":"done","summary":"s","extra":1}"#;
         assert!(validate_result(unknown, "owlshift/T-1", &brief).is_err());

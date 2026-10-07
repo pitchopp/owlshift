@@ -23,7 +23,9 @@ const CONTRACT: &str = "result.json";
 /// a reply that is not either; resolutions in increasing question order; and,
 /// against the run's brief, verdicts from the answer check only, covering
 /// exactly its latest ask, resolutions from the resolver only, covering
-/// exactly the questions it was given, and no decisions from the build role.
+/// exactly the questions it was given, no decisions from the build role,
+/// and no `done` from a Build run told that its predecessor's decisions were
+/// refused.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift result.json", transform = result_invariants)]
@@ -232,6 +234,27 @@ impl RunResult {
         Ok(result)
     }
 
+    /// Parses `result.json` as the run of `brief` wrote it and validates it
+    /// against that brief: [`RunResult::parse`] and
+    /// [`RunResult::validate_against`] together, except that the build
+    /// role's own decisions are checked right after the document's shape, so
+    /// a result that lists any is refused for them whatever other rule it
+    /// breaks, and the refusal says so (OWL-186).
+    pub fn parse_against(input: &str, brief: &Brief) -> Result<Self, Refused> {
+        let other = |error| Refused {
+            error,
+            decisions: false,
+        };
+        let result: Self = format::parse_json(CONTRACT, RESULT_FORMAT, input).map_err(other)?;
+        result.decisions_against(brief).map_err(|error| Refused {
+            error,
+            decisions: true,
+        })?;
+        result.validate().map_err(other)?;
+        result.validate_against(brief).map_err(other)?;
+        Ok(result)
+    }
+
     /// Renders `result.json`.
     pub fn render(&self) -> String {
         format::render_json(self)
@@ -332,23 +355,46 @@ impl RunResult {
     /// The build role takes no decision of its own, whatever its status
     /// (OWL-176): a choice it would record is a question, which the resolver
     /// decides when the ticket, the rules or the repository settle it, and
-    /// which reaches the decider otherwise. The reason is what the next Build
-    /// run reads in its brief's `result_refusal`, so it says what to do.
+    /// which reaches the decider otherwise. Once such a result is refused,
+    /// the next Build run, told so in its brief's `decisions_refused`, may
+    /// not end `done` (OWL-186): its predecessor's choices are still open.
+    /// The reason is what the next Build run reads in its brief's
+    /// `result_refusal`, so it says what to do and quotes the choices, as
+    /// data, after the advice the size limit keeps.
     fn decisions_against(&self, brief: &Brief) -> Result<(), ContractError> {
-        if brief.role != Role::Build || self.decisions.is_empty() {
+        if brief.role != Role::Build {
             return Ok(());
         }
-        Err(ContractError::invalid(
-            CONTRACT,
-            format!(
-                "decisions are given but the run's role is {}, which takes no decision of its \
-                 own: ask each of these choices as a question, filed under `scope` when its \
-                 answer changes what the ticket delivers; they stay open even though the work \
-                 is committed. List no choice that only follows the decider's word, a \
-                 `decision` entry of the thread, a rule or a fact of the repository",
-                brief.role.as_str()
-            ),
-        ))
+        if !self.decisions.is_empty() {
+            let choices: Vec<String> = self
+                .decisions
+                .iter()
+                .map(|d| format!("{:?} (recorded: {:?})", d.question, d.decision))
+                .collect();
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "decisions are given but the run's role is {}, which takes no decision of \
+                     its own: ask each of these choices as a question, filed under `scope` when \
+                     its answer changes what the ticket delivers, even one the thread, a rule or \
+                     the repository settles, its `context` then naming what settles it; they \
+                     stay open even though the work is committed, and the next run's result is \
+                     refused if it is `done`. The choices listed: {}",
+                    brief.role.as_str(),
+                    choices.join("; ")
+                ),
+            ));
+        }
+        if brief.decisions_refused && self.status == Status::Done {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                "status is done, but the previous run's decisions were refused and the choices \
+                 they listed are still open: ask each of them as a question, even one found \
+                 settled since; a run told of refused decisions may end with any status but \
+                 `done`",
+            ));
+        }
+        Ok(())
     }
 
     /// Resolutions come from the resolver only, and a `done` resolver gives
@@ -397,6 +443,18 @@ impl RunResult {
         }
         Ok(())
     }
+}
+
+/// Why [`RunResult::parse_against`] refused a result: the contract's error,
+/// and whether the build role's own decisions were refused.
+#[derive(Debug)]
+pub struct Refused {
+    pub error: ContractError,
+    /// The result listed decisions from the build role, or ended `done`
+    /// while its predecessor's were open (OWL-176): the next Build run is
+    /// told so in its brief's `decisions_refused`, and may not end `done`
+    /// (OWL-186).
+    pub decisions: bool,
 }
 
 /// The rules of the resolver's resolutions: in increasing question order,

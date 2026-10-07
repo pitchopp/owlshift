@@ -88,7 +88,8 @@ use crate::agent_env::AgentEnv;
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
-    DEFAULT_GATE_TIMEOUT, Executor, Git, Harness, Outcome, RESULT_PATH, RUN_DIR, RunReport, RunSpec,
+    DEFAULT_GATE_TIMEOUT, Executor, Failure, Git, Harness, Outcome, RESULT_PATH, RUN_DIR,
+    RunReport, RunSpec,
 };
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::resolver::{self, Fallback, Resolved};
@@ -239,6 +240,15 @@ pub fn result_refusal(outcome: &Outcome) -> Option<String> {
         end -= 1;
     }
     Some(format!("{}{CUT}", &reason[..end]))
+}
+
+/// Whether a run's result was refused for the build role's own decisions
+/// ([`crate::executor::Failure::Decisions`], OWL-176): the next Build run of
+/// the command, told why in [`result_refusal`], is then held to ask them
+/// (`Brief::decisions_refused`, OWL-186). True only when [`result_refusal`]
+/// tells the outcome.
+pub fn decisions_refused(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Failed(Failure::Decisions(_)))
 }
 
 /// This machine's clock, the one [`OnDemand::clock`] reads outside tests.
@@ -605,6 +615,9 @@ struct Gathered {
     /// Why the last run's `result.json` was refused, for the next Build
     /// brief only ([`result_refusal`]).
     result_refusal: Option<String>,
+    /// Whether that refusal was the build role's own decisions, for the
+    /// same brief ([`decisions_refused`]).
+    decisions_refused: bool,
     /// The runner's note of late comments given to a run ([`late_decision`]).
     decisions: Vec<Decision>,
     followups: Vec<Followup>,
@@ -1024,6 +1037,7 @@ impl OnDemand<'_> {
             // This command's own: the answer check's comes from the ticket
             // ref, and the resolver's brief never carries one.
             brief.result_refusal = gathered.result_refusal.take();
+            brief.decisions_refused = std::mem::take(&mut gathered.decisions_refused);
             let ran = self.execute(p, self.executor, self.build, &brief, attempt, sink)?;
             if let Some(gate) = &ran.report.gate {
                 gathered.gate_failure = gate.failure.clone();
@@ -1031,6 +1045,7 @@ impl OnDemand<'_> {
             // Set before any `continue` below, so it reaches the next run
             // only, whatever that run's outcome.
             gathered.result_refusal = result_refusal(&ran.report.outcome);
+            gathered.decisions_refused = decisions_refused(&ran.report.outcome);
             let (event, result) = if ran.breaches.is_empty() {
                 stage_event(&ran.report.outcome, &brief)
             } else {
@@ -2123,6 +2138,7 @@ impl OnDemand<'_> {
             },
             gate_failure,
             result_refusal: None,
+            decisions_refused: false,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }
     }
@@ -3119,6 +3135,16 @@ mod tests {
             Some("question Q4 is out of order: expected Q1")
         );
         assert_eq!(result_refusal(&Outcome::Failed(Failure::NoResult)), None);
+        // The build role's own decisions are told too, so a refusal of them
+        // is freed at the last attempt as any other (OWL-183), and flagged
+        // for the next Build run (OWL-186).
+        let decided = Outcome::Failed(Failure::Decisions("decisions are given".to_owned()));
+        assert_eq!(
+            result_refusal(&decided).as_deref(),
+            Some("decisions are given")
+        );
+        assert!(decisions_refused(&decided));
+        assert!(!decisions_refused(&refused("decisions are given")));
         assert_eq!(
             result_refusal(&Outcome::UsageLimit { resets_at: None }),
             None

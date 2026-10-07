@@ -106,6 +106,7 @@ impl Bench {
             always_human: Vec::new(),
             gate_failure: None,
             result_refusal: None,
+            decisions_refused: false,
             result_path: RelativePath::new("result.json").unwrap(),
         };
         Self {

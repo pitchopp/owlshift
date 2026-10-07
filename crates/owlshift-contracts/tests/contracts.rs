@@ -487,6 +487,8 @@ fn decisions_against_the_brief() {
             "ask each of these choices as a question",
             "`scope` when its answer changes what the ticket delivers",
             "they stay open even though the work is committed",
+            "the next run's result is refused if it is `done`",
+            r#"The choices listed: "Test framework" (recorded: "Reuse the existing one")"#,
         ] {
             assert!(
                 error.contains(needle),
@@ -497,6 +499,58 @@ fn decisions_against_the_brief() {
     let mut followed = RunResult::parse(&fixture("result-sample.json")).unwrap();
     followed.decisions.clear();
     followed.validate_against(&build).unwrap();
+
+    // The Build run told that its predecessor's decisions were refused may
+    // end with any status but `done` (OWL-186).
+    let told = Brief::parse(&edited("brief.json", |v| {
+        v["decisions_refused"] = json!(true);
+    }))
+    .unwrap();
+    for status in ["done", "questions", "blocked", "premise_false", "failed"] {
+        let result = RunResult::parse(&edited("result-sample.json", |v| {
+            v["status"] = json!(status);
+            v.as_object_mut().unwrap().remove("decisions");
+        }))
+        .unwrap();
+        let checked = result.validate_against(&told);
+        if status == "done" {
+            rejects(
+                "a done after refused decisions",
+                checked,
+                "status is done, but the previous run's decisions were refused",
+            );
+        } else {
+            checked.unwrap_or_else(|e| panic!("{status}: {e}"));
+        }
+    }
+
+    // The refusal says when it is the build role's decisions, which its next
+    // run is told of; a result that lists some is refused for them first,
+    // whatever else it breaks.
+    let kind = |input: &str, brief: &Brief| RunResult::parse_against(input, brief).unwrap_err();
+    let misnumbered = |decisions: bool| {
+        edited("result-sample.json", |v| {
+            v["questions"][0]["id"] = json!("Q2");
+            if !decisions {
+                v.as_object_mut().unwrap().remove("decisions");
+            }
+        })
+    };
+    let refused = kind(&misnumbered(true), &build);
+    assert!(refused.decisions, "{}", refused.error);
+    assert!(
+        refused.error.to_string().contains("decisions are given"),
+        "{}",
+        refused.error
+    );
+    let refused = kind(&misnumbered(false), &build);
+    assert!(!refused.decisions, "{}", refused.error);
+    let done = edited("result-sample.json", |v| {
+        v["status"] = json!("done");
+        v.as_object_mut().unwrap().remove("decisions");
+    });
+    assert!(kind(&done, &told).decisions);
+    RunResult::parse_against(&done, &build).unwrap();
 }
 
 /// The resolver's brief carries the questions it settles, without the
@@ -718,8 +772,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(9)),
+        parse(|v| v["format"] = json!(10)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 8, before Build's brief said its predecessor's decisions were refused",
+        parse(|v| v["format"] = json!(8)),
+        "unknown format 8",
     );
     rejects(
         "format 6, before the brief carried the refusal of the previous result",
@@ -788,6 +847,28 @@ fn brief_rejections() {
     );
     Brief::parse(&edited("brief.json", |v| {
         v["result_refusal"] = json!("x".repeat(MAX_RESULT_REFUSAL_BYTES));
+    }))
+    .unwrap();
+    // Refused decisions (OWL-186): Build's alone, with the reason that says
+    // why.
+    rejects(
+        "refused decisions in an answer check's brief",
+        parse(|v| {
+            v["role"] = json!("answer_check");
+            v["decisions_refused"] = json!(true);
+        }),
+        "refused decisions are given but the role is answer_check, not build",
+    );
+    rejects(
+        "refused decisions without the reason",
+        parse(|v| {
+            v.as_object_mut().unwrap().remove("result_refusal");
+            v["decisions_refused"] = json!(true);
+        }),
+        "refused decisions are given without the refused result's reason",
+    );
+    Brief::parse(&edited("brief.json", |v| {
+        v["decisions_refused"] = json!(true)
     }))
     .unwrap();
     // The checkpoint's paths and the result path come from the runner, but

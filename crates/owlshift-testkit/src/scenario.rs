@@ -27,7 +27,8 @@
 //! hands the next Build run why the last one's `result.json` was refused
 //! (`owlshift_runner::on_demand::result_refusal`, OWL-180), a refusal that
 //! never spends the last attempt when that run was not told of one
-//! (OWL-183). That
+//! (OWL-183), and whether it was the build role's own decisions, which holds
+//! that run to asking (`decisions_refused`, OWL-186). That
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
 //!
@@ -108,7 +109,9 @@ use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check::{self, Readiness};
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
-use owlshift_runner::on_demand::{account_author, result_refusal, stage_event, thread};
+use owlshift_runner::on_demand::{
+    account_author, decisions_refused, result_refusal, stage_event, thread,
+};
 use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
     DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
@@ -431,6 +434,9 @@ struct Driver {
     /// Why the last Build run's `result.json` was refused, for the next
     /// Build brief only; any other outcome of a Build run clears it.
     result_refusal: Option<String>,
+    /// Whether that refusal was the build role's own decisions, for the
+    /// same brief (`owlshift_runner::on_demand::decisions_refused`).
+    decisions_refused: bool,
     executor: Executor,
     id: TicketId,
     branch: String,
@@ -543,6 +549,7 @@ impl Driver {
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             gate_failure: None,
             result_refusal: None,
+            decisions_refused: false,
             branch: format!("owlshift/{}", scenario.ticket),
             id: scenario.ticket.clone(),
             state,
@@ -981,6 +988,7 @@ impl Driver {
         }
         if role == Role::Build {
             self.result_refusal = result_refusal(&report.outcome);
+            self.decisions_refused = decisions_refused(&report.outcome);
         }
         if report.exit_code == Some(OWN_FAILURE) {
             self.last_run = Some(report);
@@ -1067,6 +1075,7 @@ impl Driver {
                     .and_then(|ask| ask.result_refusal.clone()),
                 _ => None,
             },
+            decisions_refused: role == Role::Build && self.decisions_refused,
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
         })
