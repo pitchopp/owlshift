@@ -44,6 +44,16 @@ The "Development" section of [CONTRIBUTING.md](CONTRIBUTING.md#development) cove
 | [Build plan](docs/design/build-plan.md) | Checks to run first, workspace layout, contracts, CLI, tasks for P0 and P1 |
 | [Visual identity](docs/design/visual-identity.md) | Personality, voice, logo, colours, typefaces, and how each surface applies them |
 
+## Privacy
+
+What Owlshift sends off your machine, and to whom:
+
+- **Your tracker** (Linear today): the questions, plans and delivery reports it posts on the ticket, and the ticket text and comments it reads.
+- **The model provider** (Anthropic for Claude Code, OpenAI for Codex, per your configuration): the ticket, its comments and the code the agent reads, as briefs and prompts, through the provider's own CLI. How the provider keeps that data is set by its terms, not by Owlshift: see the [Anthropic terms](https://www.anthropic.com/legal/consumer-terms) and the [OpenAI terms](https://openai.com/policies/terms-of-use).
+- **Your forge** (GitHub): the branches and pull requests it pushes and opens.
+
+The tracker and forge credentials stay in the system keychain and are never sent to the model provider.
+
 ## Project tracking
 
 The backlog lives in a Linear workspace (team `OWL`), with one project per roadmap step. It moves to public GitHub issues when the repository opens (step P9).
