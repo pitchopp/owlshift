@@ -877,6 +877,44 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
     assert!(rule.applies_to.is_empty());
 }
 
+/// OWL-180: a Build run whose `result.json` is refused, here for questions
+/// not numbered from Q1, counts as a failed run, and the next Build run of
+/// the command is told why. Only that one: the run after it, once the
+/// resolver settled its question, and the resolver itself are not.
+#[test]
+fn a_refused_result_is_told_to_the_next_build_run_only() {
+    let bench = Bench::new(true);
+    let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(&misnumbered)),
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    let told: Vec<(Role, bool)> = bench
+        .briefs()
+        .iter()
+        .map(|brief| (brief.role, brief.result_refusal.is_some()))
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (Role::Build, false),
+            (Role::Build, true),
+            (Role::Resolver, false),
+            (Role::Build, false),
+        ]
+    );
+    let started = data_of(&bench.events(), EventKind::RunStarted, "result_refusal");
+    let flags: Vec<&Value> = started.iter().map(|data| &data["result_refusal"]).collect();
+    assert_eq!(flags, [false, true, false, false]);
+}
+
 /// The brief of the first run, and its ticket author's relation: the brief
 /// tells the agent whether the ticket text is the decider's instruction or
 /// quoted data.
