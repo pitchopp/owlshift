@@ -128,6 +128,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
     pub description: String,
+    /// The fixture folder to play on, a sibling of the scenario file, in place
+    /// of the one named after the file: a scenario on another scenario's
+    /// setup brings its own results, not a copy of the project.
+    pub fixture: Option<String>,
     pub ticket: TicketId,
     /// The virtual time the scenario starts at; step `n` is `n` minutes later.
     pub start: Timestamp,
@@ -277,7 +281,7 @@ impl fmt::Display for ScenarioError {
 impl std::error::Error for ScenarioError {}
 
 /// Plays a scenario file; its fixture folder is the file's path without the
-/// `.toml` extension.
+/// `.toml` extension, or the sibling folder its `fixture` key names.
 pub fn play(path: &Path, fake_harness: &Path) -> Result<(), ScenarioError> {
     let name = path
         .file_stem()
@@ -290,7 +294,30 @@ pub fn play(path: &Path, fake_harness: &Path) -> Result<(), ScenarioError> {
         message: format!("{}: {e}", path.display()),
         output: None,
     })?;
-    play_str(&name, &input, &path.with_extension(""), fake_harness)
+    // Only this key is read here; `play_str` parses the whole file.
+    let named = toml::from_str::<FixtureKey>(&input)
+        .ok()
+        .and_then(|key| key.fixture);
+    let folder = match named {
+        Some(fixture) if fixture.is_empty() || fixture.contains(['/', '\\']) || fixture == ".." => {
+            return Err(ScenarioError {
+                scenario: name,
+                step: None,
+                message: format!("invalid scenario: fixture \"{fixture}\" is not a folder name"),
+                output: None,
+            });
+        }
+        Some(fixture) => path.with_file_name(fixture),
+        None => path.with_extension(""),
+    };
+    play_str(&name, &input, &folder, fake_harness)
+}
+
+/// Only the `fixture` key of a scenario file; a file that does not parse is
+/// reported by `play_str`.
+#[derive(Deserialize)]
+struct FixtureKey {
+    fixture: Option<String>,
 }
 
 /// Plays a scenario given as text, on a fixture folder.
