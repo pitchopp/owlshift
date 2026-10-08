@@ -1,5 +1,5 @@
 {
-  "format": 6,
+  "format": 7,
   "status": "done",
   "summary": "Added examples/owlshift.toml with every key commented, listed in the README.",
   "decisions": [

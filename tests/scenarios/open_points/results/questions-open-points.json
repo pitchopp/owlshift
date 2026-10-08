@@ -1,5 +1,5 @@
 {
-  "format": 6,
+  "format": 7,
   "status": "questions",
   "summary": "The ticket's two open points are to be decided on the ticket.",
   "questions": [
@@ -18,5 +18,9 @@
       "text": "Where should the README list the example?",
       "recommendation": "In its Files section"
     }
+  ],
+  "refused_choices_asked": [
+    { "choice": 1, "question": "Q1" },
+    { "choice": 2, "question": "Q2" }
   ]
 }

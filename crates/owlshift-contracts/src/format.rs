@@ -26,8 +26,8 @@ pub const BRIEF_FORMAT: u32 = 11;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
-/// (OWL-176).
-pub const RESULT_FORMAT: u32 = 6;
+/// (OWL-176); format 7 adds Build's `refused_choices_asked` (OWL-193).
+pub const RESULT_FORMAT: u32 = 7;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.

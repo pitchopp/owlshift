@@ -107,7 +107,7 @@ fn fixtures_validate_against_the_committed_schemas() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
-    let base = |status: &str| json!({ "format": 6, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 7, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -121,7 +121,24 @@ fn result_schema_carries_the_expressible_rules() {
     pr_done["status"] = json!("done");
     assert!(validator.is_valid(&pr_done));
 
-    for format in [1, 2, 3, 4, 5, 7] {
+    // A refused choice is named as asked by a result that asks only
+    // (OWL-193).
+    let mut named = base("questions");
+    named["questions"] = json!([question("Q1")]);
+    named["refused_choices_asked"] = json!([{ "choice": 1, "question": "Q1" }]);
+    assert!(validator.is_valid(&named));
+    let mut unasked = named.clone();
+    unasked["status"] = json!("blocked");
+    assert!(!validator.is_valid(&unasked));
+    let mut premise = named.clone();
+    premise["status"] = json!("premise_false");
+    assert!(validator.is_valid(&premise));
+    premise["questions"] = json!([]);
+    assert!(!validator.is_valid(&premise));
+    named["refused_choices_asked"][0]["choice"] = json!(0);
+    assert!(!validator.is_valid(&named));
+
+    for format in [1, 2, 3, 4, 5, 6, 8] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
