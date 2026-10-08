@@ -55,7 +55,12 @@
 //! comment: as `owlshift do` stops on a failed post, the round is not
 //! opened and nothing of it is kept, so a later command's Build asks again
 //! (Build's kept refusal, which only a kept round or decision clears once a
-//! run asks, stays too). An `answer` step runs the
+//! run asks, stays too). A step with `ticket_ref_refuses_round = true` has
+//! the round posted but not kept, the ticket ref's write failing after the
+//! post: as `owlshift do` stops on a keeping that failed, the QUESTIONS
+//! comment stays on the ticket and its stage shows the wait, but no ask is
+//! kept and the core state is as before the round, so the refusals kept
+//! before it stay for a later command's runs (OWL-196). An `answer` step runs the
 //! answer check (OWL-116) while the ticket waits for input, once answers
 //! arrived, as `owlshift continue` decides it but with no quiet window
 //! (`owlshift_runner::answer_check::readiness`): a comment of the latest
@@ -205,6 +210,15 @@ pub struct Step {
     /// usual. Off by default.
     #[serde(default)]
     pub tracker_refuses_questions: bool,
+    /// The ticket ref refuses the write that keeps the round a `run` or
+    /// `resolve` step just posted (OWL-196): as `owlshift do` stops on a
+    /// keeping that failed after the post, the QUESTIONS comment stays on the
+    /// ticket and the visible stage moves, but the ask is not kept and the
+    /// core state is as before the round opened. What the ticket ref kept
+    /// before, such as a refused resolver result, stays. Off by default; not
+    /// with `tracker_refuses_questions`, which refuses the post itself.
+    #[serde(default)]
+    pub ticket_ref_refuses_round: bool,
     #[serde(default)]
     pub expect: Expect,
 }
@@ -395,7 +409,16 @@ pub fn play_str(
                 i64::try_from(number).unwrap_or(i64::MAX),
             ))
             .map_err(|e| fail(action.kind(), e.to_string(), None))?;
+        if step.tracker_refuses_questions && step.ticket_ref_refuses_round {
+            return Err(fail(
+                action.kind(),
+                "`tracker_refuses_questions` and `ticket_ref_refuses_round` exclude each other"
+                    .to_owned(),
+                None,
+            ));
+        }
         driver.refuse_questions = step.tracker_refuses_questions;
+        driver.refuse_save = step.ticket_ref_refuses_round;
         let event = driver
             .step(&action)
             .map_err(|m| fail(action.kind(), m, driver.run_output()))?;
@@ -493,6 +516,9 @@ struct Driver {
     /// Whether the tracker refuses this step's QUESTIONS comment
     /// ([`Step::tracker_refuses_questions`]).
     refuse_questions: bool,
+    /// Whether the ticket ref refuses the write keeping this step's round
+    /// ([`Step::ticket_ref_refuses_round`]).
+    refuse_save: bool,
     last_brief: Option<Brief>,
     last_run: Option<RunReport>,
 }
@@ -585,6 +611,7 @@ impl Driver {
             pending: None,
             resolving: Vec::new(),
             refuse_questions: false,
+            refuse_save: false,
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             gate_failure: None,
             has_ref: false,
@@ -772,8 +799,13 @@ impl Driver {
     /// the resolver's, as `owlshift do` clears them with the round's ask
     /// (OWL-192, OWL-191). False, with nothing posted or kept, when the
     /// step's tracker refuses the comment
-    /// ([`Step::tracker_refuses_questions`]): the caller then puts the core
-    /// state back as it was before the round opened.
+    /// ([`Step::tracker_refuses_questions`]), and when it posts but the ticket
+    /// ref refuses the write keeping the round
+    /// ([`Step::ticket_ref_refuses_round`]): `owlshift do` shows the stage
+    /// once the comment is posted, before keeping, then stops on the failed
+    /// write with the ask, the cleared refusals and the new state unkept
+    /// (OWL-196). The caller then puts the core state back as it was before
+    /// the round opened.
     fn post_round(
         &mut self,
         result: &RunResult,
@@ -802,6 +834,10 @@ impl Driver {
             return Ok(false);
         }
         let posted = self.post(&body)?;
+        if self.refuse_save {
+            self.show_after(Event::Questions)?;
+            return Ok(false);
+        }
         self.has_ref = true;
         self.questions.build_refusal = None;
         self.questions.resolver_refusal = None;

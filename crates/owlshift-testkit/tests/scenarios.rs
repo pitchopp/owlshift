@@ -103,6 +103,19 @@ fn resolver_replay() {
     }
 }
 
+/// OWL-196's acceptance: a refused resolver result whose fallback round is
+/// posted but not kept, the ticket ref's write failing, is told to the
+/// resolver run that replays its questions, in a later command.
+#[test]
+fn resolver_replay_after_a_failed_save() {
+    if let Err(error) = play(
+        &scenarios().join("resolver_save_fails.toml"),
+        fake_harness(),
+    ) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-176's acceptance: a ticket's open points reach the resolver or the
 /// decider, never a Build run's own decisions. A Build `done` that decided
 /// them is refused before the gate, and its retry, told why, asks them.
