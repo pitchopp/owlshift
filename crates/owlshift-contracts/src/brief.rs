@@ -81,10 +81,13 @@ pub struct Brief {
     /// it, as the ticket ref keeps it (OWL-192), with the refusal of
     /// decisions that still holds the run before it; in the answer check's,
     /// the previous check on the same ask, whatever command ran it, as the
-    /// ticket ref keeps it (OWL-184). The runner's message, at most
+    /// ticket ref keeps it (OWL-184); in the resolver's, the latest refused
+    /// resolver result, whatever command ran it, until a resolver result is
+    /// accepted or a round is kept, as the ticket ref keeps it (OWL-191): a
+    /// round whose post or keeping failed is replayed by a later command,
+    /// whose questions may differ. The runner's message, at most
     /// [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result
-    /// is data. Never in the resolver's brief, and absent when no such
-    /// refusal is kept.
+    /// is data. Absent when no such refusal is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_refusal: Option<String>,
     /// A Build run's `result.json` was refused for the build role's own
@@ -291,8 +294,8 @@ impl Brief {
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
     /// order, distinct questions of an earlier round; a resolver's brief has
     /// questions to `resolve`, in increasing order, and no other brief has
-    /// any; only Build's and the answer check's briefs have a
-    /// `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
+    /// any; only Build's, the answer check's and the resolver's briefs have
+    /// a `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
     /// Build's, with one, has `decisions_refused`.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
@@ -315,14 +318,15 @@ impl Brief {
             }
         }
         if let Some(reason) = &self.result_refusal {
-            if !matches!(self.role, Role::Build | Role::AnswerCheck) {
+            if !matches!(self.role, Role::Build | Role::AnswerCheck | Role::Resolver) {
                 return Err(ContractError::invalid(
                     CONTRACT,
                     format!(
-                        "a refused result is given but the role is {}, not {} or {}",
+                        "a refused result is given but the role is {}, not {}, {} or {}",
                         self.role.as_str(),
                         Role::Build.as_str(),
-                        Role::AnswerCheck.as_str()
+                        Role::AnswerCheck.as_str(),
+                        Role::Resolver.as_str()
                     ),
                 ));
             }

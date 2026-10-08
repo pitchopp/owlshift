@@ -118,6 +118,24 @@ pub fn outcome(outcome: &Outcome) -> Resolved<'_> {
     }
 }
 
+/// What the ticket ref keeps of the resolver's refusals after a resolver
+/// run that did not break isolation, given what it kept before (OWL-191),
+/// for `owlshift do`, `continue` and the scenarios' stand-in driver alike:
+/// a refused result ([`crate::on_demand::result_refusal`]) takes the place
+/// of the kept reason; an accepted `done` clears it; any other outcome (a
+/// usage limit, a run that failed with nothing told, an accepted `failed`)
+/// leaves it, so the next resolver run is told the same. A round kept
+/// clears it too, which the callers do with the round's ask.
+pub fn refusal_after(kept: Option<&str>, ran: &Outcome) -> Option<String> {
+    if let Some(reason) = crate::on_demand::result_refusal(ran) {
+        return Some(reason);
+    }
+    match outcome(ran) {
+        Resolved::Done(_) => None,
+        Resolved::Fallback(_) | Resolved::Quarantined => kept.map(str::to_owned),
+    }
+}
+
 /// What the runner makes of a resolver's resolutions, each list in question
 /// order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -401,5 +419,37 @@ mod tests {
             outcome(&Outcome::Quarantined(Vec::new())),
             Resolved::Quarantined
         );
+    }
+
+    /// OWL-191: a refused result is kept for the next resolver run, in the
+    /// place of any earlier one; an accepted `done` clears it; every other
+    /// outcome, an accepted `failed` included, leaves it.
+    #[test]
+    fn a_refused_resolver_result_is_kept_until_one_is_accepted() {
+        let finished = |status: &str| Outcome::Finished {
+            result: Box::new(
+                RunResult::parse(&format!(
+                    r#"{{"format":6,"status":"{status}","summary":"s"}}"#
+                ))
+                .unwrap(),
+            ),
+            artifacts: ArtifactContents::default(),
+        };
+        let refused = Outcome::Failed(Failure::InvalidResult("resolution on Q2".to_owned()));
+        for kept in [None, Some("an earlier refusal")] {
+            assert_eq!(
+                refusal_after(kept, &refused).as_deref(),
+                Some("resolution on Q2")
+            );
+            assert_eq!(refusal_after(kept, &finished("done")), None);
+            for left in [
+                finished("failed"),
+                Outcome::Failed(Failure::NoResult),
+                Outcome::Failed(Failure::TimedOut),
+                Outcome::UsageLimit { resets_at: None },
+            ] {
+                assert_eq!(refusal_after(kept, &left).as_deref(), kept, "{left:?}");
+            }
+        }
     }
 }

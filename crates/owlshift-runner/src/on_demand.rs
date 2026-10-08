@@ -221,8 +221,8 @@ pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'
 /// refusal, so of two refusals in a row the second counts. Build
 /// ([`stage_event`], OWL-183) and the answer check
 /// ([`crate::answer_check::event`], OWL-190) free theirs; the resolver's
-/// brief never carries a refusal and its refusal is a fallback, not a
-/// failed run.
+/// refusal is a fallback, not a failed run, so it frees nothing, told
+/// (OWL-191) or not.
 pub fn freed_refusal(outcome: &Outcome, brief: &Brief) -> bool {
     brief.result_refusal.is_none() && result_refusal(outcome).is_some()
 }
@@ -234,7 +234,8 @@ pub fn freed_refusal(outcome: &Outcome, brief: &Brief) -> bool {
 /// boundary, its beginning kept ([`cut_reason`]). `None` for any other
 /// outcome. The next Build run gets it from the ticket ref, whatever command
 /// runs it ([`build_refusal_after`], OWL-180 and OWL-192); the next answer
-/// check on the same ask, from the ticket ref too (OWL-184). A result or an
+/// check on the same ask, from the ticket ref too (OWL-184); the next
+/// resolver run, likewise ([`resolver::refusal_after`], OWL-191). A result or an
 /// artifact holding the harness's login is a credential failure, never a
 /// refusal, so the reason never quotes it.
 pub fn result_refusal(outcome: &Outcome) -> Option<String> {
@@ -731,7 +732,8 @@ struct Prepared {
     worktree: PathBuf,
     branch: String,
     /// The ticket ref as read, then as last written; `None` until a question
-    /// round opens, a decision is kept or a Build result is refused.
+    /// round opens, a decision is kept or a Build or resolver result is
+    /// refused.
     stored: Option<Stored>,
     /// A Build run of this command had a result accepted that clears Build's
     /// kept refusal without asking ([`build_refusal_after`]): cleared in
@@ -1335,8 +1337,10 @@ impl OnDemand<'_> {
         self.show_after(&ticket, Some(run), Event::Questions, sink);
         let mut asked = p.questions();
         // The run that asked heeded any refusal kept for Build: cleared with
-        // the round that keeps its questions (OWL-192).
+        // the round that keeps its questions (OWL-192). A resolver refusal
+        // goes with it: its questions reach the decider now (OWL-191).
         asked.build_refusal = None;
+        asked.resolver_refusal = None;
         asked.asks.push(Ask {
             kind: AskKind::Questions,
             round,
@@ -1434,11 +1438,18 @@ impl OnDemand<'_> {
         let comments = self.comments(&ticket)?;
         let mut brief = self.brief(p, Role::Resolver, &comments, rules, None, current);
         brief.resolve = resolver::unlabelled(&routed.to_resolver);
+        // Why an earlier resolver result was refused, from the ticket ref,
+        // whatever command ran it: its round may not have reached the
+        // decider (OWL-191).
+        brief.result_refusal = p.questions().resolver_refusal;
         let executor = Executor {
             timeout: resolver::RESOLVER_TIMEOUT,
             ..self.executor.clone()
         };
         let ran = self.execute(p, &executor, self.resolver, &brief, 1, sink)?;
+        if ran.breaches.is_empty() {
+            self.keep_resolver_refusal(p, state, &ran.report.outcome)?;
+        }
         // A breach is a quarantined outcome, which `ran.breaches` lists.
         let resolutions = match resolver::outcome(&ran.report.outcome) {
             Resolved::Quarantined => None,
@@ -1857,8 +1868,8 @@ impl OnDemand<'_> {
             ran.breaches.join("; ")
         };
         // A ticket without a ref keeps nothing: a ref is made only once a
-        // question round opens, a decision is kept or a Build result is
-        // refused.
+        // question round opens, a decision is kept or a Build or resolver
+        // result is refused.
         let questions = questions.or_else(|| p.stored.as_ref().map(|_| p.questions()));
         let kept = match questions {
             Some(questions) => self
@@ -1934,7 +1945,7 @@ impl OnDemand<'_> {
 
     /// Keeps `state` in the ticket's ref, when the ticket has one: a ref is
     /// made only once a question round opens, a decision is kept or a Build
-    /// result is refused.
+    /// or resolver result is refused.
     fn keep(&self, p: &mut Prepared, state: &TicketState) -> Result<(), Stop> {
         if p.stored.is_none() {
             return Ok(());
@@ -1973,6 +1984,29 @@ impl OnDemand<'_> {
         questions.build_refusal = Some(next);
         self.store(p, state, questions)
             .map_err(|e| refused("keeping Build's refused result in the ticket's ref", e))
+    }
+
+    /// Keeps what a resolver run's outcome changes of the resolver's kept
+    /// refusal ([`resolver::refusal_after`], OWL-191), at once, under
+    /// `state`, the state the raising Build run left: a refusal before its
+    /// fallback round is posted, so a round whose post or keeping fails
+    /// leaves it for the resolver run that replays the questions, making
+    /// the ticket's ref when it has none; a clear before any DECISION or
+    /// round is posted. A write that fails stops the command.
+    fn keep_resolver_refusal(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        outcome: &Outcome,
+    ) -> Result<(), Stop> {
+        let mut questions = p.questions();
+        let next = resolver::refusal_after(questions.resolver_refusal.as_deref(), outcome);
+        if next == questions.resolver_refusal {
+            return Ok(());
+        }
+        questions.resolver_refusal = next;
+        self.store(p, state, questions)
+            .map_err(|e| refused("keeping the resolver's refusal in the ticket's ref", e))
     }
 
     /// Writes `state` and `questions` as the ticket's ref, unless it already

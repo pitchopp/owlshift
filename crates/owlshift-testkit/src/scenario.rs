@@ -47,7 +47,15 @@
 //! round of what is left, renumbered Q1..Qn; when nothing is left, the
 //! ticket stays at its stage for the next `run`. A resolver without a
 //! usable result sends every question to the decider, and one that breaks
-//! isolation parks the ticket. An `answer` step runs the
+//! isolation parks the ticket. A resolver whose result was refused tells
+//! the next resolver run why, kept until a resolver result is accepted or a
+//! round is kept, as `owlshift do` keeps it in the ticket ref
+//! (`owlshift_runner::resolver::refusal_after`, OWL-191). A step with
+//! `tracker_refuses_questions = true` has the tracker refuse its QUESTIONS
+//! comment: as `owlshift do` stops on a failed post, the round is not
+//! opened and nothing of it is kept, so a later command's Build asks again
+//! (Build's kept refusal, which only a kept round or decision clears once a
+//! run asks, stays too). An `answer` step runs the
 //! answer check (OWL-116) while the ticket waits for input, once answers
 //! arrived, as `owlshift continue` decides it but with no quiet window
 //! (`owlshift_runner::answer_check::readiness`): a comment of the latest
@@ -190,6 +198,13 @@ pub struct Step {
     /// is restarted. The next steps play what it runs.
     #[serde(default, rename = "continue")]
     pub continue_command: bool,
+    /// The tracker refuses the QUESTIONS comment a `run` or `resolve` step
+    /// posts (OWL-191): as `owlshift do` stops on a failed post, the round
+    /// is not opened, nothing of it is kept and the visible stage does not
+    /// move, the ticket staying at its stage. Every other comment posts as
+    /// usual. Off by default.
+    #[serde(default)]
+    pub tracker_refuses_questions: bool,
     #[serde(default)]
     pub expect: Expect,
 }
@@ -380,6 +395,7 @@ pub fn play_str(
                 i64::try_from(number).unwrap_or(i64::MAX),
             ))
             .map_err(|e| fail(action.kind(), e.to_string(), None))?;
+        driver.refuse_questions = step.tracker_refuses_questions;
         let event = driver
             .step(&action)
             .map_err(|m| fail(action.kind(), m, driver.run_output()))?;
@@ -474,6 +490,9 @@ struct Driver {
     pending: Option<RunResult>,
     /// The questions the resolver's brief gives it.
     resolving: Vec<Question>,
+    /// Whether the tracker refuses this step's QUESTIONS comment
+    /// ([`Step::tracker_refuses_questions`]).
+    refuse_questions: bool,
     last_brief: Option<Brief>,
     last_run: Option<RunReport>,
 }
@@ -565,6 +584,7 @@ impl Driver {
             policy: GatePolicy::new(&config.policy.always_human, config.pipeline.plan_approval),
             pending: None,
             resolving: Vec::new(),
+            refuse_questions: false,
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             gate_failure: None,
             has_ref: false,
@@ -727,6 +747,7 @@ impl Driver {
             self.push_if_ahead(&self.worktree())?;
             return Ok(None);
         }
+        let before = self.state;
         let parked = self.apply(event)?;
         if let Some(reason) = parked {
             self.post_parked(reason, &report, Vec::new())?;
@@ -734,7 +755,10 @@ impl Driver {
         self.last_run = Some(report);
         if let (Event::Questions, Some(result)) = (event, &result) {
             let questions = left(&result.questions, &[]);
-            self.post_round(result, questions, 0, None)?;
+            if !self.post_round(result, questions, 0, None)? {
+                self.state = before;
+                return Ok(None);
+            }
         }
         if matches!(event, Event::Completed | Event::Questions) {
             self.push_if_ahead(&self.worktree())?;
@@ -744,14 +768,19 @@ impl Driver {
 
     /// Posts the QUESTIONS comment of a round just opened, and keeps the ask
     /// with its comment and its decider, the ticket's assignee: the bench
-    /// resolves no zone owner.
+    /// resolves no zone owner. The kept ask clears Build's kept refusal and
+    /// the resolver's, as `owlshift do` clears them with the round's ask
+    /// (OWL-192, OWL-191). False, with nothing posted or kept, when the
+    /// step's tracker refuses the comment
+    /// ([`Step::tracker_refuses_questions`]): the caller then puts the core
+    /// state back as it was before the round opened.
     fn post_round(
         &mut self,
         result: &RunResult,
         questions: Vec<Question>,
         decided: usize,
         fallback: Option<Fallback>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let round = NonZeroU32::new(self.state.round()).ok_or("no question round is open")?;
         let body = QuestionsComment {
             ticket: self.id.clone(),
@@ -769,8 +798,13 @@ impl Driver {
             .map_err(|e| e.to_string())?
             .assignee
             .ok_or("the ticket has no assignee to act as its decider")?;
+        if self.refuse_questions {
+            return Ok(false);
+        }
         let posted = self.post(&body)?;
         self.has_ref = true;
+        self.questions.build_refusal = None;
+        self.questions.resolver_refusal = None;
         self.questions.asks.push(Ask {
             kind: AskKind::Questions,
             round,
@@ -784,7 +818,8 @@ impl Driver {
             verdicts: Vec::new(),
             result_refusal: None,
         });
-        self.show_after(Event::Questions)
+        self.show_after(Event::Questions)?;
+        Ok(true)
     }
 
     /// Runs the resolver through the executor, on the fake harness, on the
@@ -801,6 +836,16 @@ impl Driver {
         let report = self.execute(Role::Resolver, reply);
         self.resolving.clear();
         let report = report?;
+        // What the ticket ref keeps for the resolver run that replays these
+        // questions, as `owlshift do` keeps it before posting their round
+        // (OWL-191).
+        if !matches!(report.outcome, Outcome::Quarantined(_)) {
+            self.questions.resolver_refusal = resolver::refusal_after(
+                self.questions.resolver_refusal.as_deref(),
+                &report.outcome,
+            );
+            self.has_ref |= self.questions.resolver_refusal.is_some();
+        }
         let (decided, fallback) = match resolver::outcome(&report.outcome) {
             Resolved::Quarantined => {
                 if let Some(reason) = self.apply(Event::Quarantined)? {
@@ -825,6 +870,7 @@ impl Driver {
                     .render();
                     let posted = self.post(&body)?;
                     self.has_ref = true;
+                    self.questions.build_refusal = None;
                     self.questions.decisions.push(KeptDecision {
                         at: posted.at,
                         comment: posted.id,
@@ -842,8 +888,12 @@ impl Driver {
         if questions.is_empty() {
             return Ok(None);
         }
+        let before = self.state;
         self.apply(Event::Questions)?;
-        self.post_round(&result, questions, decided.len(), fallback)?;
+        if !self.post_round(&result, questions, decided.len(), fallback)? {
+            self.state = before;
+            return Ok(None);
+        }
         Ok(Some(Event::Questions))
     }
 
@@ -1037,9 +1087,19 @@ impl Driver {
         }
         // What the ticket ref keeps for the next Build run, whatever command
         // runs it, as `owlshift do` and `continue` keep it (OWL-192).
+        // A result that asks clears it only with what keeps its questions,
+        // the round's ask or the resolver's first kept decision, so a round
+        // whose post fails leaves it kept.
         if role == Role::Build && !matches!(report.outcome, Outcome::Quarantined(_)) {
-            self.questions.build_refusal =
-                build_refusal_after(self.questions.build_refusal.as_ref(), &report.outcome);
+            let next = build_refusal_after(self.questions.build_refusal.as_ref(), &report.outcome);
+            let asks = matches!(
+                &report.outcome,
+                Outcome::Finished { result, .. }
+                    if matches!(result.status, ResultStatus::Questions | ResultStatus::PremiseFalse)
+            );
+            if next.is_some() || !asks {
+                self.questions.build_refusal = next;
+            }
             self.has_ref |= self.questions.build_refusal.is_some();
         }
         if report.exit_code == Some(OWN_FAILURE) {
@@ -1124,6 +1184,7 @@ impl Driver {
                     .questions
                     .latest()
                     .and_then(|ask| ask.result_refusal.clone()),
+                Role::Resolver => self.questions.resolver_refusal.clone(),
                 _ => None,
             },
             decisions_refused: false,
