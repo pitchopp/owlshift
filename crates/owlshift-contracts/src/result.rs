@@ -239,17 +239,20 @@ impl RunResult {
     /// [`RunResult::validate_against`] together, except that the build
     /// role's own decisions are checked right after the document's shape, so
     /// a result that lists any is refused for them whatever other rule it
-    /// breaks, and the refusal says so (OWL-186).
+    /// breaks, and the refusal says so, and of which kind (OWL-186,
+    /// OWL-195).
     pub fn parse_against(input: &str, brief: &Brief) -> Result<Self, Refused> {
         let other = |error| Refused {
             error,
-            decisions: false,
+            decisions: None,
         };
         let result: Self = format::parse_json(CONTRACT, RESULT_FORMAT, input).map_err(other)?;
-        result.decisions_against(brief).map_err(|error| Refused {
-            error,
-            decisions: true,
-        })?;
+        result
+            .decisions_refused(brief)
+            .map_err(|(kind, error)| Refused {
+                error,
+                decisions: Some(kind),
+            })?;
         result.validate().map_err(other)?;
         result.validate_against(brief).map_err(other)?;
         Ok(result)
@@ -303,7 +306,7 @@ impl RunResult {
     /// questions are then both in increasing order, so the same ids make the
     /// same sequence.
     pub fn validate_against(&self, brief: &Brief) -> Result<(), ContractError> {
-        self.decisions_against(brief)?;
+        self.decisions_refused(brief).map_err(|(_, error)| error)?;
         self.resolutions_against(brief)?;
         if brief.role != Role::AnswerCheck {
             if !self.verdicts.is_empty() {
@@ -360,8 +363,11 @@ impl RunResult {
     /// not end `done` (OWL-186): its predecessor's choices are still open.
     /// The reason is what the next Build run reads in its brief's
     /// `result_refusal`, so it says what to do and quotes the choices, as
-    /// data, after the advice the size limit keeps.
-    fn decisions_against(&self, brief: &Brief) -> Result<(), ContractError> {
+    /// data, after the advice the size limit keeps. A run told of refused
+    /// decisions that lists some again gets a short advice: the next run is
+    /// told every refused list, the first one's full advice first, within
+    /// one size limit (OWL-195). The error comes with its kind.
+    fn decisions_refused(&self, brief: &Brief) -> Result<(), (DecisionsRefusal, ContractError)> {
         if brief.role != Role::Build {
             return Ok(());
         }
@@ -371,8 +377,14 @@ impl RunResult {
                 .iter()
                 .map(|d| format!("{:?} (recorded: {:?})", d.question, d.decision))
                 .collect();
-            return Err(ContractError::invalid(
-                CONTRACT,
+            let reason = if brief.decisions_refused {
+                format!(
+                    "decisions are given again, by a run told that its predecessor's were \
+                     refused: ask each of these choices as a question too, as told for the \
+                     earlier ones. The choices listed: {}",
+                    choices.join("; ")
+                )
+            } else {
                 format!(
                     "decisions are given but the run's role is {}, which takes no decision of \
                      its own: ask each of these choices as a question, filed under `scope` when \
@@ -382,16 +394,23 @@ impl RunResult {
                      refused if it is `done`. The choices listed: {}",
                     brief.role.as_str(),
                     choices.join("; ")
-                ),
+                )
+            };
+            return Err((
+                DecisionsRefusal::Listed,
+                ContractError::invalid(CONTRACT, reason),
             ));
         }
         if brief.decisions_refused && self.status == Status::Done {
-            return Err(ContractError::invalid(
-                CONTRACT,
-                "status is done, but the previous run's decisions were refused and the choices \
-                 they listed are still open: ask each of them as a question, even one found \
-                 settled since; a run told of refused decisions may end with any status but \
-                 `done`",
+            return Err((
+                DecisionsRefusal::Done,
+                ContractError::invalid(
+                    CONTRACT,
+                    "status is done, but the previous run's decisions were refused and the \
+                     choices they listed are still open: ask each of them as a question, even \
+                     one found settled since; a run told of refused decisions may end with any \
+                     status but `done`",
+                ),
             ));
         }
         Ok(())
@@ -446,15 +465,27 @@ impl RunResult {
 }
 
 /// Why [`RunResult::parse_against`] refused a result: the contract's error,
-/// and whether the build role's own decisions were refused.
+/// and whether the build role's own decisions were refused, and how.
 #[derive(Debug)]
 pub struct Refused {
     pub error: ContractError,
-    /// The result listed decisions from the build role, or ended `done`
-    /// while its predecessor's were open (OWL-176): the next Build run is
-    /// told so in its brief's `decisions_refused`, and may not end `done`
-    /// (OWL-186).
-    pub decisions: bool,
+    /// The build role's own decisions were refused (OWL-176): the next
+    /// Build run is told so in its brief's `decisions_refused`, and may not
+    /// end `done` (OWL-186). `None` for any other refusal.
+    pub decisions: Option<DecisionsRefusal>,
+}
+
+/// Why a Build result was refused for the build role's own decisions: the
+/// runner keeps every refused list of choices for the next Build run, and
+/// tells it apart from a refused `done` by this kind, never by the
+/// reason's text (OWL-195).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionsRefusal {
+    /// The result listed decisions: its reason quotes the choices.
+    Listed,
+    /// The result ended `done` while its predecessor's choices were open,
+    /// and listed none.
+    Done,
 }
 
 /// The rules of the resolver's resolutions: in increasing question order,

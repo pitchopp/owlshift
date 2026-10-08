@@ -78,8 +78,9 @@ pub struct Brief {
     /// its `artifacts` name: what this run fixes in its own, such as
     /// questions not numbered from Q1. In Build's brief, the latest refused
     /// Build result since one was accepted (OWL-180), whatever command ran
-    /// it, as the ticket ref keeps it (OWL-192), with the refusal of
-    /// decisions that still holds the run before it; in the answer check's,
+    /// it, as the ticket ref keeps it (OWL-192), with every list of choices
+    /// refused since no Build run asked before it, oldest first (OWL-195);
+    /// in the answer check's,
     /// the previous check on the same ask, whatever command ran it, as the
     /// ticket ref keeps it (OWL-184); in the resolver's, the latest refused
     /// resolver result, whatever command ran it, until a resolver result is

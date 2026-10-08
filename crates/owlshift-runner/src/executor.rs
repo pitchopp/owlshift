@@ -59,7 +59,7 @@ use owlshift_adapters::harness::claude::Usage;
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::{Brief, GateFailure};
 use owlshift_contracts::ids::RelativePath;
-use owlshift_contracts::result::{self, RunResult};
+use owlshift_contracts::result::{self, DecisionsRefusal, RunResult};
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 use owlshift_platform::keychain::Secret;
 
@@ -210,8 +210,12 @@ pub enum Failure {
     /// `result.json` was refused for the build role's own decisions: it
     /// listed some, or ended `done` while its predecessor's were open
     /// (OWL-176). The next Build run is told so, and may not end `done`
-    /// (`Brief::decisions_refused`, OWL-186).
-    Decisions(String),
+    /// (`Brief::decisions_refused`, OWL-186); `kind` says which, so every
+    /// refused list is kept for it (OWL-195).
+    Decisions {
+        kind: DecisionsRefusal,
+        reason: String,
+    },
     /// An artifact the result names was refused.
     Artifact(ArtifactError),
     /// The role reported `done`, and the project's gate, run by the
@@ -226,7 +230,7 @@ impl Failure {
     /// other failure, an artifact the runner could not read included.
     pub fn refusal(&self) -> Option<String> {
         match self {
-            Self::InvalidResult(reason) | Self::Decisions(reason) => Some(reason.clone()),
+            Self::InvalidResult(reason) | Self::Decisions { reason, .. } => Some(reason.clone()),
             Self::Artifact(error) => error.is_the_runs().then(|| error.to_string()),
             Self::TimedOut
             | Self::Credentials(_)
@@ -246,7 +250,7 @@ impl fmt::Display for Failure {
             Self::Harness(reason) => write!(f, "the harness failed: {reason}"),
             Self::Driver(reason) => write!(f, "the harness's output could not be read: {reason}"),
             Self::NoResult => write!(f, "the role left no {RESULT_PATH}"),
-            Self::InvalidResult(reason) | Self::Decisions(reason) => {
+            Self::InvalidResult(reason) | Self::Decisions { reason, .. } => {
                 write!(f, "{RESULT_PATH} was refused: {reason}")
             }
             Self::Artifact(error) => error.fmt(f),
@@ -607,10 +611,9 @@ pub fn validate_result(bytes: &[u8], branch: &str, brief: &Brief) -> Result<RunR
         .map_err(|_| Failure::InvalidResult("it is not UTF-8 text".to_owned()))?;
     let result = RunResult::parse_against(text, brief).map_err(|refused| {
         let reason = refused.error.to_string();
-        if refused.decisions {
-            Failure::Decisions(reason)
-        } else {
-            Failure::InvalidResult(reason)
+        match refused.decisions {
+            Some(kind) => Failure::Decisions { kind, reason },
+            None => Failure::InvalidResult(reason),
         }
     })?;
     if let Some(pr) = &result.pr
@@ -811,7 +814,11 @@ mod tests {
         let decided = br#"{"format":6,"status":"done","summary":"s","decisions":[{"question":"q","decision":"d","basis":"b"}]}"#;
         let refused = validate_result(decided, "owlshift/T-1", &brief).unwrap_err();
         assert!(
-            matches!(&refused, Failure::Decisions(reason) if reason.contains("ask each")),
+            matches!(
+                &refused,
+                Failure::Decisions { kind: DecisionsRefusal::Listed, reason }
+                    if reason.contains("ask each")
+            ),
             "{refused:?}"
         );
         // Unknown fields are refused, and so is text that is not UTF-8.

@@ -39,8 +39,9 @@ pub const TICKET_STATE_FORMAT: u32 = 2;
 /// Format 4 added the resolver's kept `decisions` (OWL-138); format 5 an
 /// ask's `result_refusal` (OWL-184); format 6 Build's kept `build_refusal`
 /// (OWL-192); format 7 the resolver's kept `resolver_refusal` (OWL-191);
-/// formats 2 to 6 are still read.
-pub const QUESTIONS_FORMAT: u32 = 7;
+/// format 8 every refused list of choices in `build_refusal` (OWL-195);
+/// formats 2 to 7 are still read.
+pub const QUESTIONS_FORMAT: u32 = 8;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 
