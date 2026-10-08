@@ -67,7 +67,7 @@ use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
 
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
-pub use git::{Git, GitError};
+pub use git::{Git, GitError, MINIMUM_GIT_VERSION};
 pub use harness::{
     Harness, HarnessEnd, HarnessError, HarnessLogin, HarnessRun, HarnessStatus, SandboxNeeds,
 };
