@@ -152,6 +152,19 @@ fn open_points_restart() {
     }
 }
 
+/// OWL-193's acceptance: the told retry that asks one of two refused choices
+/// is refused with nothing posted, and parks; after the restart, the run
+/// that asks both, naming each, opens round 1.
+#[test]
+fn open_points_partial() {
+    if let Err(error) = play(
+        &scenarios().join("open_points_partial.toml"),
+        fake_harness(),
+    ) {
+        panic!("{error}");
+    }
+}
+
 /// A `continue` needs a ticket ref: on a ticket that never asked, kept a
 /// decision or had a Build result refused, it is refused.
 #[test]

@@ -260,8 +260,9 @@ pub fn result_refusal(outcome: &Outcome) -> Option<String> {
 ///   lists none is kept only while it is the latest refusal;
 /// - an accepted result (a valid `result.json`, or a `done` whose gate
 ///   failed) clears it, except that a hold is cleared only by a result that
-///   asks (`questions` or `premise_false`): a `blocked` or `failed` result
-///   asked nothing, and a `done` is refused under the hold (OWL-186);
+///   asks (`questions`, or `premise_false` with a question): a `blocked` or
+///   `failed` result, or a `premise_false` with none, asked nothing
+///   (OWL-193), and a `done` is refused under the hold (OWL-186);
 /// - any other outcome (a usage limit, a run that failed with nothing told,
 ///   a quarantine) leaves it as it is, so the next run is told the same.
 pub fn build_refusal_after(kept: Option<&BuildRefusal>, outcome: &Outcome) -> Option<BuildRefusal> {
@@ -275,10 +276,16 @@ pub fn build_refusal_after(kept: Option<&BuildRefusal>, outcome: &Outcome) -> Op
         return Some(next);
     }
     match accepted_status(outcome) {
-        Some(result::Status::Questions | result::Status::PremiseFalse) => None,
-        Some(_) if held.is_none() => None,
+        Some(_) if asked(outcome) || held.is_none() => None,
         _ => kept.cloned(),
     }
+}
+
+/// Whether the run's accepted result asks ([`RunResult::asks`]): only such
+/// a result clears a hold, a `premise_false` with no question asking
+/// nothing (OWL-193).
+fn asked(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Finished { result, .. } if result.asks())
 }
 
 /// The status of a Build result the runner accepted: a valid `result.json`,
@@ -3368,12 +3375,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":6,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":7,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t"}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":6,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":7,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -3454,9 +3461,18 @@ mod tests {
             (questions_of(&held), &held.reason),
             (vec!["A".to_owned(), "B".to_owned()], &None)
         );
-        for outcome in left_as_is
-            .iter()
-            .chain(&[finished("blocked"), finished("failed")])
+        // A `premise_false` with no question asks nothing either (OWL-193).
+        let unasked_premise = Outcome::Finished {
+            result: Box::new(
+                RunResult::parse(r#"{"format":7,"status":"premise_false","summary":"s"}"#).unwrap(),
+            ),
+            artifacts: crate::artifact::ArtifactContents::default(),
+        };
+        assert_eq!(build_refusal_after(Some(&shaped), &unasked_premise), None);
+        for outcome in
+            left_as_is
+                .iter()
+                .chain(&[finished("blocked"), finished("failed"), unasked_premise])
         {
             assert_eq!(
                 build_refusal_after(Some(&held), outcome).as_ref(),
@@ -3547,7 +3563,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":6,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":7,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -3584,7 +3600,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":6,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":7,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());

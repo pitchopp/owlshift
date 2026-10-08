@@ -1,5 +1,7 @@
 //! `result.json`: what a role leaves for the runner at the end of a run.
 
+use std::num::NonZeroU32;
+
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -15,6 +17,12 @@ use crate::refs::cut_to;
 pub use owlshift_core::vocab::AnswerClass;
 
 pub(crate) const CONTRACT: &str = "result.json";
+
+/// How much of an unasked choice's question a refusal quotes (OWL-193):
+/// the run has every choice whole in its brief's `refused_choices`, so the
+/// quote only helps a person reading the reason, and comes after the
+/// instruction and the places, which the reason's cut keeps.
+const UNASKED_QUOTE_BYTES: usize = 80;
 
 /// What a Build run whose result listed decisions is told to do, before the
 /// choices: the advice of a refusal of decisions, and of what a held Build
@@ -34,8 +42,9 @@ pub(crate) const DECISIONS_ADVICE: &str = "decisions are given but the run's rol
 /// against the run's brief, verdicts from the answer check only, covering
 /// exactly its latest ask, resolutions from the resolver only, covering
 /// exactly the questions it was given, no decisions from the build role,
-/// and no `done` from a Build run told that its predecessor's decisions were
-/// refused.
+/// no `done` from a Build run told that its predecessor's decisions were
+/// refused, and, from such a run when it asks, every refused choice of its
+/// brief named in `refused_choices_asked` (OWL-193).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift result.json", transform = result_invariants)]
@@ -73,6 +82,24 @@ pub struct RunResult {
     /// question order; only from the resolver, and only with `status: done`.
     #[serde(default)]
     pub resolutions: Vec<Resolution>,
+    /// For each choice of the brief's `refused_choices`, by its place from
+    /// 1, the question of this result that asks it (OWL-193): every place,
+    /// in order, when a Build run told of refused choices asks. Only in a
+    /// result that asks ([`RunResult::asks`]), and only when the brief gives
+    /// refused choices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_choices_asked: Vec<RefusedChoiceAsked>,
+}
+
+/// Where a Build run told of refused choices asks one of them (OWL-193):
+/// the choice's place in its brief's `refused_choices`, from 1, and the id
+/// of the question of the same result that asks it. Several choices may
+/// name one question.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RefusedChoiceAsked {
+    pub choice: NonZeroU32,
+    pub question: QuestionId,
 }
 
 /// How a run ended.
@@ -300,8 +327,36 @@ impl RunResult {
                 "resolutions are given but status is not done",
             ));
         }
+        if !self.refused_choices_asked.is_empty() && !self.asks() {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                "refused choices are named as asked but the result asks no question",
+            ));
+        }
+        if let Some(named) = self
+            .refused_choices_asked
+            .iter()
+            .find(|named| !self.questions.iter().any(|q| q.id == named.question))
+        {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "refused choice {} is named as asked by {}, which the result does not ask",
+                    named.choice, named.question
+                ),
+            ));
+        }
         check_verdicts(CONTRACT, &self.verdicts)?;
         check_resolutions(&self.resolutions)
+    }
+
+    /// Whether the result asks: `questions`, or `premise_false` with at
+    /// least one question. Only such a result clears a hold of refused
+    /// decisions (OWL-192, OWL-193), and only such a result names where it
+    /// asks the refused choices.
+    pub fn asks(&self) -> bool {
+        matches!(self.status, Status::Questions | Status::PremiseFalse)
+            && !self.questions.is_empty()
     }
 
     /// Checks the rules that need the brief of the run: verdicts come from
@@ -317,6 +372,7 @@ impl RunResult {
     /// same sequence.
     pub fn validate_against(&self, brief: &Brief) -> Result<(), ContractError> {
         self.decisions_refused(brief).map_err(|(_, error)| error)?;
+        self.refused_choices_against(brief)?;
         self.resolutions_against(brief)?;
         if brief.role != Role::AnswerCheck {
             if !self.verdicts.is_empty() {
@@ -426,6 +482,81 @@ impl RunResult {
             ));
         }
         Ok(())
+    }
+
+    /// A Build run told of refused choices, which may not end `done`
+    /// (OWL-186), names, when it asks, the question that asks each of them
+    /// (OWL-193): every place of its brief's `refused_choices`, from 1, in
+    /// order, so a retry that asks some and silently drops others is
+    /// refused. The runner checks what the run declares, not that the
+    /// question named truly asks the choice. A result names none when its
+    /// brief gives no refused choice: a hold an older ticket ref kept as
+    /// text has no place to name. The reason gives the instruction and the
+    /// places first, so the cut of a kept reason keeps them.
+    fn refused_choices_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        let refused = &brief.refused_choices;
+        if refused.is_empty() {
+            if self.refused_choices_asked.is_empty() {
+                return Ok(());
+            }
+            return Err(ContractError::invalid(
+                CONTRACT,
+                "refused choices are named as asked but the brief gives none",
+            ));
+        }
+        if !self.asks() {
+            return Ok(());
+        }
+        let named: Vec<usize> = self
+            .refused_choices_asked
+            .iter()
+            .map(|n| usize::try_from(n.choice.get()).unwrap_or(usize::MAX))
+            .collect();
+        if named.iter().copied().eq(1..=refused.len()) {
+            return Ok(());
+        }
+        let list = |places: &[usize]| {
+            places
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let unasked: Vec<usize> = (1..=refused.len())
+            .filter(|place| !named.contains(place))
+            .collect();
+        let stray: Vec<usize> = named
+            .iter()
+            .enumerate()
+            .filter(|&(i, &place)| place > refused.len() || named[..i].iter().any(|&p| p >= place))
+            .map(|(_, &place)| place)
+            .collect();
+        let mut reason = String::from(
+            "the refused choices are not all named as asked: a run told of refused decisions \
+             asks every choice of `refused_choices`, and names in `refused_choices_asked`, for \
+             each in order, its place from 1 and the question that asks it",
+        );
+        if !unasked.is_empty() {
+            reason.push_str(&format!(". Not named: {}", list(&unasked)));
+        }
+        if !stray.is_empty() {
+            reason.push_str(&format!(
+                ". Repeated, out of order or past the {} given: {}",
+                refused.len(),
+                list(&stray)
+            ));
+        }
+        if !unasked.is_empty() {
+            let quoted: Vec<String> = unasked
+                .iter()
+                .map(|&place| {
+                    let question = &refused[place - 1].question;
+                    format!("{place} {:?}", cut_to(question, UNASKED_QUOTE_BYTES))
+                })
+                .collect();
+            reason.push_str(&format!(". The choices not named: {}", quoted.join("; ")));
+        }
+        Err(ContractError::invalid(CONTRACT, reason))
     }
 
     /// Resolutions come from the resolver only, and a `done` resolver gives
@@ -624,7 +755,7 @@ pub(crate) fn check_question_order(
     Ok(())
 }
 
-/// Adds to the schema the four rules of [`RunResult::validate`] that JSON
+/// Adds to the schema the five rules of [`RunResult::validate`] that JSON
 /// Schema can express.
 fn result_invariants(schema: &mut Schema) {
     let rules = json!([
@@ -643,6 +774,16 @@ fn result_invariants(schema: &mut Schema) {
         {
             "if": { "properties": { "resolutions": { "minItems": 1 } }, "required": ["resolutions"] },
             "then": { "properties": { "status": { "const": "done" } } }
+        },
+        {
+            "if": { "properties": { "refused_choices_asked": { "minItems": 1 } }, "required": ["refused_choices_asked"] },
+            "then": {
+                "properties": {
+                    "status": { "enum": ["questions", "premise_false"] },
+                    "questions": { "minItems": 1 }
+                },
+                "required": ["questions"]
+            }
         }
     ]);
     schema.insert("allOf".to_owned(), rules);

@@ -251,7 +251,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(7);
+            v["format"] = json!(8);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -300,20 +300,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 7, "status""#),
+        RunResult::parse(r#"{"format": 8, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 6, "status""#),
+        RunResult::parse(r#"{"format": 7, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(7));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(8));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 7,
-            supported: 6,
+            found: 8,
+            supported: 7,
             ..
         })
     ));
@@ -622,6 +622,163 @@ fn decisions_against_the_brief() {
             .to_owned()
     };
     assert_eq!(quoted(&short), quoted(&full));
+}
+
+/// A Build run told of refused choices names, when it asks, the question
+/// that asks each of them, by its place in the brief's `refused_choices`
+/// (OWL-193): a retry that asks some and drops others is refused.
+#[test]
+fn refused_choices_asked_against_the_brief() {
+    let held = |choices: Vec<Value>| {
+        Brief::parse(&edited("brief.json", |v| {
+            v["decisions_refused"] = json!(true);
+            v["refused_choices"] = json!(choices);
+        }))
+        .unwrap()
+    };
+    let choice = |question: &str| json!({ "question": question, "recorded": "r" });
+    let two = held(vec![
+        choice("Every key or only the required ones"),
+        choice("Where the README lists it"),
+    ]);
+    let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
+    let named = |pairs: &[(u32, &str)]| {
+        json!(
+            pairs
+                .iter()
+                .map(|(choice, question)| json!({ "choice": choice, "question": question }))
+                .collect::<Vec<_>>()
+        )
+    };
+    let result = |status: &str, questions: &[&str], asked: Option<Value>| {
+        edited("result-sample.json", |v| {
+            let object = v.as_object_mut().unwrap();
+            object.remove("decisions");
+            object.insert("status".to_owned(), json!(status));
+            object.insert(
+                "questions".to_owned(),
+                json!(questions.iter().map(|id| question(id)).collect::<Vec<_>>()),
+            );
+            if let Some(asked) = asked.clone() {
+                object.insert("refused_choices_asked".to_owned(), asked);
+            }
+        })
+    };
+    let checked = |input: &str, brief: &Brief| RunResult::parse_against(input, brief).map(|_| ());
+
+    // Every place named, each by its own question or several by one: the
+    // runner checks the declaration, not that the question asks the choice.
+    for asked in [
+        named(&[(1, "Q1"), (2, "Q2")]),
+        named(&[(1, "Q1"), (2, "Q1")]),
+    ] {
+        for status in ["questions", "premise_false"] {
+            checked(&result(status, &["Q1", "Q2"], Some(asked.clone())), &two)
+                .unwrap_or_else(|e| panic!("{status} {asked}: {}", e.error));
+        }
+    }
+    // A result that asks nothing names nothing, and keeps the hold.
+    for status in ["blocked", "failed", "premise_false"] {
+        checked(&result(status, &[], None), &two).unwrap();
+    }
+
+    // A retry that asks one of the two, or every one without naming them.
+    let one = checked(
+        &result("questions", &["Q1"], Some(named(&[(1, "Q1")]))),
+        &two,
+    )
+    .unwrap_err();
+    assert_eq!(one.decisions, None);
+    let reason = one.error.to_string();
+    for needle in [
+        "the refused choices are not all named as asked",
+        "names in `refused_choices_asked`, for each in order, its place from 1",
+        ". Not named: 2. The choices not named: 2 \"Where the README lists it\"",
+    ] {
+        assert!(reason.contains(needle), "{needle:?} not in {reason}");
+    }
+    rejects(
+        "a retry asking every choice without naming them",
+        checked(&result("premise_false", &["Q1", "Q2"], None), &two).map_err(|r| r.error),
+        "Not named: 1, 2.",
+    );
+    for (asked, needle) in [
+        (
+            named(&[(1, "Q1"), (1, "Q2"), (2, "Q2")]),
+            "Repeated, out of order or past the 2 given: 1",
+        ),
+        (
+            named(&[(2, "Q1"), (1, "Q2")]),
+            "Repeated, out of order or past the 2 given: 1",
+        ),
+        (
+            named(&[(1, "Q1"), (2, "Q1"), (3, "Q2")]),
+            "Repeated, out of order or past the 2 given: 3",
+        ),
+        (
+            named(&[(1, "Q1"), (2, "Q3")]),
+            "refused choice 2 is named as asked by Q3, which the result does not ask",
+        ),
+    ] {
+        rejects(
+            "a misnamed refused choice",
+            checked(&result("questions", &["Q1", "Q2"], Some(asked)), &two).map_err(|r| r.error),
+            needle,
+        );
+    }
+    for status in ["blocked", "premise_false"] {
+        rejects(
+            "a refused choice named by a result that asks nothing",
+            checked(&result(status, &[], Some(named(&[(1, "Q1")]))), &two).map_err(|r| r.error),
+            "refused choices are named as asked but the result asks no question",
+        );
+    }
+    // Listed decisions are refused for them first.
+    let decided = edited("result-sample.json", |_| {});
+    assert!(matches!(
+        RunResult::parse_against(&decided, &two)
+            .unwrap_err()
+            .decisions,
+        Some(DecisionsRefusal::Listed(_))
+    ));
+
+    // A brief with no typed choice, a hold kept as text included, has no
+    // place to name.
+    let text_hold = Brief::parse(&edited("brief.json", |v| {
+        v["decisions_refused"] = json!(true)
+    }))
+    .unwrap();
+    let build = Brief::parse(&fixture("brief.json")).unwrap();
+    for brief in [&text_hold, &build] {
+        checked(&result("questions", &["Q1"], None), brief).unwrap();
+        rejects(
+            "a refused choice named without one in the brief",
+            checked(
+                &result("questions", &["Q1"], Some(named(&[(1, "Q1")]))),
+                brief,
+            )
+            .map_err(|r| r.error),
+            "refused choices are named as asked but the brief gives none",
+        );
+    }
+
+    // The instruction and the places come first, within the kept reason's
+    // cut, whatever the choices' length.
+    let full = held(vec![
+        choice(&"x".repeat(MAX_CHOICE_BYTES));
+        MAX_REFUSED_CHOICES
+    ]);
+    let none = checked(&result("questions", &["Q1"], None), &full)
+        .unwrap_err()
+        .error
+        .to_string();
+    let places = (1..=MAX_REFUSED_CHOICES)
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let head = format!("Not named: {places}. The choices not named: 1 \"x");
+    let at = none.find(&head).unwrap_or_else(|| panic!("{none}"));
+    assert!(at + head.len() < MAX_RESULT_REFUSAL_BYTES, "{at}");
 }
 
 /// The resolver's brief carries the questions it settles, without the

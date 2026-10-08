@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift result.json",
-  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, resolutions from the resolver only, covering\nexactly the questions it was given, no decisions from the build role,\nand no `done` from a Build run told that its predecessor's decisions were\nrefused.",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, resolutions from the resolver only, covering\nexactly the questions it was given, no decisions from the build role,\nno `done` from a Build run told that its predecessor's decisions were\nrefused, and, from such a run when it asks, every refused choice of its\nbrief named in `refused_choices_asked` (OWL-193).",
   "type": "object",
   "properties": {
     "artifacts": {
@@ -28,7 +28,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 6
+      "const": 7
     },
     "pr": {
       "description": "The pull request to open; only with `status: done`.",
@@ -48,6 +48,13 @@
       "default": [],
       "items": {
         "$ref": "#/$defs/Question"
+      }
+    },
+    "refused_choices_asked": {
+      "description": "For each choice of the brief's `refused_choices`, by its place from\n1, the question of this result that asks it (OWL-193): every place,\nin order, when a Build run told of refused choices asks. Only in a\nresult that asks ([`RunResult::asks`]), and only when the brief gives\nrefused choices.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RefusedChoiceAsked"
       }
     },
     "resolutions": {
@@ -153,6 +160,34 @@
             "const": "done"
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "refused_choices_asked": {
+            "minItems": 1
+          }
+        },
+        "required": [
+          "refused_choices_asked"
+        ]
+      },
+      "then": {
+        "properties": {
+          "questions": {
+            "minItems": 1
+          },
+          "status": {
+            "enum": [
+              "questions",
+              "premise_false"
+            ]
+          }
+        },
+        "required": [
+          "questions"
+        ]
       }
     }
   ],
@@ -368,6 +403,25 @@
       "description": "A question's identifier within a round: Q1, Q2, and so on.",
       "type": "string",
       "pattern": "^Q[1-9][0-9]*$"
+    },
+    "RefusedChoiceAsked": {
+      "description": "Where a Build run told of refused choices asks one of them (OWL-193):\nthe choice's place in its brief's `refused_choices`, from 1, and the id\nof the question of the same result that asks it. Several choices may\nname one question.",
+      "type": "object",
+      "properties": {
+        "choice": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "question": {
+          "$ref": "#/$defs/QuestionId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "choice",
+        "question"
+      ]
     },
     "RelativePath": {
       "description": "A path relative to the worktree: '/'-separated segments, none empty or '..', with no backslash or colon.",

@@ -1,7 +1,7 @@
 {
   "format": 7,
   "status": "questions",
-  "summary": "The ticket's two open points are to be decided on the ticket.",
+  "summary": "Whether the example shows every key changes what the ticket delivers.",
   "questions": [
     {
       "id": "Q1",
@@ -10,17 +10,9 @@
       "text": "Should the example show every key with comments, or only the required ones?",
       "options": ["Every key, commented", "Only the required keys"],
       "recommendation": "Every key, commented"
-    },
-    {
-      "id": "Q2",
-      "category": "docs",
-      "context": "README.md has a Files section that lists every file at the root.",
-      "text": "Where should the README list the example?",
-      "recommendation": "In its Files section"
     }
   ],
   "refused_choices_asked": [
-    { "choice": 1, "question": "Q1" },
-    { "choice": 2, "question": "Q2" }
+    { "choice": 1, "question": "Q1" }
   ]
 }
