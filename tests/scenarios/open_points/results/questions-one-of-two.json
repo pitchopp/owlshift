@@ -1,0 +1,18 @@
+{
+  "format": 7,
+  "status": "questions",
+  "summary": "Whether the example shows every key changes what the ticket delivers.",
+  "questions": [
+    {
+      "id": "Q1",
+      "category": "scope",
+      "context": "The ticket leaves open what the example shows. examples/owlshift.toml is committed with every key commented, which the answer may change.",
+      "text": "Should the example show every key with comments, or only the required ones?",
+      "options": ["Every key, commented", "Only the required keys"],
+      "recommendation": "Every key, commented"
+    }
+  ],
+  "refused_choices_asked": [
+    { "choice": 1, "question": "Q1" }
+  ]
+}
