@@ -62,9 +62,11 @@ pub enum ContractError {
         source: serde_json::Error,
     },
     /// The document is not valid TOML for the contract, or breaks its shape.
+    /// Boxed: the TOML error is large, and every contract's result carries
+    /// this type.
     Toml {
         contract: &'static str,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     /// The document parses but breaks a rule of the contract.
     Invalid {
@@ -105,7 +107,7 @@ impl std::error::Error for ContractError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json { source, .. } => Some(source),
-            Self::Toml { source, .. } => Some(source),
+            Self::Toml { source, .. } => Some(source.as_ref()),
             Self::NewerFormat { .. } | Self::Invalid { .. } => None,
         }
     }
@@ -264,7 +266,7 @@ pub fn strip_role_front_matter(expected_role: Role, input: &str) -> Result<Strin
     let front_matter: RoleFrontMatter =
         toml::from_str(front).map_err(|source| ContractError::Toml {
             contract: CONTRACT,
-            source,
+            source: Box::new(source),
         })?;
     if front_matter.role != expected_role {
         return Err(ContractError::invalid(

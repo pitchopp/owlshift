@@ -8,7 +8,7 @@ DEMO-5 leaves two points open, to be decided on the ticket. The first Build
 run decides both itself: its result is refused, and the ticket ref keeps why.
 The next Build run, told why and held to asking, stops at a usage limit, which
 ends the command. A person's `continue` is a new command: its Build run is
-still told, quoting the refused choices, and still may not end done; it
+still told, listing the refused choices, and still may not end done; it
 reports done anyway, is refused, and the ticket parks with a PARKED comment
 that says `continue`. The restart is another command, and its Build run is
 told again, and asks."""
@@ -57,8 +57,9 @@ waiting = "parked"
 failed_runs = 2
 gate_failure = "none"
 branch_pushed = false
-brief_result_refusal = "The choices listed: "
+brief_result_refusal = "are in `refused_choices`, oldest first"
 brief_decisions_refused = true
+brief_refused_choices = ["Every key or only the required ones", "Where the README lists the example"]
 [step.expect.last_comment]
 author = "owlshift"
 first_line = "[owlshift] PARKED"
@@ -81,3 +82,4 @@ waiting = "none"
 comments = 1
 brief_result_refusal = "A later result was refused too: invalid result.json: status is done"
 brief_decisions_refused = true
+brief_refused_choices = ["Every key or only the required ones", "Where the README lists the example"]

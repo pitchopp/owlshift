@@ -3450,7 +3450,10 @@ mod tests {
         let questions_of = |kept: &BuildRefusal| -> Vec<String> {
             kept.choices.iter().map(|c| c.question.clone()).collect()
         };
-        assert_eq!((questions_of(&held), &held.reason), (vec!["A".to_owned(), "B".to_owned()], &None));
+        assert_eq!(
+            (questions_of(&held), &held.reason),
+            (vec!["A".to_owned(), "B".to_owned()], &None)
+        );
         for outcome in left_as_is
             .iter()
             .chain(&[finished("blocked"), finished("failed")])

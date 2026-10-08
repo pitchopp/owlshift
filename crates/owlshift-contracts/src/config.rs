@@ -246,7 +246,7 @@ impl ProjectConfig {
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let config: Self = toml::from_str(input).map_err(|source| ContractError::Toml {
             contract: PROJECT,
-            source,
+            source: Box::new(source),
         })?;
         config.validate()?;
         Ok(config)
@@ -457,7 +457,7 @@ impl PersonalConfig {
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let config: Self = toml::from_str(input).map_err(|source| ContractError::Toml {
             contract: PERSONAL,
-            source,
+            source: Box::new(source),
         })?;
         config.validate()?;
         Ok(config)
@@ -548,7 +548,7 @@ pub fn peek_requires(input: &str) -> Result<Option<VersionReq>, ContractError> {
         .map(|peek| peek.requires)
         .map_err(|source| ContractError::Toml {
             contract: CONFIGURATION,
-            source,
+            source: Box::new(source),
         })
 }
 
@@ -579,7 +579,7 @@ pub fn check_requires(input: &str, current: &Version) -> Result<(), ContractErro
 pub fn entries(input: &str) -> Result<Vec<(String, String)>, ContractError> {
     let table: toml::Table = toml::from_str(input).map_err(|source| ContractError::Toml {
         contract: CONFIGURATION,
-        source,
+        source: Box::new(source),
     })?;
     let mut out = Vec::new();
     flatten("", &table, &mut out);

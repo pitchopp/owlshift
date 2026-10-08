@@ -22,9 +22,7 @@ use crate::format::{
     self, CLAIM_FORMAT, ContractError, Format, QUESTIONS_FORMAT, TICKET_STATE_FORMAT,
 };
 use crate::ids::TicketId;
-use crate::result::{
-    self, DECISIONS_ADVICE, Question, RefusedChoice, Verdict, check_verdicts,
-};
+use crate::result::{self, DECISIONS_ADVICE, Question, RefusedChoice, Verdict, check_verdicts};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -345,7 +343,11 @@ impl BuildRefusal {
         if items.is_empty() {
             return told;
         }
-        let joiner = if self.lists.is_empty() { LATER } else { EARLIER };
+        let joiner = if self.lists.is_empty() {
+            LATER
+        } else {
+            EARLIER
+        };
         told.push_str(joiner);
         let room = MAX_RESULT_REFUSAL_BYTES.saturating_sub(told.len());
         told.push_str(&share(items, room));
@@ -704,24 +706,27 @@ impl TicketQuestions {
             ));
         }
         if let Some(kept) = &self.build_refusal {
-            let flaw = kept
-                .reason
-                .as_deref()
-                .and_then(reason_flaw)
-                .map(|flaw| format!("Build's kept refusal reason {flaw}"))
-                .or_else(|| {
-                    kept.lists.iter().enumerate().find_map(|(n, list)| {
-                        reason_flaw(list)
-                            .map(|flaw| format!("Build's kept list of choices {} {flaw}", n + 1))
+            let flaw =
+                kept.reason
+                    .as_deref()
+                    .and_then(reason_flaw)
+                    .map(|flaw| format!("Build's kept refusal reason {flaw}"))
+                    .or_else(|| {
+                        kept.lists.iter().enumerate().find_map(|(n, list)| {
+                            reason_flaw(list).map(|flaw| {
+                                format!("Build's kept list of choices {} {flaw}", n + 1)
+                            })
+                        })
                     })
-                })
-                .or_else(|| {
-                    (kept.choices.len() > MAX_REFUSED_CHOICES).then(|| {
-                        format!("Build's kept refusal keeps more than {MAX_REFUSED_CHOICES} choices")
+                    .or_else(|| {
+                        (kept.choices.len() > MAX_REFUSED_CHOICES).then(|| {
+                            format!(
+                                "Build's kept refusal keeps more than {MAX_REFUSED_CHOICES} choices"
+                            )
+                        })
                     })
-                })
-                .or_else(|| {
-                    kept.choices.iter().position(|c| {
+                    .or_else(|| {
+                        kept.choices.iter().position(|c| {
                         c.question.len() > MAX_CHOICE_BYTES || c.recorded.len() > MAX_CHOICE_BYTES
                     })
                     .map(|n| {
@@ -730,19 +735,19 @@ impl TicketQuestions {
                             n + 1
                         )
                     })
-                })
-                .or_else(|| {
-                    (kept.left_out > 0 && kept.choices.len() < MAX_REFUSED_CHOICES).then(|| {
-                        "Build's kept refusal counts choices left out with room for them"
-                            .to_owned()
                     })
-                })
-                .or_else(|| {
-                    (kept.reason.is_none() && !kept.holds()).then(|| {
-                        "Build's kept refusal keeps neither a reason nor a list of choices"
-                            .to_owned()
+                    .or_else(|| {
+                        (kept.left_out > 0 && kept.choices.len() < MAX_REFUSED_CHOICES).then(|| {
+                            "Build's kept refusal counts choices left out with room for them"
+                                .to_owned()
+                        })
                     })
-                });
+                    .or_else(|| {
+                        (kept.reason.is_none() && !kept.holds()).then(|| {
+                            "Build's kept refusal keeps neither a reason nor a list of choices"
+                                .to_owned()
+                        })
+                    });
             if let Some(flaw) = flaw {
                 return Err(ContractError::invalid(Self::CONTRACT, flaw));
             }
