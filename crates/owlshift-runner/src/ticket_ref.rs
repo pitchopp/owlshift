@@ -31,9 +31,10 @@ use owlshift_core::state::{Status, TicketState};
 
 use crate::executor::Git;
 
-/// The most a file of the ticket ref may hold; the runner's own files are
-/// far smaller.
-const MAX_FILE: u64 = 1024 * 1024;
+/// The most a file of the ticket ref may hold, in bytes: [`read()`] refuses
+/// a larger one, so [`write()`] refuses to write one (OWL-200). The runner's own
+/// files are far smaller.
+pub const MAX_FILE: u64 = 1024 * 1024;
 
 /// What the ticket ref holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +134,11 @@ pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
 /// the new commit. `previous` is the commit the ref was read at, `None` when
 /// it did not exist: the ref moves only from there, and the new commit has
 /// it as its parent and keeps every other entry of its tree.
+///
+/// A file that would hold more than [`MAX_FILE`] bytes is refused before
+/// any git command runs (OWL-200): [`read`] would refuse it, leaving the
+/// ticket where no command reads it. Nothing is written, and the ref keeps
+/// its previous state.
 pub fn write(
     git: &Git,
     checkout: &Path,
@@ -141,8 +147,22 @@ pub fn write(
     previous: Option<&str>,
 ) -> Result<String, String> {
     let name = ticket_ref(ticket);
-    let state = blob(git, checkout, record.state.render().as_bytes())?;
-    let questions = blob(git, checkout, record.questions.render().as_bytes())?;
+    let state = record.state.render();
+    let questions = record.questions.render();
+    for (file, content) in [(STATE_FILE, &state), (QUESTIONS_FILE, &questions)] {
+        // The blob holds these bytes exactly (`--no-filters`), so their
+        // count is the size `read` checks.
+        let len = content.len();
+        if u64::try_from(len).map_or(true, |len| len > MAX_FILE) {
+            return Err(format!(
+                "the ticket ref {name} would hold {file} of {len} bytes, past the {MAX_FILE} \
+                 a ticket ref file may hold: nothing is written, the ref keeps its previous \
+                 state"
+            ));
+        }
+    }
+    let state = blob(git, checkout, state.as_bytes())?;
+    let questions = blob(git, checkout, questions.as_bytes())?;
     let mut tree = Vec::new();
     if let Some(previous) = previous {
         for entry in tree_entries(git, checkout, previous)? {
