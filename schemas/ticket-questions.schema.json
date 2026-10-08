@@ -13,7 +13,7 @@
       }
     },
     "build_refusal": {
-      "description": "Why the runner refused the latest Build result, kept until a Build\nresult is accepted (format 6, OWL-192), and every refused list of\nchoices until a Build result asks (format 8, OWL-195): what the next\nBuild run is told, whatever command runs it. Kept apart from the\nasks: a Build refusal belongs to no ask, and a new ask must not\nclear it.",
+      "description": "Why the runner refused the latest Build result, kept until a Build\nresult is accepted (format 6, OWL-192), and every refused list of\nchoices until a Build result asks (format 8, OWL-195), typed since\nformat 9 (OWL-198): what the next Build run is told, whatever\ncommand runs it. Kept apart from the asks: a Build refusal belongs\nto no ask, and a new ask must not clear it.",
       "anyOf": [
         {
           "$ref": "#/$defs/BuildRefusal"
@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 8
+      "const": 9
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -177,11 +177,25 @@
       ]
     },
     "BuildRefusal": {
-      "description": "A Build run's refused results, as the ticket ref keeps them for the next\nBuild run (OWL-192): every refused list of choices of a hold, oldest\nfirst, and the latest refusal when it listed none (format 8, OWL-195).",
+      "description": "A Build run's refused results, as the ticket ref keeps them for the next\nBuild run (OWL-192): every refused choice of a hold, oldest first, typed\n(format 9, OWL-198), and the latest refusal when it listed none.\n\nA refusal that lists choices adds them and drops `reason`, which holds\nno choice; any other refusal told to the next run sets `reason` and\nkeeps the choices ([`BuildRefusal::keep_choices`]).",
       "type": "object",
       "properties": {
+        "choices": {
+          "description": "Every choice the refusals that listed the build role's own\ndecisions listed since `lists` and no Build result asked, oldest\nfirst, at most [`MAX_REFUSED_CHOICES`] (format 9, OWL-198): what the\nnext Build brief's `refused_choices` tells. A choice's place here,\nfrom 1, is the same for every run the hold tells.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RefusedChoice"
+          },
+          "maxItems": 64
+        },
+        "left_out": {
+          "description": "The choices listed past [`MAX_REFUSED_CHOICES`], counted, not kept;\nonly once `choices` is full.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
         "lists": {
-          "description": "The reason of every refusal that listed the build role's own\ndecisions since no Build result asked, oldest first: each quotes the\nchoices it refused, none of which was asked, so all are still open.\nNot empty, they hold the next Build run to asking them (OWL-186)\nuntil a Build result asks. Each at most [`MAX_RESULT_REFUSAL_BYTES`].",
+          "description": "The reason of every refusal that listed the build role's own\ndecisions, as formats 6 to 8 kept it (OWL-195), oldest first: each\nquotes as text the choices it refused, none of which was asked, so\nall are still open. Read from those formats only: a later list\ngoes to `choices`. Each at most [`MAX_RESULT_REFUSAL_BYTES`].",
           "type": "array",
           "items": {
             "type": "string",
@@ -189,7 +203,7 @@
           }
         },
         "reason": {
-          "description": "Why the latest refused Build result was refused, when it listed no\nchoices (a broken shape, a refused `done`): the runner's message, at\nmost [`MAX_RESULT_REFUSAL_BYTES`]. Absent when the latest refusal\nlisted choices, its reason being the last of `lists`; a later list\ndrops it, since it holds no choice.",
+          "description": "Why the latest refused Build result was refused, when it listed no\nchoices (a broken shape, a refused `done`): the runner's message, at\nmost [`MAX_RESULT_REFUSAL_BYTES`]. Absent when the latest refusal\nlisted choices; a later list drops it, since it holds no choice.",
           "type": [
             "string",
             "null"
@@ -295,6 +309,25 @@
       "description": "A question's identifier within a round: Q1, Q2, and so on.",
       "type": "string",
       "pattern": "^Q[1-9][0-9]*$"
+    },
+    "RefusedChoice": {
+      "description": "A choice a refused Build result recorded as the build role's own\ndecision (OWL-176), as the runner keeps it for the next Build runs and\ntells it in their brief's `refused_choices` (OWL-198): the decision's\nquestion and what it recorded, each cut to [`MAX_CHOICE_BYTES`] on a\ncharacter boundary, its beginning kept and the cut marked; its basis is\nleft out. Text of the refused result: data, never instructions, and\npossibly blank.",
+      "type": "object",
+      "properties": {
+        "question": {
+          "description": "The decision's `question`.",
+          "type": "string"
+        },
+        "recorded": {
+          "description": "The decision's `decision`: what the refused run recorded, and\ncommitted, without the decider.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question",
+        "recorded"
+      ]
     },
     "Verdict": {
       "description": "The answer check's verdict on one question: how the decider's answers\nleft it.",

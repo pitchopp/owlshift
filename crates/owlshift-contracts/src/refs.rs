@@ -15,12 +15,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::Stage;
-use crate::brief::{MAX_RESULT_REFUSAL_BYTES, ThreadEntry, validate_thread};
+use crate::brief::{
+    MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry, validate_thread,
+};
 use crate::format::{
     self, CLAIM_FORMAT, ContractError, Format, QUESTIONS_FORMAT, TICKET_STATE_FORMAT,
 };
 use crate::ids::TicketId;
-use crate::result::{Question, Verdict, check_verdicts};
+use crate::result::{
+    self, DECISIONS_ADVICE, Question, RefusedChoice, Verdict, check_verdicts,
+};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -216,10 +220,10 @@ pub struct TicketQuestions {
     pub decisions: Vec<KeptDecision>,
     /// Why the runner refused the latest Build result, kept until a Build
     /// result is accepted (format 6, OWL-192), and every refused list of
-    /// choices until a Build result asks (format 8, OWL-195): what the next
-    /// Build run is told, whatever command runs it. Kept apart from the
-    /// asks: a Build refusal belongs to no ask, and a new ask must not
-    /// clear it.
+    /// choices until a Build result asks (format 8, OWL-195), typed since
+    /// format 9 (OWL-198): what the next Build run is told, whatever
+    /// command runs it. Kept apart from the asks: a Build refusal belongs
+    /// to no ask, and a new ask must not clear it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_refusal: Option<BuildRefusal>,
     /// Why the runner refused the latest resolver result (format 7,
@@ -235,31 +239,55 @@ pub struct TicketQuestions {
 }
 
 /// A Build run's refused results, as the ticket ref keeps them for the next
-/// Build run (OWL-192): every refused list of choices of a hold, oldest
-/// first, and the latest refusal when it listed none (format 8, OWL-195).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Build run (OWL-192): every refused choice of a hold, oldest first, typed
+/// (format 9, OWL-198), and the latest refusal when it listed none.
+///
+/// A refusal that lists choices adds them and drops `reason`, which holds
+/// no choice; any other refusal told to the next run sets `reason` and
+/// keeps the choices ([`BuildRefusal::keep_choices`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BuildRefusal {
     /// Why the latest refused Build result was refused, when it listed no
     /// choices (a broken shape, a refused `done`): the runner's message, at
     /// most [`MAX_RESULT_REFUSAL_BYTES`]. Absent when the latest refusal
-    /// listed choices, its reason being the last of `lists`; a later list
-    /// drops it, since it holds no choice.
+    /// listed choices; a later list drops it, since it holds no choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = r"\S"))]
     pub reason: Option<String>,
     /// The reason of every refusal that listed the build role's own
-    /// decisions since no Build result asked, oldest first: each quotes the
-    /// choices it refused, none of which was asked, so all are still open.
-    /// Not empty, they hold the next Build run to asking them (OWL-186)
-    /// until a Build result asks. Each at most [`MAX_RESULT_REFUSAL_BYTES`].
+    /// decisions, as formats 6 to 8 kept it (OWL-195), oldest first: each
+    /// quotes as text the choices it refused, none of which was asked, so
+    /// all are still open. Read from those formats only: a later list
+    /// goes to `choices`. Each at most [`MAX_RESULT_REFUSAL_BYTES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(inner(regex(pattern = r"\S")))]
     pub lists: Vec<String>,
+    /// Every choice the refusals that listed the build role's own
+    /// decisions listed since `lists` and no Build result asked, oldest
+    /// first, at most [`MAX_REFUSED_CHOICES`] (format 9, OWL-198): what the
+    /// next Build brief's `refused_choices` tells. A choice's place here,
+    /// from 1, is the same for every run the hold tells.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = MAX_REFUSED_CHOICES))]
+    pub choices: Vec<RefusedChoice>,
+    /// The choices listed past [`MAX_REFUSED_CHOICES`], counted, not kept;
+    /// only once `choices` is full.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub left_out: u32,
+}
+
+/// Whether a count is zero, for serde.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// What joins the items a held Build run is told, OWL-192's words.
 const LATER: &str = "\n\nA later result was refused too: ";
+/// What joins the choices kept as text by formats 6 to 8 to the typed
+/// choices' advice (OWL-198).
+const EARLIER: &str = "\n\nEarlier results were refused too, their choices quoted here and \
+                       not in `refused_choices`: ";
 /// The bytes each item a Build run is told keeps at least, when the items
 /// do not fit whole in [`MAX_RESULT_REFUSAL_BYTES`].
 const TOLD_FLOOR: usize = 160;
@@ -268,55 +296,102 @@ impl BuildRefusal {
     /// Whether a refusal of the build role's own decisions holds the next
     /// Build run to asking them (OWL-186): its brief's `decisions_refused`.
     pub fn holds(&self) -> bool {
-        !self.lists.is_empty()
+        !self.lists.is_empty() || !self.choices.is_empty()
+    }
+
+    /// Keeps the choices of a refusal that listed them (OWL-198): added
+    /// after the kept ones, as listed, up to [`MAX_REFUSED_CHOICES`], the
+    /// rest counted in `left_out`; the reason, which held no choice, goes.
+    pub fn keep_choices(&mut self, listed: &[RefusedChoice]) {
+        let room = MAX_REFUSED_CHOICES.saturating_sub(self.choices.len());
+        self.choices.extend(listed.iter().take(room).cloned());
+        let past = u32::try_from(listed.len().saturating_sub(room)).unwrap_or(u32::MAX);
+        self.left_out = self.left_out.saturating_add(past);
+        self.reason = None;
     }
 
     /// What the next Build brief's `result_refusal` says, within
-    /// [`MAX_RESULT_REFUSAL_BYTES`] (OWL-195): every refused list, oldest
-    /// first, then the latest reason when it listed none. Items that do not
-    /// fit whole share the room: those shorter than their share stay whole,
-    /// the others are cut to it, their beginning kept and the cut marked.
-    /// Past the number of items that fit at 160 bytes each (ten),
-    /// the first list and the newest items are told, and a note counts the
-    /// lists left out between them.
+    /// [`MAX_RESULT_REFUSAL_BYTES`]. With typed choices kept (OWL-198): the
+    /// advice of a refusal of decisions, which says the choices are in
+    /// `refused_choices` and counts those left out, told whole; then the
+    /// lists formats 6 to 8 kept as text and the latest reason, sharing the
+    /// rest of the room. Without: every list, oldest first, then the latest
+    /// reason, sharing the room (OWL-195). Items that do not fit whole share
+    /// the room: those shorter than their share stay whole, the others are
+    /// cut to it, their beginning kept and the cut marked. Past the number
+    /// of items that fit at 160 bytes each, the first item and the newest
+    /// ones are told, and a note counts the lists left out between them.
     pub fn told(&self) -> String {
-        let mut items: Vec<String> = self.lists.iter().chain(&self.reason).cloned().collect();
-        let fits = |n: usize| {
-            n * TOLD_FLOOR + n.saturating_sub(1) * LATER.len() <= MAX_RESULT_REFUSAL_BYTES
-        };
-        let mut note = None;
-        if !fits(items.len()) {
-            let mut newest = items.len() - 1;
-            while newest > 0 && !fits(newest + 2) {
-                newest -= 1;
-            }
-            let left_out = items.len() - 1 - newest;
-            let kept = items.split_off(items.len() - newest);
-            items.truncate(1);
-            items.push(format!(
-                "[{left_out} more refused lists of choices are left out here for lack of room]"
+        let items: Vec<String> = self.lists.iter().chain(&self.reason).cloned().collect();
+        if self.choices.is_empty() {
+            return share(items, MAX_RESULT_REFUSAL_BYTES);
+        }
+        let mut told = ContractError::invalid(
+            result::CONTRACT,
+            format!(
+                "{DECISIONS_ADVICE}. The choices listed by every result refused for them since \
+                 no Build run asked are in `refused_choices`, oldest first"
+            ),
+        )
+        .to_string();
+        if self.left_out > 0 {
+            told.push_str(&format!(
+                ". {} more choices they listed are not kept, past the {MAX_REFUSED_CHOICES} \
+                 there: ask too about every other choice of what the work delivers that the \
+                 branch's commits took without the decider",
+                self.left_out
             ));
-            note = Some(1);
-            items.extend(kept);
         }
-        let budget = MAX_RESULT_REFUSAL_BYTES - items.len().saturating_sub(1) * LATER.len();
-        let mut caps = vec![0; items.len()];
-        let mut order: Vec<usize> = (0..items.len()).collect();
-        order.sort_by_key(|&i| items[i].len());
-        let mut left = budget;
-        for (rank, &i) in order.iter().enumerate() {
-            caps[i] = items[i].len().min(left / (items.len() - rank));
-            left -= caps[i];
+        if items.is_empty() {
+            return told;
         }
-        let mut told = String::new();
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                told.push_str(if note == Some(i) { "\n\n" } else { LATER });
-            }
-            told.push_str(&cut_to(item, caps[i]));
-        }
+        let joiner = if self.lists.is_empty() { LATER } else { EARLIER };
+        told.push_str(joiner);
+        let room = MAX_RESULT_REFUSAL_BYTES.saturating_sub(told.len());
+        told.push_str(&share(items, room));
         told
     }
+}
+
+/// `items`, joined after "A later result was refused too:", within
+/// `budget` bytes (OWL-195): items that do not fit whole share the room,
+/// and past the number that fit at [`TOLD_FLOOR`] bytes each, the first
+/// item and the newest ones are told, a note counting the lists left out
+/// between them.
+fn share(mut items: Vec<String>, budget: usize) -> String {
+    let fits = |n: usize| n * TOLD_FLOOR + n.saturating_sub(1) * LATER.len() <= budget;
+    let mut note = None;
+    if !fits(items.len()) {
+        let mut newest = items.len() - 1;
+        while newest > 0 && !fits(newest + 2) {
+            newest -= 1;
+        }
+        let left_out = items.len() - 1 - newest;
+        let kept = items.split_off(items.len() - newest);
+        items.truncate(1);
+        items.push(format!(
+            "[{left_out} more refused lists of choices are left out here for lack of room]"
+        ));
+        note = Some(1);
+        items.extend(kept);
+    }
+    let room = budget.saturating_sub(items.len().saturating_sub(1) * LATER.len());
+    let mut caps = vec![0; items.len()];
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| items[i].len());
+    let mut left = room;
+    for (rank, &i) in order.iter().enumerate() {
+        caps[i] = items[i].len().min(left / (items.len() - rank));
+        left -= caps[i];
+    }
+    let mut told = String::new();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            told.push_str(if note == Some(i) { "\n\n" } else { LATER });
+        }
+        told.push_str(&cut_to(item, caps[i]));
+    }
+    told
 }
 
 /// `reason` cut to [`MAX_RESULT_REFUSAL_BYTES`] on a character boundary,
@@ -330,7 +405,7 @@ pub fn cut_reason(reason: String) -> String {
 
 /// `reason` cut to at most `max` bytes on a character boundary, its
 /// beginning kept and the cut marked when there is room for the mark.
-fn cut_to(reason: &str, max: usize) -> String {
+pub(crate) fn cut_to(reason: &str, max: usize) -> String {
     const CUT: &str = " [cut]";
     if reason.len() <= max {
         return reason.to_owned();
@@ -357,26 +432,27 @@ struct LegacyBuildRefusal {
 }
 
 impl LegacyBuildRefusal {
-    /// The format-8 refusal: the refusal of decisions that started the
-    /// hold is the first list; a latest reason after it, of a kind the
-    /// older format did not keep, is kept as a list too, so no later
-    /// refusal drops it (it is told where it was); a hold without a held
-    /// reason was started by its latest one, a list. `None` for a held
-    /// reason without the hold, which the older format refused.
+    /// The refusal as format 8 kept it, and format 9 reads it: the
+    /// refusal of decisions that started the hold is the first list; a
+    /// latest reason after it, of a kind the older format did not keep, is
+    /// kept as a list too, so no later refusal drops it (it is told where
+    /// it was); a hold without a held reason was started by its latest
+    /// one, a list. `None` for a held reason without the hold, which the
+    /// older format refused.
     fn upgrade(self) -> Option<BuildRefusal> {
         Some(match (self.decisions_reason, self.decisions) {
             (Some(_), false) => return None,
             (Some(held), true) => BuildRefusal {
-                reason: None,
                 lists: vec![held, self.reason],
+                ..BuildRefusal::default()
             },
             (None, true) => BuildRefusal {
-                reason: None,
                 lists: vec![self.reason],
+                ..BuildRefusal::default()
             },
             (None, false) => BuildRefusal {
                 reason: Some(self.reason),
-                lists: Vec::new(),
+                ..BuildRefusal::default()
             },
         })
     }
@@ -519,9 +595,11 @@ impl TicketQuestions {
     /// written before Build's refusal was kept (OWL-192), a format-6 one,
     /// written before the resolver's refusal was kept (OWL-191), and a
     /// format-7 one, written before every refused list was kept (OWL-195),
-    /// are read as the current format with what they lack empty, a format-6
-    /// or 7 Build refusal upgraded (`LegacyBuildRefusal::upgrade`), and the
-    /// next write gives them the current format.
+    /// and a format-8 one, written before the refused choices were typed
+    /// (OWL-198), are read as the current format with what they lack empty,
+    /// a format-6 or 7 Build refusal upgraded (`LegacyBuildRefusal::upgrade`)
+    /// and a format-8 one's lists kept as text, and the next write gives
+    /// them the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -531,17 +609,20 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 7 document read as the current format, or `None` for
+    /// A format-2 to 8 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
-    /// in their own shape.
+    /// in their own shape, and format 9 adds the typed choices to it.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=7).contains(&format) {
+        if !(2..=8).contains(&format) {
             return None;
         }
+        let typed = document["build_refusal"]
+            .as_object()
+            .is_some_and(|kept| kept.contains_key("choices") || kept.contains_key("left_out"));
         let in_an_ask = |field: &str| {
             document["asks"]
                 .as_array()
@@ -557,6 +638,8 @@ impl TicketQuestions {
             Some("Build refusal")
         } else if format <= 6 && document.get("resolver_refusal").is_some() {
             Some("resolver refusal")
+        } else if typed {
+            Some("typed refused choices")
         } else {
             None
         };
@@ -566,9 +649,10 @@ impl TicketQuestions {
                 format!("format {format} keeps no {field}"),
             )));
         }
-        if let Some(kept) = document
-            .get_mut("build_refusal")
-            .filter(|kept| !kept.is_null())
+        if format <= 7
+            && let Some(kept) = document
+                .get_mut("build_refusal")
+                .filter(|kept| !kept.is_null())
         {
             let legacy: LegacyBuildRefusal = match serde_json::from_value(kept.take()) {
                 Ok(legacy) => legacy,
@@ -608,8 +692,10 @@ impl TicketQuestions {
     /// kept refusal is not blank and at most [`MAX_RESULT_REFUSAL_BYTES`];
     /// each decision names its comment, a decision and a basis, in time
     /// order; Build's kept refusal keeps the same bounds on its reason and
-    /// on each of its lists, and keeps one or the other; the resolver's
-    /// keeps the same bounds.
+    /// on each of its lists, at most [`MAX_REFUSED_CHOICES`] choices, each
+    /// text of at most [`MAX_CHOICE_BYTES`], counts choices left out only
+    /// once full, and keeps a reason or a choice; the resolver's keeps the
+    /// same bounds.
     pub fn validate(&self) -> Result<(), ContractError> {
         if let Some(flaw) = self.resolver_refusal.as_deref().and_then(reason_flaw) {
             return Err(ContractError::invalid(
@@ -630,7 +716,29 @@ impl TicketQuestions {
                     })
                 })
                 .or_else(|| {
-                    (kept.reason.is_none() && kept.lists.is_empty()).then(|| {
+                    (kept.choices.len() > MAX_REFUSED_CHOICES).then(|| {
+                        format!("Build's kept refusal keeps more than {MAX_REFUSED_CHOICES} choices")
+                    })
+                })
+                .or_else(|| {
+                    kept.choices.iter().position(|c| {
+                        c.question.len() > MAX_CHOICE_BYTES || c.recorded.len() > MAX_CHOICE_BYTES
+                    })
+                    .map(|n| {
+                        format!(
+                            "Build's kept choice {} has a text over {MAX_CHOICE_BYTES} bytes",
+                            n + 1
+                        )
+                    })
+                })
+                .or_else(|| {
+                    (kept.left_out > 0 && kept.choices.len() < MAX_REFUSED_CHOICES).then(|| {
+                        "Build's kept refusal counts choices left out with room for them"
+                            .to_owned()
+                    })
+                })
+                .or_else(|| {
+                    (kept.reason.is_none() && !kept.holds()).then(|| {
                         "Build's kept refusal keeps neither a reason nor a list of choices"
                             .to_owned()
                     })
