@@ -950,7 +950,7 @@ fn a_decisions_refusal_is_told_across_commands() {
     );
     let first = bench.record().questions.build_refusal.unwrap();
     assert!(
-        first.decisions && first.reason.contains("Which file"),
+        first.reason.is_none() && first.lists.len() == 1 && first.lists[0].contains("Which file"),
         "{first:?}"
     );
 
@@ -966,11 +966,8 @@ fn a_decisions_refusal_is_told_across_commands() {
         "{parked:?}\n{printed}"
     );
     let kept = bench.record().questions.build_refusal.unwrap();
-    assert!(kept.decisions);
-    assert_eq!(
-        kept.decisions_reason.as_deref(),
-        Some(first.reason.as_str())
-    );
+    assert!(kept.holds() && kept.reason.is_some());
+    assert_eq!(kept.lists, first.lists);
     assert!(
         bench
             .comments()
@@ -1024,11 +1021,61 @@ fn a_decisions_refusal_is_told_across_commands() {
     );
     let after_park = briefs[4].result_refusal.as_deref().unwrap();
     assert!(
-        after_park.starts_with(&first.reason)
+        after_park.starts_with(&first.lists[0])
             && after_park.contains("A later result was refused too: "),
         "{after_park}"
     );
     assert_eq!(bench.record().questions.build_refusal, None);
+}
+
+/// OWL-195: three refusals in a row of results that list choices, across
+/// commands: the first is freed and the told second parks; after the
+/// `continue`, the told run lists choices again. The next Build run is told
+/// every refused list, oldest first, and held to ask; its `done` is refused
+/// and parks, every list still kept.
+#[test]
+fn every_refused_list_is_told_across_commands() {
+    let bench = Bench::new(true);
+    let listing = |choice: &str| {
+        DONE.replace(
+            r#""pr":"#,
+            &format!(r#""decisions":[{{"question":"{choice}","decision":"d","basis":"b"}}],"pr":"#),
+        )
+    };
+    let parked = |stop: &Result<_, Stop>| {
+        matches!(
+            stop,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        )
+    };
+    let (stopped, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(&listing("Which file"))),
+            bench.reply(None, Some(&listing("Which tone"))),
+        ],
+        None,
+    );
+    assert!(parked(&stopped), "{stopped:?}\n{printed}");
+    let (stopped, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&listing("Which case"))),
+        bench.reply(None, Some(DONE)),
+    ]);
+    assert!(parked(&stopped), "{stopped:?}\n{printed}");
+    let kept = bench.record().questions.build_refusal.unwrap();
+    assert_eq!(kept.lists.len(), 3, "{kept:?}");
+    assert!(kept.reason.as_deref().unwrap().contains("status is done"));
+    let briefs = bench.briefs();
+    let told = briefs.last().unwrap();
+    assert!(told.decisions_refused);
+    let reason = told.result_refusal.as_deref().unwrap();
+    let at: Vec<usize> = ["Which file", "Which tone", "Which case"]
+        .iter()
+        .map(|c| reason.find(c).unwrap_or_else(|| panic!("{c} in {reason}")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "{reason}");
 }
 
 /// OWL-183: after a failed run, a refused result does not spend the last

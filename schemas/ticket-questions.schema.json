@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift ticket questions",
-  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and its decider, and what the last answer check\nread, and why the last check's result was refused, when it was; the\ndecisions the resolver took instead of asking; why Build's latest\nresult was refused, until a Build result is accepted; and why the\nresolver's latest result was refused, until one is accepted or a round\nis kept.",
+  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and its decider, and what the last answer check\nread, and why the last check's result was refused, when it was; the\ndecisions the resolver took instead of asking; why Build's latest\nresult was refused, and every list of choices refused since no Build\nresult asked, until a Build result is accepted; and why the\nresolver's latest result was refused, until one is accepted or a round\nis kept.",
   "type": "object",
   "properties": {
     "asks": {
@@ -13,7 +13,7 @@
       }
     },
     "build_refusal": {
-      "description": "Why the runner refused the latest Build result, kept until a Build\nresult is accepted (format 6, OWL-192): what the next Build run is\ntold, whatever command runs it. Kept apart from the asks: a Build\nrefusal belongs to no ask, and a new ask must not clear it.",
+      "description": "Why the runner refused the latest Build result, kept until a Build\nresult is accepted (format 6, OWL-192), and every refused list of\nchoices until a Build result asks (format 8, OWL-195): what the next\nBuild run is told, whatever command runs it. Kept apart from the\nasks: a Build refusal belongs to no ask, and a new ask must not\nclear it.",
       "anyOf": [
         {
           "$ref": "#/$defs/BuildRefusal"
@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 7
+      "const": 8
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -177,32 +177,27 @@
       ]
     },
     "BuildRefusal": {
-      "description": "A Build run's refused result, as the ticket ref keeps it for the next\nBuild run (OWL-192).",
+      "description": "A Build run's refused results, as the ticket ref keeps them for the next\nBuild run (OWL-192): every refused list of choices of a hold, oldest\nfirst, and the latest refusal when it listed none (format 8, OWL-195).",
       "type": "object",
       "properties": {
-        "decisions": {
-          "description": "Whether a refusal of the build role's own decisions holds the next\nBuild run to asking them (OWL-186): set by such a refusal, kept\nthrough every later refusal, and cleared only once a Build result\nasks.",
-          "type": "boolean"
+        "lists": {
+          "description": "The reason of every refusal that listed the build role's own\ndecisions since no Build result asked, oldest first: each quotes the\nchoices it refused, none of which was asked, so all are still open.\nNot empty, they hold the next Build run to asking them (OWL-186)\nuntil a Build result asks. Each at most [`MAX_RESULT_REFUSAL_BYTES`].",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
         },
-        "decisions_reason": {
-          "description": "The refusal of decisions that holds the run, when a later refusal\ntook its place as `reason`: it quotes the choices still open, which\nthe next run is told first. Only with `decisions`; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
+        "reason": {
+          "description": "Why the latest refused Build result was refused, when it listed no\nchoices (a broken shape, a refused `done`): the runner's message, at\nmost [`MAX_RESULT_REFUSAL_BYTES`]. Absent when the latest refusal\nlisted choices, its reason being the last of `lists`; a later list\ndrops it, since it holds no choice.",
           "type": [
             "string",
             "null"
           ],
           "pattern": "\\S"
-        },
-        "reason": {
-          "description": "Why the latest refused Build result was refused: the runner's\nmessage, at most [`MAX_RESULT_REFUSAL_BYTES`].",
-          "type": "string",
-          "pattern": "\\S"
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "reason",
-        "decisions"
-      ]
+      "additionalProperties": false
     },
     "DeciderRule": {
       "description": "The rule that made someone a ticket's decider, as a ticket ref records it.",

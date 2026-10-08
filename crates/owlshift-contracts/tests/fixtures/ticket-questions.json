@@ -1,5 +1,5 @@
 {
-  "format": 7,
+  "format": 8,
   "asks": [
     {
       "kind": "questions",
@@ -68,8 +68,10 @@
   ],
   "build_refusal": {
     "reason": "invalid result.json: status is done, but the previous run's decisions were refused",
-    "decisions": true,
-    "decisions_reason": "invalid result.json: decisions are given but the run's role is build. The choices listed: \"Which file\" (recorded: \"GREETING.md\")"
+    "lists": [
+      "invalid result.json: decisions are given but the run's role is build. The choices listed: \"Which file\" (recorded: \"GREETING.md\")",
+      "invalid result.json: decisions are given again. The choices listed: \"Which tone\" (recorded: \"Formal\")"
+    ]
   },
   "resolver_refusal": "invalid result.json: resolution on Q2, which the brief did not give"
 }
