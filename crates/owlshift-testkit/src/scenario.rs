@@ -56,7 +56,8 @@
 //! retried on the same answers, and a check whose result was refused tells
 //! the next one why, kept on the latest ask as `owlshift continue` keeps it
 //! in the ticket ref (`owlshift_runner::answer_check::keep`, OWL-184). Its outcome maps onto one core event
-//! (`owlshift_runner::answer_check::event`): an answer settles the round,
+//! (`owlshift_runner::answer_check::event`), a refused result the check was
+//! not told of never spending the last attempt (OWL-190): an answer settles the round,
 //! a RESUME comment restates what was understood of each of its questions
 //! (`owlshift_runner::writer::ResumeComment`) and the ticket resumes; an
 //! incomplete one posts a RE-ASK comment with only the open questions
@@ -860,7 +861,10 @@ impl Driver {
         }
         let read_through = self.require_new_answer()?;
         let report = self.execute(Role::AnswerCheck, reply)?;
-        let (event, result) = answer_check::event(&report.outcome);
+        let brief = self.last_brief.as_ref().ok_or("no brief")?;
+        // A refused result the check was not told of is freed from the last
+        // attempt, as `owlshift continue` frees it (OWL-190).
+        let (event, result) = answer_check::event(&report.outcome, brief);
         let result = result.cloned();
         // A check with verdicts keeps what it read and its verdicts, and a
         // refused one its reason for the next check, as `owlshift continue`

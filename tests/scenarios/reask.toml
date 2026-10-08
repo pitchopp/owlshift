@@ -9,7 +9,7 @@ answers Q1 and half of Q2, so the answer check finds Q2 partial and a RE-ASK
 asks Q2 alone. The decider asks back what it means: a counter-question, which a
 REPLY answers with the check's reply, nothing re-asked and no Build run. Their answer then settles Q2, a RESUME restates Q1 and Q2 as
 understood, and the ticket resumes at Build. Round 2 asks one question; a check
-that gives its verdict on round 1's Q2 is refused, a failed run, and is retried
+that gives its verdict on round 1's Q2 is refused, a failed run counted, and is retried
 on the same answer, which settles it, with its own RESUME. The build is then
 done and pushed."""
 ticket = "DEMO-3"
@@ -123,7 +123,7 @@ expect = { event = "none", comments = 9 }
 
 [[step]]
 answer = { result = "results/check-round1-q2-answered.json" }
-expect = { event = "run_failed", waiting = "needs_input", round = 2, failed_runs = 1, comments = 9, brief_latest_ask = ["Q1"] }
+expect = { event = "result_refused", waiting = "needs_input", round = 2, failed_runs = 1, comments = 9, brief_latest_ask = ["Q1"] }
 
 [[step]]
 answer = { result = "results/check-round2-q1-answered.json" }

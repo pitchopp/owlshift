@@ -13,7 +13,8 @@ use crate::pipeline::Pipeline;
 use crate::vocab::{AnswerClass, Stage};
 
 /// Failed runs in one stage that park the ticket: the second one does. A
-/// refused Build result never brings the count there ([`Event::ResultRefused`]).
+/// refused Build or answer-check result never brings the count there
+/// ([`Event::ResultRefused`]).
 pub const MAX_FAILED_RUNS: u32 = 2;
 
 /// Re-asks of one question round before the ticket parks: an answer still
@@ -92,7 +93,7 @@ impl Status {
 /// | The answer check found questions left open (they are re-asked) | `Incomplete` |
 /// | The decider asked a counter-question (answered in the thread) | `CounterQuestion` |
 /// | A run returned `failed` or no valid `result.json`, whatever its exit code, save the row below; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
-/// | A Build run's `result.json` was refused, and the run had not been told of a refused result: the next Build run will be | `ResultRefused` |
+/// | A Build run's or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A human restarted a parked ticket | `Restarted` |
@@ -115,12 +116,13 @@ pub enum Event {
     RunFailed,
     /// A failed run that never spends the stage's last attempt (OWL-183):
     /// it counts as [`Event::RunFailed`] below the last attempt, and at the
-    /// last attempt leaves the ticket as it is, so the next Build run,
-    /// told why the result was refused, gets that attempt. Only Build's
-    /// brief carries that reason, so it is valid at Build alone. The bound
-    /// is the runner's to keep: it gives this event only for a run that was
-    /// not itself told of a refused result, so that of two refusals in a
-    /// row, the second is a `RunFailed`.
+    /// last attempt leaves the ticket as it is, so the next run of its
+    /// kind, told why the result was refused, gets that attempt. Only
+    /// Build's brief and the answer check's carry that reason, so it is
+    /// valid at Build and while waiting for input, where the answer check
+    /// runs (OWL-190). The bound is the runner's to keep: it gives this
+    /// event only for a run that was not itself told of a refused result,
+    /// so that of two refusals in a row, the second is a `RunFailed`.
     ResultRefused,
     Interrupted,
     Quarantined,
@@ -393,7 +395,7 @@ impl TicketState {
                     })
                 }
             }
-            (Status::Active(Stage::Build), Event::ResultRefused) => {
+            (Status::Active(Stage::Build) | Status::NeedsInput { .. }, Event::ResultRefused) => {
                 let failed_runs = (self.failed_runs + 1).min(MAX_FAILED_RUNS - 1);
                 Transition::To(Self {
                     failed_runs,
@@ -595,7 +597,11 @@ mod tests {
             }
             (
                 Status::NeedsInput { .. },
-                Event::Incomplete | Event::CounterQuestion | Event::RunFailed | Event::Interrupted,
+                Event::Incomplete
+                | Event::CounterQuestion
+                | Event::RunFailed
+                | Event::ResultRefused
+                | Event::Interrupted,
             ) => Expect::To(status),
             (Status::NeedsInput { return_to }, Event::Quarantined) => {
                 Expect::Parked(parked(return_to, true), ParkReason::IsolationBreach)
@@ -778,6 +784,15 @@ mod tests {
         assert_eq!(refused, state(Status::Active(Stage::Build), 1, 0, 1));
         // At the last attempt, it leaves the ticket as it is: the next run,
         // told why, gets that attempt.
+        assert_eq!(to(refused.apply(STANDARD, Event::ResultRefused)), refused);
+
+        // The answer check's, while waiting for input, the same way
+        // (OWL-190), re-asks kept.
+        let waiting = Status::NeedsInput {
+            return_to: Stage::Build,
+        };
+        let refused = to(state(waiting, 1, 2, 0).apply(STANDARD, Event::ResultRefused));
+        assert_eq!(refused, state(waiting, 1, 2, 1));
         assert_eq!(to(refused.apply(STANDARD, Event::ResultRefused)), refused);
     }
 
