@@ -266,18 +266,20 @@ pub fn build_refusal_after(kept: Option<&BuildRefusal>, outcome: &Outcome) -> Op
     let held = kept.filter(|kept| kept.holds());
     if let Some(reason) = result_refusal(outcome) {
         let mut lists = held.map(|held| held.lists.clone()).unwrap_or_default();
-        return Some(if decisions_kind(outcome) == Some(DecisionsRefusal::Listed) {
-            lists.push(reason);
-            BuildRefusal {
-                reason: None,
-                lists,
-            }
-        } else {
-            BuildRefusal {
-                reason: Some(reason),
-                lists,
-            }
-        });
+        return Some(
+            if decisions_kind(outcome) == Some(DecisionsRefusal::Listed) {
+                lists.push(reason);
+                BuildRefusal {
+                    reason: None,
+                    lists,
+                }
+            } else {
+                BuildRefusal {
+                    reason: Some(reason),
+                    lists,
+                }
+            },
+        );
     }
     match accepted_status(outcome) {
         Some(result::Status::Questions | result::Status::PremiseFalse) => None,
@@ -3450,9 +3452,18 @@ mod tests {
         // none, which stays only while it is the latest.
         let twice = build_refusal_after(Some(&held), &listed("choices: C")).unwrap();
         let lists = |kept: &BuildRefusal| kept.lists.clone();
-        assert_eq!((lists(&twice), &twice.reason), (vec!["choices: A; B".to_owned(), "choices: C".to_owned()], &None));
+        assert_eq!(
+            (lists(&twice), &twice.reason),
+            (
+                vec!["choices: A; B".to_owned(), "choices: C".to_owned()],
+                &None
+            )
+        );
         let thrice = build_refusal_after(Some(&twice), &listed("choices: D")).unwrap();
-        assert_eq!(lists(&thrice), ["choices: A; B", "choices: C", "choices: D"]);
+        assert_eq!(
+            lists(&thrice),
+            ["choices: A; B", "choices: C", "choices: D"]
+        );
         let done_after = build_refusal_after(Some(&thrice), &done_held).unwrap();
         assert_eq!(
             (lists(&done_after), done_after.reason.as_deref()),
@@ -3520,8 +3531,10 @@ mod tests {
                 let refused =
                     crate::executor::validate_result(result.as_bytes(), "owlshift/T-1", &brief)
                         .unwrap_err();
-                questions.build_refusal =
-                    build_refusal_after(questions.build_refusal.as_ref(), &Outcome::Failed(refused));
+                questions.build_refusal = build_refusal_after(
+                    questions.build_refusal.as_ref(),
+                    &Outcome::Failed(refused),
+                );
             }
             tell_build(&mut brief, &questions);
             brief.validate().unwrap();
@@ -3536,12 +3549,19 @@ mod tests {
         assert!(told.decisions_refused);
         let at: Vec<usize> = choices
             .iter()
-            .map(|c| reason.find(&format!("{c:?} (recorded")).unwrap_or_else(|| panic!("{c} in {reason}")))
+            .map(|c| {
+                reason
+                    .find(&format!("{c:?} (recorded"))
+                    .unwrap_or_else(|| panic!("{c} in {reason}"))
+            })
             .collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{reason}");
         // The first list carries the full advice, the later ones a short one.
         assert_eq!(reason.matches("filed under `scope`").count(), 1, "{reason}");
-        assert!(reason.ends_with("may end with any status but `done`"), "{reason}");
+        assert!(
+            reason.ends_with("may end with any status but `done`"),
+            "{reason}"
+        );
 
         // Long lists share the room: each still begins its choices.
         let long = |c: &str| listing(&format!("{c} {}", "x".repeat(MAX_RESULT_REFUSAL_BYTES)));

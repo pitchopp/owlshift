@@ -276,13 +276,14 @@ impl BuildRefusal {
     /// first, then the latest reason when it listed none. Items that do not
     /// fit whole share the room: those shorter than their share stay whole,
     /// the others are cut to it, their beginning kept and the cut marked.
-    /// Past the number of items that fit at [`TOLD_FLOOR`] bytes each (ten),
+    /// Past the number of items that fit at 160 bytes each (ten),
     /// the first list and the newest items are told, and a note counts the
     /// lists left out between them.
     pub fn told(&self) -> String {
         let mut items: Vec<String> = self.lists.iter().chain(&self.reason).cloned().collect();
-        let fits = |n: usize| n * TOLD_FLOOR + n.saturating_sub(1) * LATER.len()
-            <= MAX_RESULT_REFUSAL_BYTES;
+        let fits = |n: usize| {
+            n * TOLD_FLOOR + n.saturating_sub(1) * LATER.len() <= MAX_RESULT_REFUSAL_BYTES
+        };
         let mut note = None;
         if !fits(items.len()) {
             let mut newest = items.len() - 1;
