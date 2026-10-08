@@ -11,7 +11,9 @@
 //! No command runs a hook or a file-system monitor, whatever the
 //! repository's configuration says ([`hardening`]): a run can write the
 //! repository's shared git files, and the runner's git must not run what it
-//! planted there before the isolation check has seen it.
+//! planted there before the isolation check has seen it. Nor does git's own
+//! housekeeping, which a `fetch` starts in the background, write
+//! `info/refs`, one of those files (OWL-197).
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -152,14 +154,22 @@ impl Git {
 
 /// What every command of the runner's git starts with, before the
 /// subcommand: `core.hooksPath` naming a folder that does not exist, so no
-/// hook is found, and `core.fsmonitor=false`, so no monitor command runs.
-/// Given with `-c`, they win over every configuration file.
-fn hardening() -> [OsString; 4] {
+/// hook is found; `core.fsmonitor=false`, so no monitor command runs; and
+/// `repack.updateServerInfo=false`, so that a repack, such as the one of the
+/// maintenance a `fetch` starts in the background and which outlives it,
+/// writes no `info/refs`: the isolation check guards that file, and a run
+/// during which it changed would be quarantined for nothing (OWL-197). The
+/// agent environment carries the same setting
+/// (`owlshift_core::agent_env::OVERRIDES`). Given with `-c`, they win over
+/// every configuration file, and reach the git commands git starts itself.
+fn hardening() -> [OsString; 6] {
     [
         "-c".into(),
         hooks_nowhere().into(),
         "-c".into(),
         "core.fsmonitor=false".into(),
+        "-c".into(),
+        "repack.updateServerInfo=false".into(),
     ]
 }
 
@@ -229,14 +239,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_command_turns_hooks_and_the_monitor_off() {
+    fn every_command_turns_hooks_the_monitor_and_the_server_info_off() {
         let args = hardening();
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[2], "-c");
-        assert_eq!(args[3], "core.fsmonitor=false");
-        let hooks = args[1].to_str().unwrap();
-        let folder = hooks.strip_prefix("core.hooksPath=").unwrap();
+        let settings: Vec<&str> = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-c", "{args:?}");
+                pair[1].to_str().unwrap()
+            })
+            .collect();
+        assert_eq!(settings.len(), 3, "{settings:?}");
+        assert!(settings.contains(&"core.fsmonitor=false"), "{settings:?}");
+        assert!(
+            settings.contains(&"repack.updateServerInfo=false"),
+            "{settings:?}"
+        );
+        let folder = settings
+            .iter()
+            .find_map(|setting| setting.strip_prefix("core.hooksPath="))
+            .unwrap();
         assert!(fs::symlink_metadata(folder).is_err(), "{folder} exists");
+    }
+
+    /// OWL-197: git's own housekeeping, started by a command of the runner's
+    /// git, writes no `info/refs`, which the isolation check guards: a `gc`
+    /// stands in for the maintenance a `fetch` starts, with the same repack
+    /// run as a child process. Plain git writes it. Git is hermetic: no
+    /// inherited `GIT_*` variable, no system or user configuration.
+    #[test]
+    fn the_runners_git_leaves_the_server_info_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("gitconfig");
+        fs::write(
+            &global,
+            "[user]\n\tname = Owlshift Test\n\temail = test@owlshift.invalid\n\
+             [commit]\n\tgpgsign = false\n",
+        )
+        .unwrap();
+        let hermetic = move |command: &mut Command| {
+            for (name, _) in std::env::vars_os() {
+                if name
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("GIT_")
+                {
+                    command.env_remove(name);
+                }
+            }
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &global);
+        };
+        let plain = |dir: &Path, args: &[&str]| {
+            let mut command = Command::new("git");
+            command.args(args).current_dir(dir);
+            hermetic(&mut command);
+            let out = command.output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let repo = tmp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        plain(&repo, &["init", "--quiet"]);
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        plain(&repo, &["add", "a.txt"]);
+        plain(&repo, &["commit", "--quiet", "-m", "a"]);
+        let refs = repo.join(".git").join("info").join("refs");
+
+        Git::with_setup("git", hermetic.clone())
+            .run(&repo, &["gc", "--quiet"])
+            .unwrap();
+        assert!(!refs.exists(), "the runner's git wrote {}", refs.display());
+
+        // The control: plain git's `gc` writes it.
+        plain(&repo, &["gc", "--quiet"]);
+        assert!(refs.exists(), "plain git's gc wrote no {}", refs.display());
     }
 
     /// OWL-130: git started for the agent, outside the sandbox, runs no
