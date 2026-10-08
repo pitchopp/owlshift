@@ -4,6 +4,8 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{PersistedState, TicketQuestions};
@@ -137,6 +139,63 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
     let stale = ticket_ref::write(&repo.git, &repo.root, &ticket(), &first, Some(&one));
     assert!(stale.is_err(), "{stale:?}");
     assert_eq!(repo.read().unwrap().unwrap().commit, two);
+}
+
+/// A waiting record whose `questions.json` renders to `len` bytes, its
+/// question's context padded.
+fn record_of(len: usize) -> TicketRecord {
+    let with = |context: usize| {
+        let questions = questions(1).replace(
+            r#""context":"c""#,
+            &format!(r#""context":"{}""#, "c".repeat(context)),
+        );
+        TicketRecord {
+            state: PersistedState::parse(WAITING).unwrap(),
+            questions: TicketQuestions::parse(&questions).unwrap(),
+        }
+    };
+    let base = with(1).questions.render().len();
+    let record = with(1 + len - base);
+    assert_eq!(record.questions.render().len(), len);
+    record
+}
+
+#[test]
+fn a_ticket_ref_file_past_the_read_cap_is_never_written() {
+    let repo = Repo::new();
+    let cap = usize::try_from(ticket_ref::MAX_FILE).unwrap();
+    let over = record_of(cap + 1);
+
+    // Refused before any git command, with no ref yet: none is made.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = {
+        let (env, calls) = (repo.env.clone(), Arc::clone(&calls));
+        Git::with_setup("git", move |command| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            env.apply(command);
+        })
+    };
+    let error = ticket_ref::write(&counted, &repo.root, &ticket(), &over, None).unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "would hold questions.json of {} bytes, past the {cap}",
+            cap + 1
+        )) && error.contains("nothing is written"),
+        "{error}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repo.read().unwrap(), None);
+
+    // A file of exactly the cap is written and read back.
+    let at_cap = record_of(cap);
+    let kept = ticket_ref::write(&repo.git, &repo.root, &ticket(), &at_cap, None).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, at_cap);
+
+    // One byte more over an existing ref: the ref keeps its previous state.
+    let error = ticket_ref::write(&repo.git, &repo.root, &ticket(), &over, Some(&kept));
+    assert!(error.is_err(), "{error:?}");
+    let stored = repo.read().unwrap().unwrap();
+    assert_eq!((stored.commit, stored.record), (kept, at_cap));
 }
 
 #[test]
