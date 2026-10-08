@@ -2628,8 +2628,10 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
 
 /// OWL-184: an answer check whose result is refused leaves its reason in the
 /// ticket ref, through a park, and the next check, in a later command, is
-/// told why; a check that gives its verdicts clears it. Here a crashed check
-/// counted first, so the refused one parks, and `continue` restarts it.
+/// told why; a check that gives its verdicts clears it. OWL-190: after a
+/// crashed check, the refused one, told of nothing, never spends the last
+/// attempt, and its told retry, refused again, parks; `continue` restarts
+/// it.
 #[test]
 fn a_refused_check_is_told_to_the_next_check_across_commands() {
     let bench = Bench::new(true);
@@ -2642,11 +2644,36 @@ fn a_refused_check_is_told_to_the_next_check_across_commands() {
         matches!(&crashed, Err(Stop::CheckFailed { .. })),
         "{crashed:?}"
     );
-    let off_the_ask = check(&[
-        ("Q1", "answered", "English."),
-        ("Q3", "answered", "No sign-off."),
-    ]);
-    let (parked, _) = bench.continue_ticket(vec![bench.reply(None, Some(&off_the_ask))]);
+    let off_the_ask = |id: &'static str| {
+        check(&[
+            ("Q1", "answered", "English."),
+            (id, "answered", "No sign-off."),
+        ])
+    };
+    let kept_refusal = || {
+        bench
+            .record()
+            .questions
+            .latest()
+            .unwrap()
+            .result_refusal
+            .clone()
+    };
+    let comments = bench.comments().len();
+    let (freed, _) = bench.continue_ticket(vec![bench.reply(None, Some(&off_the_ask("Q3")))]);
+    assert!(matches!(&freed, Err(Stop::CheckFailed { .. })), "{freed:?}");
+    assert_eq!(bench.record().state.waiting, Some(Waiting::NeedsInput));
+    assert_eq!(bench.record().state.failed_runs, 1);
+    assert_eq!(bench.comments().len(), comments, "nothing posted");
+    let freed_reason = kept_refusal();
+    assert!(
+        freed_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("the verdict for Q3 names a question")),
+        "{freed_reason:?}"
+    );
+
+    let (parked, _) = bench.continue_ticket(vec![bench.reply(None, Some(&off_the_ask("Q4")))]);
     assert!(
         matches!(
             &parked,
@@ -2657,16 +2684,10 @@ fn a_refused_check_is_told_to_the_next_check_across_commands() {
         ),
         "{parked:?}"
     );
-    let kept = bench
-        .record()
-        .questions
-        .latest()
-        .unwrap()
-        .result_refusal
-        .clone();
+    let kept = kept_refusal();
     assert!(
         kept.as_deref()
-            .is_some_and(|reason| reason.contains("the verdict for Q3 names a question")),
+            .is_some_and(|reason| reason.contains("the verdict for Q4 names a question")),
         "{kept:?}"
     );
 
@@ -2690,6 +2711,7 @@ fn a_refused_check_is_told_to_the_next_check_across_commands() {
             (Role::Build, None),
             (Role::AnswerCheck, None),
             (Role::AnswerCheck, None),
+            (Role::AnswerCheck, freed_reason),
             (Role::AnswerCheck, kept),
             (Role::Build, None),
         ]
@@ -2697,6 +2719,66 @@ fn a_refused_check_is_told_to_the_next_check_across_commands() {
     assert_eq!(
         bench.record().questions.latest().unwrap().result_refusal,
         None
+    );
+}
+
+/// OWL-190 under watch: after a crashed check, a refused one keeps the
+/// ticket waiting instead of parking it, and the next pass runs the told
+/// retry, with no PARKED comment and no `continue` typed.
+#[test]
+fn watch_retries_a_refused_check_at_the_last_attempt() {
+    let bench = Bench::new(true);
+    let answered = answered_round(&bench);
+    let mut pass = 0;
+    let mut sleep = |_: Duration| {
+        pass += 1;
+        pass < 3
+    };
+    let off_the_ask = check(&[
+        ("Q1", "answered", "English."),
+        ("Q3", "answered", "Hello, reader."),
+    ]);
+    let (outcomes, lines, printed) = bench.watch(
+        vec![
+            bench.reply(None, None),
+            bench.reply(None, Some(&off_the_ask)),
+            answered,
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        &mut sleep,
+    );
+    match &outcomes[..] {
+        [
+            Err(Stop::CheckFailed { .. }),
+            Err(Stop::CheckFailed { .. }),
+            Ok(delivered),
+        ] => assert!(delivered.opened, "{delivered:?}"),
+        other => panic!("{other:?}\n{lines}\n{printed}"),
+    }
+    let comments = bench.comments();
+    assert!(
+        !comments.iter().any(|c| c.starts_with("[owlshift] PARKED")),
+        "{comments:?}"
+    );
+    let told: Vec<(Role, bool)> = bench
+        .briefs()
+        .into_iter()
+        .map(|brief| {
+            let told = brief
+                .result_refusal
+                .is_some_and(|reason| reason.contains("the verdict for Q3 names a question"));
+            (brief.role, told)
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (Role::Build, false),
+            (Role::AnswerCheck, false),
+            (Role::AnswerCheck, false),
+            (Role::AnswerCheck, true),
+            (Role::Build, false),
+        ]
     );
 }
 

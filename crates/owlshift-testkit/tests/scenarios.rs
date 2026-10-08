@@ -166,6 +166,16 @@ fn check_refusal() {
     }
 }
 
+/// OWL-190's acceptance: with a crashed answer check already counted, a
+/// refused check does not park the ticket, and the next check, told why,
+/// answers the round.
+#[test]
+fn check_last_attempt() {
+    if let Err(error) = play(&scenarios().join("check_last_attempt.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
 /// OWL-123's acceptance: past the re-ask limit, a fourth incomplete answer
 /// parks the ticket with a PARKED comment naming what is still open and
 /// what restarts it. The project names a parked state, which the ticket

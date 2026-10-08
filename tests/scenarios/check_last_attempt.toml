@@ -1,20 +1,19 @@
-# OWL-184's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
+# OWL-190's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
 # It plays on the numbering/ fixture folder (the project in repo/, prepared
 # results/): round 1 asks Q1 alone, so a check giving a verdict on Q2 is
 # refused.
 
 fixture = "numbering"
 description = """
-DEMO-4 with an answer check whose result is refused. Round 1 asks Q1 and the
-decider answers it. The first check gives its verdict on Q2, which the round
-did not ask: its result is refused, a failed run counted (no run failed
-before it, so this is not the last attempt), nothing is posted, and the
-latest ask keeps the reason, as the ticket ref keeps it between commands. The
-next check stops at a usage limit, told why, and keeps nothing, so the one
-after it is told the same reason; it gives its verdict on Q1, and the round is
-answered."""
+DEMO-4 with an answer check whose result is refused at the last attempt.
+Round 1 asks Q1 and the decider answers it. The first check crashes, a failed
+run counted. The second gives its verdict on Q2, which the round did not ask:
+its result is refused, and it was told of no earlier refusal, so it never
+spends the last attempt: no PARKED comment, nothing posted, the ticket still
+waits with its count, and the latest ask keeps the reason. The next check,
+told why, gives its verdict on Q1, and the round is answered."""
 ticket = "DEMO-4"
-start = "2026-10-07T11:00:00Z"
+start = "2026-10-08T09:00:00Z"
 
 [[step]]
 dispatch = true
@@ -28,6 +27,11 @@ expect = { event = "questions", round = 1, failed_runs = 0, comments = 1 }
 comment = { author = "maintainer", body = "Q1: English.\n" }
 
 [[step]]
+answer = { stderr = "fatal: out of memory\n", exit_code = 101 }
+expect = { event = "run_failed", waiting = "needs_input", round = 1, failed_runs = 1, comments = 2 }
+
+# One failed run counted: this refusal would be the second.
+[[step]]
 answer = { result = "results/check-round1-q2-answered.json" }
 [step.expect]
 event = "result_refused"
@@ -37,15 +41,6 @@ failed_runs = 1
 tracker_stage = "Needs Input"
 comments = 2
 brief_result_refusal = "none"
-
-[[step]]
-answer = { usage_limit = "2026-10-07T18:00:00Z" }
-[step.expect]
-event = "interrupted"
-waiting = "needs_input"
-failed_runs = 1
-comments = 2
-brief_result_refusal = "the verdict for Q2 names a question the latest ask of round 1 did not ask"
 
 [[step]]
 answer = { result = "results/check-round1-q1-answered.json" }

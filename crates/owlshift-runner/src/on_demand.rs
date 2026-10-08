@@ -204,19 +204,27 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
 
 /// The core event of a stage run's outcome, given the brief it ran with, for
 /// `owlshift do` and the scenarios' stand-in driver alike: as [`core_event`],
-/// except that a Build run whose result was refused ([`result_refusal`]),
-/// and whose brief told it of no earlier refusal, is [`Event::ResultRefused`]
-/// (OWL-183). Its count never parks the ticket, since the next Build run is
-/// told why; a run that was told and fails is a plain failed run, so
-/// refusals never loop.
+/// except that a Build run whose refusal is freed ([`freed_refusal`]) is
+/// [`Event::ResultRefused`] (OWL-183). Its count never parks the ticket,
+/// since the next Build run is told why; a run that was told and fails is a
+/// plain failed run, so refusals never loop.
 pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'a RunResult>) {
-    if brief.role == Role::Build
-        && brief.result_refusal.is_none()
-        && result_refusal(outcome).is_some()
-    {
+    if brief.role == Role::Build && freed_refusal(outcome, brief) {
         return (Event::ResultRefused, None);
     }
     core_event(outcome)
+}
+
+/// Whether a run's refusal is freed from the last attempt
+/// ([`Event::ResultRefused`]): its result was refused ([`result_refusal`]),
+/// so the next run is told why, and its own brief told it of no earlier
+/// refusal, so of two refusals in a row the second counts. Build
+/// ([`stage_event`], OWL-183) and the answer check
+/// ([`crate::answer_check::event`], OWL-190) free theirs; the resolver's
+/// brief never carries a refusal and its refusal is a fallback, not a
+/// failed run.
+pub fn freed_refusal(outcome: &Outcome, brief: &Brief) -> bool {
+    brief.result_refusal.is_none() && result_refusal(outcome).is_some()
 }
 
 /// What the next run is told of a run's outcome: why its `result.json`, or
@@ -597,7 +605,7 @@ impl fmt::Display for Stop {
             Self::CheckFailed { ticket, detail } => write!(
                 f,
                 "The answer check failed: {detail}. Run `owlshift continue {ticket}` to check the \
-                 same answers again; a second failure parks the ticket."
+                 same answers again; a check that fails with no attempt left parks the ticket."
             ),
             Self::Parked {
                 reason,
@@ -1601,7 +1609,7 @@ impl OnDemand<'_> {
         };
         let ran = self.execute(p, &executor, self.answer_check, &brief, 1, sink)?;
         let event = if ran.breaches.is_empty() {
-            answer_check::event(&ran.report.outcome).0
+            answer_check::event(&ran.report.outcome, &brief).0
         } else {
             Event::Quarantined
         };
@@ -1801,7 +1809,9 @@ impl OnDemand<'_> {
                         .collect(),
                 })
             }
-            Event::RunFailed => {
+            // A refused result freed at the last attempt keeps the ticket
+            // waiting, its reason kept for the next check (OWL-190).
+            Event::RunFailed | Event::ResultRefused => {
                 self.store(p, &next, questions)
                     .map_err(|e| refused("keeping the ticket's state in its ref", e))?;
                 Err(Stop::CheckFailed {

@@ -26,7 +26,7 @@ use owlshift_core::reply::{self, Reply};
 use owlshift_core::state::Event;
 
 use crate::executor::Outcome;
-use crate::on_demand::{comment_author, core_event, result_refusal};
+use crate::on_demand::{comment_author, core_event, freed_refusal, result_refusal};
 
 /// Whether answers arrived: the newest last edit among the decider's
 /// comments when it is later than the latest ask and than what the last
@@ -142,17 +142,24 @@ pub fn readiness(
     })
 }
 
-/// The core event an answer check's outcome maps onto, and its result when
-/// it left a valid one.
+/// The core event an answer check's outcome maps onto, given the brief it
+/// ran with, and its result when it left a valid one.
 ///
 /// A `done` result folds its verdicts into one event
 /// ([`Event::from_answer_check`]). Any other status is a failed run: the
 /// role returns `done` or `failed`, and questions, a block or a false premise
-/// mean nothing while the ticket waits for its decider. Every other outcome
-/// maps as for any run ([`core_event`]): a usage limit is an interruption, a
-/// run without a valid result a failed run, a breach a quarantine. A failed
-/// check counts toward the ticket's failed runs, so a second one parks it.
-pub fn event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
+/// mean nothing while the ticket waits for its decider. A refused result,
+/// when the brief told the check of no earlier refusal
+/// ([`freed_refusal`]), is [`Event::ResultRefused`]: it never spends the
+/// last attempt, since the next check is told why (OWL-190). Every other
+/// outcome maps as for any run ([`core_event`]): a usage limit is an
+/// interruption, a run without a valid result a failed run, a breach a
+/// quarantine. A failed check counts toward the ticket's failed runs, so a
+/// second one parks it, save a freed refusal.
+pub fn event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'a RunResult>) {
+    if freed_refusal(outcome, brief) {
+        return (Event::ResultRefused, None);
+    }
     match outcome {
         Outcome::Finished { result, .. } => {
             let event = match result.status {
@@ -180,7 +187,8 @@ pub fn event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
 /// verdicts keeps what it read through and its verdicts
 /// ([`TicketQuestions::keep_check`]). The latest ask keeps why the check's
 /// result was refused ([`result_refusal`]), for the next check on it, which
-/// is told (OWL-184); any other outcome clears it, a quarantine included. A
+/// is told (OWL-184), whether it counted or was freed (OWL-190); any other
+/// outcome clears it, a quarantine included. A
 /// check interrupted by a usage limit keeps nothing, so the next one is told
 /// what this one was. Returns the verdicts kept, none when it gave none.
 pub fn keep(
@@ -517,9 +525,25 @@ mod tests {
         ))
     }
 
+    /// An answer check's brief, told of an earlier refusal or not.
+    fn check_brief(refusal: Option<&str>) -> Brief {
+        let refusal = refusal.map_or(String::new(), |reason| {
+            format!(r#","result_refusal":"{reason}""#)
+        });
+        Brief::parse(&format!(
+            r#"{{"format":{BRIEF_FORMAT},"role":"answer_check","project":"p",
+                "ticket":{{"id":"T-1","title":"t","author":{{"name":"a","relation":"decider"}},"description":"d"}},
+                "decider":"a","thread":[],
+                "permissions":{{"level":"read_only","network":false,"browser":false}},
+                "gate":[],"always_human":[],"result_path":"result.json"{refusal}}}"#
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn a_done_check_folds_its_verdicts_and_anything_else_maps_as_a_run() {
-        let event_of = |outcome: &Outcome| event(outcome).0;
+        let untold = check_brief(None);
+        let event_of = |outcome: &Outcome| event(outcome, &untold).0;
         assert_eq!(event_of(&done(&["answered"])), Event::Answered);
         assert_eq!(event_of(&done(&["answered", "partial"])), Event::Incomplete);
         assert_eq!(
@@ -540,7 +564,10 @@ mod tests {
                 {"id":"Q1","category":"scope","context":"c","text":"t"}]}"#,
         );
         assert_eq!(event_of(&asking), Event::RunFailed);
-        assert!(event(&asking).1.is_some(), "the result is still returned");
+        assert!(
+            event(&asking, &untold).1.is_some(),
+            "the result is still returned"
+        );
 
         assert_eq!(
             event_of(&Outcome::UsageLimit { resets_at: None }),
@@ -554,6 +581,27 @@ mod tests {
             event_of(&Outcome::Quarantined(Vec::new())),
             Event::Quarantined
         );
+    }
+
+    /// OWL-190: a refused result is freed from the last attempt when the
+    /// check was told of no earlier refusal, and counts when it was, so two
+    /// refusals in a row never both go free. A failure the check is not the
+    /// one to fix is a failed run either way.
+    #[test]
+    fn a_refused_check_is_freed_unless_it_was_told() {
+        let refused = Outcome::Failed(Failure::InvalidResult("the verdict for Q3".to_owned()));
+        let told = check_brief(Some("the verdict for Q2"));
+        assert_eq!(
+            event(&refused, &check_brief(None)),
+            (Event::ResultRefused, None)
+        );
+        assert_eq!(event(&refused, &told), (Event::RunFailed, None));
+        for brief in [check_brief(None), told] {
+            assert_eq!(
+                event(&Outcome::Failed(Failure::NoResult), &brief).0,
+                Event::RunFailed
+            );
+        }
     }
 
     #[test]
