@@ -6,10 +6,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
+use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::Git;
 use owlshift_runner::executor::isolation::{Concurrent, Snapshot, Violation};
 use owlshift_testkit::git::{GitEnv, seed};
@@ -83,6 +85,20 @@ impl Fixture {
         self.env.run(&self.worktree, args).unwrap();
     }
 
+    /// Runs git in the worktree as the agent's own shell does: with the
+    /// agent environment the executor gives it, and no other variable.
+    fn agent_git(&self, args: &[&str]) {
+        let agent = AgentEnv::new(self.env.agent_parent()).unwrap();
+        let mut command = Command::new("git");
+        command
+            .args(args)
+            .current_dir(&self.worktree)
+            .stdin(Stdio::null());
+        agent.apply(&mut command);
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
     /// The commit `rev` names, seen from `dir`.
     fn commit(&self, dir: &Path, rev: &str) -> String {
         let id = self.env.run(dir, &["rev-parse", "--verify", rev]).unwrap();
@@ -107,12 +123,15 @@ fn files(paths: &[&str]) -> Violation {
 fn a_runs_own_work_passes_and_every_breach_is_found() {
     let f = Fixture::new();
 
-    // The run's own work: a commit on its branch, its ignored run files, and
-    // a fetch moving a remote-tracking ref.
+    // The run's own work: a commit on its branch, its ignored run files, a
+    // fetch moving a remote-tracking ref, and git's own housekeeping as the
+    // agent's git does it (OWL-197): a `gc` stands in for the maintenance a
+    // commit starts, whose repack writes no `info/refs` there.
     let own = f.around(|f| {
         fs::write(f.worktree.join("GREETING.md"), "hi\n").unwrap();
         f.worktree_git(&["add", "GREETING.md"]);
         f.worktree_git(&["commit", "--quiet", "-m", "Greet"]);
+        f.agent_git(&["gc", "--quiet"]);
         fs::create_dir_all(f.worktree.join(".owlshift/run")).unwrap();
         fs::write(f.worktree.join(".owlshift/run/.gitignore"), "*\n").unwrap();
         fs::write(f.worktree.join(".owlshift/run/result.json"), "{}").unwrap();
@@ -170,6 +189,16 @@ fn a_runs_own_work_passes_and_every_breach_is_found() {
     assert_eq!(
         f.around(|f| f.worktree_git(&["config", "core.hooksPath", "/elsewhere"])),
         [Violation::SharedGitFiles(vec!["config".into()])]
+    );
+    // All of `info/` stays guarded: an ignore rule, and the `info/refs` that
+    // housekeeping writes when nothing turns it off, as plain git's `gc` does.
+    assert_eq!(
+        f.around(|f| fs::write(f.main.join(".git/info/exclude"), "stray/\n").unwrap()),
+        [Violation::SharedGitFiles(vec!["info/exclude".into()])]
+    );
+    assert_eq!(
+        f.around(|f| f.worktree_git(&["gc", "--quiet"])),
+        [Violation::SharedGitFiles(vec!["info/refs".into()])]
     );
 
     // The worktree: another branch, then history rewritten below the start.

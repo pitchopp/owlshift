@@ -9,8 +9,10 @@
 //! ([`PROXY_VARIABLES`], refused when it holds a login), plus the variables
 //! the project declares for its gate and the operator allows
 //! ([`check_declared`]); then [`OVERRIDES`] leave git and gh without a
-//! credential. Each override rests on a live check recorded
-//! in the build plan (results, "OWL-22").
+//! credential, and keep git's own housekeeping out of the repository's
+//! shared `info/` folder. Each override rests on a live check recorded
+//! in the build plan (results, "OWL-22"; the housekeeping one under the
+//! executor, OWL-197).
 //!
 //! This closes what an agent reaches without going around Owlshift. A process
 //! that goes looking in the operator's files or keychain is stopped by the
@@ -130,11 +132,20 @@ pub const OVERRIDES: &[(&str, &str)] = &[
     // empty configuration directory does not stop the keyring fallback.
     ("GH_TOKEN", NO_CREDENTIAL),
     ("GH_ENTERPRISE_TOKEN", NO_CREDENTIAL),
-    // No git credential helper: an empty `credential.helper` in the command
-    // scope, read last, resets the list, helpers scoped to a URL included.
-    ("GIT_CONFIG_COUNT", "1"),
+    // Two settings in the command scope, read last. No git credential
+    // helper: an empty `credential.helper` resets the list, helpers scoped
+    // to a URL included.
+    ("GIT_CONFIG_COUNT", "2"),
     ("GIT_CONFIG_KEY_0", "credential.helper"),
     ("GIT_CONFIG_VALUE_0", ""),
+    // No `update-server-info` when git repacks, its own housekeeping
+    // included (`git maintenance run --auto`, which a commit starts): it
+    // writes `info/refs`, a file the isolation check guards, so the run
+    // would read as a breach (OWL-197). The sandbox refuses that write, yet
+    // git would still try it and print an error the agent may chase. The
+    // runner's own git sets the same with `-c` (`executor::git`).
+    ("GIT_CONFIG_KEY_1", "repack.updateServerInfo"),
+    ("GIT_CONFIG_VALUE_1", "false"),
     // No askpass program: an empty `GIT_ASKPASS` makes git skip
     // `core.askPass` and `SSH_ASKPASS` too. No terminal prompt either.
     ("GIT_ASKPASS", ""),
@@ -510,9 +521,11 @@ mod tests {
             ("GH_ENTERPRISE_TOKEN", NO_CREDENTIAL),
             ("GH_TOKEN", NO_CREDENTIAL),
             ("GIT_ASKPASS", ""),
-            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_COUNT", "2"),
             ("GIT_CONFIG_KEY_0", "credential.helper"),
+            ("GIT_CONFIG_KEY_1", "repack.updateServerInfo"),
             ("GIT_CONFIG_VALUE_0", ""),
+            ("GIT_CONFIG_VALUE_1", "false"),
             ("GIT_SSH_COMMAND", ssh),
             ("GIT_TERMINAL_PROMPT", "0"),
             ("HOME", "/home/op"),
