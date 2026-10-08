@@ -79,7 +79,7 @@ owlshift start --at-login    # plain `start` runs for this session only
 owlshift uninstall --purge   # --purge also removes history and worktrees
 ```
 
-Prerequisites: git, and at least one harness CLI installed (`claude`, `codex`). Codex is logged in on the user's own subscription, which Owlshift reuses. Claude Code only has to be installed: agent runs log in with the token of the user's subscription that `owlshift init` keeps, made with `claude setup-token`; the user's own Claude Code login is not used.
+Prerequisites: git 2.39.0 or later (OWL-199; `owlshift doctor` fails below it, and the build plan records why), and at least one harness CLI installed (`claude`, `codex`). Codex is logged in on the user's own subscription, which Owlshift reuses. Claude Code only has to be installed: agent runs log in with the token of the user's subscription that `owlshift init` keeps, made with `claude setup-token`; the user's own Claude Code login is not used.
 
 **Against lingering services:**
 

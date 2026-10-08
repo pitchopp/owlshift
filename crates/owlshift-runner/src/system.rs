@@ -113,6 +113,24 @@ pub(crate) fn exact_version_of(output: &[u8]) -> Option<String> {
     (version == token).then_some(version)
 }
 
+/// Whether `version`, as [`version_of`] gives it, is older than `floor`.
+/// Compared part by part as numbers, a missing part counting as 0, so
+/// `2.39` is `2.39.0` and `2.100.0` is newer than `2.39.0`. `None` when a
+/// part is not a number that fits: the version cannot be compared.
+pub(crate) fn older_than(version: &str, floor: &str) -> Option<bool> {
+    let parts = |version: &str| {
+        version
+            .split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect::<Option<Vec<u64>>>()
+    };
+    let (mut version, mut floor) = (parts(version)?, parts(floor)?);
+    let len = version.len().max(floor.len());
+    version.resize(len, 0);
+    floor.resize(len, 0);
+    Some(version < floor)
+}
+
 fn version_token(text: &str) -> Option<&str> {
     text.split_whitespace()
         .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
@@ -393,5 +411,15 @@ mod tests {
         );
         assert_eq!(exact_version_of(b"2.1.283-beta.1 (Claude Code)\n"), None);
         assert_eq!(exact_version_of(b"no version here"), None);
+    }
+
+    #[test]
+    fn versions_compare_part_by_part_as_numbers() {
+        assert_eq!(older_than("2.38.5", "2.39.0"), Some(true));
+        assert_eq!(older_than("2.39", "2.39.0"), Some(false));
+        assert_eq!(older_than("2.39.0", "2.39.0"), Some(false));
+        assert_eq!(older_than("2.100.0", "2.39.0"), Some(false));
+        assert_eq!(older_than("1.99.99.1", "2.39.0"), Some(true));
+        assert_eq!(older_than("2.99999999999999999999.0", "2.39.0"), None);
     }
 }

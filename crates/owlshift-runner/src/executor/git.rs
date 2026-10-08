@@ -28,6 +28,16 @@ use owlshift_platform::process::{Captured, RunError, run_command};
 use crate::agent_env::AgentEnv;
 use crate::config::exit_text;
 
+/// The oldest git Owlshift runs with (OWL-199), which `owlshift doctor`
+/// checks. Set by `symbolic-ref --no-recurse`, new in 2.39.0, which every
+/// `owlshift do` runs to read origin's default branch
+/// (`project::sync_checkout`). The other features with a floor are older:
+/// `repack.updateServerInfo` (the hardening below, and the agent environment)
+/// came in 2.36.0, `GIT_CONFIG_COUNT` and `rev-parse --path-format` in
+/// 2.31.0. The live checks behind each: `docs/design/build-plan.md`, "What
+/// `doctor` checks".
+pub const MINIMUM_GIT_VERSION: &str = "2.39.0";
+
 /// How long one of the executor's git commands may take.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 

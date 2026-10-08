@@ -29,9 +29,11 @@ use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
 use serde_json::Value;
 
 use crate::config::{Effective, FileState, exit_text};
+use crate::executor::MINIMUM_GIT_VERSION;
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::system::{
-    AppError, DataDirSource, RunError, StatesError, System, exact_version_of, version_of,
+    AppError, DataDirSource, RunError, StatesError, System, exact_version_of, older_than,
+    version_of,
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
@@ -295,11 +297,38 @@ fn git(system: &dyn System, home: Option<&Path>) -> Check {
         );
     };
     match system.run(&path, &["--version"], None) {
-        Ok(out) if out.code == Some(0) => match version_of(&out.stdout) {
-            Some(version) => Check::ok(
+        Ok(out) if out.code == Some(0) => match version_of(&out.stdout)
+            .and_then(|version| Some((older_than(&version, MINIMUM_GIT_VERSION)?, version)))
+        {
+            Some((false, version)) => Check::ok(
                 Section::Tools,
                 SUBJECT,
                 format!("{version} ({})", shown(&path, home)),
+            ),
+            Some((true, version)) => Check::fail(
+                Section::Tools,
+                SUBJECT,
+                format!(
+                    "{version} ({}), older than {MINIMUM_GIT_VERSION}",
+                    shown(&path, home)
+                ),
+                &format!(
+                    "Owlshift needs git {MINIMUM_GIT_VERSION} or later: every `owlshift do` reads \
+                     origin's default branch with `git symbolic-ref --no-recurse`, which older \
+                     gits refuse."
+                ),
+                vec![
+                    Step::act(format!(
+                        "Install git {MINIMUM_GIT_VERSION} or later: https://git-scm.com/downloads"
+                    )),
+                    Step::run_noting(
+                        "git --version",
+                        &format!(
+                            "should print {MINIMUM_GIT_VERSION} or later: an older git may come \
+                             first on the PATH"
+                        ),
+                    ),
+                ],
             ),
             None => Check::warn(
                 Section::Tools,
@@ -1455,6 +1484,50 @@ mod tests {
             assert_eq!(check.status, Status::Fail);
             assert_well_formed(&check);
         }
+    }
+
+    /// OWL-199: a git older than the floor fails, since every `owlshift do`
+    /// would stop on an option it lacks; at the floor or above, whatever
+    /// the build adds after the version, it passes. A version too large to
+    /// compare keeps the warning of an unfamiliar answer.
+    #[test]
+    fn a_git_older_than_the_floor_fails() {
+        let git = |answer: &'static str| {
+            let system = logged_in(with_harnesses(FakeSystem::default()))
+                .install("git")
+                .answer("git --version", Answer::Exit(0, answer, ""));
+            let report = run(&system, &no_config());
+            (report.ready(), line(&report, "git").clone())
+        };
+
+        let (ready, old) = git("git version 2.38.5\n");
+        assert!(!ready);
+        assert_eq!(old.status, Status::Fail);
+        assert_eq!(old.detail, "2.38.5 (/fake/bin/git), older than 2.39.0");
+        assert_eq!(
+            old.fix,
+            [
+                Step::act("Install git 2.39.0 or later: https://git-scm.com/downloads"),
+                Step::run_noting(
+                    "git --version",
+                    "should print 2.39.0 or later: an older git may come first on the PATH"
+                ),
+            ]
+        );
+
+        for answer in [
+            "git version 2.39.0\n",
+            "git version 2.39.5 (Apple Git-154)\n",
+            "git version 2.47.1.windows.1\n",
+            "git version 2.39.0.rc0\n",
+        ] {
+            let (ready, check) = git(answer);
+            assert!(ready, "{answer}");
+            assert_eq!(check.status, Status::Ok, "{answer}");
+        }
+
+        let (_, huge) = git("git version 2.99999999999999999999.0\n");
+        assert_eq!(huge.status, Status::Warn);
     }
 
     /// OWL-88: a sentinel that ended or never started is a warning that says
