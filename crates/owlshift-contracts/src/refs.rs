@@ -187,8 +187,9 @@ impl TryFrom<&PersistedState> for TicketState {
 /// The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each
 /// ask with the comment that posted it, so a brief's thread shows the ask in
 /// that comment's place, and its decider, and what the last answer check
-/// read, and why the last check's result was refused, when it was; and the
-/// decisions the resolver took instead of asking.
+/// read, and why the last check's result was refused, when it was; the
+/// decisions the resolver took instead of asking; and why Build's latest
+/// result was refused, until a Build result is accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift ticket questions")]
@@ -210,6 +211,75 @@ pub struct TicketQuestions {
     /// move the latest ask that answers are timed against.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decisions: Vec<KeptDecision>,
+    /// Why the runner refused the latest Build result, kept until a Build
+    /// result is accepted (format 6, OWL-192): what the next Build run is
+    /// told, whatever command runs it. Kept apart from the asks: a Build
+    /// refusal belongs to no ask, and a new ask must not clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_refusal: Option<BuildRefusal>,
+}
+
+/// A Build run's refused result, as the ticket ref keeps it for the next
+/// Build run (OWL-192).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildRefusal {
+    /// Why the latest refused Build result was refused: the runner's
+    /// message, at most [`MAX_RESULT_REFUSAL_BYTES`].
+    #[schemars(regex(pattern = r"\S"))]
+    pub reason: String,
+    /// Whether a refusal of the build role's own decisions holds the next
+    /// Build run to asking them (OWL-186): set by such a refusal, kept
+    /// through every later refusal, and cleared only once a Build result
+    /// asks.
+    pub decisions: bool,
+    /// The refusal of decisions that holds the run, when a later refusal
+    /// took its place as `reason`: it quotes the choices still open, which
+    /// the next run is told first. Only with `decisions`; at most
+    /// [`MAX_RESULT_REFUSAL_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"\S"))]
+    pub decisions_reason: Option<String>,
+}
+
+impl BuildRefusal {
+    /// What the next Build brief's `result_refusal` says: the refusal of
+    /// decisions that holds the run, then the latest one, when they differ,
+    /// cut to [`MAX_RESULT_REFUSAL_BYTES`] with its beginning kept.
+    pub fn told(&self) -> String {
+        match &self.decisions_reason {
+            None => self.reason.clone(),
+            Some(held) => cut_reason(format!(
+                "{held}\n\nA later result was refused too: {}",
+                self.reason
+            )),
+        }
+    }
+}
+
+/// `reason` cut to [`MAX_RESULT_REFUSAL_BYTES`] on a character boundary,
+/// its beginning kept and the cut marked.
+pub fn cut_reason(reason: String) -> String {
+    if reason.len() <= MAX_RESULT_REFUSAL_BYTES {
+        return reason;
+    }
+    const CUT: &str = " [cut]";
+    let mut end = MAX_RESULT_REFUSAL_BYTES - CUT.len();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{CUT}", &reason[..end])
+}
+
+/// Why a kept refusal reason is refused: blank, or past the cap.
+fn reason_flaw(reason: &str) -> Option<&'static str> {
+    if reason.trim().is_empty() {
+        Some("is blank")
+    } else if reason.len() > MAX_RESULT_REFUSAL_BYTES {
+        Some("is over the cap")
+    } else {
+        None
+    }
 }
 
 /// A decision the resolver took without the decider, as the ticket ref
@@ -326,15 +396,17 @@ impl TicketQuestions {
             asks: Vec::new(),
             checked_through: None,
             decisions: Vec::new(),
+            build_refusal: None,
         }
     }
 
     /// Parses `questions.json`. A format-2 document, written before the
     /// asks kept their verdicts (OWL-123), a format-3 one, written before
-    /// the resolver's decisions were kept (OWL-138), and a format-4 one,
-    /// written before an ask kept its check's refusal (OWL-184), are read as
-    /// the current format with what they lack empty, and the next write
-    /// gives them the current format.
+    /// the resolver's decisions were kept (OWL-138), a format-4 one, written
+    /// before an ask kept its check's refusal (OWL-184), and a format-5 one,
+    /// written before Build's refusal was kept (OWL-192), are read as the
+    /// current format with what they lack empty, and the next write gives
+    /// them the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -344,13 +416,13 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2, 3 or 4 document read as the current format, or `None`
+    /// A format-2, 3, 4 or 5 document read as the current format, or `None`
     /// for any other. Each older format is a strict subset of the next, so
     /// a field a later format added is refused in it, whatever its value.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=4).contains(&format) {
+        if !(2..=5).contains(&format) {
             return None;
         }
         let in_an_ask = |field: &str| {
@@ -362,8 +434,10 @@ impl TicketQuestions {
             Some("verdicts")
         } else if format <= 3 && document.get("decisions").is_some() {
             Some("decisions")
-        } else if in_an_ask("result_refusal") {
+        } else if format <= 4 && in_an_ask("result_refusal") {
             Some("refusal")
+        } else if document.get("build_refusal").is_some() {
+            Some("Build refusal")
         } else {
             None
         };
@@ -393,8 +467,28 @@ impl TicketQuestions {
     /// Q1..Qn, a re-ask names questions of an earlier round, in order), and a
     /// kept refusal is not blank and at most [`MAX_RESULT_REFUSAL_BYTES`];
     /// each decision names its comment, a decision and a basis, in time
-    /// order.
+    /// order; Build's kept refusal keeps the same bounds, and a held
+    /// refusal of decisions only with `decisions`.
     pub fn validate(&self) -> Result<(), ContractError> {
+        if let Some(kept) = &self.build_refusal {
+            let flaw = reason_flaw(&kept.reason)
+                .map(|flaw| format!("Build's kept refusal reason {flaw}"))
+                .or_else(|| {
+                    let held = kept.decisions_reason.as_deref()?;
+                    Some(match reason_flaw(held) {
+                        Some(flaw) => format!("Build's kept refusal of decisions {flaw}"),
+                        None if !kept.decisions => {
+                            "Build's kept refusal keeps a refusal of decisions without \
+                             `decisions`"
+                                .to_owned()
+                        }
+                        None => return None,
+                    })
+                });
+            if let Some(flaw) = flaw {
+                return Err(ContractError::invalid(Self::CONTRACT, flaw));
+            }
+        }
         for (n, kept) in self.decisions.iter().enumerate() {
             let missing = if kept.comment.trim().is_empty() {
                 "comment"

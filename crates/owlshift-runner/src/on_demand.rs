@@ -61,8 +61,8 @@ use owlshift_adapters::forge::{Branch, CheckSet, CommitId, ErrorKind, PullReques
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, Checkpoint, GateFailure, MAX_RESULT_REFUSAL_BYTES, PermissionLevel, Permissions,
-    Relation, Rule, ThreadEntry, TicketBrief,
+    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, Relation, Rule,
+    ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
@@ -70,7 +70,8 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
-    Ask, AskDecider, AskKind, KeptDecision, PersistedState, TicketQuestions,
+    Ask, AskDecider, AskKind, BuildRefusal, KeptDecision, PersistedState, TicketQuestions,
+    cut_reason,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, Followup, Question, RunResult, Verdict as AnswerVerdict,
@@ -220,32 +221,85 @@ pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'
 
 /// What the next run is told of a run's outcome: why its `result.json`, or
 /// an artifact it names, was refused when the run is the one to fix it
-/// ([`crate::executor::Failure::refusal`]), cut to [`MAX_RESULT_REFUSAL_BYTES`] on a
-/// character boundary, its beginning kept. `None` for any other outcome.
-/// The next Build run of the same command gets it (OWL-180); the next
-/// answer check on the same ask, from the ticket ref (OWL-184). A result or
-/// an artifact holding the harness's login is a credential failure, never a
+/// ([`crate::executor::Failure::refusal`]), cut to
+/// [`owlshift_contracts::brief::MAX_RESULT_REFUSAL_BYTES`] on a character
+/// boundary, its beginning kept ([`cut_reason`]). `None` for any other
+/// outcome. The next Build run gets it from the ticket ref, whatever command
+/// runs it ([`build_refusal_after`], OWL-180 and OWL-192); the next answer
+/// check on the same ask, from the ticket ref too (OWL-184). A result or an
+/// artifact holding the harness's login is a credential failure, never a
 /// refusal, so the reason never quotes it.
 pub fn result_refusal(outcome: &Outcome) -> Option<String> {
     let Outcome::Failed(failure) = outcome else {
         return None;
     };
-    let reason = failure.refusal()?;
-    if reason.len() <= MAX_RESULT_REFUSAL_BYTES {
-        return Some(reason);
+    failure.refusal().map(cut_reason)
+}
+
+/// What the ticket ref keeps of Build's refusals after a Build run that did
+/// not break isolation, given what it kept before (OWL-192), for
+/// `owlshift do`, `continue` and the scenarios' stand-in driver alike:
+///
+/// - a refusal [`result_refusal`] tells takes the place of the kept one; a
+///   refusal of decisions ([`decisions_refused`]) holds the next runs, and a
+///   later refusal keeps that hold and the reason that quotes the choices;
+/// - an accepted result (a valid `result.json`, or a `done` whose gate
+///   failed) clears it, except that a hold is cleared only by a result that
+///   asks (`questions` or `premise_false`): a `blocked` or `failed` result
+///   asked nothing, and a `done` is refused under the hold (OWL-186);
+/// - any other outcome (a usage limit, a run that failed with nothing told,
+///   a quarantine) leaves it as it is, so the next run is told the same.
+pub fn build_refusal_after(kept: Option<&BuildRefusal>, outcome: &Outcome) -> Option<BuildRefusal> {
+    let held = kept.filter(|kept| kept.decisions);
+    if let Some(reason) = result_refusal(outcome) {
+        return Some(match held {
+            Some(held) => BuildRefusal {
+                reason,
+                decisions: true,
+                decisions_reason: Some(
+                    held.decisions_reason
+                        .clone()
+                        .unwrap_or_else(|| held.reason.clone()),
+                ),
+            },
+            None => BuildRefusal {
+                reason,
+                decisions: decisions_refused(outcome),
+                decisions_reason: None,
+            },
+        });
     }
-    const CUT: &str = " [cut]";
-    let mut end = MAX_RESULT_REFUSAL_BYTES - CUT.len();
-    while !reason.is_char_boundary(end) {
-        end -= 1;
+    match accepted_status(outcome) {
+        Some(result::Status::Questions | result::Status::PremiseFalse) => None,
+        Some(_) if held.is_none() => None,
+        _ => kept.cloned(),
     }
-    Some(format!("{}{CUT}", &reason[..end]))
+}
+
+/// The status of a Build result the runner accepted: a valid `result.json`,
+/// or a `done` whose gate failed. `None` for any other outcome.
+fn accepted_status(outcome: &Outcome) -> Option<result::Status> {
+    match outcome {
+        Outcome::Finished { result, .. } => Some(result.status),
+        Outcome::Failed(Failure::Gate(_)) => Some(result::Status::Done),
+        _ => None,
+    }
+}
+
+/// Tells a Build brief what the ticket ref keeps of Build's refusals
+/// (OWL-192): why, in `result_refusal` ([`BuildRefusal::told`]), and the
+/// hold, in `decisions_refused`.
+pub fn tell_build(brief: &mut Brief, questions: &TicketQuestions) {
+    let kept = questions.build_refusal.as_ref();
+    brief.result_refusal = kept.map(BuildRefusal::told);
+    brief.decisions_refused = kept.is_some_and(|kept| kept.decisions);
 }
 
 /// Whether a run's result was refused for the build role's own decisions
-/// ([`crate::executor::Failure::Decisions`], OWL-176): the next Build run of
-/// the command, told why in [`result_refusal`], is then held to ask them
-/// (`Brief::decisions_refused`, OWL-186). True only when [`result_refusal`]
+/// ([`crate::executor::Failure::Decisions`], OWL-176): the next Build runs,
+/// told why in [`result_refusal`], are then held to ask them
+/// (`Brief::decisions_refused`, OWL-186), whatever command runs them
+/// ([`build_refusal_after`], OWL-192). True only when [`result_refusal`]
 /// tells the outcome.
 pub fn decisions_refused(outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::Failed(Failure::Decisions(_)))
@@ -592,7 +646,7 @@ fn core_error(error: impl fmt::Debug) -> Stop {
 
 fn nothing_to_continue(ticket: &TicketId) -> Stop {
     Stop::Refused(format!(
-        "nothing to continue: no question was asked on {ticket}; run `owlshift do {ticket}`"
+        "nothing to continue: Owlshift keeps nothing on {ticket}; run `owlshift do {ticket}`"
     ))
 }
 
@@ -612,12 +666,6 @@ fn awaits_input(state: &TicketState) -> bool {
 #[derive(Default)]
 struct Gathered {
     gate_failure: Option<GateFailure>,
-    /// Why the last run's `result.json` was refused, for the next Build
-    /// brief only ([`result_refusal`]).
-    result_refusal: Option<String>,
-    /// Whether that refusal was the build role's own decisions, for the
-    /// same brief ([`decisions_refused`]).
-    decisions_refused: bool,
     /// The runner's note of late comments given to a run ([`late_decision`]).
     decisions: Vec<Decision>,
     followups: Vec<Followup>,
@@ -673,20 +721,33 @@ struct Prepared {
     worktree: PathBuf,
     branch: String,
     /// The ticket ref as read, then as last written; `None` until a question
-    /// round opens.
+    /// round opens, a decision is kept or a Build result is refused.
     stored: Option<Stored>,
+    /// A Build run of this command had a result accepted that clears Build's
+    /// kept refusal without asking ([`build_refusal_after`]): cleared in
+    /// [`Prepared::questions`], so the next brief is untold, and written
+    /// with the next state kept, never alone (OWL-192). A result that asks
+    /// clears it with what keeps its questions instead, the round's ask or
+    /// the resolver's decisions, so a post that fails leaves it kept.
+    heeded: bool,
     /// The project's gate policy, built once for the command: it routes the
     /// questions and gives the brief the project's additions.
     policy: GatePolicy,
 }
 
 impl Prepared {
-    /// The asks the ticket ref keeps, none without one.
+    /// The asks the ticket ref keeps, none without one, without Build's
+    /// refusal once a run of this command heeded it ([`Prepared::heeded`]).
     fn questions(&self) -> TicketQuestions {
-        self.stored
+        let mut questions = self
+            .stored
             .as_ref()
             .map(|stored| stored.record.questions.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if self.heeded {
+            questions.build_refusal = None;
+        }
+        questions
     }
 
     /// The ticket's decider when the command started, which a Build and a
@@ -947,6 +1008,7 @@ impl OnDemand<'_> {
             worktree,
             branch: branch_for(ticket),
             stored,
+            heeded: false,
             policy: GatePolicy::new(
                 &self.config.policy.always_human,
                 self.config.pipeline.plan_approval,
@@ -1034,18 +1096,16 @@ impl OnDemand<'_> {
                 gathered.gate_failure.clone(),
                 &current,
             );
-            // This command's own: the answer check's comes from the ticket
-            // ref, and the resolver's brief never carries one.
-            brief.result_refusal = gathered.result_refusal.take();
-            brief.decisions_refused = std::mem::take(&mut gathered.decisions_refused);
+            // Why an earlier Build result was refused, from the ticket ref,
+            // whatever command ran it (OWL-192).
+            tell_build(&mut brief, &p.questions());
             let ran = self.execute(p, self.executor, self.build, &brief, attempt, sink)?;
             if let Some(gate) = &ran.report.gate {
                 gathered.gate_failure = gate.failure.clone();
             }
-            // Set before any `continue` below, so it reaches the next run
-            // only, whatever that run's outcome.
-            gathered.result_refusal = result_refusal(&ran.report.outcome);
-            gathered.decisions_refused = decisions_refused(&ran.report.outcome);
+            if ran.breaches.is_empty() {
+                self.keep_build_refusal(p, &state, &ran.report.outcome)?;
+            }
             let (event, result) = if ran.breaches.is_empty() {
                 stage_event(&ran.report.outcome, &brief)
             } else {
@@ -1264,6 +1324,9 @@ impl OnDemand<'_> {
         // keeping them below fails.
         self.show_after(&ticket, Some(run), Event::Questions, sink);
         let mut asked = p.questions();
+        // The run that asked heeded any refusal kept for Build: cleared with
+        // the round that keeps its questions (OWL-192).
+        asked.build_refusal = None;
         asked.asks.push(Ask {
             kind: AskKind::Questions,
             round,
@@ -1415,6 +1478,9 @@ impl OnDemand<'_> {
             written.insert("question".to_owned(), json!(question.id.as_str()));
             sink.emit(&ticket, Some(&ran.run), EventKind::TrackerWrite, written);
             let mut kept = p.questions();
+            // As a round does, a kept decision keeps what the asking run
+            // asked: Build's kept refusal is cleared with it (OWL-192).
+            kept.build_refusal = None;
             kept.decisions.push(KeptDecision {
                 at: posted.created_at,
                 comment: posted.id.clone(),
@@ -1779,7 +1845,8 @@ impl OnDemand<'_> {
             ran.breaches.join("; ")
         };
         // A ticket without a ref keeps nothing: a ref is made only once a
-        // question round opens.
+        // question round opens, a decision is kept or a Build result is
+        // refused.
         let questions = questions.or_else(|| p.stored.as_ref().map(|_| p.questions()));
         let kept = match questions {
             Some(questions) => self
@@ -1854,7 +1921,8 @@ impl OnDemand<'_> {
     }
 
     /// Keeps `state` in the ticket's ref, when the ticket has one: a ref is
-    /// made only once a question round opens.
+    /// made only once a question round opens, a decision is kept or a Build
+    /// result is refused.
     fn keep(&self, p: &mut Prepared, state: &TicketState) -> Result<(), Stop> {
         if p.stored.is_none() {
             return Ok(());
@@ -1862,6 +1930,37 @@ impl OnDemand<'_> {
         let questions = p.questions();
         self.store(p, state, questions)
             .map_err(|e| refused("keeping the ticket's state in its ref", e))
+    }
+
+    /// Keeps what a Build run's outcome changes of Build's kept refusal
+    /// ([`build_refusal_after`]), before the state moves, so a park keeps it
+    /// too. A refusal is written now, under `state`, the state the run ran
+    /// in, making the ticket's ref when it has none; a clear waits for the
+    /// next write ([`Prepared::heeded`]), the round's or the decisions' for
+    /// a result that asks.
+    fn keep_build_refusal(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        outcome: &Outcome,
+    ) -> Result<(), Stop> {
+        let mut questions = p.questions();
+        let next = build_refusal_after(questions.build_refusal.as_ref(), outcome);
+        if next == questions.build_refusal {
+            return Ok(());
+        }
+        let Some(next) = next else {
+            let asked = matches!(
+                accepted_status(outcome),
+                Some(result::Status::Questions | result::Status::PremiseFalse)
+            );
+            p.heeded = !asked;
+            return Ok(());
+        };
+        p.heeded = false;
+        questions.build_refusal = Some(next);
+        self.store(p, state, questions)
+            .map_err(|e| refused("keeping Build's refused result in the ticket's ref", e))
     }
 
     /// Writes `state` and `questions` as the ticket's ref, unless it already
@@ -2751,6 +2850,7 @@ fn path(path: &Path) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use owlshift_contracts::brief::MAX_RESULT_REFUSAL_BYTES;
     use owlshift_core::decider::DeciderRule;
     use owlshift_platform::confined::{ConfinedError, Refusal};
 
@@ -3201,5 +3301,125 @@ mod tests {
         assert!(told.len() <= MAX_RESULT_REFUSAL_BYTES, "{}", told.len());
         assert!(told.starts_with("unknown variant `é"));
         assert!(told.ends_with("é [cut]"), "{told}");
+    }
+
+    /// OWL-192: what the ticket ref keeps of Build's refusals after each
+    /// kind of outcome. A refusal of decisions holds until a result asks,
+    /// through later refusals, which keep the reason quoting the choices;
+    /// any other refusal goes once a result is accepted.
+    #[test]
+    fn a_build_refusal_is_kept_until_heeded() {
+        let finished = |status: &str| {
+            let result = RunResult::parse(&format!(
+                r#"{{"format":6,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                "category":"scope","context":"c","text":"t"}}]}}"#
+            ))
+            .or_else(|_| {
+                RunResult::parse(&format!(
+                    r#"{{"format":6,"status":"{status}","summary":"s"}}"#
+                ))
+            })
+            .unwrap();
+            Outcome::Finished {
+                result: Box::new(result),
+                artifacts: crate::artifact::ArtifactContents::default(),
+            }
+        };
+        let gate_failed = Outcome::Failed(Failure::Gate(Box::new(GateFailure {
+            command: Some("make test".to_owned()),
+            reason: "exit status 1".to_owned(),
+            output: String::new(),
+            truncated: false,
+        })));
+        let decided = Outcome::Failed(Failure::Decisions("choices: A; B".to_owned()));
+        let shape = Outcome::Failed(Failure::InvalidResult("unknown field".to_owned()));
+        let done_held = Outcome::Failed(Failure::Decisions("status is done".to_owned()));
+        let left_as_is = [
+            Outcome::UsageLimit { resets_at: None },
+            Outcome::Failed(Failure::NoResult),
+            Outcome::Failed(Failure::TimedOut),
+            Outcome::Quarantined(Vec::new()),
+        ];
+
+        // Nothing kept, nothing refused: nothing to keep.
+        for outcome in [finished("done"), finished("questions")] {
+            assert_eq!(build_refusal_after(None, &outcome), None);
+        }
+
+        // A refusal of anything but decisions goes with any accepted
+        // result, a gate failure's included, and stays through the rest.
+        let shaped = build_refusal_after(None, &shape).unwrap();
+        assert_eq!(
+            (
+                shaped.reason.as_str(),
+                shaped.decisions,
+                &shaped.decisions_reason
+            ),
+            ("unknown field", false, &None)
+        );
+        for heeded in [
+            finished("done"),
+            finished("blocked"),
+            finished("failed"),
+            finished("questions"),
+            gate_failed,
+        ] {
+            assert_eq!(build_refusal_after(Some(&shaped), &heeded), None);
+        }
+        for outcome in &left_as_is {
+            assert_eq!(
+                build_refusal_after(Some(&shaped), outcome).as_ref(),
+                Some(&shaped)
+            );
+        }
+
+        // A refusal of decisions holds through every outcome that asks
+        // nothing, and later refusals keep the hold and the choices.
+        let held = build_refusal_after(None, &decided).unwrap();
+        assert!(held.decisions);
+        assert_eq!(held.told(), "choices: A; B");
+        for outcome in left_as_is
+            .iter()
+            .chain(&[finished("blocked"), finished("failed")])
+        {
+            assert_eq!(
+                build_refusal_after(Some(&held), outcome).as_ref(),
+                Some(&held)
+            );
+        }
+        for later in [&shape, &done_held] {
+            let kept = build_refusal_after(Some(&held), later).unwrap();
+            assert!(kept.decisions);
+            assert_eq!(kept.decisions_reason.as_deref(), Some("choices: A; B"));
+            // A third refusal still quotes the first choices.
+            let again = build_refusal_after(Some(&kept), &done_held).unwrap();
+            assert_eq!(again.decisions_reason.as_deref(), Some("choices: A; B"));
+            assert!(
+                again
+                    .told()
+                    .starts_with("choices: A; B\n\nA later result was refused too: ")
+            );
+        }
+        for asks in [finished("questions"), finished("premise_false")] {
+            assert_eq!(build_refusal_after(Some(&held), &asks), None);
+        }
+
+        // The brief is told what is kept.
+        let mut questions = TicketQuestions::new();
+        questions.build_refusal = Some(held);
+        let mut brief = Brief::parse(include_str!(
+            "../../owlshift-contracts/tests/fixtures/brief.json"
+        ))
+        .unwrap();
+        tell_build(&mut brief, &questions);
+        assert_eq!(
+            (brief.result_refusal.as_deref(), brief.decisions_refused),
+            (Some("choices: A; B"), true)
+        );
+        tell_build(&mut brief, &TicketQuestions::new());
+        assert_eq!(
+            (brief.result_refusal, brief.decisions_refused),
+            (None, false)
+        );
     }
 }

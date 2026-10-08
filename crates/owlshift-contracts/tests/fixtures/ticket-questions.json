@@ -1,5 +1,5 @@
 {
-  "format": 5,
+  "format": 6,
   "asks": [
     {
       "kind": "questions",
@@ -65,5 +65,10 @@
       "decision": "GREETING.md, at the repository root.",
       "basis": "The ticket's description names GREETING.md."
     }
-  ]
+  ],
+  "build_refusal": {
+    "reason": "invalid result.json: status is done, but the previous run's decisions were refused",
+    "decisions": true,
+    "decisions_reason": "invalid result.json: decisions are given but the run's role is build. The choices listed: \"Which file\" (recorded: \"GREETING.md\")"
+  }
 }

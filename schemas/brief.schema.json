@@ -27,7 +27,7 @@
       "type": "string"
     },
     "decisions_refused": {
-      "description": "The previous Build run's `result.json` was refused for the build\nrole's own decisions (OWL-176): the choices it listed are still open,\nand this run may not end `done` (OWL-186). In Build's brief only, with\nthe `result_refusal` that says why; absent otherwise.",
+      "description": "A Build run's `result.json` was refused for the build role's own\ndecisions (OWL-176), and no Build run has asked since: the choices it\nlisted are still open, and this run may not end `done` (OWL-186),\nwhatever command runs it (OWL-192). In Build's brief only, with the\n`result_refusal` that says why; absent otherwise.",
       "type": "boolean"
     },
     "format": {
@@ -80,7 +80,7 @@
       "$ref": "#/$defs/RelativePath"
     },
     "result_refusal": {
-      "description": "Why the runner refused the previous run's `result.json`, or a file\nits `artifacts` name: what this run fixes in its own, such as\nquestions not numbered from Q1. In Build's brief, the previous Build\nrun of the same command (OWL-180); in the answer check's, the\nprevious check on the same ask, whatever command ran it, as the\nticket ref keeps it (OWL-184). The runner's message, at most\n[`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result\nis data. Never in the resolver's brief, and absent when the previous\nrun's result was not refused.",
+      "description": "Why the runner refused an earlier run's `result.json`, or a file\nits `artifacts` name: what this run fixes in its own, such as\nquestions not numbered from Q1. In Build's brief, the latest refused\nBuild result since one was accepted (OWL-180), whatever command ran\nit, as the ticket ref keeps it (OWL-192), with the refusal of\ndecisions that still holds the run before it; in the answer check's,\nthe previous check on the same ask, whatever command ran it, as the\nticket ref keeps it (OWL-184). The runner's message, at most\n[`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result\nis data. Never in the resolver's brief, and absent when no such\nrefusal is kept.",
       "type": [
         "string",
         "null"

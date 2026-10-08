@@ -116,6 +116,47 @@ fn open_points_unasked() {
     }
 }
 
+/// OWL-192's acceptance: a refusal of Build's decisions outlives a usage
+/// limit and a park: the Build runs of later commands are told why, quoting
+/// the choices, and a `done` among them is refused.
+#[test]
+fn open_points_restart() {
+    if let Err(error) = play(
+        &scenarios().join("open_points_restart.toml"),
+        fake_harness(),
+    ) {
+        panic!("{error}");
+    }
+}
+
+/// A `continue` needs a ticket ref: on a ticket that never asked, kept a
+/// decision or had a Build result refused, it is refused.
+#[test]
+fn a_continue_without_a_ticket_ref_is_refused() {
+    let steps = r#"
+[[step]]
+dispatch = true
+
+[[step]]
+continue = true
+"#;
+    let input = format!(
+        "description = \"d\"\nticket = \"DEMO-5\"\nstart = \"2026-10-08T09:00:00Z\"\n{steps}"
+    );
+    let error = play_str(
+        "no_ref",
+        &input,
+        &scenarios().join("open_points"),
+        fake_harness(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("step 2 (continue): nothing to continue"),
+        "{error}"
+    );
+}
+
 /// OWL-184's acceptance: an answer check whose result is refused is followed
 /// by checks told why, through a usage limit, until one gives its verdicts.
 #[test]
