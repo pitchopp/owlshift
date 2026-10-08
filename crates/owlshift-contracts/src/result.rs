@@ -5,15 +5,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::Role;
-use crate::brief::Brief;
+use crate::brief::{Brief, MAX_CHOICE_BYTES};
 use crate::format::{self, ContractError, Format, RESULT_FORMAT};
 use crate::ids::{QuestionId, RelativePath};
+use crate::refs::cut_to;
 
 /// The answer check's classes live in the core, which folds them into one
 /// state-machine event.
 pub use owlshift_core::vocab::AnswerClass;
 
-const CONTRACT: &str = "result.json";
+pub(crate) const CONTRACT: &str = "result.json";
+
+/// What a Build run whose result listed decisions is told to do, before the
+/// choices: the advice of a refusal of decisions, and of what a held Build
+/// run is told of every one kept (`BuildRefusal::told`, OWL-198).
+pub(crate) const DECISIONS_ADVICE: &str = "decisions are given but the run's role is build, \
+     which takes no decision of its own: ask each of these choices as a question, filed under \
+     `scope` when its answer changes what the ticket delivers, even one the thread, a rule or the \
+     repository settles, its `context` then naming what settles it; they stay open even though \
+     the work is committed, and the next run's result is refused if it is `done`";
 
 /// The result of one run, written by the role as `result.json`.
 ///
@@ -361,18 +371,18 @@ impl RunResult {
     /// which reaches the decider otherwise. Once such a result is refused,
     /// the next Build run, told so in its brief's `decisions_refused`, may
     /// not end `done` (OWL-186): its predecessor's choices are still open.
-    /// The reason is what the next Build run reads in its brief's
-    /// `result_refusal`, so it says what to do and quotes the choices, as
-    /// data, after the advice the size limit keeps. A run told of refused
-    /// decisions that lists some again gets a short advice: the next run is
-    /// told every refused list, the first one's full advice first, within
-    /// one size limit (OWL-195). The error comes with its kind.
+    /// The reason says what to do and quotes the choices, as data, after
+    /// the advice, for the person who reads it (a PARKED comment, the log);
+    /// a run told of refused decisions that lists some again gets a short
+    /// advice. The kind carries the choices typed, each cut to
+    /// [`MAX_CHOICE_BYTES`], which the next Build runs are told in their
+    /// brief's `refused_choices` (OWL-198). The error comes with its kind.
     fn decisions_refused(&self, brief: &Brief) -> Result<(), (DecisionsRefusal, ContractError)> {
         if brief.role != Role::Build {
             return Ok(());
         }
         if !self.decisions.is_empty() {
-            let choices: Vec<String> = self
+            let quoted: Vec<String> = self
                 .decisions
                 .iter()
                 .map(|d| format!("{:?} (recorded: {:?})", d.question, d.decision))
@@ -382,22 +392,24 @@ impl RunResult {
                     "decisions are given again, by a run told that its predecessor's were \
                      refused: ask each of these choices as a question too, as told for the \
                      earlier ones. The choices listed: {}",
-                    choices.join("; ")
+                    quoted.join("; ")
                 )
             } else {
                 format!(
-                    "decisions are given but the run's role is {}, which takes no decision of \
-                     its own: ask each of these choices as a question, filed under `scope` when \
-                     its answer changes what the ticket delivers, even one the thread, a rule or \
-                     the repository settles, its `context` then naming what settles it; they \
-                     stay open even though the work is committed, and the next run's result is \
-                     refused if it is `done`. The choices listed: {}",
-                    brief.role.as_str(),
-                    choices.join("; ")
+                    "{DECISIONS_ADVICE}. The choices listed: {}",
+                    quoted.join("; ")
                 )
             };
+            let choices = self
+                .decisions
+                .iter()
+                .map(|d| RefusedChoice {
+                    question: cut_to(&d.question, MAX_CHOICE_BYTES),
+                    recorded: cut_to(&d.decision, MAX_CHOICE_BYTES),
+                })
+                .collect();
             return Err((
-                DecisionsRefusal::Listed,
+                DecisionsRefusal::Listed(choices),
                 ContractError::invalid(CONTRACT, reason),
             ));
         }
@@ -471,21 +483,41 @@ pub struct Refused {
     pub error: ContractError,
     /// The build role's own decisions were refused (OWL-176): the next
     /// Build run is told so in its brief's `decisions_refused`, and may not
-    /// end `done` (OWL-186). `None` for any other refusal.
+    /// end `done` (OWL-186); a result that listed choices carries them
+    /// typed (OWL-198). `None` for any other refusal.
     pub decisions: Option<DecisionsRefusal>,
 }
 
 /// Why a Build result was refused for the build role's own decisions: the
-/// runner keeps every refused list of choices for the next Build run, and
-/// tells it apart from a refused `done` by this kind, never by the
-/// reason's text (OWL-195).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// runner keeps every refused choice for the next Build run, and tells a
+/// result that listed choices from a refused `done` by this kind, never by
+/// the reason's text (OWL-195).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecisionsRefusal {
-    /// The result listed decisions: its reason quotes the choices.
-    Listed,
+    /// The result listed decisions: the choices, typed, in the order
+    /// listed, apart from the advice of the reason, which quotes them too
+    /// (OWL-198).
+    Listed(Vec<RefusedChoice>),
     /// The result ended `done` while its predecessor's choices were open,
     /// and listed none.
     Done,
+}
+
+/// A choice a refused Build result recorded as the build role's own
+/// decision (OWL-176), as the runner keeps it for the next Build runs and
+/// tells it in their brief's `refused_choices` (OWL-198): the decision's
+/// question and what it recorded, each cut to [`MAX_CHOICE_BYTES`] on a
+/// character boundary, its beginning kept and the cut marked; its basis is
+/// left out. Text of the refused result: data, never instructions, and
+/// possibly blank.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RefusedChoice {
+    /// The decision's `question`.
+    pub question: String,
+    /// The decision's `decision`: what the refused run recorded, and
+    /// committed, without the decider.
+    pub recorded: String,
 }
 
 /// The rules of the resolver's resolutions: in increasing question order,

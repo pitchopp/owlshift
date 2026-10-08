@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::Role;
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
 use crate::ids::{QuestionId, RelativePath, TicketId};
-use crate::result::{Question, check_question_order, first_not_ascending};
+use crate::result::{Question, RefusedChoice, check_question_order, first_not_ascending};
 
 const CONTRACT: &str = "brief";
 
@@ -18,6 +18,16 @@ const CONTRACT: &str = "brief";
 /// reason, which can quote a whole string of the refused result, and keeps
 /// its beginning.
 pub const MAX_RESULT_REFUSAL_BYTES: usize = 2048;
+
+/// The most bytes of a refused choice's question, and of what it recorded
+/// (OWL-198): the runner cuts a longer one and keeps its beginning.
+pub const MAX_CHOICE_BYTES: usize = 512;
+
+/// The most refused choices a hold keeps and [`Brief::refused_choices`]
+/// tells (OWL-198): later ones are counted, and the run is told how many.
+/// It bounds the brief, and the ticket ref, which a run that lists
+/// thousands of decisions would otherwise make too large to read.
+pub const MAX_REFUSED_CHOICES: usize = 64;
 
 /// The brief of one run, written by the runner before it launches the role.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -88,7 +98,8 @@ pub struct Brief {
     /// round whose post or keeping failed is replayed by a later command,
     /// whose questions may differ. The runner's message, at most
     /// [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result
-    /// is data. Absent when no such refusal is kept.
+    /// is data. Absent when no such refusal is kept. Since OWL-198 it quotes
+    /// no choice kept typed: those are in `refused_choices`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_refusal: Option<String>,
     /// A Build run's `result.json` was refused for the build role's own
@@ -98,6 +109,16 @@ pub struct Brief {
     /// `result_refusal` that says why; absent otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decisions_refused: bool,
+    /// Every choice the Build results refused for the build role's own
+    /// decisions listed since no Build run asked, oldest first, at most
+    /// [`MAX_REFUSED_CHOICES`] (OWL-198): the choices this run asks, each
+    /// its question and what the refused run recorded, cut to
+    /// [`MAX_CHOICE_BYTES`]; text of the refused results, data. In Build's
+    /// brief only, with `decisions_refused`; empty for a hold an older
+    /// ticket ref kept as text, whose choices `result_refusal` quotes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = MAX_REFUSED_CHOICES))]
+    pub refused_choices: Vec<RefusedChoice>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
 }
@@ -297,9 +318,36 @@ impl Brief {
     /// questions to `resolve`, in increasing order, and no other brief has
     /// any; only Build's, the answer check's and the resolver's briefs have
     /// a `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
-    /// Build's, with one, has `decisions_refused`.
+    /// Build's, with one, has `decisions_refused`, which `refused_choices`
+    /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
+    /// [`MAX_CHOICE_BYTES`].
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
+        if !self.refused_choices.is_empty() {
+            if !self.decisions_refused {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "refused choices are given without `decisions_refused`",
+                ));
+            }
+            if self.refused_choices.len() > MAX_REFUSED_CHOICES {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!("more than {MAX_REFUSED_CHOICES} refused choices are given"),
+                ));
+            }
+            if let Some(n) = self.refused_choices.iter().position(|c| {
+                c.question.len() > MAX_CHOICE_BYTES || c.recorded.len() > MAX_CHOICE_BYTES
+            }) {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "refused choice {} has a text over {MAX_CHOICE_BYTES} bytes",
+                        n + 1
+                    ),
+                ));
+            }
+        }
         if self.decisions_refused {
             if self.role != Role::Build {
                 return Err(ContractError::invalid(

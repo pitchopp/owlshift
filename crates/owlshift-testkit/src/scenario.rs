@@ -282,6 +282,9 @@ pub struct Expect {
     /// Whether the last brief held its Build run to asking
     /// (`decisions_refused`).
     pub brief_decisions_refused: Option<bool>,
+    /// The questions of the refused choices the last brief told
+    /// (`refused_choices`, OWL-198), in order.
+    pub brief_refused_choices: Option<Vec<String>>,
     /// The commands of the gate the step's run passed.
     pub gate_passed: Option<Vec<String>>,
 }
@@ -1224,6 +1227,7 @@ impl Driver {
                 _ => None,
             },
             decisions_refused: false,
+            refused_choices: Vec::new(),
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
         };
@@ -1465,6 +1469,22 @@ impl Driver {
                 .as_ref()
                 .ok_or("expected a brief, found none")?;
             same("brief_decisions_refused", expected, brief.decisions_refused)?;
+        }
+        if let Some(expected) = &expect.brief_refused_choices {
+            let brief = self
+                .last_brief
+                .as_ref()
+                .ok_or("expected a brief, found none")?;
+            let found: Vec<&str> = brief
+                .refused_choices
+                .iter()
+                .map(|c| c.question.as_str())
+                .collect();
+            same(
+                "brief_refused_choices",
+                format!("{expected:?}"),
+                format!("{found:?}"),
+            )?;
         }
         if let Some(expected) = &expect.gate_passed {
             let gate = self

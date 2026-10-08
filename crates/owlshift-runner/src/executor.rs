@@ -210,8 +210,9 @@ pub enum Failure {
     /// `result.json` was refused for the build role's own decisions: it
     /// listed some, or ended `done` while its predecessor's were open
     /// (OWL-176). The next Build run is told so, and may not end `done`
-    /// (`Brief::decisions_refused`, OWL-186); `kind` says which, so every
-    /// refused list is kept for it (OWL-195).
+    /// (`Brief::decisions_refused`, OWL-186); `kind` says which, and
+    /// carries the choices a result listed, typed, so every refused choice
+    /// is kept for it (OWL-195, OWL-198).
     Decisions {
         kind: DecisionsRefusal,
         reason: String,
@@ -816,8 +817,11 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Failure::Decisions { kind: DecisionsRefusal::Listed, reason }
+                Failure::Decisions { kind: DecisionsRefusal::Listed(choices), reason }
                     if reason.contains("ask each")
+                        && choices.len() == 1
+                        && (choices[0].question.as_str(), choices[0].recorded.as_str())
+                            == ("q", "d")
             ),
             "{refused:?}"
         );

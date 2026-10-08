@@ -6,7 +6,9 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use owlshift_contracts::ContractError;
-use owlshift_contracts::brief::{Brief, MAX_RESULT_REFUSAL_BYTES, ThreadEntry};
+use owlshift_contracts::brief::{
+    Brief, MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry,
+};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
 use owlshift_contracts::event::Event;
@@ -14,7 +16,9 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
     AskKind, BuildRefusal, Claim, PersistedState, TicketQuestions, claim_ref, ticket_ref,
 };
-use owlshift_contracts::result::{AnswerClass, DecisionsRefusal, Resolution, RunResult, Status};
+use owlshift_contracts::result::{
+    AnswerClass, DecisionsRefusal, RefusedChoice, Resolution, RunResult, Status,
+};
 use serde_json::{Value, json};
 
 /// Artifact paths that could leave the worktree, on any platform.
@@ -155,13 +159,23 @@ fn every_contract_round_trips() {
     ));
     assert_eq!(asked.asks[0].verdicts[1].class, AnswerClass::Partial);
     assert!(asked.asks[1].verdicts.is_empty());
-    // Build's kept refusal tells every refused list, oldest first, then the
-    // latest reason (OWL-192, OWL-195).
+    // Build's kept refusal tells the advice for its typed choices first,
+    // then a list an older format kept as text, then the latest reason
+    // (OWL-192, OWL-195, OWL-198); the typed choices go in the brief's
+    // `refused_choices`.
     let kept = asked.build_refusal.as_ref().unwrap();
     assert!(kept.holds());
+    assert_eq!(
+        kept.choices,
+        [RefusedChoice {
+            question: "Which tone".to_owned(),
+            recorded: "Formal".to_owned()
+        }]
+    );
     let told = kept.told();
     assert!(told.starts_with("invalid result.json: decisions are given but"));
-    assert!(told.contains("(recorded: \"GREETING.md\")\n\nA later result was refused too: invalid result.json: decisions are given again. The choices listed: \"Which tone\""));
+    assert!(told.contains("are in `refused_choices`, oldest first\n\nEarlier results were refused too, their choices quoted here and not in `refused_choices`: invalid result.json: decisions are given but the run's role is build. The choices listed: \"Which file\" (recorded: \"GREETING.md\")\n\nA later result was refused too: "), "{told}");
+    assert!(!told.contains("Which tone"), "{told}");
     assert!(told.ends_with("A later result was refused too: invalid result.json: status is done, but the previous run's decisions were refused"));
     assert!(matches!(
         asked.decisions[0].entry(),
@@ -546,12 +560,36 @@ fn decisions_against_the_brief() {
     };
     // Its kind tells a result that lists choices from a refused `done`
     // (OWL-195).
+    // A result that lists choices carries them typed, kept apart from the
+    // advice, each text cut to its bound (OWL-198).
+    let listed = DecisionsRefusal::Listed(
+        RunResult::parse(&fixture("result-sample.json"))
+            .unwrap()
+            .decisions
+            .iter()
+            .map(|d| RefusedChoice {
+                question: d.question.clone(),
+                recorded: d.decision.clone(),
+            })
+            .collect(),
+    );
     let refused = kind(&misnumbered(true), &build);
     assert_eq!(
-        refused.decisions,
-        Some(DecisionsRefusal::Listed),
+        refused.decisions.as_ref(),
+        Some(&listed),
         "{}",
         refused.error
+    );
+    let long = edited("result-sample.json", |v| {
+        v["decisions"][0]["question"] = json!("é".repeat(MAX_CHOICE_BYTES));
+    });
+    let Some(DecisionsRefusal::Listed(cut)) = kind(&long, &build).decisions else {
+        panic!("not a listed refusal");
+    };
+    assert!(
+        cut[0].question.len() <= MAX_CHOICE_BYTES && cut[0].question.ends_with("é [cut]"),
+        "{:?}",
+        cut[0]
     );
     let full = refused.error.to_string();
     assert!(
@@ -570,7 +608,7 @@ fn decisions_against_the_brief() {
     // run being told the first list's full advice first; the choices are
     // quoted the same way.
     let again = kind(&misnumbered(true), &told);
-    assert_eq!(again.decisions, Some(DecisionsRefusal::Listed));
+    assert_eq!(again.decisions, Some(listed));
     let short = again.error.to_string();
     assert!(
         short.contains("decisions are given again") && !short.contains("filed under `scope`"),
@@ -805,8 +843,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(11)),
+        parse(|v| v["format"] = json!(12)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 10, before Build's brief listed the refused choices",
+        parse(|v| v["format"] = json!(10)),
+        "unknown format 10",
     );
     rejects(
         "format 9, before the resolver's brief carried its refused result",
@@ -912,6 +955,38 @@ fn brief_rejections() {
         v["decisions_refused"] = json!(true)
     }))
     .unwrap();
+    // Refused choices (OWL-198): with the hold, within their bounds.
+    let choice = |question: String| json!({ "question": question, "recorded": "" });
+    let held_with = |choices: Vec<Value>| {
+        Brief::parse(&edited("brief.json", |v| {
+            v["decisions_refused"] = json!(true);
+            v["refused_choices"] = json!(choices);
+        }))
+    };
+    rejects(
+        "refused choices without the hold",
+        parse(|v| v["refused_choices"] = json!([{ "question": "Which file", "recorded": "" }])),
+        "refused choices are given without `decisions_refused`",
+    );
+    rejects(
+        "too many refused choices",
+        held_with(vec![choice(String::new()); MAX_REFUSED_CHOICES + 1]),
+        "more than 64 refused choices are given",
+    );
+    rejects(
+        "a refused choice past its cap",
+        held_with(vec![
+            choice(String::new()),
+            choice("x".repeat(MAX_CHOICE_BYTES + 1)),
+        ]),
+        "refused choice 2 has a text over 512 bytes",
+    );
+    let full = held_with(vec![
+        choice("x".repeat(MAX_CHOICE_BYTES));
+        MAX_REFUSED_CHOICES
+    ])
+    .unwrap();
+    assert_eq!(full.refused_choices.len(), MAX_REFUSED_CHOICES);
     // The checkpoint's paths and the result path come from the runner, but
     // are checked the same way as a model's artifact paths (OWL-25).
     for path in BAD_PATHS {
@@ -1004,7 +1079,7 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(9)),
+        asked(|v| v["format"] = json!(10)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1100,7 +1175,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 8,"));
+    assert!(read.render().starts_with("{\n  \"format\": 9,"));
     // A format-3 document, written before the resolver's decisions were
     // kept, is read with none, its verdicts kept.
     let format_3 = edited("ticket-questions.json", |v| {
@@ -1116,7 +1191,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_3).unwrap();
     assert!(read.decisions.is_empty());
     assert_eq!(read.asks[0].verdicts.len(), 2);
-    assert!(read.render().starts_with("{\n  \"format\": 8,"));
+    assert!(read.render().starts_with("{\n  \"format\": 9,"));
     // A format-4 document, written before an ask kept its check's refusal,
     // is read with none, its decisions kept.
     let format_4 = edited("ticket-questions.json", |v| {
@@ -1131,7 +1206,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_4).unwrap();
     assert!(read.asks.iter().all(|ask| ask.result_refusal.is_none()));
     assert_eq!(read.decisions.len(), 1);
-    assert!(read.render().starts_with("{\n  \"format\": 8,"));
+    assert!(read.render().starts_with("{\n  \"format\": 9,"));
     // A format-5 document, written before Build's refusal was kept
     // (OWL-192), is read with none, its asks' refusals kept.
     let format_5 = edited("ticket-questions.json", |v| {
@@ -1142,7 +1217,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_5).unwrap();
     assert_eq!(read.build_refusal, None);
     assert!(read.asks[1].result_refusal.is_some());
-    assert!(read.render().starts_with("{\n  \"format\": 8,"));
+    assert!(read.render().starts_with("{\n  \"format\": 9,"));
     // Formats 6 and 7 kept Build's refusal in their own shape (OWL-192,
     // OWL-194): the hold's first list in `decisions_reason`, the latest
     // reason, of a kind they did not keep, in `reason`. Each is read as
@@ -1161,7 +1236,7 @@ fn event_claim_and_state_rejections() {
     };
     let upgraded = |format: u64, refusal: Value| {
         let read = TicketQuestions::parse(&legacy(format, refusal)).unwrap();
-        assert!(read.render().starts_with("{\n  \"format\": 8,"));
+        assert!(read.render().starts_with("{\n  \"format\": 9,"));
         read.build_refusal.unwrap()
     };
     for format in [6, 7] {
@@ -1229,6 +1304,34 @@ fn event_claim_and_state_rejections() {
             "Build's kept list of choices 1 is blank",
         );
     }
+    // A format-8 document, written before the refused choices were typed
+    // (OWL-198), keeps its lists as text, told as before, and is written
+    // back as format 9; typed choices are refused in it.
+    let format_8 = |refusal: Value| {
+        edited("ticket-questions.json", |v| {
+            v["format"] = json!(8);
+            v["build_refusal"] = refusal;
+        })
+    };
+    let read =
+        TicketQuestions::parse(&format_8(json!({"reason": latest, "lists": [held]}))).unwrap();
+    assert!(read.render().starts_with("{\n  \"format\": 9,"));
+    let kept = read.build_refusal.unwrap();
+    assert!(kept.holds() && kept.choices.is_empty() && kept.lists == [held]);
+    assert_eq!(
+        kept.told(),
+        format!("{held}\n\nA later result was refused too: {latest}")
+    );
+    for typed in [
+        json!({"lists": [held], "choices": [{"question": "q", "recorded": "r"}]}),
+        json!({"lists": [held], "left_out": 0}),
+    ] {
+        rejects(
+            "a format-8 Build refusal with typed choices",
+            TicketQuestions::parse(&format_8(typed)),
+            "format 8 keeps no typed refused choices",
+        );
+    }
     // A format-6 document, written before the resolver's refusal was kept
     // (OWL-191), is read with none; the field is refused in it, whatever
     // its value. A format-7 document keeps it.
@@ -1283,8 +1386,8 @@ fn event_claim_and_state_rejections() {
     );
     rejects(
         "a blank list of choices",
-        asked(|v| v["build_refusal"]["lists"][1] = json!(" ")),
-        "Build's kept list of choices 2 is blank",
+        asked(|v| v["build_refusal"]["lists"][0] = json!(" ")),
+        "Build's kept list of choices 1 is blank",
     );
     rejects(
         "a list of choices past the cap",
@@ -1297,10 +1400,58 @@ fn event_claim_and_state_rejections() {
         "keeps neither a reason nor a list of choices",
     );
     rejects(
-        "format 7's held reason in format 8",
+        "format 7's held reason in format 9",
         asked(|v| v["build_refusal"]["decisions_reason"] = json!("x")),
         "unknown field `decisions_reason`",
     );
+    // Its typed choices (OWL-198): at most 64, each text within its bound,
+    // the ones past them counted only once full.
+    rejects(
+        "too many kept choices",
+        asked(|v| {
+            v["build_refusal"]["choices"] = json!(vec![
+                json!({"question": "q", "recorded": "r"});
+                MAX_REFUSED_CHOICES + 1
+            ])
+        }),
+        "Build's kept refusal keeps more than 64 choices",
+    );
+    rejects(
+        "a kept choice past its cap",
+        asked(|v| {
+            v["build_refusal"]["choices"][0]["recorded"] = json!("x".repeat(MAX_CHOICE_BYTES + 1))
+        }),
+        "Build's kept choice 1 has a text over 512 bytes",
+    );
+    rejects(
+        "choices left out with room for them",
+        asked(|v| v["build_refusal"]["left_out"] = json!(1)),
+        "counts choices left out with room for them",
+    );
+    TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+        v.as_object_mut().unwrap().remove("build_refusal");
+    }))
+    .unwrap();
+    // The most a hold keeps stays far within the ticket ref's 1 MiB read
+    // cap (`owlshift_runner::ticket_ref`), even as JSON escapes its text;
+    // the lists formats 6 to 8 kept as text are never added to.
+    let mut worst = TicketQuestions::parse(&fixture("ticket-questions.json")).unwrap();
+    let escaped = |bytes: usize| "\u{1}".repeat(bytes);
+    worst.build_refusal = Some(BuildRefusal {
+        reason: Some(escaped(MAX_RESULT_REFUSAL_BYTES)),
+        lists: vec![escaped(MAX_RESULT_REFUSAL_BYTES); 3],
+        choices: vec![
+            RefusedChoice {
+                question: escaped(MAX_CHOICE_BYTES),
+                recorded: escaped(MAX_CHOICE_BYTES),
+            };
+            MAX_REFUSED_CHOICES
+        ],
+        left_out: u32::MAX,
+    });
+    let rendered = worst.render();
+    assert!(rendered.len() < 512 * 1024, "{}", rendered.len());
+    assert_eq!(TicketQuestions::parse(&rendered).unwrap(), worst);
     // A kept refusal is the runner's message: never blank, within the
     // brief's cap.
     rejects(
@@ -1697,13 +1848,15 @@ fn personal_config_rejections() {
 /// OWL-195: what a held Build run is told always fits the brief's cap.
 /// Items that do not fit whole share the room, a short one kept whole;
 /// past ten, the first list and the newest items are told and a note
-/// counts the lists left out between them.
+/// counts the lists left out between them. With typed choices (OWL-198),
+/// their advice is told whole first, and the rest share what is left.
 #[test]
 fn a_build_refusal_is_told_within_the_cap() {
     let long = |n: usize| format!("list {n}: {}", "é".repeat(MAX_RESULT_REFUSAL_BYTES));
     let kept = |lists: usize, reason: Option<&str>| BuildRefusal {
         reason: reason.map(str::to_owned),
         lists: (1..=lists).map(long).collect(),
+        ..BuildRefusal::default()
     };
     let fits = |told: &str| {
         assert!(told.len() <= MAX_RESULT_REFUSAL_BYTES, "{}", told.len());
@@ -1732,6 +1885,42 @@ fn a_build_refusal_is_told_within_the_cap() {
             "{told}"
         );
         assert!(told.contains(&format!("list {lists}: é")), "{told}");
+        assert!(told.ends_with("A later result was refused too: unknown field"));
+    }
+
+    // Typed choices: the advice that points to `refused_choices`, and
+    // counts the choices left out, is never cut, whatever shares the rest.
+    let choice = RefusedChoice {
+        question: "q".to_owned(),
+        recorded: "r".to_owned(),
+    };
+    let mut typed = kept(0, Some("unknown field"));
+    typed.keep_choices(&vec![choice; MAX_REFUSED_CHOICES + 2]);
+    assert_eq!((typed.reason.as_deref(), typed.left_out), (None, 2));
+    typed.reason = Some(long(0));
+    let pointer = "are in `refused_choices`, oldest first. 2 more choices they listed are not \
+                   kept, past the 64 there: ask too about every other choice of what the work \
+                   delivers that the branch's commits took without the decider";
+    let told = fits(&typed.told());
+    assert!(
+        told.contains(&format!(
+            "{pointer}\n\nA later result was refused too: list 0: é"
+        )),
+        "{told}"
+    );
+    assert!(told.ends_with("é [cut]"), "{told}");
+    for lists in [1, 30] {
+        let mut mixed = kept(lists, Some("unknown field"));
+        mixed.choices = typed.choices.clone();
+        mixed.left_out = 2;
+        let told = fits(&mixed.told());
+        assert!(
+            told.starts_with("invalid result.json: decisions are given but")
+                && told.contains(&format!(
+                    "{pointer}\n\nEarlier results were refused too, their choices quoted here and not in `refused_choices`: list 1: é"
+                )),
+            "{told}"
+        );
         assert!(told.ends_with("A later result was refused too: unknown field"));
     }
 }

@@ -251,11 +251,13 @@ pub fn result_refusal(outcome: &Outcome) -> Option<String> {
 /// `owlshift do`, `continue` and the scenarios' stand-in driver alike:
 ///
 /// - a refusal [`result_refusal`] tells takes the place of the kept reason,
-///   except that a refusal that lists choices ([`decisions_kind`]) is added
-///   to the kept lists, oldest first, and holds the next runs, and every
-///   later refusal keeps the lists, so no refused list is dropped until a
-///   run asks (OWL-195); a reason that lists none is kept only while it is
-///   the latest refusal;
+///   except that the choices of a refusal that lists them
+///   ([`decisions_kind`]) are added, typed, to the kept ones, oldest first,
+///   up to [`owlshift_contracts::brief::MAX_REFUSED_CHOICES`]
+///   ([`BuildRefusal::keep_choices`]), and
+///   hold the next runs, and every later refusal keeps them, so no refused
+///   choice is dropped until a run asks (OWL-195, OWL-198); a reason that
+///   lists none is kept only while it is the latest refusal;
 /// - an accepted result (a valid `result.json`, or a `done` whose gate
 ///   failed) clears it, except that a hold is cleared only by a result that
 ///   asks (`questions` or `premise_false`): a `blocked` or `failed` result
@@ -265,21 +267,12 @@ pub fn result_refusal(outcome: &Outcome) -> Option<String> {
 pub fn build_refusal_after(kept: Option<&BuildRefusal>, outcome: &Outcome) -> Option<BuildRefusal> {
     let held = kept.filter(|kept| kept.holds());
     if let Some(reason) = result_refusal(outcome) {
-        let mut lists = held.map(|held| held.lists.clone()).unwrap_or_default();
-        return Some(
-            if decisions_kind(outcome) == Some(DecisionsRefusal::Listed) {
-                lists.push(reason);
-                BuildRefusal {
-                    reason: None,
-                    lists,
-                }
-            } else {
-                BuildRefusal {
-                    reason: Some(reason),
-                    lists,
-                }
-            },
-        );
+        let mut next = held.cloned().unwrap_or_default();
+        match decisions_kind(outcome) {
+            Some(DecisionsRefusal::Listed(choices)) => next.keep_choices(choices),
+            _ => next.reason = Some(reason),
+        }
+        return Some(next);
     }
     match accepted_status(outcome) {
         Some(result::Status::Questions | result::Status::PremiseFalse) => None,
@@ -299,25 +292,27 @@ fn accepted_status(outcome: &Outcome) -> Option<result::Status> {
 }
 
 /// Tells a Build brief what the ticket ref keeps of Build's refusals
-/// (OWL-192): why, in `result_refusal` ([`BuildRefusal::told`]), every
-/// refused list first (OWL-195), and the hold, in `decisions_refused`.
+/// (OWL-192): why, in `result_refusal` ([`BuildRefusal::told`]), the hold,
+/// in `decisions_refused`, and every kept choice, in `refused_choices`
+/// (OWL-198).
 pub fn tell_build(brief: &mut Brief, questions: &TicketQuestions) {
     let kept = questions.build_refusal.as_ref();
     brief.result_refusal = kept.map(BuildRefusal::told);
     brief.decisions_refused = kept.is_some_and(BuildRefusal::holds);
+    brief.refused_choices = kept.map(|kept| kept.choices.clone()).unwrap_or_default();
 }
 
 /// How a run's result was refused for the build role's own decisions
 /// ([`crate::executor::Failure::Decisions`], OWL-176), read from the
-/// failure's kind, never its reason (OWL-195): a result that listed choices
-/// is kept for the next Build runs, told why in [`result_refusal`], and
-/// holds them to ask (`Brief::decisions_refused`, OWL-186), whatever command
-/// runs them ([`build_refusal_after`], OWL-192); a `done` refused under
-/// that hold keeps it. `None` for any other outcome; `Some` only when
-/// [`result_refusal`] tells the outcome.
-pub fn decisions_kind(outcome: &Outcome) -> Option<DecisionsRefusal> {
+/// failure's kind, never its reason (OWL-195): the choices of a result that
+/// listed them are kept for the next Build runs (OWL-198), told why in
+/// [`result_refusal`], and hold them to ask (`Brief::decisions_refused`,
+/// OWL-186), whatever command runs them ([`build_refusal_after`],
+/// OWL-192); a `done` refused under that hold keeps it. `None` for any
+/// other outcome; `Some` only when [`result_refusal`] tells the outcome.
+pub fn decisions_kind(outcome: &Outcome) -> Option<&DecisionsRefusal> {
     match outcome {
-        Outcome::Failed(Failure::Decisions { kind, .. }) => Some(*kind),
+        Outcome::Failed(Failure::Decisions { kind, .. }) => Some(kind),
         _ => None,
     }
 }
@@ -2290,6 +2285,7 @@ impl OnDemand<'_> {
             gate_failure,
             result_refusal: None,
             decisions_refused: false,
+            refused_choices: Vec::new(),
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }
     }
@@ -2902,7 +2898,10 @@ fn path(path: &Path) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use owlshift_contracts::brief::MAX_RESULT_REFUSAL_BYTES;
+    use owlshift_contracts::brief::{
+        MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES,
+    };
+    use owlshift_contracts::result::RefusedChoice;
     use owlshift_core::decider::DeciderRule;
     use owlshift_platform::confined::{ConfinedError, Refusal};
 
@@ -3291,14 +3290,17 @@ mod tests {
         // is freed at the last attempt as any other (OWL-183), and flagged
         // for the next Build run (OWL-186).
         let decided = Outcome::Failed(Failure::Decisions {
-            kind: DecisionsRefusal::Listed,
+            kind: DecisionsRefusal::Listed(Vec::new()),
             reason: "decisions are given".to_owned(),
         });
         assert_eq!(
             result_refusal(&decided).as_deref(),
             Some("decisions are given")
         );
-        assert_eq!(decisions_kind(&decided), Some(DecisionsRefusal::Listed));
+        assert_eq!(
+            decisions_kind(&decided),
+            Some(&DecisionsRefusal::Listed(Vec::new()))
+        );
         assert_eq!(decisions_kind(&refused("decisions are given")), None);
         assert_eq!(
             result_refusal(&Outcome::UsageLimit { resets_at: None }),
@@ -3386,13 +3388,21 @@ mod tests {
             output: String::new(),
             truncated: false,
         })));
-        let listed = |reason: &str| {
+        let listed = |questions: &[&str]| {
             Outcome::Failed(Failure::Decisions {
-                kind: DecisionsRefusal::Listed,
-                reason: reason.to_owned(),
+                kind: DecisionsRefusal::Listed(
+                    questions
+                        .iter()
+                        .map(|q| RefusedChoice {
+                            question: (*q).to_owned(),
+                            recorded: "r".to_owned(),
+                        })
+                        .collect(),
+                ),
+                reason: format!("choices: {}", questions.join("; ")),
             })
         };
-        let decided = listed("choices: A; B");
+        let decided = listed(&["A", "B"]);
         let shape = Outcome::Failed(Failure::InvalidResult("unknown field".to_owned()));
         let done_held = Outcome::Failed(Failure::Decisions {
             kind: DecisionsRefusal::Done,
@@ -3437,7 +3447,13 @@ mod tests {
         // nothing, and later refusals keep the hold and the choices.
         let held = build_refusal_after(None, &decided).unwrap();
         assert!(held.holds());
-        assert_eq!(held.told(), "choices: A; B");
+        let questions_of = |kept: &BuildRefusal| -> Vec<String> {
+            kept.choices.iter().map(|c| c.question.clone()).collect()
+        };
+        assert_eq!(
+            (questions_of(&held), &held.reason),
+            (vec!["A".to_owned(), "B".to_owned()], &None)
+        );
         for outcome in left_as_is
             .iter()
             .chain(&[finished("blocked"), finished("failed")])
@@ -3447,81 +3463,94 @@ mod tests {
                 Some(&held)
             );
         }
-        // OWL-195: every later refusal keeps the lists, oldest first; one
-        // that lists choices adds its own, and drops a reason that listed
-        // none, which stays only while it is the latest.
-        let twice = build_refusal_after(Some(&held), &listed("choices: C")).unwrap();
-        let lists = |kept: &BuildRefusal| kept.lists.clone();
+        // OWL-195, OWL-198: every later refusal keeps the choices, oldest
+        // first; one that lists choices adds its own, and drops a reason
+        // that listed none, which stays only while it is the latest.
+        let twice = build_refusal_after(Some(&held), &listed(&["C"])).unwrap();
         assert_eq!(
-            (lists(&twice), &twice.reason),
-            (
-                vec!["choices: A; B".to_owned(), "choices: C".to_owned()],
-                &None
-            )
+            (questions_of(&twice), &twice.reason),
+            (vec!["A".to_owned(), "B".to_owned(), "C".to_owned()], &None)
         );
-        let thrice = build_refusal_after(Some(&twice), &listed("choices: D")).unwrap();
-        assert_eq!(
-            lists(&thrice),
-            ["choices: A; B", "choices: C", "choices: D"]
-        );
+        let thrice = build_refusal_after(Some(&twice), &listed(&["D"])).unwrap();
+        assert_eq!(questions_of(&thrice), ["A", "B", "C", "D"]);
         let done_after = build_refusal_after(Some(&thrice), &done_held).unwrap();
         assert_eq!(
-            (lists(&done_after), done_after.reason.as_deref()),
-            (lists(&thrice), Some("status is done"))
+            (questions_of(&done_after), done_after.reason.as_deref()),
+            (questions_of(&thrice), Some("status is done"))
         );
         for later in [&shape, &done_held] {
             let kept = build_refusal_after(Some(&held), later).unwrap();
-            assert_eq!(lists(&kept), ["choices: A; B"]);
-            let relisted = build_refusal_after(Some(&kept), &listed("choices: C")).unwrap();
+            assert_eq!(questions_of(&kept), ["A", "B"]);
+            let relisted = build_refusal_after(Some(&kept), &listed(&["C"])).unwrap();
             assert_eq!(relisted, twice);
         }
         for asks in [finished("questions"), finished("premise_false")] {
             assert_eq!(build_refusal_after(Some(&done_after), &asks), None);
         }
 
-        // The brief is told what is kept: every list, oldest first, then
-        // the latest reason when it listed none.
+        // The brief is told what is kept: the advice, then the latest
+        // reason when it listed none, and every choice, oldest first, in
+        // `refused_choices` (OWL-198).
         let mut questions = TicketQuestions::new();
-        questions.build_refusal = Some(done_after);
+        questions.build_refusal = Some(done_after.clone());
         let mut brief = Brief::parse(include_str!(
             "../../owlshift-contracts/tests/fixtures/brief.json"
         ))
         .unwrap();
         tell_build(&mut brief, &questions);
-        let later = "\n\nA later result was refused too: ";
+        brief.validate().unwrap();
         assert_eq!(
-            (brief.result_refusal.clone(), brief.decisions_refused),
             (
-                Some(format!(
-                    "choices: A; B{later}choices: C{later}choices: D{later}status is done"
-                )),
-                true
-            )
+                brief.result_refusal.clone(),
+                brief.decisions_refused,
+                brief.refused_choices.clone()
+            ),
+            (Some(done_after.told()), true, done_after.choices.clone())
+        );
+        let told = brief.result_refusal.clone().unwrap();
+        assert!(
+            told.contains("ask each of these choices") && told.contains("`refused_choices`"),
+            "{told}"
+        );
+        assert!(
+            told.ends_with("\n\nA later result was refused too: status is done"),
+            "{told}"
         );
         tell_build(&mut brief, &TicketQuestions::new());
         assert_eq!(
-            (brief.result_refusal, brief.decisions_refused),
-            (None, false)
+            (
+                brief.result_refusal,
+                brief.decisions_refused,
+                brief.refused_choices
+            ),
+            (None, false, Vec::new())
         );
     }
 
-    /// OWL-195's acceptance: three refusals in a row of results that list
-    /// choices, then a refused `done`, as the executor refuses them, each
-    /// run told what the ticket ref kept: the next Build brief tells every
-    /// refused list's choices, oldest first, within the cap, and still does
-    /// with long lists, each cut to its share.
+    /// OWL-198's acceptance: results refused in a row for the decisions
+    /// they list, as the executor refuses them, each run told what the
+    /// ticket ref kept, read back from its file: the next Build brief tells
+    /// every refused choice, typed and oldest first, in `refused_choices`,
+    /// after twelve refused lists and a refused `done`, and after one list
+    /// longer than the whole cap; `result_refusal` stays within its cap.
+    /// Past the most a hold keeps, the rest are counted, and the run is
+    /// told so.
     #[test]
-    fn every_refused_list_is_told_to_the_next_build_run() {
+    fn every_refused_choice_is_told_to_the_next_build_run() {
         let brief = Brief::parse(include_str!(
             "../../owlshift-contracts/tests/fixtures/brief.json"
         ))
         .unwrap();
-        let listing = |choice: &str| {
+        let listing = |choices: &[String]| {
+            let decisions: Vec<String> = choices
+                .iter()
+                .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
+                .collect();
             format!(
-                r#"{{"format":6,"status":"done","summary":"s","decisions":[{{"question":"{choice}","decision":"d","basis":"b"}}]}}"#
+                r#"{{"format":6,"status":"done","summary":"s","decisions":[{}]}}"#,
+                decisions.join(",")
             )
         };
-        let done = r#"{"format":6,"status":"done","summary":"s"}"#.to_owned();
         let refuse_in_turn = |results: &[String]| {
             let mut questions = TicketQuestions::new();
             let mut brief = brief.clone();
@@ -3535,44 +3564,73 @@ mod tests {
                     questions.build_refusal.as_ref(),
                     &Outcome::Failed(refused),
                 );
+                // As the ticket ref keeps it.
+                questions = TicketQuestions::parse(&questions.render()).unwrap();
             }
             tell_build(&mut brief, &questions);
             brief.validate().unwrap();
+            (brief, questions)
+        };
+        let told_questions = |brief: &Brief| -> Vec<String> {
             brief
+                .refused_choices
+                .iter()
+                .map(|c| c.question.clone())
+                .collect()
         };
 
-        let choices = ["Which file", "Which tone", "Which case"];
-        let mut results: Vec<String> = choices.iter().map(|c| listing(c)).collect();
-        results.push(done.clone());
-        let told = refuse_in_turn(&results);
-        let reason = told.result_refusal.as_deref().unwrap();
-        assert!(told.decisions_refused);
-        let at: Vec<usize> = choices
-            .iter()
-            .map(|c| {
-                reason
-                    .find(&format!("{c:?} (recorded"))
-                    .unwrap_or_else(|| panic!("{c} in {reason}"))
-            })
+        // Twelve refused lists of two choices each, then a refused `done`.
+        let lists: Vec<Vec<String>> = (1..=12)
+            .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
-        assert!(at.windows(2).all(|w| w[0] < w[1]), "{reason}");
-        // The first list carries the full advice, the later ones a short one.
-        assert_eq!(reason.matches("filed under `scope`").count(), 1, "{reason}");
+        let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
+        results.push(r#"{"format":6,"status":"done","summary":"s"}"#.to_owned());
+        let (told, _) = refuse_in_turn(&results);
+        assert!(told.decisions_refused);
+        assert_eq!(told_questions(&told), lists.concat());
+        assert!(
+            told.refused_choices
+                .iter()
+                .all(|c| c.recorded == format!("{}: d", c.question))
+        );
+        let reason = told.result_refusal.as_deref().unwrap();
+        assert!(reason.len() <= MAX_RESULT_REFUSAL_BYTES, "{}", reason.len());
+        assert!(
+            reason.contains("filed under `scope`") && reason.contains("`refused_choices`"),
+            "{reason}"
+        );
         assert!(
             reason.ends_with("may end with any status but `done`"),
             "{reason}"
         );
 
-        // Long lists share the room: each still begins its choices.
-        let long = |c: &str| listing(&format!("{c} {}", "x".repeat(MAX_RESULT_REFUSAL_BYTES)));
-        let mut results: Vec<String> = choices.iter().map(|c| long(c)).collect();
-        results.push(done);
-        let told = refuse_in_turn(&results);
-        let reason = told.result_refusal.as_deref().unwrap();
-        assert!(reason.len() <= MAX_RESULT_REFUSAL_BYTES, "{}", reason.len());
-        for c in choices {
-            assert!(reason.contains(&format!("\"{c} xxx")), "{c} in {reason}");
+        // One list longer than the whole cap: every choice told, each cut
+        // to its bound, its beginning kept.
+        let long: Vec<String> = (1..=8)
+            .map(|n| format!("Long {n} {}", "x".repeat(600)))
+            .collect();
+        let (told, _) = refuse_in_turn(&[listing(&long)]);
+        assert_eq!(told.refused_choices.len(), 8);
+        for (n, choice) in told.refused_choices.iter().enumerate() {
+            assert!(
+                choice.question.starts_with(&format!("Long {} xxx", n + 1))
+                    && choice.question.ends_with(" [cut]")
+                    && choice.question.len() <= MAX_CHOICE_BYTES,
+                "{choice:?}"
+            );
         }
-        assert_eq!(reason.matches(" [cut]").count(), 3, "{reason}");
+
+        // Past the most a hold keeps, the rest are counted, and told.
+        let many: Vec<String> = (1..=MAX_REFUSED_CHOICES + 3)
+            .map(|n| format!("Choice {n}"))
+            .collect();
+        let (told, kept) = refuse_in_turn(&[listing(&many)]);
+        assert_eq!(told_questions(&told), many[..MAX_REFUSED_CHOICES]);
+        assert_eq!(kept.build_refusal.unwrap().left_out, 3);
+        let reason = told.result_refusal.as_deref().unwrap();
+        assert!(
+            reason.contains("3 more choices they listed are not kept"),
+            "{reason}"
+        );
     }
 }

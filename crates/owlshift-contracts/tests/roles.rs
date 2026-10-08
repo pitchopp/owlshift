@@ -69,6 +69,8 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "gate_failure.output",
     "result_refusal",
     "decisions_refused",
+    "refused_choices.question",
+    "refused_choices.recorded",
     "result_path",
 ];
 
