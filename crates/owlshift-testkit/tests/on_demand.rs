@@ -219,6 +219,11 @@ struct Clocked<'a> {
     clock: &'a Cell<Timestamp>,
     /// A comment starting with this is refused, as a tracker that fails.
     refuse: &'a Cell<Option<&'static str>>,
+    /// The ticket ref's lock is taken once a comment starting with this has
+    /// posted, so keeping what that comment asks fails (OWL-196).
+    lock_after: &'a Cell<Option<&'static str>>,
+    /// The ticket ref's lock file.
+    ref_lock: PathBuf,
     /// Every stage write is refused.
     refuse_stage: bool,
     /// Every mention is unreadable, as a Linear profile link that cannot be
@@ -269,6 +274,15 @@ impl Tracker for Clocked<'_> {
         self.inner
             .post_comment(id, MarkdownTracker::AGENT, tick(self.clock), body)
             .map_err(|e| other(&e))?;
+        if self
+            .lock_after
+            .get()
+            .is_some_and(|start| body.starts_with(start))
+        {
+            self.lock_after.set(None);
+            fs::create_dir_all(self.ref_lock.parent().unwrap()).unwrap();
+            fs::write(&self.ref_lock, "").unwrap();
+        }
         // The newest comment is the one just posted.
         Tracker::comments(&self.inner, id)?
             .pop()
@@ -309,6 +323,9 @@ struct Bench {
     clock: Rc<Cell<Timestamp>>,
     /// The runner's comments starting with this are refused by the tracker.
     refuse: Cell<Option<&'static str>>,
+    /// The ticket ref is locked once a runner comment starting with this has
+    /// posted: see [`Clocked::lock_after`].
+    lock_after: Cell<Option<&'static str>>,
     /// The tracker refuses every stage write.
     refuse_stage: Cell<bool>,
     /// The tracker cannot give any mention.
@@ -406,6 +423,7 @@ impl Bench {
             github,
             clock: Rc::new(Cell::new("2026-10-02T09:00:00Z".parse().unwrap())),
             refuse: Cell::new(None),
+            lock_after: Cell::new(None),
             refuse_stage: Cell::new(false),
             refuse_mention: Cell::new(false),
             fail_reads: Cell::new(0),
@@ -473,16 +491,22 @@ impl Bench {
         )
     }
 
+    /// The lock file a write of the ticket's ref takes.
+    fn ref_lock(&self) -> PathBuf {
+        self.dirs()
+            .checkout()
+            .join(".git/refs/owlshift/tickets/DEMO-1.lock")
+    }
+
     /// Holds the ticket ref's lock file in Owlshift's checkout once the
     /// `run`th run of a command works, so that keeping a state after it
     /// fails, whatever comment was posted before (OWL-149). The lock is no
     /// ref, so the isolation check does not see it.
     fn lock_ticket_ref_during(&self, run: usize) -> During {
-        let checkout = self.dirs().checkout();
+        let path = self.ref_lock();
         (
             run,
             Box::new(move || {
-                let path = checkout.join(".git/refs/owlshift/tickets/DEMO-1.lock");
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, "").unwrap();
             }),
@@ -671,6 +695,8 @@ impl Bench {
             inner: MarkdownTracker::new(&self.remote.checkout),
             clock: &self.clock,
             refuse: &self.refuse,
+            lock_after: &self.lock_after,
+            ref_lock: self.ref_lock(),
             refuse_stage: self.refuse_stage.get(),
             refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
@@ -3424,6 +3450,75 @@ fn a_refused_resolver_result_is_told_to_the_replayed_round() {
         other => panic!("{other:?}\n{printed}"),
     }
     assert!(bench.comments().is_empty());
+}
+
+/// OWL-196: the fallback round of a refused resolver result is posted, then
+/// the ticket ref refuses the write keeping it. The command stops naming the
+/// comment, which stays on the ticket, and the refusal kept before the post
+/// is still in the ref, so the resolver run of a later `do` that replays the
+/// questions is told why.
+#[test]
+fn a_refused_resolver_result_is_told_when_its_round_was_posted_but_not_kept() {
+    let bench = Bench::new(true);
+    bench.lock_after.set(Some("[owlshift] QUESTIONS"));
+    let (stopped, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(RESOLVED_Q2)),
+        ],
+        None,
+    );
+    match &stopped {
+        Err(Stop::NotKept {
+            message,
+            landed: Landed::Questions,
+        }) => assert!(
+            message.contains("keeping them in the ticket's ref failed"),
+            "{message}"
+        ),
+        other => panic!("{other:?}\n{printed}"),
+    }
+    fs::remove_file(bench.ref_lock()).unwrap();
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1);
+    assert!(
+        comments[0].starts_with("[owlshift] QUESTIONS"),
+        "{comments:?}"
+    );
+    // The stage showed the wait before keeping was tried, as the stand-in
+    // driver plays it.
+    assert_eq!(bench.stage(), "Needs Input");
+    let record = bench.record();
+    assert_eq!((record.state.waiting, record.state.round), (None, 0));
+    assert!(record.questions.asks.is_empty());
+    let kept = record.questions.resolver_refusal.unwrap();
+    assert!(kept.contains("Q2"), "{kept}");
+
+    let (delivered, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let told: Vec<(Role, Option<String>)> = bench
+        .briefs()
+        .into_iter()
+        .map(|brief| (brief.role, brief.result_refusal))
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (Role::Build, None),
+            (Role::Resolver, None),
+            (Role::Build, None),
+            (Role::Resolver, Some(kept)),
+            (Role::Build, None),
+        ]
+    );
+    assert_eq!(bench.record().questions.resolver_refusal, None);
 }
 
 /// OWL-151's acceptance: the project's added always-human categories reach

@@ -1,0 +1,71 @@
+# OWL-196's acceptance, played by crates/owlshift-testkit/tests/scenarios.rs.
+# It plays on the resolver/ fixture folder (the project in repo/, prepared
+# results/): Build asks Q1 alone, so a resolver resolving Q2 is refused.
+
+fixture = "resolver"
+description = """
+DEMO-4's Build asks whether the README links to the greeting, a question for
+the resolver. The resolver gives its resolution on Q2, which it was not
+given: its result is refused, and every question falls back to the decider.
+That round's QUESTIONS comment posts but the ticket ref refuses the write
+keeping the round (`ticket_ref_refuses_round`): the comment stays on the
+ticket and its stage shows the wait, but no ask is kept and the core state
+is as before the round; the resolver's refusal, kept before the post, stays.
+A person's `continue` runs Build again,
+which asks the same question, and the resolver that replays it is told why
+the earlier result was refused: it decides Q1. The next Build reads the
+decision, told nothing, and is done."""
+ticket = "DEMO-4"
+start = "2026-10-08T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+run = { result = "results/questions-link.json" }
+expect = { event = "none", stage = "build", waiting = "none", round = 0, comments = 0 }
+
+[[step]]
+resolve = { result = "results/resolver-resolves-q2.json" }
+ticket_ref_refuses_round = true
+[step.expect]
+event = "none"
+stage = "build"
+waiting = "none"
+round = 0
+failed_runs = 0
+tracker_stage = "Needs Input"
+comments = 1
+brief_resolve = ["Q1"]
+brief_result_refusal = "none"
+
+[[step]]
+continue = true
+expect = { event = "none", stage = "build", waiting = "none", round = 0 }
+
+[[step]]
+run = { result = "results/questions-link.json" }
+expect = { event = "none", stage = "build", waiting = "none", round = 0, comments = 1, brief_result_refusal = "none" }
+
+[[step]]
+resolve = { result = "results/resolver-decides-link.json" }
+[step.expect]
+event = "none"
+stage = "build"
+waiting = "none"
+round = 0
+comments = 2
+brief_resolve = ["Q1"]
+brief_result_refusal = "Q2"
+[step.expect.last_comment]
+author = "owlshift"
+first_line = "[owlshift] DECISION"
+contains = ["**Decision:** Yes, in the README's list of files."]
+
+[[step]]
+run = { result = "results/build-done.json" }
+[step.expect]
+event = "completed"
+brief_decisions = ["Yes, in the README's list of files."]
+brief_result_refusal = "none"
