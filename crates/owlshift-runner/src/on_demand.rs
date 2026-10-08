@@ -242,7 +242,9 @@ pub fn result_refusal(outcome: &Outcome) -> Option<String> {
 ///
 /// - a refusal [`result_refusal`] tells takes the place of the kept one; a
 ///   refusal of decisions ([`decisions_refused`]) holds the next runs, and a
-///   later refusal keeps that hold and the reason that quotes the choices;
+///   later refusal keeps that hold and the reason that quotes the choices,
+///   the one of the refusal that started the hold, even when the later one
+///   lists choices too (OWL-194);
 /// - an accepted result (a valid `result.json`, or a `done` whose gate
 ///   failed) clears it, except that a hold is cleared only by a result that
 ///   asks (`questions` or `premise_false`): a `blocked` or `failed` result
@@ -3305,8 +3307,9 @@ mod tests {
 
     /// OWL-192: what the ticket ref keeps of Build's refusals after each
     /// kind of outcome. A refusal of decisions holds until a result asks,
-    /// through later refusals, which keep the reason quoting the choices;
-    /// any other refusal goes once a result is accepted.
+    /// through later refusals, which keep the reason quoting the choices
+    /// that started the hold (OWL-194); any other refusal goes once a result
+    /// is accepted.
     #[test]
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
@@ -3387,6 +3390,19 @@ mod tests {
                 Some(&held)
             );
         }
+        // OWL-194: a second refusal that lists choices is told after the
+        // first list, which stays the one that holds the run (the brief's
+        // check below).
+        let relisted = Outcome::Failed(Failure::Decisions("choices: C".to_owned()));
+        let twice = build_refusal_after(Some(&held), &relisted).unwrap();
+        // Known limits: a long first list cuts the second's off, and a
+        // third refusal drops the middle list.
+        let long = Outcome::Failed(Failure::Decisions("A".repeat(MAX_RESULT_REFUSAL_BYTES)));
+        let long_held = build_refusal_after(None, &long).unwrap();
+        let cut = build_refusal_after(Some(&long_held), &relisted).unwrap();
+        assert!(!cut.told().contains("choices: C"));
+        let thrice = build_refusal_after(Some(&twice), &done_held).unwrap();
+        assert!(!thrice.told().contains("choices: C"), "{}", thrice.told());
         for later in [&shape, &done_held] {
             let kept = build_refusal_after(Some(&held), later).unwrap();
             assert!(kept.decisions);
@@ -3404,9 +3420,9 @@ mod tests {
             assert_eq!(build_refusal_after(Some(&held), &asks), None);
         }
 
-        // The brief is told what is kept.
+        // The brief is told what is kept: both lists after two refusals.
         let mut questions = TicketQuestions::new();
-        questions.build_refusal = Some(held);
+        questions.build_refusal = Some(twice);
         let mut brief = Brief::parse(include_str!(
             "../../owlshift-contracts/tests/fixtures/brief.json"
         ))
@@ -3414,7 +3430,10 @@ mod tests {
         tell_build(&mut brief, &questions);
         assert_eq!(
             (brief.result_refusal.as_deref(), brief.decisions_refused),
-            (Some("choices: A; B"), true)
+            (
+                Some("choices: A; B\n\nA later result was refused too: choices: C"),
+                true
+            )
         );
         tell_build(&mut brief, &TicketQuestions::new());
         assert_eq!(
