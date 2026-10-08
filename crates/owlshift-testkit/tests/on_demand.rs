@@ -3344,6 +3344,88 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
     assert_eq!(resolved[0]["unposted"], json!(["Q1"]));
 }
 
+/// The resolver resolves Q2, which a brief giving Q1 alone did not give: its
+/// result is refused.
+const RESOLVED_Q2: &str = r#"{"format":6,"status":"done","summary":"The ticket names the file.",
+"resolutions":[{"question":"Q2","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
+"basis":"The ticket's description."}]}"#;
+
+/// OWL-191: a refused resolver result is kept in the ticket ref before its
+/// fallback round is posted, so when the tracker refuses that round, the
+/// resolver run of a later `do` that replays the questions is told why;
+/// it decides, which clears the kept reason. A reason the ticket ref
+/// cannot keep stops the command before any round is posted.
+#[test]
+fn a_refused_resolver_result_is_told_to_the_replayed_round() {
+    let bench = Bench::new(true);
+    bench.refuse.set(Some("[owlshift] QUESTIONS"));
+    let (unposted, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(RESOLVED_Q2)),
+        ],
+        None,
+    );
+    assert!(
+        matches!(&unposted, Err(Stop::NeedsInput { posted: Err(_), .. })),
+        "{unposted:?}\n{printed}"
+    );
+    bench.refuse.set(None);
+    assert!(bench.comments().is_empty());
+    let record = bench.record();
+    assert_eq!((record.state.waiting, record.state.round), (None, 0));
+    assert!(record.questions.asks.is_empty());
+    let kept = record.questions.resolver_refusal.unwrap();
+    assert!(kept.contains("Q2"), "{kept}");
+
+    let (delivered, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let told: Vec<(Role, Option<String>)> = bench
+        .briefs()
+        .into_iter()
+        .map(|brief| (brief.role, brief.result_refusal))
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (Role::Build, None),
+            (Role::Resolver, None),
+            (Role::Build, None),
+            (Role::Resolver, Some(kept)),
+            (Role::Build, None),
+        ]
+    );
+    assert_eq!(bench.record().questions.resolver_refusal, None);
+
+    // The ticket's ref is locked while the resolver runs: keeping its
+    // refusal fails, and the command stops with nothing posted.
+    let bench = Bench::new(true);
+    let (stopped, printed) = bench.invoke(
+        false,
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(RESOLVED_Q2)),
+        ],
+        None,
+        vec![bench.lock_ticket_ref_during(2)],
+    );
+    match &stopped {
+        Err(Stop::Refused(message)) => assert!(
+            message.contains("keeping the resolver's refusal in the ticket's ref"),
+            "{message}"
+        ),
+        other => panic!("{other:?}\n{printed}"),
+    }
+    assert!(bench.comments().is_empty());
+}
+
 /// OWL-151's acceptance: the project's added always-human categories reach
 /// Build's brief and the resolver's, normalized, once each and without what
 /// the floor already covers; a question Build files under one goes to the

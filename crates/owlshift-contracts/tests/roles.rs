@@ -125,6 +125,7 @@ const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "rules.text",
     "rules.source",
     "always_human",
+    "result_refusal",
     "result_path",
 ];
 

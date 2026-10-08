@@ -1,6 +1,6 @@
 +++
 role = "build"
-brief_format = 9
+brief_format = 10
 result_format = 6
 +++
 

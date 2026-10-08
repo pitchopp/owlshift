@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift ticket questions",
-  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and its decider, and what the last answer check\nread, and why the last check's result was refused, when it was; the\ndecisions the resolver took instead of asking; and why Build's latest\nresult was refused, until a Build result is accepted.",
+  "description": "The questions the runner asked on a ticket, in [`QUESTIONS_FILE`]: each\nask with the comment that posted it, so a brief's thread shows the ask in\nthat comment's place, and its decider, and what the last answer check\nread, and why the last check's result was refused, when it was; the\ndecisions the resolver took instead of asking; why Build's latest\nresult was refused, until a Build result is accepted; and why the\nresolver's latest result was refused, until one is accepted or a round\nis kept.",
   "type": "object",
   "properties": {
     "asks": {
@@ -41,7 +41,15 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 6
+      "const": 7
+    },
+    "resolver_refusal": {
+      "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "\\S"
     }
   },
   "additionalProperties": false,

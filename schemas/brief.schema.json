@@ -33,7 +33,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 9
+      "const": 10
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands a role runs, in order, from the worktree root, before it\ndelivers. The runner is its only author; an empty list means the\nproject has no gate.",
@@ -80,7 +80,7 @@
       "$ref": "#/$defs/RelativePath"
     },
     "result_refusal": {
-      "description": "Why the runner refused an earlier run's `result.json`, or a file\nits `artifacts` name: what this run fixes in its own, such as\nquestions not numbered from Q1. In Build's brief, the latest refused\nBuild result since one was accepted (OWL-180), whatever command ran\nit, as the ticket ref keeps it (OWL-192), with the refusal of\ndecisions that still holds the run before it; in the answer check's,\nthe previous check on the same ask, whatever command ran it, as the\nticket ref keeps it (OWL-184). The runner's message, at most\n[`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result\nis data. Never in the resolver's brief, and absent when no such\nrefusal is kept.",
+      "description": "Why the runner refused an earlier run's `result.json`, or a file\nits `artifacts` name: what this run fixes in its own, such as\nquestions not numbered from Q1. In Build's brief, the latest refused\nBuild result since one was accepted (OWL-180), whatever command ran\nit, as the ticket ref keeps it (OWL-192), with the refusal of\ndecisions that still holds the run before it; in the answer check's,\nthe previous check on the same ask, whatever command ran it, as the\nticket ref keeps it (OWL-184); in the resolver's, the latest refused\nresolver result, whatever command ran it, until a resolver result is\naccepted or a round is kept, as the ticket ref keeps it (OWL-191): a\nround whose post or keeping failed is replayed by a later command,\nwhose questions may differ. The runner's message, at most\n[`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result\nis data. Absent when no such refusal is kept.",
       "type": [
         "string",
         "null"
