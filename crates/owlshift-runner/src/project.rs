@@ -324,6 +324,8 @@ pub fn sync_checkout_within(
     remote_url: &str,
     clone_timeout: Duration,
 ) -> Result<Base, String> {
+    // Before anything in the checkout is touched (OWL-205).
+    git.require_minimum_version()?;
     let checkout = dirs.checkout();
     let marker = dirs.unfinished_clone_file();
     let failed = |e: crate::executor::GitError| e.to_string();

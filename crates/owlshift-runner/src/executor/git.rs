@@ -27,6 +27,7 @@ use owlshift_platform::process::{Captured, RunError, run_command};
 
 use crate::agent_env::AgentEnv;
 use crate::config::exit_text;
+use crate::system::{older_than, version_of};
 
 /// The oldest git Owlshift runs with (OWL-199), which `owlshift doctor`
 /// checks. Set by `symbolic-ref --no-recurse`, new in 2.39.0, which every
@@ -37,6 +38,34 @@ use crate::config::exit_text;
 /// 2.31.0. The live checks behind each: `docs/design/build-plan.md`, "What
 /// `doctor` checks".
 pub const MINIMUM_GIT_VERSION: &str = "2.39.0";
+
+/// Why Owlshift needs [`MINIMUM_GIT_VERSION`], as `owlshift doctor` and the
+/// refusal of a run on an older git both say it.
+pub(crate) fn git_floor_reason() -> String {
+    format!(
+        "Owlshift needs git {MINIMUM_GIT_VERSION} or later: every `owlshift do` reads origin's \
+         default branch with `git symbolic-ref --no-recurse`, which older gits refuse."
+    )
+}
+
+/// The fix for a git below the floor, step one: what to install.
+pub(crate) fn git_install_advice() -> String {
+    format!("Install git {MINIMUM_GIT_VERSION} or later: https://git-scm.com/downloads")
+}
+
+/// The fix for a git below the floor, step two: what the check afterwards
+/// (`git --version`) should print.
+pub(crate) fn git_recheck_note() -> String {
+    format!("should print {MINIMUM_GIT_VERSION} or later: an older git may come first on the PATH")
+}
+
+/// The version `git --version` printed in `output`, when it is older than
+/// [`MINIMUM_GIT_VERSION`]. `None` for a version at the floor or above, and
+/// for one that cannot be read or compared: only a known old git is refused.
+pub(crate) fn version_below_floor(output: &[u8]) -> Option<String> {
+    let version = version_of(output)?;
+    older_than(&version, MINIMUM_GIT_VERSION)?.then_some(version)
+}
 
 /// How long one of the executor's git commands may take.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -136,6 +165,32 @@ impl Git {
     /// an error carrying the end of its standard error.
     pub(crate) fn run<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Vec<u8>, GitError> {
         self.run_within(dir, args, self.timeout)
+    }
+
+    /// Refuses a git older than [`MINIMUM_GIT_VERSION`], in Owlshift's words
+    /// and with the fix steps `owlshift doctor` gives (OWL-205), instead of
+    /// letting a later command stop on an option the git lacks. Runs
+    /// `git --version` outside any repository. A git that does not run, or
+    /// whose version cannot be read, passes here: the next command says why
+    /// it fails, and `doctor` warns about an unfamiliar answer.
+    pub fn require_minimum_version(&self) -> Result<(), String> {
+        let probe = Duration::from_secs(10);
+        let Ok(out) = self.output_within(&std::env::temp_dir(), &["--version"], None, probe) else {
+            return Ok(());
+        };
+        if !out.success() {
+            return Ok(());
+        }
+        match version_below_floor(&out.stdout) {
+            Some(version) => Err(format!(
+                "git {version} is older than {MINIMUM_GIT_VERSION}. {} {}. Then run \
+                 `git --version`, which {}.",
+                git_floor_reason(),
+                git_install_advice(),
+                git_recheck_note()
+            )),
+            None => Ok(()),
+        }
     }
 
     /// [`Git::run`] with its own deadline.
@@ -247,6 +302,24 @@ impl std::error::Error for GitError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-205: only a git known to be older than the floor is refused.
+    #[test]
+    fn only_a_known_old_git_is_below_the_floor() {
+        assert_eq!(
+            version_below_floor(b"git version 2.38.5\n").as_deref(),
+            Some("2.38.5")
+        );
+        for answer in [
+            &b"git version 2.39.0\n"[..],
+            b"git version 2.54.0 (Apple Git-157)\n",
+            b"git version 2.47.1.windows.1\n",
+            b"git version 2.99999999999999999999.0\n",
+            b"no version here",
+        ] {
+            assert_eq!(version_below_floor(answer), None, "{answer:?}");
+        }
+    }
 
     #[test]
     fn every_command_turns_hooks_the_monitor_and_the_server_info_off() {

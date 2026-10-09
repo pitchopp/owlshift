@@ -193,3 +193,39 @@ fn a_clone_an_earlier_run_did_not_finish_is_cloned_anew() {
     assert!(!checkout.join("left-over").exists());
     bench.assert_whole_checkout();
 }
+
+/// OWL-205: a git older than the floor is refused before the project's
+/// folder is created or the checkout touched, in Owlshift's words with the
+/// fix steps `owlshift doctor` gives. The stand-in answers `--version` and
+/// leaves a witness for any other command.
+#[cfg(unix)]
+#[test]
+fn a_git_older_than_the_floor_is_refused_before_the_checkout_is_touched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bench = bench();
+    let witness = bench.dir.path().join("other-command");
+    let script = bench.dir.path().join("old-git");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *--version*) echo 'git version 2.38.5';;\n  *) : > {}; exit 1;;\nesac\n",
+            quoted(&witness)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error =
+        sync_checkout_within(&Git::new(&script), &bench.dirs, REMOTE_URL, secs(60)).unwrap_err();
+    assert!(error.contains("git 2.38.5 is older than 2.39.0"), "{error}");
+    assert!(
+        error.contains("Install git 2.39.0 or later: https://git-scm.com/downloads"),
+        "{error}"
+    );
+    assert!(!witness.exists(), "a command ran after the refusal");
+    assert!(
+        fs::symlink_metadata(bench.dirs.root()).is_err(),
+        "the project's folder was created"
+    );
+}

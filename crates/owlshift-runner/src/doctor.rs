@@ -29,8 +29,10 @@ use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
 use serde_json::Value;
 
 use crate::config::{Effective, FileState, exit_text};
-use crate::executor::MINIMUM_GIT_VERSION;
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
+use crate::executor::{
+    MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
+};
 use crate::system::{
     AppError, DataDirSource, RunError, StatesError, System, exact_version_of, older_than,
     version_of,
@@ -312,22 +314,10 @@ fn git(system: &dyn System, home: Option<&Path>) -> Check {
                     "{version} ({}), older than {MINIMUM_GIT_VERSION}",
                     shown(&path, home)
                 ),
-                &format!(
-                    "Owlshift needs git {MINIMUM_GIT_VERSION} or later: every `owlshift do` reads \
-                     origin's default branch with `git symbolic-ref --no-recurse`, which older \
-                     gits refuse."
-                ),
+                &git_floor_reason(),
                 vec![
-                    Step::act(format!(
-                        "Install git {MINIMUM_GIT_VERSION} or later: https://git-scm.com/downloads"
-                    )),
-                    Step::run_noting(
-                        "git --version",
-                        &format!(
-                            "should print {MINIMUM_GIT_VERSION} or later: an older git may come \
-                             first on the PATH"
-                        ),
-                    ),
+                    Step::act(git_install_advice()),
+                    Step::run_noting("git --version", &git_recheck_note()),
                 ],
             ),
             None => Check::warn(
