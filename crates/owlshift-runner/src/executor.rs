@@ -68,6 +68,7 @@ use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_
 
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
 pub use git::{Git, GitError, MINIMUM_GIT_VERSION};
+pub(crate) use git::{git_floor_reason, git_install_advice, git_recheck_note};
 pub use harness::{
     Harness, HarnessEnd, HarnessError, HarnessLogin, HarnessRun, HarnessStatus, SandboxNeeds,
 };
