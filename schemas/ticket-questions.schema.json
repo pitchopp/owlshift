@@ -195,7 +195,7 @@
           "minimum": 0
         },
         "lists": {
-          "description": "The reason of every refusal that listed the build role's own\ndecisions, as formats 6 to 8 kept it (OWL-195), oldest first: each\nquotes as text the choices it refused, none of which was asked, so\nall are still open. Read from those formats only: a later list\ngoes to `choices`. Each at most [`MAX_RESULT_REFUSAL_BYTES`].",
+          "description": "The reason of every refusal that listed the build role's own\ndecisions, as formats 6 to 8 kept it (OWL-195), oldest first: each\nquotes as text the choices it refused, none of which was asked, so\nall are still open. Read from those formats only: a later list\ngoes to `choices`. Each at most [`MAX_RESULT_REFUSAL_BYTES`]. They\nhold the next runs but have no place a run can name, so an ask is\nnot checked against them, and clears them (OWL-204, build-plan.md's\n\"A hold kept as text\").",
           "type": "array",
           "items": {
             "type": "string",
