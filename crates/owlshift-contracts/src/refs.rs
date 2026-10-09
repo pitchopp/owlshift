@@ -257,7 +257,10 @@ pub struct BuildRefusal {
     /// decisions, as formats 6 to 8 kept it (OWL-195), oldest first: each
     /// quotes as text the choices it refused, none of which was asked, so
     /// all are still open. Read from those formats only: a later list
-    /// goes to `choices`. Each at most [`MAX_RESULT_REFUSAL_BYTES`].
+    /// goes to `choices`. Each at most [`MAX_RESULT_REFUSAL_BYTES`]. They
+    /// hold the next runs but have no place a run can name, so an ask is
+    /// not checked against them, and clears them (OWL-204, build-plan.md's
+    /// "A hold kept as text").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(inner(regex(pattern = r"\S")))]
     pub lists: Vec<String>,

@@ -3649,4 +3649,100 @@ mod tests {
             "{reason}"
         );
     }
+
+    /// OWL-204: a hold `questions.json` formats 6 to 8 kept as text, read
+    /// from the ticket ref, still holds the next Build run, which is told
+    /// its lists, but they have no place in `refused_choices`, so the run's
+    /// ask is checked against the typed choices only, and clears the text
+    /// with them. The gap is left on purpose: build-plan.md's "A hold kept
+    /// as text" says why, and a change to this rule starts there.
+    #[test]
+    fn a_hold_kept_as_text_is_held_but_its_ask_unchecked() {
+        let brief = Brief::parse(include_str!(
+            "../../owlshift-contracts/tests/fixtures/brief.json"
+        ))
+        .unwrap();
+        let held = "invalid result.json: decisions are given. The choices listed: \
+                    \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
+        let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
+        let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
+        assert!(questions.render().starts_with("{\n  \"format\": 9,"));
+        let kept = questions.build_refusal.clone().unwrap();
+        assert_eq!(
+            (&kept.lists[..], kept.choices.len()),
+            (&[held.to_owned()][..], 0)
+        );
+        let told = |questions: &TicketQuestions| {
+            let mut brief = brief.clone();
+            tell_build(&mut brief, questions);
+            brief.validate().unwrap();
+            brief
+        };
+        let validated = |result: &str, brief: &Brief| {
+            crate::executor::validate_result(result.as_bytes(), "owlshift/T-1", brief)
+        };
+        let finished = |result: RunResult| Outcome::Finished {
+            result: Box::new(result),
+            artifacts: crate::artifact::ArtifactContents::default(),
+        };
+        let asking = |named: &str| {
+            format!(
+                r#"{{"format":7,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                "category":"scope","context":"c","text":"Which file, and every key?"}}]{named}}}"#
+            )
+        };
+
+        // Held and told: no place to name, the text in `result_refusal`.
+        let text_only = told(&questions);
+        assert_eq!(
+            (
+                text_only.decisions_refused,
+                text_only.refused_choices.len(),
+                text_only.result_refusal.as_deref()
+            ),
+            (true, 0, Some(held))
+        );
+        // Its `done` is refused, and the hold kept with the latest reason.
+        let done = validated(r#"{"format":7,"status":"done","summary":"s"}"#, &text_only);
+        let refused = done.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                Failure::Decisions {
+                    kind: DecisionsRefusal::Done,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        let after_done = build_refusal_after(Some(&kept), &Outcome::Failed(refused)).unwrap();
+        assert!(after_done.holds() && after_done.lists == kept.lists);
+        // Any ask passes, naming nothing, and clears the hold: a choice
+        // only the text quotes may go unasked.
+        let ask = validated(&asking(""), &text_only).unwrap();
+        assert_eq!(build_refusal_after(Some(&kept), &finished(ask)), None);
+
+        // Mixed with typed choices, a later refusal's: only those have a
+        // place, and an ask naming them all clears the text lists too.
+        let listing = r#"{"format":7,"status":"done","summary":"s","decisions":[
+            {"question":"Where the README lists it","decision":"d","basis":"b"},
+            {"question":"Which default","decision":"d","basis":"b"}]}"#;
+        let refused = validated(listing, &text_only).unwrap_err();
+        let mut mixed = questions.clone();
+        mixed.build_refusal = build_refusal_after(Some(&kept), &Outcome::Failed(refused));
+        let both = mixed.build_refusal.clone().unwrap();
+        assert_eq!((both.lists.len(), both.choices.len()), (1, 2));
+        let told_mixed = told(&mixed);
+        assert_eq!(told_mixed.refused_choices, both.choices);
+        let reason = told_mixed.result_refusal.as_deref().unwrap();
+        assert!(
+            reason.contains("not in `refused_choices`: ") && reason.ends_with(held),
+            "{reason}"
+        );
+        let all_named = asking(
+            r#","refused_choices_asked":[{"choice":1,"question":"Q1"},{"choice":2,"question":"Q1"}]"#,
+        );
+        let ask = validated(&all_named, &told_mixed).unwrap();
+        assert_eq!(build_refusal_after(Some(&both), &finished(ask)), None);
+    }
 }
