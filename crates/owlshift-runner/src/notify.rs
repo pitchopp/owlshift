@@ -249,7 +249,8 @@ impl<'a> DesktopNotifier<'a> {
                          `desktop = false` under `[notifications]` in the personal file",
                     )
                 })?;
-                Ok((program, vec![TITLE, line]))
+                // `--` ends the options: a line starting with `-` is text, not a flag.
+                Ok((program, vec!["--", TITLE, line]))
             }
             Os::Other => Err(Error::new("this system shows no desktop notification")),
         }
@@ -653,9 +654,15 @@ mod tests {
     fn linux_shows_the_line_through_notify_send_in_a_desktop_session() {
         let system = FakeSystem::default()
             .install("notify-send")
-            .answer("notify-send Owlshift OWL-7 waits", Answer::Exit(0, "", ""));
+            .answer(
+                "notify-send -- Owlshift OWL-7 waits",
+                Answer::Exit(0, "", ""),
+            )
+            .answer("notify-send -- Owlshift -x a line", Answer::Exit(0, "", ""));
         let notifier = DesktopNotifier::new(&system, Os::Linux, true).unwrap();
         assert_eq!(notifier.notify("OWL-7 waits"), Ok(()));
+        // A line that starts with `-` still reaches `notify-send` as text.
+        assert_eq!(notifier.notify("-x a line"), Ok(()));
 
         let missing = FakeSystem::default();
         let notifier = DesktopNotifier::new(&missing, Os::Linux, true).unwrap();
@@ -674,7 +681,7 @@ mod tests {
         let stderr: &'static str = Box::leak("é".repeat(STDERR_MAX).into_boxed_str());
         let system = FakeSystem::default()
             .install("notify-send")
-            .answer("notify-send Owlshift x", Answer::Exit(2, "", stderr));
+            .answer("notify-send -- Owlshift x", Answer::Exit(2, "", stderr));
         let notifier = DesktopNotifier::new(&system, Os::Linux, true).unwrap();
         let error = notifier.notify("x").unwrap_err().message;
         let kept = error
