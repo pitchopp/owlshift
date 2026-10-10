@@ -10,6 +10,7 @@ pub mod config;
 pub mod doctor;
 pub mod events;
 pub mod executor;
+pub mod forget;
 pub mod forge;
 pub mod init;
 pub mod notify;

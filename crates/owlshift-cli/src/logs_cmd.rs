@@ -1,5 +1,6 @@
-//! `owlshift logs [TICKET] [--last N] [--follow]`: the events `owlshift do` recorded,
-//! from the data directory's event log (`owlshift_runner::events`).
+//! `owlshift logs [TICKET] [--last N] [--follow]`: the events `owlshift do`
+//! and the other commands recorded, from the data directory's event log
+//! (`owlshift_runner::events`).
 
 use std::io::{self, ErrorKind};
 use std::num::NonZeroUsize;
@@ -19,10 +20,9 @@ pub fn run(ticket: Option<&str>, last: Option<NonZeroUsize>, follow: bool) -> Ex
         Ok(ticket) => ticket,
         Err(error) => return fail(&error.to_string()),
     };
-    let Some(data_dir) = owlshift_platform::paths::data_dir() else {
-        return fail(
-            "this system has no data directory: set OWLSHIFT_DATA_DIR to an absolute path",
-        );
+    let data_dir = match crate::data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => return fail(&error),
     };
     let log = EventLog::in_dir(&data_dir);
     // `--follow` runs until Ctrl-C ends the process.
