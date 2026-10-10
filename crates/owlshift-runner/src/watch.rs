@@ -18,7 +18,8 @@
 //! ([`Holds`]), so a tracker that refuses writes does not cost an answer
 //! check every pass. A continue that left a comment on the ticket whose
 //! state was not kept ([`Stop::NotKept`]) is held until a person acts
-//! (OWL-158), so the comment is not posted again at each retry.
+//! (OWL-158, OWL-169 for a RESUME), so the comment is not posted again at
+//! each retry.
 
 use std::collections::HashMap;
 use std::fs;
@@ -82,9 +83,10 @@ pub enum Admit {
 pub enum Until {
     /// [`RETRY_AFTER`] past the continue.
     At(Timestamp),
-    /// No end: the continue left a comment on the ticket, or a park whose
-    /// comment could not be posted, whose state was not kept
-    /// ([`Stop::NotKept`]), which asks a person to act (OWL-158, OWL-159).
+    /// No end: the continue left a comment on the ticket, a RESUME included,
+    /// or a park whose comment could not be posted, whose state was not kept
+    /// ([`Stop::NotKept`]), which asks a person to act (OWL-158, OWL-159,
+    /// OWL-169).
     Person,
 }
 
@@ -132,10 +134,11 @@ impl Holds {
     /// unreadable), at `now`. Returns the hold or the pause it set, if any.
     ///
     /// A busy project ran nothing: no hold. A usage limit with a reset time
-    /// pauses every continue until then. A comment, or a park whose comment
-    /// could not be posted, whose state was not kept ([`Stop::NotKept`])
-    /// holds the ticket until a person acts, unless the ref was read moved:
-    /// an unreadable ref is no reason to post the comment or park again. Otherwise a ticket ref left as it was holds the ticket for
+    /// pauses every continue until then. A comment, a RESUME included, or a
+    /// park whose comment could not be posted, whose state was not kept
+    /// ([`Stop::NotKept`]) holds the ticket until a person acts, unless the
+    /// ref was read moved: an unreadable ref is no reason to post the comment
+    /// or park again. Otherwise a ticket ref left as it was holds the ticket for
     /// [`RETRY_AFTER`]; one that moved is progress, which the next pass reads.
     /// No other way to stop is told apart, so a way added later is held
     /// exactly when it leaves the ref as it was.
@@ -578,8 +581,9 @@ mod tests {
     }
 
     /// OWL-158: a continue that left a comment on the ticket whose state was
-    /// not kept is held until a person acts, whichever comment landed, even
-    /// when the ref could not be read after it; a ref read moved is progress.
+    /// not kept is held until a person acts, whichever comment landed, a
+    /// RESUME too (OWL-169), even when the ref could not be read after it; a
+    /// ref read moved is progress.
     #[test]
     fn a_comment_whose_state_is_not_kept_is_held_until_a_person_acts() {
         let ticket = TicketId::new("DEMO-1").unwrap();
@@ -594,6 +598,7 @@ mod tests {
         });
         let mut holds = Holds::default();
         for landed in [
+            Landed::Resume,
             Landed::Reask,
             Landed::Reply,
             Landed::Parked,

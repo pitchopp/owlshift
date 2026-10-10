@@ -3962,6 +3962,31 @@ fn a_comment_on_the_ticket_whose_state_is_not_kept_is_a_stop_that_notifies() {
     not_kept(&outcome, Landed::Questions, "the questions of round 1");
     assert!(bench.comments().last().unwrap().contains("Which language"));
 
+    // A RESUME (OWL-169): it asks the decider nothing, but Build did not
+    // resume, and the ticket ref still waits for the answers.
+    let bench = Bench::new(true);
+    let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
+    let answered = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
+    ]);
+    let (outcome, _) = bench.continue_during(
+        vec![bench.reply(None, Some(&answered))],
+        vec![bench.lock_ticket_ref_during(1)],
+    );
+    not_kept(&outcome, Landed::Resume, "the resume is on the ticket");
+    assert!(
+        bench
+            .comments()
+            .last()
+            .unwrap()
+            .starts_with("[owlshift] RESUME · round 1\n")
+    );
+    assert_eq!(bench.briefs().len(), 2);
+    assert_eq!(bench.record().state.waiting, Some(Waiting::NeedsInput));
+
     // A re-ask.
     let bench = Bench::new(true);
     let (asked, _) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
@@ -4093,6 +4118,103 @@ fn a_park_neither_kept_nor_posted_is_a_stop_that_notifies() {
 // ---------------------------------------------------------------------------
 // OWL-158: watch and a comment whose state is not kept.
 // ---------------------------------------------------------------------------
+
+/// OWL-169's acceptance: under `owlshift watch`, a RESUME that reached the
+/// ticket while keeping its state failed (the ticket's ref is locked) is
+/// posted once. The ref still waits for the answers, so without a hold every
+/// pass past the 10-minute retry would run the answer check again and post
+/// the RESUME again; with it, the ticket waits for a person. Here the
+/// decider's next comment lifts it once the ref can be written: the RESUME
+/// is posted a second time, an accepted residual, kept, and Build delivers.
+#[test]
+fn a_resume_whose_state_is_not_kept_is_posted_once_under_watch() {
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let asked_at = bench.ref_commit();
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
+    fs::write(bench.ref_lock(), "").unwrap();
+
+    let ran = || bench.briefs().len();
+    let resumes = || {
+        bench
+            .comments()
+            .iter()
+            .filter(|c| c.starts_with("[owlshift] RESUME"))
+            .count()
+    };
+    let mut pass = 0;
+    let mut sleep = |_: Duration| {
+        pass += 1;
+        match pass {
+            // The answer check ran and posted the RESUME; its state was not
+            // kept, and Build did not run.
+            1 => {
+                assert_eq!((ran(), resumes()), (2, 1));
+                bench.waited.set(SignedDuration::from_mins(40));
+            }
+            // Past the 10-minute retry, then hours later: nothing ran and
+            // nothing was posted again.
+            2 => {
+                assert_eq!((ran(), resumes()), (2, 1));
+                bench.waited.set(SignedDuration::from_hours(3));
+            }
+            3 => {
+                assert_eq!((ran(), resumes()), (2, 1));
+                assert_eq!(bench.ref_commit(), asked_at);
+                fs::remove_file(bench.ref_lock()).unwrap();
+                bench.answer("Thanks.\n");
+            }
+            // The decider's comment lifted the hold: checked again, resumed,
+            // kept, built and delivered.
+            4 => {
+                assert_eq!((ran(), resumes()), (4, 2));
+                assert_ne!(bench.ref_commit(), asked_at);
+                return false;
+            }
+            _ => unreachable!(),
+        }
+        true
+    };
+    let answered = || {
+        bench.reply(
+            None,
+            Some(&check(&[
+                ("Q1", "answered", "English."),
+                ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
+            ])),
+        )
+    };
+    let (outcomes, lines, printed) = bench.watch(
+        vec![
+            answered(),
+            answered(),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        &mut sleep,
+    );
+    assert_eq!(pass, 4, "{lines}\n{printed}");
+    match &outcomes[..] {
+        [
+            Err(Stop::NotKept {
+                landed: Landed::Resume,
+                ..
+            }),
+            Ok(_),
+        ] => {}
+        other => panic!("{other:?}\n{lines}\n{printed}"),
+    }
+    // One line for the hold, and no 10-minute retry.
+    assert_eq!(
+        lines.matches("its state was not kept").count(),
+        1,
+        "{lines}"
+    );
+    assert!(!lines.contains("continues it again at"), "{lines}");
+}
 
 /// OWL-158's acceptance: under `owlshift watch`, a re-ask that reached the
 /// ticket while keeping its state failed (the ticket's ref is locked) is not
