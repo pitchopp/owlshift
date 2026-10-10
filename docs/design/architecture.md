@@ -76,7 +76,8 @@ flowchart LR
     intake[Intake] --> design[Design] --> review[Design review] --> build[Build] --> verify[Verify] --> deliver[Deliver] --> watch[Watch]
     review -- revise --> design
     verify -- fix --> build
-    watch -- "CI red, conflict or review comments" --> build
+    watch -- "review comments (P5)" --> build
+    watch -- "red check: fix run · conflict: rebase run" --> watch
     gate{{"Gate: needs input<br/>questions on the ticket, answer verified,<br/>a fresh run resumes from the checkpoint"}}
     intake <-.-> gate
     review <-.-> gate
@@ -94,7 +95,7 @@ Dashed links mark the stages that stop for a human in the default pipeline: Inta
 | Build | Implements step by step, one commit and one ledger entry per step; runs the project's full gate (lint, formatter, tests) | Commits, ledger |
 | Verify | Checks the diff against the plan and criteria, cross-family review, browser QA when declared, reads the complete CI result | Verdict; a bounded fix loop |
 | Deliver | The runner opens the PR and posts the delivery report on the ticket | PR, report |
-| Watch | Reacts to CI regressions, merge conflicts and human review comments on the PR | Fix runs, rebases, gates |
+| Watch | Reacts to CI regressions and merge conflicts with fix and rebase runs of its own, which keep the ticket at Watch (section 5, "Watch after delivery"); human review comments on the PR loop back to Build from P5 | Fix runs, rebases, gates |
 
 **Variants.** `trivial` skips Design and Design review and uses one reviewer. `standard` is the diagram. `risky` adds reviewers and makes human plan approval mandatory. Intake picks the variant; a label on the ticket forces one.
 
@@ -144,13 +145,119 @@ One event, end to end:
 
 **Watch mode, before the runner process.** Decided on 2026-10-04 (OWL-152): `owlshift watch`, roadmap P3, is a loop in the foreground of a terminal that does what a person typing `owlshift continue` does once the decider has answered, for one project, the repository of the current directory, whose configuration and secrets it reads once at start.
 
-- **Which tickets.** Those whose ticket ref, in the project's dedicated checkout, keeps a state waiting for the decider's answers and not parked. The ticket refs are the one list of the tickets Owlshift asked questions on, and a ticket without one has nothing to answer. A parked ticket stays parked until a person types `continue`, even once its decider has answered: the restart is the person's gesture ([build plan](build-plan.md), OWL-122), a deliberate reading of the roadmap's "without typing `continue`". A ticket left at Build, by a usage limit after its resume, a failed delivery or a refused push, also waits for `continue`: resuming it once the harness's limit resets is P6's pause until reset. So watch alone does not reach P3's exit gate, a full day without typing `continue`, whenever one of these happens. Rejected: reading the event log, which is append-only and does not say whether a ticket still waits, and naming the tickets on the command line, which would miss a round a `do` opens meanwhile in another terminal.
+- **Which tickets.** Those whose ticket ref, in the project's dedicated checkout, keeps a state waiting for the decider's answers and not parked; and, since OWL-208, those at Watch whose delivered pull request Owlshift still follows ("Watch after delivery", below). The ticket refs are the one list of the tickets Owlshift asked questions on or delivered, and a ticket without one has nothing to answer or follow. A parked ticket stays parked until a person types `continue`, even once its decider has answered: the restart is the person's gesture ([build plan](build-plan.md), OWL-122), a deliberate reading of the roadmap's "without typing `continue`". A ticket left at Build, by a usage limit after its resume, a failed delivery or a refused push, also waits for `continue`: resuming it once the harness's limit resets is P6's pause until reset. These restarts stay the person's: P3's exit gate, reworded on 2026-10-10 (OWL-208, [roadmap](roadmap.md) P3), records each with its reason instead of failing on it. Rejected: reading the event log, which is append-only and does not say whether a ticket still waits, and naming the tickets on the command line, which would miss a round a `do` opens meanwhile in another terminal.
 - **Poll interval.** 60 seconds after the end of each pass; a pass works the tickets one at a time, so while one ticket's answer check and Build run, the others wait. An answer that counts is otherwise picked up within a minute, at about one comments request per waiting ticket per pass, against Linear's 2,500 requests an hour (check C4). Rejected for now: an interval of the project's or the operator's choosing, and waking at the very time a reply counts, which saves less than a minute.
 - **The same resume.** Whether the decider's reply counts is decided by the function `continue` uses: an answer newer than the latest ask, left unedited for the project's quiet window by this machine's clock or ending with `go` (section 4). When it counts, a `decision` event records that watch continues the ticket, and the ticket goes through `continue`'s own path: answer check, RESUME, RE-ASK or REPLY, Build, delivery, park. Its outcome is printed, and notifies the operator, as `continue`'s is.
 - **The project lock.** Watch takes the lock `do` and `continue` take for two moments only: a snapshot, which checks the marker of a run whose isolation check did not pass and reads the ticket refs, and each continue. It reads the tracker and sleeps without it, so a command typed by hand meanwhile runs; one typed while watch continues a ticket is told the project is busy, and a pass that finds the project busy is skipped. A quarantined project is reported once and nothing in it is continued until a person clears it. A continue runs only if the ticket ref, read again under the lock, is still the one the snapshot read, so a ticket that a command typed meanwhile parked or resumed is never restarted or built by watch.
 - **Errors.** A ticket ref or a ticket's comments that cannot be read is a `warning` event, once until a read succeeds again, and the pass goes on to the next ticket; a snapshot that fails is printed. Nothing ends the loop but the operator. A continue that leaves the ticket ref as it was, such as one refused, or whose RESUME the tracker refused after the answer check ran, is not tried again for 10 minutes, unless the decider edits a comment or the ref moves meanwhile; so a tracker refusing writes costs at most one answer check per ticket every 10 minutes. A usage limit with a reset time holds every continue until then. A ticket whose answer check failed is tried again at the next pass, since the failure is kept, as typing `continue` again would, and a second failure parks it, save a refused result the check was not told of, which never spends the last attempt (OWL-190, [build plan](build-plan.md), "A refused answer check at the last attempt").
 - **A comment whose state is not kept.** Decided on 2026-10-04 (OWL-158): a continue that posted a RE-ASK, a REPLY or a PARKED comment and then failed to keep the ticket's state in its ref (`Stop::NotKept`, OWL-149) is held until a person acts, with no end time, instead of for 10 minutes: retried, it would run the answer check again and post the same comment again, every 10 minutes for as long as the ref stays unwritable. Since OWL-159, a park whose PARKED comment could not be posted either is such a stop too, held the same way: retried, it would run the answer check and park again, notifying the operator each time. The comment asks a person to act, and that act lifts the hold: the decider editing a comment (answering the re-ask, replying to the REPLY), or a command typed by hand that moves the ticket ref. A ref that cannot be read after the continue, or at a later pass, keeps the hold, since it is no reason to post again; one read moved lifts it. Watch prints one line when it sets the hold, and the operator was already notified by the stop. Accepted residuals, each one more post at most: any comment of the decider, a "thanks" too, lifts the hold; an answer posted between watch's read of the comments and the answer check's is held against the older answer, so the next pass checks it again; a person typing `continue` on a ticket whose PARKED comment was not kept runs the check again, since the ref still says it waits for answers, and may park it again; and restarting watch forgets every hold. QUESTIONS under watch come only after a RESUME whose state was kept, so the ref has moved and the ticket waits at Build for a person's `continue`; a RESUME whose state was not kept is a refusal (OWL-149) and stays under the 10-minute retry. Rejected: finding the already-posted comment before posting, since the comment comes out of an answer check run again at each retry, at an agent run's cost, whose verdict may differ (a second check may resume Build while a re-ask waits on the ticket), and since telling a posted comment from a new one means rebuilding the ask from the ticket's comments rather than from its ref; and stopping watch for the ticket for good, which leaves it stuck once the decider answers.
 - **How it stops.** Ctrl-C, like closing the terminal or SIGTERM, ends it through the policy every command shares ([runtime and operations](runtime-and-operations.md)): between passes nothing runs; during an agent run, the run is stopped and the project is refused until a person looks, as when `continue` is stopped. Ending after the current run is left to the background service's `stop` (P7).
+
+**Watch after delivery.** Decided on 2026-10-10 (OWL-208): from P3, watch also follows each pull request Owlshift delivered until a person merges or closes it, and repairs it with runs of its own, a fix run on a red check and a rebase run on a conflict (scenario S9, roadmap P3). The ticket stays at Watch while they run, shown as review, and their questions return to Watch. Watch loops back to Build only for human review comments, from P5. The forge was checked live that day wherever this session could reach it, by read-only REST calls ([build plan](build-plan.md), "The GitHub forge adapter"). The three checks it could not run are written below as pending, each the first step of the ticket whose code depends on it.
+
+- **Which pull requests.**
+  - *The list.* Every delivery keeps a `delivery.json` in the ticket's ref beside `state.json`. A ticket with no ref yet gets one, holding a `questions.json` with no ask; this is one more exception to "makes no ticket ref until a round opens". `delivery.json` holds:
+    - the pull request (number and link), the branch and the base branch;
+    - `pushed`, the commit Owlshift last pushed there;
+    - `base_at_push`, the base branch's head at that push;
+    - `rebased_onto`, the base head the last rebase run used;
+    - `pushing` while a push is under way;
+    - `ended` once watch stops following, with why and when.
+
+    The core state moves to Watch at delivery. Watch already lists the ticket refs, so a pull request a `do` delivered in another terminal is followed from the next pass.
+  - *Owlshift's own pushes.* Before each push the ref keeps `pushing`, the commit and its kind (delivery, fix or rebase). Once the forge shows that commit as the head, it becomes `pushed`. A head equal to `pushing` is Owlshift's push whose bookkeeping a crash, a Ctrl-C or a failed ref write cut short: the next pass adopts it as if the run had ended there.
+  - *Leases.* Every push to a followed branch carries `--force-with-lease=refs/heads/<branch>:<pushed>`. A branch a person pushed to or deleted is therefore never overwritten or recreated. A fix run's commits descend from `pushed`, so its push stays a fast-forward. Only a rebase run's push replaces history, which section 8's floor bounds.
+  - *Older deliveries.* Pull requests delivered before this change are not followed. None was open on 2026-10-10 when this was checked.
+  - *When one leaves.* Watch stops following, recording why in `ended` and as one event, keeping the ref, when:
+    - the pull request is merged (core `Merged`);
+    - it is closed unmerged (`Withdrawn`);
+    - its head is neither `pushed` nor `pushing`. A person pushed (the maintainer fixed [#89](https://github.com/pitchopp/owlshift/pull/89) by hand), and watch never pushes over their commits. The delivery already waits until the forge shows the pushed commit as the head (OWL-20), so another head is someone else's.
+  - *A ticket a person moved.* Before any run the ticket is read, and its stage must be one the project maps for working, needs input, review or parked. A ticket a person moved elsewhere (done, canceled, back to the backlog) gets no run while it stays there, and is followed again once it is back. This is the one place the runner reads the stage back (section 4, OWL-148).
+  - *`do` and `continue`.* `owlshift do` refuses a ticket whose ref follows an open pull request, naming it. `owlshift continue` on a ticket at Watch does what watch does for that ticket once: after its answers, or after restarting it when parked.
+- **Polling and the forge's budget.**
+  - *The pass.* Followed pull requests share the pass, the 60-second interval and the project lock with the tickets whose questions wait. Forge reads are made without the lock. A run takes the lock as a continue does, and starts only if, read again under it after the fetch, the ticket ref is the one the snapshot read, the pull request is still open, and its head is still `pushed` or `pushing`.
+  - *Pausing.* Watch runs keep the continues' rules: a busy project skips them, a quarantined one runs none, and a usage limit with a reset time pauses them with every continue (an `Interrupted` run spends nothing). A run that left the ticket ref as it was is held for 10 minutes. A fix or rebase run holds the pass as a continue's Build does, so an answer that counts meanwhile is picked up after it.
+  - *What is read.* Each pass reads, per followed pull request whose ticket is at Watch and neither waits nor is parked, the adapter's one checks query: the complete check set, mergeability and state. A red pull request adds one read of the base branch's checks, its head and `base_at_push` in one query, and a fix run reads its failed jobs' logs.
+  - *Cost.* By GitHub's documented formula a query costs 1 point. A personal token's documented budget is 5,000 points an hour, so a followed pull request costs about 60 points an hour, and 120 while it is red.
+  - *Rate limits.* A rate-limited answer holds every forge read until the reset it gives, with one `warning` event, while tracker reads and continues go on. A rate-limited answer is a GraphQL `RATE_LIMITED` error, or HTTP 403 or 429 with no budget left or a `Retry-After`; these shapes are documented, not observed. Checked live on 2026-10-10: every REST answer carries `X-RateLimit-*`, and the budget is the credential's, shared with whatever else uses it. The remaining count fell by 49 between two calls a minute apart, used by other sessions on the same credential. So a token taken from `gh auth token` shares `gh`'s budget.
+  - *Pending live check (a): the checks query's real cost.* This session's GraphQL calls were refused: HTTP 403, "GitHub GraphQL is not available from Claude Code sessions". It is OWL-209's first step: add `rateLimit { cost remaining resetAt }` to the query and record the fixture from a real call. The interval holds even at 5 points a query.
+
+What a read decides, in this order (a pure function in `owlshift-core`, OWL-209; the runner does the reading):
+
+| The read finds | Watch does |
+| --- | --- |
+| The pull request merged, or closed unmerged | Stops following (`Merged`, `Withdrawn`) |
+| A head neither `pushed` nor `pushing` | Stops following: a person pushed |
+| The head is `pushing` | Adopts it, then decides on the rest of the read |
+| Mergeability `UNKNOWN` | Waits: no run until GitHub has computed it |
+| `CONFLICTING` | A rebase run; or, when the base head is still `rebased_onto`, a failed run of that rebase, so a second rebase onto the same base head never runs |
+| A failed check beside one still unfinished | Waits. If watch first read a failure on that head 60 minutes ago or more, it records a `warning` and goes on below, the unfinished check listed as such |
+| Failed checks, none failed by the code: `CANCELLED`, `STALE`, `STARTUP_FAILURE`, `ACTION_REQUIRED` or a value the adapter does not know | Parks: a person re-runs the check, then types `continue` |
+| Every failed check failed or still running on the base head (a check absent there counts as running while any base check is unfinished) | Waits: the red is the base's, nothing is run or counted |
+| Every failed check failed on `base_at_push` and passes on the base head now | A rebase run onto that head, a refresh: CI does not run again when the base moves |
+| Any other failed check, every check finished | A fix run |
+| Checks running and none failed, or no check at all | Waits |
+| Green | Clears the fix passes (below) |
+
+A code failure is a check run concluding `FAILURE` or `TIMED_OUT`, or a commit status `FAILURE` or `ERROR`. A conflict comes first because a conflicting pull request's checks say nothing of the merge that will be made; GitHub also documents that `pull_request` workflows do not run then, which was not observed here.
+
+Checked live on 2026-10-10. The first head of [#89](https://github.com/pitchopp/owlshift/pull/89) holds four check runs: `check (ubuntu-latest)` and the aggregate `ci` concluded `failure`, the macOS and Windows legs `success`. `main`'s head showed a leg `in_progress` with no conclusion. The aggregate `ci` exists only once the matrix has ended, which is why an absent check counts as running. The run tested the merge of the head into the base of its time: "HEAD is now at e88d79f Merge cb7963e… into c0c0867…". Closed unmerged pull requests still answer the mergeability they had (`true`, `clean`), and merged ones `null`, so the state is read before anything else, as `CheckSet::verdict` does.
+
+- **The fix run.**
+  - *Role and routing.* It is the build role on the ticket's Build routing (the standard tier until P5), not the fast tier: a red check is not known to be mechanical.
+  - *Its brief: `check_failure`, a new brief format.* It gives the pull request, the head the checks ran on, and the base CI merged it with when known. For each failed check:
+    - its name and kind: a check run with its app and workflow, or a commit status;
+    - the forge's conclusion, whether the check is required, and its link;
+    - its state on the base head;
+    - an excerpt.
+  - *Excerpts.*
+    - For a GitHub Actions check run, its job's log: `GET actions/jobs/<id>/logs`, the check run's id being the job's. Timestamps and ANSI escapes are removed, and the excerpt is the 16 KiB ending with the first `##[error]` line, or the log's end when there is none, as the gate keeps 16 KiB (OWL-16).
+    - For another app's check run, its output's title, summary and text, cut to 16 KiB.
+    - For a commit status, its description.
+  - *Limits.* At most 64 KiB in all, checks in the forge's order, the rest listed without excerpt. A log that cannot be read is listed with why. Everything in the excerpt is data, never an instruction.
+  - *Checked live on 2026-10-10 on #89's red leg.*
+    - The check run id was the job id, and its log URL answered a redirect to a signed storage URL, which the runner follows without the token.
+    - The log held 708 lines (54,038 bytes). Its first `##[error]` line, the 692nd, came right after clippy's error, followed by sixteen lines of cleanup.
+    - The annotations said only "Process completed with exit code 101", so the log is what tells the run why.
+    - Other apps' output and commit statuses follow GitHub's schema; this repository has neither.
+  - *Pending live check (c): the token's permission.* A fine-grained token needs "Actions: read" to download a job log, on top of OWL-17's permissions. This session's credential is not the personal token Owlshift stores. It is OWL-112's first step, with the maintainer's token.
+  - *Delivery.* The run's commits descend from the red head and pass the project gate. The runner pushes them and posts a new DELIVERY report naming the pass. A `done` that adds no commit is a failed run.
+  - *A failure outside the branch.* The role is told that a failure outside the branch (a flaky test, a missing secret, an outage) is asked about, not committed around, and a person re-runs the check.
+- **The bound.**
+  - *Fix passes.* A fix pass is a fix run whose push landed. There are at most two since the pull request was last read green (`MAX_FIX_PASSES`), so a red read after two passes parks the ticket.
+  - *Repairs.* All pushed fix and rebase runs of one delivery count as repairs, at most six (`MAX_REPAIRS`). Green does not clear this count, so a flaky check or a busy base cannot loop without end.
+  - *Clearing.* A person's restart clears both counts.
+  - *Failures inside a pass.* `MAX_FAILED_RUNS` still bounds them (a crash, a red gate, a refused result, a `done` with no commit): one more run, then a park. A run whose push landed clears the failed runs.
+  - *OWL-55's question: no gate-specific counter.* The one red gate of the P1 and P2 deliveries (OWL-174's timing flake, OWL-177) passed at its single retry. "Two review passes" in S9, before P5's review roles, means these two fix passes ([roadmap](roadmap.md) P3).
+  - *Notification.* A park from watch notifies as every park does ([runtime and operations](runtime-and-operations.md), "Notifications").
+- **Conflicts and the rebase run.**
+  - *Detection.* A conflict is `mergeable` `CONFLICTING` in the checks query. `UNKNOWN` is read again at the next pass, since GitHub computes mergeability in the background.
+  - *Pending live check (b): a real conflicting pull request.* No pull request was open, other repositories are closed to this session, and making one means writing to the repository. It is OWL-209's first step, recorded as a fixture. The values themselves come from OWL-17's schema reading.
+  - *Trivial or not.* After a fetch, the runner runs `git merge-tree --write-tree -z --name-only <base head> <head>`. The conflict is trivial when every record other than `Auto-merging` is `CONFLICT (contents)` and at most three paths conflict.
+    - Git documents `--write-tree`, `-z` and `--name-only` from 2.38.0 (absent at 2.37.0). At 2.39.0, Owlshift's floor (OWL-199), each `-z` record is `<count>NUL<paths>…<type>NUL<message>NUL`, its type a "stable string", and the exit status 0 for a clean merge and 1 for a conflict (`Documentation/git-merge-tree.txt` at those tags, read on 2026-10-10).
+    - Run live with git 2.43.0: exit 1, the paths, then `CONFLICT (contents)` and `CONFLICT (modify/delete)` records; exit 0 and the tree alone once clean.
+    - Any other exit status, or no conflict where GitHub reports one, counts as non-trivial.
+  - *The run.* A trivial conflict gets the `rebase` role on the fast tier (`[models].fast`); any other goes to the `rebase` role on the Build routing at once. A fast run that fails is retried once on the Build routing, and a second failure parks. The role rebases onto the base commit resolved after the fetch, without `--update-refs` (OWL-49's isolation check), and the project gate runs on the result.
+  - *The push.* The runner pushes the rebase with its lease.
+  - *A refused push.* Of any run, a refused push is not a failed run. The head is read again: a person's head ends the following. Otherwise the forge refuses Owlshift's own push (a branch rule against force pushes, a hook), and the ticket parks with git's answer quoted, never retrying every pass.
+- **Back to the decider.**
+  - *Who answers.* A fix or rebase run that asks, or finds a premise false with questions, sends its questions to the decider without the resolver, as the run after late comments does (section 4). S9's cases, a prerequisite (an environment variable, a flag, infrastructure) or a finding to arbitrate, are acts and choices the agent cannot make.
+  - *The round.* It opens as any round (QUESTIONS · round N, the answer check, re-asks, replies), with Watch as its return stage. S9's "returning to review" is the same thing: Watch's visible stage is review, shown again once the answer resumes it.
+  - *After the answer.* Nothing resumes a remembered run. Watch's next pass, or a `continue`, reads the pull request again and decides by the table above. A fix run, if one is due, has the round and its answers in its brief's thread; a pull request gone green meanwhile gets none.
+  - *OWL-158's sentence.* Since OWL-208, QUESTIONS under watch also come from these runs, so the sentence in "A comment whose state is not kept" that they come only after a RESUME no longer holds. Their round is kept in the ref like any other, and that bullet's holds apply to them unchanged.
+- **What P3 leaves.** These wait, and the [roadmap](roadmap.md) records them under P3 as its deviation from S9:
+  - a confirmed finding and review passes (P5's review roles);
+  - human review comments on the pull request (P5, with P10's identity map between tracker and forge accounts);
+  - the residue as a proposed follow-up (P4): beyond the bound, P3 parks.
+- **Rejected.**
+  - *Fix and rebase runs looping back to Build,* as section 4's diagram had it. A question would return to Build rather than review, and the run resumed after an answer would be a remembered fix even once the checks turned green. A rebase would run at the Build stage, and each fix would replay Verify and Deliver.
+  - *The list from a forge query on `owlshift/*` branches.* It would follow a person's branch of that name, lose the counts across restarts, and miss the ticket's identifier, which the branch keeps lower-cased.
+  - *The fast tier for fix runs:* a red check is not known to be mechanical.
+  - *The resolver for these questions:* they are acts and arbitrations the agent cannot settle.
+  - *Merging the base instead of rebasing,* which OWL-49 and OWL-210 settle.
+  - *Acting on a red while checks still run, without the time limit,* which would spend a pass before every failure is known.
+  - *Re-running checks through the forge,* which needs the token's Actions write permission.
+  - *A commit Owlshift makes to restart CI,* which a project signing off its commits (DCO) needs a person to sign.
 
 ## 6. Adapters & contracts
 
@@ -220,7 +327,7 @@ The floor is code a project cannot configure away: no agent merges, deploys, cha
 
 **The floor.**
 
-- Owlshift never merges: neither an agent nor the Writer, approval or not; a human merges. No deploy or infrastructure change (environment variables, feature flags, DNS, CI settings) without an explicit human approval recorded on the ticket.
+- Owlshift never merges: neither an agent nor the Writer, approval or not; a human merges. Owlshift force-pushes only its ticket's own branch, after a rebase run, leased on its own last push (OWL-208, section 5, "Watch after delivery"); every other push of a branch is a fast-forward, and an agent never pushes. No deploy or infrastructure change (environment variables, feature flags, DNS, CI settings) without an explicit human approval recorded on the ticket.
 - Owlshift never handles model API keys: Codex authentication stays in Codex's own configuration. The one model login it holds is the token confined Claude Code runs log in with, made by the operator with `claude setup-token`, kept in the system keychain, read by the runner and handed to the harness command alone, on a pipe it inherits (OWL-96): never in any environment, the agent's included, a gate command, a probe, a file Owlshift writes, an event or a message, and replaced by `<redacted>` in the run's logs (OWL-94).
 - Agents hold no tracker, forge or cloud credentials; the Writer is their only holder. An agent starts from an empty environment: what a program needs to run, where a harness other than Claude Code finds its login, the operator's proxy unless it holds a login, which refuses the run (OWL-76), and the variables the project declares for its own gate (`stack.gate_env`) that the operator allows in the personal configuration (`allow_gate_env`): a project's declaration never widens that list, and a known credential, a variable of Claude Code's own (`ANTHROPIC_*`, `CLAUDE_*`) or of Codex's (`CODEX_*`, `OPENAI_*`), which chooses where a run sends its requests and with which login, or one that makes a program load code as it starts (`LD_*`, `DYLD_*`, `BASH_ENV`, `NODE_OPTIONS`), is refused even when listed (OWL-63, OWL-120, OWL-125). Git and gh are left without a credential, a harness loads no settings file, the user's or the repository's, and no MCP server, and the Executor checks this before each run ([build plan](build-plan.md#results), OWL-22); a Claude Code run that reports an API key or an MCP server fails.
 - A process that goes looking is stopped by the operating system (OWL-41): the Executor runs every agent, the harness and everything it starts, and every gate command inside a sandbox it builds itself, `sandbox-exec` on macOS and `bwrap` on Linux. The home is unreadable but for the folders a run needs, among them the tool chains its declared variables name, read-only and never a folder that is, lies in or holds a credential path (OWL-68); nothing is written outside the worktree, the repository's git folder (not its hooks or configuration) and the run's own temporary folder, the temporary folders the user's other processes share are closed, and the system credential store (the Keychain, the Secret Service) is closed. Claude Code therefore runs on the token above, in an empty configuration folder inside the run's temporary folder, gone with the run (OWL-94), and keeps its temporary files in a folder of that one too, clear of the user's own `/tmp/claude-<uid>` (OWL-100). A machine that cannot confine an agent runs none: native Windows is refused and pointed to WSL2 (decision D9), and a Linux machine without a usable `bwrap` is refused, with `owlshift doctor` saying how to fix it. Known limits, recorded with their live checks in the [build plan](build-plan.md#results): the network stays open, so an agent can reach anything it may read, the agent login included, which its shell commands inherit and the operator can revoke; secrets outside the home on shared mounts are not hidden; on macOS a process that leaves the run's process group with `setsid` is not stopped with it, and `sandbox-exec` is deprecated and does not nest.
@@ -255,9 +362,9 @@ Usage is bounded by construction: zero tokens at rest, short contexts for every 
 | --- | --- | --- |
 | Intake | standard | Reads intent, not only the spec |
 | Resolver, answer check | standard | Small context: the questions, the answers, the ticket |
-| Design, Build | from the routing verdict | Same harness for both unless the verdict says otherwise |
+| Design, Build, fix runs | from the routing verdict | Same harness for all three unless the verdict says otherwise; a fix run repairs a red check after delivery (section 5) |
 | Design review, Verify | standard | Another model family than the author when one is available |
-| Rebase, mechanical fixes | fast | Escalates to the Build routing on a non-trivial conflict |
+| Rebase | fast | Escalates to the Build routing on a non-trivial conflict, or after a failed fast run (section 5) |
 
 ## 10. Technology choices
 
