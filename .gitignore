@@ -3,3 +3,4 @@
 .DS_Store
 /.owlshift/worktrees/
 .env
+/.claude/worktrees/
