@@ -1737,6 +1737,85 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
     assert!(bench.events().is_empty());
 }
 
+/// OWL-207: a git older than the floor is refused by `do` and by `continue`
+/// before the project's lock (so before its folder exists) and before the
+/// tracker is read. The tracker here reads a folder that does not exist, so
+/// a read would stop with another reason; the stand-in git answers
+/// `--version` and leaves a witness for any other command.
+#[cfg(unix)]
+#[test]
+fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bench = Bench::new(true);
+    let witness = bench.tmp.path().join("other-git-command");
+    let script = bench.tmp.path().join("old-git");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *--version*) echo 'git version 2.38.5';;\n  *) : > '{}'; exit 1;;\nesac\n",
+            witness.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let executor = on_demand::executor(
+        Git::new(&script),
+        AgentEnv::new(bench.env.agent_parent()).unwrap(),
+    );
+    let harness = ClaudeHarness {
+        program: PathBuf::from("claude"),
+        prompt: "# Build".to_owned(),
+        model: None,
+        effort: None,
+        max_budget_usd: None,
+        login: None,
+    };
+    let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
+    let config = ProjectConfig::parse(&config_text).unwrap();
+    let tracker = MarkdownTracker::new(&bench.tmp.path().join("no-such-tracker"));
+    let forge =
+        GitHubForge::with_transport(Shared(bench.github.clone()), Repo::parse(REPO).unwrap());
+    let dirs = bench.dirs();
+    let remote_url = bench.remote.bare.to_string_lossy().into_owned();
+    let on_demand = OnDemand {
+        executor: &executor,
+        tracker: &tracker,
+        forge: &forge,
+        build: &harness,
+        answer_check: &harness,
+        resolver: &harness,
+        remote_url: &remote_url,
+        config: &config,
+        dirs: &dirs,
+        head_wait: Duration::ZERO,
+        clock: &on_demand::system_clock,
+    };
+    for command in ["do", "continue"] {
+        let mut out = Vec::new();
+        let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
+        let outcome = if command == "do" {
+            on_demand.run(&ticket(), &mut sink)
+        } else {
+            on_demand.continue_ticket(&ticket(), &mut sink)
+        };
+        let Err(Stop::Refused(reason)) = &outcome else {
+            panic!("{command}: {outcome:?}");
+        };
+        assert!(
+            reason.contains("git 2.38.5 is older than 2.39.0"),
+            "{command}: {reason}"
+        );
+        assert!(
+            fs::symlink_metadata(dirs.root()).is_err(),
+            "{command}: the project's folder was created"
+        );
+        assert!(!witness.exists(), "{command}: a git command ran");
+        assert!(bench.events().is_empty());
+    }
+}
+
 /// The Build run's first question round.
 const ROUND_1: &str = r#"{"format":7,"status":"questions",
 "summary":"The greeting's language and words are not given.",
