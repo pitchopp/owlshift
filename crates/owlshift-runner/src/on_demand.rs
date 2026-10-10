@@ -929,6 +929,13 @@ impl OnDemand<'_> {
     /// link, and the ticket ref.
     fn prepare(&self, ticket: &TicketId, command: Command) -> Result<Prepared, Stop> {
         check_team(self.config, ticket).map_err(Stop::Refused)?;
+        // An old git is refused before any side effect: the lock creates the
+        // project's folder, and the ticket is read from the tracker (OWL-207).
+        // `sync_checkout_within` checks again for its other callers.
+        self.executor
+            .git
+            .require_minimum_version()
+            .map_err(Stop::Refused)?;
         // The lock before the marker: every run writes the marker when it
         // starts, so while another `do` works the project the marker only
         // says a run is in flight. Once the lock is ours, a marker means a
