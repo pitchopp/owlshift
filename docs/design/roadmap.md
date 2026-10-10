@@ -62,9 +62,25 @@ The central bet, used by hand.
 `owlshift watch` in a terminal replaces typing `continue`.
 
 - Foreground loop over the tickets Owlshift started: quiet window, `go`, automatic resume.
-- After the PR: a red check starts a fix run (two review passes at most); a conflict starts a rebase run. Scenario S9.
+- After the PR: a red check starts a fix run (two fix passes at most); a conflict starts a rebase run. Scenario S9; the rules are [architecture](architecture.md) section 5, "Watch after delivery" (OWL-208).
 
-**Exit gate.** A full day of use without typing `continue`.
+**Deviation from S9** (OWL-208, 2026-10-10). P3 repairs what CI and the forge report. A red check starts a fix run, a conflict a rebase run, and a run that needs a prerequisite or an arbitration asks the decider. The rest of S9 waits:
+
+- A confirmed finding, and the review passes S9 bounds, need P5's review roles. Until then, "two review passes" means two fix passes: fixes pushed for red checks since the pull request was last green. P3 also caps all the repairs of one delivery at six.
+- The residue past the bound becomes a proposed follow-up only once P4 files follow-ups. P3 parks the ticket instead, with a PARKED comment.
+- Human review comments on the pull request are not read before P5. Telling whose review counts also needs P10's identity map.
+- S9 and OWL-211 send these questions to needs input "returning to review". In P3 they return to Watch, whose visible stage is review, so this is the same thing.
+- OWL-211's "through the P2 question loop (… resolver …)" is narrowed: the resolver is skipped. A fix or rebase run's questions go to the decider, as a late-comment run's do, since they are acts and arbitrations the agent cannot settle. The rest of the loop is unchanged: the answer check, re-asks and replies.
+
+**Exit gate.** A full working day with `owlshift watch` running on Owlshift's own backlog, meeting all of these:
+
+- Every reply that counts is continued by watch.
+- Every delivered pull request that goes red or conflicts is repaired or parked by watch.
+- No `continue` is typed except where watch leaves the ticket to a person by design: restarting a parked ticket, or a ticket left at Build by a usage limit, a failed delivery or a refused push ([architecture](architecture.md) section 5, "Which tickets"). Each such `continue` is recorded with its reason.
+- At least one delivered pull request is repaired after a red check, staged if none occurs, as P2's rounds were.
+- One pull request is repaired after a conflict, if a conflict occurs.
+
+Reworded on 2026-10-10 (OWL-208) from "A full day of use without typing `continue`", which these restarts, left to a person by design, would fail whatever P3 builds.
 
 ## P4 · The drain
 
@@ -134,7 +150,7 @@ A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, a
 | --- | --- |
 | S1 | P1 |
 | S2, S7 | P2 (automatic resume in P3) |
-| S9 | P3 |
+| S9 | P3 (red checks and conflicts; findings and review passes in P5) |
 | S3, S4, S6, S12, S13 | P4 |
 | S8 | P5 |
 | S5, S10, S16, S17 | P6 |
