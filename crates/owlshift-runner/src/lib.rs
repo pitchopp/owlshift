@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod events;
 pub mod executor;
 pub mod forge;
+pub mod forget;
 pub mod init;
 pub mod notify;
 pub mod on_demand;

@@ -1,10 +1,12 @@
 //! The `owlshift` binary.
 
 mod do_cmd;
+mod forget_cmd;
 mod init_cmd;
 mod logs_cmd;
 
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -62,8 +64,17 @@ enum Command {
     /// reply counts; checked every minute, until Ctrl-C. A parked ticket, or
     /// one left at Build, still needs `owlshift continue`.
     Watch,
-    /// Print the events `owlshift do`, `owlshift continue` and `owlshift
-    /// watch` recorded, oldest first.
+    /// Start over what Owlshift keeps on a ticket between commands, when it
+    /// has no room left or cannot be read: its asks and decisions go, their
+    /// comments staying on the ticket; its round count and the refusals its
+    /// next runs are told stay. Refused while another command works the
+    /// project.
+    Forget {
+        /// The ticket, such as OWL-12.
+        ticket: String,
+    },
+    /// Print the events `owlshift do`, `continue`, `watch` and `forget`
+    /// recorded, oldest first.
     Logs {
         /// Only this ticket's events.
         ticket: Option<String>,
@@ -145,12 +156,20 @@ fn main() -> ExitCode {
             do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket))
         }
         Command::Watch => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
+        Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
         Command::Logs {
             ticket,
             last,
             follow,
         } => logs_cmd::run(ticket.as_deref(), last, follow),
     }
+}
+
+/// The data directory, where the event log and each project's files live.
+fn data_dir() -> Result<PathBuf, String> {
+    owlshift_platform::paths::data_dir().ok_or_else(|| {
+        "this system has no data directory: set OWLSHIFT_DATA_DIR to an absolute path".to_owned()
+    })
 }
 
 /// Prints `message` on standard error, safe for a terminal, and fails.

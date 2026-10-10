@@ -1023,12 +1023,10 @@ impl OnDemand<'_> {
             });
         }
         let stored = ticket_ref::read(git, &checkout, ticket).map_err(|e| {
-            let name = owlshift_contracts::refs::ticket_ref(ticket);
             Stop::Refused(format!(
-                "reading the ticket's ref: {e}. To start {ticket} over, delete {name} in {} \
-                 (`git update-ref -d {name}`): its comments stay on the ticket, and its rounds \
-                 restart from 1",
-                checkout.display()
+                "reading the ticket's ref: {e}. `owlshift forget {ticket}` starts its record \
+                 over, keeping what still reads of its round count and of the refusals its next \
+                 runs are told; its comments stay on the ticket"
             ))
         })?;
         Ok(Prepared {
@@ -1381,8 +1379,8 @@ impl OnDemand<'_> {
                 },
                 message: format!(
                     "the questions of round {round} are on the ticket (comment {}), but keeping \
-                     them in the ticket's ref failed: {error}; run `owlshift do {ticket}` to ask \
-                     them again",
+                     them in the ticket's ref failed: {error}; once the ref can be written, run \
+                     `owlshift do {ticket}` to ask them again",
                     posted.id
                 ),
             };

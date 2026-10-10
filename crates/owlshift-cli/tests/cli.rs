@@ -1125,6 +1125,32 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
     assert!(!config_dir.path().join("data").exists());
 }
 
+/// OWL-202: `owlshift forget` with no record kept on the ticket is refused,
+/// and makes no data directory. What it forgets is tested in the testkit
+/// (`tests/ticket_ref.rs`, `tests/on_demand.rs`).
+#[test]
+fn forget_refuses_a_ticket_owlshift_keeps_nothing_on() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let init = ["init", "--tracker", "markdown", "--skip-secrets"];
+    assert!(
+        owlshift(repo.path(), config_dir.path(), &init)
+            .status
+            .success()
+    );
+    let origin = "https://github.com/owlshift/demo.git";
+    git(repo.path(), &["remote", "add", "origin", origin]);
+
+    let output = owlshift(repo.path(), config_dir.path(), &["forget", "DEMO-1"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr(&output),
+        "owlshift: Not run: nothing to forget: Owlshift keeps nothing on DEMO-1\n"
+    );
+    assert!(!config_dir.path().join("data").exists());
+}
+
 const EVENTS: &str = concat!(
     r#"{"format":1,"at":"2026-09-29T10:00:00Z","project":"demo/project","ticket":"OWL-1","kind":"dispatch","data":{"branch":"owlshift/owl-1"}}"#,
     "\n",

@@ -20,6 +20,11 @@
 //! 2.54.0: it wrote a commit with `commit.gpgSign=true` and a `gpg.program`
 //! that always fails); `--no-gpg-sign` is passed anyway, so a person's
 //! signing setup never stops the runner.
+//!
+//! A ticket ref that has no room for its next write, or cannot be read, is
+//! started over by [`forget`] (`owlshift forget TICKET`, OWL-202): a new
+//! record on top of the old one, keeping the round count and the refusals
+//! the next runs are told.
 
 use std::path::Path;
 
@@ -28,12 +33,14 @@ use owlshift_contracts::refs::{
     PersistedState, QUESTIONS_FILE, STATE_FILE, TICKETS_PREFIX, TicketQuestions, ticket_ref,
 };
 use owlshift_core::state::{Status, TicketState};
+use owlshift_core::vocab::Stage;
 
 use crate::executor::Git;
 
 /// The most a file of the ticket ref may hold, in bytes: [`read()`] refuses
 /// a larger one, so [`write()`] refuses to write one (OWL-200). The runner's own
-/// files are far smaller.
+/// files are far smaller: a round of three questions with their verdicts
+/// takes about 3 KB of `questions.json`, a decision about 1.2 KB (OWL-202).
 pub const MAX_FILE: u64 = 1024 * 1024;
 
 /// What the ticket ref holds.
@@ -51,66 +58,127 @@ pub struct Stored {
 }
 
 /// Reads the ticket ref of `ticket` in `checkout`: `None` when there is
-/// none. A ref that does not point to a commit, a tree without both files
-/// as regular blobs, a file that does not parse, or asks that do not match
-/// the state (a ticket waiting for answers to a round the asks do not end
-/// with) is an error. Other entries of the tree are left alone.
+/// none. A symbolic ref (Owlshift never writes one), a ref that does not
+/// point to a commit, a tree without both files as regular blobs, a file
+/// that does not parse, or asks that do not match the state (a ticket
+/// waiting for answers to a round the asks do not end with) is an error.
+/// Other entries of the tree are left alone.
 pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stored>, String> {
     let name = ticket_ref(ticket);
+    let Some(listed) = listed(git, checkout, &name)? else {
+        return Ok(None);
+    };
+    match read_listed(git, checkout, &name, &listed) {
+        Ok(stored) => Ok(Some(stored)),
+        Err(ReadError::Invalid(why) | ReadError::Git(why)) => Err(why),
+    }
+}
+
+/// A ref as `for-each-ref` lists it.
+struct Listed {
+    /// The object it points to, through a symbolic ref.
+    oid: String,
+    kind: String,
+    /// The ref a symbolic ref points to.
+    symref: Option<String>,
+}
+
+/// The ref named `name` exactly, `None` when there is none.
+fn listed(git: &Git, checkout: &Path, name: &str) -> Result<Option<Listed>, String> {
     // `for-each-ref` answers an absent ref with nothing; `show-ref --verify
     // --hash` exits 128 on one (checked 2026-10-02, git 2.54.0). The exact
-    // name is kept: a pattern also lists the refs below it.
-    let listed = git
+    // name is kept: a pattern also lists the refs below it. `%(symref)` is
+    // empty for a ref that is not symbolic, so the line has four fields.
+    let out = git
         .run(
             checkout,
             &[
                 "for-each-ref",
-                "--format=%(objectname) %(objecttype) %(refname)",
-                &name,
+                "--format=%(objectname) %(objecttype) %(symref) %(refname)",
+                name,
             ],
         )
         .map_err(|e| e.to_string())?;
-    let listed = String::from_utf8_lossy(&listed);
-    let Some((commit, kind)) = listed.lines().find_map(|line| {
-        let mut fields = line.splitn(3, ' ');
-        let (oid, kind, refname) = (fields.next()?, fields.next()?, fields.next()?);
-        (refname == name).then(|| (oid.to_owned(), kind.to_owned()))
-    }) else {
-        return Ok(None);
-    };
-    let broken = |why: String| format!("the ticket ref {name} {why}");
-    if kind != "commit" {
-        return Err(broken(format!("points to a {kind}, not a commit")));
-    }
-    let entries = tree_entries(git, checkout, &commit)?;
-    let file = |file: &str| -> Result<String, String> {
-        let entry = entries
-            .iter()
-            .find(|entry| entry.name == file)
-            .ok_or_else(|| broken(format!("has no {file}")))?;
-        if entry.mode != "100644" || entry.kind != "blob" {
-            return Err(broken(format!(
-                "holds {file} as {} {}, not a regular file",
-                entry.mode, entry.kind
-            )));
-        }
-        if entry.size.is_none_or(|size| size > MAX_FILE) {
-            return Err(broken(format!("holds {file} past {MAX_FILE} bytes")));
-        }
-        let bytes = git
-            .run(checkout, &["cat-file", "blob", &entry.oid])
-            .map_err(|e| e.to_string())?;
-        String::from_utf8(bytes).map_err(|_| broken(format!("holds {file} not in UTF-8")))
-    };
-    let state = PersistedState::parse(&file(STATE_FILE)?)
-        .map_err(|e| broken(format!("holds an invalid {STATE_FILE}: {e}")))?;
-    let questions = TicketQuestions::parse(&file(QUESTIONS_FILE)?)
-        .map_err(|e| broken(format!("holds an invalid {QUESTIONS_FILE}: {e}")))?;
-    check_consistent(&state, &questions).map_err(broken)?;
-    Ok(Some(Stored {
-        record: TicketRecord { state, questions },
-        commit,
+    Ok(String::from_utf8_lossy(&out).lines().find_map(|line| {
+        let mut fields = line.splitn(4, ' ');
+        let (oid, kind, symref, refname) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
+        (refname == name).then(|| Listed {
+            oid: oid.to_owned(),
+            kind: kind.to_owned(),
+            symref: (!symref.is_empty()).then(|| symref.to_owned()),
+        })
     }))
+}
+
+/// Why a ticket ref could not be read.
+enum ReadError {
+    /// What it holds is not a ticket record: the ref is broken.
+    Invalid(String),
+    /// Git could not show it: nothing is known of the record.
+    Git(String),
+}
+
+/// Reads the record `listed` points to; [`read`] says what is refused.
+fn read_listed(
+    git: &Git,
+    checkout: &Path,
+    name: &str,
+    listed: &Listed,
+) -> Result<Stored, ReadError> {
+    let broken = |why: String| ReadError::Invalid(format!("the ticket ref {name} {why}"));
+    if let Some(target) = &listed.symref {
+        return Err(broken(format!(
+            "is a symbolic ref to {target}, which Owlshift never writes"
+        )));
+    }
+    if listed.kind != "commit" {
+        return Err(broken(format!("points to a {}, not a commit", listed.kind)));
+    }
+    let entries = tree_entries(git, checkout, &listed.oid).map_err(ReadError::Git)?;
+    let state = PersistedState::parse(&read_file(git, checkout, name, &entries, STATE_FILE)?)
+        .map_err(|e| broken(format!("holds an invalid {STATE_FILE}: {e}")))?;
+    let questions =
+        TicketQuestions::parse(&read_file(git, checkout, name, &entries, QUESTIONS_FILE)?)
+            .map_err(|e| broken(format!("holds an invalid {QUESTIONS_FILE}: {e}")))?;
+    check_consistent(&state, &questions).map_err(broken)?;
+    Ok(Stored {
+        record: TicketRecord { state, questions },
+        commit: listed.oid.clone(),
+    })
+}
+
+/// The text of `file` among `entries`: a regular blob of at most
+/// [`MAX_FILE`] bytes, in UTF-8.
+fn read_file(
+    git: &Git,
+    checkout: &Path,
+    name: &str,
+    entries: &[Entry],
+    file: &str,
+) -> Result<String, ReadError> {
+    let broken = |why: String| ReadError::Invalid(format!("the ticket ref {name} {why}"));
+    let entry = entries
+        .iter()
+        .find(|entry| entry.name == file)
+        .ok_or_else(|| broken(format!("has no {file}")))?;
+    if entry.mode != "100644" || entry.kind != "blob" {
+        return Err(broken(format!(
+            "holds {file} as {} {}, not a regular file",
+            entry.mode, entry.kind
+        )));
+    }
+    if entry.size.is_none_or(|size| size > MAX_FILE) {
+        return Err(broken(format!("holds {file} past {MAX_FILE} bytes")));
+    }
+    let bytes = git
+        .run(checkout, &["cat-file", "blob", &entry.oid])
+        .map_err(|e| ReadError::Git(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| broken(format!("holds {file} not in UTF-8")))
 }
 
 /// The tickets that have a ticket ref in `checkout`, in the order git lists
@@ -137,8 +205,8 @@ pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
 ///
 /// A file that would hold more than [`MAX_FILE`] bytes is refused before
 /// any git command runs (OWL-200): [`read`] would refuse it, leaving the
-/// ticket where no command reads it. Nothing is written, and the ref keeps
-/// its previous state.
+/// ticket where no command reads it. Nothing is written, the ref keeps its
+/// previous state, and the error names `owlshift forget` (OWL-202).
 pub fn write(
     git: &Git,
     checkout: &Path,
@@ -157,7 +225,8 @@ pub fn write(
             return Err(format!(
                 "the ticket ref {name} would hold {file} of {len} bytes, past the {MAX_FILE} \
                  a ticket ref file may hold: nothing is written, the ref keeps its previous \
-                 state"
+                 state, and `owlshift forget {ticket}` makes room, starting the ticket's record \
+                 over with its round count and the refusals its next runs are told"
             ));
         }
     }
@@ -213,6 +282,134 @@ pub fn write(
     )
     .map_err(|e| format!("moving {name}: {e}"))?;
     Ok(commit)
+}
+
+/// What [`forget`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Forgot {
+    /// `kept` was written on top of `previous`, which stays its parent.
+    Rewritten {
+        previous: String,
+        commit: String,
+        from: Previous,
+        kept: TicketRecord,
+    },
+    /// The ref already held only what forget keeps: nothing was written.
+    Unchanged { commit: String, kept: TicketRecord },
+    /// The ref was symbolic or did not point to a commit, `why`: it was
+    /// deleted from `previous`, the object it pointed to, and nothing kept.
+    Deleted { previous: String, why: String },
+}
+
+/// The record a [`Forgot::Rewritten`] replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Previous {
+    /// Read whole.
+    Read(Box<TicketRecord>),
+    /// Broken, for this reason: what was kept is what still read on its own.
+    Unreadable(String),
+}
+
+/// Starts over what the ticket ref of `ticket` keeps (OWL-202), for a ref
+/// that has no room for the next write or cannot be read; `None` when there
+/// is no ref. The caller holds the project's lock.
+///
+/// A ref that points to a commit gets a new record on top of it, the old
+/// commit its parent: Ready, its round count kept and every other counter at
+/// zero, and of `questions.json` only Build's and the resolver's kept
+/// refusals, which the next runs are told. The asks, their verdicts, what
+/// the last answer check read and the decisions go; their comments stay on
+/// the ticket. A record that cannot be read gives what still reads on its
+/// own: the round of a `state.json` that parses, the refusals of a
+/// `questions.json` that does, round 0 and none otherwise. A symbolic ref,
+/// or one that points to anything but a commit, is deleted, its target
+/// untouched. A git command that fails changes nothing.
+pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Forgot>, String> {
+    let name = ticket_ref(ticket);
+    let Some(listed) = listed(git, checkout, &name)? else {
+        return Ok(None);
+    };
+    let (from, kept) = match read_listed(git, checkout, &name, &listed) {
+        Ok(stored) => {
+            let kept = kept(stored.record.state.round, Some(&stored.record.questions))?;
+            if kept == stored.record {
+                return Ok(Some(Forgot::Unchanged {
+                    commit: stored.commit,
+                    kept,
+                }));
+            }
+            (Previous::Read(Box::new(stored.record)), kept)
+        }
+        Err(ReadError::Git(error)) => return Err(error),
+        Err(ReadError::Invalid(why)) if listed.symref.is_some() || listed.kind != "commit" => {
+            // `--no-deref`: a symbolic ref goes, not the ref it points to.
+            git.run(
+                checkout,
+                &[
+                    "update-ref",
+                    "-m",
+                    "owlshift: forget",
+                    "--no-deref",
+                    "-d",
+                    &name,
+                    &listed.oid,
+                ],
+            )
+            .map_err(|e| format!("deleting {name}: {e}"))?;
+            return Ok(Some(Forgot::Deleted {
+                previous: listed.oid,
+                why,
+            }));
+        }
+        Err(ReadError::Invalid(why)) => {
+            let kept = salvage(git, checkout, &name, &listed.oid)?;
+            (Previous::Unreadable(why), kept)
+        }
+    };
+    // Far below the cap: the refusals are bounded (64 choices of two
+    // 512-byte texts, reasons of 2 KB), and `write` keeps any other entry of
+    // the old tree as it is.
+    let commit = write(git, checkout, ticket, &kept, Some(&listed.oid))?;
+    Ok(Some(Forgot::Rewritten {
+        previous: listed.oid,
+        commit,
+        from,
+        kept,
+    }))
+}
+
+/// The record [`forget`] leaves: Ready, `round` kept, every other counter
+/// at zero, and of `questions` only the refusals the next runs are told.
+/// Ready with any round is a state the machine can be in, and the one
+/// `owlshift do` starts from.
+fn kept(round: u32, questions: Option<&TicketQuestions>) -> Result<TicketRecord, String> {
+    let state = TicketState::restore(Status::Active(Stage::Ready), round, 0, 0)
+        .map_err(|e| e.to_string())?;
+    Ok(TicketRecord {
+        state: PersistedState::from(&state),
+        questions: TicketQuestions {
+            build_refusal: questions.and_then(|q| q.build_refusal.clone()),
+            resolver_refusal: questions.and_then(|q| q.resolver_refusal.clone()),
+            ..TicketQuestions::new()
+        },
+    })
+}
+
+/// What [`forget`] keeps of the unreadable record at `commit`: the round
+/// of its `state.json` and the refusals of its `questions.json`, each when
+/// it still reads and parses on its own.
+fn salvage(git: &Git, checkout: &Path, name: &str, commit: &str) -> Result<TicketRecord, String> {
+    let entries = tree_entries(git, checkout, commit)?;
+    let text = |file: &str| match read_file(git, checkout, name, &entries, file) {
+        Ok(text) => Ok(Some(text)),
+        Err(ReadError::Invalid(_)) => Ok(None),
+        Err(ReadError::Git(error)) => Err(error),
+    };
+    let round = text(STATE_FILE)?
+        .and_then(|text| PersistedState::parse(&text).ok())
+        .map_or(0, |state| state.round);
+    let questions = text(QUESTIONS_FILE)?.and_then(|text| TicketQuestions::parse(&text).ok());
+    kept(round, questions.as_ref())
 }
 
 /// A ticket waiting for its decider's answers waits for the latest ask's

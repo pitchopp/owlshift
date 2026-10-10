@@ -6,6 +6,7 @@
 //! confined included, is refused before the keychain is opened.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::Tracker;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::Role;
-use owlshift_contracts::config::TrackerKind;
+use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, KeychainError};
@@ -81,28 +82,7 @@ fn run_with(
         .map(TicketId::new)
         .transpose()
         .map_err(|error| error.to_string())?;
-    let (project_file, project) = match &config.project {
-        FileState::Loaded { path, config, .. } => (path, config),
-        FileState::Absent(path) => {
-            return Err(format!(
-                "no project file at {}: run `owlshift init` first",
-                path.display()
-            ));
-        }
-        FileState::NotApplicable(reason) => {
-            return Err(format!(
-                "{} runs in a git repository: {reason}",
-                mode.command()
-            ));
-        }
-        FileState::Unavailable(reason) => return Err(reason.clone()),
-        FileState::Invalid { path, error } => {
-            return Err(format!("{} is invalid: {error}", path.display()));
-        }
-    };
-    if !config.is_valid() {
-        return Err("the personal configuration is invalid: see `owlshift config show`".to_owned());
-    }
+    let (project_file, project) = loaded_project(config, mode.command())?;
     if let Some(ticket) = &ticket {
         on_demand::check_team(project, ticket)?;
     }
@@ -115,12 +95,7 @@ fn run_with(
     // a run that cannot happen. `do`, `continue` and `watch` always confine
     // their agents (`AgentEnv::from_runner`); `OnDemand` checks again.
     system.sandbox().map_err(|error| error.to_string())?;
-    let Some(data_dir) = owlshift_platform::paths::data_dir() else {
-        return Err(
-            "this system has no data directory: set OWLSHIFT_DATA_DIR to an absolute path"
-                .to_owned(),
-        );
-    };
+    let data_dir = crate::data_dir()?;
     let Some(claude) = system.locate("claude") else {
         return Err(
             "`claude` is not on the PATH: install Claude Code (agent runs log in with the token `owlshift init` stores; `owlshift doctor` checks it)"
@@ -250,6 +225,34 @@ fn run_with(
         &outcome,
         &mut sink,
     ))
+}
+
+/// The project file `command` works with, and its path, from a valid
+/// configuration: why it cannot otherwise.
+pub(crate) fn loaded_project<'c>(
+    config: &'c Effective,
+    command: &str,
+) -> Result<(&'c PathBuf, &'c ProjectConfig), String> {
+    let loaded = match &config.project {
+        FileState::Loaded { path, config, .. } => (path, config),
+        FileState::Absent(path) => {
+            return Err(format!(
+                "no project file at {}: run `owlshift init` first",
+                path.display()
+            ));
+        }
+        FileState::NotApplicable(reason) => {
+            return Err(format!("{command} runs in a git repository: {reason}"));
+        }
+        FileState::Unavailable(reason) => return Err(reason.clone()),
+        FileState::Invalid { path, error } => {
+            return Err(format!("{} is invalid: {error}", path.display()));
+        }
+    };
+    if !config.is_valid() {
+        return Err("the personal configuration is invalid: see `owlshift config show`".to_owned());
+    }
+    Ok(loaded)
 }
 
 /// The end of one run of a ticket, `do`'s, `continue`'s, or each continue

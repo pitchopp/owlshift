@@ -2237,6 +2237,116 @@ fn answers_in_the_second_of_their_ask_count() {
     );
 }
 
+/// OWL-202's acceptance: a ticket whose ref has no room for its next round
+/// stops with the round posted but not kept, naming `owlshift forget`;
+/// forgotten, its round count kept, the next `do` asks the round after it
+/// and keeps it. Rounds of the size Owlshift asks take some 120 to 350 of
+/// them to fill the 1 MiB a ref file may hold (build plan, OWL-202), so the
+/// test pads round 1's question instead of asking that many.
+#[test]
+fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
+    use owlshift_contracts::Stage;
+    use owlshift_contracts::refs::PersistedState;
+    use owlshift_runner::forget;
+    use owlshift_runner::ticket_ref::Forgot;
+
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{asked:?}\n{printed}"
+    );
+    // Round 1 was answered and Build resumed: the ticket is at Build, its
+    // `questions.json` 300 bytes short of the cap.
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let checkout = bench.dirs().checkout();
+    let mut record = bench.record();
+    record.state = PersistedState::parse(
+        r#"{"format":2,"stage":"build","round":1,"reasks":0,"failed_runs":0}"#,
+    )
+    .unwrap();
+    let short = usize::try_from(ticket_ref::MAX_FILE).unwrap() - 300;
+    let pad = short - record.questions.render().len();
+    record.questions.asks[0].questions[0]
+        .context
+        .push_str(&"x".repeat(pad));
+    assert_eq!(record.questions.render().len(), short);
+    let full = ticket_ref::write(
+        &git,
+        &checkout,
+        &ticket(),
+        &record,
+        Some(&bench.ref_commit()),
+    )
+    .unwrap();
+
+    let (stopped, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    let Err(Stop::NotKept {
+        landed: Landed::Questions,
+        message,
+    }) = &stopped
+    else {
+        panic!("{stopped:?}\n{printed}");
+    };
+    for part in [
+        "the questions of round 2 are on the ticket",
+        "past the 1048576 a ticket ref file may hold",
+        "`owlshift forget DEMO-1` makes room",
+        "once the ref can be written, run `owlshift do DEMO-1`",
+    ] {
+        assert!(message.contains(part), "{part}\n{message}");
+    }
+    assert_eq!(bench.ref_commit(), full);
+
+    let mut out = Vec::new();
+    let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
+    let forgotten = forget::forget(&git, &bench.dirs(), &ticket(), &mut sink).unwrap();
+    assert!(
+        matches!(&forgotten.forgot, Forgot::Rewritten { previous, .. } if *previous == full),
+        "{forgotten:?}"
+    );
+    let kept = bench.record();
+    assert_eq!(
+        (kept.state.stage, kept.state.waiting, kept.state.round),
+        (Stage::Ready, None, 1)
+    );
+    assert!(kept.questions.asks.is_empty());
+
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 2),
+        "{asked:?}\n{printed}"
+    );
+    let record = bench.record();
+    assert_eq!(
+        (record.state.waiting, record.state.round),
+        (Some(Waiting::NeedsInput), 2)
+    );
+    let rounds: Vec<u32> = record
+        .questions
+        .asks
+        .iter()
+        .map(|a| a.round.get())
+        .collect();
+    assert_eq!(rounds, [2]);
+    // The round posted while the ref was full stays on the ticket, before
+    // the one kept: a residual every round posted but not kept has.
+    let posted: Vec<String> = bench
+        .comments()
+        .iter()
+        .filter_map(|body| body.lines().next().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        posted,
+        [
+            "[owlshift] QUESTIONS · round 1",
+            "[owlshift] QUESTIONS · round 2",
+            "[owlshift] QUESTIONS · round 2"
+        ]
+    );
+}
+
 /// OWL-152's acceptance: `owlshift watch` resumes a ticket once its
 /// decider's answer counts, with no `continue` typed. Its passes wait for
 /// the answer, live through a tracker that cannot list the comments, hold a
