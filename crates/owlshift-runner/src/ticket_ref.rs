@@ -101,8 +101,12 @@ fn listed(git: &Git, checkout: &Path, name: &str) -> Result<Option<Listed>, Stri
         .map_err(|e| e.to_string())?;
     Ok(String::from_utf8_lossy(&out).lines().find_map(|line| {
         let mut fields = line.splitn(4, ' ');
-        let (oid, kind, symref, refname) =
-            (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+        let (oid, kind, symref, refname) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
         (refname == name).then(|| Listed {
             oid: oid.to_owned(),
             kind: kind.to_owned(),
@@ -301,7 +305,7 @@ pub enum Forgot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Previous {
     /// Read whole.
-    Read(TicketRecord),
+    Read(Box<TicketRecord>),
     /// Broken, for this reason: what was kept is what still read on its own.
     Unreadable(String),
 }
@@ -334,7 +338,7 @@ pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Fo
                     kept,
                 }));
             }
-            (Previous::Read(stored.record), kept)
+            (Previous::Read(Box::new(stored.record)), kept)
         }
         Err(ReadError::Git(error)) => return Err(error),
         Err(ReadError::Invalid(why)) if listed.symref.is_some() || listed.kind != "commit" => {

@@ -265,7 +265,7 @@ fn forget_keeps_the_round_count_and_the_refusals_and_drops_the_rest() {
         (previous.as_str(), from, &kept),
         (
             old.as_str(),
-            Previous::Read(waiting.clone()),
+            Previous::Read(Box::new(waiting.clone())),
             &forgotten(1, &waiting.questions)
         )
     );
@@ -342,17 +342,23 @@ fn forget_salvages_a_broken_record_and_deletes_a_ref_that_is_no_commit() {
 
     // A symbolic ref goes, and the ref it points to stays.
     let other = TicketId::new("DEMO-2").unwrap();
-    let theirs = ticket_ref::write(&repo.git, &repo.root, &other, &record(WAITING, 1), None).unwrap();
+    let theirs =
+        ticket_ref::write(&repo.git, &repo.root, &other, &record(WAITING, 1), None).unwrap();
     repo.git(&["symbolic-ref", REF, "refs/owlshift/tickets/DEMO-2"]);
     let error = repo.read().unwrap_err();
-    assert!(error.contains("is a symbolic ref to refs/owlshift/tickets/DEMO-2"), "{error}");
+    assert!(
+        error.contains("is a symbolic ref to refs/owlshift/tickets/DEMO-2"),
+        "{error}"
+    );
     let Some(Forgot::Deleted { previous, why }) = forget().unwrap() else {
         panic!("not deleted");
     };
     assert_eq!(previous, theirs);
     assert!(why.contains("is a symbolic ref"), "{why}");
     assert_eq!(repo.read().unwrap(), None);
-    let still = ticket_ref::read(&repo.git, &repo.root, &other).unwrap().unwrap();
+    let still = ticket_ref::read(&repo.git, &repo.root, &other)
+        .unwrap()
+        .unwrap();
     assert_eq!(still.commit, theirs);
 
     // A ref to a blob goes. Checked on 2026-10-10 with git 2.43.0: `git
@@ -360,7 +366,9 @@ fn forget_salvages_a_broken_record_and_deletes_a_ref_that_is_no_commit() {
     // refused and leaves the ref, so a ref moved since it was listed is
     // never deleted.
     repo.git(&["update-ref", REF, &state]);
-    let stale = repo.env.run(&repo.root, &["update-ref", "--no-deref", "-d", REF, &huge]);
+    let stale = repo
+        .env
+        .run(&repo.root, &["update-ref", "--no-deref", "-d", REF, &huge]);
     assert!(stale.is_err(), "{stale:?}");
     assert_eq!(repo.git(&["rev-parse", REF]), state);
     let Some(Forgot::Deleted { previous, why }) = forget().unwrap() else {
@@ -372,9 +380,16 @@ fn forget_salvages_a_broken_record_and_deletes_a_ref_that_is_no_commit() {
 
     // A record git cannot show, its tree gone from the object store, is
     // no broken record: forget fails and the ref stays.
-    let written = ticket_ref::write(&repo.git, &repo.root, &ticket(), &record(WAITING, 1), None).unwrap();
+    let written =
+        ticket_ref::write(&repo.git, &repo.root, &ticket(), &record(WAITING, 1), None).unwrap();
     let tree = repo.git(&["rev-parse", &format!("{written}^{{tree}}")]);
-    fs::remove_file(repo.root.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+    fs::remove_file(
+        repo.root
+            .join(".git/objects")
+            .join(&tree[..2])
+            .join(&tree[2..]),
+    )
+    .unwrap();
     assert!(forget().is_err());
     assert_eq!(repo.git(&["rev-parse", REF]), written);
 }
@@ -401,7 +416,8 @@ fn forget_holds_the_project_lock_and_says_what_it_dropped() {
     assert!(!dirs.root().exists());
 
     fs::create_dir_all(dirs.root()).unwrap();
-    env.run(dirs.root(), &["init", "--quiet", "checkout"]).unwrap();
+    env.run(dirs.root(), &["init", "--quiet", "checkout"])
+        .unwrap();
     let checkout = dirs.checkout();
     let waiting = kept_everything();
     let old = ticket_ref::write(&git, &checkout, &ticket(), &waiting, None).unwrap();

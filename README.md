@@ -25,7 +25,8 @@ Early development. Steps P0 and P1 of the roadmap are built: the CLI runs one ti
 - `owlshift do TICKET`: run one ticket to a verified pull request, in the foreground; questions the run needs answered are posted on the ticket.
 - `owlshift continue TICKET`: once the ticket's questions are answered there and the answer has been left unedited for 10 minutes, or the project's `policy.quiet_window_minutes` (or ends with `go`), check the answers, then ask again what is missing or run on to a verified pull request; restarts a parked ticket.
 - `owlshift watch`: in the foreground, continue each ticket whose questions wait, as `owlshift continue` would, once its decider's reply counts, until Ctrl-C. A parked ticket, or one left at Build, still needs `owlshift continue`.
-- `owlshift logs [TICKET] [--last N] [--follow]`: print the events `owlshift do`, `owlshift continue` and `owlshift watch` recorded, oldest first, optionally only one ticket's, only the last N with `--last N`, and keep printing new ones with `--follow`.
+- `owlshift forget TICKET`: start over what Owlshift keeps on a ticket when that record has no room left or cannot be read; its asks and decisions go, their comments staying on the ticket, and its round count and the refusals its next runs are told stay.
+- `owlshift logs [TICKET] [--last N] [--follow]`: print the events `owlshift do`, `owlshift continue`, `owlshift watch` and `owlshift forget` recorded, oldest first, optionally only one ticket's, only the last N with `--last N`, and keep printing new ones with `--follow`.
 
 There is no packaged release yet. Install from source:
 

@@ -2193,8 +2193,14 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
         .context
         .push_str(&"x".repeat(pad));
     assert_eq!(record.questions.render().len(), short);
-    let full =
-        ticket_ref::write(&git, &checkout, &ticket(), &record, Some(&bench.ref_commit())).unwrap();
+    let full = ticket_ref::write(
+        &git,
+        &checkout,
+        &ticket(),
+        &record,
+        Some(&bench.ref_commit()),
+    )
+    .unwrap();
 
     let (stopped, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
     let Err(Stop::NotKept {
@@ -2238,7 +2244,12 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
         (record.state.waiting, record.state.round),
         (Some(Waiting::NeedsInput), 2)
     );
-    let rounds: Vec<u32> = record.questions.asks.iter().map(|a| a.round.get()).collect();
+    let rounds: Vec<u32> = record
+        .questions
+        .asks
+        .iter()
+        .map(|a| a.round.get())
+        .collect();
     assert_eq!(rounds, [2]);
     // The round posted while the ref was full stays on the ticket, before
     // the one kept: a residual every round posted but not kept has.
