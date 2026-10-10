@@ -411,9 +411,9 @@ Everything runs in the foreground; `continue` arrives in P2, `watch` in P3, the 
 | `owlshift config show` | P0 | Effective configuration and the origin of each value |
 | `owlshift init` | P1 | Writes a commented `owlshift.toml` for the repository (`--tracker`, `--team`, `--gate`), then stores the tracker and forge secrets and the agent runs' Claude Code token in the system keychain (`--skip-secrets`, `--replace-secrets`) |
 | `owlshift do TICKET` | P1 | Runs one ticket to a verified PR, in the foreground |
+| `owlshift forget TICKET` | P2 | Starts over what Owlshift keeps on a ticket whose ticket ref has no room left or cannot be read, keeping its round count and the refusals its next runs are told (OWL-202) |
 | `owlshift continue TICKET` | P2 | Picks a ticket up once its decider has answered, after the quiet window, or restarts a parked one (OWL-122, named by OWL-127) |
 | `owlshift watch` | P3 | Continues each ticket whose questions wait, in the foreground, once its decider's reply counts, until Ctrl-C (OWL-152) |
-| `owlshift forget TICKET` | P2 | Starts over what Owlshift keeps on a ticket whose ticket ref has no room left or cannot be read, keeping its round count and the refusals its next runs are told (OWL-202) |
 | `owlshift logs [TICKET] [--last N] [--follow]` | P1 | Events, with the directory of each run's logs |
 
 **What `doctor` checks, as built in P0 (OWL-12).**
