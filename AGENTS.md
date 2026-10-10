@@ -17,12 +17,13 @@ The backlog lives in Linear, workspace **Owlshift** (URL key `owlshift`), team `
 **Access.** Do not use a Linear MCP connector for this project: the one available in Claude sessions is bound to another workspace, and its writes would land there. Use the GraphQL API directly:
 
 ```bash
-KEY=$(grep -E '^LINEAR_API_KEY=' ~/Projects/owlshift/.env | cut -d= -f2-)
+KEY=${LINEAR_API_KEY:-$(grep -sE '^LINEAR_API_KEY=' ~/Projects/owlshift/.env | cut -d= -f2-)}
 curl -s https://api.linear.app/graphql -H "Authorization: $KEY" -H "Content-Type: application/json" \
   -d '{"query":"{ organization { urlKey } }"}'
 ```
 
-- The key lives in the `.env` of the main checkout (`~/Projects/owlshift/.env`); a worktree has none. Never print it, copy it or commit it.
+- The key comes from the `LINEAR_API_KEY` environment variable when it is set, otherwise from the `.env` of the main checkout (`~/Projects/owlshift/.env`); a worktree has no `.env`. Never print it, copy it or commit it.
+- In a Claude Code cloud session the container has no `~/Projects/owlshift/.env`: the key is a secret of the cloud environment, exposed as `LINEAR_API_KEY`. Checked on 2026-10-10 in a cloud session: the command above returned `owlshift`. If the variable is missing there, ask the maintainer to add it to the environment; do not look for the key elsewhere.
 - Before the first write of a session, check that `organization { urlKey }` returns `owlshift`.
 - The API caps query complexity at 10,000: keep nested lists at `first: 50` or less.
 - An issue accepts its identifier (`"OWL-12"`) wherever an issue id is expected.
