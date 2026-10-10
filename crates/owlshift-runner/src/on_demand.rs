@@ -392,6 +392,10 @@ impl fmt::Display for Delivered {
 /// [`Landed::ParkedUnposted`] alone, a park whose comment did not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Landed {
+    /// The RESUME of a round whose answers counted. It asks nothing of the
+    /// decider, but the ticket still waits for its answers in its ref, so
+    /// Build resumes only once a person acts (OWL-169).
+    Resume,
     /// The questions of a round.
     Questions,
     /// The round of a run that found the ticket's premise false.
@@ -477,7 +481,9 @@ pub enum Stop {
     /// state in the ticket's ref failed, so the command stopped with
     /// `message`. A refusal that says so, kept apart from [`Stop::Refused`]
     /// so that the notification can tell it from one that asks nothing of
-    /// anyone (OWL-149).
+    /// anyone (OWL-149), and so that `owlshift watch` holds the ticket until
+    /// a person acts rather than posting the comment again (OWL-158, and
+    /// OWL-169 for a RESUME).
     NotKept { landed: Landed, message: String },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
@@ -1688,12 +1694,15 @@ impl OnDemand<'_> {
                     EventKind::TrackerWrite,
                     comment_written("RESUME", &posted),
                 );
-                self.store(p, &next, questions).map_err(|e| {
-                    Stop::Refused(format!(
-                        "the resume is on the ticket (comment {}), but keeping the answered state \
-                         in the ticket's ref failed: {e}",
+                // The ref still waits for answers: nothing resumes Build but
+                // a person, so the stop says the RESUME landed (OWL-169).
+                self.store(p, &next, questions).map_err(|e| Stop::NotKept {
+                    landed: Landed::Resume,
+                    message: format!(
+                        "the resume is on the ticket (comment {}), but keeping the answered \
+                         state in the ticket's ref failed: {e}",
                         posted.id
-                    ))
+                    ),
                 })?;
                 self.show_after(&ticket, Some(&ran.run), Event::Answered, sink);
                 sink.emit(

@@ -69,8 +69,12 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// failed after it ([`Stop::NotKept`]): the line says so, since the next run
 /// may post that comment again. So does a park whose PARKED comment could
 /// not be posted either ([`Landed::ParkedUnposted`]): a park waits for a
-/// person, whatever reached the ticket. The decision and the resume comments
-/// ask nothing of anyone, so a failure to keep their state stays a refusal.
+/// person, whatever reached the ticket. So does a RESUME whose state was not
+/// kept ([`Landed::Resume`], OWL-169): it asks nothing of the decider, but
+/// Build did not resume and only a person's act resumes it, which makes the
+/// operator the blocker. The decision comment asks nothing of anyone, so a
+/// failure to keep its state stays a refusal, as does a RESUME the tracker
+/// refused, since nothing reached the ticket.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
     Some(match stop {
         Stop::NeedsInput { status, posted, .. } => match (status, posted) {
@@ -96,6 +100,10 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         Stop::NotKept { landed, .. } => {
             const NOT_KEPT: &str = "Owlshift's state was not kept";
             let (what, lost) = match landed {
+                Landed::Resume => (
+                    "a resume is on the ticket",
+                    "Owlshift's state was not kept, so Build did not resume",
+                ),
                 Landed::Questions => ("questions wait for an answer on the ticket", NOT_KEPT),
                 Landed::PremiseFalse => (
                     "the run found the ticket's premise false; a decision waits on the ticket",
@@ -494,6 +502,11 @@ mod tests {
                 not_kept(Landed::ParkedUnposted),
                 "OWL-7: the ticket is parked: a person must look, but its PARKED comment was not \
                  posted and Owlshift's state was not kept; see the terminal",
+            ),
+            (
+                not_kept(Landed::Resume),
+                "OWL-7: a resume is on the ticket, but Owlshift's state was not kept, so Build \
+                 did not resume; see the terminal",
             ),
             (
                 Stop::UsageLimit {
