@@ -23,7 +23,7 @@ curl -s https://api.linear.app/graphql -H "Authorization: $KEY" -H "Content-Type
 ```
 
 - The key comes from the `LINEAR_API_KEY` environment variable when it is set, otherwise from the `.env` of the main checkout (`~/Projects/owlshift/.env`); a worktree has no `.env`. Never print it, copy it or commit it.
-- In a Claude Code cloud session the container has no `~/Projects/owlshift/.env`: the key is a secret of the cloud environment, exposed as `LINEAR_API_KEY`. Checked on 2026-10-10 in a cloud session: the command above returned `owlshift`. If the variable is missing there, ask the maintainer to add it to the environment; do not look for the key elsewhere.
+- In a Claude Code cloud session the container has no `~/Projects/owlshift/.env`: the key is set as the `LINEAR_API_KEY` environment variable in the cloud environment's settings. Checked on 2026-10-10 in a cloud session: the command above returned `owlshift`. If the variable is missing there, ask the maintainer to add it to the environment's variables; do not look for the key elsewhere.
 - Before the first write of a session, check that `organization { urlKey }` returns `owlshift`.
 - The API caps query complexity at 10,000: keep nested lists at `first: 50` or less.
 - An issue accepts its identifier (`"OWL-12"`) wherever an issue id is expected.
