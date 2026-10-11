@@ -1291,7 +1291,8 @@ impl OnDemand<'_> {
                 .then(|| ran.result())
                 .flatten();
             // Which refused choices its questions reopen, from the brief the
-            // run was told: a kept decision clears the hold (OWL-203).
+            // run was told (OWL-203): those questions go to the decider,
+            // never to the resolver (OWL-222).
             let asked = result
                 .map(|result| asked_choices(&brief, result))
                 .unwrap_or_default();
@@ -1581,8 +1582,8 @@ impl OnDemand<'_> {
 
     /// Routes the questions of a Build run before any reaches the decider
     /// ([`crate::resolver`]), the ticket still at Build. Always-human
-    /// questions, and every question of a false premise (scenario S8), go to
-    /// the decider. The rest go to a resolver run, unless `settled` runs in a
+    /// questions, those that reopen a refused choice (`asked`, OWL-222), and
+    /// every question of a false premise (scenario S8), go to the decider. The rest go to a resolver run, unless `settled` runs in a
     /// row already had all theirs decided ([`MAX_RESOLVED_PASSES`]). A
     /// decision the resolver's own label does not let stand is refused
     /// ([`resolver::settle`]) and its question goes to the decider. Each
@@ -1607,7 +1608,7 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Routing, Stop> {
         let ticket = p.ticket.clone();
-        let routed = resolver::route(&p.policy, &result.questions);
+        let routed = resolver::route(&p.policy, &result.questions, asked);
         let all = |fallback| Routing::Ask(Round::of(&result.questions, &[], asked, fallback));
         if result.status == result::Status::PremiseFalse || routed.to_resolver.is_empty() {
             return Ok(all(None));
@@ -1687,17 +1688,12 @@ impl OnDemand<'_> {
         // refused here, whatever the resolver decided (OWL-144).
         let sorted = resolver::settle(&p.policy, &routed.to_resolver, resolutions);
         for (question, decision, basis) in sorted.logged {
-            let reopened: Vec<&ReopenedChoice> = asked
-                .iter()
-                .filter(|reopened| reopened.question == question.id)
-                .collect();
             let comment = DecisionComment {
                 ticket: ticket.clone(),
                 question: question.clone(),
                 decision: decision.to_owned(),
                 basis: basis.to_owned(),
                 run: Some(ran.run.clone()),
-                reopened: reopened.iter().map(|r| r.choice.clone()).collect(),
             };
             // Never an unlogged decision: one whose comment is not on the
             // ticket goes to the decider.
@@ -1707,10 +1703,6 @@ impl OnDemand<'_> {
             };
             let mut written = comment_written("DECISION", &posted);
             written.insert("question".to_owned(), json!(question.id.as_str()));
-            if !reopened.is_empty() {
-                let places: Vec<u32> = reopened.iter().map(|r| r.place.get()).collect();
-                written.insert("reopened".to_owned(), json!(places));
-            }
             sink.emit(&ticket, Some(&ran.run), EventKind::TrackerWrite, written);
             let mut kept = p.questions();
             // As a round does, a kept decision keeps what the asking run

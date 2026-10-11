@@ -72,14 +72,16 @@ contains = [
 continue = true
 expect = { event = "restarted", stage = "build", waiting = "none", failed_runs = 0, tracker_stage = "In Progress" }
 
-# Told the choices first, then the refused done.
+# Told the choices first, then the refused done. Its questions reopen both
+# choices, so round 1 opens without the resolver (OWL-222).
 [[step]]
 run = { result = "results/questions-open-points.json" }
 [step.expect]
-event = "none"
+event = "questions"
 stage = "build"
-waiting = "none"
-comments = 1
+waiting = "needs_input"
+round = 1
+comments = 2
 brief_result_refusal = "A later result was refused too: invalid result.json: status is done"
 brief_decisions_refused = true
 brief_refused_choices = ["Every key or only the required ones", "Where the README lists the example"]

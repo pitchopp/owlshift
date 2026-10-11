@@ -4,7 +4,8 @@
 //!
 //! Each question is routed by the project's gate policy ([`route`]): a
 //! question of an always-human category, the floor's or one the project
-//! adds, goes to the decider and never to the resolver. The rest go to a run
+//! adds, goes to the decider and never to the resolver, and so does one that
+//! reopens a choice the runner refused (OWL-222). The rest go to a run
 //! of the `resolver` role (`roles/resolver.md`), read-only and without
 //! network, whose brief lists them in `resolve`. Its outcome ([`outcome`])
 //! either decides or passes on each question, or, when the run gave no usable
@@ -38,7 +39,8 @@ pub const RESOLVER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Routed {
-    /// Always-human questions: the decider's alone.
+    /// Always-human questions, and those that reopen a refused choice: the
+    /// decider's alone.
     pub to_decider: Vec<Question>,
     /// The rest: the resolver's first.
     pub to_resolver: Vec<Question>,
@@ -48,10 +50,17 @@ pub struct Routed {
 /// categories, a blank one and the project's additions go to the decider; a
 /// category is all the runner reads, so a question filed under the wrong one
 /// is routed by that one; [`settle`] then checks the resolver's own label
-/// before any decision on it is logged.
-pub fn route(policy: &GatePolicy, questions: &[Question]) -> Routed {
+/// before any decision on it is logged. A question the run names as
+/// reopening a refused choice (`reopened`, under the run's ids) goes to the
+/// decider whatever its category (OWL-222): the runner refused that choice
+/// for being taken without a human, so no resolver settles it either.
+pub fn route(policy: &GatePolicy, questions: &[Question], reopened: &[ReopenedChoice]) -> Routed {
     let mut routed = Routed::default();
     for question in questions {
+        if reopened.iter().any(|choice| choice.question == question.id) {
+            routed.to_decider.push(question.clone());
+            continue;
+        }
         match policy.route(&question.category) {
             Route::Human => routed.to_decider.push(question.clone()),
             Route::Resolver => routed.to_resolver.push(question.clone()),
@@ -229,8 +238,8 @@ pub fn left_for_decider(
 
 /// The refused choices a round reopens (OWL-203): those of `asked`, under
 /// the run's question ids, whose question the round asks, under its id in
-/// the round (`left`, from [`left_for_decider`]). A choice whose question
-/// the resolver decided is not the round's: its DECISION comment shows it.
+/// the round (`left`, from [`left_for_decider`]). Since OWL-222 the
+/// resolver is never given such a question, so each is the round's.
 pub fn reopened_in(
     left: &[(QuestionId, Question)],
     asked: &[ReopenedChoice],
@@ -261,7 +270,7 @@ pub fn reported(kept: &KeptDecision) -> Decision {
 
 #[cfg(test)]
 mod tests {
-    use owlshift_contracts::result::RunResult;
+    use owlshift_contracts::result::{RefusedChoice, RunResult};
     use owlshift_core::floor::FloorCategory;
     use owlshift_core::vocab::PlanApproval;
 
@@ -302,7 +311,7 @@ mod tests {
         ] {
             asked.push(question("Q1", category));
         }
-        let routed = route(&policy, &asked);
+        let routed = route(&policy, &asked, &[]);
         assert!(routed.to_resolver.is_empty(), "{:?}", routed.to_resolver);
         assert_eq!(routed.to_decider.len(), asked.len());
 
@@ -311,9 +320,47 @@ mod tests {
             question("Q2", "security"),
             question("Q3", "testing"),
         ];
-        let routed = route(&policy, &mixed);
+        let routed = route(&policy, &mixed, &[]);
         assert_eq!(ids(&routed.to_resolver), ["Q1", "Q3"]);
         assert_eq!(ids(&routed.to_decider), ["Q2"]);
+    }
+
+    /// A question the run names as reopening a refused choice goes to the
+    /// decider, even under a category the resolver may decide, the run's
+    /// other questions routed as before; a resolution on it is never logged,
+    /// since the resolver is not given it (OWL-222).
+    #[test]
+    fn a_question_that_reopens_a_refused_choice_goes_to_the_decider() {
+        let policy = GatePolicy::new(["billing"], PlanApproval::Never);
+        let asked = [
+            question("Q1", "naming"),
+            question("Q2", "testing"),
+            question("Q3", "security"),
+            question("Q4", "naming"),
+        ];
+        let reopened = |place: u32, id: &str| ReopenedChoice {
+            place: std::num::NonZeroU32::new(place).unwrap(),
+            question: QuestionId::new(id).unwrap(),
+            choice: RefusedChoice {
+                question: format!("choice {place}"),
+                recorded: "recorded".into(),
+            },
+        };
+        let reopened = [reopened(1, "Q4"), reopened(2, "Q1"), reopened(3, "Q4")];
+        let routed = route(&policy, &asked, &reopened);
+        assert_eq!(ids(&routed.to_resolver), ["Q2"]);
+        assert_eq!(ids(&routed.to_decider), ["Q1", "Q3", "Q4"]);
+
+        let decided = |id: &str| Resolution::Decided {
+            question: QuestionId::new(id).unwrap(),
+            category: "naming".into(),
+            decision: format!("decision on {id}"),
+            basis: "the ticket".into(),
+        };
+        let resolutions = [decided("Q1"), decided("Q2")];
+        let logged = decisions(&policy, &routed.to_resolver, &resolutions);
+        let logged: Vec<&str> = logged.iter().map(|(q, _, _)| q.id.as_str()).collect();
+        assert_eq!(logged, ["Q2"]);
     }
 
     /// A decision is logged only when Build's category and the resolver's

@@ -1056,7 +1056,9 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
 /// and the next Build run of the command is told why. Only that one: the run
 /// after it, once the resolver settled its question, and the resolver itself
 /// are not. A refusal of the build role's own decisions also holds that run
-/// to asking (`decisions_refused`, OWL-186), and it asks.
+/// to asking (`decisions_refused`, OWL-186), and it asks: its question
+/// reopens the refused choice, so it goes to the decider without the
+/// resolver (OWL-222).
 #[test]
 fn a_refused_result_is_told_to_the_next_build_run_only() {
     let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
@@ -1064,23 +1066,19 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
         r#""pr":"#,
         r#""decisions":[{"question":"Which file","decision":"GREETING.md","basis":"b"}],"pr":"#,
     );
-    for (first, decisions, asks) in [
-        (&misnumbered, false, NAMING.to_owned()),
-        (&decided, true, asking_refused(NAMING, 1)),
-    ] {
-        let bench = Bench::new(true);
-        let (outcome, printed) = bench.run(
-            vec![
-                bench.reply(None, Some(first)),
-                bench.reply(None, Some(&asks)),
-                bench.reply(None, Some(DECIDED_Q1)),
-                bench.reply(Some("Hello"), Some(DONE)),
-            ],
-            None,
-        );
-        outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-
-        let told: Vec<(Role, bool, bool)> = bench
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(&misnumbered)),
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let told = |bench: &Bench| -> Vec<(Role, bool, bool)> {
+        bench
             .briefs()
             .iter()
             .map(|brief| {
@@ -1090,43 +1088,30 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
                     brief.decisions_refused,
                 )
             })
-            .collect();
-        assert_eq!(
-            told,
-            [
-                (Role::Build, false, false),
-                (Role::Build, true, decisions),
-                (Role::Resolver, false, false),
-                (Role::Build, false, false),
-            ]
-        );
-        let started = data_of(&bench.events(), EventKind::RunStarted, "result_refusal");
-        let flags: Vec<&Value> = started.iter().map(|data| &data["result_refusal"]).collect();
-        assert_eq!(flags, [false, true, false, false]);
-    }
-}
+            .collect()
+    };
+    let flags = |bench: &Bench| -> Vec<Value> {
+        data_of(&bench.events(), EventKind::RunStarted, "result_refusal")
+            .iter()
+            .map(|data| data["result_refusal"].clone())
+            .collect()
+    };
+    assert_eq!(
+        told(&bench),
+        [
+            (Role::Build, false, false),
+            (Role::Build, true, false),
+            (Role::Resolver, false, false),
+            (Role::Build, false, false),
+        ]
+    );
+    assert_eq!(flags(&bench), [false, true, false, false]);
 
-/// OWL-203: a held retry asks both refused choices, Q1 for the first and
-/// Q2 for the second. The resolver decides Q1, so its DECISION comment
-/// shows the first choice, settled without the decider; the round renumbers
-/// Q2 as Q1, which shows the second. The events record both.
-#[test]
-fn a_reopened_choice_shows_where_it_went() {
     let bench = Bench::new(true);
-    let decided = DONE.replace(
-        r#""pr":"#,
-        r#""decisions":[{"question":"Which file","decision":"GREETING.md","basis":"b"},
-{"question":"Which words","decision":"Hello","basis":"b"}],"pr":"#,
-    );
-    let asks = format!(
-        r#"{},"refused_choices_asked":[{{"choice":1,"question":"Q1"}},{{"choice":2,"question":"Q2"}}]}}"#,
-        MIXED.strip_suffix('}').unwrap()
-    );
     let (stopped, printed) = bench.run(
         vec![
             bench.reply(None, Some(&decided)),
-            bench.reply(None, Some(&asks)),
-            bench.reply(None, Some(DECIDED_Q1)),
+            bench.reply(None, Some(&asking_refused(NAMING, 1))),
         ],
         None,
     );
@@ -1134,6 +1119,55 @@ fn a_reopened_choice_shows_where_it_went() {
         matches!(&stopped, Err(Stop::NeedsInput { posted: Ok(_), .. })),
         "{stopped:?}\n{printed}"
     );
+    assert_eq!(
+        told(&bench),
+        [(Role::Build, false, false), (Role::Build, true, true)]
+    );
+    assert_eq!(flags(&bench), [false, true]);
+}
+
+/// OWL-203 and OWL-222: a held retry asks both refused choices, Q1 for the
+/// first under a category the resolver may decide and Q2 for the second,
+/// and a third question of its own. Only Q3 reaches the resolver, which
+/// decides it in a DECISION comment that shows no choice; Q1 and Q2 go to
+/// the decider, each showing its choice in the round. The events record it.
+#[test]
+fn a_reopened_choice_goes_to_the_decider() {
+    let bench = Bench::new(true);
+    let decided = DONE.replace(
+        r#""pr":"#,
+        r#""decisions":[{"question":"Which file","decision":"GREETING.md","basis":"b"},
+{"question":"Which words","decision":"Hello","basis":"b"}],"pr":"#,
+    );
+    let asks = format!(
+        r#"{},
+  {{"id":"Q3","category":"naming","context":"The greeting has no heading yet.",
+   "text":"Which heading should the greeting use?"}}],
+"refused_choices_asked":[{{"choice":1,"question":"Q1"}},{{"choice":2,"question":"Q2"}}]}}"#,
+        MIXED.strip_suffix("]}").unwrap()
+    );
+    let decided_q3 = r#"{"format":7,"status":"done","summary":"The ticket names the heading.",
+"resolutions":[{"question":"Q3","outcome":"decided","category":"naming","decision":"Hello.",
+"basis":"The ticket's description."}]}"#;
+    let (stopped, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(&decided)),
+            bench.reply(None, Some(&asks)),
+            bench.reply(None, Some(decided_q3)),
+        ],
+        None,
+    );
+    assert!(
+        matches!(&stopped, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{stopped:?}\n{printed}"
+    );
+    let resolve: Vec<String> = bench
+        .briefs()
+        .iter()
+        .filter(|brief| brief.role == Role::Resolver)
+        .flat_map(|brief| brief.resolve.iter().map(|q| q.id.as_str().to_owned()))
+        .collect();
+    assert_eq!(resolve, ["Q3"]);
 
     let comments = bench.comments();
     let [decision, round] = &comments[comments.len() - 2..] else {
@@ -1147,32 +1181,40 @@ fn a_reopened_choice_shows_where_it_went() {
     };
     assert!(
         decision.starts_with("[owlshift] DECISION")
-            && decision.contains("Owlshift's resolver settled it here, not you.")
-            && decision.contains(&refused("Which file", "GREETING.md"))
-            && !decision.contains("Which words"),
+            && decision.contains("Which heading should the greeting use?")
+            && !decision.contains("Refused choice"),
         "{decision}"
     );
     assert!(
         round.starts_with("[owlshift] QUESTIONS · round 1")
             && round.contains(&format!(
-                "**Q1** (scope) What should the greeting say?\n\
+                "**Q1** (naming) Which file should hold the greeting?\n\
+                 The repository has no greeting yet.\n{}",
+                refused("Which file", "GREETING.md")
+            ))
+            && round.contains(&format!(
+                "**Q2** (scope) What should the greeting say?\n\
                  The ticket names neither the words nor the ending.\n{}",
                 refused("Which words", "Hello")
             ))
-            && !round.contains("Which file")
-            && !round.contains("**Q2**"),
+            && !round.contains("**Q3**"),
         "{round}"
     );
 
     let events = bench.events();
+    let resolved = data_of(&events, EventKind::Gate, "resolver");
+    assert_eq!(resolved.last().unwrap()["given"], json!(["Q3"]));
     let opened = data_of(&events, EventKind::Gate, "opened");
     assert_eq!(
         opened.last().unwrap()["reopened"],
-        json!([{ "choice": 2, "question": "Q1", "raised_as": "Q2" }])
+        json!([
+            { "choice": 1, "question": "Q1", "raised_as": "Q1" },
+            { "choice": 2, "question": "Q2", "raised_as": "Q2" }
+        ])
     );
     let written = data_of(&events, EventKind::TrackerWrite, "question");
     assert_eq!(written.len(), 1);
-    assert_eq!(written[0]["reopened"], json!([1]));
+    assert!(!written[0].as_object().unwrap().contains_key("reopened"));
 }
 
 /// OWL-192: a refusal of Build's decisions is kept in the ticket ref, made
@@ -1243,15 +1285,16 @@ fn a_decisions_refusal_is_told_across_commands() {
     assert_eq!(bench.record().questions.build_refusal, Some(kept));
     bench.refuse.set(None);
 
-    let (delivered, printed) = bench.run(
-        vec![
-            bench.reply(None, Some(&asking_refused(NAMING, 1))),
-            bench.reply(None, Some(DECIDED_Q1)),
-            bench.reply(Some("Hello"), Some(DONE)),
-        ],
+    // Its question reopens the refused choice: it goes to the decider,
+    // without the resolver (OWL-222).
+    let (asked, printed) = bench.run(
+        vec![bench.reply(None, Some(&asking_refused(NAMING, 1)))],
         None,
     );
-    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{asked:?}\n{printed}"
+    );
     let briefs = bench.briefs();
     let told: Vec<(Role, bool, bool)> = briefs
         .iter()
@@ -1271,8 +1314,6 @@ fn a_decisions_refusal_is_told_across_commands() {
             (Role::Build, true, true),
             (Role::Build, true, true),
             (Role::Build, true, true),
-            (Role::Resolver, false, false),
-            (Role::Build, false, false),
         ]
     );
     let after_park = briefs[4].result_refusal.as_deref().unwrap();
