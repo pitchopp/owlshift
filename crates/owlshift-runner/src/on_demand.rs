@@ -3963,7 +3963,14 @@ impl OnDemand<'_> {
             },
             checks,
             gate,
-            decisions: questions.decisions.iter().map(resolver::reported).collect(),
+            decisions: questions
+                .decisions
+                .iter()
+                .map(|kept| {
+                    let corrected = correction.as_ref().map_or(&[][..], |c| &c.questions[..]);
+                    resolver::reported_reversing(kept, corrected)
+                })
+                .collect(),
             followups,
             fix_pass,
             rebase,

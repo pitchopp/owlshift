@@ -246,6 +246,7 @@ impl OnDemand<'_> {
             })?;
         let checks = self.forge.checks(pull_request.number, pushed);
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
+        let corrected = question_texts(&p.questions(), reversed);
         let report = DeliveryReport {
             ticket: ticket.clone(),
             summary: done.repaired.summary,
@@ -256,13 +257,13 @@ impl OnDemand<'_> {
                 .questions()
                 .decisions
                 .iter()
-                .map(resolver::reported)
+                .map(|kept| resolver::reported_reversing(kept, &corrected))
                 .collect(),
             followups,
             fix_pass: None,
             rebase: None,
             correction: Some(Corrected {
-                questions: question_texts(&p.questions(), reversed),
+                questions: corrected.clone(),
                 pushed: false,
             }),
         };

@@ -5770,6 +5770,12 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
         "{report}"
     );
     assert!(!report.contains("Fix pass"), "{report}");
+    // The decision the reply reverses is listed as reversed in this very
+    // report, before the durable mark moves (OWL-233).
+    assert!(
+        report.contains("GREETING.md, at the root. (reversed by the decider's reply)"),
+        "{report}"
+    );
 
     // The decision keeps the reply as followed; the state counts nothing.
     let record = bench.record();

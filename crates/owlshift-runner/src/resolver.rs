@@ -261,11 +261,21 @@ pub fn reopened_in(
 /// A kept decision as the delivery report lists it, among the decisions
 /// taken without a human; one the decider reversed says so (OWL-146).
 pub fn reported(kept: &KeptDecision) -> Decision {
+    reported_reversing(kept, &[])
+}
+
+/// [`reported`], for the report of a correction: a decision whose question
+/// is among `corrected`, the questions the correction follows the replies
+/// to, says it was reversed although the ticket's ref marks it only once the
+/// push has landed (OWL-233). Nothing is written: the mark keeps its timing.
+pub fn reported_reversing(kept: &KeptDecision, corrected: &[String]) -> Decision {
+    let reversed = kept.reversed.is_some() || corrected.contains(&kept.question.text);
     Decision {
         question: kept.question.text.clone(),
-        decision: match kept.reversed {
-            Some(_) => format!("{} (reversed by the decider's reply)", kept.decision),
-            None => kept.decision.clone(),
+        decision: if reversed {
+            format!("{} (reversed by the decider's reply)", kept.decision)
+        } else {
+            kept.decision.clone()
         },
         basis: kept.basis.clone(),
     }
