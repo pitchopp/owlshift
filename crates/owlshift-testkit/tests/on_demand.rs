@@ -5198,8 +5198,9 @@ fn a_fix_report_the_tracker_refused_is_posted_at_the_next_pass_once() {
     bench.refuse.set(Some("[owlshift] DELIVERY"));
     let mut owing = None;
     let mut pass = 0;
-    let (outcomes, lines, printed) =
-        bench.watch(vec![bench.reply(Some("Hello again"), Some(FIXED))], &mut |_| {
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        &mut |_| {
             pass += 1;
             match pass {
                 1 => {
@@ -5219,7 +5220,8 @@ fn a_fix_report_the_tracker_refused_is_posted_at_the_next_pass_once() {
                 _ => {}
             }
             pass < 3
-        });
+        },
+    );
     assert!(
         matches!(&outcomes[..], [Err(Stop::Delivery(why))] if why.contains("the next pass posts it")),
         "{outcomes:?}\n{lines}\n{printed}"
@@ -5306,7 +5308,14 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
     let fix = env
         .run(
             &bare,
-            &["commit-tree", &format!("{tip}^{{tree}}"), "-p", &tip, "-m", "Fix"],
+            &[
+                "commit-tree",
+                &format!("{tip}^{{tree}}"),
+                "-p",
+                &tip,
+                "-m",
+                "Fix",
+            ],
         )
         .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
         .unwrap();

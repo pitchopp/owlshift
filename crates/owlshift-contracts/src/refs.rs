@@ -1110,7 +1110,10 @@ impl TicketDelivery {
             .get("pushing")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|pushing| pushing.contains_key("report"));
-        for (field, kept) in [("owed", fields.contains_key("owed")), ("pushing.report", report)] {
+        for (field, kept) in [
+            ("owed", fields.contains_key("owed")),
+            ("pushing.report", report),
+        ] {
             if kept {
                 return Some(Err(ContractError::invalid(
                     Self::CONTRACT,

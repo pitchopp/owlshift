@@ -2311,7 +2311,9 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
         ("a delivery's push with a report", |v| {
             v["pushing"]["kind"] = json!("delivery")
         }),
-        ("owed for a delivery", |v| v["owed"]["kind"] = json!("delivery")),
+        ("owed for a delivery", |v| {
+            v["owed"]["kind"] = json!("delivery")
+        }),
         ("owed pass 0", |v| v["owed"]["count"] = json!(0)),
         ("owed with nothing pushed", |v| {
             v.as_object_mut().unwrap().remove("pushed");
@@ -2337,7 +2339,11 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     })
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
-    assert!(older.render().contains("\"format\": 2"), "{}", older.render());
+    assert!(
+        older.render().contains("\"format\": 2"),
+        "{}",
+        older.render()
+    );
     let newer: [(&str, Edit); 2] = [
         ("owed", |v| {
             v["format"] = json!(1);

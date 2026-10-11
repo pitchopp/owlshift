@@ -3786,7 +3786,7 @@ impl OnDemand<'_> {
                 );
                 return Err(Stop::Delivery(format!(
                     "the {what} {commit} was pushed, but its pull request could not be read at \
-                     it: {reason}; watch adopts the push at its next read, and no report is posted"
+                     it: {reason}; watch adopts the push at its next read and posts its report then"
                 )));
             }
         };

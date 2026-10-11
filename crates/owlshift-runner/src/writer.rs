@@ -214,7 +214,10 @@ impl DeliveryReport {
                 )
             })
         };
-        let pull_request = format!("**Pull request:** {pr_link}, head {}", code(short(&pr.head)));
+        let pull_request = format!(
+            "**Pull request:** {pr_link}, head {}",
+            code(short(&pr.head))
+        );
         (repair, pull_request)
     }
 
@@ -1502,7 +1505,10 @@ impl<'a> Writer<'a> {
         let (repair, pull_request) = report.lead_lines();
         let names = |body: &str| {
             let lines: Vec<&str> = body.lines().collect();
-            repair.iter().chain([&pull_request]).all(|line| lines.contains(&line.as_str()))
+            repair
+                .iter()
+                .chain([&pull_request])
+                .all(|line| lines.contains(&line.as_str()))
         };
         let posted = self
             .tracker
@@ -2893,11 +2899,17 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             Mergeable::Mergeable,
             vec![check("ci", CheckState::Passed, "SUCCESS", false)],
         )));
-        assert_eq!(writer.post_repair_report(&fix(green.clone(), 1)).unwrap(), posted);
+        assert_eq!(
+            writer.post_repair_report(&fix(green.clone(), 1)).unwrap(),
+            posted
+        );
         assert_eq!(tracker.posts.get(), 2);
         // The delivery's own report, or another pass, is another push's.
         writer.post_delivery_report(&green).unwrap();
-        assert_ne!(writer.post_repair_report(&fix(green.clone(), 2)).unwrap(), posted);
+        assert_ne!(
+            writer.post_repair_report(&fix(green.clone(), 2)).unwrap(),
+            posted
+        );
         let mut moved = fix(green, 1);
         moved.pull_request.head = CommitId::new("b".repeat(40)).unwrap();
         assert_ne!(writer.post_repair_report(&moved).unwrap(), posted);
