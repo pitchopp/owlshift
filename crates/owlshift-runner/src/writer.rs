@@ -186,12 +186,14 @@ impl DeliveryReport {
                 .collect();
             sections.push(if correction.pushed {
                 format!(
-                    "**Corrected after delivery,** to follow the decider's replies to the                      decisions on {}.",
+                    "**Corrected after delivery,** to follow the decider's replies to the \
+                     decisions on {}.",
                     questions.join(", ")
                 )
             } else {
                 format!(
-                    "**No correction needed after delivery:** the pull request already follows                      the decider's replies to the decisions on {}, and nothing was pushed.",
+                    "**No correction needed after delivery:** the pull request already follows \
+                     the decider's replies to the decisions on {}, and nothing was pushed.",
                     questions.join(", ")
                 )
             });
