@@ -2279,7 +2279,8 @@ fn a_build_refusal_is_told_within_the_cap() {
 
 /// OWL-209: `delivery.json` reads back as written, and is refused when a
 /// commit is not a full id, a branch could not be pushed or leased, the link
-/// is not https, or an ended delivery still pushes.
+/// is not https, or an ended delivery still pushes; OWL-218: or a report is
+/// kept or owed where none can be.
 #[test]
 fn a_ticket_delivery_round_trips_and_is_checked() {
     let delivery = round_trip(
@@ -2291,7 +2292,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     assert_eq!(delivery.pushing.as_ref().unwrap().kind, PushKind::Fix);
     let parse = |edit: fn(&mut Value)| TicketDelivery::parse(&edited("ticket-delivery.json", edit));
     type Edit = fn(&mut Value);
-    let refused: [(&str, Edit); 7] = [
+    let refused: [(&str, Edit); 12] = [
         ("short commit", |v| v["pushed"] = json!("abc")),
         ("upper-case commit", |v| {
             v["pushing"]["base"] = json!("A".repeat(40))
@@ -2307,9 +2308,48 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
             v["ended"] = json!({ "why": "merged", "at": "2026-10-11T12:00:00Z" })
         }),
         ("unknown field", |v| v["extra"] = json!(true)),
+        ("a delivery's push with a report", |v| {
+            v["pushing"]["kind"] = json!("delivery")
+        }),
+        ("owed for a delivery", |v| v["owed"]["kind"] = json!("delivery")),
+        ("owed pass 0", |v| v["owed"]["count"] = json!(0)),
+        ("owed with nothing pushed", |v| {
+            v.as_object_mut().unwrap().remove("pushed");
+        }),
+        ("owed rebase with no base", |v| {
+            v.as_object_mut().unwrap().remove("rebased_onto");
+        }),
     ];
     for (case, edit) in refused {
         assert!(parse(edit).is_err(), "{case}");
+    }
+    let owed = delivery.owed.as_ref().unwrap();
+    assert_eq!((owed.kind, owed.count), (PushKind::Rebase, 1));
+    let kept = delivery.pushing.as_ref().unwrap().report.as_ref().unwrap();
+    assert_eq!(kept.gate.as_deref(), Some(&["cargo test".to_owned()][..]));
+    // OWL-218: a format-1 document, written before the owed and kept
+    // reports, is read without them and written back as format 2; one
+    // that carries either is refused.
+    let older = parse(|v| {
+        v["format"] = json!(1);
+        v.as_object_mut().unwrap().remove("owed");
+        v["pushing"].as_object_mut().unwrap().remove("report");
+    })
+    .unwrap();
+    assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
+    assert!(older.render().contains("\"format\": 2"), "{}", older.render());
+    let newer: [(&str, Edit); 2] = [
+        ("owed", |v| {
+            v["format"] = json!(1);
+            v["pushing"].as_object_mut().unwrap().remove("report");
+        }),
+        ("pushing.report", |v| {
+            v["format"] = json!(1);
+            v.as_object_mut().unwrap().remove("owed");
+        }),
+    ];
+    for (field, edit) in newer {
+        rejects(field, parse(edit), &format!("format 1 keeps no {field}"));
     }
     let ended = parse(|v| {
         v.as_object_mut().unwrap().remove("pushing");

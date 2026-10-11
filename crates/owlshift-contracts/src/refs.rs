@@ -23,7 +23,9 @@ use crate::format::{
     TICKET_STATE_FORMAT,
 };
 use crate::ids::TicketId;
-use crate::result::{self, DECISIONS_ADVICE, Question, RefusedChoice, Verdict, check_verdicts};
+use crate::result::{
+    self, DECISIONS_ADVICE, Followup, Question, RefusedChoice, Verdict, check_verdicts,
+};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -958,6 +960,11 @@ pub struct TicketDelivery {
     /// A push under way, until the forge shows it as the head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pushing: Option<Pushing>,
+    /// The DELIVERY report of `pushed`, a fix or rebase run's push that
+    /// landed, while it is not on the ticket yet (OWL-218): the next pass
+    /// posts it, once. Since format 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owed: Option<OwedReport>,
     /// Why and when watch stopped following the pull request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<Ended>,
@@ -985,6 +992,46 @@ pub struct Pushing {
     /// `rebased_onto` once the push lands or is adopted (OWL-210).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onto: Option<String>,
+    /// What a fix or rebase run's DELIVERY report says, kept before the push
+    /// so a push a crash cut short is still reported once adopted (OWL-218).
+    /// Since format 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<KeptReport>,
+}
+
+/// What a fix or rebase run gave its DELIVERY report (OWL-218).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeptReport {
+    /// The run's `summary`.
+    pub summary: String,
+    /// The project gate's commands, all passed, as the run's gate ran them;
+    /// absent when no gate result was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<Vec<String>>,
+    /// For a fix run, the failed checks it was given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    /// The follow-ups the run proposed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followups: Vec<Followup>,
+}
+
+/// A DELIVERY report still to be posted for the delivery's `pushed`
+/// commit, a fix or rebase run's push (OWL-218). The commit, and for a
+/// rebase the base it rebased onto, are the delivery's `pushed` and
+/// `rebased_onto`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OwedReport {
+    /// `fix` or `rebase`.
+    pub kind: PushKind,
+    /// The fix pass or the repair the push was, from 1.
+    pub count: u32,
+    /// What the run gave its report; absent for a push adopted from a ref
+    /// that kept none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<KeptReport>,
 }
 
 /// Which run's push.
@@ -1033,14 +1080,51 @@ impl TicketDelivery {
             base_at_push: None,
             rebased_onto: None,
             pushing: None,
+            owed: None,
             ended: None,
         }
     }
 
+    /// Parses a `delivery.json`. A format-1 one, written before the owed
+    /// report and the kept report were kept (OWL-218), is read without
+    /// them, and the next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let delivery: Self = format::parse_json(Self::CONTRACT, DELIVERY_FORMAT, input)?;
+        let delivery: Self = match Self::from_older_format(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, DELIVERY_FORMAT, input)?,
+        };
         delivery.validate()?;
         Ok(delivery)
+    }
+
+    /// A format-1 document read as the current format, or `None` for any
+    /// other. Format 1 is format 2 without `owed` and `pushing.report`, so
+    /// either is refused in it.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        let fields = document.as_object_mut()?;
+        if fields.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        let report = fields
+            .get("pushing")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|pushing| pushing.contains_key("report"));
+        for (field, kept) in [("owed", fields.contains_key("owed")), ("pushing.report", report)] {
+            if kept {
+                return Some(Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!("format 1 keeps no {field}"),
+                )));
+            }
+        }
+        fields.insert("format".to_owned(), DELIVERY_FORMAT.into());
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {
@@ -1054,8 +1138,10 @@ impl TicketDelivery {
 
     /// Checks the commits are full ids, the branches git branch names, the
     /// link a plain `https://` URL, that a push under way names its `onto`
-    /// exactly when it is a rebase's, and that an ended delivery pushes
-    /// nothing.
+    /// exactly when it is a rebase's and keeps a report only for a fix or a
+    /// rebase, that an owed report is a fix's or a rebase's, from 1, of a
+    /// pushed commit with its pull request (and for a rebase its base), and
+    /// that an ended delivery pushes nothing.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
         for (field, branch) in [("branch", &self.branch), ("base_branch", &self.base_branch)] {
@@ -1106,6 +1192,28 @@ impl TicketDelivery {
             return invalid(
                 "a push under way names its onto if and only if it is a rebase's".to_owned(),
             );
+        }
+        if let Some(pushing) = &self.pushing
+            && pushing.kind == PushKind::Delivery
+            && pushing.report.is_some()
+        {
+            return invalid("a delivery's push keeps no fix or rebase report".to_owned());
+        }
+        if let Some(owed) = &self.owed {
+            if owed.kind == PushKind::Delivery {
+                return invalid("an owed report is a fix's or a rebase's".to_owned());
+            }
+            if owed.count == 0 {
+                return invalid("an owed report counts from 1".to_owned());
+            }
+            if self.pushed.is_none() || self.pull_request.is_none() {
+                return invalid(
+                    "an owed report needs the pushed commit and its pull request".to_owned(),
+                );
+            }
+            if owed.kind == PushKind::Rebase && self.rebased_onto.is_none() {
+                return invalid("an owed rebase report needs rebased_onto".to_owned());
+            }
         }
         if self.ended.is_some() && self.pushing.is_some() {
             return invalid("an ended delivery has a push under way".to_owned());
