@@ -28,6 +28,7 @@ use owlshift_contracts::result::{Decision, Question, Resolution, Status};
 use owlshift_core::gate::{GatePolicy, Route};
 
 use crate::executor::Outcome;
+use crate::writer::ReopenedChoice;
 
 /// The executor's deadline for a resolver run: a short role, like the answer
 /// check, that reads what it needs and decides.
@@ -222,6 +223,28 @@ pub fn left_for_decider(
                 ..question.clone()
             };
             (question.id.clone(), renumbered)
+        })
+        .collect()
+}
+
+/// The refused choices a round reopens (OWL-203): those of `asked`, under
+/// the run's question ids, whose question the round asks, under its id in
+/// the round (`left`, from [`left_for_decider`]). A choice whose question
+/// the resolver decided is not the round's: its DECISION comment shows it.
+pub fn reopened_in(
+    left: &[(QuestionId, Question)],
+    asked: &[ReopenedChoice],
+) -> Vec<ReopenedChoice> {
+    asked
+        .iter()
+        .filter_map(|reopened| {
+            let (_, question) = left
+                .iter()
+                .find(|(raised, _)| *raised == reopened.question)?;
+            Some(ReopenedChoice {
+                question: question.id.clone(),
+                ..reopened.clone()
+            })
         })
         .collect()
 }
