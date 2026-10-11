@@ -161,51 +161,13 @@ impl DeliveryReport {
             round: None,
         };
         let mut sections = vec![header.render()];
-        if let Some(fix) = &self.fix_pass {
-            let checks: Vec<String> = fix.checks.iter().map(|c| code(&flatten(c))).collect();
-            sections.push(format!(
-                "**Fix pass {} of {MAX_FIX_PASSES} after delivery,** for the red checks {}.",
-                fix.pass,
-                checks.join(", ")
-            ));
-        }
-        if let Some(rebase) = &self.rebase {
-            sections.push(format!(
-                "**Rebased onto {} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
-                 branch's history was replaced, leased on Owlshift's last push.",
-                code(&flatten(&rebase.base_branch)),
-                code(short(&rebase.onto)),
-                rebase.repair
-            ));
-        }
-        if let Some(correction) = &self.correction {
-            let questions: Vec<String> = correction
-                .questions
-                .iter()
-                .map(|q| format!("**{}**", flatten(q)))
-                .collect();
-            sections.push(if correction.pushed {
-                format!(
-                    "**Corrected after delivery,** to follow the decider's replies to the \
-                     decisions on {}.",
-                    questions.join(", ")
-                )
-            } else {
-                format!(
-                    "**No correction needed after delivery:** the pull request already follows \
-                     the decider's replies to the decisions on {}, and nothing was pushed.",
-                    questions.join(", ")
-                )
-            });
-        }
+        let (repair, pull_request) = self.lead_lines();
+        sections.extend(repair);
         let summary = flatten(&self.summary);
         if !summary.is_empty() {
             sections.push(summary);
         }
-        sections.push(format!(
-            "**Pull request:** {pr_link}, head {}",
-            code(short(&pr.head))
-        ));
+        sections.push(pull_request);
         sections.push(self.checks_section(&mut remains));
         sections.push(self.gate_section());
         sections.push(self.decisions_section());
@@ -232,6 +194,70 @@ impl DeliveryReport {
         let mut body = sections.join("\n\n");
         body.push('\n');
         body
+    }
+
+    /// The lines that tell which push the report is of: the fix pass, the
+    /// rebase or the correction line (OWL-146) when there is one, and the
+    /// pull request line with its head. Two reports with the same are of the same push (OWL-218).
+    fn lead_lines(&self) -> (Option<String>, String) {
+        let pr = &self.pull_request;
+        let pr_link = link(&format!("#{}", pr.number), &pr.url);
+        let repair = if let Some(fix) = &self.fix_pass {
+            let checks: Vec<String> = fix.checks.iter().map(|c| code(&flatten(c))).collect();
+            // A push adopted from a ref that kept no report names no checks.
+            Some(if checks.is_empty() {
+                format!(
+                    "**Fix pass {} of {MAX_FIX_PASSES} after delivery.**",
+                    fix.pass
+                )
+            } else {
+                format!(
+                    "**Fix pass {} of {MAX_FIX_PASSES} after delivery,** for the red checks {}.",
+                    fix.pass,
+                    checks.join(", ")
+                )
+            })
+        } else if let Some(rebase) = &self.rebase {
+            Some(format!(
+                "**Rebased onto {} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
+                 branch's history was replaced, leased on Owlshift's last push.",
+                code(&flatten(&rebase.base_branch)),
+                code(short(&rebase.onto)),
+                rebase.repair
+            ))
+        } else {
+            self.correction.as_ref().map(|correction| {
+                let questions: Vec<String> = correction
+                    .questions
+                    .iter()
+                    .map(|q| format!("**{}**", flatten(q)))
+                    .collect();
+                // A push adopted from a ref that kept no report names no
+                // question.
+                let on = if questions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" on {}", questions.join(", "))
+                };
+                if correction.pushed {
+                    format!(
+                        "**Corrected after delivery,** to follow the decider's replies to the \
+                         decisions{on}."
+                    )
+                } else {
+                    format!(
+                        "**No correction needed after delivery:** the pull request already \
+                         follows the decider's replies to the decisions{on}, and nothing was \
+                         pushed."
+                    )
+                }
+            })
+        };
+        let pull_request = format!(
+            "**Pull request:** {pr_link}, head {}",
+            code(short(&pr.head))
+        );
+        (repair, pull_request)
     }
 
     fn checks_section(&self, remains: &mut Vec<String>) -> String {
@@ -504,6 +530,32 @@ pub struct QuestionsComment {
     pub reopened: Vec<ReopenedChoice>,
 }
 
+/// What follows "Part k of n of this round:" in a part of a split round.
+const PART_NOTE: &str = " its questions are longer than a comment holds.";
+
+fn part_line(k: usize, n: usize) -> String {
+    format!("Part {k} of {n} of this round:")
+}
+
+/// Whether `body` (a marked QUESTIONS comment) is a part of a split round
+/// other than the last, as [`QuestionsComment::parts`] writes it: the first
+/// line after the header reads "Part k of n of this round:" with k < n.
+pub(crate) fn is_earlier_part(body: &str) -> bool {
+    let Some(line) = body.lines().skip(1).find(|line| !line.is_empty()) else {
+        return false;
+    };
+    let Some(rest) = line.strip_prefix("Part ") else {
+        return false;
+    };
+    let Some((k, rest)) = rest.split_once(" of ") else {
+        return false;
+    };
+    let Some((n, _)) = rest.split_once(" of this round:") else {
+        return false;
+    };
+    matches!((k.parse::<usize>(), n.parse::<usize>()), (Ok(k), Ok(n)) if k < n)
+}
+
 impl QuestionsComment {
     /// The comment body: the `[owlshift] QUESTIONS · round N` header, the
     /// run's summary, what the resolver decided or why it did not, that
@@ -578,9 +630,7 @@ impl QuestionsComment {
         };
         let mut all = vec![header.render()];
         if let Some((k, n)) = part {
-            all.push(format!(
-                "Part {k} of {n} of this round: its questions are longer than a comment holds."
-            ));
+            all.push(format!("{}{PART_NOTE}", part_line(k, n)));
         }
         all.extend(sections);
         if last {
@@ -1505,6 +1555,37 @@ impl<'a> Writer<'a> {
         }
         self.tracker
             .post_comment(&report.ticket, &body)
+            .map_err(WriteError::Tracker)
+    }
+
+    /// Posts a fix, rebase or correction run's delivery report once
+    /// (OWL-218, OWL-146): when a delivery report on the ticket already
+    /// names the same fix pass, rebase or correction and the same pull
+    /// request head, that comment is returned and
+    /// nothing is posted, whatever its checks said then. A report posted
+    /// before a crash kept it as posted is thus never posted again, and a
+    /// pass after it never posts a newer body of the same push.
+    pub fn post_repair_report(&self, report: &DeliveryReport) -> Result<Comment, WriteError> {
+        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        let (repair, pull_request) = report.lead_lines();
+        let names = |body: &str| {
+            let lines: Vec<&str> = body.lines().collect();
+            repair
+                .iter()
+                .chain([&pull_request])
+                .all(|line| lines.contains(&line.as_str()))
+        };
+        let posted = self
+            .tracker
+            .comments(&report.ticket)
+            .map_err(WriteError::Tracker)?
+            .into_iter()
+            .find(|comment| is_delivery(&comment.body) && names(&comment.body));
+        if let Some(posted) = posted {
+            return Ok(posted);
+        }
+        self.tracker
+            .post_comment(&report.ticket, &report.render())
             .map_err(WriteError::Tracker)
     }
 
@@ -2860,5 +2941,45 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         assert!(matches!(error, WriteError::Tracker(_)), "{error}");
         assert_eq!(error.to_string(), "tracker: tracker down");
         assert_eq!(tracker.posts.get(), 4);
+    }
+
+    /// OWL-218: a fix or rebase report is posted once per push, whatever
+    /// its checks say by the next try; another pass or head is posted.
+    #[test]
+    fn the_writer_posts_a_repair_report_once_per_push() {
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker);
+        let pending = report(Ok(set(
+            Mergeable::Mergeable,
+            vec![check("ci", CheckState::Pending, "QUEUED", false)],
+        )));
+        let fix = |mut report: DeliveryReport, pass| {
+            report.fix_pass = Some(FixPass {
+                pass,
+                checks: vec!["ci".to_owned()],
+            });
+            report
+        };
+        let posted = writer.post_repair_report(&fix(pending.clone(), 1)).unwrap();
+        tracker.post_comment(&ticket(), "A human comment.").unwrap();
+        let green = report(Ok(set(
+            Mergeable::Mergeable,
+            vec![check("ci", CheckState::Passed, "SUCCESS", false)],
+        )));
+        assert_eq!(
+            writer.post_repair_report(&fix(green.clone(), 1)).unwrap(),
+            posted
+        );
+        assert_eq!(tracker.posts.get(), 2);
+        // The delivery's own report, or another pass, is another push's.
+        writer.post_delivery_report(&green).unwrap();
+        assert_ne!(
+            writer.post_repair_report(&fix(green.clone(), 2)).unwrap(),
+            posted
+        );
+        let mut moved = fix(green, 1);
+        moved.pull_request.head = CommitId::new("b".repeat(40)).unwrap();
+        assert_ne!(writer.post_repair_report(&moved).unwrap(), posted);
+        assert_eq!(tracker.posts.get(), 5);
     }
 }

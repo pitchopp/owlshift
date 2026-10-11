@@ -2370,7 +2370,8 @@ fn a_build_refusal_is_told_within_the_cap() {
 
 /// OWL-209: `delivery.json` reads back as written, and is refused when a
 /// commit is not a full id, a branch could not be pushed or leased, the link
-/// is not https, or an ended delivery still pushes.
+/// is not https, or an ended delivery still pushes; OWL-218: or a report is
+/// kept or owed where none can be.
 #[test]
 fn a_ticket_delivery_round_trips_and_is_checked() {
     let delivery = round_trip(
@@ -2382,7 +2383,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     assert_eq!(delivery.pushing.as_ref().unwrap().kind, PushKind::Fix);
     let parse = |edit: fn(&mut Value)| TicketDelivery::parse(&edited("ticket-delivery.json", edit));
     type Edit = fn(&mut Value);
-    let refused: [(&str, Edit); 7] = [
+    let refused: [(&str, Edit); 12] = [
         ("short commit", |v| v["pushed"] = json!("abc")),
         ("upper-case commit", |v| {
             v["pushing"]["base"] = json!("A".repeat(40))
@@ -2398,9 +2399,54 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
             v["ended"] = json!({ "why": "merged", "at": "2026-10-11T12:00:00Z" })
         }),
         ("unknown field", |v| v["extra"] = json!(true)),
+        ("a delivery's push with a report", |v| {
+            v["pushing"]["kind"] = json!("delivery")
+        }),
+        ("owed for a delivery", |v| {
+            v["owed"]["kind"] = json!("delivery")
+        }),
+        ("owed pass 0", |v| v["owed"]["count"] = json!(0)),
+        ("owed with nothing pushed", |v| {
+            v.as_object_mut().unwrap().remove("pushed");
+        }),
+        ("owed rebase with no base", |v| {
+            v.as_object_mut().unwrap().remove("rebased_onto");
+        }),
     ];
     for (case, edit) in refused {
         assert!(parse(edit).is_err(), "{case}");
+    }
+    let owed = delivery.owed.as_ref().unwrap();
+    assert_eq!((owed.kind, owed.count), (PushKind::Rebase, 1));
+    let kept = delivery.pushing.as_ref().unwrap().report.as_ref().unwrap();
+    assert_eq!(kept.gate.as_deref(), Some(&["cargo test".to_owned()][..]));
+    // OWL-218: a format-1 document, written before the owed and kept
+    // reports, is read without them and written back as the current
+    // format; one that carries either is refused.
+    let older = parse(|v| {
+        v["format"] = json!(1);
+        v.as_object_mut().unwrap().remove("owed");
+        v["pushing"].as_object_mut().unwrap().remove("report");
+    })
+    .unwrap();
+    assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
+    assert!(
+        older.render().contains("\"format\": 3"),
+        "{}",
+        older.render()
+    );
+    let newer: [(&str, Edit); 2] = [
+        ("owed", |v| {
+            v["format"] = json!(1);
+            v["pushing"].as_object_mut().unwrap().remove("report");
+        }),
+        ("pushing.report", |v| {
+            v["format"] = json!(1);
+            v.as_object_mut().unwrap().remove("owed");
+        }),
+    ];
+    for (field, edit) in newer {
+        rejects(field, parse(edit), &format!("format 1 keeps no {field}"));
     }
     let ended = parse(|v| {
         v.as_object_mut().unwrap().remove("pushing");
@@ -2412,21 +2458,51 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert_eq!(ended.ended.as_ref().unwrap().why, EndedWhy::HeadMoved);
     assert!(!ended.followed());
-    // A format-1 document, written before a correction's push (OWL-146),
-    // is read as format 2; a correction's push is refused in it.
-    let older = parse(|v| v["format"] = json!(1)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 2,"));
-    assert!(
-        parse(|v| {
-            v["format"] = json!(1);
+    // OWL-146: a format-2 document, written before a correction's push, is
+    // read as format 3; a correction's push or report is refused in it, as
+    // in format 1. Format 3 keeps one, whose report names its questions,
+    // and only a correction's report does.
+    let older = parse(|v| v["format"] = json!(2)).unwrap();
+    assert!(older.render().starts_with("{\n  \"format\": 3,"));
+    let refused: [(&str, Edit); 3] = [
+        ("correction's push", |v| {
+            v["format"] = json!(2);
             v["pushing"]["kind"] = json!("correction");
-        })
-        .unwrap_err()
-        .to_string()
-        .contains("format 1 keeps no correction's push")
-    );
-    let correction = parse(|v| v["pushing"]["kind"] = json!("correction")).unwrap();
+        }),
+        ("correction's report", |v| {
+            v["format"] = json!(2);
+            v["owed"]["report"]["questions"] = json!(["Which file?"]);
+        }),
+        ("correction's push", |v| {
+            v["format"] = json!(2);
+            v["owed"]["kind"] = json!("correction");
+        }),
+    ];
+    for (field, edit) in refused {
+        rejects(field, parse(edit), &format!("format 2 keeps no {field}"));
+    }
+    let correction = parse(|v| {
+        v["pushing"]["kind"] = json!("correction");
+        v["pushing"]["report"]["checks"] = json!([]);
+        v["pushing"]["report"]["questions"] = json!(["Which file should hold the greeting?"]);
+    })
+    .unwrap();
     assert_eq!(correction.pushing.unwrap().kind, PushKind::Correction);
+    let unnamed: [(&str, Edit); 2] = [
+        ("a correction's report without questions", |v| {
+            v["pushing"]["kind"] = json!("correction");
+        }),
+        ("a fix's report with questions", |v| {
+            v["pushing"]["report"]["questions"] = json!(["Which file?"]);
+        }),
+    ];
+    for (case, edit) in unnamed {
+        rejects(
+            case,
+            parse(edit),
+            "a report names questions if and only if it is a correction's",
+        );
+    }
     // A first delivery's push is under way before its pull request exists.
     let first = TicketDelivery::new("owlshift/demo-1", "main");
     assert_eq!(TicketDelivery::parse(&first.render()).unwrap(), first);

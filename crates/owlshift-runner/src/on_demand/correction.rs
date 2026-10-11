@@ -118,21 +118,9 @@ impl OnDemand<'_> {
         {
             let commit = CommitId::new(pushing.commit.as_str())
                 .map_err(|e| refused("the commit under way", e))?;
-            let repaired = Repaired {
-                commit,
-                summary: "The correction run's commit, whose push had no answer, pushed again."
-                    .to_owned(),
-                gate: Gate::NotRecorded,
-            };
+            let (repaired, followups) = Repaired::again(commit, pushing, "correction");
             return self.push_correction(
-                p,
-                &delivery,
-                &pushed_id,
-                repaired,
-                state,
-                Vec::new(),
-                &reversed,
-                sink,
+                p, &delivery, &pushed_id, repaired, state, followups, &reversed, sink,
             );
         }
         if reversed.is_empty() {

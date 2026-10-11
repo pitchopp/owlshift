@@ -1022,6 +1022,7 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         kind: owlshift_contracts::refs::PushKind::Delivery,
         base: bench.remote_main(),
         onto: None,
+        report: None,
     });
     cut.delivery = Some(pushing);
     bench.write_record(&cut);
@@ -5179,6 +5180,186 @@ fn a_persons_push_during_a_fix_run_ends_the_following() {
     assert_eq!(ended.why, owlshift_contracts::refs::EndedWhy::HeadMoved);
 }
 
+/// The DELIVERY reports on the ticket.
+fn reports(bench: &Bench) -> Vec<String> {
+    bench
+        .comments()
+        .into_iter()
+        .filter(|c| c.starts_with("[owlshift] DELIVERY"))
+        .collect()
+}
+
+/// The fix pass line of a report naming the red check `ci`.
+const FIX_PASS_1: &str = "**Fix pass 1 of 2 after delivery,** for the red checks `ci`.";
+
+/// OWL-218's acceptance: the tracker refuses the DELIVERY report of a fix
+/// run whose push landed; the ref keeps it owed, and watch's next pass
+/// posts it, once. A crash after that post, before the ref kept it as
+/// posted, is told by the report on the ticket: the pass after it posts
+/// nothing.
+#[test]
+fn a_fix_report_the_tracker_refused_is_posted_at_the_next_pass_once() {
+    let bench = delivered();
+    let delivered_events = bench.events().len();
+    let github = bench.github.clone();
+    github.followed.lock().unwrap().conclusion = "FAILURE";
+    bench.refuse.set(Some("[owlshift] DELIVERY"));
+    let mut owing = None;
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        &mut |_| {
+            pass += 1;
+            match pass {
+                1 => {
+                    let record = bench.record();
+                    assert!(record.delivery.as_ref().unwrap().owed.is_some());
+                    owing = Some(record);
+                    bench.refuse.set(None);
+                    github.followed.lock().unwrap().conclusion = "SUCCESS";
+                }
+                // The post landed, and the crash lost the ref's write.
+                2 => {
+                    assert!(bench.record().delivery.unwrap().owed.is_none());
+                    let mut lost = bench.record();
+                    lost.delivery = owing.take().unwrap().delivery;
+                    bench.write_record(&lost);
+                }
+                _ => {}
+            }
+            pass < 3
+        },
+    );
+    assert!(
+        matches!(&outcomes[..], [Err(Stop::Delivery(why))] if why.contains("the next pass posts it")),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let reports = reports(&bench);
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    assert!(reports[1].contains(FIX_PASS_1), "{}", reports[1]);
+    assert!(
+        reports[1].contains("Kept the greeting on every platform."),
+        "{}",
+        reports[1]
+    );
+    let delivery = bench.record().delivery.unwrap();
+    assert!(delivery.owed.is_none() && delivery.followed());
+    let events = &bench.events()[delivered_events..];
+    let warned = data_of(events, EventKind::Warning, "what");
+    let unposted: Vec<&Value> = warned
+        .iter()
+        .filter(|w| w["what"] == "fix_report_unposted")
+        .collect();
+    assert_eq!(unposted.len(), 1, "{warned:?}");
+}
+
+/// OWL-218: `owlshift continue` at Watch posts the report the ref owes,
+/// once; one still owed when the pull request was merged is dropped with a
+/// warning, not posted.
+#[test]
+fn continue_posts_an_owed_fix_report_and_an_end_drops_it() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    bench.refuse.set(Some("[owlshift] DELIVERY"));
+    let (refused, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello again"), Some(FIXED))]);
+    assert!(
+        matches!(&refused, Err(Stop::Delivery(_))),
+        "{refused:?}\n{printed}"
+    );
+    let owing = bench.record();
+    assert!(owing.delivery.as_ref().unwrap().owed.is_some());
+    assert_eq!(reports(&bench).len(), 1);
+
+    bench.refuse.set(None);
+    bench.github.followed.lock().unwrap().conclusion = "SUCCESS";
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Watched { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    assert!(bench.record().delivery.unwrap().owed.is_none());
+    let reports_now = reports(&bench);
+    assert_eq!(reports_now.len(), 2);
+    assert!(reports_now[1].contains(FIX_PASS_1), "{}", reports_now[1]);
+
+    // Owed again, as a refusal would leave it, then merged by a person.
+    let mut again = bench.record();
+    again.delivery = owing.delivery;
+    bench.write_record(&again);
+    bench.comment_as("someone", "Merged it.");
+    let before = bench.comments().len();
+    bench.github.followed.lock().unwrap().state = "MERGED";
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Watched { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.comments().len(), before);
+    let delivery = bench.record().delivery.unwrap();
+    assert!(delivery.owed.is_none() && delivery.ended.is_some());
+    let warned = data_of(&bench.events(), EventKind::Warning, "what");
+    assert!(
+        warned.iter().any(|w| w["what"] == "fix_report_dropped"),
+        "{warned:?}"
+    );
+}
+
+/// OWL-218: a fix push a crash cut short, adopted by watch's read, gets
+/// its DELIVERY report at that pass, with what the run kept for it.
+#[test]
+fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
+    let bench = delivered();
+    let (env, bare) = (bench.env.clone(), bench.remote.bare.clone());
+    let branch = format!("refs/heads/{BRANCH}");
+    let tip = bench.remote_branch().unwrap();
+    let fix = env
+        .run(
+            &bare,
+            &[
+                "commit-tree",
+                &format!("{tip}^{{tree}}"),
+                "-p",
+                &tip,
+                "-m",
+                "Fix",
+            ],
+        )
+        .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
+        .unwrap();
+    env.run(&bare, &["update-ref", &branch, &fix]).unwrap();
+    let mut record = bench.record();
+    let delivery = record.delivery.as_mut().unwrap();
+    delivery.pushing = Some(owlshift_contracts::refs::Pushing {
+        commit: fix.clone(),
+        kind: owlshift_contracts::refs::PushKind::Fix,
+        base: bench.remote_main(),
+        onto: None,
+        report: Some(owlshift_contracts::refs::KeptReport {
+            summary: "Kept the greeting on every platform.".to_owned(),
+            gate: Some(vec!["git grep -q Hello".to_owned()]),
+            checks: vec!["ci".to_owned()],
+            questions: Vec::new(),
+            followups: Vec::new(),
+        }),
+    });
+    bench.write_record(&record);
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    let reports = reports(&bench);
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    for text in [
+        FIX_PASS_1,
+        "Kept the greeting on every platform.",
+        "`git grep -q Hello`",
+    ] {
+        assert!(reports[1].contains(text), "{text}: {}", reports[1]);
+    }
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(delivery.pushed.as_deref(), Some(fix.as_str()));
+    assert!(delivery.owed.is_none() && delivery.pushing.is_none());
+}
+
 /// Another merge into `bare`'s `main`, writing `files`, an empty text
 /// removing its file, from a new clone in `root`; returns `main`'s new head.
 fn merge_into(env: &GitEnv, root: &Path, bare: &Path, files: &[(&str, &str)]) -> String {
@@ -5499,8 +5680,10 @@ const CORRECTED: &str = r#"{"format":7,"status":"done","summary":"Moved the gree
 /// Scenario S7's reversal (OWL-146): once the ticket is delivered, the
 /// decider replies to the DECISION comment, and watch runs a correction run
 /// briefed with the reply once it counts, whose commit is pushed with a lease
-/// on the delivery and reported; the decision keeps the reply as followed,
-/// and the next pass runs nothing. A stranger's reply reverses nothing.
+/// on the delivery; the decision keeps the reply as followed, and the next
+/// pass runs nothing. A stranger's reply reverses nothing. Its DELIVERY
+/// report, refused by the tracker, is owed and posted once at the next pass
+/// (OWL-218).
 #[test]
 fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
     let bench = Bench::new(true);
@@ -5522,23 +5705,31 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
                     bench.reply_as("maintainer", &decision, "No: put it in HELLO.md.");
                     bench.waited.set(SignedDuration::ZERO);
                 }
-                // Settling: nothing ran. Past the window now.
+                // Settling: nothing ran. Past the window now, and the tracker
+                // refuses the DELIVERY report.
                 2 => {
                     assert_eq!(ran(), 3);
                     bench.waited.set(SignedDuration::from_mins(10));
+                    bench.refuse.set(Some("[owlshift] DELIVERY"));
                 }
-                // The correction ran; the next pass runs nothing.
-                3 => assert_eq!(ran(), 4),
+                // The correction ran and was pushed; its report is owed.
+                3 => {
+                    assert_eq!(ran(), 4);
+                    assert!(bench.record().delivery.unwrap().owed.is_some());
+                    bench.refuse.set(None);
+                }
+                // Posted; the next pass runs nothing and posts nothing.
+                4 => assert!(bench.record().delivery.unwrap().owed.is_none()),
                 _ => {}
             }
-            pass < 4
+            pass < 5
         },
     );
     assert_eq!(outcomes.len(), 1, "{outcomes:?}\n{lines}\n{printed}");
-    let delivered = outcomes[0]
-        .as_ref()
-        .unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    assert!(!delivered.opened);
+    assert!(
+        matches!(&outcomes[0], Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
+        "{outcomes:?}\n{printed}"
+    );
     assert_eq!(ran(), 4);
 
     // The build role at Watch, given the decider's reply alone.
@@ -5563,7 +5754,13 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
     assert_eq!(pushes[0]["pushed"], "fast_forward");
     let last = bench.remote_branch().unwrap();
     assert_eq!(pushes[0]["commit"], json!(last));
-    let report = bench.comments().pop().unwrap();
+    let corrected: Vec<String> = bench
+        .comments()
+        .into_iter()
+        .filter(|c| c.contains("**Corrected after delivery,**"))
+        .collect();
+    assert_eq!(corrected.len(), 1, "{corrected:?}");
+    let report = &corrected[0];
     assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
     assert!(
         report.contains(
@@ -5572,6 +5769,7 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
         ),
         "{report}"
     );
+    assert!(!report.contains("Fix pass"), "{report}");
 
     // The decision keeps the reply as followed; the state counts nothing.
     let record = bench.record();
