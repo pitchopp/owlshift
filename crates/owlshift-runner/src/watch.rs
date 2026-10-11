@@ -371,6 +371,7 @@ impl Watch<'_> {
             sink.emit(ticket, None, EventKind::Decision, event);
             self.line(out, &format!("{ticket}: {seen}"));
         }
+        let commit = on_demand.post_owed_report(ticket, stored, &seen, commit, sink);
         if !matches!(
             seen.decision,
             Decision::Follow {

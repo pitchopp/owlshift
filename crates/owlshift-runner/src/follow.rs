@@ -24,7 +24,7 @@ use owlshift_adapters::forge::{
     PrState, PullRequestRead, Verdict,
 };
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Ended, EndedWhy, PushKind, Pushing, TicketDelivery};
+use owlshift_contracts::refs::{Ended, EndedWhy, OwedReport, PushKind, Pushing, TicketDelivery};
 use owlshift_core::follow::{
     self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
 };
@@ -505,6 +505,23 @@ pub fn landed(delivery: &mut TicketDelivery, pushing: Pushing) {
     }
 }
 
+/// [`landed`] for a fix or rebase run's push, the `count`th of its kind
+/// (from 1), whose DELIVERY report is now owed until a pass posts it
+/// (OWL-218). Returns the owed report it replaces, which is never posted.
+pub fn landed_owing(
+    delivery: &mut TicketDelivery,
+    pushing: Pushing,
+    count: u32,
+) -> Option<OwedReport> {
+    let owed = OwedReport {
+        kind: pushing.kind,
+        count: count.max(1),
+        report: pushing.report.clone(),
+    };
+    landed(delivery, pushing);
+    delivery.owed.replace(owed)
+}
+
 /// The record `seen` leaves in the ticket ref, `None` when it changes
 /// nothing: the following ended, a push adopted, or the fix passes and
 /// failed runs cleared by a green read (`ChecksGreen`). A fix, a rebase or a
@@ -539,15 +556,26 @@ pub fn changed(
                     PushKind::Rebase => Some(Event::RebasePushed),
                     PushKind::Delivery => None,
                 };
-                landed(&mut delivery, pushing);
-                // A fix or rebase push a crash cut short counts as the run
-                // would have (OWL-112, OWL-210), when the bounds still allow
-                // it: a stuck count never stops the following. No report is
-                // posted for it.
-                if let Some(event) = event {
-                    let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
-                    if let Ok(Transition::To(pushed)) = state.apply(pipeline, event) {
-                        next.state = (&pushed).into();
+                match event {
+                    None => landed(&mut delivery, pushing),
+                    // A fix or rebase push a crash cut short counts as the
+                    // run would have (OWL-112, OWL-210), when the bounds
+                    // still allow it: a stuck count never stops the
+                    // following. Its report is owed, and the pass that keeps
+                    // this posts it (OWL-218).
+                    Some(event) => {
+                        let state =
+                            TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
+                        let state = match state.apply(pipeline, event) {
+                            Ok(Transition::To(pushed)) => pushed,
+                            _ => state,
+                        };
+                        next.state = (&state).into();
+                        let count = match pushing.kind {
+                            PushKind::Rebase => state.repairs(),
+                            _ => state.fix_passes(),
+                        };
+                        landed_owing(&mut delivery, pushing, count);
                     }
                 }
             }
@@ -585,7 +613,7 @@ mod tests {
     use owlshift_adapters::forge::Repo;
     use owlshift_adapters::graphql::{RateHeaders, Response, Transport};
     use owlshift_contracts::refs::TicketQuestions;
-    use owlshift_contracts::refs::{DeliveredPullRequest, PersistedState, Pushing};
+    use owlshift_contracts::refs::{DeliveredPullRequest, KeptReport, PersistedState, Pushing};
     use owlshift_core::state::Status;
     use owlshift_core::vocab::Stage;
     use serde_json::Value;
@@ -878,6 +906,7 @@ mod tests {
             kind: PushKind::Fix,
             base: BASE.to_owned(),
             onto: None,
+            report: None,
         });
         let adopted = seen_with(
             Decision::Follow {
@@ -899,6 +928,30 @@ mod tests {
         assert_eq!(next.pushed.as_deref(), Some(PUSHING));
         assert_eq!(next.base_at_push.as_deref(), Some(BASE));
         assert_eq!(next.pushing, None);
+        // Its report is owed, for the pass that keeps this to post (OWL-218),
+        // with what the run kept for it.
+        let report = KeptReport {
+            summary: "Kept the greeting.".to_owned(),
+            gate: None,
+            checks: vec!["ci".to_owned()],
+            followups: vec![],
+        };
+        assert_eq!(
+            next.owed,
+            Some(OwedReport {
+                kind: PushKind::Fix,
+                count: 1,
+                report: None
+            })
+        );
+        let mut reported = pushing.clone();
+        reported.pushing.as_mut().unwrap().report = Some(report.clone());
+        let next = changed(&record(reported, watching(0)), pipeline, &adopted, at(0))
+            .unwrap()
+            .unwrap()
+            .delivery
+            .unwrap();
+        assert_eq!(next.owed.unwrap().report, Some(report));
         // A fix push adopted counts its pass; past the bound it counts none,
         // and the following goes on.
         let fix = pushing;
@@ -912,6 +965,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(TicketState::try_from(&kept.state).unwrap(), bound);
+        assert_eq!(kept.delivery.unwrap().owed.unwrap().count, 2);
+        // A delivery's own push adopted owes nothing here: `do` reports it.
+        let mut first = delivery();
+        first.pushing = Some(Pushing {
+            commit: PUSHING.to_owned(),
+            kind: PushKind::Delivery,
+            base: BASE.to_owned(),
+            onto: None,
+            report: None,
+        });
+        let first = changed(&record(first, watching(0)), pipeline, &adopted, at(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.delivery.unwrap().owed, None);
         // A rebase push adopted counts a repair and keeps the base it was
         // rebased onto (OWL-210).
         let mut rebase = delivery();
@@ -920,6 +987,7 @@ mod tests {
             kind: PushKind::Rebase,
             base: BASE.to_owned(),
             onto: Some(ONTO.to_owned()),
+            report: None,
         });
         let rebased = changed(&record(rebase, watching(1)), pipeline, &adopted, at(0))
             .unwrap()
@@ -934,6 +1002,10 @@ mod tests {
             ),
             (Some(BASE), Some(ONTO))
         );
+        assert_eq!(
+            rebased.owed.as_ref().map(|owed| (owed.kind, owed.count)),
+            Some((PushKind::Rebase, 1))
+        );
 
         let moved = seen_with(Decision::End(EndReason::HeadMoved), PUSHING);
         let ended = changed(&plain, pipeline, &moved, at(5))
@@ -945,5 +1017,19 @@ mod tests {
         let ended = ended.ended.unwrap();
         assert_eq!((ended.why, ended.at), (EndedWhy::HeadMoved, at(5)));
         assert_eq!(ended.head.as_deref(), Some(PUSHING));
+        // An end keeps an owed report: the pass that keeps it drops it, with
+        // a warning (OWL-218).
+        let mut owing = delivery();
+        owing.owed = Some(OwedReport {
+            kind: PushKind::Fix,
+            count: 1,
+            report: None,
+        });
+        let ended = changed(&record(owing, watching(0)), pipeline, &moved, at(5))
+            .unwrap()
+            .unwrap()
+            .delivery
+            .unwrap();
+        assert!(ended.ended.is_some() && ended.owed.is_some());
     }
 }

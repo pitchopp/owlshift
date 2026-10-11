@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "pull_request": {
     "number": 42,
     "url": "https://github.com/demo/project/pull/42"
@@ -12,6 +12,22 @@
   "pushing": {
     "commit": "1111111111111111111111111111111111111111",
     "kind": "fix",
-    "base": "2222222222222222222222222222222222222222"
+    "base": "2222222222222222222222222222222222222222",
+    "report": {
+      "summary": "Kept the greeting on every platform.",
+      "gate": [
+        "cargo test"
+      ],
+      "checks": [
+        "ci"
+      ]
+    }
+  },
+  "owed": {
+    "kind": "rebase",
+    "count": 1,
+    "report": {
+      "summary": "Rebased onto main."
+    }
   }
 }

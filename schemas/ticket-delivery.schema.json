@@ -33,7 +33,18 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
+    },
+    "owed": {
+      "description": "The DELIVERY report of `pushed`, a fix or rebase run's push that\nlanded, while it is not on the ticket yet (OWL-218): the next pass\nposts it, once. Since format 2.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OwedReport"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "pull_request": {
       "description": "The pull request, once the forge showed the delivery's push as its\nhead; absent while the first push is under way.",
@@ -143,6 +154,123 @@
         }
       ]
     },
+    "Followup": {
+      "description": "A follow-up ticket proposed to a human.",
+      "type": "object",
+      "properties": {
+        "blocked_by_parent": {
+          "description": "Whether the follow-up waits for the current ticket to be done.",
+          "type": "boolean",
+          "default": false
+        },
+        "done_when": {
+          "description": "When the follow-up counts as done.",
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/FollowupSource"
+        },
+        "title": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "why",
+        "source",
+        "done_when"
+      ]
+    },
+    "FollowupSource": {
+      "description": "Who found the follow-up.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "reviewer",
+        "ci"
+      ]
+    },
+    "KeptReport": {
+      "description": "What a fix or rebase run gave its DELIVERY report (OWL-218).",
+      "type": "object",
+      "properties": {
+        "checks": {
+          "description": "For a fix run, the failed checks it was given.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "followups": {
+          "description": "The follow-ups the run proposed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Followup"
+          }
+        },
+        "gate": {
+          "description": "The project gate's commands, all passed, as the run's gate ran them;\nabsent when no gate result was recorded.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "description": "The run's `summary`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "summary"
+      ]
+    },
+    "OwedReport": {
+      "description": "A DELIVERY report still to be posted for the delivery's `pushed`\ncommit, a fix or rebase run's push (OWL-218). The commit, and for a\nrebase the base it rebased onto, are the delivery's `pushed` and\n`rebased_onto`.",
+      "type": "object",
+      "properties": {
+        "count": {
+          "description": "The fix pass or the repair the push was, from 1.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "kind": {
+          "description": "`fix` or `rebase`.",
+          "$ref": "#/$defs/PushKind"
+        },
+        "report": {
+          "description": "What the run gave its report; absent for a push adopted from a ref\nthat kept none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeptReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "count"
+      ]
+    },
     "PushKind": {
       "description": "Which run's push.",
       "type": "string",
@@ -172,6 +300,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "report": {
+          "description": "What a fix or rebase run's DELIVERY report says, kept before the push\nso a push a crash cut short is still reported once adopted (OWL-218).\nSince format 2.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeptReport"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
