@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::Brief;
 use owlshift_contracts::format::{RESULT_FORMAT, strip_role_front_matter};
-use owlshift_contracts::result::{AnswerClass, Resolution, RunResult};
+use owlshift_contracts::result::{
+    AnswerClass, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES, Resolution, RunResult,
+};
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
 use owlshift_core::gate::{GatePolicy, Route};
@@ -251,6 +253,18 @@ fn build_front_matter_matches_the_contract_formats() {
     assert!(
         prompt.contains(&format!("JSON with `format` {RESULT_FORMAT},")),
         "roles/build.md does not say result.json has `format` {RESULT_FORMAT}"
+    );
+}
+
+#[test]
+fn build_prompt_states_the_question_bounds() {
+    let sentence = format!(
+        "at most {MAX_QUESTIONS} questions, each at most {MAX_QUESTION_BYTES} bytes, \
+         all together at most {MAX_QUESTIONS_BYTES} bytes."
+    );
+    assert!(
+        build_prompt().contains(&sentence),
+        "roles/build.md does not state the bounds on a result's questions as: {sentence}"
     );
 }
 
