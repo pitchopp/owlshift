@@ -456,6 +456,110 @@ mod tests {
         );
     }
 
+    /// An attempt at a round posted in parts that was abandoned (its ref
+    /// write failed), then the round posted again and kept: the thread
+    /// folds the kept attempt's earlier part only, the abandoned attempt
+    /// stays comments as a round not kept does, and the answer check still
+    /// counts an answer only after the kept last part.
+    #[test]
+    fn only_the_kept_attempts_parts_are_folded() {
+        use std::num::NonZeroU32;
+
+        use owlshift_contracts::brief::ThreadEntry;
+        use owlshift_contracts::ids::{QuestionId, TicketId};
+
+        use crate::on_demand::thread;
+        use crate::writer::QuestionsComment;
+
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let question = |n: u32| Question {
+            id: QuestionId::new(format!("Q{n}")).unwrap(),
+            category: "scope".into(),
+            context: "c".repeat(300),
+            text: "t".into(),
+            options: Vec::new(),
+            recommendation: None,
+        };
+        let parts = QuestionsComment {
+            ticket: TicketId::new("OWL-1").unwrap(),
+            round: NonZeroU32::new(1).unwrap(),
+            summary: String::new(),
+            questions: vec![question(1), question(2)],
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+            reopened: Vec::new(),
+        }
+        .parts(600);
+        assert_eq!(parts.len(), 2);
+        let by_decider = |created: u32, body: &str| Comment {
+            id: format!("c{created}"),
+            author: Author::Account(decider.clone()),
+            created_at: at(created),
+            edited_at: None,
+            body: body.into(),
+            parent: None,
+        };
+        // The abandoned attempt at 5 and 6, the kept one at 9 and 10.
+        let mut comments = vec![
+            by_decider(5, &parts[0]),
+            by_decider(6, &parts[1]),
+            by_decider(9, &parts[0]),
+            by_decider(10, &parts[1]),
+        ];
+        let asked = TicketQuestions::parse(
+            r#"{"format":2,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T10:10:00Z",
+                "comment":"c10","questions":[{"id":"Q1","category":"scope","context":"c","text":"t"}],
+                "decider":{"account":"u1","by":"assignee"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(new_answer(&comments, &decider, &asked), None);
+        comments.push(by_decider(11, "Q1: yes."));
+        assert_eq!(new_answer(&comments, &decider, &asked), Some(at(11)));
+
+        let entries = thread(&comments, &asked.asks, &[], &decider);
+        assert!(
+            matches!(
+                &entries[..],
+                [
+                    ThreadEntry::Comment { .. },
+                    ThreadEntry::Comment { .. },
+                    ThreadEntry::Questions { .. },
+                    ThreadEntry::Comment { author: answer, .. },
+                ] if answer.relation == Relation::Decider
+            ),
+            "{entries:?}"
+        );
+
+        // An attempt stopped after its first part, then the round posted
+        // in parts again with a person's comment between them: the stray
+        // first part stays a comment, the kept attempt is folded.
+        let comments = vec![
+            by_decider(5, &parts[0]),
+            by_decider(8, &parts[0]),
+            by_decider(9, "Looking."),
+            by_decider(10, &parts[1]),
+        ];
+        let entries = thread(&comments, &asked.asks, &[], &decider);
+        assert!(
+            matches!(
+                &entries[..],
+                [
+                    ThreadEntry::Comment { .. },
+                    ThreadEntry::Comment { .. },
+                    ThreadEntry::Questions { .. },
+                ]
+            ),
+            "{entries:?}"
+        );
+    }
+
     #[test]
     fn the_deciders_newest_comment_counts_after_the_quiet_window_or_with_go() {
         let decider = Person {

@@ -537,23 +537,15 @@ fn part_line(k: usize, n: usize) -> String {
     format!("Part {k} of {n} of this round:")
 }
 
-/// Whether `body` (a marked QUESTIONS comment) is a part of a split round
-/// other than the last, as [`QuestionsComment::parts`] writes it: the first
-/// line after the header reads "Part k of n of this round:" with k < n.
-pub(crate) fn is_earlier_part(body: &str) -> bool {
-    let Some(line) = body.lines().skip(1).find(|line| !line.is_empty()) else {
-        return false;
-    };
-    let Some(rest) = line.strip_prefix("Part ") else {
-        return false;
-    };
-    let Some((k, rest)) = rest.split_once(" of ") else {
-        return false;
-    };
-    let Some((n, _)) = rest.split_once(" of this round:") else {
-        return false;
-    };
-    matches!((k.parse::<usize>(), n.parse::<usize>()), (Ok(k), Ok(n)) if k < n)
+/// Which part of a split round `body` (a marked QUESTIONS comment) is, as
+/// [`QuestionsComment::parts`] writes it: `(k, n)` when the first line after
+/// the header reads "Part k of n of this round:".
+pub(crate) fn part_numbers(body: &str) -> Option<(usize, usize)> {
+    let line = body.lines().skip(1).find(|line| !line.is_empty())?;
+    let rest = line.strip_prefix("Part ")?;
+    let (k, rest) = rest.split_once(" of ")?;
+    let (n, _) = rest.split_once(" of this round:")?;
+    Some((k.parse().ok()?, n.parse().ok()?))
 }
 
 impl QuestionsComment {
