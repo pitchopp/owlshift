@@ -33,6 +33,28 @@ pub(crate) const DECISIONS_ADVICE: &str = "decisions are given but the run's rol
      repository settles, its `context` then naming what settles it; they stay open even though \
      the work is committed, and the next run's result is refused if it is `done`";
 
+/// The most bytes one question weighs (OWL-213), rendered as JSON, so that
+/// escaping counts: a quote takes two bytes, a control character up to six.
+/// A question's text, context and options take about 1 KB in practice
+/// (build-plan.md, "`owlshift forget TICKET`"); this leaves room for the
+/// two 512-byte texts of a refused choice ([`MAX_CHOICE_BYTES`]) in one
+/// question, even escaped at their worst.
+pub const MAX_QUESTION_BYTES: usize = 8 * 1024;
+
+/// The most bytes the questions of one result weigh together (OWL-213),
+/// rendered as JSON like [`MAX_QUESTION_BYTES`]: room for a retry that
+/// restates the 64 choices of a full hold ([`crate::brief::MAX_REFUSED_CHOICES`]) with
+/// twice the room it needs, and an eighth of the ticket ref's file cap, so
+/// an ask and its re-asks cannot fill it alone.
+pub const MAX_QUESTIONS_BYTES: usize = 128 * 1024;
+
+/// The most questions one result asks (OWL-213): a hold of
+/// [`crate::brief::MAX_REFUSED_CHOICES`] choices needs one question at least, as one
+/// question may cover several choices. The count bounds the JSON syntax a
+/// byte bound cannot see, such as the indentation of a thousand empty
+/// questions.
+pub const MAX_QUESTIONS: usize = 64;
+
 /// The result of one run, written by the role as `result.json`.
 ///
 /// Beyond this schema, the runner also requires question ids to be Q1, Q2, …
@@ -303,6 +325,7 @@ impl RunResult {
     /// Checks the rules the types alone do not carry.
     pub fn validate(&self) -> Result<(), ContractError> {
         check_question_order(CONTRACT, &self.questions)?;
+        check_questions_size(&self.questions)?;
         if self.status == Status::Questions && self.questions.is_empty() {
             return Err(ContractError::invalid(
                 CONTRACT,
@@ -730,6 +753,52 @@ pub(crate) fn check_verdicts(
         return Err(ContractError::invalid(
             contract,
             format!("the verdict for {question} {broken}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The questions of a result are copied whole into the ticket ref, which
+/// refuses a file past its read cap, and `owlshift forget` cannot make room
+/// for a result that asks more than the cap holds: a result over the bounds
+/// is refused, and its retry is told why (OWL-213). Build's questions are
+/// the only ones kept; a refusal of the decisions the build role listed
+/// comes first, whatever the size.
+fn check_questions_size(questions: &[Question]) -> Result<(), ContractError> {
+    if questions.len() > MAX_QUESTIONS {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            format!(
+                "{} questions are asked, past the {MAX_QUESTIONS} a result may ask: ask fewer \
+                 questions, one question may cover several choices or points",
+                questions.len()
+            ),
+        ));
+    }
+    if let Some(question) = questions
+        .iter()
+        .find(|q| format::render_json(q).len() > MAX_QUESTION_BYTES)
+    {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            format!(
+                "question {} weighs {} bytes rendered as JSON, past the {MAX_QUESTION_BYTES} a \
+                 question may weigh: shorten its context, text and options, or split it",
+                question.id,
+                format::render_json(question).len()
+            ),
+        ));
+    }
+    let total = format::render_json(&questions).len();
+    if total > MAX_QUESTIONS_BYTES {
+        return Err(ContractError::invalid(
+            CONTRACT,
+            format!(
+                "the questions weigh {total} bytes rendered as JSON, past the \
+                 {MAX_QUESTIONS_BYTES} a result's questions may weigh together: ask shorter \
+                 questions, or paraphrase the refused choices, as one question may cover \
+                 several"
+            ),
         ));
     }
     Ok(())

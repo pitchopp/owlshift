@@ -826,6 +826,18 @@ mod tests {
             ),
             "{refused:?}"
         );
+        // Questions past their byte bound are a refusal the retry is told
+        // (OWL-213).
+        let verbose = format!(
+            r#"{{"format":7,"status":"questions","summary":"s","questions":[{{"id":"Q1","category":"scope","context":"{}","text":"t"}}]}}"#,
+            "c".repeat(owlshift_contracts::result::MAX_QUESTION_BYTES)
+        );
+        let refused = validate_result(verbose.as_bytes(), "owlshift/T-1", &brief).unwrap_err();
+        assert!(
+            matches!(&refused, Failure::InvalidResult(reason)
+                if reason.contains("question Q1 weighs") && reason.contains("shorten")),
+            "{refused:?}"
+        );
         // Unknown fields are refused, and so is text that is not UTF-8.
         let unknown = br#"{"format":7,"status":"done","summary":"s","extra":1}"#;
         assert!(validate_result(unknown, "owlshift/T-1", &brief).is_err());

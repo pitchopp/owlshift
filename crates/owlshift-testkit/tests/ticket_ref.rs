@@ -167,6 +167,42 @@ fn record_of(len: usize) -> TicketRecord {
     record
 }
 
+/// OWL-213: the largest round a Build result may ask, kept as an ask and as
+/// the three re-asks of it, in a record `forget` has emptied, stays far
+/// inside the read cap: the escaping of its text and the indentation of
+/// the file included, so one result can never make the file unwritable.
+#[test]
+fn a_maximal_round_with_its_re_asks_fits_the_read_cap() {
+    use owlshift_contracts::result::{MAX_QUESTIONS, MAX_QUESTIONS_BYTES, RunResult};
+
+    // The most 64 questions may weigh, each full of control characters,
+    // which escape to six bytes.
+    let context = "\u{1}".repeat(MAX_QUESTIONS_BYTES / MAX_QUESTIONS / 6 - 30);
+    let questions: Vec<_> = (1..=MAX_QUESTIONS)
+        .map(|n| json!({ "id": format!("Q{n}"), "category": "scope", "context": context, "text": "t" }))
+        .collect();
+    let result =
+        json!({ "format": 7, "status": "questions", "summary": "s", "questions": questions });
+    RunResult::parse(&result.to_string()).expect("the round is within the bound");
+
+    let ask = |kind: &str, n: u32| {
+        json!({
+            "kind": kind, "round": 1, "at": "2026-09-28T09:00:00Z", "comment": format!("c-{n}"),
+            "questions": questions, "decider": { "account": "u", "by": "assignee" }
+        })
+    };
+    let asks = [
+        ask("questions", 1),
+        ask("reask", 2),
+        ask("reask", 3),
+        ask("reask", 4),
+    ];
+    let record = TicketQuestions::parse(&json!({ "format": 9, "asks": asks }).to_string()).unwrap();
+    let size = record.render().len();
+    let cap = usize::try_from(ticket_ref::MAX_FILE).unwrap();
+    assert!(size < cap * 3 / 5, "{size} bytes of a cap of {cap}");
+}
+
 #[test]
 fn a_ticket_ref_file_past_the_read_cap_is_never_written() {
     let repo = Repo::new();
