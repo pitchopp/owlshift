@@ -36,7 +36,7 @@ use owlshift_core::state::{Status, TicketState};
 
 use crate::answer_check::{self, Readiness};
 use crate::events::{EventSink, data, printable};
-use crate::on_demand::{Delivered, OnDemand, Stop};
+use crate::on_demand::{Delivered, Landed, OnDemand, Stop};
 use crate::ticket_ref::{self, Stored};
 
 /// How long watch sleeps after each pass.
@@ -382,14 +382,30 @@ impl Watch<'_> {
             ),
             Some(Admit::Held {
                 until: Until::Person,
-            }) => self.line(
-                out,
-                &format!(
-                    "{ticket} waits for a person to act, but its state was not kept: \
-                     watch continues it again only once its decider edits a comment or a \
+            }) => {
+                // A RESUME asks the decider nothing: the remedy is the
+                // operator's, once the ticket ref can be written.
+                let remedy = if matches!(
+                    outcome,
+                    Err(Stop::NotKept {
+                        landed: Landed::Resume,
+                        ..
+                    })
+                ) {
+                    "run `owlshift continue` once the ticket ref can be written; watch also \
+                     continues it again once its decider edits a comment or a command moves \
+                     its ticket ref"
+                } else {
+                    "watch continues it again only once its decider edits a comment or a \
                      command moves its ticket ref"
-                ),
-            ),
+                };
+                self.line(
+                    out,
+                    &format!(
+                        "{ticket} waits for a person to act, but its state was not kept: {remedy}"
+                    ),
+                )
+            }
             Some(Admit::Paused { until }) => self.line(
                 out,
                 &format!("no ticket is continued before the usage limit resets at {until}"),
