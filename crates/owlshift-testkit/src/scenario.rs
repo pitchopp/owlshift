@@ -771,7 +771,7 @@ impl Driver {
         let result = result.cloned();
         if let (Event::Questions, Some(result)) = (event, &result)
             && result.status != ResultStatus::PremiseFalse
-            && !resolver::route(&self.policy, &result.questions)
+            && !resolver::route(&self.policy, &result.questions, &asked)
                 .to_resolver
                 .is_empty()
         {
@@ -875,7 +875,7 @@ impl Driver {
             .pending
             .take()
             .ok_or("no run's questions wait for the resolver")?;
-        let given = resolver::route(&self.policy, &result.questions).to_resolver;
+        let given = resolver::route(&self.policy, &result.questions, &asked).to_resolver;
         self.resolving.clone_from(&given);
         let report = self.execute(Role::Resolver, reply);
         self.resolving.clear();
@@ -910,11 +910,6 @@ impl Driver {
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
                         run: None,
-                        reopened: asked
-                            .iter()
-                            .filter(|reopened| reopened.question == question.id)
-                            .map(|reopened| reopened.choice.clone())
-                            .collect(),
                     }
                     .render();
                     let posted = self.post(&body)?;
