@@ -1218,7 +1218,7 @@ impl OnDemand<'_> {
             ..
         } = seen.decision
         {
-            return self.repair(p, seen.failing_for, sink);
+            return self.repair(p, seen.failing_for, &mut following, sink);
         }
         // The decider's replies to a DECISION, which the correction reads
         // again under this command's lock (OWL-146).
@@ -2968,12 +2968,14 @@ impl OnDemand<'_> {
     /// recorded, when the project is busy, or the ref moved or no longer
     /// keeps a ticket at Watch: the next pass reads it again.
     /// `failing_for` is how long ago watch first read a failure on the
-    /// head, for the table's hour.
+    /// head, for the table's hour. `following` is watch's memory, which
+    /// records a ticket's moved stage once (OWL-219).
     pub fn repair_seen(
         &self,
         ticket: &TicketId,
         seen: &str,
         failing_for: Option<Duration>,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
         let mut p = match self.prepare(ticket, Command::Fix) {
@@ -2988,7 +2990,7 @@ impl OnDemand<'_> {
         {
             return None;
         }
-        Some(self.repair(&mut p, failing_for, sink))
+        Some(self.repair(&mut p, failing_for, following, sink))
     }
 
     /// Repairs the followed pull request of a ticket at Watch (OWL-112,
@@ -3008,6 +3010,7 @@ impl OnDemand<'_> {
         &self,
         p: &mut Prepared,
         failing_for: Option<Duration>,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
@@ -3050,17 +3053,22 @@ impl OnDemand<'_> {
             .tracker
             .stage(&ticket)
             .map_err(|e| refused(&format!("reading the stage of {ticket}"), e))?;
-        if !repairs_in(stage, &self.config.tracker.states) {
-            sink.emit(
-                &ticket,
-                None,
-                EventKind::Decision,
-                data([
-                    ("watch", json!("stage_moved")),
-                    ("pull_request", json!(pr.number)),
-                    ("stage", json!(stage)),
-                ]),
-            );
+        if repairs_in(stage, &self.config.tracker.states) {
+            following.stage_back(&ticket);
+        } else {
+            // Once per move, not at each attempt (OWL-219).
+            if following.stage_moved(&ticket, stage) {
+                sink.emit(
+                    &ticket,
+                    None,
+                    EventKind::Decision,
+                    data([
+                        ("watch", json!("stage_moved")),
+                        ("pull_request", json!(pr.number)),
+                        ("stage", json!(stage)),
+                    ]),
+                );
+            }
             return Err(Stop::Refused(format!(
                 "{ticket} shows {stage:?} on the tracker, which is not a state Owlshift works \
                  in: pull request #{} gets no repair while it stays there",

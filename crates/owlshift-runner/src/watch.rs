@@ -405,8 +405,13 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &held, now) != Admit::Go {
             return;
         }
-        let Some(outcome) = on_demand.repair_seen(ticket, &held.commit, seen.failing_for, sink)
-        else {
+        let Some(outcome) = on_demand.repair_seen(
+            ticket,
+            &held.commit,
+            seen.failing_for,
+            &mut memory.following,
+            sink,
+        ) else {
             return;
         };
         continued(ticket, &outcome, sink);
