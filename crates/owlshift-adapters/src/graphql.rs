@@ -6,6 +6,8 @@
 //! with the rate-limit headers alone ([`RateHeaders`]): never another header,
 //! so a recording cannot hold a credential.
 
+use std::io::Read;
+
 use serde_json::Value;
 
 /// An HTTP answer: its status and its body, and the rate-limit headers a
@@ -40,9 +42,37 @@ pub struct RateHeaders {
     pub retry_after: Option<u64>,
 }
 
-/// Sends one GraphQL request.
+/// An answer to a REST read (OWL-112): its status, its rate-limit headers,
+/// and its body, which the caller streams.
+pub struct RestAnswer {
+    pub status: u16,
+    pub rate: RateHeaders,
+    pub body: Box<dyn Read>,
+}
+
+impl RestAnswer {
+    /// An answer without rate-limit headers.
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            rate: RateHeaders::default(),
+            body: Box::new(std::io::Cursor::new(body.into())),
+        }
+    }
+}
+
+/// Sends one GraphQL request, or one REST read.
 pub trait Transport {
     /// Posts `request`, a GraphQL request body (`query` and `variables`).
     /// `Err` means no HTTP answer at all: network, TLS or timeout.
     fn send(&self, request: &Value) -> Result<Response, String>;
+
+    /// Reads `path` of the forge's REST API, such as
+    /// `repos/<owner>/<name>/actions/jobs/<id>/logs`, following a redirect
+    /// without the credential. `Err` means no HTTP answer at all. Refused by
+    /// default: only GitHub's own transport and the fakes that stand in for
+    /// a job's log read REST.
+    fn get(&self, path: &str) -> Result<RestAnswer, String> {
+        Err(format!("this transport reads no REST path ({path})"))
+    }
 }

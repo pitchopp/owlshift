@@ -41,7 +41,9 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
-use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push_parts};
+use owlshift_adapters::forge::push::{
+    PushError, Pushed, leased_push_command, push_command, read_push_parts,
+};
 use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
@@ -788,6 +790,37 @@ impl ParkedComment {
 
 /// Why a ticket was parked, as a person reads it: the PARKED comment and
 /// what `owlshift do` and `owlshift continue` print say it the same way.
+/// Runs a push the adapter built, with `--no-verify` after `push`, through
+/// the runner's git, and reads its outcome.
+fn run_push(
+    git: &Git,
+    checkout: &Path,
+    branch: &Branch,
+    command: &std::process::Command,
+) -> Result<Pushed, WriteError> {
+    let mut pushed = command.get_args();
+    let mut args: Vec<OsString> = pushed.next().map(OsStr::to_owned).into_iter().collect();
+    args.push("--no-verify".into());
+    args.extend(pushed.map(OsStr::to_owned));
+    let output = git.output(checkout, &args, None).map_err(|error| {
+        WriteError::Push(PushError::Failed {
+            message: error.to_string(),
+        })
+    })?;
+    let ended = match output.code {
+        Some(code) => format!("exit status: {code}"),
+        None => "a signal".to_owned(),
+    };
+    read_push_parts(
+        branch,
+        output.success(),
+        &ended,
+        &output.stdout,
+        &output.stderr,
+    )
+    .map_err(WriteError::Push)
+}
+
 pub fn park_reason(reason: ParkReason) -> &'static str {
     match reason {
         ParkReason::FailedRuns => "a run failed again, with no attempt left",
@@ -980,27 +1013,55 @@ impl<'a> Writer<'a> {
         // bench's hermetic setup applies to the push too.
         let command = push_command(Path::new("git"), checkout, remote, commit, branch)
             .map_err(WriteError::Push)?;
-        let mut pushed = command.get_args();
-        let mut args: Vec<OsString> = pushed.next().map(OsStr::to_owned).into_iter().collect();
-        args.push("--no-verify".into());
-        args.extend(pushed.map(OsStr::to_owned));
-        let output = git.output(checkout, &args, None).map_err(|error| {
-            WriteError::Push(PushError::Failed {
-                message: error.to_string(),
-            })
-        })?;
-        let ended = match output.code {
-            Some(code) => format!("exit status: {code}"),
-            None => "a signal".to_owned(),
-        };
-        read_push_parts(
-            branch,
-            output.success(),
-            &ended,
-            &output.stdout,
-            &output.stderr,
-        )
-        .map_err(WriteError::Push)
+        run_push(git, checkout, branch, &command)
+    }
+
+    /// [`Self::push_branch`] to a branch watch follows (architecture section
+    /// 5, "Leases"), leased on `lease`, the commit Owlshift last pushed
+    /// there: a branch a person moved or deleted refuses it. `commit` must
+    /// descend from `lease`, checked before git runs, since a lease alone
+    /// would let a rewritten history replace the branch: a fix run's push
+    /// stays a fast-forward. Only a rebase run replaces history (OWL-210).
+    pub fn push_leased(
+        &self,
+        git: &Git,
+        checkout: &Path,
+        remote: &str,
+        commit: &CommitId,
+        branch: &Branch,
+        lease: &CommitId,
+    ) -> Result<Pushed, WriteError> {
+        floor::check_action(Action::PushBranch, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        let descends = git
+            .output(
+                checkout,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    "--end-of-options",
+                    lease.as_str(),
+                    commit.as_str(),
+                ],
+                None,
+            )
+            .map_err(|error| {
+                WriteError::Push(PushError::Failed {
+                    message: error.to_string(),
+                })
+            })?;
+        if !descends.success() {
+            return Err(WriteError::Push(PushError::Failed {
+                message: format!(
+                    "{commit} does not descend from {lease}, the branch's last push: a fix is \
+                     pushed as a fast-forward only"
+                ),
+            }));
+        }
+        let command =
+            leased_push_command(Path::new("git"), checkout, remote, commit, branch, lease)
+                .map_err(WriteError::Push)?;
+        run_push(git, checkout, branch, &command)
     }
 
     /// Opens the pull request of `head` into `base` with the run's title and
@@ -1252,6 +1313,8 @@ mod tests {
                 "https://github.com/pitchopp/owlshift/runs/{}",
                 name.len()
             )),
+            id: None,
+            description: None,
         }
     }
 

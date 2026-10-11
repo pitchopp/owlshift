@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use owlshift_contracts::ContractError;
 use owlshift_contracts::brief::{
-    Brief, MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry,
+    Brief, MAX_CHOICE_BYTES, MAX_EXCERPT_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES,
+    ThreadEntry,
 };
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
@@ -1106,7 +1107,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(12)),
+        parse(|v| v["format"] = json!(13)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1250,6 +1251,60 @@ fn brief_rejections() {
     ])
     .unwrap();
     assert_eq!(full.refused_choices.len(), MAX_REFUSED_CHOICES);
+    // A check failure (OWL-112): Build's alone, each check with an excerpt
+    // or why none, within the excerpts' caps.
+    let check = |excerpt: Option<String>| {
+        let mut check = json!({ "name": "ci", "kind": { "type": "check_run", "app": "github-actions" },
+            "conclusion": "FAILURE", "required": true, "on_base": "passed" });
+        match excerpt {
+            Some(excerpt) => check["excerpt"] = json!(excerpt),
+            None => check["no_excerpt"] = json!("the log could not be read"),
+        }
+        check
+    };
+    let failing = |checks: Vec<Value>| {
+        Brief::parse(&edited("brief.json", |v| {
+            v["check_failure"] = json!({ "pull_request": 7,
+                "url": "https://github.com/demo/project/pull/7",
+                "head": "1111111111111111111111111111111111111111", "checks": checks });
+        }))
+    };
+    let failure = failing(vec![check(Some("error".into())), check(None)]).unwrap();
+    assert_eq!(failure.check_failure.unwrap().checks.len(), 2);
+    rejects(
+        "a check failure in an answer check's brief",
+        parse(|v| {
+            v["role"] = json!("answer_check");
+            v["check_failure"] = json!({ "pull_request": 7, "url": "u", "head": "h",
+                "checks": [{ "name": "ci", "kind": { "type": "status" },
+                    "conclusion": "ERROR", "required": false, "on_base": "absent",
+                    "no_excerpt": "none" }] });
+        }),
+        "a check failure is given but the role is answer_check, not build",
+    );
+    rejects(
+        "a check failure without a check",
+        failing(Vec::new()),
+        "a check failure lists no failed check",
+    );
+    let mut both = check(Some("error".into()));
+    both["no_excerpt"] = json!("and why not");
+    rejects(
+        "a check with an excerpt and why none",
+        failing(vec![both]),
+        "check \"ci\" needs either an excerpt or why it has none",
+    );
+    rejects(
+        "an excerpt past its cap",
+        failing(vec![check(Some("x".repeat(MAX_EXCERPT_BYTES + 1)))]),
+        "the excerpt of check \"ci\" exceeds 16384 bytes",
+    );
+    rejects(
+        "excerpts past their cap together",
+        failing(vec![check(Some("x".repeat(MAX_EXCERPT_BYTES))); 5]),
+        "the excerpts exceed 65536 bytes together",
+    );
+    failing(vec![check(Some("x".repeat(MAX_EXCERPT_BYTES))); 4]).unwrap();
     // The checkpoint's paths and the result path come from the runner, but
     // are checked the same way as a model's artifact paths (OWL-25).
     for path in BAD_PATHS {

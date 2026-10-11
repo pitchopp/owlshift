@@ -5,8 +5,13 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use owlshift_adapters::forge::push::{PushError, Pushed, push_command, read_push};
+use owlshift_adapters::forge::push::{
+    PushError, Pushed, leased_push_command, push_command, read_push,
+};
 use owlshift_adapters::forge::{Branch, CommitId};
+use owlshift_adapters::tracker::markdown::MarkdownTracker;
+use owlshift_runner::executor::Git;
+use owlshift_runner::writer::{WriteError, Writer};
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 
 struct Bench {
@@ -61,6 +66,25 @@ impl Bench {
         read_push(branch, &command.output().unwrap())
     }
 
+    fn push_leased(
+        &self,
+        commit: &CommitId,
+        branch: &Branch,
+        lease: &CommitId,
+    ) -> Result<Pushed, PushError> {
+        let mut command: Command = leased_push_command(
+            Path::new("git"),
+            &self.remote.checkout,
+            "origin",
+            commit,
+            branch,
+            lease,
+        )
+        .unwrap();
+        self.env.apply(&mut command);
+        read_push(branch, &command.output().unwrap())
+    }
+
     fn remote_branch(&self, branch: &Branch) -> String {
         let out = self
             .env
@@ -99,4 +123,65 @@ fn an_unreachable_remote_is_a_failure_without_a_verdict() {
     let commit = bench.commit("one");
     let error = bench.push("../nowhere.git", &commit, &branch).unwrap_err();
     assert!(matches!(error, PushError::Failed { .. }), "{error:?}");
+}
+
+/// A leased push lands while the branch is still at the lease, and is
+/// rejected once someone else moved it (OWL-112); the Writer refuses, before
+/// git runs, a commit that does not descend from the lease, which the lease
+/// alone would let replace the branch's history.
+#[test]
+fn a_leased_push_moves_the_branch_forward_from_its_lease_only() {
+    let bench = bench();
+    let branch = Branch::new("owl-112-push").unwrap();
+    let first = bench.commit("one");
+    let second = bench.commit("two");
+    assert_eq!(bench.push("origin", &first, &branch), Ok(Pushed::Created));
+    assert_eq!(
+        bench.push_leased(&second, &branch, &first),
+        Ok(Pushed::FastForward)
+    );
+    // Someone else pushed `third`: a push leased on `second` is refused.
+    let third = bench.commit("three");
+    assert_eq!(
+        bench.push("origin", &third, &branch),
+        Ok(Pushed::FastForward)
+    );
+    let fourth = bench.commit("four");
+    let stale = bench.push_leased(&fourth, &branch, &second).unwrap_err();
+    assert!(matches!(stale, PushError::Rejected { .. }), "{stale:?}");
+    assert_eq!(bench.remote_branch(&branch), third.as_str());
+
+    // A rewritten history leased on the branch's head: refused before git
+    // pushes anything.
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let tracker = MarkdownTracker::new(&bench.remote.checkout);
+    let writer = Writer::new(&tracker);
+    let refused = writer
+        .push_leased(
+            &git,
+            &bench.remote.checkout,
+            "origin",
+            &first,
+            &branch,
+            &third,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&refused, WriteError::Push(PushError::Failed { message })
+            if message.contains("does not descend")),
+        "{refused:?}"
+    );
+    assert_eq!(bench.remote_branch(&branch), third.as_str());
+    assert_eq!(
+        writer.push_leased(
+            &git,
+            &bench.remote.checkout,
+            "origin",
+            &fourth,
+            &branch,
+            &third
+        ),
+        Ok(Pushed::FastForward)
+    );
 }

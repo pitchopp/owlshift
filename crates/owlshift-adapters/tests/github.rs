@@ -205,6 +205,9 @@ fn watch_reads_a_pull_request_red_conflicting_then_merged() {
         failed,
         [("check (ubuntu-latest)", "FAILURE"), ("ci", "FAILURE")]
     );
+    // A check run's id is its job's, for the fix run's log (OWL-112).
+    assert_eq!(red.checks.checks[0].id, Some(2));
+    assert_eq!(red.checks.checks[2].id, None);
     let rate = red.rate.expect("the query's cost");
     assert_eq!((rate.cost, rate.remaining), (1, 4990));
 

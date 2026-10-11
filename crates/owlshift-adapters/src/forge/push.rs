@@ -81,6 +81,40 @@ pub fn push_command(
     Ok(command)
 }
 
+/// [`push_command`] with a lease (architecture section 5, "Leases"):
+/// `--force-with-lease=refs/heads/<branch>:<lease>`, so the remote takes the
+/// push only while the branch is still at `lease`, the commit Owlshift last
+/// pushed there, and a branch a person pushed to or deleted is never
+/// overwritten or recreated.
+///
+/// The lease alone would also let a commit that does not descend from
+/// `lease` replace the branch's history: the caller pushes a commit that
+/// descends from it, which the runner's Writer checks before git runs, and a
+/// forced update (`+`) still reads as a failure ([`read_push`]).
+pub fn leased_push_command(
+    git: &Path,
+    worktree: &Path,
+    remote: &str,
+    commit: &CommitId,
+    branch: &Branch,
+    lease: &CommitId,
+) -> Result<Command, PushError> {
+    if remote.is_empty() || remote.starts_with('-') {
+        return Err(PushError::Failed {
+            message: format!("{remote:?} is not a remote"),
+        });
+    }
+    let mut command = Command::new(git);
+    command
+        .current_dir(worktree)
+        .args(["push", "--porcelain"])
+        .arg(format!("--force-with-lease=refs/heads/{branch}:{lease}"))
+        .arg(remote)
+        .arg(format!("{commit}:refs/heads/{branch}"))
+        .stdin(Stdio::null());
+    Ok(command)
+}
+
 /// Reads the output of a [`push_command`] for `branch`.
 pub fn read_push(branch: &Branch, output: &Output) -> Result<Pushed, PushError> {
     read_push_parts(

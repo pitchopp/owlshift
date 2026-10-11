@@ -217,6 +217,11 @@ pub struct Check {
     pub required: bool,
     /// Where its details are, when the forge gives one.
     pub url: Option<String>,
+    /// The check run's id, which for GitHub Actions is its job's: given by
+    /// watch's read (OWL-112), absent from the delivery's.
+    pub id: Option<u64>,
+    /// A commit status's description: given by watch's read (OWL-112).
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,6 +418,8 @@ mod tests {
             raw: String::new(),
             required: false,
             url: None,
+            id: None,
+            description: None,
         }
     }
 

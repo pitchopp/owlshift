@@ -27,6 +27,7 @@
 //!   by branch; `headRepository` tells a fork's same-named branch apart.
 
 use std::fmt;
+use std::io::{self, BufRead, BufReader, Read};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -34,15 +35,27 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use jiff::Timestamp;
+use owlshift_contracts::brief::MAX_EXCERPT_BYTES;
 
 use crate::forge::{
     BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId, Error,
     ErrorKind, Mergeable, PrState, PullRequest, PullRequestRead, RateLimit, Repo,
 };
-pub use crate::graphql::{RateHeaders, Response, Transport};
+pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
 /// GitHub's GraphQL endpoint.
 pub const ENDPOINT: &str = "https://api.github.com/graphql";
+
+/// GitHub's REST API, which the job logs and another app's output are read
+/// from (OWL-112).
+pub const REST_API: &str = "https://api.github.com/";
+
+/// The most bytes of a job's log read: past it, the excerpt is the end of
+/// what was read.
+pub const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most bytes of a REST answer read whole, such as a check run's.
+const MAX_REST_BYTES: u64 = 1024 * 1024;
 
 /// The most items GitHub returns in one page.
 pub const MAX_PAGE: u32 = 100;
@@ -80,18 +93,75 @@ impl fmt::Debug for HttpTransport {
 
 impl HttpTransport {
     pub fn new(token: Token) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            // A 401 or 403 carries a body worth reading.
-            .http_status_as_error(false)
-            // GitHub refuses requests without a user agent.
-            .user_agent(concat!("owlshift/", env!("CARGO_PKG_VERSION")))
-            .build();
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: agent(Duration::from_secs(30)),
             token,
         }
     }
+}
+
+/// An agent that follows no redirect: [`HttpTransport::get`] follows the
+/// one a log answers itself, without the token.
+fn agent(timeout: Duration) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        // A 401 or 403 carries a body worth reading.
+        .http_status_as_error(false)
+        .max_redirects(0)
+        // GitHub refuses requests without a user agent.
+        .user_agent(concat!("owlshift/", env!("CARGO_PKG_VERSION")))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+/// Where a REST answer redirects to, when it is a redirect: an HTTPS URL
+/// with no credential of its own, which the runner reads without the token
+/// (architecture section 5, "The fix run"). A log answers with a signed
+/// storage URL.
+pub fn redirect_target(status: u16, location: Option<&str>) -> Result<Option<String>, String> {
+    if !(300..400).contains(&status) {
+        return Ok(None);
+    }
+    let Some(location) = location else {
+        return Err(format!("GitHub answered HTTP {status} without a location"));
+    };
+    let Some(rest) = location.strip_prefix("https://") else {
+        return Err(format!(
+            "GitHub redirected to {}, which is not HTTPS",
+            redact(location)
+        ));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(format!(
+            "GitHub redirected to {}, which names no host or carries a credential",
+            redact(location)
+        ));
+    }
+    Ok(Some(location.to_owned()))
+}
+
+/// `text` with the query of every URL in it removed: a signed storage URL's
+/// query is its credential.
+pub fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        // A URL runs to the next space or quote.
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+            .map_or(rest.len(), |end| at + end);
+        match rest[at..end].find('?') {
+            Some(query) => {
+                out.push_str(&rest[..at + query]);
+                out.push_str("?<query removed>");
+            }
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 impl Transport for HttpTransport {
@@ -121,6 +191,48 @@ impl Transport for HttpTransport {
             .read_to_string()
             .map_err(|e| e.to_string())?;
         Ok(Response { status, body, rate })
+    }
+
+    fn get(&self, path: &str) -> Result<RestAnswer, String> {
+        let answer = self
+            .agent
+            .get(&format!("{REST_API}{path}"))
+            .header("Authorization", &format!("bearer {}", self.token.0))
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| redact(&e.to_string()))?;
+        let status = answer.status().as_u16();
+        let header = |name: &str| {
+            answer
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_owned())
+        };
+        let rate = RateHeaders {
+            remaining: header("x-ratelimit-remaining").and_then(|v| v.parse().ok()),
+            reset: header("x-ratelimit-reset").and_then(|v| v.parse().ok()),
+            retry_after: header("retry-after").and_then(|v| v.parse().ok()),
+        };
+        let answer = match redirect_target(status, header("location").as_deref())? {
+            // A fresh request through an agent that never held the token.
+            Some(target) => agent(Duration::from_secs(120))
+                .get(&target)
+                .call()
+                .map_err(|e| redact(&e.to_string()))?,
+            None => answer,
+        };
+        let status = answer.status().as_u16();
+        let body = answer
+            .into_body()
+            .into_with_config()
+            .limit(u64::MAX)
+            .reader();
+        Ok(RestAnswer {
+            status,
+            rate,
+            body: Box::new(body),
+        })
     }
 }
 
@@ -314,6 +426,83 @@ impl GitHubForge {
             at_head,
             at_push,
             rate: rate.get(),
+        })
+    }
+
+    /// The excerpt of a GitHub Actions job's log (OWL-112): the job is the
+    /// check run of the same id. The log is streamed, never held whole, and
+    /// read to [`MAX_LOG_BYTES`] at most ([`log_excerpt`]). The redirect it
+    /// answers is followed without the token. A refused token is
+    /// [`ErrorKind::Unauthorized`], HTTP 401 or a 403 that is no rate limit,
+    /// since a fine-grained token needs actions (read); a log GitHub no
+    /// longer keeps is [`ErrorKind::NotFound`].
+    pub fn job_log_excerpt(&self, job: u64) -> Result<String, Error> {
+        let answer = self.rest(&format!(
+            "repos/{}/{}/actions/jobs/{job}/logs",
+            self.repo.owner(),
+            self.repo.name()
+        ))?;
+        log_excerpt(answer.body.take(MAX_LOG_BYTES), MAX_EXCERPT_BYTES)
+            .map_err(|e| invalid(format!("reading the log: {}", redact(&e.to_string()))))
+    }
+
+    /// Another app's check run's output (OWL-112): its title, summary and
+    /// text, each when given, a blank line between them.
+    pub fn check_run_output(&self, id: u64) -> Result<String, Error> {
+        let answer = self.rest(&format!(
+            "repos/{}/{}/check-runs/{id}",
+            self.repo.owner(),
+            self.repo.name()
+        ))?;
+        let mut body = String::new();
+        answer
+            .body
+            .take(MAX_REST_BYTES)
+            .read_to_string(&mut body)
+            .map_err(|e| invalid(format!("reading the check run: {e}")))?;
+        let run: RestCheckRun = serde_json::from_str(&body)
+            .map_err(|e| invalid(format!("unexpected check run from GitHub: {e}")))?;
+        let output = run.output.unwrap_or_default();
+        Ok([output.title, output.summary, output.text]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"))
+    }
+
+    /// One REST read: a successful answer, or the error its status says.
+    fn rest(&self, path: &str) -> Result<RestAnswer, Error> {
+        let mut answer = self
+            .transport
+            .get(path)
+            .map_err(|e| invalid(format!("GitHub could not be reached: {}", redact(&e))))?;
+        if (200..300).contains(&answer.status) {
+            return Ok(answer);
+        }
+        let mut body = String::new();
+        let _ = (&mut answer.body).take(4096).read_to_string(&mut body);
+        let message = serde_json::from_str::<Envelope>(&body)
+            .ok()
+            .and_then(|e| e.message)
+            .unwrap_or_default();
+        let rate = answer.rate;
+        let status = answer.status;
+        Err(match status {
+            403 | 429 if rate.remaining == Some(0) || rate.retry_after.is_some() => Error::new(
+                ErrorKind::RateLimited,
+                format!("GitHub's rate limit: HTTP {status} {message}"),
+            )
+            .with_reset(resets_at(rate, Timestamp::now())),
+            401 | 403 => Error::new(
+                ErrorKind::Unauthorized,
+                format!("GitHub refused the token: HTTP {status} {message}"),
+            ),
+            404 | 410 => Error::new(
+                ErrorKind::NotFound,
+                format!("GitHub has no such {path}: HTTP {status} {message}"),
+            ),
+            _ => invalid(format!("GitHub answered HTTP {status} {message}")),
         })
     }
 
@@ -537,9 +726,11 @@ const FOLLOW_QUERY: &str = "query Follow($owner: String!, $name: String!, $numbe
     commits(last: 1) { nodes { commit { oid statusCheckRollup { \
     contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } \
     nodes { __typename \
-    ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl \
+    ... on CheckRun { databaseId name status conclusion \
+    isRequired(pullRequestNumber: $number) detailsUrl \
     checkSuite { app { slug } workflowRun { workflow { name } } } } \
-    ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } \
+    ... on StatusContext { context state description isRequired(pullRequestNumber: $number) \
+    targetUrl } \
     } } } } } } } } }";
 
 /// The checks of the base head and of `base_at_push` (OWL-209).
@@ -567,6 +758,115 @@ const COMMIT_CHECKS_QUERY: &str = "query CommitChecks($owner: String!, $name: St
     ... on CheckRun { name status conclusion detailsUrl \
     checkSuite { app { slug } workflowRun { workflow { name } } } } \
     ... on StatusContext { context state targetUrl } } } } } } } }";
+
+/// The excerpt of a GitHub Actions log read from `log` (OWL-112): each
+/// line without its leading timestamp and its ANSI escapes, and the lines,
+/// at most `max` bytes of them, ending with the first `##[error]` line, or
+/// the log's last ones when it has none. Reading stops at that line. A line
+/// longer than `max` keeps its end.
+pub fn log_excerpt(log: impl Read, max: usize) -> io::Result<String> {
+    let mut reader = BufReader::new(log);
+    let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut size = 0;
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&raw);
+        let line = clean_log_line(text.trim_end_matches(['\n', '\r']));
+        let line = tail(&line, max.saturating_sub(1));
+        let error = line.contains("##[error]");
+        size += line.len() + 1;
+        kept.push_back(line);
+        while size > max {
+            match kept.pop_front() {
+                Some(front) => size -= front.len() + 1,
+                None => break,
+            }
+        }
+        if error {
+            break;
+        }
+    }
+    let mut excerpt = String::with_capacity(size);
+    for line in kept {
+        excerpt.push_str(&line);
+        excerpt.push('\n');
+    }
+    Ok(excerpt)
+}
+
+/// The end of `text` within `max` bytes, cut on a character boundary.
+fn tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
+
+/// A log line without the timestamp GitHub Actions starts it with
+/// (`2026-10-01T09:12:44.1234567Z `) and without ANSI escape sequences.
+fn clean_log_line(line: &str) -> String {
+    let line = match line.split_once(' ') {
+        Some((stamp, rest)) if is_log_timestamp(stamp) => rest,
+        _ => line,
+    };
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI: ESC [ parameters, then one final byte from @ to ~; any other
+        // escape drops the ESC and the next character.
+        if chars.next_if_eq(&'[').is_some() {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            chars.next();
+        }
+    }
+    out
+}
+
+fn is_log_timestamp(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() >= 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes.ends_with(b"Z")
+        && stamp
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'T' | b':' | b'.' | b'Z'))
+}
+
+/// A REST check run, its output alone.
+#[derive(Deserialize)]
+struct RestCheckRun {
+    #[serde(default)]
+    output: Option<RestOutput>,
+}
+
+#[derive(Default, Deserialize)]
+struct RestOutput {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
 
 /// Reads a GraphQL answer: a rejected token first, then a spent budget, then
 /// GraphQL errors, then `data`.
@@ -920,6 +1220,8 @@ impl PageInfo {
 enum Context {
     #[serde(rename_all = "camelCase")]
     CheckRun {
+        #[serde(default)]
+        database_id: Option<u64>,
         name: String,
         status: String,
         conclusion: Option<String>,
@@ -934,6 +1236,8 @@ enum Context {
     StatusContext {
         context: String,
         state: String,
+        #[serde(default)]
+        description: Option<String>,
         #[serde(default)]
         is_required: Option<bool>,
         #[serde(default)]
@@ -969,6 +1273,7 @@ impl Context {
     fn into_check(self) -> Check {
         match self {
             Self::CheckRun {
+                database_id,
                 name,
                 status,
                 conclusion,
@@ -994,11 +1299,14 @@ impl Context {
                     },
                     required: is_required.unwrap_or(false),
                     url: details_url,
+                    id: database_id,
+                    description: None,
                 }
             }
             Self::StatusContext {
                 context,
                 state,
+                description,
                 is_required,
                 target_url,
             } => Check {
@@ -1008,6 +1316,8 @@ impl Context {
                 raw: state,
                 required: is_required.unwrap_or(false),
                 url: target_url,
+                id: None,
+                description,
             },
         }
     }
@@ -1369,5 +1679,127 @@ mod tests {
         let forge = GitHubForge::new(token.clone(), Repo::parse("o/n").unwrap());
         let shown = format!("{token:?} {transport:?} {forge:?}");
         assert!(!shown.contains("do_not_print"), "{shown}");
+    }
+
+    /// A log as GitHub Actions writes it: timestamps, an ANSI escape, the
+    /// error line, and cleanup after it.
+    const LOG: &str = "2026-10-01T09:12:40.1000000Z ##[group]Run cargo clippy\n\
+        2026-10-01T09:12:44.1234567Z \u{1b}[1m\u{1b}[91merror\u{1b}[0m: unused import: `std::fs`\n\
+        2026-10-01T09:12:44.2000000Z ##[error]Process completed with exit code 101.\n\
+        2026-10-01T09:12:45.0000000Z Post job cleanup.\n";
+
+    /// The window ends with the first `##[error]` line, cleaned; without
+    /// one, it is the log's end; a window keeps whole lines within its
+    /// bytes, and a single longer line keeps its end.
+    #[test]
+    fn a_logs_excerpt_ends_with_its_first_error() {
+        let excerpt = log_excerpt(LOG.as_bytes(), 1024).unwrap();
+        assert_eq!(
+            excerpt,
+            "##[group]Run cargo clippy\nerror: unused import: `std::fs`\n\
+             ##[error]Process completed with exit code 101.\n"
+        );
+        let excerpt = log_excerpt(LOG.as_bytes(), 60).unwrap();
+        assert_eq!(excerpt, "##[error]Process completed with exit code 101.\n");
+
+        let quiet = "a\nb\nc\n".repeat(1000);
+        assert_eq!(log_excerpt(quiet.as_bytes(), 5).unwrap(), "b\nc\n");
+        let long = format!("{}é\n", "x".repeat(100));
+        assert_eq!(log_excerpt(long.as_bytes(), 4).unwrap(), "xé\n");
+        // A log past the bytes read keeps the end of what was read.
+        let big = format!("{}tail\n", "line\n".repeat(100_000));
+        let read = big.as_bytes().take(big.len() as u64 - 5);
+        assert_eq!(log_excerpt(read, 10).unwrap(), "line\nline\n");
+    }
+
+    /// Only an HTTPS redirect without a credential of its own is followed;
+    /// a signed URL's query never shows in an error.
+    #[test]
+    fn a_redirect_is_followed_to_https_only_and_its_query_is_redacted() {
+        let signed = "https://results.blob.core.windows.net/logs/job.txt?sig=SECRET&se=1";
+        assert_eq!(redirect_target(200, None), Ok(None));
+        assert_eq!(
+            redirect_target(302, Some(signed)),
+            Ok(Some(signed.to_owned()))
+        );
+        assert!(redirect_target(302, None).is_err());
+        let plain = redirect_target(302, Some("http://example.com/x?sig=SECRET")).unwrap_err();
+        assert!(!plain.contains("SECRET"), "{plain}");
+        assert!(redirect_target(302, Some("https://user:pw@example.com/x")).is_err());
+        assert!(redirect_target(302, Some("https:///x")).is_err());
+        let error = redact(&format!("failed to GET {signed} timeout? yes"));
+        assert_eq!(
+            error,
+            "failed to GET https://results.blob.core.windows.net/logs/job.txt?<query removed> \
+             timeout? yes"
+        );
+    }
+
+    /// Answers REST reads with one status and body each.
+    struct Rest(Mutex<Vec<(u16, RateHeaders, &'static str)>>);
+
+    impl Transport for Rest {
+        fn send(&self, _: &Value) -> Result<Response, String> {
+            Err("no GraphQL here".to_owned())
+        }
+
+        fn get(&self, path: &str) -> Result<RestAnswer, String> {
+            assert!(path.starts_with("repos/o/n/"), "{path}");
+            let (status, rate, body) = self.0.lock().unwrap().remove(0);
+            Ok(RestAnswer {
+                rate,
+                ..RestAnswer::new(status, body)
+            })
+        }
+    }
+
+    /// A job's log and another app's output are read by REST; a refused
+    /// token, a spent budget and a gone log are told apart.
+    #[test]
+    fn rest_reads_give_the_excerpt_or_why_not() {
+        let spent = RateHeaders {
+            remaining: Some(0),
+            reset: Some(1_790_000_000),
+            retry_after: None,
+        };
+        let none = RateHeaders::default();
+        let forge = GitHubForge::with_transport(
+            Rest(Mutex::new(vec![
+                (200, none, LOG),
+                (
+                    403,
+                    none,
+                    r#"{"message":"Resource not accessible by personal access token"}"#,
+                ),
+                (403, spent, r#"{"message":"API rate limit exceeded"}"#),
+                (410, none, ""),
+                (
+                    200,
+                    none,
+                    r#"{"output":{"title":"Coverage","summary":"71%","text":null}}"#,
+                ),
+            ])),
+            Repo::parse("o/n").unwrap(),
+        );
+        assert!(
+            forge
+                .job_log_excerpt(2)
+                .unwrap()
+                .ends_with("exit code 101.\n")
+        );
+        let refused = forge.job_log_excerpt(2).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::Unauthorized);
+        assert!(
+            refused.message.contains("personal access token"),
+            "{refused}"
+        );
+        let limited = forge.job_log_excerpt(2).unwrap_err();
+        assert_eq!(limited.kind, ErrorKind::RateLimited);
+        assert_eq!(limited.resets_at.unwrap().as_second(), 1_790_000_000);
+        assert_eq!(
+            forge.job_log_excerpt(2).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        assert_eq!(forge.check_run_output(3).unwrap(), "Coverage\n\n71%");
     }
 }

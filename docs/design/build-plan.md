@@ -540,7 +540,7 @@ Everything runs in the foreground; `continue` arrives in P2, `watch` in P3, the 
       - *Check (c) still pending (2026-10-11).* This session had no personal token: its GitHub App user token read #89's check runs (200) and got the 302 on `actions/jobs/110572493177/logs`, as on 2026-10-10. The maintainer runs, with the stored token:
 
         ```sh
-        OWLSHIFT_LIVE_GITHUB=pitchopp/owlshift OWLSHIFT_LIVE_GITHUB_JOB=110572493177 \
+        OWLSHIFT_GITHUB_TOKEN=<the stored token> OWLSHIFT_LIVE_GITHUB=pitchopp/owlshift OWLSHIFT_LIVE_GITHUB_JOB=110572493177 \
           cargo test -p owlshift-adapters --test github_live -- --ignored --nocapture reads_a_failed_jobs_log
         ```
 

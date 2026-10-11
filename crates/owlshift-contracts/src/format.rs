@@ -21,8 +21,9 @@ use crate::Role;
 /// `result_refusal` (OWL-180); format 8 gives it to the answer check too
 /// (OWL-184); format 9 adds Build's `decisions_refused` (OWL-186); format 10
 /// gives `result_refusal` to the resolver too (OWL-191); format 11 adds
-/// Build's `refused_choices` (OWL-198).
-pub const BRIEF_FORMAT: u32 = 11;
+/// Build's `refused_choices` (OWL-198); format 12 adds Build's `check_failure`
+/// (OWL-112).
+pub const BRIEF_FORMAT: u32 = 12;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role

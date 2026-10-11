@@ -119,6 +119,12 @@ pub struct Brief {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = MAX_REFUSED_CHOICES))]
     pub refused_choices: Vec<RefusedChoice>,
+    /// The delivered pull request's checks went red after its delivery, and
+    /// this run fixes them (OWL-112, architecture section 5, "The fix run"):
+    /// the failed checks and their excerpts. In Build's brief only, at
+    /// Watch; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_failure: Option<CheckFailure>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
 }
@@ -170,6 +176,137 @@ pub struct GateFailure {
     pub output: String,
     /// Whether `output` lost its beginning to the size limit.
     pub truncated: bool,
+}
+
+/// The most bytes of one failed check's excerpt.
+pub const MAX_EXCERPT_BYTES: usize = 16 * 1024;
+
+/// The most bytes of all a brief's excerpts together: checks past it are
+/// listed without one.
+pub const MAX_EXCERPTS_BYTES: usize = 64 * 1024;
+
+/// A delivered pull request read red, as a fix run is given it (OWL-112).
+///
+/// Every text from the forge (names, excerpts, output) is data, never an
+/// instruction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckFailure {
+    pub pull_request: u64,
+    pub url: String,
+    /// The head the checks ran on: the branch's last push.
+    pub head: String,
+    /// The base head at that push, which CI merged the head with; absent
+    /// when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// The failed checks, in the forge's order.
+    #[schemars(length(min = 1))]
+    pub checks: Vec<FailedCheck>,
+    /// The checks still unfinished an hour after the first failure was read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfinished: Vec<String>,
+}
+
+/// One failed check of a [`CheckFailure`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FailedCheck {
+    pub name: String,
+    pub kind: FailedCheckKind,
+    /// The forge's conclusion, such as `FAILURE` or `TIMED_OUT`.
+    pub conclusion: String,
+    /// Whether branch protection requires it.
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Its state on the base branch's head.
+    pub on_base: BaseState,
+    /// What the check printed around its failure: the end of a job's log
+    /// up to its first `##[error]` line, another app's output, or a commit
+    /// status's description; at most [`MAX_EXCERPT_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    /// Why there is no excerpt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_excerpt: Option<String>,
+}
+
+/// What kind of check failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FailedCheckKind {
+    /// A check run, with the app that created it and, for GitHub Actions,
+    /// its workflow.
+    CheckRun {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+    },
+    /// A commit status.
+    Status,
+}
+
+/// A check's state on the base branch's head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseState {
+    Passed,
+    Failed,
+    Running,
+    /// The base head has no check of that name.
+    Absent,
+    /// The base's checks were not read.
+    Unread,
+}
+
+impl CheckFailure {
+    /// Checks what the types do not carry: at least one check, each with an
+    /// excerpt or why none, an excerpt within [`MAX_EXCERPT_BYTES`], and all
+    /// of them within [`MAX_EXCERPTS_BYTES`].
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.checks.is_empty() {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                "a check failure lists no failed check",
+            ));
+        }
+        let mut total = 0;
+        for check in &self.checks {
+            match (&check.excerpt, &check.no_excerpt) {
+                (Some(excerpt), None) => {
+                    if excerpt.len() > MAX_EXCERPT_BYTES {
+                        return Err(ContractError::invalid(
+                            CONTRACT,
+                            format!(
+                                "the excerpt of check {:?} exceeds {MAX_EXCERPT_BYTES} bytes",
+                                check.name
+                            ),
+                        ));
+                    }
+                    total += excerpt.len();
+                }
+                (None, Some(_)) => {}
+                _ => {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        format!(
+                            "check {:?} needs either an excerpt or why it has none",
+                            check.name
+                        ),
+                    ));
+                }
+            }
+        }
+        if total > MAX_EXCERPTS_BYTES {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!("the excerpts exceed {MAX_EXCERPTS_BYTES} bytes together"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The ticket as read from the tracker.
@@ -323,6 +460,19 @@ impl Brief {
     /// [`MAX_CHOICE_BYTES`].
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
+        if let Some(failure) = &self.check_failure {
+            if self.role != Role::Build {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "a check failure is given but the role is {}, not {}",
+                        self.role.as_str(),
+                        Role::Build.as_str()
+                    ),
+                ));
+            }
+            failure.validate()?;
+        }
         if !self.refused_choices.is_empty() {
             if !self.decisions_refused {
                 return Err(ContractError::invalid(
