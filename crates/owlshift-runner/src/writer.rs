@@ -464,7 +464,7 @@ impl QuestionsComment {
     /// fits, otherwise parts of the round (OWL-223). Each part is a marked
     /// QUESTIONS comment of the round that says which part it is; the first
     /// holds what comes before the questions, the summary cut to
-    /// [`SPLIT_SUMMARY_CHARS`] or to the room the part leaves it, and the
+    /// 8,000 characters or to the room the part leaves it, and the
     /// parts are cut between questions
     /// only, each question with the refused choices it reopens; the last
     /// says how to answer. A question too long for a part alone, which the
