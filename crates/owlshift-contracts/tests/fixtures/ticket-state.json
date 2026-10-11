@@ -1,8 +1,10 @@
 {
-  "format": 2,
+  "format": 3,
   "stage": "design_review",
   "waiting": "needs_input",
   "round": 2,
   "reasks": 1,
-  "failed_runs": 0
+  "failed_runs": 0,
+  "fix_passes": 0,
+  "repairs": 0
 }

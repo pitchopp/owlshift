@@ -35,7 +35,9 @@ pub const EVENT_FORMAT: u32 = 2;
 /// The format version of a claim (`claim.json` on a claim ref).
 pub const CLAIM_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).
-pub const TICKET_STATE_FORMAT: u32 = 2;
+/// Format 3 adds the fix passes and repairs at Watch (OWL-55); format 2 is
+/// still read, with both at 0.
+pub const TICKET_STATE_FORMAT: u32 = 3;
 /// The format version of a ticket's asks (`questions.json` on a ticket ref).
 /// Format 4 added the resolver's kept `decisions` (OWL-138); format 5 an
 /// ask's `result_refusal` (OWL-184); format 6 Build's kept `build_refusal`

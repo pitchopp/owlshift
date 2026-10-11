@@ -549,7 +549,7 @@ impl Driver {
             return Err("a scenario's project uses the markdown tracker".to_owned());
         }
         // The on-demand run of P1: the ticket starts at Ready.
-        let state = TicketState::restore(Status::Active(Stage::Ready), 0, 0, 0)
+        let state = TicketState::restore(Status::Active(Stage::Ready), 0, 0, 0, 0, 0)
             .map_err(|e| e.to_string())?;
         let runner_git = git.clone();
         let timeout = scenario

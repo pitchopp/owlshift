@@ -503,6 +503,10 @@ Everything runs in the foreground; `continue` arrives in P2, `watch` in P3, the 
       - `ForgeBlocked` parks (`ParkReason::Forge`): a red no run fixes, or a push the forge refused.
     - *Existing events.* `ResultRefused` becomes valid at Watch as at Build, and `Restarted` clears both counts.
     - *Doc comments.* The `Event` table's Watch row, `Pipeline::loop_back` and `Stage::default_role` stop saying that fixes and rebases loop back to Build: at Watch, only review comments (P5) loop back.
+    - *Implemented* (OWL-55, 2026-10-11) in `owlshift_core::state` (`MAX_FIX_PASSES`, `MAX_REPAIRS`, `TicketState::fix_passes` and `repairs`, the six events, the three park reasons) and `owlshift_contracts::refs::PersistedState` (format 3, reading format 2 with both counts at 0 and refusing a format-2 document that carries either). Three points the design left open:
+      - Leaving Watch, which only review comments do (P5), clears both counts, as a new stage clears the failed runs: the next delivery is a new one, and `restore` refuses the counts elsewhere.
+      - `FixPushed` with the fix passes or the repairs at their bound, and `RebasePushed` with the repairs at theirs, are invalid transitions: the runner gives `FixDue` or `RebaseDue` before each run.
+      - `FixDue` with both counts at their bounds parks for the fix passes.
   - **OWL-112: the fix run.**
     - *The brief's `check_failure`.* A new brief format, with its schema, filled with the failed checks and their excerpts. The job log is read through REST `actions/jobs/<id>/logs` by the runner, the forge's only credential holder, which follows the redirect without the token. Timestamps and ANSI escapes are removed, the 16 KiB ending with the first `##[error]` line are kept, and the brief's 64 KiB limit applies.
     - *`roles/build.md`.* What a fix run is, and that a failure outside the branch is asked about.

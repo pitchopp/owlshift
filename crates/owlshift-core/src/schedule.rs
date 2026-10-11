@@ -124,7 +124,7 @@ mod tests {
     };
 
     fn ready_state() -> TicketState {
-        TicketState::restore(Status::Active(Stage::Ready), 0, 0, 0).unwrap()
+        TicketState::restore(Status::Active(Stage::Ready), 0, 0, 0, 0, 0).unwrap()
     }
 
     fn ticket(id: &'static str, priority: Priority) -> Ticket<&'static str> {
@@ -144,13 +144,15 @@ mod tests {
         let mut intake = ticket("A", Priority::Urgent);
         intake.state = TicketState::admitted();
         let mut building = ticket("B", Priority::Urgent);
-        building.state = TicketState::restore(Status::Active(Stage::Build), 0, 0, 0).unwrap();
+        building.state = TicketState::restore(Status::Active(Stage::Build), 0, 0, 0, 0, 0).unwrap();
         let mut waiting = ticket("C", Priority::Urgent);
         waiting.state = TicketState::restore(
             Status::NeedsInput {
                 return_to: Stage::Ready,
             },
             1,
+            0,
+            0,
             0,
             0,
         )
