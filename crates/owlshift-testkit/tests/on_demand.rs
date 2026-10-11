@@ -22,7 +22,7 @@ use tempfile::TempDir;
 
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::{Repo, Verdict};
-use owlshift_adapters::graphql::{Response, Transport};
+use owlshift_adapters::graphql::{Response, RestAnswer, Transport};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{self, Capability, Comment, Ticket, Tracker};
 use owlshift_contracts::Role;
@@ -35,7 +35,7 @@ use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::refs::{AskDecider, Waiting};
 use owlshift_contracts::result::RefusedChoice;
 use owlshift_core::decider::DeciderRule;
-use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason};
+use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason, Status, TicketState};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{Data, EventLog, EventSink};
 use owlshift_runner::executor::harness::ClaudeHarness;
@@ -69,7 +69,17 @@ struct FakeGitHub {
     followed: Mutex<Followed>,
     /// Watch's reads of the pull request so far.
     follow_reads: Mutex<u32>,
+    /// The status the red job's log answers (OWL-112), and how many times
+    /// it was read.
+    log: Mutex<(u16, u32)>,
 }
+
+/// The red job's log, as GitHub Actions writes it: timestamps, an ANSI
+/// escape, the error, then cleanup.
+const JOB_LOG: &str = "2026-10-11T09:00:00.0000000Z ##[group]Run git grep -q Hello\n\
+    2026-10-11T09:00:01.0000000Z \u{1b}[31merror\u{1b}[0m: GREETING.md says hello on macOS only\n\
+    2026-10-11T09:00:01.5000000Z ##[error]Process completed with exit code 1.\n\
+    2026-10-11T09:00:02.0000000Z Post job cleanup.\n";
 
 /// The pull request as watch reads it.
 #[derive(Clone)]
@@ -146,10 +156,12 @@ impl FakeGitHub {
                         "totalCount": 1,
                         "pageInfo": { "hasNextPage": false, "endCursor": null },
                         "nodes": [{
-                            "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
-                            "conclusion": followed.conclusion, "isRequired": true,
+                            "__typename": "CheckRun", "databaseId": 2, "name": "ci",
+                            "status": "COMPLETED", "conclusion": followed.conclusion,
+                            "isRequired": true,
                             "detailsUrl": "https://github.com/demo/project/runs/2",
-                            "checkSuite": null,
+                            "checkSuite": { "app": { "slug": "github-actions" },
+                                            "workflowRun": { "workflow": { "name": "CI" } } },
                         }],
                     },
                 } } }] },
@@ -204,6 +216,17 @@ impl Transport for Shared {
             status: 200,
             body: json!({ "data": data }).to_string(),
             ..Default::default()
+        })
+    }
+
+    /// The red job's log, the one REST read of the bench.
+    fn get(&self, path: &str) -> Result<RestAnswer, String> {
+        assert_eq!(path, "repos/demo/project/actions/jobs/2/logs");
+        let mut log = self.0.log.lock().unwrap();
+        log.1 += 1;
+        Ok(match log.0 {
+            200 => RestAnswer::new(200, JOB_LOG),
+            status => RestAnswer::new(status, r#"{"message":"Resource not accessible"}"#),
         })
     }
 }
@@ -355,6 +378,10 @@ impl Tracker for Clocked<'_> {
             .ok_or_else(|| other(&"the comment just posted is gone"))
     }
 
+    fn stage(&self, id: &TicketId) -> Result<String, tracker::Error> {
+        Tracker::stage(&self.inner, id)
+    }
+
     fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), tracker::Error> {
         if self.refuse_stage {
             return Err(tracker::Error::new(
@@ -482,6 +509,7 @@ impl Bench {
             stale_reads: Mutex::new(0),
             followed: Mutex::default(),
             follow_reads: Mutex::new(0),
+            log: Mutex::new((200, 0)),
         });
         Self {
             data: tmp.path().join("data"),
@@ -4665,7 +4693,12 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
         pass += 1;
         let mut followed = github.followed.lock().unwrap();
         match pass {
-            2 | 3 => followed.conclusion = "FAILURE",
+            // Red on the base too: nothing to fix (OWL-112 fixes a red of
+            // the pull request's own).
+            2 | 3 => {
+                followed.conclusion = "FAILURE";
+                followed.base_conclusion = "FAILURE";
+            }
             4 => followed.mergeable = "CONFLICTING",
             5 => followed.state = "MERGED",
             _ => {}
@@ -4693,7 +4726,7 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
                 &json!("verdict"),
                 &json!("red"),
                 &json!("mergeable"),
-                &json!("fix")
+                &json!("wait_base_red")
             ),
             (
                 &json!("mergeable"),
@@ -4736,4 +4769,270 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
         lines.ends_with("no ticket's questions wait for an answer\n"),
         "{lines}"
     );
+}
+
+/// A fix run's `done`: the greeting committed again.
+const FIXED: &str = r#"{"format":7,"status":"done","summary":"Kept the greeting on every platform.",
+"pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Fixed."}}"#;
+
+/// A delivered ticket, its pull request followed.
+fn delivered() -> Bench {
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    bench
+}
+
+/// The ticket's state as its ref keeps it.
+fn state_of(bench: &Bench) -> TicketState {
+    TicketState::try_from(&bench.record().state).unwrap()
+}
+
+/// The ticket's stage line on the tracker, rewritten by a person.
+fn move_ticket(bench: &Bench, stage: &str) {
+    let file = bench.ticket_file();
+    let text = fs::read_to_string(&file).unwrap();
+    let line = text.lines().find(|l| l.starts_with("stage = ")).unwrap();
+    fs::write(&file, text.replace(line, &format!("stage = \"{stage}\""))).unwrap();
+}
+
+/// Scenario S9's red-check part (OWL-112): watch reads the delivered pull
+/// request red and runs a fix run briefed with the failed check and its
+/// log's excerpt, whose commit passes the gate and is pushed to the same
+/// branch with a lease, with a DELIVERY report naming the pass. A green
+/// read clears the passes; two more fixes reach the bound, and the next red
+/// parks the ticket with a PARKED comment and no fourth run.
+#[test]
+fn a_red_pull_request_gets_fix_runs_until_the_bound_parks_it() {
+    let bench = delivered();
+    let delivered_events = bench.events().len();
+    let first_push = bench.remote_branch().unwrap();
+    let github = bench.github.clone();
+    let mut pass = 0;
+    let replies = vec![
+        bench.reply(Some("Hello again"), Some(FIXED)),
+        bench.reply(Some("Hello, again and again"), Some(FIXED)),
+        bench.reply(Some("Hello, at last"), Some(FIXED)),
+    ];
+    // What the forge shows at each pass: red, green, then red.
+    github.followed.lock().unwrap().conclusion = "FAILURE";
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        github.followed.lock().unwrap().conclusion = match pass {
+            1 => "SUCCESS",
+            _ => "FAILURE",
+        };
+        pass < 6
+    });
+    // Red: fix 1. Green: cleared. Red: fix 2, then fix 3. Red: parked.
+    assert_eq!(outcomes.len(), 4, "{outcomes:?}\n{lines}\n{printed}");
+    for outcome in &outcomes[..3] {
+        let delivered = outcome
+            .as_ref()
+            .unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+        assert!(!delivered.opened);
+    }
+    assert!(
+        matches!(
+            &outcomes[3],
+            Err(Stop::Parked {
+                reason: ParkReason::FixPasses,
+                ..
+            })
+        ),
+        "{:?}",
+        outcomes[3]
+    );
+    let state = state_of(&bench);
+    assert!(matches!(state.status(), Status::Parked { .. }), "{state:?}");
+    assert_eq!((state.fix_passes(), state.repairs()), (2, 3));
+
+    // Each fix run was the build role at Watch, told the failed check and
+    // its excerpt: the job log's lines up to its first error, cleaned.
+    let briefs = bench.briefs();
+    assert_eq!(briefs.len(), 4);
+    for brief in &briefs[1..] {
+        assert_eq!(brief.role, Role::Build);
+        let failure = brief.check_failure.as_ref().expect("a check failure");
+        assert_eq!(failure.pull_request, 1);
+        let check = &failure.checks[0];
+        assert_eq!(
+            (check.name.as_str(), check.conclusion.as_str()),
+            ("ci", "FAILURE")
+        );
+        assert_eq!(
+            check.excerpt.as_deref(),
+            Some(
+                "##[group]Run git grep -q Hello\nerror: GREETING.md says hello on macOS only\n\
+                 ##[error]Process completed with exit code 1.\n"
+            )
+        );
+    }
+    assert!(briefs[0].check_failure.is_none());
+    assert_eq!(github.log.lock().unwrap().1, 3);
+
+    // Each fix landed on the same branch, a fast-forward leased on the push
+    // before it; the ref follows the last one.
+    let events = &bench.events()[delivered_events..];
+    let pushes = data_of(events, EventKind::TrackerWrite, "lease");
+    assert_eq!(pushes.len(), 3);
+    assert_eq!(pushes[0]["lease"], json!(first_push));
+    assert!(
+        pushes.iter().all(|p| p["pushed"] == "fast_forward"),
+        "{pushes:?}"
+    );
+    assert_eq!(pushes[1]["lease"], pushes[0]["commit"]);
+    let last = bench.remote_branch().unwrap();
+    assert_eq!(pushes[2]["commit"], json!(last));
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(delivery.pushed.as_deref(), Some(last.as_str()));
+    assert!(delivery.pushing.is_none() && delivery.followed());
+
+    // A DELIVERY report per fix, naming its pass, then the PARKED comment.
+    let comments = bench.comments();
+    let reports: Vec<&String> = comments
+        .iter()
+        .filter(|c| c.starts_with("[owlshift] DELIVERY"))
+        .collect();
+    assert_eq!(reports.len(), 4);
+    for (report, pass) in reports[1..].iter().zip([1, 1, 2]) {
+        assert!(
+            report.contains(&format!(
+                "**Fix pass {pass} of 2 after delivery,** for the red checks `ci`."
+            )),
+            "{report}"
+        );
+    }
+    let parked = comments.last().unwrap();
+    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    assert!(parked.contains("after 2 fix passes"), "{parked}");
+    let decided = data_of(events, EventKind::Decision, "watch");
+    assert!(decided.iter().any(|d| d["action"] == "fix"), "{decided:?}");
+    assert_eq!(bench.stage(), "Needs Input");
+}
+
+/// A ticket a person moved out of Owlshift's states gets no fix run while
+/// it stays there, and one once it is back (architecture section 5, "A
+/// ticket a person moved"). A fix run that asks parks the ticket, its
+/// questions in the PARKED comment, until OWL-211 builds the round.
+#[test]
+fn a_moved_ticket_waits_and_a_fix_run_that_asks_parks_it() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    move_ticket(&bench, "Done");
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Refused(why)) if why.contains("\"Done\"")),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 1);
+    assert!(
+        data_of(&bench.events(), EventKind::Decision, "watch")
+            .iter()
+            .any(|d| d["watch"] == "stage_moved")
+    );
+
+    move_ticket(&bench, "In Review");
+    let asks = r#"{"format":7,"status":"questions","summary":"The red is a missing secret.",
+"questions":[{"id":"Q1","category":"secrets","context":"CI lacks the token the check reads.",
+"text":"Can someone add the DEPLOY_TOKEN secret and re-run the check?"}]}"#;
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(asks))]);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::Blocked,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    let parked = bench.comments().pop().unwrap();
+    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    assert!(
+        parked.contains("Q1: Can someone add the DEPLOY_TOKEN secret"),
+        "{parked}"
+    );
+    assert_eq!(bench.briefs().len(), 2);
+    assert_eq!(state_of(&bench).fix_passes(), 0);
+}
+
+/// A red no run fixes parks the ticket without a run; restarted, a red of
+/// the code gets its fix run, and a push the forge refuses while the branch
+/// is still at Owlshift's last push parks it again, git's answer quoted.
+#[test]
+fn a_red_no_run_fixes_and_a_refused_push_park_the_ticket() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "CANCELLED";
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Parked { reason: ParkReason::Forge, detail, .. })
+            if detail.contains("ci (CANCELLED)")),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 1);
+
+    // The remote cannot lock the branch's ref: it refuses the push.
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let lock = bench.remote.bare.join("refs/heads/owlshift/demo-1.lock");
+    let pushed = bench.remote_branch().unwrap();
+    let during = (
+        1,
+        Box::new(move || fs::write(lock, "").unwrap()) as Box<dyn FnOnce()>,
+    );
+    let (outcome, printed) = bench.continue_during(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        vec![during],
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::Parked { reason: ParkReason::Forge, detail, .. })
+            if detail.contains("the forge refused Owlshift's push")),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.remote_branch().unwrap(), pushed);
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(
+        (delivery.pushed.as_deref(), delivery.pushing),
+        (Some(pushed.as_str()), None)
+    );
+    assert_eq!(state_of(&bench).fix_passes(), 0);
+}
+
+/// Someone pushing to the branch while the fix run works: the leased push
+/// is refused, nothing is overwritten, and the next read ends the
+/// following.
+#[test]
+fn a_persons_push_during_a_fix_run_ends_the_following() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let (env, bare) = (bench.env.clone(), bench.remote.bare.clone());
+    let main = bench.remote_main();
+    let during = (
+        1,
+        Box::new(move || {
+            env.run(
+                &bare,
+                &["update-ref", &format!("refs/heads/{BRANCH}"), &main],
+            )
+            .unwrap();
+        }) as Box<dyn FnOnce()>,
+    );
+    let (outcome, printed) = bench.continue_during(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        vec![during],
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::Refused(why)) if why.contains("someone else pushed")),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.remote_branch().unwrap(), bench.remote_main());
+    assert!(bench.record().delivery.unwrap().pushing.is_none());
+
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Watched { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let ended = bench.record().delivery.unwrap().ended.unwrap();
+    assert_eq!(ended.why, owlshift_contracts::refs::EndedWhy::HeadMoved);
 }

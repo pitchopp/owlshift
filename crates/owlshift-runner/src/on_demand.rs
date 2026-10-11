@@ -2903,7 +2903,6 @@ impl OnDemand<'_> {
         }
         let pushed_id =
             CommitId::new(pushed.as_str()).map_err(|e| refused("the pushed commit", e))?;
-        let head = Branch::new(&p.branch).map_err(|e| refused("the ticket's branch", e))?;
         let local = self.fix_branch(p, &pushed_id)?;
         // A fix whose push had no verdict is pushed again, without a run.
         if let Some(pushing) = &delivery.pushing
@@ -2954,9 +2953,6 @@ impl OnDemand<'_> {
         })?;
         let current = person(p.current()?, &p.found);
         let dispatched = self.dispatch(p, Command::Fix, sink)?;
-        if dispatched.head != head {
-            return Err(Stop::Refused("the ticket's branch moved".to_owned()));
-        }
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
         let fixed = loop {
