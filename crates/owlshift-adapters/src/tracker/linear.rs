@@ -498,11 +498,13 @@ fn profile_link(url: &str) -> Option<String> {
 }
 
 /// The fields read from every comment. No e-mail, no full name: only what the
-/// contract carries, and whether the user is an app (OWL-157).
+/// contract carries, whether the user is an app (OWL-157), and the comment a
+/// reply answers (OWL-146: `issue.comments` lists replies too, each naming its
+/// `parent`, checked live on 2026-10-11).
 macro_rules! comment_fields {
     () => {
         "id body createdAt editedAt user { id displayName app } botActor { name } \
-         externalUser { name }"
+         externalUser { name } parent { id }"
     };
 }
 
@@ -745,6 +747,14 @@ struct LinearComment {
     user: Option<User>,
     bot_actor: Option<Named>,
     external_user: Option<Named>,
+    /// Absent from recordings made before OWL-146.
+    #[serde(default)]
+    parent: Option<Parent>,
+}
+
+#[derive(Deserialize)]
+struct Parent {
+    id: String,
 }
 
 impl LinearComment {
@@ -755,6 +765,7 @@ impl LinearComment {
             created_at: self.created_at,
             edited_at: self.edited_at,
             body: self.body,
+            parent: self.parent.map(|parent| parent.id),
         }
     }
 }
@@ -960,6 +971,7 @@ mod tests {
             external_user: external.map(|n| Named {
                 name: Some(n.to_owned()),
             }),
+            parent: None,
         };
         let other = |name: &str| Author::Other {
             name: name.to_owned(),
@@ -1006,6 +1018,26 @@ mod tests {
             matches!(&comments[1].author, Author::Account(person) if person.id == "u1"),
             "{comments:?}"
         );
+    }
+
+    /// A reply as Linear answered it on 2026-10-11 (OWL-146): listed among
+    /// the issue's comments, naming its `parent`; a top-level comment's is
+    /// `null`.
+    #[test]
+    fn a_reply_names_the_comment_it_answers() {
+        let page = r#"{"data":{"issue":{"comments":{"nodes":[
+            {"id":"c2","body":"b","createdAt":"2026-10-11T20:24:31Z","editedAt":null,
+             "user":{"id":"u1","displayName":"person-1","app":false},
+             "botActor":null,"externalUser":null,"parent":{"id":"c1"}},
+            {"id":"c1","body":"b","createdAt":"2026-10-04T09:15:59Z","editedAt":null,
+             "user":{"id":"u2","displayName":"owlshiftbot","app":true},
+             "botActor":null,"externalUser":null,"parent":null}],
+            "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}"#;
+        let comments = tracker(vec![page])
+            .comments(&TicketId::new("OWL-1").unwrap())
+            .unwrap();
+        let parents: Vec<Option<&str>> = comments.iter().map(|c| c.parent.as_deref()).collect();
+        assert_eq!(parents, [None, Some("c1")]);
     }
 
     /// Answers each request by its operation's name, and keeps the names.

@@ -541,6 +541,23 @@ pub struct KeptDecision {
     /// What settles it.
     #[schemars(regex(pattern = r"\S"))]
     pub basis: String,
+    /// The decider reversed it by replying to its DECISION comment
+    /// (format 10, OWL-146): the replies a run was given and followed, up to
+    /// [`Reversal::through`]. A newer reply is one no run has followed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversed: Option<Reversal>,
+}
+
+/// The decider's replies to a DECISION comment that a run followed: the
+/// Build that delivered the ticket, or a correction run at Watch (OWL-146).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Reversal {
+    /// The newest last edit among those replies.
+    pub through: Timestamp,
+    /// The tracker's identifier of the reply edited at `through`.
+    #[schemars(regex(pattern = r"\S"))]
+    pub comment: String,
 }
 
 impl KeptDecision {
@@ -551,6 +568,7 @@ impl KeptDecision {
             question: self.question.clone(),
             decision: self.decision.clone(),
             basis: self.basis.clone(),
+            reversed: self.reversed.is_some(),
         }
     }
 }
@@ -650,10 +668,11 @@ impl TicketQuestions {
     /// written before the resolver's refusal was kept (OWL-191), and a
     /// format-7 one, written before every refused list was kept (OWL-195),
     /// and a format-8 one, written before the refused choices were typed
-    /// (OWL-198), are read as the current format with what they lack empty,
-    /// a format-6 or 7 Build refusal upgraded (`LegacyBuildRefusal::upgrade`)
-    /// and a format-8 one's lists kept as text, and the next write gives
-    /// them the current format.
+    /// (OWL-198), and a format-9 one, written before a decision kept its
+    /// reversal (OWL-146), are read as the current format with what they lack
+    /// empty, a format-6 or 7 Build refusal upgraded
+    /// (`LegacyBuildRefusal::upgrade`) and a format-8 one's lists kept as
+    /// text, and the next write gives them the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -663,20 +682,27 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 8 document read as the current format, or `None` for
+    /// A format-2 to 9 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
-    /// in their own shape, and format 9 adds the typed choices to it.
+    /// in their own shape, format 9 adds the typed choices to it, and format
+    /// 10 a decision's reversal.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=8).contains(&format) {
+        if !(2..=9).contains(&format) {
             return None;
         }
-        let typed = document["build_refusal"]
-            .as_object()
-            .is_some_and(|kept| kept.contains_key("choices") || kept.contains_key("left_out"));
+        let typed = format <= 8
+            && document["build_refusal"]
+                .as_object()
+                .is_some_and(|kept| kept.contains_key("choices") || kept.contains_key("left_out"));
+        let reversed = document["decisions"].as_array().is_some_and(|decisions| {
+            decisions
+                .iter()
+                .any(|decision| decision.get("reversed").is_some())
+        });
         let in_an_ask = |field: &str| {
             document["asks"]
                 .as_array()
@@ -694,6 +720,8 @@ impl TicketQuestions {
             Some("resolver refusal")
         } else if typed {
             Some("typed refused choices")
+        } else if reversed {
+            Some("reversed decision")
         } else {
             None
         };
@@ -811,6 +839,12 @@ impl TicketQuestions {
                 "decision"
             } else if kept.basis.trim().is_empty() {
                 "basis"
+            } else if kept
+                .reversed
+                .as_ref()
+                .is_some_and(|r| r.comment.trim().is_empty())
+            {
+                "reversing reply"
             } else if n > 0 && self.decisions[n - 1].at > kept.at {
                 return Err(ContractError::invalid(
                     Self::CONTRACT,
@@ -960,9 +994,9 @@ pub struct TicketDelivery {
     /// A push under way, until the forge shows it as the head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pushing: Option<Pushing>,
-    /// The DELIVERY report of `pushed`, a fix or rebase run's push that
-    /// landed, while it is not on the ticket yet (OWL-218): the next pass
-    /// posts it, once. Since format 2.
+    /// The DELIVERY report of `pushed`, a fix, rebase or correction run's
+    /// push that landed, while it is not on the ticket yet (OWL-218): the
+    /// next pass posts it, once. Since format 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owed: Option<OwedReport>,
     /// Why and when watch stopped following the pull request.
@@ -992,14 +1026,15 @@ pub struct Pushing {
     /// `rebased_onto` once the push lands or is adopted (OWL-210).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onto: Option<String>,
-    /// What a fix or rebase run's DELIVERY report says, kept before the push
-    /// so a push a crash cut short is still reported once adopted (OWL-218).
-    /// Since format 2.
+    /// What a fix, rebase or correction run's DELIVERY report says, kept
+    /// before the push so a push a crash cut short is still reported once
+    /// adopted (OWL-218). Since format 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<KeptReport>,
 }
 
-/// What a fix or rebase run gave its DELIVERY report (OWL-218).
+/// What a fix, rebase or correction run gave its DELIVERY report (OWL-218,
+/// OWL-146).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeptReport {
@@ -1012,21 +1047,26 @@ pub struct KeptReport {
     /// For a fix run, the failed checks it was given.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<String>,
+    /// For a correction run, the questions of the decisions the decider's
+    /// replies reversed (format 3, OWL-146).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<String>,
     /// The follow-ups the run proposed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub followups: Vec<Followup>,
 }
 
 /// A DELIVERY report still to be posted for the delivery's `pushed`
-/// commit, a fix or rebase run's push (OWL-218). The commit, and for a
-/// rebase the base it rebased onto, are the delivery's `pushed` and
-/// `rebased_onto`.
+/// commit, a fix, rebase or correction run's push (OWL-218, OWL-146). The
+/// commit, and for a rebase the base it rebased onto, are the delivery's
+/// `pushed` and `rebased_onto`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OwedReport {
-    /// `fix` or `rebase`.
+    /// `fix`, `rebase` or `correction`.
     pub kind: PushKind,
-    /// The fix pass or the repair the push was, from 1.
+    /// The fix pass or the repair the push was, from 1; for a correction,
+    /// how many decisions it follows the replies to.
     pub count: u32,
     /// What the run gave its report; absent for a push adopted from a ref
     /// that kept none.
@@ -1041,6 +1081,9 @@ pub enum PushKind {
     Delivery,
     Fix,
     Rebase,
+    /// A correction run's, after the decider reversed a decision (format 3,
+    /// OWL-146).
+    Correction,
 }
 
 /// Why and when watch stopped following a pull request.
@@ -1087,7 +1130,8 @@ impl TicketDelivery {
 
     /// Parses a `delivery.json`. A format-1 one, written before the owed
     /// report and the kept report were kept (OWL-218), is read without
-    /// them, and the next write gives it the current format.
+    /// them, and a format-2 one, written before a correction run's push
+    /// (OWL-146), without one; the next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -1097,27 +1141,43 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1 document read as the current format, or `None` for any
-    /// other. Format 1 is format 2 without `owed` and `pushing.report`, so
-    /// either is refused in it.
+    /// A format-1 or format-2 document read as the current format, or
+    /// `None` for any other. Format 1 is format 2 without `owed` and
+    /// `pushing.report`, and format 2 is format 3 without a correction's push
+    /// or report, so each is refused in an older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
-        if fields.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+        let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
+        if !(1..=2).contains(&format) {
             return None;
         }
-        let report = fields
-            .get("pushing")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|pushing| pushing.contains_key("report"));
+        let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
+        let report = pushing.is_some_and(|pushing| pushing.contains_key("report"));
+        let correction = [
+            pushing.and_then(|p| p.get("kind")),
+            fields.get("owed").and_then(|owed| owed.get("kind")),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|kind| kind == "correction");
+        let questions = [
+            pushing.and_then(|p| p.get("report")),
+            fields.get("owed").and_then(|owed| owed.get("report")),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|report| report.get("questions").is_some());
         for (field, kept) in [
-            ("owed", fields.contains_key("owed")),
-            ("pushing.report", report),
+            ("owed", format == 1 && fields.contains_key("owed")),
+            ("pushing.report", format == 1 && report),
+            ("correction's push", correction),
+            ("correction's report", questions),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
                     Self::CONTRACT,
-                    format!("format 1 keeps no {field}"),
+                    format!("format {format} keeps no {field}"),
                 )));
             }
         }
@@ -1141,9 +1201,10 @@ impl TicketDelivery {
 
     /// Checks the commits are full ids, the branches git branch names, the
     /// link a plain `https://` URL, that a push under way names its `onto`
-    /// exactly when it is a rebase's and keeps a report only for a fix or a
-    /// rebase, that an owed report is a fix's or a rebase's, from 1, of a
-    /// pushed commit with its pull request (and for a rebase its base), and
+    /// exactly when it is a rebase's and keeps a report only for a fix, a
+    /// rebase or a correction, that an owed report is one of theirs, from 1,
+    /// of a pushed commit with its pull request (and for a rebase its base),
+    /// that a report names questions exactly when it is a correction's, and
     /// that an ended delivery pushes nothing.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
@@ -1200,11 +1261,32 @@ impl TicketDelivery {
             && pushing.kind == PushKind::Delivery
             && pushing.report.is_some()
         {
-            return invalid("a delivery's push keeps no fix or rebase report".to_owned());
+            return invalid("a delivery's push keeps no run's report".to_owned());
+        }
+        // A correction's report names the questions it follows the replies
+        // to, and no other report does (OWL-146).
+        let reports = [
+            self.pushing
+                .as_ref()
+                .and_then(|p| p.report.as_ref().map(|r| (p.kind, r))),
+            self.owed
+                .as_ref()
+                .and_then(|o| o.report.as_ref().map(|r| (o.kind, r))),
+        ];
+        if reports
+            .into_iter()
+            .flatten()
+            .any(|(kind, report)| (kind == PushKind::Correction) == report.questions.is_empty())
+        {
+            return invalid(
+                "a report names questions if and only if it is a correction's".to_owned(),
+            );
         }
         if let Some(owed) = &self.owed {
             if owed.kind == PushKind::Delivery {
-                return invalid("an owed report is a fix's or a rebase's".to_owned());
+                return invalid(
+                    "an owed report is a fix's, a rebase's or a correction's".to_owned(),
+                );
             }
             if owed.count == 0 {
                 return invalid("an owed report counts from 1".to_owned());

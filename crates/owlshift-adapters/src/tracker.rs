@@ -179,6 +179,9 @@ pub struct Comment {
     /// When its author last edited it; `None` if never edited.
     pub edited_at: Option<Timestamp>,
     pub body: String,
+    /// The comment it replies to, in a tracker that threads replies: how the
+    /// decider reverses a DECISION (OWL-146); `None` for a top-level one.
+    pub parent: Option<String>,
 }
 
 impl Author {

@@ -621,6 +621,14 @@ impl Bench {
             .unwrap();
     }
 
+    /// `author` replies to the comment `parent`, at the next minute
+    /// (OWL-146).
+    fn reply_as(&self, author: &str, parent: &str, body: &str) {
+        MarkdownTracker::new(&self.remote.checkout)
+            .post_reply(&ticket(), author, tick(&self.clock), parent, body)
+            .unwrap();
+    }
+
     /// The decider comments on the ticket in the second of `at`, after the
     /// comments already there, leaving the clock as it is.
     fn answer_at(&self, at: Timestamp, body: &str) {
@@ -5331,6 +5339,7 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
             summary: "Kept the greeting on every platform.".to_owned(),
             gate: Some(vec!["git grep -q Hello".to_owned()]),
             checks: vec!["ci".to_owned()],
+            questions: Vec::new(),
             followups: Vec::new(),
         }),
     });
@@ -5644,4 +5653,274 @@ fn a_rebase_that_fails_twice_parks_the_ticket() {
         .unwrap();
     assert_eq!(String::from_utf8(local).unwrap().trim(), first_push);
     assert_eq!(state_of(&bench).repairs(), 0);
+}
+
+/// A ticket whose Build's question the resolver decided, delivered in the
+/// same command: the DECISION comment's id.
+fn delivered_with_a_decision(bench: &Bench) -> String {
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let decisions = bench.record().questions.decisions;
+    assert_eq!(decisions.len(), 1);
+    assert!(decisions[0].reversed.is_none());
+    decisions[0].comment.clone()
+}
+
+/// A correction run's `done`, the greeting moved as the reply asks.
+const CORRECTED: &str = r#"{"format":7,"status":"done","summary":"Moved the greeting as the reply asks.",
+"pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Corrected."}}"#;
+
+/// Scenario S7's reversal (OWL-146): once the ticket is delivered, the
+/// decider replies to the DECISION comment, and watch runs a correction run
+/// briefed with the reply once it counts, whose commit is pushed with a lease
+/// on the delivery; the decision keeps the reply as followed, and the next
+/// pass runs nothing. A stranger's reply reverses nothing. Its DELIVERY
+/// report, refused by the tracker, is owed and posted once at the next pass
+/// (OWL-218).
+#[test]
+fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
+    let bench = Bench::new(true);
+    let decision = delivered_with_a_decision(&bench);
+    let delivered_events = bench.events().len();
+    let first_push = bench.remote_branch().unwrap();
+    let ran = || bench.briefs().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.reply(Some("Hello from HELLO.md"), Some(CORRECTED))],
+        &mut |_| {
+            pass += 1;
+            match pass {
+                // Nothing to correct. A stranger replies, then the decider,
+                // within the quiet window.
+                1 => {
+                    assert_eq!(ran(), 3);
+                    bench.reply_as("reviewer", &decision, "Keep GREETING.md.");
+                    bench.reply_as("maintainer", &decision, "No: put it in HELLO.md.");
+                    bench.waited.set(SignedDuration::ZERO);
+                }
+                // Settling: nothing ran. Past the window now, and the tracker
+                // refuses the DELIVERY report.
+                2 => {
+                    assert_eq!(ran(), 3);
+                    bench.waited.set(SignedDuration::from_mins(10));
+                    bench.refuse.set(Some("[owlshift] DELIVERY"));
+                }
+                // The correction ran and was pushed; its report is owed.
+                3 => {
+                    assert_eq!(ran(), 4);
+                    assert!(bench.record().delivery.unwrap().owed.is_some());
+                    bench.refuse.set(None);
+                }
+                // Posted; the next pass runs nothing and posts nothing.
+                4 => assert!(bench.record().delivery.unwrap().owed.is_none()),
+                _ => {}
+            }
+            pass < 5
+        },
+    );
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(
+        matches!(&outcomes[0], Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
+        "{outcomes:?}\n{printed}"
+    );
+    assert_eq!(ran(), 4);
+
+    // The build role at Watch, given the decider's reply alone.
+    let brief = bench.briefs().pop().unwrap();
+    assert_eq!(brief.role, Role::Build);
+    let correction = brief.correction.expect("a correction");
+    assert_eq!(correction.pull_request, 1);
+    assert_eq!(correction.head, first_push);
+    let reversed = &correction.reversed[0];
+    assert_eq!(
+        reversed.question.text,
+        "Which file should hold the greeting?"
+    );
+    assert_eq!(reversed.decision, "GREETING.md, at the root.");
+    assert_eq!(reversed.reply, "No: put it in HELLO.md.");
+
+    // Pushed as a fast-forward leased on the delivery, then reported.
+    let events = &bench.events()[delivered_events..];
+    let pushes = data_of(events, EventKind::TrackerWrite, "lease");
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0]["lease"], json!(first_push));
+    assert_eq!(pushes[0]["pushed"], "fast_forward");
+    let last = bench.remote_branch().unwrap();
+    assert_eq!(pushes[0]["commit"], json!(last));
+    let corrected: Vec<String> = bench
+        .comments()
+        .into_iter()
+        .filter(|c| c.contains("**Corrected after delivery,**"))
+        .collect();
+    assert_eq!(corrected.len(), 1, "{corrected:?}");
+    let report = &corrected[0];
+    assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
+    assert!(
+        report.contains(
+            "**Corrected after delivery,** to follow the decider's replies to the decisions on \
+             **Which file should hold the greeting?**."
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("Fix pass"), "{report}");
+
+    // The decision keeps the reply as followed; the state counts nothing.
+    let record = bench.record();
+    let kept = record.questions.decisions[0].reversed.as_ref().unwrap();
+    let replies = MarkdownTracker::new(&bench.remote.checkout)
+        .comments(&ticket())
+        .unwrap();
+    let reply = replies
+        .iter()
+        .find(|c| c.body == "No: put it in HELLO.md.")
+        .unwrap();
+    assert_eq!(kept.comment, reply.id);
+    assert_eq!(kept.through, reply.at);
+    let state = state_of(&bench);
+    assert_eq!(
+        state.status(),
+        Status::Active(owlshift_core::vocab::Stage::Watch)
+    );
+    assert_eq!((state.fix_passes(), state.repairs()), (0, 0));
+    assert_eq!(
+        record.delivery.unwrap().pushed.as_deref(),
+        Some(last.as_str())
+    );
+    let decided = data_of(events, EventKind::Decision, "outcome");
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["watch"], "correction");
+    assert_eq!(decided[0]["outcome"], "pushed");
+    assert_eq!(decided[0]["questions"], json!(["Q1"]));
+    assert_eq!(decided[0]["replies"], json!([reply.id]));
+}
+
+/// A reply the delivering Build read starts nothing once delivered: the
+/// delivery keeps it as followed (OWL-146). A later reply, which the pull
+/// request already follows, gets a correction run that changes nothing and
+/// is reported so, through `owlshift continue` at Watch.
+#[test]
+fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_reported() {
+    let bench = Bench::new(true);
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (stopped, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            limited,
+        ],
+        None,
+    );
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    let decision = bench.record().questions.decisions[0].comment.clone();
+    bench.reply_as("maintainer", &decision, "No: put it in HELLO.md.");
+    let (delivered, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello from HELLO.md"), Some(DONE))]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let build = bench.briefs().pop().unwrap();
+    assert!(
+        build
+            .thread
+            .iter()
+            .any(|entry| matches!(entry, ThreadEntry::Comment { body, .. } if body == "No: put it in HELLO.md.")),
+        "{:?}",
+        build.thread
+    );
+    assert!(bench.record().questions.decisions[0].reversed.is_some());
+
+    // Nothing to correct: a look.
+    let (look, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&look, Err(Stop::Watched { .. })),
+        "{look:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 4);
+
+    // A newer reply the pull request already follows.
+    bench.reply_as("maintainer", &decision, "To be clear: HELLO.md. go");
+    let pushed = bench.remote_branch();
+    let (unchanged, printed) = bench.continue_ticket(vec![bench.reply(
+        None,
+        Some(r#"{"format":7,"status":"done","summary":"HELLO.md already holds the greeting."}"#),
+    )]);
+    unchanged.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let brief = bench.briefs().pop().unwrap();
+    assert_eq!(
+        brief.correction.unwrap().reversed[0].reply,
+        "To be clear: HELLO.md. go"
+    );
+    assert_eq!(bench.remote_branch(), pushed, "nothing pushed");
+    let report = bench.comments().pop().unwrap();
+    assert!(
+        report.contains("**No correction needed after delivery:**"),
+        "{report}"
+    );
+    assert!(
+        report.contains("HELLO.md already holds the greeting."),
+        "{report}"
+    );
+    assert!(
+        report.contains("GREETING.md, at the root. (reversed by the decider's reply)"),
+        "{report}"
+    );
+    let kept = bench.record().questions.decisions[0]
+        .reversed
+        .clone()
+        .unwrap();
+    assert_ne!(kept.comment, "");
+    let outcomes: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "outcome")
+        .into_iter()
+        .map(|d| d["outcome"].clone())
+        .collect();
+    assert_eq!(outcomes, [json!("unchanged")]);
+    // Followed: a third look runs nothing.
+    let (look, _) = bench.continue_ticket(Vec::new());
+    assert!(matches!(look, Err(Stop::Watched { .. })), "{look:?}");
+}
+
+/// A correction run that fails gets one more run; one that asks parks the
+/// ticket, its questions in the PARKED comment, as a fix run's do until
+/// OWL-211, and the decision keeps no reply as followed, so the restart
+/// corrects again (OWL-146).
+#[test]
+fn a_correction_that_fails_then_asks_parks_and_keeps_the_reply_unfollowed() {
+    let bench = Bench::new(true);
+    let decision = delivered_with_a_decision(&bench);
+    bench.reply_as("maintainer", &decision, "Use the README instead. go");
+    let asks = r#"{"format":7,"status":"questions","summary":"The README has no greeting section.",
+"questions":[{"id":"Q1","category":"scope","context":"The README holds the install steps only.",
+"text":"Where in the README should the greeting go?"}]}"#;
+    let (outcome, printed) =
+        bench.continue_ticket(vec![bench.reply(None, None), bench.reply(None, Some(asks))]);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::Blocked,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    let briefs = bench.briefs();
+    assert_eq!(briefs.len(), 5);
+    assert!(briefs[3..].iter().all(|b| b.correction.is_some()));
+    let parked = bench.comments().pop().unwrap();
+    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    assert!(
+        parked.contains("Q1: Where in the README should the greeting go?"),
+        "{parked}"
+    );
+    assert!(bench.record().questions.decisions[0].reversed.is_none());
+    assert!(data_of(&bench.events(), EventKind::Decision, "outcome").is_empty());
 }

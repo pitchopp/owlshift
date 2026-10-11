@@ -89,6 +89,20 @@ pub struct DeliveryReport {
     /// A rebase run's push after the delivery (OWL-210): the base it rebased
     /// onto, and which repair it is. `None` otherwise.
     pub rebase: Option<Rebased>,
+    /// A correction run's outcome after the delivery, once the decider
+    /// replied to DECISION comments (OWL-146). `None` otherwise.
+    pub correction: Option<Corrected>,
+}
+
+/// A correction a DELIVERY report names (OWL-146, architecture section 5, "A
+/// reversed decision").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Corrected {
+    /// The questions of the decisions the decider's replies reversed.
+    pub questions: Vec<String>,
+    /// Whether the run pushed a commit; `false` when the pull request
+    /// already followed the replies.
+    pub pushed: bool,
 }
 
 /// A rebase a DELIVERY report names (OWL-210, architecture section 5,
@@ -182,9 +196,9 @@ impl DeliveryReport {
         body
     }
 
-    /// The lines that tell which push the report is of: the fix pass or the
-    /// rebase line when there is one, and the pull request line with its
-    /// head. Two reports with the same are of the same push (OWL-218).
+    /// The lines that tell which push the report is of: the fix pass, the
+    /// rebase or the correction line (OWL-146) when there is one, and the
+    /// pull request line with its head. Two reports with the same are of the same push (OWL-218).
     fn lead_lines(&self) -> (Option<String>, String) {
         let pr = &self.pull_request;
         let pr_link = link(&format!("#{}", pr.number), &pr.url);
@@ -203,15 +217,40 @@ impl DeliveryReport {
                     checks.join(", ")
                 )
             })
+        } else if let Some(rebase) = &self.rebase {
+            Some(format!(
+                "**Rebased onto {} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
+                 branch's history was replaced, leased on Owlshift's last push.",
+                code(&flatten(&rebase.base_branch)),
+                code(short(&rebase.onto)),
+                rebase.repair
+            ))
         } else {
-            self.rebase.as_ref().map(|rebase| {
-                format!(
-                    "**Rebased onto {} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
-                     branch's history was replaced, leased on Owlshift's last push.",
-                    code(&flatten(&rebase.base_branch)),
-                    code(short(&rebase.onto)),
-                    rebase.repair
-                )
+            self.correction.as_ref().map(|correction| {
+                let questions: Vec<String> = correction
+                    .questions
+                    .iter()
+                    .map(|q| format!("**{}**", flatten(q)))
+                    .collect();
+                // A push adopted from a ref that kept no report names no
+                // question.
+                let on = if questions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" on {}", questions.join(", "))
+                };
+                if correction.pushed {
+                    format!(
+                        "**Corrected after delivery,** to follow the decider's replies to the \
+                         decisions{on}."
+                    )
+                } else {
+                    format!(
+                        "**No correction needed after delivery:** the pull request already \
+                         follows the decider's replies to the decisions{on}, and nothing was \
+                         pushed."
+                    )
+                }
             })
         };
         let pull_request = format!(
@@ -750,8 +789,9 @@ impl DecisionComment {
                 flatten(&self.decision),
                 flatten(&self.basis)
             ),
-            "To reverse it, say what you want instead in a comment on this ticket: the next run \
-             follows your comment over this decision."
+            "To reverse it, reply to this comment with what you want instead: the next run \
+             follows your reply over this decision, and once the pull request is delivered, \
+             Owlshift's watch corrects it to follow your reply."
                 .to_owned(),
             Footer {
                 format: Format,
@@ -1518,9 +1558,10 @@ impl<'a> Writer<'a> {
             .map_err(WriteError::Tracker)
     }
 
-    /// Posts a fix or rebase run's delivery report once (OWL-218): when a
-    /// delivery report on the ticket already names the same fix pass or
-    /// rebase and the same pull request head, that comment is returned and
+    /// Posts a fix, rebase or correction run's delivery report once
+    /// (OWL-218, OWL-146): when a delivery report on the ticket already
+    /// names the same fix pass, rebase or correction and the same pull
+    /// request head, that comment is returned and
     /// nothing is posted, whatever its checks said then. A report posted
     /// before a crash kept it as posted is thus never posted again, and a
     /// pass after it never posts a newer body of the same push.
@@ -1832,6 +1873,7 @@ mod tests {
             }],
             fix_pass: None,
             rebase: None,
+            correction: None,
         }
     }
 
@@ -2327,7 +2369,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
              GREETING.md / HELLO.md",
             "**Decision:** GREETING.md <!-- owlshift:",
             "**Settled by:** The ticket's description.",
-            "To reverse it, say what you want instead in a comment on this ticket",
+            "To reverse it, reply to this comment with what you want instead",
         ] {
             assert!(body.contains(text), "{text}\n---\n{body}");
         }
@@ -2552,6 +2594,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 created_at: "2026-09-28T12:00:00Z".parse().unwrap(),
                 edited_at: None,
                 body: body.to_owned(),
+                parent: None,
             };
             self.comments.borrow_mut().push(comment.clone());
             Ok(comment)

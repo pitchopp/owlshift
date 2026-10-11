@@ -33,10 +33,10 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "owed": {
-      "description": "The DELIVERY report of `pushed`, a fix or rebase run's push that\nlanded, while it is not on the ticket yet (OWL-218): the next pass\nposts it, once. Since format 2.",
+      "description": "The DELIVERY report of `pushed`, a fix, rebase or correction run's\npush that landed, while it is not on the ticket yet (OWL-218): the\nnext pass posts it, once. Since format 2.",
       "anyOf": [
         {
           "$ref": "#/$defs/OwedReport"
@@ -202,7 +202,7 @@
       ]
     },
     "KeptReport": {
-      "description": "What a fix or rebase run gave its DELIVERY report (OWL-218).",
+      "description": "What a fix, rebase or correction run gave its DELIVERY report (OWL-218,\nOWL-146).",
       "type": "object",
       "properties": {
         "checks": {
@@ -229,6 +229,13 @@
             "type": "string"
           }
         },
+        "questions": {
+          "description": "For a correction run, the questions of the decisions the decider's\nreplies reversed (format 3, OWL-146).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "summary": {
           "description": "The run's `summary`.",
           "type": "string"
@@ -240,17 +247,17 @@
       ]
     },
     "OwedReport": {
-      "description": "A DELIVERY report still to be posted for the delivery's `pushed`\ncommit, a fix or rebase run's push (OWL-218). The commit, and for a\nrebase the base it rebased onto, are the delivery's `pushed` and\n`rebased_onto`.",
+      "description": "A DELIVERY report still to be posted for the delivery's `pushed`\ncommit, a fix, rebase or correction run's push (OWL-218, OWL-146). The\ncommit, and for a rebase the base it rebased onto, are the delivery's\n`pushed` and `rebased_onto`.",
       "type": "object",
       "properties": {
         "count": {
-          "description": "The fix pass or the repair the push was, from 1.",
+          "description": "The fix pass or the repair the push was, from 1; for a correction,\nhow many decisions it follows the replies to.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         },
         "kind": {
-          "description": "`fix` or `rebase`.",
+          "description": "`fix`, `rebase` or `correction`.",
           "$ref": "#/$defs/PushKind"
         },
         "report": {
@@ -273,11 +280,20 @@
     },
     "PushKind": {
       "description": "Which run's push.",
-      "type": "string",
-      "enum": [
-        "delivery",
-        "fix",
-        "rebase"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "delivery",
+            "fix",
+            "rebase"
+          ]
+        },
+        {
+          "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146).",
+          "type": "string",
+          "const": "correction"
+        }
       ]
     },
     "Pushing": {
@@ -303,7 +319,7 @@
           ]
         },
         "report": {
-          "description": "What a fix or rebase run's DELIVERY report says, kept before the push\nso a push a crash cut short is still reported once adopted (OWL-218).\nSince format 2.",
+          "description": "What a fix, rebase or correction run's DELIVERY report says, kept\nbefore the push so a push a crash cut short is still reported once\nadopted (OWL-218). Since format 2.",
           "anyOf": [
             {
               "$ref": "#/$defs/KeptReport"

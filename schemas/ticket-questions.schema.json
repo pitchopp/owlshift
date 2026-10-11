@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 9
+      "const": 10
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -254,6 +254,17 @@
         "question": {
           "description": "The question as the raising run asked it, under that run's id.",
           "$ref": "#/$defs/Question"
+        },
+        "reversed": {
+          "description": "The decider reversed it by replying to its DECISION comment\n(format 10, OWL-146): the replies a run was given and followed, up to\n[`Reversal::through`]. A newer reply is one no run has followed yet.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Reversal"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -327,6 +338,27 @@
       "required": [
         "question",
         "recorded"
+      ]
+    },
+    "Reversal": {
+      "description": "The decider's replies to a DECISION comment that a run followed: the\nBuild that delivered the ticket, or a correction run at Watch (OWL-146).",
+      "type": "object",
+      "properties": {
+        "comment": {
+          "description": "The tracker's identifier of the reply edited at `through`.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "through": {
+          "description": "The newest last edit among those replies.",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "through",
+        "comment"
       ]
     },
     "Verdict": {

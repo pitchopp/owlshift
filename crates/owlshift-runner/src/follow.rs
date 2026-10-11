@@ -505,8 +505,9 @@ pub fn landed(delivery: &mut TicketDelivery, pushing: Pushing) {
     }
 }
 
-/// [`landed`] for a fix or rebase run's push, the `count`th of its kind
-/// (from 1), whose DELIVERY report is now owed until a pass posts it
+/// [`landed`] for a fix, rebase or correction run's push, the `count`th of
+/// its kind (from 1; for a correction, how many decisions it follows the
+/// replies to), whose DELIVERY report is now owed until a pass posts it
 /// (OWL-218). Returns the owed report it replaces, which is never posted.
 pub fn landed_owing(
     delivery: &mut TicketDelivery,
@@ -554,15 +555,16 @@ pub fn changed(
                 let event = match pushing.kind {
                     PushKind::Fix => Some(Event::FixPushed),
                     PushKind::Rebase => Some(Event::RebasePushed),
+                    PushKind::Correction => Some(Event::Corrected),
                     PushKind::Delivery => None,
                 };
                 match event {
                     None => landed(&mut delivery, pushing),
-                    // A fix or rebase push a crash cut short counts as the
-                    // run would have (OWL-112, OWL-210), when the bounds
-                    // still allow it: a stuck count never stops the
-                    // following. Its report is owed, and the pass that keeps
-                    // this posts it (OWL-218).
+                    // A fix, rebase or correction push a crash cut short
+                    // counts as the run would have (OWL-112, OWL-210,
+                    // OWL-146), when the bounds still allow it: a stuck count
+                    // never stops the following. Its report is owed, and the
+                    // pass that keeps this posts it (OWL-218).
                     Some(event) => {
                         let state =
                             TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
@@ -573,7 +575,13 @@ pub fn changed(
                         next.state = (&state).into();
                         let count = match pushing.kind {
                             PushKind::Rebase => state.repairs(),
-                            _ => state.fix_passes(),
+                            // A correction counts no fix pass: its report
+                            // counts the decisions it follows the replies to.
+                            PushKind::Correction => pushing
+                                .report
+                                .as_ref()
+                                .map_or(1, |kept| kept.questions.len() as u32),
+                            PushKind::Fix | PushKind::Delivery => state.fix_passes(),
                         };
                         landed_owing(&mut delivery, pushing, count);
                     }
@@ -934,6 +942,7 @@ mod tests {
             summary: "Kept the greeting.".to_owned(),
             gate: None,
             checks: vec!["ci".to_owned()],
+            questions: vec![],
             followups: vec![],
         };
         assert_eq!(

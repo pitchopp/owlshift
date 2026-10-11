@@ -7,6 +7,10 @@
 //! marking the n-th comment of a second. The format is settled in
 //! `docs/design/build-plan.md`, "The test tracker".
 //!
+//! A reply opens with a TOML front matter naming the comment it answers,
+//! `+++\nreply_to = "<id>"\n+++`, the id being that comment's file name
+//! without `.md` (OWL-146); any other comment file is its body alone.
+//!
 //! A comment's time is its second plus a microsecond for each comment of
 //! that second before it by n (OWL-136): the times then order the comments
 //! as the tracker lists them, as Linear's do, which the runner's comparisons
@@ -55,6 +59,15 @@ pub struct Comment {
     pub at: Timestamp,
     pub author: String,
     pub body: String,
+    /// The comment it replies to, from its front matter.
+    pub reply_to: Option<String>,
+}
+
+/// A reply's front matter.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyFront {
+    reply_to: String,
 }
 
 /// A tracker file that could not be read or written, named by its path.
@@ -111,11 +124,14 @@ impl MarkdownTracker {
         comment_files(&dir)?
             .into_iter()
             .map(|file| {
+                let path = dir.join(&file.name);
+                let (reply_to, body) = reply_front(&read(&path)?).map_err(|e| error(&path, e))?;
                 Ok(Comment {
                     id: file.name.strip_suffix(".md").unwrap_or_default().to_owned(),
                     at: time(file.second, file.nth).map_err(|e| error(&dir, e))?,
                     author: file.author,
-                    body: read(&dir.join(&file.name))?,
+                    body,
+                    reply_to,
                 })
             })
             .collect()
@@ -131,6 +147,31 @@ impl MarkdownTracker {
         id: &TicketId,
         author: &str,
         at: Timestamp,
+        body: &str,
+    ) -> Result<Comment, TrackerError> {
+        self.post(id, author, at, None, body)
+    }
+
+    /// Adds a reply to the comment `reply_to`, as
+    /// [`MarkdownTracker::post_comment`] adds a comment (OWL-146). Only a
+    /// person replies: the runner never does.
+    pub fn post_reply(
+        &self,
+        id: &TicketId,
+        author: &str,
+        at: Timestamp,
+        reply_to: &str,
+        body: &str,
+    ) -> Result<Comment, TrackerError> {
+        self.post(id, author, at, Some(reply_to), body)
+    }
+
+    fn post(
+        &self,
+        id: &TicketId,
+        author: &str,
+        at: Timestamp,
+        reply_to: Option<&str>,
         body: &str,
     ) -> Result<Comment, TrackerError> {
         let ticket = self.ticket_file(id);
@@ -164,13 +205,21 @@ impl MarkdownTracker {
             .create_new(true)
             .open(&path)
             .map_err(|e| error(&path, e))?;
-        file.write_all(body.as_bytes())
+        let text = match reply_to {
+            Some(parent) => format!(
+                "+++\nreply_to = {}\n+++\n\n{body}",
+                toml::Value::String(parent.to_owned())
+            ),
+            None => body.to_owned(),
+        };
+        file.write_all(text.as_bytes())
             .map_err(|e| error(&path, e))?;
         Ok(Comment {
             id,
             at,
             author: author.to_owned(),
             body: body.to_owned(),
+            reply_to: reply_to.map(str::to_owned),
         })
     }
 
@@ -323,6 +372,7 @@ fn shared_comment(comment: Comment) -> shared::Comment {
         created_at: comment.at,
         edited_at: None,
         body: comment.body,
+        parent: comment.reply_to,
     }
 }
 
@@ -375,6 +425,26 @@ fn parse(input: &str) -> Result<(FrontMatter, &str), String> {
     let (front, description) = split(input)?;
     let front = toml::from_str(&input[front]).map_err(|e| format!("invalid front matter: {e}"))?;
     Ok((front, description))
+}
+
+/// A comment file's text as the comment it replies to, from its front
+/// matter, and its body. A file that does not open with a `+++` line is a
+/// body alone. Test tracker only: a body of the runner's own that opened
+/// with `+++` would read as a reply, and none does.
+fn reply_front(text: &str) -> Result<(Option<String>, String), String> {
+    if text
+        .split_inclusive('\n')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        != "+++"
+    {
+        return Ok((None, text.to_owned()));
+    }
+    let (front, body) = split(text)?;
+    let front: ReplyFront =
+        toml::from_str(&text[front]).map_err(|e| format!("invalid reply front matter: {e}"))?;
+    Ok((Some(front.reply_to), body.to_owned()))
 }
 
 /// Where the front matter's text sits, and the description after it, without
@@ -564,6 +634,30 @@ mod tests {
             assert_eq!(error.path, file);
             assert!(error.to_string().contains(reason), "{error}");
         }
+    }
+
+    /// A reply names the comment it answers in its front matter (OWL-146),
+    /// which its body leaves out; a comment without one is its body alone.
+    #[test]
+    fn a_reply_names_the_comment_it_answers() {
+        let (_root, tracker, _) = repository(TICKET);
+        let decision = tracker
+            .post_comment(&id(), "owlshift", at("2026-09-28T10:00:00Z"), "Decided.\n")
+            .unwrap();
+        let reply = tracker
+            .post_reply(
+                &id(),
+                "maintainer",
+                at("2026-09-28T10:05:00Z"),
+                &decision.id,
+                "No: in docs/.\n",
+            )
+            .unwrap();
+        let read = tracker.comments(&id()).unwrap();
+        assert_eq!(read, [decision.clone(), reply]);
+        assert_eq!(read[1].reply_to.as_deref(), Some(decision.id.as_str()));
+        assert_eq!(read[1].body, "No: in docs/.\n");
+        assert_eq!(read[0].reply_to, None);
     }
 
     #[test]
