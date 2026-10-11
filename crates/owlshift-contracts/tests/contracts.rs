@@ -17,7 +17,8 @@ use owlshift_contracts::refs::{
     AskKind, BuildRefusal, Claim, PersistedState, TicketQuestions, claim_ref, ticket_ref,
 };
 use owlshift_contracts::result::{
-    AnswerClass, DecisionsRefusal, RefusedChoice, Resolution, RunResult, Status,
+    AnswerClass, DecisionsRefusal, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES,
+    RefusedChoice, Resolution, RunResult, Status,
 };
 use serde_json::{Value, json};
 
@@ -406,6 +407,110 @@ fn result_rejections() {
     // Deserializing the type directly still refuses another format.
     let direct = serde_json::from_str::<RunResult>(&newer).unwrap_err();
     assert!(direct.to_string().contains("upgrade Owlshift"));
+}
+
+/// OWL-213: a result's questions weigh at most `MAX_QUESTION_BYTES` each and
+/// `MAX_QUESTIONS_BYTES` together, rendered as JSON, so one verbose result
+/// cannot fill the ticket ref's file.
+#[test]
+fn questions_are_bounded() {
+    let result =
+        |questions: Vec<Value>| edited("result-sample.json", |v| v["questions"] = json!(questions));
+    let question = |n: usize, context: String| json!({ "id": format!("Q{n}"), "category": "scope", "context": context, "text": "t" });
+
+    // One question over its bound, in text and in escaped control bytes: the
+    // rendering counts, not the characters.
+    let big = "x".repeat(MAX_QUESTION_BYTES);
+    let refused = RunResult::parse(&result(vec![question(1, big.clone())])).unwrap_err();
+    let message = refused.to_string();
+    for needle in [
+        "question Q1 weighs",
+        "past the 8192 a question may weigh",
+        "split it",
+    ] {
+        assert!(message.contains(needle), "{needle:?} not in {message}");
+    }
+    rejects(
+        "control characters escape to six bytes",
+        RunResult::parse(&result(vec![question(
+            1,
+            "\u{1}".repeat(MAX_QUESTION_BYTES / 4),
+        )])),
+        "question Q1 weighs",
+    );
+    // Just under it passes, whichever question carries it.
+    let fits = "x".repeat(MAX_QUESTION_BYTES - 512);
+    RunResult::parse(&result(vec![
+        question(1, "c".to_owned()),
+        question(2, fits),
+    ]))
+    .unwrap();
+    rejects(
+        "the second question over its bound",
+        RunResult::parse(&result(vec![question(1, "c".to_owned()), question(2, big)])),
+        "question Q2 weighs",
+    );
+
+    // Questions each within their bound but together past the round's.
+    let each = "x".repeat(MAX_QUESTION_BYTES - 512);
+    let many: Vec<Value> = (1..=MAX_QUESTIONS_BYTES / MAX_QUESTION_BYTES + 2)
+        .map(|n| question(n, each.clone()))
+        .collect();
+    let message = RunResult::parse(&result(many)).unwrap_err().to_string();
+    for needle in [
+        "the questions weigh",
+        "a result's questions may weigh together",
+    ] {
+        assert!(message.contains(needle), "{needle:?} not in {message}");
+    }
+    // Too many questions, however short.
+    let message = RunResult::parse(&result(
+        (1..=MAX_QUESTIONS + 1)
+            .map(|n| question(n, "c".to_owned()))
+            .collect(),
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        message.contains("past the 64 a result may ask"),
+        "{message}"
+    );
+
+    // A retry answering a hold at its maximum is accepted: 64 refused
+    // choices of two 512-byte texts, each restated by a question of its own
+    // (quotes escape to two bytes), and each named as asked.
+    let text = "\"q\"".repeat(MAX_CHOICE_BYTES / 3);
+    let recorded = "\"r\"".repeat(MAX_CHOICE_BYTES / 3);
+    let choices: Vec<Value> = (0..MAX_REFUSED_CHOICES)
+        .map(|_| json!({ "question": text, "recorded": recorded }))
+        .collect();
+    let brief = Brief::parse(&edited("brief.json", |v| {
+        v["decisions_refused"] = json!(true);
+        v["refused_choices"] = json!(choices);
+    }))
+    .unwrap();
+    let held = edited("result-sample.json", |v| {
+        let object = v.as_object_mut().unwrap();
+        object.remove("decisions");
+        let restated = format!("{text} {recorded}");
+        object.insert(
+            "questions".to_owned(),
+            json!(
+                (1..=MAX_REFUSED_CHOICES)
+                    .map(|n| question(n, restated.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        object.insert(
+            "refused_choices_asked".to_owned(),
+            json!(
+                (1..=MAX_REFUSED_CHOICES)
+                    .map(|n| json!({ "choice": n, "question": format!("Q{n}") }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    });
+    RunResult::parse_against(&held, &brief).unwrap_or_else(|e| panic!("{}", e.error));
 }
 
 /// Verdicts against the brief of the run: from the answer check only, one for
