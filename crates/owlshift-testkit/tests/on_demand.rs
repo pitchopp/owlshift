@@ -1014,6 +1014,7 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         kind: owlshift_contracts::refs::PushKind::Delivery,
         base: bench.remote_main(),
         onto: None,
+        report: None,
     });
     cut.delivery = Some(pushing);
     bench.write_record(&cut);

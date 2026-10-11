@@ -58,7 +58,8 @@ use serde_json::{Value, json};
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::push::{PushError, Pushed};
 use owlshift_adapters::forge::{
-    Branch, Check, CheckSet, CheckState, CommitId, ErrorKind, PullRequest, Repo, Verdict,
+    self as forge, Branch, Check, CheckSet, CheckState, CommitId, ErrorKind, PrState, PullRequest,
+    Repo, Verdict,
 };
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
@@ -72,8 +73,8 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
-    Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision, PersistedState,
-    PushKind, Pushing, TicketDelivery, TicketQuestions, cut_reason,
+    Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision, KeptReport,
+    OwedReport, PersistedState, PushKind, Pushing, TicketDelivery, TicketQuestions, cut_reason,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -1198,6 +1199,7 @@ impl OnDemand<'_> {
         if let Some(event) = following.events(&ticket, &seen) {
             sink.emit(&ticket, None, EventKind::Decision, event);
         }
+        self.settle_owed_report(p, sink)?;
         // A fix run, a rebase run or a park the read decided, which the
         // repair reads again under this command's lock (OWL-112, OWL-210).
         if let FollowDecision::Follow {
@@ -2611,6 +2613,7 @@ impl OnDemand<'_> {
             kind: PushKind::Delivery,
             base: base_at_push.clone(),
             onto: None,
+            report: None,
         });
         let questions = p.questions();
         self.store_delivery(p, state, questions, Some(kept.clone()))
@@ -2822,6 +2825,57 @@ struct Repaired {
     commit: CommitId,
     summary: String,
     gate: Gate,
+}
+
+impl Repaired {
+    /// A run's commit whose push had no verdict, pushed again without a
+    /// run: what the run kept for its report when the push under way kept
+    /// it (OWL-218), with its follow-ups, or a placeholder.
+    fn again(commit: CommitId, pushing: &Pushing, what: &str) -> (Self, Vec<Followup>) {
+        let (summary, gate, followups) = told(pushing.report.as_ref(), || {
+            format!("The {what} run's commit, whose push had no answer, pushed again.")
+        });
+        (
+            Self {
+                commit,
+                summary,
+                gate,
+            },
+            followups,
+        )
+    }
+
+    /// What its DELIVERY report keeps before the push (OWL-218).
+    fn kept(&self, kind: &RepairKind, followups: &[Followup]) -> KeptReport {
+        KeptReport {
+            summary: self.summary.clone(),
+            gate: match &self.gate {
+                Gate::Passed(commands) => Some(commands.clone()),
+                Gate::NotRecorded => None,
+            },
+            checks: match kind {
+                RepairKind::Fix { checks } => checks.clone(),
+                RepairKind::Rebase { .. } => Vec::new(),
+            },
+            followups: followups.to_vec(),
+        }
+    }
+}
+
+/// The summary, gate and follow-ups a kept report gives a DELIVERY report,
+/// or `placeholder`'s summary with no gate recorded when none was kept.
+fn told(
+    kept: Option<&KeptReport>,
+    placeholder: impl FnOnce() -> String,
+) -> (String, Gate, Vec<Followup>) {
+    match kept {
+        Some(kept) => (
+            kept.summary.clone(),
+            kept.gate.clone().map_or(Gate::NotRecorded, Gate::Passed),
+            kept.followups.clone(),
+        ),
+        None => (placeholder(), Gate::NotRecorded, Vec::new()),
+    }
 }
 
 /// Which repair a push carries (OWL-112, OWL-210).
@@ -3057,11 +3111,7 @@ impl OnDemand<'_> {
         {
             let commit = CommitId::new(pushing.commit.as_str())
                 .map_err(|e| refused("the commit under way", e))?;
-            let fixed = Repaired {
-                commit,
-                summary: "The fix run's commit, whose push had no answer, pushed again.".to_owned(),
-                gate: Gate::NotRecorded,
-            };
+            let (fixed, followups) = Repaired::again(commit, pushing, "fix");
             return self.push_repair(
                 p,
                 state,
@@ -3069,7 +3119,7 @@ impl OnDemand<'_> {
                 &pushed_id,
                 fixed,
                 RepairKind::Fix { checks: names },
-                Vec::new(),
+                followups,
                 sink,
             );
         }
@@ -3388,12 +3438,7 @@ impl OnDemand<'_> {
                 .map_err(|e| refused("the commit under way", e))?;
             let kept_onto =
                 CommitId::new(kept_onto.as_str()).map_err(|e| refused("the rebase's base", e))?;
-            let repaired = Repaired {
-                commit,
-                summary: "The rebase run's commit, whose push had no answer, pushed again."
-                    .to_owned(),
-                gate: Gate::NotRecorded,
-            };
+            let (repaired, followups) = Repaired::again(commit, pushing, "rebase");
             return self.push_repair(
                 p,
                 state,
@@ -3401,7 +3446,7 @@ impl OnDemand<'_> {
                 &pushed_id,
                 repaired,
                 RepairKind::Rebase { onto: kept_onto },
-                Vec::new(),
+                followups,
                 sink,
             );
         }
@@ -3623,6 +3668,7 @@ impl OnDemand<'_> {
         let what = kind.what();
         let head = Branch::new(&delivery.branch).map_err(|e| refused("the ticket's branch", e))?;
         let base = Branch::new(&delivery.base_branch).map_err(|e| refused("the base branch", e))?;
+        let report = repaired.kept(&kind, &followups);
         let commit = repaired.commit;
         let base_at_push = self.base_head(p, &base, &ticket, sink);
         let mut kept = delivery.clone();
@@ -3637,6 +3683,7 @@ impl OnDemand<'_> {
                 RepairKind::Fix { .. } => None,
                 RepairKind::Rebase { onto } => Some(onto.to_string()),
             },
+            report: Some(report),
         });
         let questions = p.questions();
         self.store_delivery(p, &state, questions, Some(kept.clone()))
@@ -3751,87 +3798,294 @@ impl OnDemand<'_> {
             Ok(Transition::To(next)) => next,
             other => return Err(core_error(other)),
         };
+        // The report is owed from the write that keeps the push, so a
+        // tracker that refuses it, or a crash, leaves it for the next pass
+        // (OWL-218).
         if let Some(pushing) = kept.pushing.take() {
-            follow::landed(&mut kept, pushing);
+            let count = match kind {
+                RepairKind::Fix { .. } => state.fix_passes(),
+                RepairKind::Rebase { .. } => state.repairs(),
+            };
+            if let Some(replaced) = follow::landed_owing(&mut kept, pushing, count) {
+                self.replaced(&ticket, &replaced, delivery, sink);
+            }
         }
         let questions = p.questions();
-        self.store_delivery(p, &state, questions, Some(kept))
+        self.store_delivery(p, &state, questions, Some(kept.clone()))
             .map_err(|e| Stop::Delivery(format!("keeping the {what} in the ticket's ref: {e}")))?;
         let checks_read = self.forge.checks(pull_request.number, &commit);
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
-        let decisions: Vec<Decision> = p
-            .questions()
-            .decisions
-            .iter()
-            .map(resolver::reported)
-            .collect();
-        let (fix_pass, rebase, counted) = match kind {
-            RepairKind::Fix { checks } => (
-                Some(FixPass {
-                    pass: state.fix_passes(),
-                    checks,
-                }),
-                None,
-                ("fix_pass", state.fix_passes()),
-            ),
-            RepairKind::Rebase { onto } => (
-                None,
-                Some(Rebased {
-                    base_branch: delivery.base_branch.clone(),
-                    onto,
-                    repair: state.repairs(),
-                }),
-                ("repair", state.repairs()),
-            ),
-        };
-        let report = DeliveryReport {
-            ticket: ticket.clone(),
-            summary: repaired.summary,
-            pull_request: pull_request.clone(),
-            checks: checks_read,
-            gate: repaired.gate,
-            decisions,
-            followups,
-            fix_pass,
-            rebase,
-        };
-        let comment = match writer.post_delivery_report(&report) {
-            Ok(comment) => comment,
-            Err(error) => {
-                sink.emit(
-                    &ticket,
-                    None,
-                    EventKind::Warning,
-                    data([
-                        ("what", json!(format!("{what}_report_unposted"))),
-                        ("commit", json!(commit.as_str())),
-                        ("reason", json!(error.to_string())),
-                    ]),
-                );
-                return Err(Stop::Delivery(format!(
+        let comment = self
+            .post_owed(&ticket, &kept, &p.questions(), checks_read, sink)
+            .map_err(|error| {
+                Stop::Delivery(format!(
                     "the {what} {commit} was pushed and kept, but its delivery report could not \
-                     be posted: {error}"
-                )));
-            }
-        };
-        sink.emit(
-            &ticket,
-            None,
-            EventKind::TrackerWrite,
-            data([
-                ("target", json!("tracker")),
-                ("action", json!("comment")),
-                ("kind", json!("DELIVERY")),
-                ("comment", json!(comment.id)),
-                (counted.0, json!(counted.1)),
-            ]),
-        );
+                     be posted: {error}; the next pass posts it while watch follows the pull \
+                     request"
+                ))
+            })?;
+        kept.owed = None;
+        let questions = p.questions();
+        self.store_delivery(p, &state, questions, Some(kept))
+            .map_err(|e| {
+                Stop::Delivery(format!(
+                    "the {what} {commit} was pushed and reported, but keeping its report as \
+                     posted in the ticket's ref failed: {e}; the next pass finds it on the \
+                     ticket and posts nothing"
+                ))
+            })?;
         Ok(Delivered {
             pull_request,
             opened: false,
             verdict,
             comment: comment.id,
         })
+    }
+
+    /// Posts the DELIVERY report `delivery` owes (OWL-218), once
+    /// ([`Writer::post_repair_report`]), with `checks`, its head's check
+    /// set as read now, and records the comment; a refusal is a `warning`,
+    /// and the report stays owed. The report says what the run kept for it,
+    /// or, for a push adopted from a ref that kept nothing, that its summary
+    /// was not kept.
+    fn post_owed(
+        &self,
+        ticket: &TicketId,
+        delivery: &TicketDelivery,
+        questions: &TicketQuestions,
+        checks: Result<CheckSet, forge::Error>,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Comment, String> {
+        let (Some(owed), Some(pr), Some(pushed)) =
+            (&delivery.owed, &delivery.pull_request, &delivery.pushed)
+        else {
+            return Err("the ticket's ref owes no report of a pushed commit".to_owned());
+        };
+        let what = push_what(owed.kind);
+        let head = CommitId::new(pushed.as_str()).map_err(|e| e.to_string())?;
+        let (summary, gate, followups) = told(owed.report.as_ref(), || {
+            format!(
+                "The {what} run's commit, adopted after its command was cut short: its summary \
+                 was not kept."
+            )
+        });
+        let (fix_pass, rebase, counted) = match owed.kind {
+            PushKind::Rebase => {
+                let onto = delivery
+                    .rebased_onto
+                    .as_deref()
+                    .map(CommitId::new)
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("the ticket's ref keeps no base for the rebase")?;
+                let rebased = Rebased {
+                    base_branch: delivery.base_branch.clone(),
+                    onto,
+                    repair: owed.count,
+                };
+                (None, Some(rebased), "repair")
+            }
+            _ => {
+                let pass = FixPass {
+                    pass: owed.count,
+                    checks: owed
+                        .report
+                        .as_ref()
+                        .map(|kept| kept.checks.clone())
+                        .unwrap_or_default(),
+                };
+                (Some(pass), None, "fix_pass")
+            }
+        };
+        let report = DeliveryReport {
+            ticket: ticket.clone(),
+            summary,
+            pull_request: PullRequest {
+                number: pr.number,
+                url: pr.url.clone(),
+                head: head.clone(),
+                state: PrState::Open,
+            },
+            checks,
+            gate,
+            decisions: questions.decisions.iter().map(resolver::reported).collect(),
+            followups,
+            fix_pass,
+            rebase,
+        };
+        match Writer::new(self.tracker).post_repair_report(&report) {
+            Ok(comment) => {
+                sink.emit(
+                    ticket,
+                    None,
+                    EventKind::TrackerWrite,
+                    data([
+                        ("target", json!("tracker")),
+                        ("action", json!("comment")),
+                        ("kind", json!("DELIVERY")),
+                        ("comment", json!(comment.id)),
+                        (counted, json!(owed.count)),
+                    ]),
+                );
+                Ok(comment)
+            }
+            Err(error) => {
+                sink.emit(
+                    ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!(format!("{what}_report_unposted"))),
+                        ("commit", json!(head.as_str())),
+                        ("reason", json!(error.to_string())),
+                    ]),
+                );
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// A `warning` that `replaced`, the report `delivery` owed of its last
+    /// push, is dropped unposted for a newer push's (OWL-218).
+    fn replaced(
+        &self,
+        ticket: &TicketId,
+        replaced: &OwedReport,
+        delivery: &TicketDelivery,
+        sink: &mut EventSink<'_>,
+    ) {
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Warning,
+            data([
+                (
+                    "what",
+                    json!(format!("{}_report_replaced", push_what(replaced.kind))),
+                ),
+                ("commit", json!(delivery.pushed)),
+                ("count", json!(replaced.count)),
+            ]),
+        );
+    }
+
+    /// What settles the report `record` owes, if it owes one (OWL-218): the
+    /// delivery to keep once it is posted, or dropped, with a `warning`,
+    /// when watch no longer follows the pull request. `None` when nothing
+    /// is owed or the post failed, and the report stays owed.
+    fn settle_owed(
+        &self,
+        ticket: &TicketId,
+        record: &TicketRecord,
+        sink: &mut EventSink<'_>,
+    ) -> Option<TicketDelivery> {
+        let delivery = record.delivery.as_ref()?;
+        let owed = delivery.owed.as_ref()?;
+        let mut settled = delivery.clone();
+        settled.owed = None;
+        if let Some(ended) = &delivery.ended {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    (
+                        "what",
+                        json!(format!("{}_report_dropped", push_what(owed.kind))),
+                    ),
+                    ("commit", json!(delivery.pushed)),
+                    ("ended", json!(ended.why)),
+                ]),
+            );
+            return Some(settled);
+        }
+        let number = delivery.pull_request.as_ref()?.number;
+        let head = CommitId::new(delivery.pushed.as_deref()?).ok()?;
+        let checks = self.forge.checks(number, &head);
+        self.post_owed(ticket, delivery, &record.questions, checks, sink)
+            .ok()
+            .map(|_| settled)
+    }
+
+    /// For `owlshift watch`, once a look at a followed pull request is kept
+    /// at `commit`, the ticket ref's commit: posts the DELIVERY report the
+    /// ref owes, under the project's lock and only while the ref is still
+    /// `commit`, then keeps it as posted (OWL-218). Returns the ref's commit
+    /// after it. Nothing is locked or read unless `stored`, the ref the
+    /// look started from, owes a report or `seen` adopted a push.
+    pub fn post_owed_report(
+        &self,
+        ticket: &TicketId,
+        stored: &Stored,
+        seen: &Seen,
+        commit: String,
+        sink: &mut EventSink<'_>,
+    ) -> String {
+        let owes = stored
+            .record
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.owed.is_some());
+        if !owes && !matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
+            return commit;
+        }
+        let Ok(Some(_lock)) = self.dirs.lock() else {
+            return commit;
+        };
+        if !matches!(self.dirs.unverified(), Ok(None)) {
+            return commit;
+        }
+        let git = &self.executor.git;
+        let checkout = self.dirs.checkout();
+        let current = match ticket_ref::read(git, &checkout, ticket) {
+            Ok(Some(current)) if current.commit == commit => current,
+            _ => return commit,
+        };
+        let Some(delivery) = self.settle_owed(ticket, &current.record, sink) else {
+            return commit;
+        };
+        let record = TicketRecord {
+            delivery: Some(delivery),
+            ..current.record
+        };
+        match ticket_ref::write(git, &checkout, ticket, &record, Some(&commit)) {
+            Ok(written) => written,
+            Err(reason) => {
+                sink.emit(
+                    ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("owed_report_unkept")),
+                        ("reason", json!(reason)),
+                    ]),
+                );
+                commit
+            }
+        }
+    }
+
+    /// For `owlshift continue` at Watch, under its lock: posts the DELIVERY
+    /// report the ticket ref owes and keeps it as posted (OWL-218).
+    fn settle_owed_report(&self, p: &mut Prepared, sink: &mut EventSink<'_>) -> Result<(), Stop> {
+        let Some(stored) = p.stored.clone() else {
+            return Ok(());
+        };
+        let Some(delivery) = self.settle_owed(&p.ticket, &stored.record, sink) else {
+            return Ok(());
+        };
+        let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
+        self.store_delivery(p, &state, stored.record.questions, Some(delivery))
+            .map_err(|e| refused("keeping the owed report as posted in the ticket's ref", e))
+    }
+}
+
+/// `fix` or `rebase`, for what the runner tells of a push of `kind`.
+fn push_what(kind: PushKind) -> &'static str {
+    match kind {
+        PushKind::Rebase => "rebase",
+        PushKind::Fix => "fix",
+        PushKind::Delivery => "delivery",
     }
 }
 
