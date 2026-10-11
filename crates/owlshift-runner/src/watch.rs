@@ -17,7 +17,9 @@
 //! ref is written under the lock from the ref the snapshot read
 //! ([`crate::follow`]). A fix run, a rebase run or a park it decides is
 //! repaired through [`OnDemand::repair_seen`] (OWL-112, OWL-210), held as a
-//! continue is.
+//! continue is. A read that asks for no repair leaves room for a correction:
+//! the decider's replies to a DECISION comment, once they count, go to
+//! [`OnDemand::correct_seen`] (OWL-146).
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A

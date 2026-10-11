@@ -63,6 +63,7 @@ The central bet, used by hand.
 
 - Foreground loop over the tickets Owlshift started: quiet window, `go`, automatic resume.
 - After the PR: a red check starts a fix run (two fix passes at most); a conflict starts a rebase run. Scenario S9; the rules are [architecture](architecture.md) section 5, "Watch after delivery" (OWL-208).
+- After the PR: the decider's reply to a DECISION comment starts a correction run that makes the pull request follow it. Scenario S7; the rules are [architecture](architecture.md) section 5, "A reversed decision" (OWL-146).
 
 **Deviation from S9** (OWL-208, 2026-10-10). P3 repairs what CI and the forge report. A red check starts a fix run, a conflict a rebase run, and a run that needs a prerequisite or an arbitration asks the decider. The rest of S9 waits:
 
@@ -149,7 +150,7 @@ A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, a
 | Scenario | Step |
 | --- | --- |
 | S1 | P1 |
-| S2, S7 | P2 (automatic resume in P3) |
+| S2, S7 | P2 (automatic resume and S7's correction run in P3) |
 | S9 | P3 (red checks and conflicts; findings and review passes in P5) |
 | S3, S4, S6, S12, S13 | P4 |
 | S8 | P5 |

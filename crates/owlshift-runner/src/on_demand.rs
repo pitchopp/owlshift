@@ -104,9 +104,9 @@ use crate::reversal;
 use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
-    Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment, Posted,
-    QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart, ResumeComment,
-    VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
+    Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment,
+    Posted, QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart,
+    ResumeComment, VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 

@@ -172,7 +172,8 @@ impl OnDemand<'_> {
             sink,
         )?;
         if done.repaired.commit == pushed_id {
-            return self.already_follows(p, &delivery, &pushed_id, done, followups, &reversed, sink);
+            return self
+                .already_follows(p, &delivery, &pushed_id, done, followups, &reversed, sink);
         }
         self.push_correction(
             p,

@@ -96,7 +96,11 @@ pub fn newest<'a>(reversals: &[Reversed<'a>]) -> Option<&'a Comment> {
 /// When the replies count, as an answer does (architecture section 4, "No
 /// premature resume"): `None` once the newest has been left unedited for
 /// `window` at `now`, or ends with `go`; otherwise the time it will count.
-pub fn counts_at(reversals: &[Reversed<'_>], now: Timestamp, window: Duration) -> Option<Timestamp> {
+pub fn counts_at(
+    reversals: &[Reversed<'_>],
+    now: Timestamp,
+    window: Duration,
+) -> Option<Timestamp> {
     let newest = newest(reversals)?;
     let edited = newest.last_edit();
     let quiet_for = Duration::try_from(now.duration_since(edited)).unwrap_or_default();
@@ -175,9 +179,9 @@ fn cut(text: &str) -> String {
 mod tests {
     use std::num::NonZeroU32;
 
-    use owlshift_contracts::result::Question;
     use owlshift_contracts::ids::QuestionId;
     use owlshift_contracts::refs::{Ask, AskDecider, AskKind, KeptDecision};
+    use owlshift_contracts::result::Question;
     use owlshift_core::decider::DeciderRule;
 
     use super::*;
@@ -225,7 +229,12 @@ mod tests {
     fn ids<'a>(reversals: &[Reversed<'a>]) -> Vec<(usize, Vec<&'a str>)> {
         reversals
             .iter()
-            .map(|r| (r.decision, r.replies.iter().map(|c| c.id.as_str()).collect()))
+            .map(|r| {
+                (
+                    r.decision,
+                    r.replies.iter().map(|c| c.id.as_str()).collect(),
+                )
+            })
             .collect()
     }
 
