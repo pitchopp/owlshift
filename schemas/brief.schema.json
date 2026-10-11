@@ -33,6 +33,17 @@
         }
       ]
     },
+    "correction": {
+      "description": "The decider replied to the DECISION comments of decisions kept on the\ndelivered ticket, and this run makes the pull request follow the\nreplies (OWL-146, architecture section 5, \"A reversed decision\"). In\nBuild's brief only, at Watch; absent otherwise.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Correction"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "decider": {
       "description": "The person whose answers unblock the ticket's gates.",
       "type": "string"
@@ -44,7 +55,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 13
+      "const": 14
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands a role runs, in order, from the worktree root, before it\ndelivers. The runner is its only author; an empty list means the\nproject has no gate.",
@@ -273,6 +284,39 @@
         }
       },
       "additionalProperties": false
+    },
+    "Correction": {
+      "description": "The decisions the decider reversed on a delivered ticket, as a correction\nrun is given them (OWL-146). The replies are the decider's words, the\ninstruction this run follows; everything else here is the runner's\nrecord.",
+      "type": "object",
+      "properties": {
+        "head": {
+          "description": "The branch's head: Owlshift's last push.",
+          "type": "string"
+        },
+        "pull_request": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reversed": {
+          "description": "Each reversed decision, oldest first.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReversedDecision"
+          },
+          "minItems": 1
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pull_request",
+        "url",
+        "head",
+        "reversed"
+      ]
     },
     "FailedCheck": {
       "description": "One failed check of a [`CheckFailure`].",
@@ -559,6 +603,30 @@
       "type": "string",
       "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
     },
+    "ReversedDecision": {
+      "description": "One decision a [`Correction`] reverses.",
+      "type": "object",
+      "properties": {
+        "decision": {
+          "description": "The decision the replies reverse.",
+          "type": "string"
+        },
+        "question": {
+          "description": "The question the decision settled, under the raising run's id.",
+          "$ref": "#/$defs/Question"
+        },
+        "reply": {
+          "description": "The decider's replies to its DECISION comment that no run followed\nyet, oldest first, separated by blank lines, at most\n[`MAX_REPLY_BYTES`].",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question",
+        "decision",
+        "reply"
+      ]
+    },
     "Role": {
       "description": "What a run executes: a stage's role, or one of the runner's helper roles.",
       "type": "string",
@@ -713,6 +781,10 @@
             "question": {
               "description": "The question as the raising run asked it, under that run's id.",
               "$ref": "#/$defs/Question"
+            },
+            "reversed": {
+              "description": "The decider reversed it by replying to its DECISION comment\n(OWL-146): the reply, a `comment` of the thread, is followed and\nthis decision never is.",
+              "type": "boolean"
             },
             "type": {
               "type": "string",

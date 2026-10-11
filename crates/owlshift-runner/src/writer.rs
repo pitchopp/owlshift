@@ -89,6 +89,20 @@ pub struct DeliveryReport {
     /// A rebase run's push after the delivery (OWL-210): the base it rebased
     /// onto, and which repair it is. `None` otherwise.
     pub rebase: Option<Rebased>,
+    /// A correction run's outcome after the delivery, once the decider
+    /// replied to DECISION comments (OWL-146). `None` otherwise.
+    pub correction: Option<Corrected>,
+}
+
+/// A correction a DELIVERY report names (OWL-146, architecture section 5, "A
+/// reversed decision").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Corrected {
+    /// The questions of the decisions the decider's replies reversed.
+    pub questions: Vec<String>,
+    /// Whether the run pushed a commit; `false` when the pull request
+    /// already followed the replies.
+    pub pushed: bool,
 }
 
 /// A rebase a DELIVERY report names (OWL-210, architecture section 5,
@@ -163,6 +177,24 @@ impl DeliveryReport {
                 code(short(&rebase.onto)),
                 rebase.repair
             ));
+        }
+        if let Some(correction) = &self.correction {
+            let questions: Vec<String> = correction
+                .questions
+                .iter()
+                .map(|q| format!("**{}**", flatten(q)))
+                .collect();
+            sections.push(if correction.pushed {
+                format!(
+                    "**Corrected after delivery,** to follow the decider's replies to the                      decisions on {}.",
+                    questions.join(", ")
+                )
+            } else {
+                format!(
+                    "**No correction needed after delivery:** the pull request already follows                      the decider's replies to the decisions on {}, and nothing was pushed.",
+                    questions.join(", ")
+                )
+            });
         }
         let summary = flatten(&self.summary);
         if !summary.is_empty() {
@@ -705,8 +737,9 @@ impl DecisionComment {
                 flatten(&self.decision),
                 flatten(&self.basis)
             ),
-            "To reverse it, say what you want instead in a comment on this ticket: the next run \
-             follows your comment over this decision."
+            "To reverse it, reply to this comment with what you want instead: the next run \
+             follows your reply over this decision, and once the pull request is delivered, \
+             Owlshift's watch corrects it to follow your reply."
                 .to_owned(),
             Footer {
                 format: Format,
@@ -1757,6 +1790,7 @@ mod tests {
             }],
             fix_pass: None,
             rebase: None,
+            correction: None,
         }
     }
 
@@ -2252,7 +2286,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
              GREETING.md / HELLO.md",
             "**Decision:** GREETING.md <!-- owlshift:",
             "**Settled by:** The ticket's description.",
-            "To reverse it, say what you want instead in a comment on this ticket",
+            "To reverse it, reply to this comment with what you want instead",
         ] {
             assert!(body.contains(text), "{text}\n---\n{body}");
         }

@@ -33,7 +33,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "pull_request": {
       "description": "The pull request, once the forge showed the delivery's push as its\nhead; absent while the first push is under way.",
@@ -145,11 +145,20 @@
     },
     "PushKind": {
       "description": "Which run's push.",
-      "type": "string",
-      "enum": [
-        "delivery",
-        "fix",
-        "rebase"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "delivery",
+            "fix",
+            "rebase"
+          ]
+        },
+        {
+          "description": "A correction run's, after the decider reversed a decision (format 2,\nOWL-146).",
+          "type": "string",
+          "const": "correction"
+        }
       ]
     },
     "Pushing": {

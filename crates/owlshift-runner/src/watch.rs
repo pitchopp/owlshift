@@ -47,7 +47,8 @@ use owlshift_core::vocab::Stage;
 use crate::answer_check::{self, Readiness};
 use crate::events::{EventSink, data, printable};
 use crate::follow::{self, Following, Look};
-use crate::on_demand::{Delivered, Landed, OnDemand, PIPELINE, Stop};
+use crate::on_demand::{self, Delivered, Landed, OnDemand, PIPELINE, Stop};
+use crate::reversal::{self, Current};
 use crate::ticket_ref::{self, Stored, TicketRecord};
 
 /// How long watch sleeps after each pass.
@@ -381,6 +382,17 @@ impl Watch<'_> {
                 ..
             }
         ) {
+            // A read that asks for no repair leaves room for a correction
+            // (OWL-146).
+            if matches!(
+                seen.decision,
+                Decision::Follow {
+                    adopt: false,
+                    action: Action::Green | Action::WaitChecks | Action::WaitBaseRed,
+                }
+            ) {
+                self.correct(memory, sink, continued, ticket, stored, commit);
+            }
             return;
         }
         let held = Seen {
@@ -392,6 +404,74 @@ impl Watch<'_> {
         }
         let Some(outcome) = on_demand.repair_seen(ticket, &held.commit, seen.failing_for, sink)
         else {
+            return;
+        };
+        continued(ticket, &outcome, sink);
+        let git = &on_demand.executor.git;
+        let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket)
+            .ok()
+            .flatten()
+            .map(|stored| stored.commit);
+        let now = (on_demand.clock)();
+        memory
+            .holds
+            .after(ticket, held, &outcome, after.as_deref(), now);
+    }
+
+    /// A followed pull request whose ticket keeps decisions (OWL-146): its
+    /// comments, and a correction once the decider's replies to a DECISION
+    /// count, by the quiet window as an answer does, held as a continue is
+    /// ([`Holds`]). Who the decider is follows the brief's thread: the
+    /// decider of the latest ask before a reply, or the ticket's assignee,
+    /// read only once a reply is found; a ticket whose zones' owners decide
+    /// is left to [`OnDemand::correct_seen`], which reads them under the
+    /// lock.
+    fn correct(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        continued: &mut Continued<'_>,
+        ticket: &TicketId,
+        stored: &Stored,
+        commit: String,
+    ) {
+        let on_demand = self.on_demand;
+        let questions = &stored.record.questions;
+        if questions.decisions.is_empty() {
+            return;
+        }
+        let comments = match on_demand.tracker.comments(ticket) {
+            Ok(comments) => comments,
+            Err(e) => {
+                let reason = format!("reading its comments: {e}");
+                return self.unreadable(memory, sink, ticket, reason);
+            }
+        };
+        if reversal::reversals(&comments, questions, Current::Unresolved).is_empty() {
+            return;
+        }
+        let decider = match on_demand.tracker.ticket(ticket) {
+            Ok(found) => on_demand::known_decider(&found),
+            Err(e) => {
+                let reason = format!("reading the ticket: {e}");
+                return self.unreadable(memory, sink, ticket, reason);
+            }
+        };
+        let current = decider.as_ref().map_or(Current::Unresolved, Current::Known);
+        let reversed = reversal::reversals(&comments, questions, current);
+        let now = (on_demand.clock)();
+        let window = on_demand.config.policy.quiet_window();
+        if reversed.is_empty() || reversal::counts_at(&reversed, now, window).is_some() {
+            return;
+        }
+        let held = Seen {
+            commit,
+            answer: reversal::newest(&reversed).map(|reply| reply.last_edit()),
+        };
+        if memory.holds.admit(ticket, &held, now) != Admit::Go {
+            return;
+        }
+        let Some(outcome) = on_demand.correct_seen(ticket, &held.commit, sink) else {
             return;
         };
         continued(ticket, &outcome, sink);

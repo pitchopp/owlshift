@@ -100,10 +100,11 @@ use crate::follow::{self, Following, Look, Seen};
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::rebase;
 use crate::resolver::{self, Fallback, Resolved};
+use crate::reversal;
 use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
-    DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment, Posted,
+    Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment, Posted,
     QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart, ResumeComment,
     VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
@@ -122,6 +123,8 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 /// How many times the pull request is read before its head must be the
 /// pushed commit: GitHub updates a pull request's head shortly after a push.
 const HEAD_READS: u32 = 5;
+
+mod correction;
 
 /// The pipeline of this version: the build stage alone, in the core machine.
 pub(crate) const PIPELINE: Pipeline = Pipeline::new(Variant::Trivial);
@@ -790,6 +793,9 @@ enum Command {
     Fix,
     /// A rebase run's dispatch (OWL-210), in a repair.
     Rebase,
+    /// A correction run after the decider replied to a DECISION (OWL-146),
+    /// by watch or by `continue` at Watch: as a repair.
+    Correct,
 }
 
 impl Command {
@@ -799,6 +805,7 @@ impl Command {
             Command::Continue => "continue",
             Command::Fix => "fix",
             Command::Rebase => "rebase",
+            Command::Correct => "correct",
         }
     }
 }
@@ -1211,6 +1218,11 @@ impl OnDemand<'_> {
         {
             return self.repair(p, seen.failing_for, sink);
         }
+        // The decider's replies to a DECISION, which the correction reads
+        // again under this command's lock (OWL-146).
+        if !p.questions().decisions.is_empty() {
+            return self.correct(p, sink);
+        }
         Err(Stop::Watched {
             ticket,
             seen: Box::new(seen),
@@ -1423,9 +1435,24 @@ impl OnDemand<'_> {
                         sink,
                     ));
                 }
-                // Build completed: in this version, delivery follows.
+                // Build completed: in this version, delivery follows. The
+                // decider's replies to DECISION comments its brief held are
+                // followed, so none starts a correction once delivered
+                // (OWL-146).
                 _ => {
-                    self.keep(p, &state)?;
+                    let mut questions = p.questions();
+                    let reversed = reversal::reversals(
+                        &comments,
+                        &questions,
+                        reversal::Current::Known(&current),
+                    );
+                    if reversal::followed(&mut questions, &reversed) {
+                        self.store(p, &state, questions).map_err(|e| {
+                            refused("keeping the replies Build followed in the ticket's ref", e)
+                        })?;
+                    } else {
+                        self.keep(p, &state)?;
+                    }
                     break ran.report;
                 }
             }
@@ -2701,6 +2728,7 @@ impl OnDemand<'_> {
             followups: gathered.followups,
             fix_pass: None,
             rebase: None,
+            correction: None,
         };
         let comment = writer
             .post_delivery_report(&delivery_report)
@@ -2833,6 +2861,9 @@ enum RepairKind {
     /// A rebase run's, onto this base commit: the one push that replaces
     /// the branch's history.
     Rebase { onto: CommitId },
+    /// A correction run's, following the decider's replies to the DECISION
+    /// comments of these questions (OWL-146): a fast-forward.
+    Correction { questions: Vec<String> },
 }
 
 impl RepairKind {
@@ -2840,6 +2871,7 @@ impl RepairKind {
         match self {
             Self::Fix { .. } => "fix",
             Self::Rebase { .. } => "rebase",
+            Self::Correction { .. } => "correction",
         }
     }
 }
@@ -3633,10 +3665,11 @@ impl OnDemand<'_> {
             kind: match kind {
                 RepairKind::Fix { .. } => PushKind::Fix,
                 RepairKind::Rebase { .. } => PushKind::Rebase,
+                RepairKind::Correction { .. } => PushKind::Correction,
             },
             base: base_at_push.clone(),
             onto: match &kind {
-                RepairKind::Fix { .. } => None,
+                RepairKind::Fix { .. } | RepairKind::Correction { .. } => None,
                 RepairKind::Rebase { onto } => Some(onto.to_string()),
             },
         });
@@ -3646,7 +3679,7 @@ impl OnDemand<'_> {
         let writer = Writer::new(self.tracker);
         let git = &self.executor.git;
         let landed = match &kind {
-            RepairKind::Fix { .. } => {
+            RepairKind::Fix { .. } | RepairKind::Correction { .. } => {
                 writer.push_leased(git, &p.checkout, "origin", &commit, &head, pushed)
             }
             RepairKind::Rebase { onto } => {
@@ -3748,6 +3781,7 @@ impl OnDemand<'_> {
         let event = match kind {
             RepairKind::Fix { .. } => Event::FixPushed,
             RepairKind::Rebase { .. } => Event::RebasePushed,
+            RepairKind::Correction { .. } => Event::Corrected,
         };
         state = match state.apply(PIPELINE, event) {
             Ok(Transition::To(next)) => next,
@@ -3767,6 +3801,13 @@ impl OnDemand<'_> {
             .iter()
             .map(resolver::reported)
             .collect();
+        let correction = match &kind {
+            RepairKind::Correction { questions } => Some(Corrected {
+                questions: questions.clone(),
+                pushed: true,
+            }),
+            _ => None,
+        };
         let (fix_pass, rebase, counted) = match kind {
             RepairKind::Fix { checks } => (
                 Some(FixPass {
@@ -3785,6 +3826,9 @@ impl OnDemand<'_> {
                 }),
                 ("repair", state.repairs()),
             ),
+            RepairKind::Correction { questions } => {
+                (None, None, ("corrected", questions.len() as u32))
+            }
         };
         let report = DeliveryReport {
             ticket: ticket.clone(),
@@ -3796,6 +3840,7 @@ impl OnDemand<'_> {
             followups,
             fix_pass,
             rebase,
+            correction,
         };
         let comment = match writer.post_delivery_report(&report) {
             Ok(comment) => comment,
@@ -3953,6 +3998,16 @@ fn pending_decider(ticket: &Ticket) -> Result<Pending, String> {
         return decide(ticket, &declared, &ZoneOwners::default()).map(Pending::Known);
     }
     Ok(Pending::Owners(declared))
+}
+
+/// The ticket's decider as the ticket alone tells (its assignee), for
+/// `owlshift watch`, which reads no project file: `None` when its zones'
+/// owners decide, or nobody does (OWL-146).
+pub(crate) fn known_decider(ticket: &Ticket) -> Option<Person> {
+    match pending_decider(ticket) {
+        Ok(Pending::Known(decider)) => Some(person(&decider, ticket)),
+        _ => None,
+    }
 }
 
 /// The decider of `ticket` with `declared` zones and the zone `owners` of
@@ -5062,7 +5117,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 9,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 10,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

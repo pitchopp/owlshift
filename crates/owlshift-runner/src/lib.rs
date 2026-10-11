@@ -20,6 +20,7 @@ pub mod on_demand;
 pub mod project;
 pub mod rebase;
 pub mod resolver;
+pub mod reversal;
 pub mod roles;
 pub mod rules;
 pub mod system;

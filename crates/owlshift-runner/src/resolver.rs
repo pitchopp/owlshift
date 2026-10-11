@@ -259,11 +259,14 @@ pub fn reopened_in(
 }
 
 /// A kept decision as the delivery report lists it, among the decisions
-/// taken without a human.
+/// taken without a human; one the decider reversed says so (OWL-146).
 pub fn reported(kept: &KeptDecision) -> Decision {
     Decision {
         question: kept.question.text.clone(),
-        decision: kept.decision.clone(),
+        decision: match kept.reversed {
+            Some(_) => format!("{} (reversed by the decider's reply)", kept.decision),
+            None => kept.decision.clone(),
+        },
         basis: kept.basis.clone(),
     }
 }
