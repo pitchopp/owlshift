@@ -671,6 +671,17 @@ impl Bench {
         ticket_ref::write(&git, &checkout, &ticket(), record, previous.as_deref()).unwrap();
     }
 
+    /// Another merge into the remote's `main`, writing `files`, from a
+    /// clone of its own; returns `main`'s new head.
+    fn merge_into_main(&self, files: &[(&str, &str)]) -> String {
+        merge_into(&self.env, self.tmp.path(), &self.remote.bare, files)
+    }
+
+    /// The ticket's worktree, where its runs work.
+    fn worktree(&self) -> PathBuf {
+        self.dirs().worktree(&ticket())
+    }
+
     /// The remote's `main`.
     fn remote_main(&self) -> String {
         let out = self
@@ -5117,4 +5128,299 @@ fn a_persons_push_during_a_fix_run_ends_the_following() {
     );
     let ended = bench.record().delivery.unwrap().ended.unwrap();
     assert_eq!(ended.why, owlshift_contracts::refs::EndedWhy::HeadMoved);
+}
+
+/// Another merge into `bare`'s `main`, writing `files`, an empty text
+/// removing its file, from a new clone in `root`; returns `main`'s new head.
+fn merge_into(env: &GitEnv, root: &Path, bare: &Path, files: &[(&str, &str)]) -> String {
+    let n = fs::read_dir(root).unwrap().count();
+    let clone = root.join(format!("merger-{n}"));
+    env.run(
+        root,
+        &[
+            "clone",
+            "--quiet",
+            bare.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    for (name, text) in files {
+        if text.is_empty() {
+            fs::remove_file(clone.join(name)).unwrap();
+        } else {
+            fs::write(clone.join(name), text).unwrap();
+        }
+    }
+    env.run(&clone, &["add", "--all"]).unwrap();
+    env.run(&clone, &["commit", "--quiet", "-m", "Another merge"])
+        .unwrap();
+    env.run(
+        &clone,
+        &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+    )
+    .unwrap();
+    let head = env.run(bare, &["rev-parse", "refs/heads/main"]).unwrap();
+    String::from_utf8(head).unwrap().trim().to_owned()
+}
+
+/// The project's rules as a delivery changes them, and as another merge
+/// changes the same line meanwhile: a contents conflict on one path.
+const AGENTS_DELIVERED: &str = "Sign off every commit (`git commit -s`), always.\n";
+const AGENTS_MERGED: &str = "Sign off every commit (`git commit -s`) and keep it short.\n";
+const AGENTS_RESOLVED: &str =
+    "Sign off every commit (`git commit -s`), always, and keep it short.\n";
+
+/// A rebase run's `done`.
+const REBASED: &str = r#"{"format":7,"status":"done","summary":"Rebased onto the base; the conflict kept both sides."}"#;
+
+/// A rebase run that could not resolve its conflict.
+const NOT_REBASED: &str = r#"{"format":7,"status":"failed","summary":"Could not resolve AGENTS.md; the rebase was aborted."}"#;
+
+/// A delivered ticket whose delivery also changed the project's rules, its
+/// pull request followed.
+fn delivered_with_rules() -> Bench {
+    let bench = Bench::new(true);
+    let mut reply = bench.reply(Some("Hello"), Some(DONE));
+    reply.files.insert(
+        RelativePath::new("AGENTS.md").unwrap(),
+        AGENTS_DELIVERED.to_owned(),
+    );
+    let (outcome, printed) = bench.run(vec![reply], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    bench
+}
+
+/// What the agent of a rebase run does in its worktree, played by the
+/// bench: `git rebase` onto `onto`, each conflicted file written as
+/// `resolved`, then the rebase continued.
+fn rebase_in(bench: &Bench, onto: String, resolved: Vec<(&'static str, &'static str)>) -> During {
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    let act = move || {
+        // The conflict stops the rebase: git exits 1.
+        let _ = env.run(&worktree, &["rebase", "--quiet", &onto]);
+        for (name, text) in &resolved {
+            fs::write(worktree.join(name), text).unwrap();
+            env.run(&worktree, &["add", "--", name]).unwrap();
+        }
+        env.run(
+            &worktree,
+            &["-c", "core.editor=true", "rebase", "--continue"],
+        )
+        .unwrap();
+    };
+    (1, Box::new(act))
+}
+
+fn is_ancestor(bench: &Bench, ancestor: &str, of: &str) -> bool {
+    bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["merge-base", "--is-ancestor", ancestor, of],
+        )
+        .is_ok()
+}
+
+/// Scenario S9's conflict (OWL-210): another merge changed the line the
+/// delivery changed, a trivial conflict. The rebase run is on the fast
+/// tier, briefed with the base, the branch and the conflicting path; the
+/// runner, never the agent, force-pushes the rebase leased on its last push,
+/// keeps the base it was rebased onto and reports it. Read conflicting
+/// again against that same base, the rebase counts as failed with no run,
+/// and the second such read parks the ticket.
+#[test]
+fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
+    let bench = delivered_with_rules();
+    let delivered_events = bench.events().len();
+    let first_push = bench.remote_branch().unwrap();
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (outcome, printed) = bench.continue_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![rebase_in(
+            &bench,
+            main.clone(),
+            vec![("AGENTS.md", AGENTS_RESOLVED)],
+        )],
+    );
+    let delivered = outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(!delivered.opened);
+
+    // One run, of the rebase role on the fast tier, told what to rebase.
+    let events = &bench.events()[delivered_events..];
+    let runs = data_of(events, EventKind::Decision, "tier");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        (
+            &runs[0]["tier"],
+            &runs[0]["trivial"],
+            &runs[0]["conflicting"]
+        ),
+        (&json!("fast"), &json!(true), &json!(["AGENTS.md"]))
+    );
+    let briefs = bench.briefs();
+    let brief = briefs.last().unwrap();
+    assert_eq!(brief.role, Role::Rebase);
+    let told = brief.rebase.as_ref().expect("what to rebase");
+    assert_eq!(
+        (
+            told.head.as_str(),
+            told.onto.as_str(),
+            told.base_branch.as_str()
+        ),
+        (first_push.as_str(), main.as_str(), "main")
+    );
+    assert_eq!(
+        (told.branch.as_str(), told.conflicting.as_slice()),
+        (BRANCH, &["AGENTS.md".to_owned()][..])
+    );
+    assert!(!told.refresh);
+
+    // The runner force-pushed the rebase, leased on its last push.
+    let rebased = bench.remote_branch().unwrap();
+    assert_ne!(rebased, first_push);
+    assert!(is_ancestor(&bench, &main, &rebased));
+    let pushes = data_of(events, EventKind::TrackerWrite, "lease");
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(
+        (
+            &pushes[0]["pushed"],
+            &pushes[0]["lease"],
+            &pushes[0]["commit"]
+        ),
+        (&json!("forced"), &json!(first_push), &json!(rebased))
+    );
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(
+        (delivery.pushed.as_deref(), delivery.rebased_onto.as_deref()),
+        (Some(rebased.as_str()), Some(main.as_str()))
+    );
+    assert!(delivery.pushing.is_none() && delivery.followed());
+    let state = state_of(&bench);
+    assert_eq!((state.repairs(), state.failed_runs()), (1, 0));
+    let report = bench.comments().pop().unwrap();
+    assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
+    assert!(
+        report.contains("**Rebased onto `main` at ") && report.contains("repair 1 of 6"),
+        "{report}"
+    );
+
+    // Still conflicting against the base it was rebased onto: a failed run
+    // of that rebase, no second one; then a park.
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Refused(why)) if why.contains("still conflicts with")),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(state_of(&bench).failed_runs(), 1);
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), briefs.len());
+    assert_eq!(bench.remote_branch().unwrap(), rebased);
+}
+
+/// A conflict that is not trivial, the delivery changing a file another
+/// merge removed, goes to the Build routing at once (OWL-210). The base moving again during the
+/// run changes nothing of what the rebase was onto: the ref keeps the base
+/// the run used, and the base head read before the push beside it.
+#[test]
+fn a_non_trivial_conflict_goes_to_the_build_routing_at_once() {
+    let bench = delivered_with_rules();
+    let delivered_events = bench.events().len();
+    let main = bench.merge_into_main(&[("AGENTS.md", "")]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let rebase = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_DELIVERED)]);
+    let moved = Rc::new(RefCell::new(None));
+    let (env, root, bare) = (
+        bench.env.clone(),
+        bench.tmp.path().to_owned(),
+        bench.remote.bare.clone(),
+    );
+    let kept = moved.clone();
+    let during = (
+        1,
+        Box::new(move || {
+            (rebase.1)();
+            *kept.borrow_mut() = Some(merge_into(&env, &root, &bare, &[("NOTES.md", "later\n")]));
+        }) as Box<dyn FnOnce()>,
+    );
+    let (outcome, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED))], vec![during]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    let events = &bench.events()[delivered_events..];
+    let runs = data_of(events, EventKind::Decision, "tier");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        (&runs[0]["tier"], &runs[0]["trivial"]),
+        (&json!("build"), &json!(false))
+    );
+    let rebased = bench.remote_branch().unwrap();
+    assert!(is_ancestor(&bench, &main, &rebased));
+    let later = moved.borrow().clone().unwrap();
+    assert!(!is_ancestor(&bench, &later, &rebased));
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(
+        (
+            delivery.rebased_onto.as_deref(),
+            delivery.base_at_push.as_deref()
+        ),
+        (Some(main.as_str()), Some(later.as_str()))
+    );
+}
+
+/// A trivial conflict whose fast run fails gets one more run, on the Build
+/// routing; a second failure parks the ticket, the PARKED comment saying
+/// what restarts it (OWL-210). Nothing was pushed, and the ticket's branch
+/// is back at Owlshift's last push, so a fix run can start from it.
+#[test]
+fn a_rebase_that_fails_twice_parks_the_ticket() {
+    let bench = delivered_with_rules();
+    let delivered_events = bench.events().len();
+    let first_push = bench.remote_branch().unwrap();
+    bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (outcome, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(NOT_REBASED)),
+        bench.reply(None, Some(NOT_REBASED)),
+    ]);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    let events = &bench.events()[delivered_events..];
+    let tiers: Vec<Value> = data_of(events, EventKind::Decision, "tier")
+        .iter()
+        .map(|run| run["tier"].clone())
+        .collect();
+    assert_eq!(tiers, [json!("fast"), json!("build")]);
+    let parked = bench.comments().pop().unwrap();
+    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    assert!(parked.contains("owlshift continue DEMO-1"), "{parked}");
+    assert_eq!(bench.remote_branch().unwrap(), first_push);
+    let local = bench
+        .env
+        .run(
+            &bench.dirs().checkout(),
+            &["rev-parse", &format!("refs/heads/{BRANCH}")],
+        )
+        .unwrap();
+    assert_eq!(String::from_utf8(local).unwrap().trim(), first_push);
+    assert_eq!(state_of(&bench).repairs(), 0);
 }

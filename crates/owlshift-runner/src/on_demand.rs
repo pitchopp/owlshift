@@ -98,14 +98,14 @@ use crate::executor::{
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
-use crate::resolver::{self, Fallback, Resolved};
 use crate::rebase;
+use crate::resolver::{self, Fallback, Resolved};
 use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
     DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment, Posted,
-    QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart,
-    ResumeComment, VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
+    QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart, ResumeComment,
+    VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 
@@ -3763,9 +3763,8 @@ impl OnDemand<'_> {
             follow::landed(&mut kept, pushing);
         }
         let questions = p.questions();
-        self.store_delivery(p, &state, questions, Some(kept)).map_err(|e| {
-            Stop::Delivery(format!("keeping the {what} in the ticket's ref: {e}"))
-        })?;
+        self.store_delivery(p, &state, questions, Some(kept))
+            .map_err(|e| Stop::Delivery(format!("keeping the {what} in the ticket's ref: {e}")))?;
         let checks_read = self.forge.checks(pull_request.number, &commit);
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let decisions: Vec<Decision> = p

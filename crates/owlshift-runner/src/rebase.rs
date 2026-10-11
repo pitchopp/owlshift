@@ -10,7 +10,9 @@
 //! its type a stable string. Exit status 0 is a clean merge, 1 a conflict.
 //! Checked live with git 2.43.0 on 2026-10-11: a contents conflict, a
 //! modify/delete and a binary file each give their own record, the binary
-//! one a `CONFLICT (binary)` before its `CONFLICT (contents)`.
+//! one a `CONFLICT (binary)` before its `CONFLICT (contents)`; both sides
+//! adding the same path is typed `CONFLICT (contents)` (only its message
+//! says add/add), so it is trivial by the rule.
 
 use std::path::Path;
 
@@ -33,7 +35,13 @@ pub struct Classified {
 /// holds. `conflicting` is whether the forge reports a conflict: a clean
 /// merge then counts as non-trivial, since git and the forge disagree; a
 /// clean merge with no conflict reported, a refresh's, is trivial.
-pub fn classify(git: &Git, checkout: &Path, onto: &str, head: &str, conflicting: bool) -> Classified {
+pub fn classify(
+    git: &Git,
+    checkout: &Path,
+    onto: &str,
+    head: &str,
+    conflicting: bool,
+) -> Classified {
     let out = git.output(
         checkout,
         &[
@@ -172,8 +180,8 @@ mod tests {
         for kind in [
             "CONFLICT (modify/delete)",
             "CONFLICT (binary)",
-            "CONFLICT (add/add)",
             "CONFLICT (rename/delete)",
+            "CONFLICT (file/directory)",
         ] {
             let out = output(&["f"], &[(kind, kind), ("f", "CONFLICT (contents)")]);
             assert!(!parse(Some(1), &out, true).trivial, "{kind}");

@@ -1103,7 +1103,9 @@ impl TicketDelivery {
         if let Some(pushing) = &self.pushing
             && (pushing.kind == PushKind::Rebase) != pushing.onto.is_some()
         {
-            return invalid("a push under way names its onto if and only if it is a rebase's".to_owned());
+            return invalid(
+                "a push under way names its onto if and only if it is a rebase's".to_owned(),
+            );
         }
         if self.ended.is_some() && self.pushing.is_some() {
             return invalid("an ended delivery has a push under way".to_owned());

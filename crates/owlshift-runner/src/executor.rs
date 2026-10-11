@@ -323,7 +323,11 @@ impl Executor {
         // instead of its start (OWL-49): the base it was told, which must
         // be the commit the run was given, so the isolation check never
         // accepts a descent from another one (OWL-210).
-        let onto = spec.brief.rebase.as_ref().map(|rebase| rebase.onto.as_str());
+        let onto = spec
+            .brief
+            .rebase
+            .as_ref()
+            .map(|rebase| rebase.onto.as_str());
         if let Some(onto) = onto
             && onto != spec.base
         {

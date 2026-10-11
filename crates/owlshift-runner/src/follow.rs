@@ -928,7 +928,10 @@ mod tests {
         assert_eq!((state.repairs(), state.failed_runs()), (1, 0));
         let rebased = rebased.delivery.unwrap();
         assert_eq!(
-            (rebased.base_at_push.as_deref(), rebased.rebased_onto.as_deref()),
+            (
+                rebased.base_at_push.as_deref(),
+                rebased.rebased_onto.as_deref()
+            ),
             (Some(BASE), Some(ONTO))
         );
 

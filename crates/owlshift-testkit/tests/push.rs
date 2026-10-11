@@ -85,6 +85,30 @@ impl Bench {
         read_push(branch, &command.output().unwrap())
     }
 
+    /// A commit on `parent` writing `file`, or an empty one, from a
+    /// detached head of the checkout.
+    fn commit_on(&self, parent: &str, file: Option<(&str, &str)>, message: &str) -> CommitId {
+        let dir = &self.remote.checkout;
+        self.env
+            .run(dir, &["checkout", "--quiet", "--detach", parent])
+            .unwrap();
+        match file {
+            Some((name, text)) => {
+                fs::write(dir.join(name), text).unwrap();
+                self.env.run(dir, &["add", "--all"]).unwrap();
+                self.env
+                    .run(dir, &["commit", "--quiet", "-m", message])
+                    .unwrap();
+            }
+            None => {
+                self.env
+                    .run(dir, &["commit", "--quiet", "--allow-empty", "-m", message])
+                    .unwrap();
+            }
+        }
+        self.head()
+    }
+
     fn remote_branch(&self, branch: &Branch) -> String {
         let out = self
             .env
@@ -183,5 +207,98 @@ fn a_leased_push_moves_the_branch_forward_from_its_lease_only() {
             &third
         ),
         Ok(Pushed::FastForward)
+    );
+}
+
+/// A rebase run's push (OWL-210): leased on Owlshift's last push, it
+/// replaces the branch's history with a rebase of the delivery onto the new
+/// base, read as forced. Before git runs, the Writer refuses a commit that
+/// is the base, adds nothing to it, does not descend from it, or no longer
+/// changes a file the delivery changed; the lease still refuses a branch a
+/// person moved or deleted, which is never recreated.
+#[test]
+fn a_rebased_push_replaces_the_history_only_with_the_delivery_kept() {
+    let bench = bench();
+    let branch = Branch::new("owl-210-push").unwrap();
+    let seed = bench.head();
+    let delivered = bench.commit_on(seed.as_str(), Some(("file.txt", "delivered\n")), "deliver");
+    assert_eq!(
+        bench.push("origin", &delivered, &branch),
+        Ok(Pushed::Created)
+    );
+    // Another merge moved the base.
+    let base = bench.commit_on(seed.as_str(), Some(("main.txt", "merged\n")), "merge");
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let tracker = MarkdownTracker::new(&bench.remote.checkout);
+    let writer = Writer::new(&tracker);
+    let push = |commit: &CommitId, lease: &CommitId| {
+        writer.push_rebased(
+            &git,
+            &bench.remote.checkout,
+            "origin",
+            commit,
+            &branch,
+            lease,
+            &base,
+        )
+    };
+    let lost = bench.commit_on(base.as_str(), Some(("other.txt", "x\n")), "lose it");
+    let empty = bench.commit_on(base.as_str(), None, "nothing");
+    let elsewhere = bench.commit_on(seed.as_str(), Some(("file.txt", "again\n")), "elsewhere");
+    for (commit, why) in [
+        (&base, "it is the base itself"),
+        (&empty, "its tree is the base's"),
+        (&elsewhere, "does not descend from the base"),
+        (&lost, "no longer changes file.txt"),
+    ] {
+        let refused = push(commit, &delivered).unwrap_err();
+        assert!(
+            matches!(&refused, WriteError::Push(PushError::Failed { message })
+                if message.contains(why)),
+            "{why}: {refused:?}"
+        );
+        assert_eq!(bench.remote_branch(&branch), delivered.as_str());
+    }
+
+    let rebased = bench.commit_on(base.as_str(), Some(("file.txt", "delivered\n")), "deliver");
+    assert_eq!(push(&rebased, &delivered), Ok(Pushed::Forced));
+    assert_eq!(bench.remote_branch(&branch), rebased.as_str());
+
+    // A person pushed meanwhile: the lease on the rebase refuses the next.
+    let theirs = bench.commit_on(rebased.as_str(), Some(("theirs.txt", "t\n")), "theirs");
+    assert_eq!(
+        bench.push("origin", &theirs, &branch),
+        Ok(Pushed::FastForward)
+    );
+    let again = bench.commit_on(base.as_str(), Some(("file.txt", "delivered!\n")), "again");
+    let stale = push(&again, &rebased).unwrap_err();
+    assert!(
+        matches!(stale, WriteError::Push(PushError::Rejected { .. })),
+        "{stale:?}"
+    );
+    assert_eq!(bench.remote_branch(&branch), theirs.as_str());
+
+    // A person deleted the branch: it is not recreated.
+    bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["update-ref", "-d", &format!("refs/heads/{branch}")],
+        )
+        .unwrap();
+    let gone = push(&again, &rebased).unwrap_err();
+    assert!(
+        matches!(gone, WriteError::Push(PushError::Rejected { .. })),
+        "{gone:?}"
+    );
+    assert!(
+        bench
+            .env
+            .run(
+                &bench.remote.bare,
+                &["rev-parse", "--verify", "--quiet", branch.as_str()]
+            )
+            .is_err()
     );
 }

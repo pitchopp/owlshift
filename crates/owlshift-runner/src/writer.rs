@@ -42,8 +42,7 @@ use std::path::Path;
 
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
 use owlshift_adapters::forge::push::{
-    PushError, Pushed, leased_push_command, push_command, read_forced_push_parts,
-    read_push_parts,
+    PushError, Pushed, leased_push_command, push_command, read_forced_push_parts, read_push_parts,
 };
 use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
@@ -961,7 +960,11 @@ pub fn rebase_keeps_delivery(
     onto: &CommitId,
     commit: &CommitId,
 ) -> Result<(), String> {
-    let refused = |why: String| Err(format!("{commit} is not a rebase of {lease} onto {onto}: {why}"));
+    let refused = |why: String| {
+        Err(format!(
+            "{commit} is not a rebase of {lease} onto {onto}: {why}"
+        ))
+    };
     if commit == onto {
         return refused("it is the base itself".to_owned());
     }
@@ -993,7 +996,12 @@ pub fn rebase_keeps_delivery(
         Some(0) => return refused("its tree is the base's: no change is left".to_owned()),
         _ => return Err(format!("comparing {commit} with {onto}: git diff failed")),
     }
-    let parted = run(&["merge-base", "--end-of-options", lease.as_str(), onto.as_str()])?;
+    let parted = run(&[
+        "merge-base",
+        "--end-of-options",
+        lease.as_str(),
+        onto.as_str(),
+    ])?;
     if !parted.success() {
         return refused("the delivery shares no history with the base".to_owned());
     }
@@ -1011,7 +1019,9 @@ pub fn rebase_keeps_delivery(
             to,
         ])?;
         if !out.success() {
-            return Err(format!("listing the paths {from}..{to} changes: git diff failed"));
+            return Err(format!(
+                "listing the paths {from}..{to} changes: git diff failed"
+            ));
         }
         Ok(out
             .stdout
