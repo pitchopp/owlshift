@@ -414,8 +414,20 @@ fn reopened_lines(choice: &RefusedChoice) -> String {
     lines.join("\n")
 }
 
+/// The most characters, counted as Unicode code points, one comment may
+/// hold: Linear refuses a comment of more (OWL-223, checked live on
+/// 2026-10-11; build plan, "What Linear accepts of one comment"). Every
+/// tracker gets the same bound.
+pub const MAX_COMMENT_CHARS: usize = 100_000;
+
+/// The most characters of the run's summary a QUESTIONS round split in
+/// parts shows: the summary is a recap, the questions are what the decider
+/// needs.
+const SPLIT_SUMMARY_CHARS: usize = 8_000;
+
 /// The QUESTIONS comment (scenario S2): a round of numbered questions for the
-/// decider, all in one comment, each understandable without a transcript.
+/// decider, each understandable without a transcript, in one comment when it
+/// fits in [`MAX_COMMENT_CHARS`], in parts otherwise ([`Self::parts`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuestionsComment {
     pub ticket: TicketId,
@@ -443,15 +455,105 @@ impl QuestionsComment {
     /// with the refused choices it reopens, how to answer, and the footer.
     /// Text from a model is flattened to one line.
     pub fn render(&self) -> String {
+        let (head, blocks) = self.sections(flatten(&self.summary));
+        self.body(None, head.into_iter().chain(blocks), true)
+    }
+
+    /// The round as the comments that hold it, in posting order, each of at
+    /// most `room` characters: the whole body ([`Self::render`]) when it
+    /// fits, otherwise parts of the round (OWL-223). Each part is a marked
+    /// QUESTIONS comment of the round that says which part it is; the first
+    /// holds what comes before the questions, the summary cut to
+    /// 8,000 characters or to the room the part leaves it, and the
+    /// parts are cut between questions
+    /// only, each question with the refused choices it reopens; the last
+    /// says how to answer. A question too long for a part alone, which the
+    /// result's bounds leave no room for, is cut, visibly.
+    pub fn parts(&self, room: usize) -> Vec<String> {
+        let whole = self.render();
+        if chars(&whole) <= room {
+            return vec![whole];
+        }
+        let frame = chars(&self.body(Some((usize::MAX, usize::MAX)), [], true));
+        // Each section adds its characters and the blank line before it.
+        let room = room.saturating_sub(frame);
+        let (others, _) = self.sections(String::new());
+        let others: usize = others.iter().map(|section| chars(section) + 2).sum();
+        let summary = cut(
+            &flatten(&self.summary),
+            SPLIT_SUMMARY_CHARS.min(room.saturating_sub(others + 2)),
+            "the run's summary is longer than a comment holds",
+        );
+        let (head, blocks) = self.sections(summary);
+        let mut parts = vec![head];
+        for block in blocks {
+            let block = cut(
+                &block,
+                room.saturating_sub(2),
+                "this question is longer than a comment holds",
+            );
+            let part = parts.last_mut().expect("the first part is there");
+            let used: usize = part.iter().map(|section| chars(section) + 2).sum();
+            if !part.is_empty() && used + chars(&block) + 2 > room {
+                parts.push(vec![block]);
+            } else {
+                part.push(block);
+            }
+        }
+        let n = parts.len();
+        parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, sections)| self.body(Some((i + 1, n)), sections, i + 1 == n))
+            .collect()
+    }
+
+    /// A body: the header, which part it is when the round is in parts,
+    /// `sections`, how to answer when `last`, and the footer.
+    fn body(
+        &self,
+        part: Option<(usize, usize)>,
+        sections: impl IntoIterator<Item = String>,
+        last: bool,
+    ) -> String {
         let header = Header {
             kind: MarkerKind::Questions,
             round: Some(self.round),
         };
-        let mut sections = vec![header.render()];
+        let mut all = vec![header.render()];
+        if let Some((k, n)) = part {
+            all.push(format!(
+                "Part {k} of {n} of this round: its questions are longer than a comment holds."
+            ));
+        }
+        all.extend(sections);
+        if last {
+            all.push(
+                "Answer here, in one comment or several: the work resumes once every question \
+                 is settled."
+                    .to_owned(),
+            );
+        }
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Questions,
+            ticket: self.ticket.clone(),
+            round: Some(self.round),
+            run: None,
+        };
+        all.push(footer.render());
+        let mut body = all.join("\n\n");
+        body.push('\n');
+        body
+    }
+
+    /// The sections before the questions, with `summary` as the run's, and
+    /// one per question, with the refused choices it reopens.
+    fn sections(&self, summary: String) -> (Vec<String>, Vec<String>) {
+        let mut sections = Vec::new();
         if self.premise_false {
             sections.push("The run found the ticket's premise false.".to_owned());
         }
-        let summary = flatten(&self.summary);
         if !summary.is_empty() {
             sections.push(summary);
         }
@@ -488,33 +590,43 @@ impl QuestionsComment {
                     .to_owned(),
             );
         }
-        sections.extend(self.questions.iter().map(|question| {
-            let mut block = vec![question_block(question)];
-            block.extend(
-                self.reopened
-                    .iter()
-                    .filter(|reopened| reopened.question == question.id)
-                    .map(|reopened| reopened_lines(&reopened.choice)),
-            );
-            block.join("\n")
-        }));
-        sections.push(
-            "Answer here, in one comment or several: the work resumes once every question is \
-             settled."
-                .to_owned(),
-        );
-        let footer = Footer {
-            format: Format,
-            kind: MarkerKind::Questions,
-            ticket: self.ticket.clone(),
-            round: Some(self.round),
-            run: None,
-        };
-        sections.push(footer.render());
-        let mut body = sections.join("\n\n");
-        body.push('\n');
-        body
+        let blocks = self
+            .questions
+            .iter()
+            .map(|question| {
+                let mut block = vec![question_block(question)];
+                block.extend(
+                    self.reopened
+                        .iter()
+                        .filter(|reopened| reopened.question == question.id)
+                        .map(|reopened| reopened_lines(&reopened.choice)),
+                );
+                block.join("\n")
+            })
+            .collect();
+        (sections, blocks)
     }
+}
+
+/// The characters of `text`, counted as Unicode code points, as Linear
+/// counts them.
+fn chars(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// `text` as is when it has at most `room` characters, otherwise its start,
+/// ending with a note of the cut that gives `why`, in `room` characters.
+fn cut(text: &str, room: usize, why: &str) -> String {
+    if chars(text) <= room {
+        return text.to_owned();
+    }
+    let note = format!(" … (cut: {why})");
+    let mut kept: String = text
+        .chars()
+        .take(room.saturating_sub(chars(&note)))
+        .collect();
+    kept.push_str(&note);
+    kept
 }
 
 /// The DECISION comment (scenario S7): a question a run raised that the
@@ -1219,8 +1331,45 @@ impl<'a> Writer<'a> {
 
     /// Posts a round's QUESTIONS comment and returns it as the tracker
     /// recorded it: its id and time are what the ticket ref keeps of the ask.
+    ///
+    /// A round longer than a comment holds is posted in parts, in order, each
+    /// of at most [`MAX_COMMENT_CHARS`] characters (OWL-223), and the last
+    /// part is returned: the ask's time is the round's end, so an answer
+    /// counts once the whole round is on the ticket, and that part alone
+    /// mentions the decider, so they are told then. A part refused stops
+    /// the round there; the error says how many parts reached the ticket.
     pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Posted, WriteError> {
-        self.post_waiting(&comment.ticket, comment.render())
+        let (mention, mention_dropped) = self.mention();
+        let line = mention
+            .as_deref()
+            .map_or(0, |m| chars(&waiting_line(m)) + 2);
+        let parts = comment.parts(MAX_COMMENT_CHARS.saturating_sub(line));
+        let n = parts.len();
+        let mut posted = None;
+        for (i, body) in parts.into_iter().enumerate() {
+            let body = if i + 1 == n {
+                with_mention(body, mention.as_deref())
+            } else {
+                body
+            };
+            match self.post(&comment.ticket, &body) {
+                Ok(part) => posted = Some(part),
+                Err(WriteError::Tracker(error)) if i > 0 => {
+                    return Err(WriteError::Tracker(TrackerError::new(
+                        error.kind,
+                        format!(
+                            "{}; parts 1 to {i} of {n} of the round are on the ticket",
+                            error.message
+                        ),
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Posted {
+            comment: posted.expect("a round has one part at least"),
+            mention_dropped,
+        })
     }
 
     /// Posts a DECISION comment and returns it as the tracker recorded it:
@@ -1275,10 +1424,21 @@ impl<'a> Writer<'a> {
 
     /// Posts `body`, a marked comment that waits for the decider, with the
     /// line naming them as its second section when the tracker can mention
-    /// them. The tracker is asked at each post: a few times a ticket. A
-    /// mention it could not give is left out, and said in the result.
+    /// them. A mention it could not give is left out, and said in the result.
     fn post_waiting(&self, ticket: &TicketId, body: String) -> Result<Posted, WriteError> {
-        let (mention, mention_dropped) = match self.decider.as_deref() {
+        let (mention, mention_dropped) = self.mention();
+        let body = with_mention(body, mention.as_deref());
+        let comment = self.post(ticket, &body)?;
+        Ok(Posted {
+            comment,
+            mention_dropped,
+        })
+    }
+
+    /// The decider's mention, when the tracker has one, or why it could not
+    /// give it. The tracker is asked at each post: a few times a ticket.
+    fn mention(&self) -> (Option<String>, Option<MentionDropped>) {
+        match self.decider.as_deref() {
             None => (None, None),
             Some(account) => match self.tracker.mention(account) {
                 Ok(mention) => (mention, None),
@@ -1290,18 +1450,23 @@ impl<'a> Writer<'a> {
                     }),
                 ),
             },
-        };
-        let body = match (mention, body.split_once("\n\n")) {
-            (Some(mention), Some((header, rest))) => {
-                format!("{header}\n\nWaiting for {mention}\n\n{rest}")
-            }
-            _ => body,
-        };
-        let comment = self.post(ticket, &body)?;
-        Ok(Posted {
-            comment,
-            mention_dropped,
-        })
+        }
+    }
+}
+
+/// The line that names the decider a comment waits for.
+fn waiting_line(mention: &str) -> String {
+    format!("Waiting for {mention}")
+}
+
+/// `body` with the line naming the decider as its second section, when
+/// there is a mention.
+fn with_mention(body: String, mention: Option<&str>) -> String {
+    match (mention, body.split_once("\n\n")) {
+        (Some(mention), Some((header, rest))) => {
+            format!("{header}\n\n{}\n\n{rest}", waiting_line(mention))
+        }
+        _ => body,
     }
 }
 
@@ -2139,6 +2304,8 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         comments: RefCell<Vec<Comment>>,
         posts: Cell<usize>,
         fail_comments: Cell<bool>,
+        /// The post, from 1, the tracker refuses.
+        fail_post: Cell<Option<usize>>,
         stages: RefCell<Vec<String>>,
     }
 
@@ -2159,6 +2326,9 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         }
 
         fn post_comment(&self, _: &TicketId, body: &str) -> Result<Comment, TrackerError> {
+            if self.fail_post.get() == Some(self.posts.get() + 1) {
+                return Err(TrackerError::new(TrackerErrorKind::Other, "body too long"));
+            }
             self.posts.set(self.posts.get() + 1);
             let comment = Comment {
                 id: self.posts.get().to_string(),
@@ -2296,6 +2466,153 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         assert_eq!(
             (posted.comment.body, posted.mention_dropped),
             (questions.render(), None)
+        );
+    }
+
+    /// The largest round a valid result can ask, all ASCII, the character
+    /// count Linear bounds being largest per byte: 64 questions of about
+    /// 2 KiB as JSON (`MAX_QUESTIONS_BYTES` together), each reopening one
+    /// of 64 refused choices of two 512-byte texts, and a long summary.
+    fn maximal_round() -> QuestionsComment {
+        use owlshift_contracts::brief::{MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES};
+        use owlshift_contracts::result::{MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES};
+        let questions: Vec<Question> = (1..=MAX_QUESTIONS)
+            .map(|n| Question {
+                id: QuestionId::new(format!("Q{n}")).unwrap(),
+                category: "scope".to_owned(),
+                context: "c".repeat(980),
+                text: format!("Which {n}? {}", "t".repeat(900)),
+                options: vec!["o".repeat(20), "p".repeat(20)],
+                recommendation: Some("r".repeat(20)),
+            })
+            .collect();
+        let weights: Vec<usize> = questions
+            .iter()
+            .map(|q| serde_json::to_vec(q).unwrap().len())
+            .collect();
+        assert!(weights.iter().all(|w| *w <= MAX_QUESTION_BYTES));
+        let total: usize = weights.iter().sum();
+        assert!(
+            (MAX_QUESTIONS_BYTES - 4_096..=MAX_QUESTIONS_BYTES).contains(&total),
+            "{total}"
+        );
+        let reopened = (1..=MAX_REFUSED_CHOICES)
+            .map(|n| ReopenedChoice {
+                place: NonZeroU32::new(u32::try_from(n).unwrap()).unwrap(),
+                question: QuestionId::new(format!("Q{n}")).unwrap(),
+                choice: RefusedChoice {
+                    question: format!("{n:<MAX_CHOICE_BYTES$}").replace(' ', "a"),
+                    recorded: format!("{n:<MAX_CHOICE_BYTES$}").replace(' ', "b"),
+                },
+            })
+            .collect();
+        QuestionsComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(3).unwrap(),
+            summary: "s".repeat(20_000),
+            questions,
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+            reopened,
+        }
+    }
+
+    /// OWL-223: a round longer than a comment holds is posted in parts of
+    /// at most `MAX_COMMENT_CHARS`, the mention included, each a marked
+    /// QUESTIONS comment of the round, cut between questions only, in
+    /// order; the summary is cut; the last part says how to answer, mentions
+    /// the decider and is the one returned.
+    #[test]
+    fn a_round_longer_than_a_comment_is_posted_in_parts() {
+        let round = maximal_round();
+        assert!(chars(&round.render()) > 2 * MAX_COMMENT_CHARS * 9 / 10);
+        let tracker = FakeTracker::default();
+        let posted = Writer::new(&tracker)
+            .mentioning("u1")
+            .post_questions(&round)
+            .unwrap();
+        let parts: Vec<String> = tracker
+            .comments
+            .borrow()
+            .iter()
+            .map(|c| c.body.clone())
+            .collect();
+        let n = parts.len();
+        assert!(n > 1, "{n}");
+        assert_eq!(posted.comment.body, parts[n - 1]);
+        let mut next = 1;
+        for (i, body) in parts.iter().enumerate() {
+            assert!(
+                chars(body) <= MAX_COMMENT_CHARS,
+                "part {i}: {}",
+                chars(body)
+            );
+            let marked = MarkedComment::parse(body).unwrap().unwrap();
+            assert_eq!(
+                (marked.header.kind, marked.header.round),
+                (MarkerKind::Questions, NonZeroU32::new(3))
+            );
+            let footer = marked.footer.unwrap();
+            assert_eq!(
+                (footer.ticket, footer.round),
+                (ticket(), NonZeroU32::new(3))
+            );
+            assert!(body.contains(&format!("\n\nPart {} of {n} of this round", i + 1)));
+            let last = i + 1 == n;
+            assert_eq!(
+                body.contains("Waiting for <mention of u1>"),
+                last,
+                "part {i}"
+            );
+            assert_eq!(body.contains("Answer here"), last, "part {i}");
+            assert_eq!(body.contains(&"s".repeat(100)), i == 0, "part {i}");
+            // Each question whole, with its reopened choice, in order.
+            let mut at = 0;
+            while let Some(found) = body[at..].find(&format!("**Q{next}** (scope) Which {next}?")) {
+                at += found;
+                let recorded = format!(
+                    "Recorded by the refused run: {}",
+                    format!("{next:<512}").replace(' ', "b")
+                );
+                assert!(body[at..].contains(&recorded), "Q{next}");
+                next += 1;
+            }
+        }
+        assert_eq!(next, 65, "every question, in order");
+        assert!(parts[0].contains(" … (cut: the run's summary is longer than a comment holds)"));
+        assert!(!parts.concat().contains("this question is longer"));
+    }
+
+    /// One question with every refused choice it may reopen fits a part
+    /// whole; past a part's room it is cut, visibly, and no part passes it.
+    /// A part the tracker refuses stops the round, saying what is posted.
+    #[test]
+    fn a_question_fits_a_part_and_a_refused_part_stops_the_round() {
+        let mut round = maximal_round();
+        for reopened in &mut round.reopened {
+            reopened.question = QuestionId::new("Q1").unwrap();
+        }
+        round.questions.truncate(1);
+        round.questions[0].text = "x".repeat(6_000);
+        let parts = round.parts(MAX_COMMENT_CHARS - 200);
+        assert_eq!(parts.len(), 1);
+        assert!(!parts[0].contains("(cut:"));
+
+        let parts = round.parts(5_000);
+        assert!(parts.iter().all(|part| chars(part) <= 5_000));
+        assert!(parts[1].contains(" … (cut: this question is longer than a comment holds)"));
+
+        let tracker = FakeTracker::default();
+        tracker.fail_post.set(Some(2));
+        let error = Writer::new(&tracker)
+            .post_questions(&maximal_round())
+            .unwrap_err();
+        assert_eq!(tracker.posts.get(), 1);
+        let n = maximal_round().parts(MAX_COMMENT_CHARS).len();
+        assert_eq!(
+            error.to_string(),
+            format!("tracker: body too long; parts 1 to 1 of {n} of the round are on the ticket")
         );
     }
 

@@ -366,6 +366,77 @@ mod tests {
         assert_eq!(new_answer(&[], &decider, &TicketQuestions::new()), None);
     }
 
+    /// A round posted in parts (OWL-223), on Linear by the key's account,
+    /// which may be the decider's: no part is an answer, an answer counts
+    /// after the last part, the one the ask keeps, and a brief's thread
+    /// shows the earlier parts as Owlshift's comments before the round.
+    #[test]
+    fn a_round_posted_in_parts_is_never_an_answer() {
+        use std::num::NonZeroU32;
+
+        use owlshift_contracts::brief::ThreadEntry;
+        use owlshift_contracts::ids::{QuestionId, TicketId};
+
+        use crate::on_demand::thread;
+        use crate::writer::QuestionsComment;
+
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let question = |n: u32| Question {
+            id: QuestionId::new(format!("Q{n}")).unwrap(),
+            category: "scope".into(),
+            context: "c".repeat(300),
+            text: "t".into(),
+            options: Vec::new(),
+            recommendation: None,
+        };
+        let parts = QuestionsComment {
+            ticket: TicketId::new("OWL-1").unwrap(),
+            round: NonZeroU32::new(1).unwrap(),
+            summary: String::new(),
+            questions: vec![question(1), question(2)],
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+            reopened: Vec::new(),
+        }
+        .parts(600);
+        assert_eq!(parts.len(), 2);
+        let by_decider = |created: u32, body: &str| Comment {
+            id: format!("c{created}"),
+            author: Author::Account(decider.clone()),
+            created_at: at(created),
+            edited_at: None,
+            body: body.into(),
+        };
+        let mut comments = vec![by_decider(9, &parts[0]), by_decider(10, &parts[1])];
+        let asked = TicketQuestions::parse(
+            r#"{"format":2,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T10:10:00Z",
+                "comment":"c10","questions":[{"id":"Q1","category":"scope","context":"c","text":"t"}],
+                "decider":{"account":"u1","by":"assignee"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(new_answer(&comments, &decider, &asked), None);
+        comments.push(by_decider(11, "Q1: yes."));
+        assert_eq!(new_answer(&comments, &decider, &asked), Some(at(11)));
+
+        let entries = thread(&comments, &asked.asks, &[], &decider);
+        assert!(
+            matches!(&entries[..], [
+                ThreadEntry::Comment { author: first, body, .. },
+                ThreadEntry::Questions { .. },
+                ThreadEntry::Comment { author: answer, .. },
+            ] if first.relation == Relation::Owlshift && *body == parts[0]
+                && answer.relation == Relation::Decider),
+            "{entries:?}"
+        );
+    }
+
     #[test]
     fn the_deciders_newest_comment_counts_after_the_quiet_window_or_with_go() {
         let decider = Person {
