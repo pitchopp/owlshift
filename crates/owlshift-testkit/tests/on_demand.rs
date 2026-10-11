@@ -4403,6 +4403,8 @@ fn a_resume_whose_state_is_not_kept_is_posted_once_under_watch() {
         "{lines}"
     );
     assert!(!lines.contains("continues it again at"), "{lines}");
+    // The operator's `continue` is named: the decider has nothing to answer.
+    assert!(lines.contains("run `owlshift continue`"), "{lines}");
 }
 
 /// OWL-158's acceptance: under `owlshift watch`, a re-ask that reached the
