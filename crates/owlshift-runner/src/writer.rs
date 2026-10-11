@@ -470,6 +470,32 @@ pub struct QuestionsComment {
     pub reopened: Vec<ReopenedChoice>,
 }
 
+/// What follows "Part k of n of this round:" in a part of a split round.
+const PART_NOTE: &str = " its questions are longer than a comment holds.";
+
+fn part_line(k: usize, n: usize) -> String {
+    format!("Part {k} of {n} of this round:")
+}
+
+/// Whether `body` (a marked QUESTIONS comment) is a part of a split round
+/// other than the last, as [`QuestionsComment::parts`] writes it: the first
+/// line after the header reads "Part k of n of this round:" with k < n.
+pub(crate) fn is_earlier_part(body: &str) -> bool {
+    let Some(line) = body.lines().skip(1).find(|line| !line.is_empty()) else {
+        return false;
+    };
+    let Some(rest) = line.strip_prefix("Part ") else {
+        return false;
+    };
+    let Some((k, rest)) = rest.split_once(" of ") else {
+        return false;
+    };
+    let Some((n, _)) = rest.split_once(" of this round:") else {
+        return false;
+    };
+    matches!((k.parse::<usize>(), n.parse::<usize>()), (Ok(k), Ok(n)) if k < n)
+}
+
 impl QuestionsComment {
     /// The comment body: the `[owlshift] QUESTIONS · round N` header, the
     /// run's summary, what the resolver decided or why it did not, that
@@ -544,9 +570,7 @@ impl QuestionsComment {
         };
         let mut all = vec![header.render()];
         if let Some((k, n)) = part {
-            all.push(format!(
-                "Part {k} of {n} of this round: its questions are longer than a comment holds."
-            ));
+            all.push(format!("{}{PART_NOTE}", part_line(k, n)));
         }
         all.extend(sections);
         if last {
