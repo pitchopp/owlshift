@@ -57,7 +57,9 @@ impl Pipeline {
 
     /// Where a stage loops back to, if it does and this pipeline includes the
     /// target: Design review to Design (revise the plan), Verify to Build (fix)
-    /// and Watch to Build (a red check, a merge conflict or review comments).
+    /// and Watch to Build (review comments on the pull request, from P5; a red
+    /// check or a merge conflict gets a fix or rebase run that keeps the ticket
+    /// at Watch).
     pub fn loop_back(self, stage: Stage) -> Option<Stage> {
         let target = match stage {
             Stage::DesignReview => Stage::Design,
@@ -73,7 +75,8 @@ impl Pipeline {
 impl Stage {
     /// The role a stage runs by default. `None` for Ready (nothing runs until
     /// dispatch), Deliver (the runner opens the pull request itself) and Watch
-    /// (it reacts to the pull request; fixes and rebases loop back to Build).
+    /// (it follows the pull request; its fix and rebase runs keep the ticket at
+    /// Watch, and only review comments loop back to Build).
     pub const fn default_role(self) -> Option<Role> {
         match self {
             Stage::Intake => Some(Role::Intake),

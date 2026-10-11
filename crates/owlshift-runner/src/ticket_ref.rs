@@ -383,7 +383,7 @@ pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Fo
 /// Ready with any round is a state the machine can be in, and the one
 /// `owlshift do` starts from.
 fn kept(round: u32, questions: Option<&TicketQuestions>) -> Result<TicketRecord, String> {
-    let state = TicketState::restore(Status::Active(Stage::Ready), round, 0, 0)
+    let state = TicketState::restore(Status::Active(Stage::Ready), round, 0, 0, 0, 0)
         .map_err(|e| e.to_string())?;
     Ok(TicketRecord {
         state: PersistedState::from(&state),

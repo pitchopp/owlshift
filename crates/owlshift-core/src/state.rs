@@ -27,6 +27,18 @@ pub const MAX_REASKS: u32 = 3;
 /// repository settles cannot loop without bound (architecture, section 4).
 pub const MAX_RESOLVED_PASSES: u32 = 3;
 
+/// Fix passes since the pull request was last read green: a fix pass is a
+/// fix run at Watch whose push landed, and a red read after the second one
+/// parks the ticket instead of a third ([`Event::FixDue`]; architecture,
+/// section 5, "The bound").
+pub const MAX_FIX_PASSES: u32 = 2;
+
+/// Repairs of one delivery: every fix or rebase run at Watch whose push
+/// landed. A green read does not clear them, so a flaky check or a busy base
+/// cannot loop without end: the run due after the sixth parks the ticket
+/// ([`Event::FixDue`], [`Event::RebaseDue`]).
+pub const MAX_REPAIRS: u32 = 6;
+
 /// Where a ticket stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Status {
@@ -86,16 +98,22 @@ impl Status {
 /// | --- | --- |
 /// | The scheduler claimed a ready ticket | `Dispatched` |
 /// | A stage run returned `done`, and the stage passed | `Completed` |
-/// | A stage run returned `done` asking for a revision or a fix; at Watch, a red check, a merge conflict or review comments | `LoopBack` |
+/// | A stage run returned `done` asking for a revision or a fix; at Watch, review comments on the pull request (from P5) | `LoopBack` |
 /// | A stage run returned `questions` or `premise_false` (after the resolver) | `Questions` |
 /// | A stage run returned `blocked` | `Blocked` |
 /// | The answer check found every question answered | `Answered` |
 /// | The answer check found questions left open (they are re-asked) | `Incomplete` |
 /// | The decider asked a counter-question (answered in the thread) | `CounterQuestion` |
 /// | A run returned `failed` or no valid `result.json`, whatever its exit code, save the row below; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
-/// | A Build run's or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
+/// | A Build run's (at Build, or a fix run's at Watch) or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
+/// | At Watch, a fix run's push landed on the pull request | `FixPushed` |
+/// | At Watch, a rebase run's push landed on the pull request | `RebasePushed` |
+/// | At Watch, the pull request was read green | `ChecksGreen` |
+/// | At Watch, a read calls for a fix run, before it runs | `FixDue` |
+/// | At Watch, a read calls for a rebase run, before it runs | `RebaseDue` |
+/// | At Watch, a red no run fixes, or a push the forge refused | `ForgeBlocked` |
 /// | A human restarted a parked ticket | `Restarted` |
 /// | A human merged the pull request | `Merged` |
 /// | A human canceled, closed or excluded the ticket | `Withdrawn` |
@@ -119,13 +137,34 @@ pub enum Event {
     /// last attempt leaves the ticket as it is, so the next run of its
     /// kind, told why the result was refused, gets that attempt. Only
     /// Build's brief and the answer check's carry that reason, so it is
-    /// valid at Build and while waiting for input, where the answer check
-    /// runs (OWL-190). The bound is the runner's to keep: it gives this
+    /// valid at Build, at Watch, where a fix run is the build role's, and
+    /// while waiting for input, where the answer check runs (OWL-190). The bound is the runner's to keep: it gives this
     /// event only for a run that was not itself told of a refused result,
     /// so that of two refusals in a row, the second is a `RunFailed`.
     ResultRefused,
     Interrupted,
     Quarantined,
+    /// A fix run's push landed (OWL-55): the ticket stays at Watch, its
+    /// failed runs are cleared, and a fix pass and a repair are counted.
+    /// The runner gives [`Event::FixDue`] before the run, so a push past a
+    /// bound is an [`InvalidTransition`].
+    FixPushed,
+    /// A rebase run's push landed: as [`Event::FixPushed`], counting a
+    /// repair and no fix pass.
+    RebasePushed,
+    /// The pull request was read green: the fix passes and the failed runs
+    /// are cleared, and the repairs are kept.
+    ChecksGreen,
+    /// A read calls for a fix run. It parks the ticket at a bound, the fix
+    /// passes first, then the repairs; otherwise it changes nothing and
+    /// the fix run may start.
+    FixDue,
+    /// A read calls for a rebase run. It parks the ticket when the repairs
+    /// are at their bound; otherwise it changes nothing and the rebase run
+    /// may start.
+    RebaseDue,
+    /// A red no run fixes, or a push the forge refused: the ticket parks.
+    ForgeBlocked,
     Restarted,
     Merged,
     Withdrawn,
@@ -133,7 +172,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 21] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -146,6 +185,12 @@ impl Event {
         Self::ResultRefused,
         Self::Interrupted,
         Self::Quarantined,
+        Self::FixPushed,
+        Self::RebasePushed,
+        Self::ChecksGreen,
+        Self::FixDue,
+        Self::RebaseDue,
+        Self::ForgeBlocked,
         Self::Restarted,
         Self::Merged,
         Self::Withdrawn,
@@ -197,6 +242,14 @@ pub enum ParkReason {
     Blocked,
     /// A run broke isolation; it is quarantined.
     IsolationBreach,
+    /// The pull request was read red after [`MAX_FIX_PASSES`] fix passes
+    /// since it was last green.
+    FixPasses,
+    /// A repair was due after [`MAX_REPAIRS`] repairs of the delivery.
+    Repairs,
+    /// The forge blocks the pull request: a red no run fixes, or a refused
+    /// push.
+    Forge,
 }
 
 /// How a ticket left the machine.
@@ -232,6 +285,8 @@ pub struct TicketState {
     round: u32,
     reasks: u32,
     failed_runs: u32,
+    fix_passes: u32,
+    repairs: u32,
 }
 
 impl TicketState {
@@ -242,6 +297,8 @@ impl TicketState {
             round: 0,
             reasks: 0,
             failed_runs: 0,
+            fix_passes: 0,
+            repairs: 0,
         }
     }
 
@@ -256,12 +313,16 @@ impl TicketState {
     ///   Intake (intake questions return to Ready);
     /// - a ticket at Intake has asked no question round;
     /// - nothing runs at Ready, so nothing is parked there unless it was
-    ///   waiting for input.
+    ///   waiting for input;
+    /// - at most [`MAX_FIX_PASSES`] fix passes and [`MAX_REPAIRS`] repairs,
+    ///   and either only at Watch.
     pub fn restore(
         status: Status,
         round: u32,
         reasks: u32,
         failed_runs: u32,
+        fix_passes: u32,
+        repairs: u32,
     ) -> Result<Self, InvalidState> {
         let parked = matches!(status, Status::Parked { .. });
         let problem = if reasks > MAX_REASKS {
@@ -283,6 +344,12 @@ impl TicketState {
             })
         {
             Some("parked at ready, where nothing runs")
+        } else if fix_passes > MAX_FIX_PASSES {
+            Some("more fix passes than the bound allows")
+        } else if repairs > MAX_REPAIRS {
+            Some("more repairs than the bound allows")
+        } else if (fix_passes > 0 || repairs > 0) && status.stage() != Stage::Watch {
+            Some("fix passes or repairs outside watch")
         } else {
             None
         };
@@ -291,6 +358,8 @@ impl TicketState {
             round,
             reasks,
             failed_runs,
+            fix_passes,
+            repairs,
         };
         match problem {
             None => Ok(state),
@@ -320,6 +389,16 @@ impl TicketState {
     /// Failed runs in the current stage.
     pub const fn failed_runs(&self) -> u32 {
         self.failed_runs
+    }
+
+    /// Fix passes since the pull request was last read green; only at Watch.
+    pub const fn fix_passes(&self) -> u32 {
+        self.fix_passes
+    }
+
+    /// Repairs of the current delivery; only at Watch.
+    pub const fn repairs(&self) -> u32 {
+        self.repairs
     }
 
     /// Applies an event to this state, in the ticket's pipeline.
@@ -395,7 +474,10 @@ impl TicketState {
                     })
                 }
             }
-            (Status::Active(Stage::Build) | Status::NeedsInput { .. }, Event::ResultRefused) => {
+            (
+                Status::Active(Stage::Build | Stage::Watch) | Status::NeedsInput { .. },
+                Event::ResultRefused,
+            ) => {
                 let failed_runs = (self.failed_runs + 1).min(MAX_FAILED_RUNS - 1);
                 Transition::To(Self {
                     failed_runs,
@@ -406,6 +488,52 @@ impl TicketState {
             (status, Event::Interrupted) if status.runs() => Transition::To(*self),
             (status, Event::Quarantined) if status.runs() => {
                 self.park(ParkReason::IsolationBreach, self.failed_runs)
+            }
+
+            (Status::Active(Stage::Watch), Event::FixPushed) => {
+                if self.fix_passes >= MAX_FIX_PASSES || self.repairs >= MAX_REPAIRS {
+                    return Err(invalid);
+                }
+                Transition::To(Self {
+                    fix_passes: self.fix_passes + 1,
+                    repairs: self.repairs + 1,
+                    failed_runs: 0,
+                    ..*self
+                })
+            }
+            (Status::Active(Stage::Watch), Event::RebasePushed) => {
+                if self.repairs >= MAX_REPAIRS {
+                    return Err(invalid);
+                }
+                Transition::To(Self {
+                    repairs: self.repairs + 1,
+                    failed_runs: 0,
+                    ..*self
+                })
+            }
+            (Status::Active(Stage::Watch), Event::ChecksGreen) => Transition::To(Self {
+                fix_passes: 0,
+                failed_runs: 0,
+                ..*self
+            }),
+            (Status::Active(Stage::Watch), Event::FixDue) => {
+                if self.fix_passes >= MAX_FIX_PASSES {
+                    self.park(ParkReason::FixPasses, self.failed_runs)
+                } else if self.repairs >= MAX_REPAIRS {
+                    self.park(ParkReason::Repairs, self.failed_runs)
+                } else {
+                    Transition::To(*self)
+                }
+            }
+            (Status::Active(Stage::Watch), Event::RebaseDue) => {
+                if self.repairs >= MAX_REPAIRS {
+                    self.park(ParkReason::Repairs, self.failed_runs)
+                } else {
+                    Transition::To(*self)
+                }
+            }
+            (Status::Active(Stage::Watch), Event::ForgeBlocked) => {
+                self.park(ParkReason::Forge, self.failed_runs)
             }
 
             (Status::Parked { at, awaiting_input }, Event::Restarted) => {
@@ -419,6 +547,8 @@ impl TicketState {
                     round: self.round,
                     reasks: 0,
                     failed_runs: 0,
+                    fix_passes: 0,
+                    repairs: 0,
                 })
             }
 
@@ -427,18 +557,21 @@ impl TicketState {
         Ok(transition)
     }
 
-    /// This state moved to `status`; the failed-run count restarts when the
-    /// stage changes.
+    /// This state moved to `status`. The failed-run count restarts when the
+    /// stage changes, and so do the fix passes and repairs, which count
+    /// only at Watch: leaving it, which only review comments do (P5), ends
+    /// the delivery they counted.
     fn enter(&self, status: Status) -> Self {
-        let failed_runs = if status.stage() == self.stage() {
-            self.failed_runs
+        if status.stage() == self.stage() {
+            Self { status, ..*self }
         } else {
-            0
-        };
-        Self {
-            status,
-            failed_runs,
-            ..*self
+            Self {
+                status,
+                failed_runs: 0,
+                fix_passes: 0,
+                repairs: 0,
+                ..*self
+            }
         }
     }
 
@@ -493,10 +626,13 @@ impl fmt::Display for InvalidState {
             round,
             reasks,
             failed_runs,
+            fix_passes,
+            repairs,
         } = self.state;
         write!(
             f,
-            "invalid ticket state {status:?} (round {round}, re-asks {reasks}, failed runs {failed_runs}): {}",
+            "invalid ticket state {status:?} (round {round}, re-asks {reasks}, failed runs \
+             {failed_runs}, fix passes {fix_passes}, repairs {repairs}): {}",
             self.reason
         )
     }
@@ -533,11 +669,24 @@ mod tests {
     /// for a status the machine never has.
     fn baseline(status: Status) -> Option<TicketState> {
         let round = u32::from(status.stage() != Stage::Intake);
-        TicketState::restore(status, round, 0, 0).ok()
+        TicketState::restore(status, round, 0, 0, 0, 0).ok()
     }
 
     fn state(status: Status, round: u32, reasks: u32, failed_runs: u32) -> TicketState {
-        TicketState::restore(status, round, reasks, failed_runs).expect("a valid state")
+        TicketState::restore(status, round, reasks, failed_runs, 0, 0).expect("a valid state")
+    }
+
+    /// A ticket working at Watch with these counts, in round 1.
+    fn watch(failed_runs: u32, fix_passes: u32, repairs: u32) -> TicketState {
+        TicketState::restore(
+            Status::Active(Stage::Watch),
+            1,
+            0,
+            failed_runs,
+            fix_passes,
+            repairs,
+        )
+        .expect("a valid state")
     }
 
     fn to(transition: Result<Transition, InvalidTransition>) -> TicketState {
@@ -587,7 +736,19 @@ mod tests {
             (Status::Active(stage), Event::RunFailed | Event::Interrupted) if stage != Ready => {
                 Expect::To(status)
             }
-            (Status::Active(Build), Event::ResultRefused) => Expect::To(status),
+            (Status::Active(Build | Watch), Event::ResultRefused) => Expect::To(status),
+            // With every count at zero, nothing is at a bound.
+            (
+                Status::Active(Watch),
+                Event::FixPushed
+                | Event::RebasePushed
+                | Event::ChecksGreen
+                | Event::FixDue
+                | Event::RebaseDue,
+            ) => Expect::To(status),
+            (Status::Active(Watch), Event::ForgeBlocked) => {
+                Expect::Parked(parked(Watch, false), ParkReason::Forge)
+            }
             (Status::Active(stage), Event::Quarantined) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::IsolationBreach)
             }
@@ -878,6 +1039,101 @@ mod tests {
     }
 
     #[test]
+    fn watch_counts_fix_passes_and_repairs_up_to_their_bounds() {
+        let parked = |reason| {
+            move |from: TicketState| {
+                Ok::<_, InvalidTransition>(Transition::Parked {
+                    state: TicketState {
+                        status: Status::Parked {
+                            at: Stage::Watch,
+                            awaiting_input: false,
+                        },
+                        ..from
+                    },
+                    reason,
+                })
+            }
+        };
+        let fix_passes = parked(ParkReason::FixPasses);
+        let repairs = parked(ParkReason::Repairs);
+        let refused = |from: TicketState, event| {
+            Err(InvalidTransition {
+                from: from.status(),
+                event,
+            })
+        };
+        let stays = |state| Ok(Transition::To(state));
+        // (from, event, expected), each written out: (failed runs, fix
+        // passes, repairs).
+        let table = [
+            // A push clears the failed runs and counts a repair, a fix also
+            // a fix pass.
+            (watch(1, 0, 0), Event::FixPushed, stays(watch(0, 1, 1))),
+            (watch(1, 1, 4), Event::FixPushed, stays(watch(0, 2, 5))),
+            (watch(1, 2, 0), Event::RebasePushed, stays(watch(0, 2, 1))),
+            // Green clears the fix passes and the failed runs, never the
+            // repairs.
+            (watch(1, 2, 5), Event::ChecksGreen, stays(watch(0, 0, 5))),
+            // Below the bounds, a due run changes nothing.
+            (watch(1, 1, 5), Event::FixDue, stays(watch(1, 1, 5))),
+            (watch(1, 2, 5), Event::RebaseDue, stays(watch(1, 2, 5))),
+            // At a bound, it parks, the fix passes first.
+            (watch(1, 2, 3), Event::FixDue, fix_passes(watch(1, 2, 3))),
+            (watch(0, 2, 6), Event::FixDue, fix_passes(watch(0, 2, 6))),
+            (watch(0, 0, 6), Event::FixDue, repairs(watch(0, 0, 6))),
+            (watch(0, 0, 6), Event::RebaseDue, repairs(watch(0, 0, 6))),
+            (
+                watch(1, 2, 6),
+                Event::ForgeBlocked,
+                parked(ParkReason::Forge)(watch(1, 2, 6)),
+            ),
+            // A push past a bound is the runner's error: it asks first.
+            (
+                watch(0, 2, 3),
+                Event::FixPushed,
+                refused(watch(0, 2, 3), Event::FixPushed),
+            ),
+            (
+                watch(0, 1, 6),
+                Event::FixPushed,
+                refused(watch(0, 1, 6), Event::FixPushed),
+            ),
+            (
+                watch(0, 0, 6),
+                Event::RebasePushed,
+                refused(watch(0, 0, 6), Event::RebasePushed),
+            ),
+            // A refused fix run's result counts as at Build.
+            (watch(0, 1, 2), Event::ResultRefused, stays(watch(1, 1, 2))),
+            (watch(1, 1, 2), Event::ResultRefused, stays(watch(1, 1, 2))),
+        ];
+        for (from, event, expected) in table {
+            assert_eq!(
+                from.apply(STANDARD, event),
+                expected,
+                "{from:?} + {event:?}"
+            );
+        }
+
+        // Waiting for input at Watch keeps the counts; leaving Watch, which
+        // only review comments do, clears them with the failed runs.
+        let repaired = watch(1, 2, 5);
+        let waiting = to(repaired.apply(STANDARD, Event::Questions));
+        assert_eq!((waiting.fix_passes(), waiting.repairs()), (2, 5));
+        assert_eq!(
+            to(waiting.apply(STANDARD, Event::Answered)),
+            TicketState {
+                round: 2,
+                ..repaired
+            }
+        );
+        assert_eq!(
+            to(repaired.apply(STANDARD, Event::LoopBack)),
+            state(Status::Active(Stage::Build), 1, 0, 0)
+        );
+    }
+
+    #[test]
     fn a_restart_clears_the_breakers_keeps_the_round_and_never_skips_open_questions() {
         let failed = state(
             Status::Parked {
@@ -913,6 +1169,16 @@ mod tests {
                 0
             )
         );
+
+        let Ok(Transition::Parked { state: bounded, .. }) =
+            watch(1, MAX_FIX_PASSES, MAX_REPAIRS).apply(STANDARD, Event::FixDue)
+        else {
+            panic!("a fix due at the bounds must park the ticket");
+        };
+        assert_eq!(
+            to(bounded.apply(STANDARD, Event::Restarted)),
+            watch(0, 0, 0)
+        );
     }
 
     #[test]
@@ -930,15 +1196,24 @@ mod tests {
                 }
             }
         }
-        // Every status the table test uses is reachable.
+        // Every status the table test uses is reachable, and so is each
+        // bound: the fix passes', and the repairs' below it, green having
+        // cleared the passes and not the repairs.
         let statuses: HashSet<_> = seen.iter().map(TicketState::status).collect();
         assert_eq!(statuses.len(), 29);
+        assert!(seen.iter().any(|s| s.fix_passes() == MAX_FIX_PASSES));
+        assert!(
+            seen.iter()
+                .any(|s| s.repairs() == MAX_REPAIRS && s.fix_passes() < MAX_FIX_PASSES)
+        );
         for reached in seen {
             let restored = TicketState::restore(
                 reached.status(),
                 reached.round(),
                 reached.reasks(),
                 reached.failed_runs(),
+                reached.fix_passes(),
+                reached.repairs(),
             );
             assert_eq!(restored, Ok(reached));
         }
@@ -951,15 +1226,16 @@ mod tests {
             return_to: Stage::Build,
         };
         let parked = |at, awaiting_input| Status::Parked { at, awaiting_input };
+        let watching = Status::Active(Stage::Watch);
         let broken = [
-            (waiting, 1, MAX_REASKS + 1, 0),
-            (build, 1, 1, 0),
-            (parked(Stage::Build, false), 1, 1, 0),
-            (build, 0, 0, MAX_FAILED_RUNS),
-            (waiting, 1, 0, MAX_FAILED_RUNS),
-            (parked(Stage::Build, false), 0, 0, MAX_FAILED_RUNS + 1),
-            (waiting, 0, 0, 0),
-            (parked(Stage::Build, true), 0, 0, 0),
+            (waiting, 1, MAX_REASKS + 1, 0, 0, 0),
+            (build, 1, 1, 0, 0, 0),
+            (parked(Stage::Build, false), 1, 1, 0, 0, 0),
+            (build, 0, 0, MAX_FAILED_RUNS, 0, 0),
+            (waiting, 1, 0, MAX_FAILED_RUNS, 0, 0),
+            (parked(Stage::Build, false), 0, 0, MAX_FAILED_RUNS + 1, 0, 0),
+            (waiting, 0, 0, 0, 0, 0),
+            (parked(Stage::Build, true), 0, 0, 0, 0, 0),
             (
                 Status::NeedsInput {
                     return_to: Stage::Intake,
@@ -967,16 +1243,39 @@ mod tests {
                 1,
                 0,
                 0,
+                0,
+                0,
             ),
-            (parked(Stage::Intake, true), 1, 0, 0),
-            (Status::Active(Stage::Intake), 1, 0, 0),
-            (parked(Stage::Intake, false), 1, 0, 0),
-            (parked(Stage::Ready, false), 0, 0, 0),
+            (parked(Stage::Intake, true), 1, 0, 0, 0, 0),
+            (Status::Active(Stage::Intake), 1, 0, 0, 0, 0),
+            (parked(Stage::Intake, false), 1, 0, 0, 0, 0),
+            (parked(Stage::Ready, false), 0, 0, 0, 0, 0),
+            (watching, 1, 0, 0, MAX_FIX_PASSES + 1, MAX_FIX_PASSES + 1),
+            (watching, 1, 0, 0, 0, MAX_REPAIRS + 1),
+            (build, 1, 0, 0, 1, 0),
+            (waiting, 1, 0, 0, 0, 1),
+            (parked(Stage::Deliver, false), 1, 0, 0, 0, 1),
         ];
-        for (status, round, reasks, failed_runs) in broken {
+        for (status, round, reasks, failed_runs, fix_passes, repairs) in broken {
             assert!(
-                TicketState::restore(status, round, reasks, failed_runs).is_err(),
-                "{status:?} round {round} re-asks {reasks} failed {failed_runs}"
+                TicketState::restore(status, round, reasks, failed_runs, fix_passes, repairs)
+                    .is_err(),
+                "{status:?} round {round} re-asks {reasks} failed {failed_runs} \
+                 fix passes {fix_passes} repairs {repairs}"
+            );
+        }
+        // The bounds themselves hold at Watch, working, waiting or parked.
+        for status in [
+            watching,
+            Status::NeedsInput {
+                return_to: Stage::Watch,
+            },
+            parked(Stage::Watch, false),
+            parked(Stage::Watch, true),
+        ] {
+            assert!(
+                TicketState::restore(status, 1, 0, 0, MAX_FIX_PASSES, MAX_REPAIRS).is_ok(),
+                "{status:?}"
             );
         }
     }
@@ -989,11 +1288,17 @@ mod tests {
             error.to_string(),
             "event Answered is not valid for a ticket in state Active(Intake)"
         );
-        let error = TicketState::restore(Status::Active(Stage::Build), 0, 1, 0).unwrap_err();
+        let error = TicketState::restore(Status::Active(Stage::Build), 0, 1, 0, 0, 0).unwrap_err();
         assert!(
             error
                 .to_string()
                 .ends_with("re-asks while not waiting for input")
+        );
+        let error = TicketState::restore(Status::Active(Stage::Verify), 1, 0, 0, 1, 2).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid ticket state Active(Verify) (round 1, re-asks 0, failed runs 0, fix passes \
+             1, repairs 2): fix passes or repairs outside watch"
         );
     }
 }

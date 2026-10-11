@@ -741,7 +741,11 @@ impl ParkedComment {
                 "Parked: {}. What it changed is recorded on the machine that ran it, not here.",
                 park_reason(self.reason)
             )),
-            ParkReason::FailedRuns | ParkReason::Blocked => {
+            ParkReason::FailedRuns
+            | ParkReason::Blocked
+            | ParkReason::FixPasses
+            | ParkReason::Repairs
+            | ParkReason::Forge => {
                 let mut line = format!("Parked: {}.", park_reason(self.reason));
                 if !detail.is_empty() {
                     line.push_str(&format!(" {}: {detail}", detail_label(self.reason)));
@@ -790,6 +794,9 @@ pub fn park_reason(reason: ParkReason) -> &'static str {
         ParkReason::Reasks => "the answers stayed incomplete",
         ParkReason::Blocked => "the run is blocked",
         ParkReason::IsolationBreach => "the run broke isolation and is quarantined",
+        ParkReason::FixPasses => "the pull request stayed red after its fix passes",
+        ParkReason::Repairs => "the pull request reached its limit of repairs",
+        ParkReason::Forge => "the forge blocks the pull request",
     }
 }
 
@@ -797,6 +804,7 @@ pub fn park_reason(reason: ParkReason) -> &'static str {
 fn detail_label(reason: ParkReason) -> &'static str {
     match reason {
         ParkReason::Blocked => "The run said",
+        ParkReason::Forge => "The forge said",
         _ => "The last failure",
     }
 }

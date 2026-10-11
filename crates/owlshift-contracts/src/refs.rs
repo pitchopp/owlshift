@@ -101,6 +101,12 @@ pub struct PersistedState {
     pub reasks: u32,
     /// Failed runs in the current stage.
     pub failed_runs: u32,
+    /// Fix runs pushed since the pull request was last read green; only at
+    /// Watch (format 3).
+    pub fix_passes: u32,
+    /// Fix and rebase runs pushed since the delivery; only at Watch (format
+    /// 3).
+    pub repairs: u32,
 }
 
 /// Why a ticket waits.
@@ -118,10 +124,43 @@ pub enum Waiting {
 impl PersistedState {
     const CONTRACT: &str = "ticket state";
 
+    /// Parses a `state.json`. A format-2 one, written before the fix passes
+    /// and repairs were kept (OWL-55), is read with both at 0, and the next
+    /// write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let state: Self = format::parse_json(Self::CONTRACT, TICKET_STATE_FORMAT, input)?;
+        let state: Self = match Self::from_older_format(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, TICKET_STATE_FORMAT, input)?,
+        };
         state.validate()?;
         Ok(state)
+    }
+
+    /// A format-2 document read as the current format, or `None` for any
+    /// other. Format 2 is format 3 without the two counts, so either field
+    /// is refused in it, whatever its value.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        let fields = document.as_object_mut()?;
+        if fields.get("format").and_then(serde_json::Value::as_u64) != Some(2) {
+            return None;
+        }
+        for field in ["fix_passes", "repairs"] {
+            if fields.contains_key(field) {
+                return Some(Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!("format 2 keeps no {field}"),
+                )));
+            }
+            fields.insert(field.to_owned(), 0.into());
+        }
+        fields.insert("format".to_owned(), TICKET_STATE_FORMAT.into());
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {
@@ -155,6 +194,8 @@ impl From<&TicketState> for PersistedState {
             round: state.round(),
             reasks: state.reasks(),
             failed_runs: state.failed_runs(),
+            fix_passes: state.fix_passes(),
+            repairs: state.repairs(),
         }
     }
 }
@@ -181,6 +222,8 @@ impl TryFrom<&PersistedState> for TicketState {
             persisted.round,
             persisted.reasks,
             persisted.failed_runs,
+            persisted.fix_passes,
+            persisted.repairs,
         )
         .map_err(|error| ContractError::invalid(PersistedState::CONTRACT, error.to_string()))
     }

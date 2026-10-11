@@ -830,8 +830,8 @@ impl OnDemand<'_> {
         };
         // From Ready, keeping the rounds already asked: their asks stay in
         // the thread, and a new round follows them.
-        let ready =
-            TicketState::restore(Status::Active(Stage::Ready), round, 0, 0).map_err(core_error)?;
+        let ready = TicketState::restore(Status::Active(Stage::Ready), round, 0, 0, 0, 0)
+            .map_err(core_error)?;
         let state = match ready.apply(PIPELINE, Event::Dispatched) {
             Ok(Transition::To(state)) => state,
             other => return Err(core_error(other)),

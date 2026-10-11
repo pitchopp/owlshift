@@ -1336,6 +1336,18 @@ fn event_claim_and_state_rejections() {
         state(|v| v["extra"] = json!(1)),
         "unknown field `extra`",
     );
+    rejects(
+        "a format-2 state with fix passes",
+        state(|v| v["format"] = json!(2)),
+        "format 2 keeps no fix_passes",
+    );
+    rejects(
+        "a format-3 state without repairs",
+        state(|v| {
+            v.as_object_mut().unwrap().remove("repairs");
+        }),
+        "missing field `repairs`",
+    );
 
     let asked =
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));

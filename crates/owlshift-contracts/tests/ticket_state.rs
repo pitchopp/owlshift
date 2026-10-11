@@ -76,7 +76,7 @@ fn each_status_maps_onto_its_own_fields() {
     let parked = |at, awaiting_input| Status::Parked { at, awaiting_input };
     // Distinct counters, so a swapped field cannot cancel out.
     let cases = [
-        (Status::Active(Stage::Build), 3, 0, 1, None),
+        (Status::Active(Stage::Build), 3, 0, 1, 0, 0, None),
         (
             Status::NeedsInput {
                 return_to: Stage::Ready,
@@ -84,20 +84,33 @@ fn each_status_maps_onto_its_own_fields() {
             u32::MAX,
             2,
             1,
+            0,
+            0,
             Some(Waiting::NeedsInput),
         ),
-        (parked(Stage::Verify, false), 4, 0, 2, Some(Waiting::Parked)),
+        (
+            parked(Stage::Verify, false),
+            4,
+            0,
+            2,
+            0,
+            0,
+            Some(Waiting::Parked),
+        ),
         (
             parked(Stage::Watch, true),
             5,
             3,
             1,
+            2,
+            6,
             Some(Waiting::ParkedAwaitingInput),
         ),
     ];
     let schema = schema_validator();
-    for (status, round, reasks, failed_runs, waiting) in cases {
-        let state = TicketState::restore(status, round, reasks, failed_runs).unwrap();
+    for (status, round, reasks, failed_runs, fix_passes, repairs, waiting) in cases {
+        let state =
+            TicketState::restore(status, round, reasks, failed_runs, fix_passes, repairs).unwrap();
         let persisted = PersistedState::from(&state);
         assert_eq!(
             (
@@ -105,15 +118,25 @@ fn each_status_maps_onto_its_own_fields() {
                 persisted.waiting,
                 persisted.round,
                 persisted.reasks,
-                persisted.failed_runs
+                persisted.failed_runs,
+                persisted.fix_passes,
+                persisted.repairs
             ),
-            (status.stage(), waiting, round, reasks, failed_runs),
+            (
+                status.stage(),
+                waiting,
+                round,
+                reasks,
+                failed_runs,
+                fix_passes,
+                repairs
+            ),
             "{status:?}"
         );
         assert_eq!(written_and_read(&state, &schema), state);
     }
 
-    let parked_awaiting = TicketState::restore(parked(Stage::Build, true), 1, 0, 0).unwrap();
+    let parked_awaiting = TicketState::restore(parked(Stage::Build, true), 1, 0, 0, 0, 0).unwrap();
     let rendered: Value =
         serde_json::from_str(&PersistedState::from(&parked_awaiting).render()).unwrap();
     assert_eq!(rendered["waiting"], json!("parked_awaiting_input"));
@@ -133,12 +156,14 @@ fn invalid_reason<T: Debug>(result: Result<T, ContractError>) -> String {
 #[test]
 fn a_state_the_machine_cannot_be_in_is_refused() {
     let document = json!({
-        "format": 2,
+        "format": 3,
         "stage": "intake",
         "waiting": "needs_input",
         "round": 1,
         "reasks": 0,
         "failed_runs": 0,
+        "fix_passes": 0,
+        "repairs": 0,
     })
     .to_string();
     assert!(
@@ -154,5 +179,55 @@ fn a_state_the_machine_cannot_be_in_is_refused() {
     assert!(
         invalid_reason(TicketState::try_from(&built))
             .ends_with("re-asks while not waiting for input")
+    );
+
+    let repaired_at_build = document
+        .replace("intake", "build")
+        .replace("\"repairs\":0", "\"repairs\":1");
+    assert!(
+        invalid_reason(PersistedState::parse(&repaired_at_build))
+            .ends_with("fix passes or repairs outside watch")
+    );
+}
+
+/// A `state.json` the runner wrote before OWL-55, in format 2, reads with no
+/// fix pass and no repair, and is written back in the current format.
+#[test]
+fn a_format_2_state_reads_with_no_fix_pass_or_repair() {
+    let document = json!({
+        "format": 2,
+        "stage": "watch",
+        "waiting": "parked",
+        "round": 2,
+        "reasks": 0,
+        "failed_runs": 2,
+    })
+    .to_string();
+    let persisted = PersistedState::parse(&document).unwrap();
+    let state = TicketState::try_from(&persisted).unwrap();
+    assert_eq!(
+        state,
+        TicketState::restore(
+            Status::Parked {
+                at: Stage::Watch,
+                awaiting_input: false,
+            },
+            2,
+            0,
+            2,
+            0,
+            0,
+        )
+        .unwrap()
+    );
+    let rendered: Value = serde_json::from_str(&persisted.render()).unwrap();
+    assert!(schema_validator().is_valid(&rendered), "{rendered}");
+    assert_eq!(
+        (
+            &rendered["format"],
+            &rendered["fix_passes"],
+            &rendered["repairs"]
+        ),
+        (&json!(3), &json!(0), &json!(0))
     );
 }
