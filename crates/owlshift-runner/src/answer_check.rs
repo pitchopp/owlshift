@@ -438,9 +438,20 @@ mod tests {
         // A copy of a part posted after the ask, or of another round, is a
         // comment still.
         comments.push(by_decider(12, &parts[0]));
-        comments.push(by_decider(13, &parts[0].replace("round 1", "round 2")));
+        comments.insert(0, by_decider(8, &parts[0].replace("round 1", "round 2")));
         let entries = thread(&comments, &asked.asks, &[], &decider);
-        assert_eq!(entries.len(), 4, "{entries:?}");
+        assert!(
+            matches!(
+                &entries[..],
+                [
+                    ThreadEntry::Comment { .. },
+                    ThreadEntry::Questions { .. },
+                    ThreadEntry::Comment { .. },
+                    ThreadEntry::Comment { .. },
+                ]
+            ),
+            "{entries:?}"
+        );
     }
 
     #[test]

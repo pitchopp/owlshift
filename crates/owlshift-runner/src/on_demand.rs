@@ -3912,8 +3912,9 @@ pub fn thread(
 }
 
 /// Whether `comment` is a part of the round `ask` kept, other than the one
-/// the ask keeps: marked QUESTIONS of the ask's round, "Part k of n", posted
-/// at or before the ask.
+/// the ask keeps: marked QUESTIONS of the ask's round, "Part k of n" with k < n,
+/// posted at or before the ask. The parts of an abandoned attempt at the
+/// same round (its ref write failed) are folded too.
 fn is_part_of(comment: &Comment, ask: &Ask) -> bool {
     comment.created_at <= ask.at
         && matches!(
@@ -3921,15 +3922,7 @@ fn is_part_of(comment: &Comment, ask: &Ask) -> bool {
             Ok(Some(MarkedComment { header, .. }))
                 if header.kind == MarkerKind::Questions && header.round == Some(ask.round)
         )
-        && comment
-            .body
-            .lines()
-            .skip(1)
-            .find(|line| !line.is_empty())
-            .is_some_and(|line| {
-                line.strip_prefix("Part ")
-                    .is_some_and(|rest| rest.contains(" of "))
-            })
+        && crate::writer::is_earlier_part(&comment.body)
 }
 
 /// An entry the ticket ref keeps, which takes the place of its comment in a
