@@ -141,6 +141,7 @@ impl Transport for Shared {
         Ok(Response {
             status: 200,
             body: json!({ "data": data }).to_string(),
+            ..Default::default()
         })
     }
 }

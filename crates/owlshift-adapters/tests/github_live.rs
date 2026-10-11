@@ -8,6 +8,17 @@
 //!   cargo test -p owlshift-adapters --test github_live -- --ignored --nocapture
 //! ```
 //!
+//! `records_watch_reads` (OWL-209) records watch's read of a conflicting
+//! pull request, with the query's cost, as `tests/fixtures/github/
+//! follow-conflicting.json`: the live checks (a) and (b) of the build plan's
+//! "Watch after delivery". It pushes a commit to the repository's `main` to
+//! make the conflict, so the repository must be one nobody else uses:
+//!
+//! ```sh
+//! OWLSHIFT_LIVE_GITHUB=<owner>/<test-repo> \
+//!   cargo test -p owlshift-adapters --test github_live -- --ignored --nocapture records_watch_reads
+//! ```
+//!
 //! The repository needs a `main` branch. The token comes from
 //! `OWLSHIFT_GITHUB_TOKEN`, or from the `gh` login; the push uses your own
 //! git credentials over SSH, or over `OWLSHIFT_LIVE_GITHUB_REMOTE` when set.
@@ -21,7 +32,7 @@ use serde_json::json;
 
 use owlshift_adapters::forge::github::{GitHubForge, HttpTransport, NewPullRequest, Transport};
 use owlshift_adapters::forge::push::{Pushed, push_command, read_push};
-use owlshift_adapters::forge::{Branch, CommitId, ErrorKind, PrState, Repo};
+use owlshift_adapters::forge::{Branch, CommitId, ErrorKind, Mergeable, PrState, Repo};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -178,4 +189,132 @@ fn node_id(repo: &Repo, number: u64) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+/// Commits `content` as `file` in `checkout` and returns the commit.
+fn commit_file(checkout: &Path, file: &str, content: &str, message: &str) -> CommitId {
+    std::fs::write(checkout.join(file), content).unwrap();
+    git(checkout, &["add", file]);
+    git(
+        checkout,
+        &[
+            "-c",
+            "user.name=Owlshift live test",
+            "-c",
+            "user.email=live@owlshift.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
+    CommitId::new(git(checkout, &["rev-parse", "HEAD"])).unwrap()
+}
+
+/// OWL-209's live checks (a) and (b): a pull request made to conflict with
+/// its base reads `CONFLICTING` through watch's query, whose `rateLimit`
+/// gives its real cost; the read is recorded as the fixture the contract
+/// test replays. Only the repository `OWLSHIFT_LIVE_GITHUB` names is
+/// touched: its `main` gets one commit, and the pull request is closed and
+/// its branch deleted at the end.
+#[test]
+#[ignore = "live: writes to GitHub; set OWLSHIFT_LIVE_GITHUB=<owner>/<test-repo>"]
+fn records_watch_reads() {
+    let repo = std::env::var("OWLSHIFT_LIVE_GITHUB")
+        .expect("this test writes to GitHub: name a disposable repository in OWLSHIFT_LIVE_GITHUB");
+    let repo = Repo::parse(&repo).unwrap();
+    assert_ne!(
+        repo.to_string(),
+        "pitchopp/owlshift",
+        "records_watch_reads pushes to main: name a disposable repository"
+    );
+    let remote = std::env::var("OWLSHIFT_LIVE_GITHUB_REMOTE")
+        .unwrap_or_else(|_| format!("git@github.com:{repo}.git"));
+    let token = support::github_token();
+    let forge = GitHubForge::new(token.clone(), repo.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    let status = Command::new("git")
+        .args(["clone", "--quiet", "--branch", "main", &remote])
+        .arg(&checkout)
+        .status()
+        .unwrap();
+    assert!(status.success(), "cloning {remote}");
+    let base_commit = git(&checkout, &["rev-parse", "HEAD"]);
+    let stamp = jiff::Timestamp::now().as_second();
+    let branch = Branch::new(format!("owlshift-live-conflict-{stamp}")).unwrap();
+    let base = Branch::new("main").unwrap();
+    let file = "owlshift-live-conflict.txt";
+
+    let commit = commit_file(
+        &checkout,
+        file,
+        "the pull request's line\n",
+        "The pull request's side",
+    );
+    let mut cleanup = Cleanup {
+        checkout: &checkout,
+        branch: &branch,
+        pushed: false,
+        pull_request_id: None,
+    };
+    let mut push = push_command(Path::new("git"), &checkout, "origin", &commit, &branch).unwrap();
+    let pushed = read_push(&branch, &push.output().unwrap());
+    cleanup.pushed = pushed.is_ok();
+    assert_eq!(pushed, Ok(Pushed::Created));
+    let pr = forge
+        .open_pull_request(NewPullRequest {
+            head: &branch,
+            base: &base,
+            title: "Owlshift live test: a conflict",
+            body: "Opened by the Owlshift live test; closed at its end.\n",
+            draft: false,
+        })
+        .unwrap();
+    eprintln!("opened {}", pr.url);
+    cleanup.pull_request_id = Some(node_id(&repo, pr.number));
+
+    // The base's side of the same file, pushed to main.
+    git(
+        &checkout,
+        &["checkout", "--quiet", "--detach", &base_commit],
+    );
+    let theirs = commit_file(&checkout, file, "the base's line\n", "The base's side");
+    git(
+        &checkout,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("{theirs}:refs/heads/main"),
+        ],
+    );
+
+    // GitHub computes mergeability in the background.
+    let mut read = forge.follow(pr.number).unwrap();
+    for _ in 0..30 {
+        if read.checks.mergeable != Mergeable::Unknown {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        read = forge.follow(pr.number).unwrap();
+    }
+    eprintln!(
+        "mergeable {:?}, merge state {}, cost {:?}",
+        read.checks.mergeable, read.checks.merge_state, read.rate
+    );
+    assert_eq!(read.checks.mergeable, Mergeable::Conflicting);
+
+    let recorded = format!("{} on {repo}, recorded live", jiff::Zoned::now().date());
+    let recorder = support::Recorder::over(HttpTransport::new(token), support::fixtures("github"));
+    let read = GitHubForge::with_transport(recorder.clone(), repo.clone())
+        .follow(pr.number)
+        .unwrap();
+    assert_eq!(read.checks.mergeable, Mergeable::Conflicting);
+    let rate = read.rate.expect("rateLimit in watch's query");
+    eprintln!("the follow query cost {} points", rate.cost);
+    recorder.write("follow-conflicting.json", &recorded);
 }

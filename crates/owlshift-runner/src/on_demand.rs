@@ -3290,6 +3290,7 @@ mod tests {
                 Ok(Response {
                     status: 200,
                     body: body.to_owned(),
+                    ..Default::default()
                 })
             }
         }

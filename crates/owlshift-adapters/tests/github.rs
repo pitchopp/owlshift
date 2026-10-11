@@ -6,6 +6,12 @@
 //! schema gives it and flagged `synthesized`; the live test
 //! (`github_live.rs`) opens a real one.
 //!
+//! Watch's reads (OWL-209: `follow-*.json`, `base-checks.json`,
+//! `rate-limited.json`) are made up in the schema's shape and say so in their
+//! `recorded` line and on each exchange: GitHub refuses GraphQL to the cloud
+//! sessions that wrote them. `github_live.rs`'s `records_watch_reads`
+//! records the follow fixtures on a disposable repository.
+//!
 //! To record again, with a token that can read the repository in
 //! `OWLSHIFT_GITHUB_TOKEN`, or logged in with `gh`:
 //!
@@ -22,7 +28,7 @@ use serde_json::{Value, json};
 
 use owlshift_adapters::forge::github::{GitHubForge, HttpTransport, NewPullRequest, Token};
 use owlshift_adapters::forge::{
-    Branch, CheckKind, CheckState, CommitId, ErrorKind, PrState, Repo, Verdict,
+    Branch, CheckKind, CheckState, CommitId, ErrorKind, Mergeable, PrState, Repo, Verdict,
 };
 
 use support::{Recorder, Replay};
@@ -32,6 +38,14 @@ const NO_OPEN_PR: &str = "no-open-pull-request.json";
 const OPEN: &str = "open-pull-request.json";
 const UNKNOWN_PR: &str = "unknown-pull-request.json";
 const UNAUTHORIZED: &str = "unauthorized.json";
+const FOLLOW_RED: &str = "follow-red.json";
+const FOLLOW_CONFLICTING: &str = "follow-conflicting.json";
+const FOLLOW_MERGED: &str = "follow-merged.json";
+const BASE_CHECKS: &str = "base-checks.json";
+const RATE_LIMITED: &str = "rate-limited.json";
+
+/// The pull request of the made-up watch fixtures.
+const FOLLOWED: u64 = 42;
 
 /// PR #16 (OWL-13), merged, with four GitHub Actions check runs.
 const PR_16: u64 = 16;
@@ -155,8 +169,107 @@ fn a_rejected_token_is_unauthorized() {
     assert_eq!(error.kind, ErrorKind::Unauthorized, "{error}");
 }
 
-/// No fixture may hold a token, a header or an e-mail address, and only the
-/// write is made up.
+/// Watch's read takes whatever head it finds, with the query's cost: a red
+/// check set, a conflict, then the merge (OWL-209).
+#[test]
+fn watch_reads_a_pull_request_red_conflicting_then_merged() {
+    // A fixture recorded live names its own disposable repository and pull
+    // request: the read asks for those.
+    let read = |name| {
+        let replay = Replay::of(&dir(), name);
+        let variables = &support::load(&dir(), name).exchanges[0].request["variables"];
+        let repo = Repo::parse(&format!(
+            "{}/{}",
+            variables["owner"].as_str().unwrap(),
+            variables["name"].as_str().unwrap()
+        ))
+        .unwrap();
+        let number = variables["number"].as_u64().unwrap();
+        let read = GitHubForge::with_transport(replay.clone(), repo)
+            .follow(number)
+            .unwrap();
+        replay.assert_done();
+        read
+    };
+    let red = read(FOLLOW_RED);
+    assert_eq!(red.checks.state, PrState::Open);
+    assert_eq!(red.checks.verdict(), Verdict::Red);
+    let failed: Vec<_> = red
+        .checks
+        .checks
+        .iter()
+        .filter(|c| c.state == CheckState::Failed)
+        .map(|c| (c.name.as_str(), c.raw.as_str()))
+        .collect();
+    assert_eq!(
+        failed,
+        [("check (ubuntu-latest)", "FAILURE"), ("ci", "FAILURE")]
+    );
+    let rate = red.rate.expect("the query's cost");
+    assert_eq!((rate.cost, rate.remaining), (1, 4990));
+
+    let conflicting = read(FOLLOW_CONFLICTING);
+    assert_eq!(conflicting.checks.state, PrState::Open);
+    assert_eq!(conflicting.checks.mergeable, Mergeable::Conflicting);
+    assert_eq!(conflicting.checks.merge_state, "DIRTY");
+    assert!(conflicting.rate.is_some());
+
+    let merged = read(FOLLOW_MERGED);
+    assert_eq!(merged.checks.state, PrState::Merged);
+    assert!(merged.checks.checks.is_empty());
+}
+
+/// The base head's checks across pages and `base_at_push`'s, with the cost
+/// of both queries summed.
+#[test]
+fn reads_the_checks_of_the_base_head_and_of_base_at_push() {
+    let replay = Replay::of(&dir(), BASE_CHECKS);
+    let at_push = CommitId::new("c0c0867c0c0867c0c0867c0c0867c0c0867c0c08").unwrap();
+    let base = forge(&replay)
+        .with_check_page(1)
+        .base_checks(&main_branch(), Some(&at_push))
+        .unwrap();
+    replay.assert_done();
+    let states = |checks: &[owlshift_adapters::forge::Check]| -> Vec<(String, CheckState)> {
+        checks.iter().map(|c| (c.name.clone(), c.state)).collect()
+    };
+    assert_eq!(
+        states(&base.at_head),
+        [
+            ("check (ubuntu-latest)".to_owned(), CheckState::Passed),
+            ("ci".to_owned(), CheckState::Pending)
+        ]
+    );
+    assert_eq!(
+        states(base.at_push.as_deref().unwrap()),
+        [("check (ubuntu-latest)".to_owned(), CheckState::Failed)]
+    );
+    let rate = base.rate.unwrap();
+    assert_eq!((rate.cost, rate.remaining), (2, 4989));
+}
+
+/// GraphQL's own limit and a secondary limit both hold the reads, until the
+/// reset the answer gives.
+#[test]
+fn a_spent_budget_is_rate_limited() {
+    let replay = Replay::of(&dir(), RATE_LIMITED);
+    let forge = forge(&replay);
+    let primary = forge.follow(FOLLOWED).unwrap_err();
+    assert_eq!(primary.kind, ErrorKind::RateLimited, "{primary}");
+    assert_eq!(
+        primary.resets_at,
+        Some(jiff::Timestamp::from_second(1_791_000_000).unwrap())
+    );
+    let secondary = forge.follow(FOLLOWED).unwrap_err();
+    assert_eq!(secondary.kind, ErrorKind::RateLimited, "{secondary}");
+    assert!(secondary.resets_at.is_some());
+    replay.assert_done();
+}
+
+/// No fixture may hold a token, a header other than the rate limit's, or an
+/// e-mail address. In a recorded fixture only the write is made up; a
+/// fixture made up whole says so in its `recorded` line and on every
+/// exchange.
 #[test]
 fn fixtures_hold_no_credential_and_flag_what_is_made_up() {
     for entry in fs::read_dir(dir()).unwrap() {
@@ -170,10 +283,13 @@ fn fixtures_hold_no_credential_and_flag_what_is_made_up() {
             );
         }
         let fixture: support::Fixture = serde_json::from_str(&text).unwrap();
+        let made_up = fixture
+            .recorded
+            .starts_with("made up, pending live recording");
         for exchange in &fixture.exchanges {
             let query = exchange.request["query"].as_str().unwrap_or_default();
             assert_eq!(
-                query.starts_with("mutation"),
+                made_up || query.starts_with("mutation"),
                 exchange.synthesized.is_some(),
                 "{}: a write must be made up, a read recorded",
                 path.display()
