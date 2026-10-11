@@ -95,6 +95,7 @@ fn posts_the_delivery_report_on_a_real_ticket() {
             basis: "The ticket's acceptance, validated before OWL-20".to_owned(),
         }],
         followups: vec![],
+        fix_pass: None,
     };
     let writer = Writer::new(&tracker);
     let posted = writer.post_delivery_report(&report).unwrap();

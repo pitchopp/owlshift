@@ -39,6 +39,18 @@ pub trait Tracker {
     /// one; the Markdown tracker takes any name.
     fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), Error>;
 
+    /// The name of the state the ticket shows now, as a person sees it on
+    /// the tracker: watch reads it before a repair run, which a ticket a
+    /// person moved to a state Owlshift does not work in never gets
+    /// (OWL-112, architecture section 5, "A ticket a person moved"). An
+    /// error by default: a tracker that cannot tell gets no repair run.
+    fn stage(&self, _id: &TicketId) -> Result<String, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not read a ticket's stage",
+        ))
+    }
+
     /// A link to the ticket that a person can open, for a notification
     /// (OWL-140). `None` when the tracker has none, and when it could not be
     /// read: a link is never worth failing for.

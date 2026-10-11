@@ -24,7 +24,7 @@ use owlshift_adapters::forge::{
     PrState, PullRequestRead, Verdict,
 };
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Ended, EndedWhy, TicketDelivery};
+use owlshift_contracts::refs::{Ended, EndedWhy, PushKind, TicketDelivery};
 use owlshift_core::follow::{
     self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
 };
@@ -51,14 +51,14 @@ pub fn read_of(set: &CheckSet) -> Read {
             Mergeable::Conflicting => follow::Mergeable::Conflicting,
             Mergeable::Unknown => follow::Mergeable::Unknown,
         },
-        checks: set.checks.iter().map(check_of).collect(),
+        checks: set.checks.iter().map(check_read).collect(),
     }
 }
 
 /// A check for the core: a code failure is a check run concluding `FAILURE`
 /// or `TIMED_OUT`, or a commit status `FAILURE` or `ERROR`; any other failure
 /// is one a person re-runs. Whether the check is required plays no part.
-fn check_of(check: &Check) -> CheckRead {
+pub(crate) fn check_read(check: &Check) -> CheckRead {
     let outcome = match check.state {
         CheckState::Passed => CheckOutcome::Passed,
         CheckState::Pending => CheckOutcome::Pending,
@@ -83,12 +83,86 @@ fn check_of(check: &Check) -> CheckRead {
 fn base_read_of(base: &BaseChecks) -> BaseRead {
     BaseRead {
         head: base.head.to_string(),
-        at_head: base.at_head.iter().map(check_of).collect(),
+        at_head: base.at_head.iter().map(check_read).collect(),
         at_push: base
             .at_push
             .as_ref()
-            .map(|checks| checks.iter().map(check_of).collect()),
+            .map(|checks| checks.iter().map(check_read).collect()),
     }
+}
+
+/// A pull request read and decided: its checks, the base's when the
+/// table needed them, and the decision.
+#[derive(Clone, Debug)]
+pub struct Fresh {
+    pub checks: CheckSet,
+    pub base: Option<BaseChecks>,
+    pub decision: Decision,
+    /// How long ago a failure was first read on this head, as the decision
+    /// took it.
+    pub failing_for: Option<Duration>,
+}
+
+impl Fresh {
+    /// What a person and the events read of it.
+    pub fn seen(&self, pull_request: u64, url: &str) -> Seen {
+        Seen {
+            pull_request,
+            url: url.to_owned(),
+            head: self.checks.head.to_string(),
+            verdict: self.checks.verdict(),
+            mergeable: self.checks.mergeable,
+            decision: self.decision.clone(),
+            base_head: self.base.as_ref().map(|base| base.head.to_string()),
+            failing_for: self.failing_for,
+        }
+    }
+}
+
+/// Reads pull request `number` of `delivery`, whose last push is `pushed`,
+/// and decides on it by the core's table, reading the base branch when the
+/// table needs it. `failing_for` gives how long ago a failure was first read
+/// on the head read. Watch's look and a repair's read under the lock
+/// (OWL-112) both read through it.
+pub fn read(
+    forge: &GitHubForge,
+    delivery: &TicketDelivery,
+    number: u64,
+    pushed: &str,
+    mut failing_for: impl FnMut(&Read) -> Option<Duration>,
+) -> Result<Fresh, owlshift_adapters::forge::Error> {
+    let PullRequestRead { checks, .. } = forge.follow(number)?;
+    let core = read_of(&checks);
+    let followed = Followed {
+        pushed,
+        pushing: delivery.pushing.as_ref().map(|p| p.commit.as_str()),
+        rebased_onto: delivery.rebased_onto.as_deref(),
+    };
+    let failing_for = failing_for(&core);
+    let mut decision = follow::decide(&core, followed, None, failing_for);
+    let mut base = None;
+    if matches!(
+        decision,
+        Decision::Follow {
+            action: Action::NeedsBase,
+            ..
+        }
+    ) {
+        let at_push = delivery
+            .base_at_push
+            .as_deref()
+            .and_then(|c| CommitId::new(c).ok());
+        let read = Branch::new(&delivery.base_branch)
+            .and_then(|branch| forge.base_checks(&branch, at_push.as_ref()))?;
+        decision = follow::decide(&core, followed, Some(&base_read_of(&read)), failing_for);
+        base = Some(read);
+    }
+    Ok(Fresh {
+        checks,
+        base,
+        decision,
+        failing_for,
+    })
 }
 
 /// What a look at a followed pull request found.
@@ -113,6 +187,9 @@ pub struct Seen {
     pub decision: Decision,
     /// The base head the decision was made against, when it was read.
     pub base_head: Option<String>,
+    /// How long ago watch first read a failure on this head, when it had
+    /// read one before: a repair decides again with it (OWL-112).
+    pub failing_for: Option<Duration>,
 }
 
 impl Seen {
@@ -257,67 +334,28 @@ impl Following {
             };
             return (look, warnings);
         };
-        let read = match forge.follow(pr.number) {
-            Ok(read) => read,
+        let failing = |core: &Read| self.failing_for(ticket, core, now);
+        let fresh = match read(forge, delivery, pr.number, pushed, failing) {
+            Ok(fresh) => fresh,
             Err(error) => return self.failed(ticket, &error, now, warnings),
         };
-        let PullRequestRead { checks, .. } = read;
-        let core = read_of(&checks);
-        let followed = Followed {
-            pushed,
-            pushing: delivery.pushing.as_ref().map(|p| p.commit.as_str()),
-            rebased_onto: delivery.rebased_onto.as_deref(),
-        };
-        let failing_for = self.failing_for(ticket, &core, now);
-        let mut base_head = None;
-        let mut decision = follow::decide(&core, followed, None, failing_for);
-        if matches!(
-            decision,
-            Decision::Follow {
-                action: Action::NeedsBase,
-                ..
-            }
-        ) {
-            let base = Branch::new(&delivery.base_branch);
-            let at_push = delivery
-                .base_at_push
-                .as_deref()
-                .and_then(|c| CommitId::new(c).ok());
-            let base = base.and_then(|base| forge.base_checks(&base, at_push.as_ref()));
-            match base {
-                Ok(base) => {
-                    let base = base_read_of(&base);
-                    decision = follow::decide(&core, followed, Some(&base), failing_for);
-                    base_head = Some(base.head);
-                }
-                Err(error) => return self.failed(ticket, &error, now, warnings),
-            }
-        }
+        let seen = fresh.seen(pr.number, &pr.url);
         self.unread.remove(ticket);
         if let Decision::Follow {
             action: Action::Fix { overdue },
             ..
-        } = &decision
+        } = &seen.decision
             && !overdue.is_empty()
-            && self.overdue.get(ticket) != Some(&core.head)
+            && self.overdue.get(ticket) != Some(&seen.head)
         {
-            self.overdue.insert(ticket.clone(), core.head.clone());
+            self.overdue.insert(ticket.clone(), seen.head.clone());
             warnings.push(data([
                 ("what", json!("checks_overdue")),
                 ("pull_request", json!(pr.number)),
-                ("head", json!(core.head)),
+                ("head", json!(seen.head)),
                 ("checks", json!(overdue)),
             ]));
         }
-        let seen = Seen {
-            pull_request: pr.number,
-            url: pr.url.clone(),
-            head: core.head,
-            verdict: checks.verdict(),
-            mergeable: checks.mergeable,
-            decision,
-            base_head,
-        };
         (Look::Read(seen), warnings)
     }
 
@@ -483,9 +521,18 @@ pub fn changed(
             if *adopt && let Some(pushing) = delivery.pushing.take() {
                 delivery.pushed = Some(pushing.commit);
                 delivery.base_at_push = Some(pushing.base);
+                // A fix push a crash cut short counts as the run would have
+                // (OWL-112), when the bounds still allow it: a stuck count
+                // never stops the following.
+                if pushing.kind == PushKind::Fix {
+                    let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
+                    if let Ok(Transition::To(pushed)) = state.apply(pipeline, Event::FixPushed) {
+                        next.state = (&pushed).into();
+                    }
+                }
             }
             if *action == Action::Green {
-                let state = TicketState::try_from(&record.state).map_err(|e| e.to_string())?;
+                let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
                 if state.fix_passes() > 0 || state.failed_runs() > 0 {
                     match state.apply(pipeline, Event::ChecksGreen) {
                         Ok(Transition::To(green)) => next.state = (&green).into(),
@@ -518,7 +565,7 @@ mod tests {
     use owlshift_adapters::forge::Repo;
     use owlshift_adapters::graphql::{RateHeaders, Response, Transport};
     use owlshift_contracts::refs::TicketQuestions;
-    use owlshift_contracts::refs::{DeliveredPullRequest, PersistedState, PushKind, Pushing};
+    use owlshift_contracts::refs::{DeliveredPullRequest, PersistedState, Pushing};
     use owlshift_core::state::Status;
     use owlshift_core::vocab::Stage;
     use serde_json::Value;
@@ -773,6 +820,7 @@ mod tests {
             mergeable: Mergeable::Mergeable,
             decision,
             base_head: None,
+            failing_for: None,
         }
     }
 
@@ -816,14 +864,32 @@ mod tests {
             },
             PUSHING,
         );
-        let next = changed(&record(pushing, watching(0)), pipeline, &adopted, at(0))
-            .unwrap()
-            .unwrap()
-            .delivery
-            .unwrap();
+        let next = changed(
+            &record(pushing.clone(), watching(0)),
+            pipeline,
+            &adopted,
+            at(0),
+        )
+        .unwrap()
+        .unwrap()
+        .delivery
+        .unwrap();
         assert_eq!(next.pushed.as_deref(), Some(PUSHING));
         assert_eq!(next.base_at_push.as_deref(), Some(BASE));
         assert_eq!(next.pushing, None);
+        // A fix push adopted counts its pass; past the bound it counts none,
+        // and the following goes on.
+        let fix = pushing;
+        let counted = changed(&record(fix.clone(), watching(1)), pipeline, &adopted, at(0))
+            .unwrap()
+            .unwrap();
+        let state = TicketState::try_from(&counted.state).unwrap();
+        assert_eq!((state.fix_passes(), state.failed_runs()), (1, 0));
+        let bound = TicketState::restore(Status::Active(Stage::Watch), 0, 0, 0, 2, 2).unwrap();
+        let kept = changed(&record(fix, bound), pipeline, &adopted, at(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(TicketState::try_from(&kept.state).unwrap(), bound);
 
         let moved = seen_with(Decision::End(EndReason::HeadMoved), PUSHING);
         let ended = changed(&plain, pipeline, &moved, at(5))

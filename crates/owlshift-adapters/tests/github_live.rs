@@ -318,3 +318,34 @@ fn records_watch_reads() {
     eprintln!("the follow query cost {} points", rate.cost);
     recorder.write("follow-conflicting.json", &recorded);
 }
+
+/// Live check (c) of the build plan's "Watch after delivery" (OWL-112):
+/// whether the token Owlshift stores reads a failed job's log. Read only,
+/// so any repository will do, `pitchopp/owlshift` included; pass the stored
+/// token in `OWLSHIFT_GITHUB_TOKEN`, since `gh`'s own login is not what
+/// Owlshift reads:
+///
+/// ```sh
+/// OWLSHIFT_GITHUB_TOKEN=<the stored token> OWLSHIFT_LIVE_GITHUB=pitchopp/owlshift \
+///   OWLSHIFT_LIVE_GITHUB_JOB=110572493177 \
+///   cargo test -p owlshift-adapters --test github_live -- --ignored --nocapture reads_a_failed_jobs_log
+/// ```
+///
+/// A refused token fails with `Unauthorized`: the token lacks actions (read).
+#[test]
+#[ignore = "live: reads GitHub; set OWLSHIFT_LIVE_GITHUB and OWLSHIFT_LIVE_GITHUB_JOB"]
+fn reads_a_failed_jobs_log() {
+    let repo = Repo::parse(&std::env::var("OWLSHIFT_LIVE_GITHUB").unwrap()).unwrap();
+    let job: u64 = std::env::var("OWLSHIFT_LIVE_GITHUB_JOB")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let forge = GitHubForge::new(support::github_token(), repo);
+    match forge.job_log_excerpt(job) {
+        Ok(excerpt) => {
+            eprintln!("{} bytes of excerpt:\n{excerpt}", excerpt.len());
+            assert!(!excerpt.is_empty());
+        }
+        Err(error) => panic!("{:?}: {error}", error.kind),
+    }
+}

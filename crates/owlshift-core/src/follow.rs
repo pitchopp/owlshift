@@ -44,7 +44,8 @@ pub enum CheckOutcome {
 }
 
 impl CheckOutcome {
-    fn failed(self) -> bool {
+    /// A failure, by the code or not.
+    pub fn failed(self) -> bool {
         matches!(self, Self::CodeFailure | Self::OtherFailure)
     }
 
@@ -218,7 +219,7 @@ fn act(
     };
     let at_head = collapse(&base.at_head);
     let base_running = at_head.iter().any(|c| c.outcome == CheckOutcome::Pending);
-    let on_head = |name: &str| at_head.iter().find(|c| c.name == name).map(|c| c.outcome);
+    let on_head = |name: &str| outcome_of(&at_head, name);
     // A check absent from the base head counts as running while any base
     // check is unfinished: an aggregate check exists only once its matrix
     // has ended.
@@ -261,6 +262,17 @@ fn collapse(checks: &[CheckRead]) -> Vec<CheckRead> {
         }
     }
     out
+}
+
+/// The outcome of the checks named `name` in `checks`, at their worst, as
+/// the table reads them; `None` when none has that name. A fix run's brief
+/// gives each failed check's state on the base head by it (OWL-112).
+pub fn outcome_of(checks: &[CheckRead], name: &str) -> Option<CheckOutcome> {
+    checks
+        .iter()
+        .filter(|c| c.name == name)
+        .map(|c| c.outcome)
+        .max_by_key(|outcome| outcome.rank())
 }
 
 /// Whether `read` shows a failed check: the runner's first-failure time
@@ -514,5 +526,8 @@ mod tests {
         assert_eq!(action(&running, None, None), Action::WaitChecks);
         assert!(has_failure(&r));
         assert!(!has_failure(&running));
+        assert_eq!(outcome_of(&b.at_head, "ci"), Some(CodeFailure));
+        assert_eq!(outcome_of(&running.checks, "ci"), Some(Pending));
+        assert_eq!(outcome_of(&running.checks, "lint"), None);
     }
 }
