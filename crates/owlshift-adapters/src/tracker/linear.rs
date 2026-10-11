@@ -174,7 +174,7 @@ fn post_graphql(
         .body_mut()
         .read_to_string()
         .map_err(|e| e.to_string())?;
-    Ok(Response { status, body })
+    Ok(Response::new(status, body))
 }
 
 type Shared = Box<dyn Transport + Send + Sync>;
@@ -884,6 +884,7 @@ mod tests {
         Response {
             status,
             body: body.to_owned(),
+            ..Default::default()
         }
     }
 

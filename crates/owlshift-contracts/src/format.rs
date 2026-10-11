@@ -46,6 +46,9 @@ pub const TICKET_STATE_FORMAT: u32 = 3;
 /// format 9 the refused choices typed in it (OWL-198); formats 2 to 8 are
 /// still read.
 pub const QUESTIONS_FORMAT: u32 = 9;
+/// The format version of a ticket's delivery (`delivery.json` on a ticket
+/// ref, OWL-209).
+pub const DELIVERY_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

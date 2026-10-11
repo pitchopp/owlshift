@@ -11,6 +11,13 @@
 //! [`OnDemand::continue_seen`], which runs only while the ticket ref, read
 //! again under the lock, is still the one the snapshot read.
 //!
+//! Since OWL-209, each pass also looks at the pull request of each ticket at
+//! Watch whose delivery Owlshift follows ([`followed`]): its read, without
+//! the lock, decides by the core's table, and what it changes in the ticket
+//! ref is written under the lock from the ref the snapshot read
+//! ([`crate::follow`]). A fix, a rebase or a park is decided and recorded
+//! only: OWL-112 and OWL-210 run them.
+//!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
 //! continue that left the ticket ref as it was is held for [`RETRY_AFTER`],
@@ -33,11 +40,13 @@ use owlshift_adapters::tracker::Person;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::state::{Status, TicketState};
+use owlshift_core::vocab::Stage;
 
 use crate::answer_check::{self, Readiness};
 use crate::events::{EventSink, data, printable};
-use crate::on_demand::{Delivered, Landed, OnDemand, Stop};
-use crate::ticket_ref::{self, Stored};
+use crate::follow::{self, Following, Look};
+use crate::on_demand::{Delivered, Landed, OnDemand, PIPELINE, Stop};
+use crate::ticket_ref::{self, Stored, TicketRecord};
 
 /// How long watch sleeps after each pass.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -52,6 +61,18 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 /// at a stage waits for no answer.
 pub fn watched(status: Status) -> bool {
     matches!(status, Status::NeedsInput { .. })
+}
+
+/// Whether watch follows the pull request of a ticket in `status` whose
+/// ref keeps `stored`: a ticket working at Watch, neither waiting nor
+/// parked, whose delivery has a pull request and has not ended (OWL-209).
+pub fn followed(status: Status, stored: &Stored) -> bool {
+    status == Status::Active(Stage::Watch)
+        && stored
+            .record
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.followed())
 }
 
 /// What a continue starts from: the ticket ref's commit and the decider's
@@ -198,8 +219,12 @@ enum Project {
     Quarantined,
     /// The snapshot failed.
     Unread(String),
-    /// The tickets whose questions wait.
-    Waiting(Vec<TicketId>),
+    /// The tickets whose questions wait, and those whose pull request watch
+    /// follows.
+    Watching {
+        waiting: Vec<TicketId>,
+        followed: Vec<TicketId>,
+    },
 }
 
 /// What the loop keeps from one pass to the next.
@@ -210,6 +235,8 @@ struct Memory {
     project: Option<Project>,
     /// Why each ticket could not be read, as last warned of.
     failing: HashMap<TicketId, String>,
+    /// What watch keeps of the pull requests it follows.
+    following: Following,
 }
 
 /// Called with each continue's outcome, for the caller to print it and tell
@@ -248,6 +275,7 @@ impl Watch<'_> {
             Err(project) => return self.note(memory, out, project),
         };
         let mut waiting = Vec::new();
+        let mut following = Vec::new();
         // A ticket whose ref cannot be read now keeps its hold: only one
         // read and found not waiting, or gone from the list, loses it.
         let mut unread = Vec::new();
@@ -259,6 +287,10 @@ impl Watch<'_> {
             });
             match state {
                 Ok((stored, state)) if watched(state.status()) => waiting.push((ticket, stored)),
+                Ok((stored, state)) if followed(state.status(), &stored) => {
+                    memory.failing.remove(&ticket);
+                    following.push((ticket, stored));
+                }
                 Ok(_) => {
                     memory.failing.remove(&ticket);
                 }
@@ -269,11 +301,96 @@ impl Watch<'_> {
             }
         }
         let ids: Vec<TicketId> = waiting.iter().map(|(ticket, _)| ticket.clone()).collect();
+        let followed: Vec<TicketId> = following.iter().map(|(ticket, _)| ticket.clone()).collect();
         memory.holds.retain(&[&ids[..], &unread[..]].concat());
-        self.note(memory, out, Project::Waiting(ids));
+        memory
+            .following
+            .retain(&[&followed[..], &unread[..]].concat());
+        self.note(
+            memory,
+            out,
+            Project::Watching {
+                waiting: ids,
+                followed,
+            },
+        );
         for (ticket, stored) in waiting {
             self.look(memory, sink, out, continued, &ticket, &stored);
         }
+        for (ticket, stored) in following {
+            self.follow(memory, sink, out, &ticket, &stored);
+        }
+    }
+
+    /// One followed pull request (OWL-209): its read and what it decides,
+    /// the ticket ref written with what it changes, then its events.
+    fn follow(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        stored: &Stored,
+    ) {
+        let on_demand = self.on_demand;
+        let Some(delivery) = &stored.record.delivery else {
+            return;
+        };
+        let now = (on_demand.clock)();
+        let (look, warnings) = memory
+            .following
+            .look(on_demand.forge, ticket, delivery, now);
+        for warning in warnings {
+            sink.emit(ticket, None, EventKind::Warning, warning);
+        }
+        let seen = match look {
+            Look::Read(seen) => seen,
+            Look::Paused { .. } | Look::Unread { .. } => return,
+        };
+        let change =
+            follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
+                Some(record) => self.write_seen(ticket, &stored.commit, &record),
+                None => Ok(true),
+            });
+        match change {
+            Ok(true) => {}
+            // Busy, or the ref moved: the next pass reads it again.
+            Ok(false) => return,
+            Err(reason) => {
+                let reason = format!("keeping what watch read of its pull request: {reason}");
+                return self.unreadable(memory, sink, ticket, reason);
+            }
+        }
+        if let Some(event) = memory.following.events(ticket, &seen) {
+            sink.emit(ticket, None, EventKind::Decision, event);
+            self.line(out, &format!("{ticket}: {seen}"));
+        }
+    }
+
+    /// Writes `record` as the ticket ref of `ticket` under the project's
+    /// lock, only while the ref is still `seen`, the commit the snapshot
+    /// read: `false`, with nothing written, when the project is busy or the
+    /// ref moved.
+    fn write_seen(
+        &self,
+        ticket: &TicketId,
+        seen: &str,
+        record: &TicketRecord,
+    ) -> Result<bool, String> {
+        let dirs = self.on_demand.dirs;
+        let _lock = match dirs.lock() {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(format!("the project's lock: {e}")),
+        };
+        let git = &self.on_demand.executor.git;
+        let checkout = dirs.checkout();
+        let current = ticket_ref::read(git, &checkout, ticket)?;
+        if current.map(|stored| stored.commit).as_deref() != Some(seen) {
+            return Ok(false);
+        }
+        ticket_ref::write(git, &checkout, ticket, record, Some(seen))?;
+        Ok(true)
     }
 
     /// The ticket refs, read under the project's lock, once its marker says
@@ -454,17 +571,27 @@ impl Watch<'_> {
                 self.on_demand.dirs.unverified_file().display()
             ),
             Project::Unread(reason) => format!("the ticket refs could not be read: {reason}"),
-            Project::Waiting(tickets) if tickets.is_empty() => {
-                "no ticket's questions wait for an answer".to_owned()
+            Project::Watching { waiting, followed } => {
+                let list = |tickets: &[TicketId]| {
+                    tickets
+                        .iter()
+                        .map(TicketId::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let mut text = if waiting.is_empty() {
+                    "no ticket's questions wait for an answer".to_owned()
+                } else {
+                    format!("questions wait for an answer on {}", list(waiting))
+                };
+                if !followed.is_empty() {
+                    text.push_str(&format!(
+                        "; watch follows the pull requests of {}",
+                        list(followed)
+                    ));
+                }
+                text
             }
-            Project::Waiting(tickets) => format!(
-                "questions wait for an answer on {}",
-                tickets
-                    .iter()
-                    .map(TicketId::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
         };
         self.line(out, &text);
         memory.project = Some(project);

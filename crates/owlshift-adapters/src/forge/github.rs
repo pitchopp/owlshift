@@ -33,11 +33,13 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use jiff::Timestamp;
+
 use crate::forge::{
-    Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId, Error, ErrorKind,
-    Mergeable, PrState, PullRequest, Repo,
+    BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId, Error,
+    ErrorKind, Mergeable, PrState, PullRequest, PullRequestRead, RateLimit, Repo,
 };
-pub use crate::graphql::{Response, Transport};
+pub use crate::graphql::{RateHeaders, Response, Transport};
 
 /// GitHub's GraphQL endpoint.
 pub const ENDPOINT: &str = "https://api.github.com/graphql";
@@ -101,11 +103,24 @@ impl Transport for HttpTransport {
             .send_json(request)
             .map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_owned())
+        };
+        // The rate-limit headers alone (OWL-209).
+        let rate = RateHeaders {
+            remaining: header("x-ratelimit-remaining").and_then(|v| v.parse().ok()),
+            reset: header("x-ratelimit-reset").and_then(|v| v.parse().ok()),
+            retry_after: header("retry-after").and_then(|v| v.parse().ok()),
+        };
         let body = response
             .body_mut()
             .read_to_string()
             .map_err(|e| e.to_string())?;
-        Ok(Response { status, body })
+        Ok(Response { status, body, rate })
     }
 }
 
@@ -240,34 +255,194 @@ impl GitHubForge {
     /// `expected_head`, the commit the runner pushed; with its state and
     /// merge state. Every page is read; the list is refused rather than
     /// returned partial when the pages do not advance, the count differs
-    /// from GitHub's total, or the head moves while reading.
+    /// from GitHub's total, or the head moves while reading. A head that is
+    /// not the expected one is [`ErrorKind::HeadMoved`] with the head read.
     pub fn checks(&self, number: u64, expected_head: &CommitId) -> Result<CheckSet, Error> {
+        self.read_checks(CHECKS_QUERY, number, Some(expected_head))
+            .map(|(set, _)| set)
+    }
+
+    /// Watch's read of pull request `number` (OWL-209): its state, its head
+    /// whoever pushed it, its mergeability and, while it is open, every check
+    /// of that head, as complete as [`checks`](Self::checks) reads them;
+    /// with the query's cost. A pull request that is not open lists no check.
+    pub fn follow(&self, number: u64) -> Result<PullRequestRead, Error> {
+        let (checks, rate) = self.read_checks(FOLLOW_QUERY, number, None)?;
+        Ok(PullRequestRead { checks, rate })
+    }
+
+    /// The checks of `base`'s head and, when given, of `at_push`, each read
+    /// to the last page, in one query while each fits a page (OWL-209).
+    /// Checks of a commit are not tied to a pull request, so none is
+    /// required. `at_push` that GitHub does not know as a commit has none.
+    pub fn base_checks(
+        &self,
+        base: &Branch,
+        at_push: Option<&CommitId>,
+    ) -> Result<BaseChecks, Error> {
+        let variables = json!({
+            "owner": self.repo.owner(), "name": self.repo.name(),
+            "head": format!("refs/heads/{base}"),
+            // Without `base_at_push`, the base head again, its answer unused:
+            // one query shape, and no directive.
+            "atPush": at_push.map_or_else(|| format!("refs/heads/{base}"), |c| c.to_string()),
+            "first": self.check_page,
+        });
+        let data: BaseData = self.call(BASE_CHECKS_QUERY, variables)?;
+        let mut rate = Rates::default();
+        rate.add(data.rate_limit);
+        let head = data
+            .repository
+            .head
+            .and_then(|object| object.into_commit())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    format!("no branch {base} in {}", self.repo),
+                )
+            })?;
+        let (head, rollup) = head;
+        let at_head = self.every_context(&head, rollup, &mut rate)?;
+        let at_push = match data.repository.at_push.and_then(|o| o.into_commit()) {
+            Some((oid, rollup)) if at_push == Some(&oid) => {
+                Some(self.every_context(&oid, rollup, &mut rate)?)
+            }
+            _ => None,
+        };
+        Ok(BaseChecks {
+            head,
+            at_head,
+            at_push,
+            rate: rate.get(),
+        })
+    }
+
+    /// The checks of a commit from the first page `rollup`, reading its
+    /// other pages; refused when the pages do not advance or their count
+    /// differs from GitHub's total.
+    fn every_context(
+        &self,
+        oid: &CommitId,
+        rollup: Option<Rollup>,
+        rate: &mut Rates,
+    ) -> Result<Vec<Check>, Error> {
+        let Some(rollup) = rollup else {
+            return Ok(Vec::new());
+        };
+        let total = rollup.contexts.total_count;
+        let mut info = rollup.contexts.page_info;
+        let mut checks: Vec<Check> = rollup
+            .contexts
+            .nodes
+            .into_iter()
+            .map(Context::into_check)
+            .collect();
+        while info.has_next_page {
+            let cursor = info
+                .end_cursor
+                .clone()
+                .ok_or_else(|| invalid("the check pages do not advance"))?;
+            let variables = json!({
+                "owner": self.repo.owner(), "name": self.repo.name(),
+                "oid": oid.as_str(), "first": self.check_page, "after": cursor,
+            });
+            let data: CommitData = self.call(COMMIT_CHECKS_QUERY, variables)?;
+            rate.add(data.rate_limit);
+            let contexts = data
+                .repository
+                .object
+                .and_then(|o| o.into_commit())
+                .and_then(|(_, rollup)| rollup)
+                .ok_or_else(|| {
+                    invalid(format!("the checks of {oid} vanished while they were read"))
+                })?
+                .contexts;
+            if contexts.total_count != total {
+                return Err(invalid(format!(
+                    "the checks of {oid} changed while they were read"
+                )));
+            }
+            if contexts.page_info.has_next_page
+                && contexts.page_info.end_cursor.as_ref() == Some(&cursor)
+            {
+                return Err(invalid("the check pages do not advance"));
+            }
+            checks.extend(contexts.nodes.into_iter().map(Context::into_check));
+            info = contexts.page_info;
+        }
+        if checks.len() as u64 != total {
+            return Err(invalid(format!(
+                "read {} checks of {oid}, GitHub counts {total}",
+                checks.len()
+            )));
+        }
+        Ok(checks)
+    }
+
+    /// The check set of pull request `number` through `query`, at
+    /// `expected` when given, else at the head the first page reads.
+    fn read_checks(
+        &self,
+        query: &str,
+        number: u64,
+        expected: Option<&CommitId>,
+    ) -> Result<(CheckSet, Option<RateLimit>), Error> {
         let mut checks = Vec::new();
         let mut after: Option<String> = None;
         let mut total: Option<u64> = None;
+        let mut rate = Rates::default();
+        let mut read_head: Option<CommitId> = None;
         loop {
             let variables = json!({
                 "owner": self.repo.owner(), "name": self.repo.name(), "number": number,
                 "first": self.check_page, "after": after,
             });
-            let data: ChecksData = self.call(CHECKS_QUERY, variables)?;
+            let data: ChecksData = self.call(query, variables)?;
+            rate.add(data.rate_limit);
             let pr = data.repository.pull_request.ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotFound,
                     format!("no pull request #{number} in {}", self.repo),
                 )
             })?;
-            let head = pr.head_ref_oid.as_str();
-            if head != expected_head.as_str() {
-                return Err(Error::new(
-                    ErrorKind::HeadMoved,
-                    format!(
-                        "pull request #{number} is at {head}, not at the pushed commit {expected_head}"
-                    ),
-                ));
+            let head = CommitId::new(pr.head_ref_oid.as_str())?;
+            match (expected, &read_head) {
+                (Some(expected), _) if head != *expected => {
+                    return Err(Error::new(
+                        ErrorKind::HeadMoved,
+                        format!(
+                            "pull request #{number} is at {head}, not at the pushed commit {expected}"
+                        ),
+                    )
+                    .with_head(head));
+                }
+                (None, Some(first)) if head != *first => {
+                    return Err(Error::new(
+                        ErrorKind::HeadMoved,
+                        format!("pull request #{number} changed while its checks were read"),
+                    )
+                    .with_head(head));
+                }
+                (None, None) => {
+                    read_head = Some(head.clone());
+                    let state = pr_state(&pr.state)?;
+                    // Not open: watch stops following, whatever its checks.
+                    if state != PrState::Open {
+                        let set = CheckSet {
+                            pull_request: number,
+                            head,
+                            state,
+                            mergeable: mergeable(pr.mergeable.as_deref().unwrap_or_default()),
+                            merge_state: pr.merge_state_status,
+                            checks: Vec::new(),
+                        };
+                        return Ok((set, rate.get()));
+                    }
+                }
+                _ => {}
             }
             let commit = match <[CommitNode; 1]>::try_from(pr.commits.nodes) {
-                Ok([node]) if node.commit.oid == head => node.commit,
+                Ok([node]) if node.commit.oid == head.as_str() => node.commit,
                 _ => {
                     return Err(Error::new(
                         ErrorKind::HeadMoved,
@@ -295,21 +470,22 @@ impl GitHubForge {
             };
             checks.extend(nodes.into_iter().map(Context::into_check));
             if !page_info.has_next_page {
-                let expected = total.unwrap_or(0);
-                if checks.len() as u64 != expected {
+                let expected_count = total.unwrap_or(0);
+                if checks.len() as u64 != expected_count {
                     return Err(invalid(format!(
-                        "read {} checks of pull request #{number}, GitHub counts {expected}",
+                        "read {} checks of pull request #{number}, GitHub counts {expected_count}",
                         checks.len()
                     )));
                 }
-                return Ok(CheckSet {
+                let set = CheckSet {
                     pull_request: number,
-                    head: expected_head.clone(),
+                    head,
                     state: pr_state(&pr.state)?,
-                    mergeable: mergeable(&pr.mergeable),
+                    mergeable: mergeable(pr.mergeable.as_deref().unwrap_or_default()),
                     merge_state: pr.merge_state_status,
                     checks,
-                });
+                };
+                return Ok((set, rate.get()));
             }
             match page_info.end_cursor {
                 Some(cursor) if after.as_ref() != Some(&cursor) => after = Some(cursor),
@@ -351,8 +527,49 @@ const CHECKS_QUERY: &str = "query Checks($owner: String!, $name: String!, $numbe
     ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } \
     } } } } } } } } }";
 
-/// Reads a GraphQL answer: a rejected token first, then GraphQL errors, then
-/// `data`.
+/// Watch's read of a pull request (OWL-209): the checks query with the
+/// query's cost. Delivery's [`CHECKS_QUERY`] keeps the text its fixtures were
+/// recorded live with.
+const FOLLOW_QUERY: &str = "query Follow($owner: String!, $name: String!, $number: Int!, \
+    $first: Int!, $after: String) { rateLimit { cost remaining resetAt } \
+    repository(owner: $owner, name: $name) { \
+    pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus \
+    commits(last: 1) { nodes { commit { oid statusCheckRollup { \
+    contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } \
+    nodes { __typename \
+    ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl \
+    checkSuite { app { slug } workflowRun { workflow { name } } } } \
+    ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } \
+    } } } } } } } } }";
+
+/// The checks of the base head and of `base_at_push` (OWL-209).
+const BASE_CHECKS_QUERY: &str = "query BaseChecks($owner: String!, $name: String!, \
+    $head: String!, $atPush: String!, $first: Int!) { \
+    rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { \
+    head: object(expression: $head) { ... on Commit { oid statusCheckRollup { \
+    contexts(first: $first) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename \
+    ... on CheckRun { name status conclusion detailsUrl \
+    checkSuite { app { slug } workflowRun { workflow { name } } } } \
+    ... on StatusContext { context state targetUrl } } } } } } \
+    atPush: object(expression: $atPush) { ... on Commit { oid \
+    statusCheckRollup { contexts(first: $first) { totalCount \
+    pageInfo { hasNextPage endCursor } nodes { __typename \
+    ... on CheckRun { name status conclusion detailsUrl \
+    checkSuite { app { slug } workflowRun { workflow { name } } } } \
+    ... on StatusContext { context state targetUrl } } } } } } } }";
+
+/// The next page of a commit's checks (OWL-209).
+const COMMIT_CHECKS_QUERY: &str = "query CommitChecks($owner: String!, $name: String!, \
+    $oid: String!, $first: Int!, $after: String) { rateLimit { cost remaining resetAt } \
+    repository(owner: $owner, name: $name) { object(expression: $oid) { ... on Commit { oid \
+    statusCheckRollup { contexts(first: $first, after: $after) { totalCount \
+    pageInfo { hasNextPage endCursor } nodes { __typename \
+    ... on CheckRun { name status conclusion detailsUrl \
+    checkSuite { app { slug } workflowRun { workflow { name } } } } \
+    ... on StatusContext { context state targetUrl } } } } } } } }";
+
+/// Reads a GraphQL answer: a rejected token first, then a spent budget, then
+/// GraphQL errors, then `data`.
 fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
     let envelope = serde_json::from_str::<Envelope>(&response.body).ok();
     if response.status == 401 {
@@ -361,6 +578,19 @@ fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
             ErrorKind::Unauthorized,
             format!("GitHub refused the token: HTTP 401 {message}"),
         ));
+    }
+    let rate = response.rate;
+    let limited = |message: String| {
+        Error::new(ErrorKind::RateLimited, message).with_reset(resets_at(rate, Timestamp::now()))
+    };
+    if matches!(response.status, 403 | 429)
+        && (rate.remaining == Some(0) || rate.retry_after.is_some())
+    {
+        let message = envelope.and_then(|e| e.message).unwrap_or_default();
+        return Err(limited(format!(
+            "GitHub's rate limit: HTTP {} {message}",
+            response.status
+        )));
     }
     let Some(envelope) = envelope else {
         return Err(invalid(format!(
@@ -371,6 +601,9 @@ fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
     if let Some(error) = envelope.errors.into_iter().next() {
         let kind = match error.kind.as_deref() {
             Some("NOT_FOUND") => ErrorKind::NotFound,
+            Some("RATE_LIMITED") => {
+                return Err(limited(format!("GitHub: RATE_LIMITED: {}", error.message)));
+            }
             _ => ErrorKind::Other,
         };
         let code = error.kind.as_deref().unwrap_or("no type");
@@ -390,6 +623,39 @@ fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
         Some(data) if !data.is_null() => serde_json::from_value(data)
             .map_err(|e| invalid(format!("unexpected answer from GitHub: {e}"))),
         _ => Err(invalid("GitHub answered without data")),
+    }
+}
+
+/// When a spent budget resets: `Retry-After` from `now`, else
+/// `x-ratelimit-reset`; `None` when the answer gives neither.
+fn resets_at(rate: RateHeaders, now: Timestamp) -> Option<Timestamp> {
+    match (rate.retry_after, rate.reset) {
+        (Some(after), _) => now.checked_add(Duration::from_secs(after)).ok(),
+        (None, Some(reset)) => Timestamp::from_second(reset).ok(),
+        (None, None) => None,
+    }
+}
+
+/// The cost of a read over its queries: the points summed, the budget and
+/// reset of the last answer.
+#[derive(Default)]
+struct Rates(Option<RateLimit>);
+
+impl Rates {
+    fn add(&mut self, answer: Option<GhRateLimit>) {
+        let Some(answer) = answer else {
+            return;
+        };
+        let cost = self.0.map_or(0, |r| r.cost) + answer.cost;
+        self.0 = Some(RateLimit {
+            cost,
+            remaining: answer.remaining,
+            resets_at: answer.reset_at,
+        });
+    }
+
+    fn get(&self) -> Option<RateLimit> {
+        self.0
     }
 }
 
@@ -521,8 +787,66 @@ struct Created {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ChecksData {
     repository: ChecksRepository,
+    #[serde(default)]
+    rate_limit: Option<GhRateLimit>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhRateLimit {
+    cost: u64,
+    remaining: u64,
+    reset_at: Timestamp,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseData {
+    repository: BaseRepository,
+    #[serde(default)]
+    rate_limit: Option<GhRateLimit>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseRepository {
+    head: Option<CommitObject>,
+    #[serde(default)]
+    at_push: Option<CommitObject>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitData {
+    repository: CommitRepository,
+    #[serde(default)]
+    rate_limit: Option<GhRateLimit>,
+}
+
+#[derive(Deserialize)]
+struct CommitRepository {
+    object: Option<CommitObject>,
+}
+
+/// An object by expression: a commit carries its `oid`; any other object
+/// answers an empty fragment.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitObject {
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(default)]
+    status_check_rollup: Option<Rollup>,
+}
+
+impl CommitObject {
+    fn into_commit(self) -> Option<(CommitId, Option<Rollup>)> {
+        let oid = CommitId::new(self.oid?).ok()?;
+        Some((oid, self.status_check_rollup))
+    }
 }
 
 #[derive(Deserialize)]
@@ -536,7 +860,8 @@ struct ChecksRepository {
 struct ChecksPullRequest {
     state: String,
     head_ref_oid: String,
-    mergeable: String,
+    #[serde(default)]
+    mergeable: Option<String>,
     merge_state_status: String,
     commits: Nodes<CommitNode>,
 }
@@ -701,6 +1026,7 @@ mod tests {
         Response {
             status,
             body: body.to_owned(),
+            ..Default::default()
         }
     }
 
@@ -723,14 +1049,57 @@ mod tests {
             e.message,
             "GitHub: UNPROCESSABLE: A pull request already exists"
         );
-        let limited = error(403, r#"{"message":"API rate limit exceeded"}"#);
-        assert_eq!(limited.kind, ErrorKind::Other);
-        assert!(
-            limited.message.contains("403 API rate limit exceeded"),
-            "{limited}"
-        );
+        // A 403 without the rate-limit headers is a refusal, not a limit.
+        let refused = error(403, r#"{"message":"Resource not accessible"}"#);
+        assert_eq!(refused.kind, ErrorKind::Other);
+        assert!(refused.message.contains("403 Resource"), "{refused}");
         assert_eq!(error(502, "<html>").kind, ErrorKind::Other);
         assert_eq!(error(200, r#"{"data":null}"#).kind, ErrorKind::Other);
+    }
+
+    /// OWL-209: a spent budget is its own kind, with its reset when the
+    /// answer gives one.
+    #[test]
+    fn a_spent_budget_is_rate_limited_until_its_reset() {
+        let limited = |status, rate: RateHeaders, body: &str| {
+            decode::<Value>(&Response {
+                status,
+                body: body.to_owned(),
+                rate,
+            })
+            .unwrap_err()
+        };
+        let spent = RateHeaders {
+            remaining: Some(0),
+            reset: Some(1_790_000_000),
+            retry_after: None,
+        };
+        let e = limited(403, spent, r#"{"message":"API rate limit exceeded"}"#);
+        assert_eq!(e.kind, ErrorKind::RateLimited);
+        assert_eq!(
+            e.resets_at,
+            Some(Timestamp::from_second(1_790_000_000).unwrap())
+        );
+        assert!(e.message.contains("API rate limit exceeded"), "{e}");
+        // A secondary limit: Retry-After, any body.
+        let retry = RateHeaders {
+            retry_after: Some(60),
+            ..RateHeaders::default()
+        };
+        let e = limited(429, retry, "<html>");
+        assert_eq!(e.kind, ErrorKind::RateLimited);
+        assert!(e.resets_at.is_some_and(|at| at > Timestamp::now()));
+        // GraphQL's own: HTTP 200 with an error; no reset in the answer.
+        let graphql = r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user"}]}"#;
+        let e = limited(200, RateHeaders::default(), graphql);
+        assert_eq!(e.kind, ErrorKind::RateLimited);
+        assert_eq!(e.resets_at, None);
+        let now = Timestamp::from_second(1_000).unwrap();
+        assert_eq!(
+            resets_at(retry, now),
+            Some(Timestamp::from_second(1_060).unwrap())
+        );
+        assert_eq!(resets_at(RateHeaders::default(), now), None);
     }
 
     #[test]
@@ -847,6 +1216,8 @@ mod tests {
         // The head is not the pushed commit.
         let e = check(vec![page(OTHER, OTHER, 1, RUN, None)]).unwrap_err();
         assert_eq!(e.kind, ErrorKind::HeadMoved, "{e}");
+        // With the head read (OWL-209).
+        assert_eq!(e.head, Some(CommitId::new(OTHER).unwrap()));
         // The last commit is not the head: a push landed between the two.
         let e = check(vec![page(HEAD, OTHER, 1, RUN, None)]).unwrap_err();
         assert_eq!(e.kind, ErrorKind::HeadMoved, "{e}");
@@ -878,6 +1249,45 @@ mod tests {
         // A kind of check the adapter cannot read.
         let unknown = r#"{"__typename":"SomethingNew","name":"x"}"#;
         assert!(check(vec![page(HEAD, HEAD, 1, unknown, None)]).is_err());
+    }
+
+    /// Watch's read takes the head it finds, keeps it across pages, and
+    /// lists no check of a pull request that is not open.
+    #[test]
+    fn watchs_read_takes_the_head_it_finds() {
+        let (forge, canned) = forge(vec![
+            page(OTHER, OTHER, 2, RUN, Some("c1")),
+            page(OTHER, OTHER, 2, STATUS, None),
+        ]);
+        let read = forge.with_check_page(1).follow(7).unwrap();
+        assert!(
+            canned.requests.lock().unwrap()[0]["query"]
+                .as_str()
+                .unwrap()
+                .starts_with("query Follow")
+        );
+        assert_eq!(read.checks.head, CommitId::new(OTHER).unwrap());
+        assert_eq!(read.checks.checks.len(), 2);
+        assert_eq!(read.rate, None);
+        let moved = forge_of(vec![
+            page(HEAD, HEAD, 2, RUN, Some("c1")),
+            page(OTHER, OTHER, 2, RUN, None),
+        ])
+        .with_check_page(1)
+        .follow(7)
+        .unwrap_err();
+        assert_eq!(moved.kind, ErrorKind::HeadMoved);
+        let merged = page(HEAD, OTHER, 9, RUN, Some("c1"))
+            .replace(r#""state":"OPEN""#, r#""state":"MERGED""#)
+            .replace(r#""mergeable":"MERGEABLE""#, r#""mergeable":null"#);
+        let read = forge_of(vec![merged]).follow(7).unwrap();
+        assert_eq!(read.checks.state, PrState::Merged);
+        assert!(read.checks.checks.is_empty());
+        assert_eq!(read.checks.mergeable, Mergeable::Unknown);
+    }
+
+    fn forge_of(bodies: Vec<String>) -> GitHubForge {
+        forge(bodies).0
     }
 
     #[test]

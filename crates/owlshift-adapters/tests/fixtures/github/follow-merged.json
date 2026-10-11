@@ -1,0 +1,92 @@
+{
+  "recorded": "made up, pending live recording: GitHub GraphQL answered HTTP 403 \"GitHub GraphQL is not available from Claude Code sessions\" to OWL-209's cloud session on 2026-10-11; shaped by GitHub's schema. github_live.rs records_watch_reads records it on a disposable repository",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Follow($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid mergeable mergeStateStatus commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state isRequired(pullRequestNumber: $number) targetUrl } } } } } } } } } }",
+        "variables": {
+          "after": null,
+          "first": 100,
+          "name": "owlshift",
+          "number": 42,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "rateLimit": {
+            "cost": 1,
+            "remaining": 4990,
+            "resetAt": "2026-10-11T13:00:00Z"
+          },
+          "repository": {
+            "pullRequest": {
+              "state": "MERGED",
+              "headRefOid": "5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f",
+              "mergeable": "UNKNOWN",
+              "mergeStateStatus": "UNKNOWN",
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f",
+                      "statusCheckRollup": {
+                        "contexts": {
+                          "totalCount": 2,
+                          "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                          },
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "name": "check (ubuntu-latest)",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "isRequired": false
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "ci",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "isRequired": false
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "synthesized": "not recorded: made up in the shape of GitHub's schema (OWL-209)"
+    }
+  ]
+}

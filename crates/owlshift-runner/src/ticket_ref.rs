@@ -3,7 +3,8 @@
 //! commit whose tree holds the ticket's core state ([`STATE_FILE`]) and the
 //! questions the runner asked on it ([`QUESTIONS_FILE`]), so `owlshift
 //! continue` knows the round, its re-asks and failed runs, and which comments
-//! are the runner's asks.
+//! are the runner's asks; and, once a delivery was made, the pull request
+//! `owlshift watch` follows ([`DELIVERY_FILE`], OWL-209).
 //!
 //! The ref lives in the dedicated checkout only (decided 2026-10-02): it is
 //! not pushed, which architecture section 7 plans for once claims exist
@@ -30,7 +31,8 @@ use std::path::Path;
 
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    PersistedState, QUESTIONS_FILE, STATE_FILE, TICKETS_PREFIX, TicketQuestions, ticket_ref,
+    DELIVERY_FILE, PersistedState, QUESTIONS_FILE, STATE_FILE, TICKETS_PREFIX, TicketDelivery,
+    TicketQuestions, ticket_ref,
 };
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
@@ -48,6 +50,9 @@ pub const MAX_FILE: u64 = 1024 * 1024;
 pub struct TicketRecord {
     pub state: PersistedState,
     pub questions: TicketQuestions,
+    /// The delivery, once one was made: `None` when the tree holds no
+    /// [`DELIVERY_FILE`].
+    pub delivery: Option<TicketDelivery>,
 }
 
 /// A ticket record and the commit it was read from, or last written as.
@@ -62,6 +67,7 @@ pub struct Stored {
 /// point to a commit, a tree without both files as regular blobs, a file
 /// that does not parse, or asks that do not match the state (a ticket
 /// waiting for answers to a round the asks do not end with) is an error.
+/// [`DELIVERY_FILE`] is optional, checked like the two others when present.
 /// Other entries of the tree are left alone.
 pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stored>, String> {
     let name = ticket_ref(ticket);
@@ -145,9 +151,22 @@ fn read_listed(
     let questions =
         TicketQuestions::parse(&read_file(git, checkout, name, &entries, QUESTIONS_FILE)?)
             .map_err(|e| broken(format!("holds an invalid {QUESTIONS_FILE}: {e}")))?;
+    let delivery = if entries.iter().any(|entry| entry.name == DELIVERY_FILE) {
+        let text = read_file(git, checkout, name, &entries, DELIVERY_FILE)?;
+        Some(
+            TicketDelivery::parse(&text)
+                .map_err(|e| broken(format!("holds an invalid {DELIVERY_FILE}: {e}")))?,
+        )
+    } else {
+        None
+    };
     check_consistent(&state, &questions).map_err(broken)?;
     Ok(Stored {
-        record: TicketRecord { state, questions },
+        record: TicketRecord {
+            state,
+            questions,
+            delivery,
+        },
         commit: listed.oid.clone(),
     })
 }
@@ -201,7 +220,9 @@ pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
 /// Writes `record` as the ticket ref of `ticket` in `checkout` and returns
 /// the new commit. `previous` is the commit the ref was read at, `None` when
 /// it did not exist: the ref moves only from there, and the new commit has
-/// it as its parent and keeps every other entry of its tree.
+/// it as its parent and keeps every other entry of its tree but
+/// [`DELIVERY_FILE`], written when the record has a delivery and left out
+/// when it has none.
 ///
 /// A file that would hold more than [`MAX_FILE`] bytes is refused before
 /// any git command runs (OWL-200): [`read`] would refuse it, leaving the
@@ -215,9 +236,14 @@ pub fn write(
     previous: Option<&str>,
 ) -> Result<String, String> {
     let name = ticket_ref(ticket);
-    let state = record.state.render();
-    let questions = record.questions.render();
-    for (file, content) in [(STATE_FILE, &state), (QUESTIONS_FILE, &questions)] {
+    let mut files = vec![
+        (STATE_FILE, record.state.render()),
+        (QUESTIONS_FILE, record.questions.render()),
+    ];
+    if let Some(delivery) = &record.delivery {
+        files.push((DELIVERY_FILE, delivery.render()));
+    }
+    for (file, content) in &files {
         // The blob holds these bytes exactly (`--no-filters`), so their
         // count is the size `read` checks.
         let len = content.len();
@@ -230,12 +256,14 @@ pub fn write(
             ));
         }
     }
-    let state = blob(git, checkout, state.as_bytes())?;
-    let questions = blob(git, checkout, questions.as_bytes())?;
+    let mut blobs = Vec::new();
+    for (file, content) in &files {
+        blobs.push((*file, blob(git, checkout, content.as_bytes())?));
+    }
     let mut tree = Vec::new();
     if let Some(previous) = previous {
         for entry in tree_entries(git, checkout, previous)? {
-            if entry.name != STATE_FILE && entry.name != QUESTIONS_FILE {
+            if ![STATE_FILE, QUESTIONS_FILE, DELIVERY_FILE].contains(&entry.name.as_str()) {
                 tree.extend_from_slice(
                     format!(
                         "{} {} {}\t{}\0",
@@ -246,7 +274,7 @@ pub fn write(
             }
         }
     }
-    for (file, oid) in [(STATE_FILE, &state), (QUESTIONS_FILE, &questions)] {
+    for (file, oid) in &blobs {
         tree.extend_from_slice(format!("100644 blob {oid}\t{file}\0").as_bytes());
     }
     let tree = with_input(git, checkout, &["mktree", "-z"], &tree)?;
@@ -317,7 +345,8 @@ pub enum Previous {
 /// A ref that points to a commit gets a new record on top of it, the old
 /// commit its parent: Ready, its round count kept and every other counter at
 /// zero, and of `questions.json` only Build's and the resolver's kept
-/// refusals, which the next runs are told. The asks, their verdicts, what
+/// refusals, which the next runs are told. `delivery.json` goes: nothing is
+/// followed any more, and `owlshift do` delivers again (OWL-209). The asks, their verdicts, what
 /// the last answer check read and the decisions go; their comments stay on
 /// the ticket. A record that cannot be read gives what still reads on its
 /// own: the round of a `state.json` that parses, the refusals of a
@@ -392,6 +421,7 @@ fn kept(round: u32, questions: Option<&TicketQuestions>) -> Result<TicketRecord,
             resolver_refusal: questions.and_then(|q| q.resolver_refusal.clone()),
             ..TicketQuestions::new()
         },
+        delivery: None,
     })
 }
 

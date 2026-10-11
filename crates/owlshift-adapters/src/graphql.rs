@@ -2,16 +2,42 @@
 //! a [`Transport`] that is HTTPS in production and a replay of recorded
 //! exchanges in tests.
 //!
-//! An exchange is the request body, the HTTP status and the response body:
-//! never a header, so a recording cannot hold a credential.
+//! An exchange is the request body, the HTTP status and the response body,
+//! with the rate-limit headers alone ([`RateHeaders`]): never another header,
+//! so a recording cannot hold a credential.
 
 use serde_json::Value;
 
-/// An HTTP answer: its status and its body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An HTTP answer: its status and its body, and the rate-limit headers a
+/// forge reads ([`RateHeaders`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Response {
     pub status: u16,
     pub body: String,
+    pub rate: RateHeaders,
+}
+
+impl Response {
+    /// An answer without rate-limit headers.
+    pub fn new(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            rate: RateHeaders::default(),
+        }
+    }
+}
+
+/// The rate-limit headers of an answer, and no other: they hold no
+/// credential, so a recording that keeps them still holds none (OWL-209).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RateHeaders {
+    /// `x-ratelimit-remaining`.
+    pub remaining: Option<u64>,
+    /// `x-ratelimit-reset`, in seconds since the epoch.
+    pub reset: Option<i64>,
+    /// `retry-after`, in seconds.
+    pub retry_after: Option<u64>,
 }
 
 /// Sends one GraphQL request.

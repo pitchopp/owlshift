@@ -16,6 +16,7 @@ pub mod push;
 
 use std::fmt;
 
+use jiff::Timestamp;
 use owlshift_contracts::ids::is_repository_part;
 
 /// A row of the forge line in architecture section 6.
@@ -253,7 +254,8 @@ pub enum Mergeable {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckSet {
     pub pull_request: u64,
-    /// The commit the checks belong to: the one the caller expected.
+    /// The commit the checks belong to: the one the caller expected, or, for
+    /// watch's read, the head read.
     pub head: CommitId,
     pub state: PrState,
     pub mergeable: Mergeable,
@@ -264,6 +266,36 @@ pub struct CheckSet {
     pub merge_state: String,
     /// Every check, in the forge's order; never a partial list.
     pub checks: Vec<Check>,
+}
+
+/// What GitHub said of the query's cost (`rateLimit`, OWL-209): the points
+/// it cost, summed over its pages, and the budget left after the last one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimit {
+    pub cost: u64,
+    pub remaining: u64,
+    pub resets_at: Timestamp,
+}
+
+/// Watch's read of a pull request it follows: its check set at the head
+/// read, whoever pushed it, and the read's cost when GitHub reported it. A
+/// pull request that is not open has no checks listed: the read ends the
+/// following before any check counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestRead {
+    pub checks: CheckSet,
+    pub rate: Option<RateLimit>,
+}
+
+/// The checks of the base branch's head and of `base_at_push`, the base
+/// head of Owlshift's last push, each complete; `at_push` is `None` when it
+/// was not asked or is no commit GitHub knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseChecks {
+    pub head: CommitId,
+    pub at_head: Vec<Check>,
+    pub at_push: Option<Vec<Check>>,
+    pub rate: Option<RateLimit>,
 }
 
 /// What a check set says about the pull request.
@@ -312,7 +344,12 @@ pub enum ErrorKind {
     Unauthorized,
     /// The pull request's head is not the expected commit, or moved while
     /// its checks were read: read again once the push has landed.
+    /// [`Error::head`] is the head read, when one was.
     HeadMoved,
+    /// The forge's budget is spent: a GraphQL `RATE_LIMITED` error, or HTTP
+    /// 403 or 429 with no budget left or a `Retry-After`. Nothing is read
+    /// again before [`Error::resets_at`], when the answer gave it.
+    RateLimited,
     /// Anything else: transport, a refused request, a malformed or
     /// incomplete answer.
     Other,
@@ -323,6 +360,10 @@ pub enum ErrorKind {
 pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
+    /// For [`ErrorKind::HeadMoved`], the head read.
+    pub head: Option<CommitId>,
+    /// For [`ErrorKind::RateLimited`], when the budget resets.
+    pub resets_at: Option<Timestamp>,
 }
 
 impl Error {
@@ -330,7 +371,21 @@ impl Error {
         Self {
             kind,
             message: message.into(),
+            head: None,
+            resets_at: None,
         }
+    }
+
+    /// The error with the head read.
+    pub fn with_head(mut self, head: CommitId) -> Self {
+        self.head = Some(head);
+        self
+    }
+
+    /// The error with the time the budget resets.
+    pub fn with_reset(mut self, at: Option<Timestamp>) -> Self {
+        self.resets_at = at;
+        self
     }
 }
 

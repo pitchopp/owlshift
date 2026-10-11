@@ -324,6 +324,7 @@ mod tests {
             Ok(Response {
                 status,
                 body: String::new(),
+                ..Default::default()
             })
         }
 

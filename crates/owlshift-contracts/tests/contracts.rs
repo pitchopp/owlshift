@@ -14,7 +14,8 @@ use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requ
 use owlshift_contracts::event::Event;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    AskKind, BuildRefusal, Claim, PersistedState, TicketQuestions, claim_ref, ticket_ref,
+    AskKind, BuildRefusal, Claim, EndedWhy, PersistedState, PushKind, TicketDelivery,
+    TicketQuestions, claim_ref, ticket_ref,
 };
 use owlshift_contracts::result::{
     AnswerClass, DecisionsRefusal, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES,
@@ -2197,4 +2198,54 @@ fn a_build_refusal_is_told_within_the_cap() {
         );
         assert!(told.ends_with("A later result was refused too: unknown field"));
     }
+}
+
+/// OWL-209: `delivery.json` reads back as written, and is refused when a
+/// commit is not a full id, a branch could not be pushed or leased, the link
+/// is not https, or an ended delivery still pushes.
+#[test]
+fn a_ticket_delivery_round_trips_and_is_checked() {
+    let delivery = round_trip(
+        "ticket-delivery.json",
+        TicketDelivery::parse,
+        TicketDelivery::render,
+    );
+    assert!(delivery.followed());
+    assert_eq!(delivery.pushing.as_ref().unwrap().kind, PushKind::Fix);
+    let parse = |edit: fn(&mut Value)| TicketDelivery::parse(&edited("ticket-delivery.json", edit));
+    type Edit = fn(&mut Value);
+    let refused: [(&str, Edit); 7] = [
+        ("short commit", |v| v["pushed"] = json!("abc")),
+        ("upper-case commit", |v| {
+            v["pushing"]["base"] = json!("A".repeat(40))
+        }),
+        ("option-like branch", |v| v["branch"] = json!("--force")),
+        ("branch with a colon", |v| {
+            v["base_branch"] = json!("main:x")
+        }),
+        ("http link", |v| {
+            v["pull_request"]["url"] = json!("http://github.com/demo/project/pull/42")
+        }),
+        ("ended while pushing", |v| {
+            v["ended"] = json!({ "why": "merged", "at": "2026-10-11T12:00:00Z" })
+        }),
+        ("unknown field", |v| v["extra"] = json!(true)),
+    ];
+    for (case, edit) in refused {
+        assert!(parse(edit).is_err(), "{case}");
+    }
+    let ended = parse(|v| {
+        v.as_object_mut().unwrap().remove("pushing");
+        v["ended"] = json!({
+            "why": "head_moved", "at": "2026-10-11T12:00:00Z",
+            "head": "3333333333333333333333333333333333333333",
+        });
+    })
+    .unwrap();
+    assert_eq!(ended.ended.as_ref().unwrap().why, EndedWhy::HeadMoved);
+    assert!(!ended.followed());
+    // A first delivery's push is under way before its pull request exists.
+    let first = TicketDelivery::new("owlshift/demo-1", "main");
+    assert_eq!(TicketDelivery::parse(&first.render()).unwrap(), first);
+    assert!(!first.followed());
 }

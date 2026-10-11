@@ -3,8 +3,8 @@
 //!
 //! A fixture is a JSON file under `tests/fixtures/<adapter>/`: the exchanges one
 //! test makes, in order, each holding the request body, the HTTP status and
-//! the response body. Headers are never recorded, so no fixture holds a
-//! credential. Recording pseudonymizes every Linear account (`id`,
+//! the response body, and the rate-limit headers when the answer had any.
+//! No other header is recorded, so no fixture holds a credential. Recording pseudonymizes every Linear account (`id`,
 //! `displayName`) and reads no e-mail address at all.
 //!
 //! To record the Linear fixtures again, run the ignored recorder tests with the key in
@@ -25,7 +25,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use owlshift_adapters::graphql::{Response, Transport};
+use owlshift_adapters::graphql::{RateHeaders, Response, Transport};
 use owlshift_adapters::tracker::linear::{ApiKey, HttpTransport};
 
 /// One request and its answer.
@@ -34,9 +34,42 @@ pub struct Exchange {
     pub request: Value,
     pub status: u16,
     pub response: Value,
+    /// The answer's rate-limit headers, when it had any (OWL-209).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<Rate>,
     /// Set on an exchange made up rather than recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthesized: Option<String>,
+}
+
+/// The rate-limit headers of a recorded answer.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+}
+
+impl Rate {
+    fn of(headers: RateHeaders) -> Option<Self> {
+        (headers != RateHeaders::default()).then_some(Self {
+            remaining: headers.remaining,
+            reset: headers.reset,
+            retry_after: headers.retry_after,
+        })
+    }
+
+    fn headers(rate: Option<Self>) -> RateHeaders {
+        rate.map_or_else(RateHeaders::default, |rate| RateHeaders {
+            remaining: rate.remaining,
+            reset: rate.reset,
+            retry_after: rate.retry_after,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +144,7 @@ impl Transport for Replay {
         Ok(Response {
             status: next.status,
             body: next.response.to_string(),
+            rate: Rate::headers(next.rate),
         })
     }
 }
@@ -252,6 +286,7 @@ impl Recorder {
                 request: request.clone(),
                 status: 200,
                 response,
+                rate: None,
                 synthesized: Some(note),
             });
         }
@@ -274,6 +309,7 @@ impl Recorder {
                 request: request.clone(),
                 status: 200,
                 response: json!({ "data": { "commentCreate": { "success": true, "comment": comment } } }),
+                rate: None,
                 synthesized: Some("not posted: shaped like the recorded comments".to_owned()),
             });
         }
@@ -319,6 +355,7 @@ impl Transport for Recorder {
                     request: request.clone(),
                     status: answer.status,
                     response,
+                    rate: Rate::of(answer.rate),
                     synthesized,
                 }
             }
@@ -326,6 +363,7 @@ impl Transport for Recorder {
         let answer = Response {
             status: exchange.status,
             body: exchange.response.to_string(),
+            rate: Rate::headers(exchange.rate),
         };
         self.log.lock().unwrap().push(exchange);
         Ok(answer)

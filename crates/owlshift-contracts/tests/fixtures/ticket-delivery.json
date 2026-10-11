@@ -1,0 +1,17 @@
+{
+  "format": 1,
+  "pull_request": {
+    "number": 42,
+    "url": "https://github.com/demo/project/pull/42"
+  },
+  "branch": "owlshift/demo-1",
+  "base_branch": "main",
+  "pushed": "36f0557116ea73f9b0805980e83b360e23b99940",
+  "base_at_push": "c0c0867c0c0867c0c0867c0c0867c0c0867c0c08",
+  "rebased_onto": "c0c0867c0c0867c0c0867c0c0867c0c0867c0c08",
+  "pushing": {
+    "commit": "1111111111111111111111111111111111111111",
+    "kind": "fix",
+    "base": "2222222222222222222222222222222222222222"
+  }
+}

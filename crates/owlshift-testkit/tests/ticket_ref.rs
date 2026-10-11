@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use owlshift_adapters::forge::Repo as ForgeRepo;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{PersistedState, TicketQuestions};
+use owlshift_contracts::refs::{PersistedState, TicketDelivery, TicketQuestions};
 use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::executor::Git;
 use owlshift_runner::forget;
@@ -98,6 +98,7 @@ fn record(state: &str, round: u32) -> TicketRecord {
     TicketRecord {
         state: PersistedState::parse(state).unwrap(),
         questions: TicketQuestions::parse(&questions(round)).unwrap(),
+        delivery: None,
     }
 }
 
@@ -146,6 +147,24 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
     let stale = ticket_ref::write(&repo.git, &repo.root, &ticket(), &first, Some(&one));
     assert!(stale.is_err(), "{stale:?}");
     assert_eq!(repo.read().unwrap().unwrap().commit, two);
+
+    // A delivery is kept beside them, read back, and left out by a write
+    // whose record has none (OWL-209).
+    let delivered = TicketRecord {
+        delivery: Some(
+            TicketDelivery::parse(include_str!(
+                "../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
+            ))
+            .unwrap(),
+        ),
+        ..second.clone()
+    };
+    let three =
+        ticket_ref::write(&repo.git, &repo.root, &ticket(), &delivered, Some(&two)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, delivered);
+    let four = ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&three)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, second);
+    assert_eq!(repo.git(&["rev-parse", &format!("{four}:plan.md")]), plan);
 }
 
 /// A waiting record whose `questions.json` renders to `len` bytes, its
@@ -159,6 +178,7 @@ fn record_of(len: usize) -> TicketRecord {
         TicketRecord {
             state: PersistedState::parse(WAITING).unwrap(),
             questions: TicketQuestions::parse(&questions).unwrap(),
+            delivery: None,
         }
     };
     let base = with(1).questions.render().len();
@@ -256,6 +276,13 @@ fn kept_everything() -> TicketRecord {
             "../../owlshift-contracts/tests/fixtures/ticket-questions.json"
         ))
         .unwrap(),
+        // Forgetting drops the delivery too (OWL-209).
+        delivery: Some(
+            TicketDelivery::parse(include_str!(
+                "../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
+            ))
+            .unwrap(),
+        ),
     }
 }
 
@@ -272,6 +299,7 @@ fn forgotten(round: u32, questions: &TicketQuestions) -> TicketRecord {
             resolver_refusal: questions.resolver_refusal.clone(),
             ..TicketQuestions::new()
         },
+        delivery: None,
     }
 }
 
