@@ -319,6 +319,45 @@ fn record_stage_fixture() {
     }
 }
 
+/// The ticket whose stage is read back: OWL-112, which added the read and is
+/// Done, so the answer the fixture holds is the one Linear still gives.
+const READ_STAGE_TICKET: &str = "OWL-112";
+const READ_STAGE_FIXTURE: &str = "read-stage-owl-112.json";
+
+fn check_read_stage(tracker: &dyn Tracker) {
+    assert_eq!(tracker.stage(&id(READ_STAGE_TICKET)).unwrap(), "Done");
+    let missing = tracker.stage(&linear_case().missing).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
+}
+
+#[test]
+fn the_linear_tracker_reads_a_tickets_stage() {
+    let replay = Replay::new(READ_STAGE_FIXTURE);
+    check_read_stage(&LinearTracker::with_transport(replay.clone()));
+    replay.assert_done();
+}
+
+/// Records the stage read (OWL-112) against the live API. It only reads, and
+/// the answer is checked against the recording's, so a ticket that has moved
+/// since fails here rather than recording another stage.
+#[test]
+#[ignore = "records against the live Linear API"]
+fn record_read_stage_fixture() {
+    let key = support::live_key();
+    support::assert_owlshift_workspace(&key);
+    let recorder = Recorder::new(&key);
+    let tracker = LinearTracker::with_transport(recorder.clone());
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_read_stage(&tracker)));
+    recorder.write(
+        READ_STAGE_FIXTURE,
+        &format!("{} on the Owlshift workspace, recorded live", today()),
+    );
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Puts the issue back in the state it was found in when dropped, and says
 /// whether Linear confirms it.
 struct Restore {

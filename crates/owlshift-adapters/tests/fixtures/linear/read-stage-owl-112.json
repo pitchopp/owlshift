@@ -1,0 +1,56 @@
+{
+  "recorded": "2026-10-11 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query TicketStage($id: String!) { issue(id: $id) { state { name } } }",
+        "variables": {
+          "id": "OWL-112"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "state": {
+              "name": "Done"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query TicketStage($id: String!) { issue(id: $id) { state { name } } }",
+        "variables": {
+          "id": "OWL-99999"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": null,
+        "errors": [
+          {
+            "extensions": {
+              "code": "INPUT_ERROR",
+              "statusCode": 400,
+              "type": "invalid input",
+              "userError": true,
+              "userPresentableMessage": "Could not find referenced Issue."
+            },
+            "locations": [
+              {
+                "column": 35,
+                "line": 1
+              }
+            ],
+            "message": "Entity not found: Issue",
+            "path": [
+              "issue"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
