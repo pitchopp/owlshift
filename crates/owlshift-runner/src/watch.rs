@@ -15,9 +15,9 @@
 //! Watch whose delivery Owlshift follows ([`followed`]): its read, without
 //! the lock, decides by the core's table, and what it changes in the ticket
 //! ref is written under the lock from the ref the snapshot read
-//! ([`crate::follow`]). A fix run or a park it decides is repaired through
-//! [`OnDemand::repair_seen`] (OWL-112), held as a continue is; a rebase is
-//! decided and recorded only, for OWL-210.
+//! ([`crate::follow`]). A fix run, a rebase run or a park it decides is
+//! repaired through [`OnDemand::repair_seen`] (OWL-112, OWL-210), held as a
+//! continue is.
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -326,8 +326,9 @@ impl Watch<'_> {
 
     /// One followed pull request (OWL-209): its read and what it decides,
     /// the ticket ref written with what it changes, then its events. A fix
-    /// run or a park it decides goes to [`OnDemand::repair_seen`] (OWL-112),
-    /// held as a continue is ([`Holds`]).
+    /// run, a rebase run or a park it decides goes to
+    /// [`OnDemand::repair_seen`] (OWL-112, OWL-210), held as a continue is
+    /// ([`Holds`]).
     fn follow(
         &self,
         memory: &mut Memory,
@@ -373,7 +374,10 @@ impl Watch<'_> {
         if !matches!(
             seen.decision,
             Decision::Follow {
-                action: Action::Fix { .. } | Action::Park,
+                action: Action::Fix { .. }
+                    | Action::Park
+                    | Action::Rebase { .. }
+                    | Action::RebaseFailed { .. },
                 ..
             }
         ) {

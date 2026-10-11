@@ -63,8 +63,8 @@ use owlshift_adapters::forge::{
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, Relation, Rule,
-    ThreadEntry, TicketBrief,
+    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, RebaseBrief, Relation,
+    Rule, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
@@ -99,12 +99,13 @@ use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::resolver::{self, Fallback, Resolved};
+use crate::rebase;
 use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
     DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment, Posted,
-    QuestionsComment, ReaskComment, ReopenedChoice, ReplyComment, Restart, ResumeComment,
-    VisibleStage, WriteError, Writer, park_reason,
+    QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart,
+    ResumeComment, VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 
@@ -367,6 +368,12 @@ pub struct OnDemand<'a> {
     pub answer_check: &'a dyn Harness,
     /// Runs the resolver (`roles/resolver.md`).
     pub resolver: &'a dyn Harness,
+    /// Runs the rebase role (`roles/rebase.md`) on the Build routing: a
+    /// non-trivial conflict, or a retry after a failed fast run (OWL-210).
+    pub rebase: &'a dyn Harness,
+    /// Runs the rebase role on the fast tier (`[models].fast`, else the
+    /// standard tier's model): a trivial conflict's first run.
+    pub rebase_fast: &'a dyn Harness,
     /// What the dedicated checkout clones and fetches: the `origin` of the
     /// person's checkout.
     pub remote_url: &'a str,
@@ -781,6 +788,8 @@ enum Command {
     /// A repair of a delivered pull request, by watch or by `continue` at
     /// Watch (OWL-112): as `continue` before its run.
     Fix,
+    /// A rebase run's dispatch (OWL-210), in a repair.
+    Rebase,
 }
 
 impl Command {
@@ -789,6 +798,7 @@ impl Command {
             Command::Do => "do",
             Command::Continue => "continue",
             Command::Fix => "fix",
+            Command::Rebase => "rebase",
         }
     }
 }
@@ -1142,7 +1152,8 @@ impl OnDemand<'_> {
     /// `owlshift continue` on a ticket at Watch whose pull request is
     /// followed (OWL-209): one look, as watch's, with a memory of its own;
     /// the ref keeps what it changes, then its events are recorded. A fix
-    /// run or a park the look decides is repaired at once (OWL-112).
+    /// run, a rebase run or a park the look decides is repaired at once
+    /// (OWL-112, OWL-210).
     fn watch_once(&self, p: &mut Prepared, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
         let Some(stored) = p.stored.clone() else {
@@ -1187,10 +1198,14 @@ impl OnDemand<'_> {
         if let Some(event) = following.events(&ticket, &seen) {
             sink.emit(&ticket, None, EventKind::Decision, event);
         }
-        // A fix run or a park the read decided, which the repair reads
-        // again under this command's lock (OWL-112).
+        // A fix run, a rebase run or a park the read decided, which the
+        // repair reads again under this command's lock (OWL-112, OWL-210).
         if let FollowDecision::Follow {
-            action: FollowAction::Fix { .. } | FollowAction::Park,
+            action:
+                FollowAction::Fix { .. }
+                | FollowAction::Park
+                | FollowAction::Rebase { .. }
+                | FollowAction::RebaseFailed { .. },
             ..
         } = seen.decision
         {
@@ -1431,12 +1446,30 @@ impl OnDemand<'_> {
         gathered: &mut Gathered,
         sink: &mut EventSink<'_>,
     ) -> Result<(Ran, Event), Stop> {
-        let ran = self.execute(p, self.executor, self.build, brief, attempt, sink)?;
+        self.run_role_once(p, self.build, state, brief, attempt, gathered, sink)
+    }
+
+    /// [`Self::run_build_once`] on `harness`, for a rebase run's role too
+    /// (OWL-210); only a Build run keeps a refused result for the next one.
+    #[allow(clippy::too_many_arguments)]
+    fn run_role_once(
+        &self,
+        p: &mut Prepared,
+        harness: &dyn Harness,
+        state: &TicketState,
+        brief: &Brief,
+        attempt: u32,
+        gathered: &mut Gathered,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(Ran, Event), Stop> {
+        let ran = self.execute(p, self.executor, harness, brief, attempt, sink)?;
         if let Some(gate) = &ran.report.gate {
             gathered.gate_failure = gate.failure.clone();
         }
         let event = if ran.breaches.is_empty() {
-            self.keep_build_refusal(p, state, &ran.report.outcome)?;
+            if brief.role == Role::Build {
+                self.keep_build_refusal(p, state, &ran.report.outcome)?;
+            }
             stage_event(&ran.report.outcome, brief).0
         } else {
             Event::Quarantined
@@ -2520,7 +2553,7 @@ impl OnDemand<'_> {
             resources: Vec::new(),
             rules: rules.to_vec(),
             permissions: Permissions {
-                level: if build {
+                level: if build || role == Role::Rebase {
                     PermissionLevel::WriteWorktree
                 } else {
                     PermissionLevel::ReadOnly
@@ -2539,6 +2572,7 @@ impl OnDemand<'_> {
             decisions_refused: false,
             refused_choices: Vec::new(),
             check_failure: None,
+            rebase: None,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }
     }
@@ -2584,6 +2618,7 @@ impl OnDemand<'_> {
             commit: commit.to_string(),
             kind: PushKind::Delivery,
             base: base_at_push.clone(),
+            onto: None,
         });
         let questions = p.questions();
         self.store_delivery(p, state, questions, Some(kept.clone()))
@@ -2671,6 +2706,7 @@ impl OnDemand<'_> {
             decisions,
             followups: gathered.followups,
             fix_pass: None,
+            rebase: None,
         };
         let comment = writer
             .post_delivery_report(&delivery_report)
@@ -2789,16 +2825,59 @@ pub fn repairs_in(stage: &str, states: &States) -> bool {
         || states.parked.as_deref() == Some(stage)
 }
 
-/// What a fix run delivered, for its push and its report.
-struct Fixed {
+/// What a fix or rebase run delivered, for its push and its report.
+struct Repaired {
     commit: CommitId,
     summary: String,
     gate: Gate,
 }
 
+/// Which repair a push carries (OWL-112, OWL-210).
+enum RepairKind {
+    /// A fix run's, answering these failed checks: a fast-forward.
+    Fix { checks: Vec<String> },
+    /// A rebase run's, onto this base commit: the one push that replaces
+    /// the branch's history.
+    Rebase { onto: CommitId },
+}
+
+impl RepairKind {
+    fn what(&self) -> &'static str {
+        match self {
+            Self::Fix { .. } => "fix",
+            Self::Rebase { .. } => "rebase",
+        }
+    }
+}
+
+/// What a repair's runs need of their kind ([`OnDemand::repair_runs`]).
+struct RepairRun<'r> {
+    role: Role,
+    /// `fix` or `rebase`, for what the runner tells.
+    what: &'static str,
+    pull_request: u64,
+    rules: &'r [Rule],
+    /// The harness of each attempt, from 1.
+    harness: &'r dyn Fn(u32) -> &'r dyn Harness,
+    /// Done before each attempt, from 1, before its brief is built.
+    before: &'r dyn Fn(&Prepared, u32, &mut EventSink<'_>) -> Result<(), Stop>,
+    /// What the kind adds to each brief.
+    decorate: &'r dyn Fn(&mut Brief, &TicketQuestions),
+    /// Whether a `done`'s gated commit is one to push, or why not: a failed
+    /// run then.
+    accept: &'r dyn Fn(&CommitId) -> Result<(), String>,
+}
+
+/// A repair's runs ended on a commit to push.
+struct RepairDone {
+    state: TicketState,
+    repaired: Repaired,
+}
+
 impl OnDemand<'_> {
     /// A repair for `owlshift watch` (OWL-112): what `continue` does for a
-    /// ticket at Watch whose read decided a fix run or a park, run only
+    /// ticket at Watch whose read decided a fix run, a rebase run (OWL-210)
+    /// or a park, run only
     /// while the ticket ref, read under the project's lock, is still `seen`,
     /// the commit watch read it at. `None`, with nothing run, kept or
     /// recorded, when the project is busy, or the ref moved or no longer
@@ -2835,7 +2914,11 @@ impl OnDemand<'_> {
     /// parks the ticket (`ForgeBlocked`); a fix run parks it at a bound
     /// (`FixDue`), or runs the build role at Watch on the failed checks
     /// ([`fix::check_failure`]), and its commit is pushed with a lease and
-    /// reported. Any other decision runs nothing and is told as a look.
+    /// reported. A conflict, or a red the base has fixed since, gets a
+    /// rebase run ([`Self::repair_rebase`], OWL-210), and a conflict with
+    /// the base its last rebase was pushed onto a failed run of that rebase
+    /// ([`Self::rebase_failed`]). Any other decision runs nothing and is
+    /// told as a look.
     fn repair(
         &self,
         p: &mut Prepared,
@@ -2864,7 +2947,11 @@ impl OnDemand<'_> {
         let action = match &fresh.decision {
             FollowDecision::Follow {
                 adopt: false,
-                action: action @ (FollowAction::Fix { .. } | FollowAction::Park),
+                action:
+                    action @ (FollowAction::Fix { .. }
+                    | FollowAction::Park
+                    | FollowAction::Rebase { .. }
+                    | FollowAction::RebaseFailed { .. }),
             } => action.clone(),
             // Anything else is a look's: the next one keeps it.
             _ => {
@@ -2894,6 +2981,15 @@ impl OnDemand<'_> {
                  in: pull request #{} gets no repair while it stays there",
                 pr.number
             )));
+        }
+        match action {
+            FollowAction::Rebase { refresh, .. } => {
+                return self.repair_rebase(p, state, &delivery, &pr, &pushed, refresh, sink);
+            }
+            FollowAction::RebaseFailed { .. } => {
+                return Err(self.rebase_failed(p, state, &delivery, &pr, sink));
+            }
+            _ => {}
         }
         let failed: Vec<&Check> = fresh
             .checks
@@ -2930,7 +3026,7 @@ impl OnDemand<'_> {
                 ));
             }
             FollowAction::Fix { overdue } => overdue,
-            _ => unreachable!("only a fix or a park is repaired"),
+            _ => unreachable!("only a fix or a park is left to repair"),
         };
         match state.apply(PIPELINE, Event::FixDue) {
             Ok(Transition::To(due)) => state = due,
@@ -2969,18 +3065,18 @@ impl OnDemand<'_> {
         {
             let commit = CommitId::new(pushing.commit.as_str())
                 .map_err(|e| refused("the commit under way", e))?;
-            let fixed = Fixed {
+            let fixed = Repaired {
                 commit,
                 summary: "The fix run's commit, whose push had no answer, pushed again.".to_owned(),
                 gate: Gate::NotRecorded,
             };
-            return self.push_fix(
+            return self.push_repair(
                 p,
                 state,
                 &delivery,
                 &pushed_id,
                 fixed,
-                names,
+                RepairKind::Fix { checks: names },
                 Vec::new(),
                 sink,
             );
@@ -3009,130 +3105,45 @@ impl OnDemand<'_> {
                 ),
             })
         })?;
-        let current = person(p.current()?, &p.found);
         let dispatched = self.dispatch(p, Command::Fix, sink)?;
-        let mut gathered = Gathered::default();
-        let mut attempt = 0u32;
-        let fixed = loop {
-            attempt += 1;
-            let comments = self.comments(&p.ticket)?;
-            let mut brief = self.brief(
-                p,
-                Role::Build,
-                &comments,
-                &dispatched.rules,
-                gathered.gate_failure.clone(),
-                &current,
-            );
+        let build = |_: u32| self.build;
+        let decorate = |brief: &mut Brief, questions: &TicketQuestions| {
             brief.check_failure = Some(failure.clone());
-            tell_build(&mut brief, &p.questions());
-            let (ran, mut event) =
-                self.run_build_once(p, &state, &brief, attempt, &mut gathered, sink)?;
-            let mut detail = None;
-            let gated = ran
-                .report
-                .gate
-                .as_ref()
-                .filter(|gate| gate.passed())
-                .and_then(|gate| gate.commit.as_deref())
-                .and_then(|commit| CommitId::new(commit).ok());
-            if event == Event::Completed {
-                match (&gated, ran.result()) {
-                    (Some(commit), Some(result)) if *commit != pushed_id => {
-                        break Fixed {
-                            commit: commit.clone(),
-                            summary: result.summary.clone(),
-                            gate: Gate::Passed(
-                                ran.report
-                                    .gate
-                                    .as_ref()
-                                    .map(|g| g.commands.clone())
-                                    .unwrap_or_default(),
-                            ),
-                        };
-                    }
-                    _ => {
-                        // A `done` that adds no commit fixed nothing.
-                        event = Event::RunFailed;
-                        detail = Some(format!(
-                            "the fix run ended done without a commit on top of {pushed}"
-                        ));
-                    }
-                }
-            }
-            if event == Event::Questions {
-                // Deviation until OWL-211: the questions park the ticket,
-                // listed in the PARKED comment, instead of a round that
-                // returns to Watch.
-                let parked = match state.apply(PIPELINE, Event::Blocked) {
-                    Ok(Transition::Parked { state, .. }) => state,
-                    other => return Err(core_error(other)),
-                };
-                let questions: Vec<String> = ran
-                    .result()
-                    .map(|result| {
-                        result
-                            .questions
-                            .iter()
-                            .map(|q| format!("{}: {}", q.id, q.text))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let summary = ran.result().map(|r| r.summary.clone()).unwrap_or_default();
-                let detail = format!(
-                    "the fix run of pull request #{} asks before it can go on: {summary} \
-                     Questions: {}. Answer on the ticket, then type `owlshift continue {ticket}`",
-                    pr.number,
-                    questions.join(" ")
-                );
-                return Err(self.park_with(
-                    p,
-                    &parked,
-                    ParkReason::Blocked,
-                    Some(&ran.run),
-                    detail,
-                    None,
-                    Vec::new(),
-                    sink,
-                ));
-            }
-            match state.apply(PIPELINE, event) {
-                Ok(Transition::To(next)) => {
-                    state = next;
-                    self.keep(p, &state)?;
-                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-                        return Err(Stop::UsageLimit { resets_at });
-                    }
-                }
-                Ok(Transition::Parked {
-                    state: parked,
-                    reason,
-                }) => {
-                    return Err(match detail {
-                        Some(detail) => self.park_with(
-                            p,
-                            &parked,
-                            reason,
-                            Some(&ran.run),
-                            detail,
-                            None,
-                            Vec::new(),
-                            sink,
-                        ),
-                        None => self.park(p, &parked, reason, &ran, None, Vec::new(), sink),
-                    });
-                }
-                other => return Err(core_error(other)),
+            tell_build(brief, questions);
+        };
+        let accept = |commit: &CommitId| {
+            // A `done` that adds no commit fixed nothing.
+            if *commit == pushed_id {
+                Err(format!(
+                    "the fix run ended done without a commit on top of {pushed}"
+                ))
+            } else {
+                Ok(())
             }
         };
-        self.push_fix(
+        let (fixed, followups) = self.repair_runs(
             p,
             state,
+            &RepairRun {
+                role: Role::Build,
+                what: "fix",
+                pull_request: pr.number,
+                rules: &dispatched.rules,
+                harness: &build,
+                before: &|_, _, _| Ok(()),
+                decorate: &decorate,
+                accept: &accept,
+            },
+            sink,
+        )?;
+        self.push_repair(
+            p,
+            fixed.state,
             &delivery,
             &pushed_id,
-            fixed,
-            names,
-            gathered.followups,
+            fixed.repaired,
+            RepairKind::Fix { checks: names },
+            followups,
             sink,
         )
     }
@@ -3188,49 +3199,466 @@ impl OnDemand<'_> {
         Ok(Some(head))
     }
 
-    /// Pushes a fix run's commit with a lease on `pushed` (architecture
-    /// section 5, "The fix run"): the ref keeps the push under way first;
-    /// a push that lands gives `FixPushed`, the ref keeps it, and the
-    /// DELIVERY report names the pass. A push the remote rejects while the
-    /// branch is still at `pushed` is the forge refusing Owlshift's own
-    /// push, which parks the ticket; one rejected because the branch moved
-    /// is someone's push, which ends the following at the next read. A push
-    /// with no verdict is a failed run, its commit pushed again next time.
+    /// The runs of a repair, from `state` at Watch, until one ends `done`
+    /// on a gated commit `run.accept` takes (OWL-112, OWL-210): each attempt
+    /// gets `run.before`, then the role on `run.harness`'s harness for its
+    /// number, briefed with the gate failure of the attempt before it. A
+    /// failed run, a refused result, a usage limit, a breach or a bound go
+    /// as for a Build run, a `done` whose commit `run.accept` refuses is a
+    /// failed run; questions park the ticket, listed in its PARKED comment,
+    /// until OWL-211 opens a round that returns to Watch.
+    fn repair_runs(
+        &self,
+        p: &mut Prepared,
+        mut state: TicketState,
+        run: &RepairRun<'_>,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(RepairDone, Vec<Followup>), Stop> {
+        let ticket = p.ticket.clone();
+        let current = person(p.current()?, &p.found);
+        let mut gathered = Gathered::default();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            (run.before)(p, attempt, sink)?;
+            let comments = self.comments(&p.ticket)?;
+            let mut brief = self.brief(
+                p,
+                run.role,
+                &comments,
+                run.rules,
+                gathered.gate_failure.clone(),
+                &current,
+            );
+            (run.decorate)(&mut brief, &p.questions());
+            let harness = (run.harness)(attempt);
+            let (ran, mut event) =
+                self.run_role_once(p, harness, &state, &brief, attempt, &mut gathered, sink)?;
+            let mut detail = None;
+            let gated = ran
+                .report
+                .gate
+                .as_ref()
+                .filter(|gate| gate.passed())
+                .and_then(|gate| gate.commit.as_deref())
+                .and_then(|commit| CommitId::new(commit).ok());
+            if event == Event::Completed {
+                let why = match (&gated, ran.result()) {
+                    (Some(commit), Some(result)) => match (run.accept)(commit) {
+                        Ok(()) => {
+                            let repaired = Repaired {
+                                commit: commit.clone(),
+                                summary: result.summary.clone(),
+                                gate: Gate::Passed(
+                                    ran.report
+                                        .gate
+                                        .as_ref()
+                                        .map(|g| g.commands.clone())
+                                        .unwrap_or_default(),
+                                ),
+                            };
+                            return Ok((RepairDone { state, repaired }, gathered.followups));
+                        }
+                        Err(why) => why,
+                    },
+                    _ => format!("the {} run ended done without a gated commit", run.what),
+                };
+                event = Event::RunFailed;
+                detail = Some(why);
+            }
+            if event == Event::Questions {
+                // Deviation until OWL-211: the questions park the ticket,
+                // listed in the PARKED comment, instead of a round that
+                // returns to Watch.
+                let parked = match state.apply(PIPELINE, Event::Blocked) {
+                    Ok(Transition::Parked { state, .. }) => state,
+                    other => return Err(core_error(other)),
+                };
+                let questions: Vec<String> = ran
+                    .result()
+                    .map(|result| {
+                        result
+                            .questions
+                            .iter()
+                            .map(|q| format!("{}: {}", q.id, q.text))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let summary = ran.result().map(|r| r.summary.clone()).unwrap_or_default();
+                let detail = format!(
+                    "the {} run of pull request #{} asks before it can go on: {summary} \
+                     Questions: {}. Answer on the ticket, then type `owlshift continue {ticket}`",
+                    run.what,
+                    run.pull_request,
+                    questions.join(" ")
+                );
+                return Err(self.park_with(
+                    p,
+                    &parked,
+                    ParkReason::Blocked,
+                    Some(&ran.run),
+                    detail,
+                    None,
+                    Vec::new(),
+                    sink,
+                ));
+            }
+            match state.apply(PIPELINE, event) {
+                Ok(Transition::To(next)) => {
+                    state = next;
+                    self.keep(p, &state)?;
+                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
+                        return Err(Stop::UsageLimit { resets_at });
+                    }
+                }
+                Ok(Transition::Parked {
+                    state: parked,
+                    reason,
+                }) => {
+                    return Err(match detail {
+                        Some(detail) => self.park_with(
+                            p,
+                            &parked,
+                            reason,
+                            Some(&ran.run),
+                            detail,
+                            None,
+                            Vec::new(),
+                            sink,
+                        ),
+                        None => self.park(p, &parked, reason, &ran, None, Vec::new(), sink),
+                    });
+                }
+                other => return Err(core_error(other)),
+            }
+        }
+    }
+
+    /// A rebase run of the followed pull request (OWL-210, architecture
+    /// section 5, "Conflicts and the rebase run"), its stage already read:
+    /// `RebaseDue` first, which parks at the repairs' bound. A rebase whose
+    /// push had no verdict is pushed again without a run. Otherwise the
+    /// conflict is classified ([`rebase::classify`]) between `pushed` and
+    /// the base commit resolved after the fetch, which the run rebases
+    /// onto: a trivial one's first run is on the fast tier, any other run
+    /// on the Build routing, and a failed run gets one more before the
+    /// ticket parks. Each attempt starts from a fresh worktree at `pushed`
+    /// ([`Self::reset_worktree`]). A `done` is pushed only when its gated
+    /// commit is a rebase of the delivery onto the base that keeps its
+    /// change ([`rebase_keeps_delivery`]); the runner pushes it, leased on
+    /// `pushed`, never the agent.
     #[allow(clippy::too_many_arguments)]
-    fn push_fix(
+    fn repair_rebase(
+        &self,
+        p: &mut Prepared,
+        mut state: TicketState,
+        delivery: &TicketDelivery,
+        pr: &DeliveredPullRequest,
+        pushed: &str,
+        refresh: bool,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        match state.apply(PIPELINE, Event::RebaseDue) {
+            Ok(Transition::To(due)) => state = due,
+            Ok(Transition::Parked {
+                state: parked,
+                reason,
+            }) => {
+                let detail = format!(
+                    "pull request #{} needs a rebase again after {} repairs of its delivery, the \
+                     most one delivery gets. Rebase it by hand and push, which ends Owlshift's \
+                     following of it",
+                    pr.number,
+                    state.repairs()
+                );
+                return Err(self.park_with(
+                    p,
+                    &parked,
+                    reason,
+                    None,
+                    detail,
+                    None,
+                    Vec::new(),
+                    sink,
+                ));
+            }
+            other => return Err(core_error(other)),
+        }
+        let pushed_id = CommitId::new(pushed).map_err(|e| refused("the pushed commit", e))?;
+        // A rebase whose push had no verdict is pushed again, without a run,
+        // against the base it was rebased onto.
+        if let Some(pushing) = &delivery.pushing
+            && pushing.kind == PushKind::Rebase
+            && let Some(kept_onto) = &pushing.onto
+            && self.branch_head(p).as_deref() == Some(pushing.commit.as_str())
+        {
+            let commit = CommitId::new(pushing.commit.as_str())
+                .map_err(|e| refused("the commit under way", e))?;
+            let kept_onto =
+                CommitId::new(kept_onto.as_str()).map_err(|e| refused("the rebase's base", e))?;
+            let repaired = Repaired {
+                commit,
+                summary: "The rebase run's commit, whose push had no answer, pushed again."
+                    .to_owned(),
+                gate: Gate::NotRecorded,
+            };
+            return self.push_repair(
+                p,
+                state,
+                delivery,
+                &pushed_id,
+                repaired,
+                RepairKind::Rebase { onto: kept_onto },
+                Vec::new(),
+                sink,
+            );
+        }
+        let onto =
+            CommitId::new(p.base.commit.as_str()).map_err(|e| refused("the base commit", e))?;
+        let git = &self.executor.git;
+        let checkout = p.checkout.clone();
+        let contains_base = git
+            .output(
+                &checkout,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    "--end-of-options",
+                    onto.as_str(),
+                    pushed,
+                ],
+                None,
+            )
+            .is_ok_and(|out| out.success());
+        if contains_base {
+            return Err(Stop::Refused(format!(
+                "pull request #{}'s head {pushed} already contains the base's head {onto}: there \
+                 is nothing to rebase, and no run starts",
+                pr.number
+            )));
+        }
+        let classified = rebase::classify(git, &checkout, onto.as_str(), pushed, !refresh);
+        let dispatched = self.dispatch(p, Command::Rebase, sink)?;
+        let fast = |attempt: u32| classified.trivial && attempt == 1;
+        let harness = |attempt: u32| {
+            if fast(attempt) {
+                self.rebase_fast
+            } else {
+                self.rebase
+            }
+        };
+        let before = |p: &Prepared, attempt: u32, sink: &mut EventSink<'_>| {
+            self.reset_worktree(p, &pushed_id)?;
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Decision,
+                data([
+                    ("watch", json!("rebase_run")),
+                    ("pull_request", json!(pr.number)),
+                    ("attempt", json!(attempt)),
+                    ("tier", json!(if fast(attempt) { "fast" } else { "build" })),
+                    ("trivial", json!(classified.trivial)),
+                    ("refresh", json!(refresh)),
+                    ("onto", json!(onto.as_str())),
+                    ("conflicting", json!(classified.paths)),
+                ]),
+            );
+            Ok(())
+        };
+        let told = RebaseBrief {
+            pull_request: pr.number,
+            url: pr.url.clone(),
+            branch: p.branch.clone(),
+            head: pushed.to_owned(),
+            base_branch: delivery.base_branch.clone(),
+            onto: onto.to_string(),
+            refresh,
+            conflicting: classified.paths.clone(),
+        };
+        let decorate = |brief: &mut Brief, _: &TicketQuestions| {
+            brief.rebase = Some(told.clone());
+        };
+        let accept =
+            |commit: &CommitId| rebase_keeps_delivery(git, &checkout, &pushed_id, &onto, commit);
+        let ran = self.repair_runs(
+            p,
+            state,
+            &RepairRun {
+                role: Role::Rebase,
+                what: "rebase",
+                pull_request: pr.number,
+                rules: &dispatched.rules,
+                harness: &harness,
+                before: &before,
+                decorate: &decorate,
+                accept: &accept,
+            },
+            sink,
+        );
+        let (done, followups) = match ran {
+            Ok(done) => done,
+            Err(stop) => {
+                // The ticket's branch goes back to Owlshift's last push, so a
+                // fix run that comes next starts from it; a breach's worktree
+                // is left for the person who looks.
+                if !matches!(
+                    stop,
+                    Stop::Parked {
+                        reason: ParkReason::IsolationBreach,
+                        ..
+                    }
+                ) {
+                    let _ = self.reset_worktree(p, &pushed_id);
+                }
+                return Err(stop);
+            }
+        };
+        self.push_repair(
+            p,
+            done.state,
+            delivery,
+            &pushed_id,
+            done.repaired,
+            RepairKind::Rebase { onto },
+            followups,
+            sink,
+        )
+    }
+
+    /// The pull request conflicts with the base its last rebase was pushed
+    /// onto (OWL-210): a failed run of that rebase, counted with the
+    /// ticket's other failed runs, and no second rebase onto the same base
+    /// head runs. The first such read keeps the count; one more parks.
+    fn rebase_failed(
+        &self,
+        p: &mut Prepared,
+        state: TicketState,
+        delivery: &TicketDelivery,
+        pr: &DeliveredPullRequest,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let onto = delivery.rebased_onto.as_deref().unwrap_or("its base");
+        let detail = format!(
+            "pull request #{} still conflicts with {onto}, the base its last rebase was pushed \
+             onto: a failed run of that rebase, counted with the ticket's other failed runs, and \
+             no second rebase onto the same base head runs. Resolve the conflict by hand and \
+             push, which ends Owlshift's following of it",
+            pr.number
+        );
+        match state.apply(PIPELINE, Event::RunFailed) {
+            Ok(Transition::To(failed)) => match self.keep(p, &failed) {
+                Ok(()) => Stop::Refused(format!(
+                    "{detail}; a new commit on the base starts a new rebase, and one more such \
+                     read parks the ticket"
+                )),
+                Err(stop) => stop,
+            },
+            Ok(Transition::Parked {
+                state: parked,
+                reason,
+            }) => self.park_with(p, &parked, reason, None, detail, None, Vec::new(), sink),
+            other => core_error(other),
+        }
+    }
+
+    /// The ticket's worktree made anew at `pushed` before a rebase attempt
+    /// (OWL-210), so no attempt starts from an earlier one's rebase, its
+    /// conflicts or a detached head: the worktree's folder is removed by
+    /// the file system alone, no git running in it, then the dedicated
+    /// checkout forgets it and moves the ticket's branch to `pushed`; the
+    /// executor adds the worktree again on that branch.
+    fn reset_worktree(&self, p: &Prepared, pushed: &CommitId) -> Result<(), Stop> {
+        if fs::symlink_metadata(&p.worktree).is_ok() {
+            fs::remove_dir_all(&p.worktree)
+                .map_err(|e| refused("removing the ticket's worktree before a rebase run", e))?;
+        }
+        let git = &self.executor.git;
+        git.run(&p.checkout, &["worktree", "prune"])
+            .map_err(|e| refused("pruning the ticket's worktree", e))?;
+        let branch = format!("refs/heads/{}", p.branch);
+        git.run(&p.checkout, &["update-ref", &branch, pushed.as_str()])
+            .map_err(|e| refused("moving the ticket's branch to its last push", e))?;
+        Ok(())
+    }
+
+    /// The ticket's branch's head in the dedicated checkout, when it has one.
+    fn branch_head(&self, p: &Prepared) -> Option<String> {
+        let name = format!("refs/heads/{}", p.branch);
+        self.executor
+            .git
+            .run(
+                &p.checkout,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "--end-of-options",
+                    &name,
+                ],
+            )
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+            .filter(|head| !head.is_empty())
+    }
+
+    /// Pushes a fix or rebase run's commit with a lease on `pushed`
+    /// (architecture section 5, "The fix run", "Conflicts and the rebase
+    /// run"): the ref keeps the push under way first; a push that lands
+    /// gives `FixPushed` or `RebasePushed`, the ref keeps it (for a rebase,
+    /// with the base it was rebased onto, `rebased_onto`), and the DELIVERY
+    /// report names the pass or the rebase. A fix is pushed as a
+    /// fast-forward ([`Writer::push_leased`]), a rebase replaces the
+    /// branch's history ([`Writer::push_rebased`]). A push the remote
+    /// rejects while the branch is still at `pushed` is the forge refusing
+    /// Owlshift's own push, which parks the ticket; one rejected because the
+    /// branch moved is someone's push, which ends the following at the next
+    /// read. A push with no verdict is a failed run, its commit pushed again
+    /// next time.
+    #[allow(clippy::too_many_arguments)]
+    fn push_repair(
         &self,
         p: &mut Prepared,
         mut state: TicketState,
         delivery: &TicketDelivery,
         pushed: &CommitId,
-        fixed: Fixed,
-        checks: Vec<String>,
+        repaired: Repaired,
+        kind: RepairKind,
         followups: Vec<Followup>,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
+        let what = kind.what();
         let head = Branch::new(&delivery.branch).map_err(|e| refused("the ticket's branch", e))?;
         let base = Branch::new(&delivery.base_branch).map_err(|e| refused("the base branch", e))?;
-        let commit = fixed.commit;
+        let commit = repaired.commit;
         let base_at_push = self.base_head(p, &base, &ticket, sink);
         let mut kept = delivery.clone();
         kept.pushing = Some(Pushing {
             commit: commit.to_string(),
-            kind: PushKind::Fix,
+            kind: match kind {
+                RepairKind::Fix { .. } => PushKind::Fix,
+                RepairKind::Rebase { .. } => PushKind::Rebase,
+            },
             base: base_at_push.clone(),
+            onto: match &kind {
+                RepairKind::Fix { .. } => None,
+                RepairKind::Rebase { onto } => Some(onto.to_string()),
+            },
         });
         let questions = p.questions();
         self.store_delivery(p, &state, questions, Some(kept.clone()))
             .map_err(|e| refused("keeping the push in the ticket's ref", e))?;
         let writer = Writer::new(self.tracker);
-        let landed = writer.push_leased(
-            &self.executor.git,
-            &p.checkout,
-            "origin",
-            &commit,
-            &head,
-            pushed,
-        );
+        let git = &self.executor.git;
+        let landed = match &kind {
+            RepairKind::Fix { .. } => {
+                writer.push_leased(git, &p.checkout, "origin", &commit, &head, pushed)
+            }
+            RepairKind::Rebase { onto } => {
+                writer.push_rebased(git, &p.checkout, "origin", &commit, &head, pushed, onto)
+            }
+        };
         match landed {
             Ok(landed) => {
                 sink.emit(
@@ -3312,27 +3740,32 @@ impl OnDemand<'_> {
                     None,
                     EventKind::Warning,
                     data([
-                        ("what", json!("fix_head_unread")),
+                        ("what", json!(format!("{what}_head_unread"))),
                         ("commit", json!(commit.as_str())),
                         ("reason", json!(reason)),
                     ]),
                 );
                 return Err(Stop::Delivery(format!(
-                    "the fix {commit} was pushed, but its pull request could not be read at it: \
-                     {reason}; watch adopts the push at its next read, and no report is posted"
+                    "the {what} {commit} was pushed, but its pull request could not be read at \
+                     it: {reason}; watch adopts the push at its next read, and no report is posted"
                 )));
             }
         };
-        state = match state.apply(PIPELINE, Event::FixPushed) {
+        let event = match kind {
+            RepairKind::Fix { .. } => Event::FixPushed,
+            RepairKind::Rebase { .. } => Event::RebasePushed,
+        };
+        state = match state.apply(PIPELINE, event) {
             Ok(Transition::To(next)) => next,
             other => return Err(core_error(other)),
         };
-        kept.pushed = Some(commit.to_string());
-        kept.base_at_push = Some(base_at_push);
-        kept.pushing = None;
+        if let Some(pushing) = kept.pushing.take() {
+            follow::landed(&mut kept, pushing);
+        }
         let questions = p.questions();
-        self.store_delivery(p, &state, questions, Some(kept))
-            .map_err(|e| Stop::Delivery(format!("keeping the fix in the ticket's ref: {e}")))?;
+        self.store_delivery(p, &state, questions, Some(kept)).map_err(|e| {
+            Stop::Delivery(format!("keeping the {what} in the ticket's ref: {e}"))
+        })?;
         let checks_read = self.forge.checks(pull_request.number, &commit);
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let decisions: Vec<Decision> = p
@@ -3341,18 +3774,35 @@ impl OnDemand<'_> {
             .iter()
             .map(resolver::reported)
             .collect();
+        let (fix_pass, rebase, counted) = match kind {
+            RepairKind::Fix { checks } => (
+                Some(FixPass {
+                    pass: state.fix_passes(),
+                    checks,
+                }),
+                None,
+                ("fix_pass", state.fix_passes()),
+            ),
+            RepairKind::Rebase { onto } => (
+                None,
+                Some(Rebased {
+                    base_branch: delivery.base_branch.clone(),
+                    onto,
+                    repair: state.repairs(),
+                }),
+                ("repair", state.repairs()),
+            ),
+        };
         let report = DeliveryReport {
             ticket: ticket.clone(),
-            summary: fixed.summary,
+            summary: repaired.summary,
             pull_request: pull_request.clone(),
             checks: checks_read,
-            gate: fixed.gate,
+            gate: repaired.gate,
             decisions,
             followups,
-            fix_pass: Some(FixPass {
-                pass: state.fix_passes(),
-                checks,
-            }),
+            fix_pass,
+            rebase,
         };
         let comment = match writer.post_delivery_report(&report) {
             Ok(comment) => comment,
@@ -3362,14 +3812,14 @@ impl OnDemand<'_> {
                     None,
                     EventKind::Warning,
                     data([
-                        ("what", json!("fix_report_unposted")),
+                        ("what", json!(format!("{what}_report_unposted"))),
                         ("commit", json!(commit.as_str())),
                         ("reason", json!(error.to_string())),
                     ]),
                 );
                 return Err(Stop::Delivery(format!(
-                    "the fix {commit} was pushed and kept, but its delivery report could not be \
-                     posted: {error}"
+                    "the {what} {commit} was pushed and kept, but its delivery report could not \
+                     be posted: {error}"
                 )));
             }
         };
@@ -3382,7 +3832,7 @@ impl OnDemand<'_> {
                 ("action", json!("comment")),
                 ("kind", json!("DELIVERY")),
                 ("comment", json!(comment.id)),
-                ("fix_pass", json!(state.fix_passes())),
+                (counted.0, json!(counted.1)),
             ]),
         );
         Ok(Delivered {
@@ -3843,6 +4293,7 @@ fn pushed_name(pushed: Pushed) -> &'static str {
         Pushed::Created => "created",
         Pushed::FastForward => "fast_forward",
         Pushed::UpToDate => "up_to_date",
+        Pushed::Forced => "forced",
     }
 }
 

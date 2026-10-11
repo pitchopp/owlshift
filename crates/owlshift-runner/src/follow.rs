@@ -24,7 +24,7 @@ use owlshift_adapters::forge::{
     PrState, PullRequestRead, Verdict,
 };
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Ended, EndedWhy, PushKind, TicketDelivery};
+use owlshift_contracts::refs::{Ended, EndedWhy, PushKind, Pushing, TicketDelivery};
 use owlshift_core::follow::{
     self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
 };
@@ -492,10 +492,25 @@ fn ended_why(reason: EndReason) -> EndedWhy {
     }
 }
 
+/// What `delivery` keeps once Owlshift's push under way shows as the head,
+/// whether its command saw it land or a later read adopted it: the pushed
+/// commit, the base head read before the push, and for a rebase run's push
+/// the base it rebased onto (OWL-210), which a conflict read against it
+/// makes a failed run of that rebase.
+pub fn landed(delivery: &mut TicketDelivery, pushing: Pushing) {
+    delivery.pushed = Some(pushing.commit);
+    delivery.base_at_push = Some(pushing.base);
+    if let Some(onto) = pushing.onto {
+        delivery.rebased_onto = Some(onto);
+    }
+}
+
 /// The record `seen` leaves in the ticket ref, `None` when it changes
 /// nothing: the following ended, a push adopted, or the fix passes and
 /// failed runs cleared by a green read (`ChecksGreen`). A fix, a rebase or a
-/// park is decided only: OWL-112 and OWL-210 run them.
+/// park is decided only: the repair runs them ([`OnDemand::repair_seen`]).
+///
+/// [`OnDemand::repair_seen`]: crate::on_demand::OnDemand::repair_seen
 pub fn changed(
     record: &TicketRecord,
     pipeline: Pipeline,
@@ -519,14 +534,19 @@ pub fn changed(
         }
         Decision::Follow { adopt, action } => {
             if *adopt && let Some(pushing) = delivery.pushing.take() {
-                delivery.pushed = Some(pushing.commit);
-                delivery.base_at_push = Some(pushing.base);
-                // A fix push a crash cut short counts as the run would have
-                // (OWL-112), when the bounds still allow it: a stuck count
-                // never stops the following.
-                if pushing.kind == PushKind::Fix {
+                let event = match pushing.kind {
+                    PushKind::Fix => Some(Event::FixPushed),
+                    PushKind::Rebase => Some(Event::RebasePushed),
+                    PushKind::Delivery => None,
+                };
+                landed(&mut delivery, pushing);
+                // A fix or rebase push a crash cut short counts as the run
+                // would have (OWL-112, OWL-210), when the bounds still allow
+                // it: a stuck count never stops the following. No report is
+                // posted for it.
+                if let Some(event) = event {
                     let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
-                    if let Ok(Transition::To(pushed)) = state.apply(pipeline, Event::FixPushed) {
+                    if let Ok(Transition::To(pushed)) = state.apply(pipeline, event) {
                         next.state = (&pushed).into();
                     }
                 }
@@ -575,6 +595,7 @@ mod tests {
     const PUSHED: &str = "1111111111111111111111111111111111111111";
     const PUSHING: &str = "2222222222222222222222222222222222222222";
     const BASE: &str = "3333333333333333333333333333333333333333";
+    const ONTO: &str = "4444444444444444444444444444444444444444";
 
     /// Answers with prepared responses, in order, counting the requests.
     #[derive(Clone, Default)]
@@ -856,6 +877,7 @@ mod tests {
             commit: PUSHING.to_owned(),
             kind: PushKind::Fix,
             base: BASE.to_owned(),
+            onto: None,
         });
         let adopted = seen_with(
             Decision::Follow {
@@ -890,6 +912,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(TicketState::try_from(&kept.state).unwrap(), bound);
+        // A rebase push adopted counts a repair and keeps the base it was
+        // rebased onto (OWL-210).
+        let mut rebase = delivery();
+        rebase.pushing = Some(Pushing {
+            commit: PUSHING.to_owned(),
+            kind: PushKind::Rebase,
+            base: BASE.to_owned(),
+            onto: Some(ONTO.to_owned()),
+        });
+        let rebased = changed(&record(rebase, watching(1)), pipeline, &adopted, at(0))
+            .unwrap()
+            .unwrap();
+        let state = TicketState::try_from(&rebased.state).unwrap();
+        assert_eq!((state.repairs(), state.failed_runs()), (1, 0));
+        let rebased = rebased.delivery.unwrap();
+        assert_eq!(
+            (rebased.base_at_push.as_deref(), rebased.rebased_onto.as_deref()),
+            (Some(BASE), Some(ONTO))
+        );
 
         let moved = seen_with(Decision::End(EndReason::HeadMoved), PUSHING);
         let ended = changed(&plain, pipeline, &moved, at(5))

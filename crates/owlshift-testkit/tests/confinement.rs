@@ -202,6 +202,7 @@ fn brief() -> Brief {
         decisions_refused: false,
         refused_choices: Vec::new(),
         check_failure: None,
+        rebase: None,
         result_path: RelativePath::new("result.json").unwrap(),
     }
 }

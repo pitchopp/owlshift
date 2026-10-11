@@ -830,6 +830,8 @@ impl Bench {
             build: &harness,
             answer_check: &harness,
             resolver: &harness,
+            rebase: &harness,
+            rebase_fast: &harness,
             remote_url: &remote_url,
             config: &config,
             dirs: &dirs,
@@ -1000,6 +1002,7 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         commit: tip.clone(),
         kind: owlshift_contracts::refs::PushKind::Delivery,
         base: bench.remote_main(),
+        onto: None,
     });
     cut.delivery = Some(pushing);
     bench.write_record(&cut);
@@ -1933,6 +1936,8 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         build: &harness,
         answer_check: &harness,
         resolver: &harness,
+        rebase: &harness,
+        rebase_fast: &harness,
         remote_url: &remote_url,
         config: &config,
         dirs: &dirs,
@@ -2001,6 +2006,8 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         build: &harness,
         answer_check: &harness,
         resolver: &harness,
+        rebase: &harness,
+        rebase_fast: &harness,
         remote_url: &remote_url,
         config: &config,
         dirs: &dirs,
@@ -4774,7 +4781,12 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
         }
         pass < 7
     });
-    assert!(outcomes.is_empty(), "nothing is continued: {outcomes:?}");
+    // The conflict the forge reports goes to a rebase repair, which finds
+    // the base already in the head here: no run (OWL-210).
+    assert!(
+        matches!(&outcomes[..], [Err(Stop::Refused(why))] if why.contains("nothing to rebase")),
+        "{outcomes:?}"
+    );
 
     let events = &bench.events()[delivered_events..];
     let decided = data_of(events, EventKind::Decision, "watch");
@@ -4817,8 +4829,9 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
         events.iter().all(|e| e.kind == EventKind::Decision),
         "no warning nor any other event: {events:?}"
     );
-    // Seven passes: the sixth read it merged, the seventh read nothing.
-    assert_eq!(*github.follow_reads.lock().unwrap(), 6);
+    // Seven passes: the sixth read it merged, the seventh read nothing; the
+    // rebase repair read it once more under the lock.
+    assert_eq!(*github.follow_reads.lock().unwrap(), 7);
     let delivery = bench.record().delivery.unwrap();
     assert!(!delivery.followed());
     assert_eq!(

@@ -96,6 +96,7 @@ fn posts_the_delivery_report_on_a_real_ticket() {
         }],
         followups: vec![],
         fix_pass: None,
+        rebase: None,
     };
     let writer = Writer::new(&tracker);
     let posted = writer.post_delivery_report(&report).unwrap();

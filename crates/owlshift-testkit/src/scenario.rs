@@ -1239,6 +1239,7 @@ impl Driver {
             decisions_refused: false,
             refused_choices: Vec::new(),
             check_failure: None,
+            rebase: None,
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
         };

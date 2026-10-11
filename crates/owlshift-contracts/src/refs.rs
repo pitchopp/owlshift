@@ -950,7 +950,9 @@ pub struct TicketDelivery {
     /// The base branch's head at that push.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_at_push: Option<String>,
-    /// The base head the last rebase run used.
+    /// The base commit the last rebase run whose push landed rebased onto
+    /// (OWL-210): a conflict read against it is a failed run of that
+    /// rebase, never a second rebase onto the same base head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebased_onto: Option<String>,
     /// A push under way, until the forge shows it as the head.
@@ -979,6 +981,10 @@ pub struct Pushing {
     /// The base branch's head read just before the push: `base_at_push`
     /// once the push is adopted.
     pub base: String,
+    /// For a rebase run's push, the base commit the run rebased onto:
+    /// `rebased_onto` once the push lands or is adopted (OWL-210).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onto: Option<String>,
 }
 
 /// Which run's push.
@@ -1047,7 +1053,8 @@ impl TicketDelivery {
     }
 
     /// Checks the commits are full ids, the branches git branch names, the
-    /// link a plain `https://` URL, and that an ended delivery pushes
+    /// link a plain `https://` URL, that a push under way names its `onto`
+    /// exactly when it is a rebase's, and that an ended delivery pushes
     /// nothing.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
@@ -1069,6 +1076,10 @@ impl TicketDelivery {
                 self.pushing.as_ref().map(|p| p.base.as_str()),
             ),
             (
+                "pushing.onto",
+                self.pushing.as_ref().and_then(|p| p.onto.as_deref()),
+            ),
+            (
                 "ended.head",
                 self.ended.as_ref().and_then(|e| e.head.as_deref()),
             ),
@@ -1088,6 +1099,11 @@ impl TicketDelivery {
             if pr.number == 0 {
                 return invalid("pull_request.number is 0".to_owned());
             }
+        }
+        if let Some(pushing) = &self.pushing
+            && (pushing.kind == PushKind::Rebase) != pushing.onto.is_some()
+        {
+            return invalid("a push under way names its onto if and only if it is a rebase's".to_owned());
         }
         if self.ended.is_some() && self.pushing.is_some() {
             return invalid("an ended delivery has a push under way".to_owned());

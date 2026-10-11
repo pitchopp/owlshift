@@ -42,7 +42,8 @@ use std::path::Path;
 
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
 use owlshift_adapters::forge::push::{
-    PushError, Pushed, leased_push_command, push_command, read_push_parts,
+    PushError, Pushed, leased_push_command, push_command, read_forced_push_parts,
+    read_push_parts,
 };
 use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
@@ -57,7 +58,7 @@ use owlshift_contracts::result::{
 };
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{
-    Event, MAX_FIX_PASSES, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason, Status,
+    Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, MAX_RESOLVED_PASSES, ParkReason, Status,
 };
 use owlshift_core::vocab::Stage;
 
@@ -86,6 +87,19 @@ pub struct DeliveryReport {
     /// A fix run's push after the delivery (OWL-112): which pass it is, and
     /// the checks it answers. `None` for the delivery itself.
     pub fix_pass: Option<FixPass>,
+    /// A rebase run's push after the delivery (OWL-210): the base it rebased
+    /// onto, and which repair it is. `None` otherwise.
+    pub rebase: Option<Rebased>,
+}
+
+/// A rebase a DELIVERY report names (OWL-210, architecture section 5,
+/// "Conflicts and the rebase run"): the branch's history was replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rebased {
+    pub base_branch: String,
+    pub onto: forge::CommitId,
+    /// From 1, the repairs of the delivery so far, this one included.
+    pub repair: u32,
 }
 
 /// A fix pass a DELIVERY report names (OWL-112, architecture section 5,
@@ -140,6 +154,15 @@ impl DeliveryReport {
                 "**Fix pass {} of {MAX_FIX_PASSES} after delivery,** for the red checks {}.",
                 fix.pass,
                 checks.join(", ")
+            ));
+        }
+        if let Some(rebase) = &self.rebase {
+            sections.push(format!(
+                "**Rebased onto {} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
+                 branch's history was replaced, leased on Owlshift's last push.",
+                code(&flatten(&rebase.base_branch)),
+                code(short(&rebase.onto)),
+                rebase.repair
             ));
         }
         let summary = flatten(&self.summary);
@@ -886,6 +909,7 @@ fn run_push(
     checkout: &Path,
     branch: &Branch,
     command: &std::process::Command,
+    forced: bool,
 ) -> Result<Pushed, WriteError> {
     let mut pushed = command.get_args();
     let mut args: Vec<OsString> = pushed.next().map(OsStr::to_owned).into_iter().collect();
@@ -900,7 +924,12 @@ fn run_push(
         Some(code) => format!("exit status: {code}"),
         None => "a signal".to_owned(),
     };
-    read_push_parts(
+    let read = if forced {
+        read_forced_push_parts
+    } else {
+        read_push_parts
+    };
+    read(
         branch,
         output.success(),
         &ended,
@@ -908,6 +937,100 @@ fn run_push(
         &output.stderr,
     )
     .map_err(WriteError::Push)
+}
+
+fn push_failed(message: String) -> WriteError {
+    WriteError::Push(PushError::Failed { message })
+}
+
+/// Whether `commit` is a rebase of the delivery `lease`, Owlshift's last
+/// push, onto `onto` that keeps the delivery's change (OWL-210): it
+/// descends from `onto`, it is not `onto` and its tree differs from
+/// `onto`'s, and every path the delivery changed since it parted from
+/// `onto`'s history still differs from `onto`. A run that reset the branch
+/// to the base, kept the base's side of every conflict or dropped a file
+/// the delivery changed passes the isolation check and maybe the gate, but
+/// a forced push of it would lose delivered work: refused, with why. A
+/// delivery whose change on a path the base now carries identically is
+/// refused too; a person decides then. Read in the dedicated checkout,
+/// whose object store holds every commit named, with the runner's git.
+pub fn rebase_keeps_delivery(
+    git: &Git,
+    checkout: &Path,
+    lease: &CommitId,
+    onto: &CommitId,
+    commit: &CommitId,
+) -> Result<(), String> {
+    let refused = |why: String| Err(format!("{commit} is not a rebase of {lease} onto {onto}: {why}"));
+    if commit == onto {
+        return refused("it is the base itself".to_owned());
+    }
+    let run = |args: &[&str]| {
+        git.output(checkout, args, None)
+            .map_err(|e| format!("reading the rebase of {lease} onto {onto}: {e}"))
+    };
+    let descends = run(&[
+        "merge-base",
+        "--is-ancestor",
+        "--end-of-options",
+        onto.as_str(),
+        commit.as_str(),
+    ])?;
+    if !descends.success() {
+        return refused("it does not descend from the base".to_owned());
+    }
+    let differs = run(&[
+        "diff",
+        "--quiet",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--end-of-options",
+        onto.as_str(),
+        commit.as_str(),
+    ])?;
+    match differs.code {
+        Some(1) => {}
+        Some(0) => return refused("its tree is the base's: no change is left".to_owned()),
+        _ => return Err(format!("comparing {commit} with {onto}: git diff failed")),
+    }
+    let parted = run(&["merge-base", "--end-of-options", lease.as_str(), onto.as_str()])?;
+    if !parted.success() {
+        return refused("the delivery shares no history with the base".to_owned());
+    }
+    let parted = String::from_utf8_lossy(&parted.stdout).trim().to_owned();
+    let changed = |from: &str, to: &str| -> Result<Vec<String>, String> {
+        let out = run(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--end-of-options",
+            from,
+            to,
+        ])?;
+        if !out.success() {
+            return Err(format!("listing the paths {from}..{to} changes: git diff failed"));
+        }
+        Ok(out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect())
+    };
+    let delivered = changed(&parted, lease.as_str())?;
+    let kept = changed(onto.as_str(), commit.as_str())?;
+    let lost: Vec<&String> = delivered.iter().filter(|p| !kept.contains(p)).collect();
+    if !lost.is_empty() {
+        let lost: Vec<&str> = lost.iter().map(|p| p.as_str()).collect();
+        return refused(format!(
+            "it no longer changes {}, which the delivery changed",
+            lost.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 pub fn park_reason(reason: ParkReason) -> &'static str {
@@ -1102,7 +1225,7 @@ impl<'a> Writer<'a> {
         // bench's hermetic setup applies to the push too.
         let command = push_command(Path::new("git"), checkout, remote, commit, branch)
             .map_err(WriteError::Push)?;
-        run_push(git, checkout, branch, &command)
+        run_push(git, checkout, branch, &command, false)
     }
 
     /// [`Self::push_branch`] to a branch watch follows (architecture section
@@ -1110,7 +1233,8 @@ impl<'a> Writer<'a> {
     /// there: a branch a person moved or deleted refuses it. `commit` must
     /// descend from `lease`, checked before git runs, since a lease alone
     /// would let a rewritten history replace the branch: a fix run's push
-    /// stays a fast-forward. Only a rebase run replaces history (OWL-210).
+    /// stays a fast-forward. Only a rebase run replaces history
+    /// ([`Self::push_rebased`]).
     pub fn push_leased(
         &self,
         git: &Git,
@@ -1134,23 +1258,45 @@ impl<'a> Writer<'a> {
                 ],
                 None,
             )
-            .map_err(|error| {
-                WriteError::Push(PushError::Failed {
-                    message: error.to_string(),
-                })
-            })?;
+            .map_err(|error| push_failed(error.to_string()))?;
         if !descends.success() {
-            return Err(WriteError::Push(PushError::Failed {
-                message: format!(
-                    "{commit} does not descend from {lease}, the branch's last push: a fix is \
-                     pushed as a fast-forward only"
-                ),
-            }));
+            return Err(push_failed(format!(
+                "{commit} does not descend from {lease}, the branch's last push: a fix is \
+                 pushed as a fast-forward only"
+            )));
         }
         let command =
             leased_push_command(Path::new("git"), checkout, remote, commit, branch, lease)
                 .map_err(WriteError::Push)?;
-        run_push(git, checkout, branch, &command)
+        run_push(git, checkout, branch, &command, false)
+    }
+
+    /// A rebase run's push (OWL-210, architecture section 5, "Leases"), the
+    /// one push that replaces a branch's history: leased on `lease`, the
+    /// commit Owlshift last pushed there, as every push to a followed
+    /// branch, so a branch a person moved or deleted refuses it; and, before
+    /// git runs, `commit` must be a rebase of the delivery onto `onto`
+    /// ([`rebase_keeps_delivery`]). Both checks, never one instead of the
+    /// other: the lease guards a person's push, the rebase check a run that
+    /// lost the delivered work. A forced update reads as [`Pushed::Forced`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_rebased(
+        &self,
+        git: &Git,
+        checkout: &Path,
+        remote: &str,
+        commit: &CommitId,
+        branch: &Branch,
+        lease: &CommitId,
+        onto: &CommitId,
+    ) -> Result<Pushed, WriteError> {
+        floor::check_action(Action::PushBranch, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        rebase_keeps_delivery(git, checkout, lease, onto, commit).map_err(push_failed)?;
+        let command =
+            leased_push_command(Path::new("git"), checkout, remote, commit, branch, lease)
+                .map_err(WriteError::Push)?;
+        run_push(git, checkout, branch, &command, true)
     }
 
     /// Opens the pull request of `head` into `base` with the run's title and
@@ -1447,7 +1593,29 @@ mod tests {
                 blocked_by_parent: true,
             }],
             fix_pass: None,
+            rebase: None,
         }
+    }
+
+    /// A rebase run's report says the branch was rebased, onto what, and
+    /// which repair it is (OWL-210).
+    #[test]
+    fn a_rebase_runs_report_says_the_history_was_replaced() {
+        let mut report = report(Ok(set(Mergeable::Mergeable, vec![])));
+        report.rebase = Some(Rebased {
+            base_branch: "main".to_owned(),
+            onto: forge::CommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            repair: 1,
+        });
+        let body = report.render();
+        assert!(
+            body.starts_with(
+                "[owlshift] DELIVERY\n\n**Rebased onto `main` at `0123456` after delivery,** \
+                 repair 1 of 6: the branch's history was replaced, leased on Owlshift's last \
+                 push.\n\nPosts the delivery report"
+            ),
+            "{body}"
+        );
     }
 
     /// A fix run's report names its pass and the checks it answers, before

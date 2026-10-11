@@ -57,6 +57,12 @@ pub const ANSWER_CHECK_ROLE: &str = include_str!("../../../roles/answer_check.md
 /// settle the questions a run raised that are not the decider's alone.
 pub const RESOLVER_ROLE: &str = include_str!("../../../roles/resolver.md");
 
+/// The default rebase role prompt, `roles/rebase.md`, as this binary was
+/// built with it: what watch and `owlshift continue` hand Claude Code to
+/// rebase a delivered pull request's branch that conflicts with its base
+/// (OWL-210).
+pub const REBASE_ROLE: &str = include_str!("../../../roles/rebase.md");
+
 /// Reads `<roles_dir>/<role>.md` and strips its front matter, per
 /// [`owlshift_contracts::format::strip_role_front_matter`].
 pub fn load_role_prompt(roles_dir: &Path, role: Role) -> Result<String, RoleLoadError> {
@@ -106,6 +112,8 @@ mod tests {
         let prompt =
             format::strip_role_front_matter(Role::Resolver, RESOLVER_ROLE).expect("strips");
         assert!(prompt.trim_start().starts_with("# Resolver"), "{prompt}");
+        let prompt = format::strip_role_front_matter(Role::Rebase, REBASE_ROLE).expect("strips");
+        assert!(prompt.trim_start().starts_with("# Rebase"), "{prompt}");
     }
 
     #[test]

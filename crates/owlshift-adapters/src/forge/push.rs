@@ -26,6 +26,9 @@ pub enum Pushed {
     FastForward,
     /// The branch already pointed to the commit.
     UpToDate,
+    /// The branch's history was replaced under a lease: a rebase run's push
+    /// (OWL-210), read only by [`read_forced_push_parts`].
+    Forced,
 }
 
 /// A push that did not land.
@@ -88,9 +91,12 @@ pub fn push_command(
 /// overwritten or recreated.
 ///
 /// The lease alone would also let a commit that does not descend from
-/// `lease` replace the branch's history: the caller pushes a commit that
+/// `lease` replace the branch's history: a fix's push is of a commit that
 /// descends from it, which the runner's Writer checks before git runs, and a
-/// forced update (`+`) still reads as a failure ([`read_push`]).
+/// forced update (`+`) still reads as a failure ([`read_push`]). Only a
+/// rebase run's push replaces history (OWL-210): the Writer checks that its
+/// commit descends from the base it was rebased onto and keeps the
+/// delivery's change, and reads the push with [`read_forced_push_parts`].
 pub fn leased_push_command(
     git: &Path,
     worktree: &Path,
@@ -137,6 +143,30 @@ pub fn read_push_parts(
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<Pushed, PushError> {
+    read_parts(branch, success, ended, stdout, stderr, false)
+}
+
+/// [`read_push_parts`] for a rebase run's leased push (OWL-210), the one
+/// push that may replace the branch's history: a forced update (`+`) reads
+/// as [`Pushed::Forced`] instead of a failure.
+pub fn read_forced_push_parts(
+    branch: &Branch,
+    success: bool,
+    ended: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Pushed, PushError> {
+    read_parts(branch, success, ended, stdout, stderr, true)
+}
+
+fn read_parts(
+    branch: &Branch,
+    success: bool,
+    ended: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+    forced: bool,
+) -> Result<Pushed, PushError> {
     let target = format!("refs/heads/{branch}");
     let stdout = String::from_utf8_lossy(stdout);
     // `<flag>\t<from>:<to>\t<summary>`; Git for Windows ends lines with CRLF.
@@ -157,6 +187,7 @@ pub fn read_push_parts(
             "*" => Ok(Pushed::Created),
             " " => Ok(Pushed::FastForward),
             "=" => Ok(Pushed::UpToDate),
+            "+" if forced => Ok(Pushed::Forced),
             other => Err(PushError::Failed {
                 message: format!("unexpected update {other:?} of {target}"),
             }),
@@ -265,6 +296,32 @@ mod tests {
         ));
         assert!(matches!(
             read(0, "+", "aaa...bbb (forced update)"),
+            Err(PushError::Failed { .. })
+        ));
+        // Only a rebase's push reads a forced update as landed.
+        let forced = |code, flag, summary| {
+            let out = output(code, &porcelain(flag, summary, "\n"), "");
+            read_forced_push_parts(
+                &branch(),
+                out.status.success(),
+                "exit",
+                &out.stdout,
+                &out.stderr,
+            )
+        };
+        assert_eq!(
+            forced(0, "+", "aaa...bbb (forced update)"),
+            Ok(Pushed::Forced)
+        );
+        assert_eq!(forced(0, " ", "aaa..bbb"), Ok(Pushed::FastForward));
+        assert_eq!(
+            forced(1, "!", "[rejected] (stale info)"),
+            Err(PushError::Rejected {
+                reason: "[rejected] (stale info)".to_owned()
+            })
+        );
+        assert!(matches!(
+            forced(1, "+", "aaa...bbb (forced update)"),
             Err(PushError::Failed { .. })
         ));
     }
