@@ -14,8 +14,11 @@ use owlshift_platform::keychain::{Keychain, SERVICE};
 pub const GITHUB_ACCOUNT: &str = "github";
 
 /// What the GitHub token must allow, as `owlshift init` tells its user.
+/// Actions (read) lets watch read a red check's job log for its fix run
+/// (OWL-112): GitHub documents it, and live check (c) of the build plan is
+/// still to confirm it with a stored token.
 pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (write), checks, \
-     commit statuses and metadata (read) on the project's repository; the output of \
+     commit statuses, actions and metadata (read) on the project's repository; the output of \
      `gh auth token` also works";
 
 /// The GitHub adapter for `repo`, with its token read from `keychain`:

@@ -266,6 +266,11 @@ impl shared::Tracker for MarkdownTracker {
         })
     }
 
+    fn stage(&self, id: &TicketId) -> Result<String, shared::Error> {
+        self.require_ticket(id)?;
+        Ok(MarkdownTracker::ticket(self, id).map_err(other)?.stage)
+    }
+
     fn comments(&self, id: &TicketId) -> Result<Vec<shared::Comment>, shared::Error> {
         self.require_ticket(id)?;
         let comments = MarkdownTracker::comments(self, id).map_err(other)?;

@@ -15,8 +15,9 @@
 //! Watch whose delivery Owlshift follows ([`followed`]): its read, without
 //! the lock, decides by the core's table, and what it changes in the ticket
 //! ref is written under the lock from the ref the snapshot read
-//! ([`crate::follow`]). A fix, a rebase or a park is decided and recorded
-//! only: OWL-112 and OWL-210 run them.
+//! ([`crate::follow`]). A fix run or a park it decides is repaired through
+//! [`OnDemand::repair_seen`] (OWL-112), held as a continue is; a rebase is
+//! decided and recorded only, for OWL-210.
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -39,6 +40,7 @@ use serde_json::json;
 use owlshift_adapters::tracker::Person;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
+use owlshift_core::follow::{Action, Decision};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
 
@@ -318,17 +320,20 @@ impl Watch<'_> {
             self.look(memory, sink, out, continued, &ticket, &stored);
         }
         for (ticket, stored) in following {
-            self.follow(memory, sink, out, &ticket, &stored);
+            self.follow(memory, sink, out, continued, &ticket, &stored);
         }
     }
 
     /// One followed pull request (OWL-209): its read and what it decides,
-    /// the ticket ref written with what it changes, then its events.
+    /// the ticket ref written with what it changes, then its events. A fix
+    /// run or a park it decides goes to [`OnDemand::repair_seen`] (OWL-112),
+    /// held as a continue is ([`Holds`]).
     fn follow(
         &self,
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
+        continued: &mut Continued<'_>,
         ticket: &TicketId,
         stored: &Stored,
     ) {
@@ -350,47 +355,76 @@ impl Watch<'_> {
         let change =
             follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
                 Some(record) => self.write_seen(ticket, &stored.commit, &record),
-                None => Ok(true),
+                None => Ok(Some(stored.commit.clone())),
             });
-        match change {
-            Ok(true) => {}
+        let commit = match change {
+            Ok(Some(commit)) => commit,
             // Busy, or the ref moved: the next pass reads it again.
-            Ok(false) => return,
+            Ok(None) => return,
             Err(reason) => {
                 let reason = format!("keeping what watch read of its pull request: {reason}");
                 return self.unreadable(memory, sink, ticket, reason);
             }
-        }
+        };
         if let Some(event) = memory.following.events(ticket, &seen) {
             sink.emit(ticket, None, EventKind::Decision, event);
             self.line(out, &format!("{ticket}: {seen}"));
         }
+        if !matches!(
+            seen.decision,
+            Decision::Follow {
+                action: Action::Fix { .. } | Action::Park,
+                ..
+            }
+        ) {
+            return;
+        }
+        let held = Seen {
+            commit,
+            answer: None,
+        };
+        if memory.holds.admit(ticket, &held, now) != Admit::Go {
+            return;
+        }
+        let Some(outcome) = on_demand.repair_seen(ticket, &held.commit, seen.failing_for, sink)
+        else {
+            return;
+        };
+        continued(ticket, &outcome, sink);
+        let git = &on_demand.executor.git;
+        let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket)
+            .ok()
+            .flatten()
+            .map(|stored| stored.commit);
+        let now = (on_demand.clock)();
+        memory
+            .holds
+            .after(ticket, held, &outcome, after.as_deref(), now);
     }
 
     /// Writes `record` as the ticket ref of `ticket` under the project's
     /// lock, only while the ref is still `seen`, the commit the snapshot
-    /// read: `false`, with nothing written, when the project is busy or the
-    /// ref moved.
+    /// read, and returns the ref's new commit: `None`, with nothing written,
+    /// when the project is busy or the ref moved.
     fn write_seen(
         &self,
         ticket: &TicketId,
         seen: &str,
         record: &TicketRecord,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<String>, String> {
         let dirs = self.on_demand.dirs;
         let _lock = match dirs.lock() {
             Ok(Some(lock)) => lock,
-            Ok(None) => return Ok(false),
+            Ok(None) => return Ok(None),
             Err(e) => return Err(format!("the project's lock: {e}")),
         };
         let git = &self.on_demand.executor.git;
         let checkout = dirs.checkout();
         let current = ticket_ref::read(git, &checkout, ticket)?;
         if current.map(|stored| stored.commit).as_deref() != Some(seen) {
-            return Ok(false);
+            return Ok(None);
         }
-        ticket_ref::write(git, &checkout, ticket, record, Some(seen))?;
-        Ok(true)
+        ticket_ref::write(git, &checkout, ticket, record, Some(seen)).map(Some)
     }
 
     /// The ticket refs, read under the project's lock, once its marker says

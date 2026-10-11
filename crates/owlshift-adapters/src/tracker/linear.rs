@@ -467,6 +467,12 @@ impl Tracker for LinearTracker {
         self.issue_url(id).ok()
     }
 
+    /// The issue's workflow state, by its name (OWL-112).
+    fn stage(&self, id: &TicketId) -> Result<String, Error> {
+        let data: StageNameData = self.call(STAGE_QUERY, json!({ "id": id.as_str() }))?;
+        Ok(data.issue.state.name)
+    }
+
     /// The account's profile link (`User.url`), which Linear turns into a
     /// mention of them (checked 2026-10-04, OWL-157). Read each time, a few
     /// times a ticket: a person may rename their profile while `watch`
@@ -823,6 +829,8 @@ struct IssueState {
 /// An issue's link, read for a notification only (OWL-140).
 const URL_QUERY: &str = "query TicketUrl($id: String!) { issue(id: $id) { url } }";
 
+const STAGE_QUERY: &str = "query TicketStage($id: String!) { issue(id: $id) { state { name } } }";
+
 impl LinearTracker {
     /// The link Linear gives an issue, as Linear gives it: whoever shows it
     /// checks it is fit to show.
@@ -874,6 +882,16 @@ struct Organization {
 #[derive(Deserialize)]
 struct IssueUrl {
     url: String,
+}
+
+#[derive(Deserialize)]
+struct StageNameData {
+    issue: IssueStageName,
+}
+
+#[derive(Deserialize)]
+struct IssueStageName {
+    state: StateName,
 }
 
 #[cfg(test)]
@@ -1318,5 +1336,17 @@ mod tests {
         let not_found = r#"{"errors":[{"message":"Entity not found: Issue",
             "extensions":{"code":"INPUT_ERROR"}}]}"#;
         assert_eq!(tracker(vec![not_found]).ticket_url(&id), None);
+    }
+
+    /// The issue's state is read by its name (OWL-112); an unreadable one
+    /// is an error, never a guess.
+    #[test]
+    fn a_tickets_stage_is_its_states_name() {
+        let id = TicketId::new("OWL-112").unwrap();
+        let review = r#"{"data":{"issue":{"state":{"name":"In Review"}}}}"#;
+        assert_eq!(tracker(vec![review]).stage(&id).unwrap(), "In Review");
+        let not_found = r#"{"errors":[{"message":"Entity not found: Issue",
+            "extensions":{"code":"INPUT_ERROR"}}]}"#;
+        assert!(tracker(vec![not_found]).stage(&id).is_err());
     }
 }

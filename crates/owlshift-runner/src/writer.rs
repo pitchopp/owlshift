@@ -56,7 +56,9 @@ use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, Question, Verdict as AnswerVerdict,
 };
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
-use owlshift_core::state::{Event, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason, Status};
+use owlshift_core::state::{
+    Event, MAX_FIX_PASSES, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason, Status,
+};
 use owlshift_core::vocab::Stage;
 
 use crate::executor::Git;
@@ -81,6 +83,19 @@ pub struct DeliveryReport {
     /// The follow-ups the runs proposed. Nothing files them yet, so they are
     /// listed for a human.
     pub followups: Vec<Followup>,
+    /// A fix run's push after the delivery (OWL-112): which pass it is, and
+    /// the checks it answers. `None` for the delivery itself.
+    pub fix_pass: Option<FixPass>,
+}
+
+/// A fix pass a DELIVERY report names (OWL-112, architecture section 5,
+/// "The fix run").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixPass {
+    /// From 1, since the pull request was last read green.
+    pub pass: u32,
+    /// The failed checks the run was given.
+    pub checks: Vec<String>,
 }
 
 /// The project's own gate (`stack.gate` in `owlshift.toml`), as Owlshift ran
@@ -119,6 +134,14 @@ impl DeliveryReport {
             round: None,
         };
         let mut sections = vec![header.render()];
+        if let Some(fix) = &self.fix_pass {
+            let checks: Vec<String> = fix.checks.iter().map(|c| code(&flatten(c))).collect();
+            sections.push(format!(
+                "**Fix pass {} of {MAX_FIX_PASSES} after delivery,** for the red checks {}.",
+                fix.pass,
+                checks.join(", ")
+            ));
+        }
         let summary = flatten(&self.summary);
         if !summary.is_empty() {
             sections.push(summary);
@@ -1357,7 +1380,27 @@ mod tests {
                 done_when: "A new delivery edits the old report.".to_owned(),
                 blocked_by_parent: true,
             }],
+            fix_pass: None,
         }
+    }
+
+    /// A fix run's report names its pass and the checks it answers, before
+    /// the summary (OWL-112).
+    #[test]
+    fn a_fix_runs_report_names_its_pass() {
+        let mut report = report(Ok(set(Mergeable::Mergeable, vec![])));
+        report.fix_pass = Some(FixPass {
+            pass: 2,
+            checks: vec!["check (ubuntu-latest)".to_owned(), "ci".to_owned()],
+        });
+        let body = report.render();
+        assert!(
+            body.starts_with(
+                "[owlshift] DELIVERY\n\n**Fix pass 2 of 2 after delivery,** for the red checks \
+                 `check (ubuntu-latest)`, `ci`.\n\nPosts the delivery report"
+            ),
+            "{body}"
+        );
     }
 
     #[test]
