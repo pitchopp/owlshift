@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket delivery",
+  "description": "The pull request a delivery opened and Owlshift's pushes to its branch, in\n[`DELIVERY_FILE`] (OWL-209, architecture section 5, \"Watch after\ndelivery\"). `owlshift watch` follows it while it has a pull request and\nhas not `ended`.",
+  "type": "object",
+  "properties": {
+    "base_at_push": {
+      "description": "The base branch's head at that push.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_branch": {
+      "description": "The branch the pull request merges into.",
+      "type": "string"
+    },
+    "branch": {
+      "description": "The ticket's branch.",
+      "type": "string"
+    },
+    "ended": {
+      "description": "Why and when watch stopped following the pull request.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ended"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "pull_request": {
+      "description": "The pull request, once the forge showed the delivery's push as its\nhead; absent while the first push is under way.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeliveredPullRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pushed": {
+      "description": "The commit Owlshift last pushed, once the forge showed it as the head.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pushing": {
+      "description": "A push under way, until the forge shows it as the head.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Pushing"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rebased_onto": {
+      "description": "The base head the last rebase run used.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "branch",
+    "base_branch"
+  ],
+  "$defs": {
+    "DeliveredPullRequest": {
+      "description": "A delivered pull request.",
+      "type": "object",
+      "properties": {
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "url"
+      ]
+    },
+    "Ended": {
+      "description": "Why and when watch stopped following a pull request.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "head": {
+          "description": "The head read, when someone else's push ended the following.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "why": {
+          "$ref": "#/$defs/EndedWhy"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "why",
+        "at"
+      ]
+    },
+    "EndedWhy": {
+      "description": "Why watch stopped following.",
+      "oneOf": [
+        {
+          "description": "A person merged it.",
+          "type": "string",
+          "const": "merged"
+        },
+        {
+          "description": "It was closed unmerged.",
+          "type": "string",
+          "const": "closed"
+        },
+        {
+          "description": "A person pushed to its branch.",
+          "type": "string",
+          "const": "head_moved"
+        }
+      ]
+    },
+    "PushKind": {
+      "description": "Which run's push.",
+      "type": "string",
+      "enum": [
+        "delivery",
+        "fix",
+        "rebase"
+      ]
+    },
+    "Pushing": {
+      "description": "A push of Owlshift's under way.",
+      "type": "object",
+      "properties": {
+        "base": {
+          "description": "The base branch's head read just before the push: `base_at_push`\nonce the push is adopted.",
+          "type": "string"
+        },
+        "commit": {
+          "description": "The commit pushed.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PushKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "kind",
+        "base"
+      ]
+    }
+  }
+}

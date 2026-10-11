@@ -23,6 +23,7 @@
 pub mod agent_env;
 pub mod decider;
 pub mod floor;
+pub mod follow;
 pub mod gate;
 pub mod pipeline;
 pub mod reply;

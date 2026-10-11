@@ -70,8 +70,8 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
-    Ask, AskDecider, AskKind, BuildRefusal, KeptDecision, PersistedState, TicketQuestions,
-    cut_reason,
+    Ask, AskDecider, AskKind, BuildRefusal, KeptDecision, PersistedState, TicketDelivery,
+    TicketQuestions, cut_reason,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -2032,16 +2032,29 @@ impl OnDemand<'_> {
     }
 
     /// Writes `state` and `questions` as the ticket's ref, unless it already
-    /// holds them.
+    /// holds them, carrying its delivery forward (OWL-209).
     fn store(
         &self,
         p: &mut Prepared,
         state: &TicketState,
         questions: TicketQuestions,
     ) -> Result<(), String> {
+        let delivery = p.stored.as_ref().and_then(|s| s.record.delivery.clone());
+        self.store_delivery(p, state, questions, delivery)
+    }
+
+    /// [`Self::store`] with `delivery` as the ref's delivery.
+    fn store_delivery(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        questions: TicketQuestions,
+        delivery: Option<TicketDelivery>,
+    ) -> Result<(), String> {
         let record = TicketRecord {
             state: PersistedState::from(state),
             questions,
+            delivery,
         };
         if p.stored
             .as_ref()

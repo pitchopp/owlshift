@@ -2,8 +2,8 @@
 //!
 //! `refs/owlshift/claims/<ticket>` points to a commit whose tree holds
 //! [`CLAIM_FILE`]; `refs/owlshift/tickets/<ticket>` points to a commit whose
-//! tree holds [`STATE_FILE`], [`QUESTIONS_FILE`] and, later, the ticket's
-//! artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
+//! tree holds [`STATE_FILE`], [`QUESTIONS_FILE`], once a delivery was made
+//! [`DELIVERY_FILE`] (OWL-209), and, later, the ticket's artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
 //! checkout only; pushing it to the remote comes with claims (P7).
 
 use std::num::NonZeroU32;
@@ -19,7 +19,8 @@ use crate::brief::{
     MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry, validate_thread,
 };
 use crate::format::{
-    self, CLAIM_FORMAT, ContractError, Format, QUESTIONS_FORMAT, TICKET_STATE_FORMAT,
+    self, CLAIM_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
+    TICKET_STATE_FORMAT,
 };
 use crate::ids::TicketId;
 use crate::result::{self, DECISIONS_ADVICE, Question, RefusedChoice, Verdict, check_verdicts};
@@ -42,6 +43,9 @@ pub const LEDGER_FILE: &str = "ledger.json";
 /// The questions the runner asked on the ticket, in a ticket ref's tree; the
 /// answers stay on the ticket.
 pub const QUESTIONS_FILE: &str = "questions.json";
+/// The pull request Owlshift delivered and follows, in a ticket ref's tree
+/// (OWL-209).
+pub const DELIVERY_FILE: &str = "delivery.json";
 /// The review findings, in a ticket ref's tree.
 pub const FINDINGS_FILE: &str = "findings.json";
 
@@ -921,4 +925,200 @@ impl Default for TicketQuestions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The pull request a delivery opened and Owlshift's pushes to its branch, in
+/// [`DELIVERY_FILE`] (OWL-209, architecture section 5, "Watch after
+/// delivery"). `owlshift watch` follows it while it has a pull request and
+/// has not `ended`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket delivery")]
+pub struct TicketDelivery {
+    pub format: Format<DELIVERY_FORMAT>,
+    /// The pull request, once the forge showed the delivery's push as its
+    /// head; absent while the first push is under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<DeliveredPullRequest>,
+    /// The ticket's branch.
+    pub branch: String,
+    /// The branch the pull request merges into.
+    pub base_branch: String,
+    /// The commit Owlshift last pushed, once the forge showed it as the head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<String>,
+    /// The base branch's head at that push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_at_push: Option<String>,
+    /// The base head the last rebase run used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebased_onto: Option<String>,
+    /// A push under way, until the forge shows it as the head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushing: Option<Pushing>,
+    /// Why and when watch stopped following the pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<Ended>,
+}
+
+/// A delivered pull request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveredPullRequest {
+    pub number: u64,
+    pub url: String,
+}
+
+/// A push of Owlshift's under way.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Pushing {
+    /// The commit pushed.
+    pub commit: String,
+    pub kind: PushKind,
+    /// The base branch's head read just before the push: `base_at_push`
+    /// once the push is adopted.
+    pub base: String,
+}
+
+/// Which run's push.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PushKind {
+    Delivery,
+    Fix,
+    Rebase,
+}
+
+/// Why and when watch stopped following a pull request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Ended {
+    pub why: EndedWhy,
+    pub at: Timestamp,
+    /// The head read, when someone else's push ended the following.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+}
+
+/// Why watch stopped following.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EndedWhy {
+    /// A person merged it.
+    Merged,
+    /// It was closed unmerged.
+    Closed,
+    /// A person pushed to its branch.
+    HeadMoved,
+}
+
+impl TicketDelivery {
+    const CONTRACT: &str = "ticket delivery";
+
+    /// A delivery of `branch` into `base_branch` with nothing pushed yet.
+    pub fn new(branch: &str, base_branch: &str) -> Self {
+        Self {
+            format: Format,
+            pull_request: None,
+            branch: branch.to_owned(),
+            base_branch: base_branch.to_owned(),
+            pushed: None,
+            base_at_push: None,
+            rebased_onto: None,
+            pushing: None,
+            ended: None,
+        }
+    }
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let delivery: Self = format::parse_json(Self::CONTRACT, DELIVERY_FORMAT, input)?;
+        delivery.validate()?;
+        Ok(delivery)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+
+    /// Whether watch follows it: it has a pull request and has not ended.
+    pub fn followed(&self) -> bool {
+        self.pull_request.is_some() && self.ended.is_none()
+    }
+
+    /// Checks the commits are full ids, the branches git branch names, the
+    /// link a plain `https://` URL, and that an ended delivery pushes
+    /// nothing.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
+        for (field, branch) in [("branch", &self.branch), ("base_branch", &self.base_branch)] {
+            if !is_branch_name(branch) {
+                return invalid(format!("{field} {branch:?} is not a valid branch name"));
+            }
+        }
+        let commits = [
+            ("pushed", self.pushed.as_deref()),
+            ("base_at_push", self.base_at_push.as_deref()),
+            ("rebased_onto", self.rebased_onto.as_deref()),
+            (
+                "pushing.commit",
+                self.pushing.as_ref().map(|p| p.commit.as_str()),
+            ),
+            (
+                "pushing.base",
+                self.pushing.as_ref().map(|p| p.base.as_str()),
+            ),
+            (
+                "ended.head",
+                self.ended.as_ref().and_then(|e| e.head.as_deref()),
+            ),
+        ];
+        for (field, commit) in commits {
+            if let Some(commit) = commit
+                && !is_commit_id(commit)
+            {
+                return invalid(format!("{field} {commit:?} is not a full commit id"));
+            }
+        }
+        if let Some(pr) = &self.pull_request {
+            let rest = pr.url.strip_prefix("https://").unwrap_or_default();
+            if rest.is_empty() || rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return invalid(format!("pull_request.url {:?} is not an https URL", pr.url));
+            }
+            if pr.number == 0 {
+                return invalid("pull_request.number is 0".to_owned());
+            }
+        }
+        if self.ended.is_some() && self.pushing.is_some() {
+            return invalid("an ended delivery has a push under way".to_owned());
+        }
+        if self.ended.is_some() && self.pull_request.is_none() {
+            return invalid("a delivery ended with no pull request".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// A full commit id: 40 or 64 lowercase hexadecimal digits.
+fn is_commit_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// Git's rules for a branch name (`git check-ref-format --branch`), the
+/// forge adapter's `Branch` too: safe in a refspec and a lease.
+fn is_branch_name(name: &str) -> bool {
+    let bad_component = name
+        .split('/')
+        .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"));
+    let bad_char = name.chars().any(|c| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    });
+    !(name.is_empty()
+        || name.starts_with('-')
+        || name.ends_with('.')
+        || name == "@"
+        || name.contains("..")
+        || name.contains("@{")
+        || bad_component
+        || bad_char)
 }
