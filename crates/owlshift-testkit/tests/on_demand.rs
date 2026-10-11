@@ -20,8 +20,8 @@ use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github::GitHubForge;
+use owlshift_adapters::forge::{Repo, Verdict};
 use owlshift_adapters::graphql::{Response, Transport};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{self, Capability, Comment, Ticket, Tracker};
@@ -64,6 +64,31 @@ struct FakeGitHub {
     open: Mutex<Option<u64>>,
     created: Mutex<Vec<Value>>,
     stale_reads: Mutex<u32>,
+    /// What watch's read of the pull request finds (OWL-209): its state,
+    /// mergeability and its check's conclusion, and the base's.
+    followed: Mutex<Followed>,
+    /// Watch's reads of the pull request so far.
+    follow_reads: Mutex<u32>,
+}
+
+/// The pull request as watch reads it.
+#[derive(Clone)]
+struct Followed {
+    state: &'static str,
+    mergeable: &'static str,
+    conclusion: &'static str,
+    base_conclusion: &'static str,
+}
+
+impl Default for Followed {
+    fn default() -> Self {
+        Self {
+            state: "OPEN",
+            mergeable: "MERGEABLE",
+            conclusion: "SUCCESS",
+            base_conclusion: "SUCCESS",
+        }
+    }
 }
 
 impl FakeGitHub {
@@ -109,6 +134,43 @@ impl FakeGitHub {
                 .push(request["variables"]["input"].clone());
             *self.open.lock().unwrap() = Some(1);
             json!({ "createPullRequest": { "pullRequest": self.pull_request() } })
+        } else if query.starts_with("query Follow") {
+            *self.follow_reads.lock().unwrap() += 1;
+            let followed = self.followed.lock().unwrap().clone();
+            let head = self.tip();
+            json!({ "repository": { "pullRequest": {
+                "state": followed.state, "headRefOid": head, "mergeable": followed.mergeable,
+                "mergeStateStatus": "CLEAN",
+                "commits": { "nodes": [{ "commit": { "oid": head, "statusCheckRollup": {
+                    "contexts": {
+                        "totalCount": 1,
+                        "pageInfo": { "hasNextPage": false, "endCursor": null },
+                        "nodes": [{
+                            "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+                            "conclusion": followed.conclusion, "isRequired": true,
+                            "detailsUrl": "https://github.com/demo/project/runs/2",
+                            "checkSuite": null,
+                        }],
+                    },
+                } } }] },
+            } } })
+        } else if query.starts_with("query BaseChecks") {
+            let followed = self.followed.lock().unwrap().clone();
+            let base = self
+                .env
+                .run(&self.bare, &["rev-parse", "refs/heads/main"])
+                .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
+                .unwrap();
+            let rollup = json!({ "contexts": {
+                "totalCount": 1,
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [{ "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+                            "conclusion": followed.base_conclusion }],
+            } });
+            json!({ "repository": {
+                "head": { "oid": base, "statusCheckRollup": rollup },
+                "atPush": { "oid": base, "statusCheckRollup": rollup },
+            } })
         } else if query.starts_with("query Checks") {
             let head = self.tip();
             json!({ "repository": { "pullRequest": {
@@ -418,6 +480,8 @@ impl Bench {
             open: Mutex::new(None),
             created: Mutex::new(Vec::new()),
             stale_reads: Mutex::new(0),
+            followed: Mutex::default(),
+            follow_reads: Mutex::new(0),
         });
         Self {
             data: tmp.path().join("data"),
@@ -566,6 +630,26 @@ impl Bench {
             })
             .map(|event| event.data["state"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    /// Writes `record` as the ticket ref, over the one it holds.
+    fn write_record(&self, record: &TicketRecord) {
+        let env = self.env.clone();
+        let git = Git::with_setup("git", move |command| env.apply(command));
+        let checkout = self.dirs().checkout();
+        let previous = ticket_ref::read(&git, &checkout, &ticket())
+            .unwrap()
+            .map(|stored| stored.commit);
+        ticket_ref::write(&git, &checkout, &ticket(), record, previous.as_deref()).unwrap();
+    }
+
+    /// The remote's `main`.
+    fn remote_main(&self) -> String {
+        let out = self
+            .env
+            .run(&self.remote.bare, &["rev-parse", "refs/heads/main"])
+            .unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
     }
 
     /// What the ticket ref holds.
@@ -857,14 +941,47 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
     assert_eq!(bench.person(), person);
     assert_eq!(dirs.unverified().unwrap(), None);
 
-    // Again: the checkout is fetched, the push is up to date, and the pull
-    // request and its report are found, not made twice.
+    // The ticket ref keeps the delivery, and the ticket at Watch: watch
+    // follows its pull request (OWL-209).
+    let kept = bench.record();
+    let delivery = kept.delivery.clone().expect("the delivery");
+    assert!(delivery.followed());
+    assert_eq!(delivery.pull_request.as_ref().unwrap().number, 1);
+    assert_eq!(delivery.pushed.as_deref(), Some(tip.as_str()));
+    assert_eq!(delivery.base_at_push, Some(bench.remote_main()));
+    assert_eq!(delivery.pushing, None);
+    assert_eq!(kept.state.stage, owlshift_contracts::Stage::Watch);
+
+    // `do` again is refused while watch follows it, nothing run.
+    let (refused, printed) = bench.run(vec![], None);
+    match refused {
+        Err(Stop::Refused(why)) => assert!(why.contains("pull request #1"), "{why}"),
+        other => panic!("{other:?}\n{printed}"),
+    }
+
+    // A delivery cut short after its push, before its pull request was
+    // kept, is finished by `do`: the checkout is fetched, the push is up to
+    // date, and the pull request and its report are found, not made twice.
+    let mut cut = kept.clone();
+    cut.state = owlshift_contracts::refs::PersistedState::parse(
+        r#"{"format":3,"stage":"verify","round":0,"reasks":0,"failed_runs":0,"fix_passes":0,"repairs":0}"#,
+    )
+    .unwrap();
+    let mut pushing = owlshift_contracts::refs::TicketDelivery::new(BRANCH, "main");
+    pushing.pushing = Some(owlshift_contracts::refs::Pushing {
+        commit: tip.clone(),
+        kind: owlshift_contracts::refs::PushKind::Delivery,
+        base: bench.remote_main(),
+    });
+    cut.delivery = Some(pushing);
+    bench.write_record(&cut);
     let (again, printed) = bench.run(vec![bench.reply(None, Some(DONE))], None);
     let again = again.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(!again.opened);
     assert_eq!(bench.github.created.lock().unwrap().len(), 1);
     assert_eq!(bench.comments().len(), 1);
     assert!(printed.contains("pushed=up_to_date"), "{printed}");
+    assert!(bench.record().delivery.unwrap().followed());
 }
 
 #[test]
@@ -2180,10 +2297,11 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
         .collect();
     assert_eq!(commands, [json!("do"), json!("continue")]);
 
-    // Delivered: nothing is left to resume.
+    // Delivered: `continue` reads its pull request once, as watch would
+    // (OWL-209), and runs nothing.
     let (done, _) = bench.continue_ticket(Vec::new());
     assert!(
-        matches!(&done, Err(Stop::Refused(why)) if why.contains("nothing to continue")),
+        matches!(&done, Err(Stop::Watched { seen, .. }) if seen.verdict == Verdict::Green),
         "{done:?}"
     );
 }
@@ -2458,9 +2576,19 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
         "{comments:?}"
     );
     assert_eq!(bench.stage(), "In Review");
+    // The continue, then, in the same pass, watch's first read of the pull
+    // request it now follows (OWL-209).
     let decided = data_of(&bench.events(), EventKind::Decision, "watch");
-    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided.len(), 2, "{decided:?}");
     assert_eq!(decided[0]["watch"], "continue");
+    assert_eq!(
+        (&decided[1]["watch"], &decided[1]["verdict"]),
+        (&json!("read"), &json!("green"))
+    );
+    assert!(
+        lines.contains("watch follows the pull requests of DEMO-1"),
+        "{lines}"
+    );
     for line in [
         "watch: questions wait for an answer on DEMO-1",
         "watch: another command is working the project",
@@ -4516,4 +4644,96 @@ fn a_reask_whose_state_is_not_kept_is_posted_once_under_watch() {
         "{lines}"
     );
     assert!(!lines.contains("continues it again at"), "{lines}");
+}
+
+/// OWL-209's acceptance: once `do` delivers, watch follows the pull request
+/// without a command typed, records it going red, then conflicting, then
+/// merged, each as one event, nothing for a pass that reads no change, and
+/// reads it no more once merged.
+#[test]
+fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let delivered_events = bench.events().len();
+
+    // What the forge shows before each pass: green twice, red, red again,
+    // conflicting, merged, then two passes with nothing to read.
+    let github = bench.github.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        let mut followed = github.followed.lock().unwrap();
+        match pass {
+            2 | 3 => followed.conclusion = "FAILURE",
+            4 => followed.mergeable = "CONFLICTING",
+            5 => followed.state = "MERGED",
+            _ => {}
+        }
+        pass < 7
+    });
+    assert!(outcomes.is_empty(), "nothing is continued: {outcomes:?}");
+
+    let events = &bench.events()[delivered_events..];
+    let decided = data_of(events, EventKind::Decision, "watch");
+    let seen: Vec<(&Value, &Value, &Value, &Value)> = decided
+        .iter()
+        .map(|d| (&d["watch"], &d["verdict"], &d["mergeable"], &d["action"]))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (
+                &json!("read"),
+                &json!("green"),
+                &json!("mergeable"),
+                &json!("green")
+            ),
+            (
+                &json!("verdict"),
+                &json!("red"),
+                &json!("mergeable"),
+                &json!("fix")
+            ),
+            (
+                &json!("mergeable"),
+                &json!("red"),
+                &json!("conflicting"),
+                &json!("rebase")
+            ),
+            (
+                &json!("ended"),
+                &json!("not_open"),
+                &json!("conflicting"),
+                &json!("end")
+            ),
+        ],
+        "{lines}\n{printed}"
+    );
+    assert_eq!(decided[3]["reason"], "merged");
+    assert!(
+        events.iter().all(|e| e.kind == EventKind::Decision),
+        "no warning nor any other event: {events:?}"
+    );
+    // Seven passes: the sixth read it merged, the seventh read nothing.
+    assert_eq!(*github.follow_reads.lock().unwrap(), 6);
+    let delivery = bench.record().delivery.unwrap();
+    assert!(!delivery.followed());
+    assert_eq!(
+        delivery.ended.unwrap().why,
+        owlshift_contracts::refs::EndedWhy::Merged
+    );
+    assert!(lines.contains("DEMO-1: pull request #1"), "{lines}");
+    assert!(
+        lines.contains("it was merged: watch no longer follows it"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("watch follows the pull requests of DEMO-1"),
+        "{lines}"
+    );
+    assert!(
+        lines.ends_with("no ticket's questions wait for an answer\n"),
+        "{lines}"
+    );
 }

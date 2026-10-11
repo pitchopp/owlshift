@@ -2213,7 +2213,8 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     assert!(delivery.followed());
     assert_eq!(delivery.pushing.as_ref().unwrap().kind, PushKind::Fix);
     let parse = |edit: fn(&mut Value)| TicketDelivery::parse(&edited("ticket-delivery.json", edit));
-    let refused: [(&str, fn(&mut Value)); 7] = [
+    type Edit = fn(&mut Value);
+    let refused: [(&str, Edit); 7] = [
         ("short commit", |v| v["pushed"] = json!("abc")),
         ("upper-case commit", |v| {
             v["pushing"]["base"] = json!("A".repeat(40))

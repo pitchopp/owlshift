@@ -70,8 +70,8 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
-    Ask, AskDecider, AskKind, BuildRefusal, KeptDecision, PersistedState, TicketDelivery,
-    TicketQuestions, cut_reason,
+    Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision, PersistedState,
+    PushKind, Pushing, TicketDelivery, TicketQuestions, cut_reason,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -93,6 +93,7 @@ use crate::executor::{
     DEFAULT_GATE_TIMEOUT, Executor, Failure, Git, Harness, Outcome, RESULT_PATH, RUN_DIR,
     RunReport, RunSpec,
 };
+use crate::follow::{self, Following, Look, Seen};
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::resolver::{self, Fallback, Resolved};
 use crate::rules;
@@ -117,7 +118,7 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 const HEAD_READS: u32 = 5;
 
 /// The pipeline of this version: the build stage alone, in the core machine.
-const PIPELINE: Pipeline = Pipeline::new(Variant::Trivial);
+pub(crate) const PIPELINE: Pipeline = Pipeline::new(Variant::Trivial);
 
 /// The executor of `owlshift do`: `git` for the runner's own commands,
 /// `agent` for the environment of every agent, the credential check on
@@ -489,6 +490,10 @@ pub enum Stop {
     UsageLimit { resets_at: Option<Timestamp> },
     /// The run was done and its gate passed, but its delivery failed.
     Delivery(String),
+    /// `owlshift continue` on a ticket at Watch read its pull request and
+    /// decided ([`follow`], OWL-209): nothing is wrong, nobody is the
+    /// blocker.
+    Watched { ticket: TicketId, seen: Box<Seen> },
 }
 
 impl fmt::Display for Stop {
@@ -657,6 +662,10 @@ impl fmt::Display for Stop {
                 "The run is done and its gate passed, but the delivery failed: {reason}. The \
                  worktree keeps the work; run again to retry the delivery."
             ),
+            Self::Watched { ticket, seen } => write!(
+                f,
+                "Watching {ticket}: {seen}. Owlshift never merges: review and merge it."
+            ),
         }
     }
 }
@@ -816,6 +825,17 @@ impl OnDemand<'_> {
         let round = match &p.stored {
             Some(stored) => {
                 let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
+                // Watch follows its pull request until a person merges or
+                // closes it (OWL-209): a new delivery would push over it.
+                if let Some(delivery) = &stored.record.delivery
+                    && delivery.followed()
+                    && let Some(pr) = &delivery.pull_request
+                {
+                    return Err(Stop::Refused(format!(
+                        "{ticket}'s pull request #{} ({}) is followed until a person merges or                          closes it: `owlshift watch` follows it, and `owlshift continue {ticket}`                          reads it now",
+                        pr.number, pr.url
+                    )));
+                }
                 if awaits_input(&state) {
                     return Err(Stop::Refused(format!(
                         "the questions of round {} on {ticket} wait for {}: answer them on the \
@@ -916,6 +936,15 @@ impl OnDemand<'_> {
         }
         if let Status::NeedsInput { .. } = state.status() {
             state = self.check_answers(&mut p, state, sink)?;
+        }
+        // At Watch, what watch does for the ticket, once (OWL-209).
+        if state.status() == Status::Active(Stage::Watch)
+            && p.stored
+                .as_ref()
+                .and_then(|stored| stored.record.delivery.as_ref())
+                .is_some_and(TicketDelivery::followed)
+        {
+            return Err(self.watch_once(&mut p, sink));
         }
         if state.status() != Status::Active(Stage::Build) {
             return Err(Stop::Refused(format!(
@@ -1045,6 +1074,56 @@ impl OnDemand<'_> {
                 self.config.pipeline.plan_approval,
             ),
         })
+    }
+
+    /// `owlshift continue` on a ticket at Watch whose pull request is
+    /// followed (OWL-209): one look, as watch's, with a memory of its own;
+    /// the ref keeps what it changes, then its events are recorded.
+    fn watch_once(&self, p: &mut Prepared, sink: &mut EventSink<'_>) -> Stop {
+        let ticket = p.ticket.clone();
+        let Some(stored) = p.stored.clone() else {
+            return nothing_to_continue(&ticket);
+        };
+        let Some(delivery) = &stored.record.delivery else {
+            return nothing_to_continue(&ticket);
+        };
+        let mut following = Following::default();
+        let now = (self.clock)();
+        let (look, warnings) = following.look(self.forge, &ticket, delivery, now);
+        for warning in warnings {
+            sink.emit(&ticket, None, EventKind::Warning, warning);
+        }
+        let seen = match look {
+            Look::Read(seen) => seen,
+            Look::Paused { until } => {
+                return Stop::Refused(format!(
+                    "GitHub's rate limit is spent until {until}: run `owlshift continue                      {ticket}` again then"
+                ));
+            }
+            Look::Unread { reason, .. } => {
+                return refused("reading the pull request", reason);
+            }
+        };
+        match follow::changed(&stored.record, PIPELINE, &seen, now) {
+            Ok(Some(record)) => {
+                let state = match TicketState::try_from(&record.state) {
+                    Ok(state) => state,
+                    Err(e) => return core_error(e),
+                };
+                if let Err(e) = self.store_delivery(p, &state, record.questions, record.delivery) {
+                    return refused("keeping what the read changed in the ticket's ref", e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Stop::Refused(e),
+        }
+        if let Some(event) = following.events(&ticket, &seen) {
+            sink.emit(&ticket, None, EventKind::Decision, event);
+        }
+        Stop::Watched {
+            ticket,
+            seen: Box::new(seen),
+        }
     }
 
     /// What a Build needs, read just before its first run: the forge is asked
@@ -1267,7 +1346,7 @@ impl OnDemand<'_> {
                 }
             }
         };
-        self.deliver(p, dispatched, report, gathered, sink)
+        self.deliver(p, dispatched, report, gathered, &state, sink)
     }
 
     /// Opens a question round of what the resolver left for the decider
@@ -2326,15 +2405,22 @@ impl OnDemand<'_> {
 
     /// Delivers a Build `done` whose gate passed. The push leaves from the
     /// dedicated checkout, never from the worktree (`Writer::push_branch`).
+    /// Delivers the gated commit: the ticket ref keeps the push under way
+    /// (`pushing`, OWL-209) before it, with `state`, the state Build left;
+    /// once the forge shows the commit as the pull request's head, the ref
+    /// keeps the pull request, `pushed`, `base_at_push` and Watch, in one
+    /// write, and watch follows it from its next pass.
     fn deliver(
         &self,
-        p: &Prepared,
+        p: &mut Prepared,
         dispatched: &Dispatched,
         report: RunReport,
         gathered: Gathered,
+        state: &TicketState,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
-        let (ticket, head, base) = (&p.ticket, &dispatched.head, &dispatched.base_branch);
+        let ticket = &p.ticket.clone();
+        let (head, base) = (&dispatched.head, &dispatched.base_branch);
         let (Outcome::Finished { result, .. }, Some(gate)) = (&report.outcome, &report.gate) else {
             return Err(Stop::Delivery(
                 "the run did not report a passing gate".to_owned(),
@@ -2350,6 +2436,18 @@ impl OnDemand<'_> {
         let delivery =
             |what: &str, error: &dyn fmt::Display| Stop::Delivery(format!("{what}: {error}"));
 
+        // The base head at the push, `base_at_push` once the push lands:
+        // what CI merges the head with.
+        let base_at_push = self.base_head(p, base, ticket, sink);
+        let mut kept = TicketDelivery::new(head.as_str(), base.as_str());
+        kept.pushing = Some(Pushing {
+            commit: commit.to_string(),
+            kind: PushKind::Delivery,
+            base: base_at_push.clone(),
+        });
+        let questions = p.questions();
+        self.store_delivery(p, state, questions, Some(kept.clone()))
+            .map_err(|e| delivery("keeping the push in the ticket's ref", &e))?;
         let pushed = writer
             .push_branch(&self.executor.git, &p.checkout, "origin", &commit, head)
             .map_err(|e| delivery("pushing the branch", &e))?;
@@ -2388,6 +2486,25 @@ impl OnDemand<'_> {
         // The pull request is open, whatever the steps below find.
         self.show(ticket, None, VisibleStage::Review, sink);
         let pull_request = self.head_at(opened.pull_request, head, base, &commit)?;
+        // Delivered: Completed at Verify, which has no role before P5, then
+        // at Deliver, to Watch, which follows the pull request.
+        let mut watching = *state;
+        for _ in 0..2 {
+            watching = match watching.apply(PIPELINE, Event::Completed) {
+                Ok(Transition::To(next)) => next,
+                other => return Err(core_error(other)),
+            };
+        }
+        kept.pull_request = Some(DeliveredPullRequest {
+            number: pull_request.number,
+            url: pull_request.url.clone(),
+        });
+        kept.pushed = Some(commit.to_string());
+        kept.base_at_push = Some(base_at_push);
+        kept.pushing = None;
+        let questions = p.questions();
+        self.store_delivery(p, &watching, questions, Some(kept))
+            .map_err(|e| delivery("keeping the delivery in the ticket's ref", &e))?;
         let checks = self.forge.checks(pull_request.number, &commit);
         if let Err(error) = &checks
             && error.kind == ErrorKind::HeadMoved
@@ -2433,6 +2550,47 @@ impl OnDemand<'_> {
             opened: opened.opened,
             verdict,
             comment: comment.id,
+        })
+    }
+
+    /// The base branch's head on the remote, read just before a push; the
+    /// base the Build was dispatched on when it cannot be read, with a
+    /// `warning`.
+    fn base_head(
+        &self,
+        p: &Prepared,
+        base: &Branch,
+        ticket: &TicketId,
+        sink: &mut EventSink<'_>,
+    ) -> String {
+        let name = format!("refs/heads/{base}");
+        let read = self
+            .executor
+            .git
+            .run(&p.checkout, &["ls-remote", "origin", &name])
+            .map_err(|e| e.to_string())
+            .and_then(|out| {
+                String::from_utf8_lossy(&out)
+                    .lines()
+                    .find_map(|line| {
+                        let (oid, refname) = line.split_once('\t')?;
+                        (refname == name).then(|| oid.to_owned())
+                    })
+                    .filter(|oid| CommitId::new(oid.as_str()).is_ok())
+                    .ok_or_else(|| format!("the remote has no {name}"))
+            });
+        read.unwrap_or_else(|reason| {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("base_head_unread")),
+                    ("reason", json!(reason)),
+                    ("base", json!(p.base.commit)),
+                ]),
+            );
+            p.base.commit.clone()
         })
     }
 

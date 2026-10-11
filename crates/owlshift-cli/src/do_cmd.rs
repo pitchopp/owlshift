@@ -318,7 +318,12 @@ fn finish(
         }
         Err(stop) => {
             let _ = writeln!(stdout, "\n{}", printable(&stop.to_string()));
-            ExitCode::FAILURE
+            // A look at a followed pull request is no failure (OWL-209).
+            if matches!(stop, Stop::Watched { .. }) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
