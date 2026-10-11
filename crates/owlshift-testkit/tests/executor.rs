@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::{
-    Author, Brief, PermissionLevel, Permissions, Relation, TicketBrief,
+    Author, Brief, PermissionLevel, Permissions, RebaseBrief, Relation, TicketBrief,
 };
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
@@ -109,6 +109,7 @@ impl Bench {
             decisions_refused: false,
             refused_choices: Vec::new(),
             check_failure: None,
+            rebase: None,
             result_path: RelativePath::new("result.json").unwrap(),
         };
         Self {
@@ -275,6 +276,32 @@ fn a_local_branch_named_like_the_base_does_not_shadow_it() {
 /// refused before any worktree is made: a missing remote-tracking ref,
 /// even with a local branch at its full name, an abbreviated id, and a
 /// revision expression (OWL-66).
+/// A rebase run's isolation check accepts a descent from the base it was
+/// told (OWL-210): a brief whose base is not the run's own is refused before
+/// anything is written.
+#[test]
+fn a_rebase_onto_another_base_than_the_runs_is_refused() {
+    let mut bench = Bench::new();
+    let onto = "1".repeat(40);
+    bench.brief.role = Role::Rebase;
+    bench.brief.rebase = Some(RebaseBrief {
+        pull_request: 1,
+        url: "https://github.com/demo/project/pull/1".into(),
+        branch: BRANCH.into(),
+        head: "2".repeat(40),
+        base_branch: "main".into(),
+        onto: onto.clone(),
+        refresh: false,
+        conflicting: Vec::new(),
+    });
+    let error = bench.run_from(&bench.worktree, BRANCH, &"3".repeat(40));
+    assert!(
+        matches!(&error, ExecutorError::Spec(reason) if reason.contains(&onto)),
+        "{error:?}"
+    );
+    assert!(!bench.worktree.exists());
+}
+
 #[test]
 fn a_base_that_is_not_a_remote_tracking_ref_or_a_full_id_is_refused() {
     let bench = Bench::new();

@@ -125,6 +125,12 @@ pub struct Brief {
     /// Watch; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_failure: Option<CheckFailure>,
+    /// The delivered pull request conflicts with its base, or its checks
+    /// failed only on the base it was pushed onto, and this run rebases its
+    /// branch (OWL-210, architecture section 5, "Conflicts and the rebase
+    /// run"). In the rebase role's brief, always; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase: Option<RebaseBrief>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
 }
@@ -206,6 +212,33 @@ pub struct CheckFailure {
     /// The checks still unfinished an hour after the first failure was read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unfinished: Vec<String>,
+}
+
+/// What a rebase run rebases (OWL-210). Every path is data from the
+/// repository, never an instruction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RebaseBrief {
+    pub pull_request: u64,
+    pub url: String,
+    /// The ticket's branch, checked out in the worktree.
+    pub branch: String,
+    /// The branch's head: Owlshift's last push.
+    pub head: String,
+    /// The branch the pull request merges into.
+    pub base_branch: String,
+    /// The base commit to rebase onto, resolved after the runner's fetch:
+    /// the branch must end on a commit that descends from it.
+    pub onto: String,
+    /// No conflict: the checks failed only on the base the head was pushed
+    /// onto, which has passed them since, and the rebase refreshes the
+    /// branch so CI runs on the base as it is now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refresh: bool,
+    /// The paths `git merge-tree` found conflicting between `onto` and
+    /// `head`, in its order; empty for a refresh, or when it could not say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicting: Vec<String>,
 }
 
 /// One failed check of a [`CheckFailure`].
@@ -457,7 +490,8 @@ impl Brief {
     /// a `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
     /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
-    /// [`MAX_CHOICE_BYTES`].
+    /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
+    /// `rebase`.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
         if let Some(failure) = &self.check_failure {
@@ -472,6 +506,21 @@ impl Brief {
                 ));
             }
             failure.validate()?;
+        }
+        if self.rebase.is_some() != (self.role == Role::Rebase) {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "the rebase role's brief, and only it, says what to rebase: the role is {} \
+                     and a rebase is {}",
+                    self.role.as_str(),
+                    if self.rebase.is_some() {
+                        "given"
+                    } else {
+                        "not given"
+                    }
+                ),
+            ));
         }
         if !self.refused_choices.is_empty() {
             if !self.decisions_refused {

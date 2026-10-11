@@ -23,7 +23,8 @@
 //! finding, the first snapshot, the command) is an [`ExecutorError`]:
 //! nothing ran.
 //!
-//! A Build run that finishes with `done` is not taken at its word either:
+//! A Build or rebase run that finishes with `done` is not taken at its word
+//! either (a rebase run's isolation check accepts its new base, OWL-210):
 //! the executor then runs the project's gate itself ([`gate`], OWL-16), and
 //! checks isolation again after it. A red gate makes the run
 //! [`Failure::Gate`]; a gate that breaks isolation quarantines it. The gate
@@ -166,8 +167,8 @@ pub struct RunReport {
     pub stderr_log: PathBuf,
     /// The first error writing a log file: the run went on without it.
     pub log_error: Option<String>,
-    /// The project's gate, when the executor ran it: after a Build `done`
-    /// that broke no isolation. Its commands and commit fill the delivery
+    /// The project's gate, when the executor ran it: after a Build or a
+    /// rebase `done` that broke no isolation. Its commands and commit fill the delivery
     /// report's gate when it passed.
     pub gate: Option<GateReport>,
 }
@@ -318,6 +319,23 @@ impl Executor {
         harness: &dyn Harness,
     ) -> Result<RunReport, ExecutorError> {
         let started = Instant::now();
+        // A rebase run may end on a commit that descends from its new base
+        // instead of its start (OWL-49): the base it was told, which must
+        // be the commit the run was given, so the isolation check never
+        // accepts a descent from another one (OWL-210).
+        let onto = spec
+            .brief
+            .rebase
+            .as_ref()
+            .map(|rebase| rebase.onto.as_str());
+        if let Some(onto) = onto
+            && onto != spec.base
+        {
+            return Err(ExecutorError::Spec(format!(
+                "the rebase is onto {onto}, but the run's base is {}",
+                spec.base
+            )));
+        }
         // An agent that cannot be confined never starts, before anything is
         // written (OWL-41).
         self.agent
@@ -341,8 +359,17 @@ impl Executor {
         if !findings.is_empty() {
             return Err(ExecutorError::Credentials(findings));
         }
-        let before = isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch)
-            .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
+        let before = match onto {
+            Some(onto) => isolation::Snapshot::take_rebase(
+                &self.git,
+                spec.main,
+                spec.worktree,
+                spec.branch,
+                onto,
+            ),
+            None => isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch),
+        }
+        .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
 
         let context = HarnessRun {
             worktree: spec.worktree,
@@ -428,7 +455,7 @@ impl Executor {
         let hidden = login.as_ref().map(|login| &login.token);
         let (mut outcome, end) = decide(violations, timed_out, driven, spec, hidden);
         let mut gate = None;
-        if brief.role == Role::Build && is_done(&outcome) {
+        if matches!(brief.role, Role::Build | Role::Rebase) && is_done(&outcome) {
             // The gate runs the code the run wrote, confined as the run was,
             // without the harness's own folders.
             let report = gate::run(

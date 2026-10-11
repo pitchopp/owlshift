@@ -65,7 +65,7 @@
       ]
     },
     "rebased_onto": {
-      "description": "The base head the last rebase run used.",
+      "description": "The base commit the last rebase run whose push landed rebased onto\n(OWL-210): a conflict read against it is a failed run of that\nrebase, never a second rebase onto the same base head.",
       "type": [
         "string",
         "null"
@@ -166,6 +166,13 @@
         },
         "kind": {
           "$ref": "#/$defs/PushKind"
+        },
+        "onto": {
+          "description": "For a rebase run's push, the base commit the run rebased onto:\n`rebased_onto` once the push lands or is adopted (OWL-210).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,

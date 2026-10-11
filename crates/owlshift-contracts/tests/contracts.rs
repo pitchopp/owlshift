@@ -1107,7 +1107,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(13)),
+        parse(|v| v["format"] = json!(14)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1305,6 +1305,28 @@ fn brief_rejections() {
         "the excerpts exceed 65536 bytes together",
     );
     failing(vec![check(Some("x".repeat(MAX_EXCERPT_BYTES))); 4]).unwrap();
+    // The rebase role's brief, and only it, says what to rebase (OWL-210).
+    let rebase = json!({ "pull_request": 7, "url": "https://github.com/demo/project/pull/7",
+        "branch": "owlshift/demo-7", "head": "1111111111111111111111111111111111111111",
+        "base_branch": "main", "onto": "2222222222222222222222222222222222222222",
+        "conflicting": ["README.md"] });
+    let rebasing = Brief::parse(&edited("brief.json", |v| {
+        v["role"] = json!("rebase");
+        v["rebase"] = rebase.clone();
+        v.as_object_mut().unwrap().remove("result_refusal");
+    }))
+    .unwrap();
+    assert_eq!(rebasing.rebase.unwrap().conflicting, ["README.md"]);
+    rejects(
+        "a rebase in a build brief",
+        Brief::parse(&edited("brief.json", |v| v["rebase"] = rebase.clone())),
+        "the role is build and a rebase is given",
+    );
+    rejects(
+        "a rebase brief without its rebase",
+        parse(|v| v["role"] = json!("rebase")),
+        "the role is rebase and a rebase is not given",
+    );
     // The checkpoint's paths and the result path come from the runner, but
     // are checked the same way as a model's artifact paths (OWL-25).
     for path in BAD_PATHS {

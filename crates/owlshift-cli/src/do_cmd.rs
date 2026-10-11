@@ -26,7 +26,7 @@ use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
-use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE, RESOLVER_ROLE};
+use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE, REBASE_ROLE, RESOLVER_ROLE};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_runner::{forge, tracker};
@@ -108,6 +108,8 @@ fn run_with(
         .map_err(|error| format!("the built-in answer-check role: {error}"))?;
     let resolver_prompt = strip_role_front_matter(Role::Resolver, RESOLVER_ROLE)
         .map_err(|error| format!("the built-in resolver role: {error}"))?;
+    let rebase_prompt = strip_role_front_matter(Role::Rebase, REBASE_ROLE)
+        .map_err(|error| format!("the built-in rebase role: {error}"))?;
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
@@ -166,6 +168,22 @@ fn run_with(
         prompt: resolver_prompt,
         ..harness.clone()
     };
+    // A rebase run (OWL-210) on the Build routing, and its fast tier for a
+    // trivial conflict's first run: `[models].fast`, else the standard
+    // tier's model.
+    let rebase = ClaudeHarness {
+        prompt: rebase_prompt,
+        ..harness.clone()
+    };
+    let rebase_fast = ClaudeHarness {
+        model: project
+            .models
+            .fast
+            .as_ref()
+            .and_then(|tier| tier.claude.clone())
+            .or_else(|| rebase.model.clone()),
+        ..rebase.clone()
+    };
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let on_demand = OnDemand {
@@ -175,6 +193,8 @@ fn run_with(
         build: &harness,
         answer_check: &check,
         resolver: &resolver,
+        rebase: &rebase,
+        rebase_fast: &rebase_fast,
         remote_url: &remote_url,
         config: project,
         dirs: &dirs,
