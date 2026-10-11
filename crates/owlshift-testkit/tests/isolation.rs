@@ -105,6 +105,21 @@ impl Fixture {
         String::from_utf8(id).unwrap().trim().to_owned()
     }
 
+    /// Makes git read `file` of `dir` again, through its filters, whenever
+    /// it checks the file for a change. Git skips that read when the stat
+    /// data of an index entry shows the file changed or shows nothing
+    /// racy, so a control that expects a filter to run cannot rely on a
+    /// plain edit. An entry staged with `--cacheinfo` has no stat data:
+    /// git can only compare the content, and reads it through the clean
+    /// filter, whatever the timing.
+    fn force_reread(&self, dir: &Path, file: &str) {
+        let blob = self.commit(dir, &format!("HEAD:{file}"));
+        let entry = format!("100644,{blob},{file}");
+        self.env
+            .run(dir, &["update-index", "--cacheinfo", &entry])
+            .unwrap();
+    }
+
     /// Commits `text` as `file` in `dir`.
     fn commit_file(&self, dir: &Path, file: &str, text: &str) {
         fs::write(dir.join(file), text).unwrap();
@@ -274,6 +289,8 @@ fn a_redirected_link_or_a_planted_filter_stops_the_check_before_any_git() {
             }
             _ => {
                 let fired = fired.to_string_lossy().replace('\\', "/");
+                // Before the filter is configured: git would run it here.
+                f.force_reread(&f.main, "README.md");
                 f.main_git(&[
                     "config",
                     "filter.owl.clean",
@@ -304,7 +321,7 @@ fn a_redirected_link_or_a_planted_filter_stops_the_check_before_any_git() {
         assert_eq!(ran.lock().unwrap().as_deref(), Some(&[][..]), "{case}");
         assert!(!fired.exists(), "{case}: the filter ran");
         if case == "a planted filter" {
-            // The control: `git status` does run it.
+            // The control: `git status` does run it, whatever the stat data.
             f.main_git(&["status", "--porcelain"]);
             assert!(fired.exists(), "the planted filter never runs");
         }
@@ -325,6 +342,8 @@ fn a_planted_submodule_starts_no_git_in_it() {
     let violations = f.around(|f| {
         f.main_git(&["init", "--quiet", "sub"]);
         f.commit_file(&sub, "file.txt", "one\n");
+        // Before any helper is configured: git runs those too.
+        f.force_reread(&sub, "file.txt");
         let sentinel = |path: &Path| path.to_string_lossy().replace('\\', "/");
         f.env
             .run(
