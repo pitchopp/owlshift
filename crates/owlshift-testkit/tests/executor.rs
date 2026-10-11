@@ -109,6 +109,7 @@ impl Bench {
             decisions_refused: false,
             refused_choices: Vec::new(),
             check_failure: None,
+            correction: None,
             rebase: None,
             result_path: RelativePath::new("result.json").unwrap(),
         };

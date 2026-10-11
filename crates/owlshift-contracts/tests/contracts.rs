@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use owlshift_contracts::ContractError;
 use owlshift_contracts::brief::{
-    Brief, MAX_CHOICE_BYTES, MAX_EXCERPT_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES,
-    ThreadEntry,
+    Brief, MAX_CHOICE_BYTES, MAX_EXCERPT_BYTES, MAX_REFUSED_CHOICES, MAX_REPLY_BYTES,
+    MAX_RESULT_REFUSAL_BYTES, ThreadEntry,
 };
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
@@ -1107,7 +1107,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(14)),
+        parse(|v| v["format"] = json!(15)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1282,6 +1282,59 @@ fn brief_rejections() {
         }),
         "a check failure is given but the role is answer_check, not build",
     );
+    // A correction (OWL-146): Build's alone, reversing at least one
+    // decision, each with a reply within its cap.
+    let reversed = |reply: String| {
+        json!({ "pull_request": 7, "url": "https://github.com/demo/project/pull/7",
+            "head": "1111111111111111111111111111111111111111",
+            "reversed": [{ "question": { "id": "Q1", "category": "naming", "context": "c",
+                "text": "Which file?" }, "decision": "GREETING.md", "reply": reply }] })
+    };
+    let corrected = Brief::parse(&edited("brief.json", |v| {
+        v["correction"] = json!({ "pull_request": 7, "url": "https://github.com/demo/project/pull/7",
+            "head": "1111111111111111111111111111111111111111",
+            "reversed": [{ "question": { "id": "Q1", "category": "naming", "context": "c",
+                "text": "Which file?" }, "decision": "GREETING.md", "reply": "No: HELLO.md." }] });
+    }))
+    .unwrap();
+    assert_eq!(corrected.correction.unwrap().reversed.len(), 1);
+    for (case, correction, role, needle) in [
+        (
+            "a correction in a rebase brief",
+            reversed("No.".into()),
+            "rebase",
+            "a correction is given but the role is rebase, not build",
+        ),
+        (
+            "a blank reply",
+            reversed(" ".into()),
+            "build",
+            "reversed decision 1 has a blank reply",
+        ),
+        (
+            "a reply past its cap",
+            reversed("x".repeat(MAX_REPLY_BYTES + 1)),
+            "build",
+            "reversed decision 1 has a blank reply or one over",
+        ),
+    ] {
+        let mut brief: Value = serde_json::from_str(&fixture("brief.json")).unwrap();
+        brief["role"] = json!(role);
+        brief["correction"] = correction;
+        if role == "rebase" {
+            brief["rebase"] = json!({ "pull_request": 7, "url": "u", "branch": "b",
+                "head": "h", "base_branch": "main", "onto": "o" });
+        }
+        rejects(case, Brief::parse(&brief.to_string()), needle);
+    }
+    let mut none: Value = serde_json::from_str(&fixture("brief.json")).unwrap();
+    none["correction"] = reversed("No.".into());
+    none["correction"]["reversed"] = json!([]);
+    rejects(
+        "a correction reversing nothing",
+        Brief::parse(&none.to_string()),
+        "a correction reverses no decision",
+    );
     rejects(
         "a check failure without a check",
         failing(Vec::new()),
@@ -1431,7 +1484,7 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(10)),
+        asked(|v| v["format"] = json!(11)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1527,7 +1580,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 9,"));
+    assert!(read.render().starts_with("{\n  \"format\": 10,"));
     // A format-3 document, written before the resolver's decisions were
     // kept, is read with none, its verdicts kept.
     let format_3 = edited("ticket-questions.json", |v| {
@@ -1543,7 +1596,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_3).unwrap();
     assert!(read.decisions.is_empty());
     assert_eq!(read.asks[0].verdicts.len(), 2);
-    assert!(read.render().starts_with("{\n  \"format\": 9,"));
+    assert!(read.render().starts_with("{\n  \"format\": 10,"));
     // A format-4 document, written before an ask kept its check's refusal,
     // is read with none, its decisions kept.
     let format_4 = edited("ticket-questions.json", |v| {
@@ -1558,7 +1611,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_4).unwrap();
     assert!(read.asks.iter().all(|ask| ask.result_refusal.is_none()));
     assert_eq!(read.decisions.len(), 1);
-    assert!(read.render().starts_with("{\n  \"format\": 9,"));
+    assert!(read.render().starts_with("{\n  \"format\": 10,"));
     // A format-5 document, written before Build's refusal was kept
     // (OWL-192), is read with none, its asks' refusals kept.
     let format_5 = edited("ticket-questions.json", |v| {
@@ -1569,7 +1622,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_5).unwrap();
     assert_eq!(read.build_refusal, None);
     assert!(read.asks[1].result_refusal.is_some());
-    assert!(read.render().starts_with("{\n  \"format\": 9,"));
+    assert!(read.render().starts_with("{\n  \"format\": 10,"));
     // Formats 6 and 7 kept Build's refusal in their own shape (OWL-192,
     // OWL-194): the hold's first list in `decisions_reason`, the latest
     // reason, of a kind they did not keep, in `reason`. Each is read as
@@ -1588,7 +1641,7 @@ fn event_claim_and_state_rejections() {
     };
     let upgraded = |format: u64, refusal: Value| {
         let read = TicketQuestions::parse(&legacy(format, refusal)).unwrap();
-        assert!(read.render().starts_with("{\n  \"format\": 9,"));
+        assert!(read.render().starts_with("{\n  \"format\": 10,"));
         read.build_refusal.unwrap()
     };
     for format in [6, 7] {
@@ -1658,7 +1711,7 @@ fn event_claim_and_state_rejections() {
     }
     // A format-8 document, written before the refused choices were typed
     // (OWL-198), keeps its lists as text, told as before, and is written
-    // back as format 9; typed choices are refused in it.
+    // back as the current format; typed choices are refused in it.
     let format_8 = |refusal: Value| {
         edited("ticket-questions.json", |v| {
             v["format"] = json!(8);
@@ -1667,7 +1720,7 @@ fn event_claim_and_state_rejections() {
     };
     let read =
         TicketQuestions::parse(&format_8(json!({"reason": latest, "lists": [held]}))).unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 9,"));
+    assert!(read.render().starts_with("{\n  \"format\": 10,"));
     let kept = read.build_refusal.unwrap();
     assert!(kept.holds() && kept.choices.is_empty() && kept.lists == [held]);
     assert_eq!(
@@ -1684,6 +1737,44 @@ fn event_claim_and_state_rejections() {
             "format 8 keeps no typed refused choices",
         );
     }
+    // A format-9 document, written before a decision kept its reversal
+    // (OWL-146), is read with none and written back as format 10; a
+    // reversal is refused in it. Format 10 keeps one, naming its reply.
+    let read = TicketQuestions::parse(&edited("ticket-questions.json", |v| v["format"] = json!(9)))
+        .unwrap();
+    assert!(read.render().starts_with("{\n  \"format\": 10,"));
+    assert!(read.decisions[0].reversed.is_none());
+    let reversal = || json!({"through": "2026-09-28T12:00:00Z", "comment": "c-reply-1"});
+    rejects(
+        "a format-9 decision with a reversal",
+        TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+            v["format"] = json!(9);
+            v["decisions"][0]["reversed"] =
+                json!({"through": "2026-09-28T12:00:00Z", "comment": "c-reply-1"});
+        })),
+        "format 9 keeps no reversed decision",
+    );
+    let reversed = TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+        v["decisions"][0]["reversed"] =
+            json!({"through": "2026-09-28T12:00:00Z", "comment": "c-reply-1"});
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(reversed.decisions[0].reversed.as_ref().unwrap()).unwrap(),
+        reversal()
+    );
+    assert!(matches!(
+        reversed.decisions[0].entry(),
+        ThreadEntry::Decision { reversed: true, .. }
+    ));
+    rejects(
+        "a reversal naming no reply",
+        TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+            v["decisions"][0]["reversed"] =
+                json!({"through": "2026-09-28T12:00:00Z", "comment": " "});
+        })),
+        "decision 1 names no reversing reply",
+    );
     // A format-6 document, written before the resolver's refusal was kept
     // (OWL-191), is read with none; the field is refused in it, whatever
     // its value. A format-7 document keeps it.
@@ -2321,6 +2412,21 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert_eq!(ended.ended.as_ref().unwrap().why, EndedWhy::HeadMoved);
     assert!(!ended.followed());
+    // A format-1 document, written before a correction's push (OWL-146),
+    // is read as format 2; a correction's push is refused in it.
+    let older = parse(|v| v["format"] = json!(1)).unwrap();
+    assert!(older.render().starts_with("{\n  \"format\": 2,"));
+    assert!(
+        parse(|v| {
+            v["format"] = json!(1);
+            v["pushing"]["kind"] = json!("correction");
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("format 1 keeps no correction's push")
+    );
+    let correction = parse(|v| v["pushing"]["kind"] = json!("correction")).unwrap();
+    assert_eq!(correction.pushing.unwrap().kind, PushKind::Correction);
     // A first delivery's push is under way before its pull request exists.
     let first = TicketDelivery::new("owlshift/demo-1", "main");
     assert_eq!(TicketDelivery::parse(&first.render()).unwrap(), first);

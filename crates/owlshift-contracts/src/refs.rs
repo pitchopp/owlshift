@@ -539,6 +539,23 @@ pub struct KeptDecision {
     /// What settles it.
     #[schemars(regex(pattern = r"\S"))]
     pub basis: String,
+    /// The decider reversed it by replying to its DECISION comment
+    /// (format 10, OWL-146): the replies a run was given and followed, up to
+    /// [`Reversal::through`]. A newer reply is one no run has followed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversed: Option<Reversal>,
+}
+
+/// The decider's replies to a DECISION comment that a run followed: the
+/// Build that delivered the ticket, or a correction run at Watch (OWL-146).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Reversal {
+    /// The newest last edit among those replies.
+    pub through: Timestamp,
+    /// The tracker's identifier of the reply edited at `through`.
+    #[schemars(regex(pattern = r"\S"))]
+    pub comment: String,
 }
 
 impl KeptDecision {
@@ -549,6 +566,7 @@ impl KeptDecision {
             question: self.question.clone(),
             decision: self.decision.clone(),
             basis: self.basis.clone(),
+            reversed: self.reversed.is_some(),
         }
     }
 }
@@ -648,10 +666,11 @@ impl TicketQuestions {
     /// written before the resolver's refusal was kept (OWL-191), and a
     /// format-7 one, written before every refused list was kept (OWL-195),
     /// and a format-8 one, written before the refused choices were typed
-    /// (OWL-198), are read as the current format with what they lack empty,
-    /// a format-6 or 7 Build refusal upgraded (`LegacyBuildRefusal::upgrade`)
-    /// and a format-8 one's lists kept as text, and the next write gives
-    /// them the current format.
+    /// (OWL-198), and a format-9 one, written before a decision kept its
+    /// reversal (OWL-146), are read as the current format with what they lack
+    /// empty, a format-6 or 7 Build refusal upgraded
+    /// (`LegacyBuildRefusal::upgrade`) and a format-8 one's lists kept as
+    /// text, and the next write gives them the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -661,20 +680,27 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 8 document read as the current format, or `None` for
+    /// A format-2 to 9 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
-    /// in their own shape, and format 9 adds the typed choices to it.
+    /// in their own shape, format 9 adds the typed choices to it, and format
+    /// 10 a decision's reversal.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=8).contains(&format) {
+        if !(2..=9).contains(&format) {
             return None;
         }
-        let typed = document["build_refusal"]
-            .as_object()
-            .is_some_and(|kept| kept.contains_key("choices") || kept.contains_key("left_out"));
+        let typed = format <= 8
+            && document["build_refusal"]
+                .as_object()
+                .is_some_and(|kept| kept.contains_key("choices") || kept.contains_key("left_out"));
+        let reversed = document["decisions"].as_array().is_some_and(|decisions| {
+            decisions
+                .iter()
+                .any(|decision| decision.get("reversed").is_some())
+        });
         let in_an_ask = |field: &str| {
             document["asks"]
                 .as_array()
@@ -692,6 +718,8 @@ impl TicketQuestions {
             Some("resolver refusal")
         } else if typed {
             Some("typed refused choices")
+        } else if reversed {
+            Some("reversed decision")
         } else {
             None
         };
@@ -809,6 +837,12 @@ impl TicketQuestions {
                 "decision"
             } else if kept.basis.trim().is_empty() {
                 "basis"
+            } else if kept
+                .reversed
+                .as_ref()
+                .is_some_and(|r| r.comment.trim().is_empty())
+            {
+                "reversing reply"
             } else if n > 0 && self.decisions[n - 1].at > kept.at {
                 return Err(ContractError::invalid(
                     Self::CONTRACT,
@@ -994,6 +1028,9 @@ pub enum PushKind {
     Delivery,
     Fix,
     Rebase,
+    /// A correction run's, after the decider reversed a decision (format 2,
+    /// OWL-146).
+    Correction,
 }
 
 /// Why and when watch stopped following a pull request.
@@ -1037,10 +1074,39 @@ impl TicketDelivery {
         }
     }
 
+    /// Parses a `delivery.json`. A format-1 one, written before a
+    /// correction run's push (OWL-146), is read as the current format, and
+    /// the next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let delivery: Self = format::parse_json(Self::CONTRACT, DELIVERY_FORMAT, input)?;
+        let delivery: Self = match Self::from_older_format(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, DELIVERY_FORMAT, input)?,
+        };
         delivery.validate()?;
         Ok(delivery)
+    }
+
+    /// A format-1 document read as the current format, or `None` for any
+    /// other. Format 1 is a strict subset of format 2, so a correction's push
+    /// is refused in it.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        if document["pushing"]["kind"] == "correction" {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "format 1 keeps no correction's push",
+            )));
+        }
+        document["format"] = DELIVERY_FORMAT.into();
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {

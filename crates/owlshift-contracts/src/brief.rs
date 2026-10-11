@@ -131,6 +131,12 @@ pub struct Brief {
     /// run"). In the rebase role's brief, always; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebase: Option<RebaseBrief>,
+    /// The decider replied to the DECISION comments of decisions kept on the
+    /// delivered ticket, and this run makes the pull request follow the
+    /// replies (OWL-146, architecture section 5, "A reversed decision"). In
+    /// Build's brief only, at Watch; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<Correction>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
 }
@@ -239,6 +245,39 @@ pub struct RebaseBrief {
     /// `head`, in its order; empty for a refresh, or when it could not say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicting: Vec<String>,
+}
+
+/// The most bytes of the replies to one DECISION a correction is given.
+pub const MAX_REPLY_BYTES: usize = 16 * 1024;
+
+/// The decisions the decider reversed on a delivered ticket, as a correction
+/// run is given them (OWL-146). The replies are the decider's words, the
+/// instruction this run follows; everything else here is the runner's
+/// record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Correction {
+    pub pull_request: u64,
+    pub url: String,
+    /// The branch's head: Owlshift's last push.
+    pub head: String,
+    /// Each reversed decision, oldest first.
+    #[schemars(length(min = 1))]
+    pub reversed: Vec<ReversedDecision>,
+}
+
+/// One decision a [`Correction`] reverses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReversedDecision {
+    /// The question the decision settled, under the raising run's id.
+    pub question: Question,
+    /// The decision the replies reverse.
+    pub decision: String,
+    /// The decider's replies to its DECISION comment that no run followed
+    /// yet, oldest first, separated by blank lines, at most
+    /// [`MAX_REPLY_BYTES`].
+    pub reply: String,
 }
 
 /// One failed check of a [`CheckFailure`].
@@ -412,6 +451,11 @@ pub enum ThreadEntry {
         decision: String,
         /// What settles it: the ticket, a rule, a file, an earlier answer.
         basis: String,
+        /// The decider reversed it by replying to its DECISION comment
+        /// (OWL-146): the reply, a `comment` of the thread, is followed and
+        /// this decision never is.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reversed: bool,
     },
 }
 
@@ -491,7 +535,8 @@ impl Brief {
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
     /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
     /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
-    /// `rebase`.
+    /// `rebase`; only Build's has a `correction`, which reverses at least one
+    /// decision, each with a reply of at most [`MAX_REPLY_BYTES`].
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
         if let Some(failure) = &self.check_failure {
@@ -506,6 +551,37 @@ impl Brief {
                 ));
             }
             failure.validate()?;
+        }
+        if let Some(correction) = &self.correction {
+            if self.role != Role::Build {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "a correction is given but the role is {}, not {}",
+                        self.role.as_str(),
+                        Role::Build.as_str()
+                    ),
+                ));
+            }
+            if correction.reversed.is_empty() {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "a correction reverses no decision",
+                ));
+            }
+            if let Some(n) = correction
+                .reversed
+                .iter()
+                .position(|r| r.reply.trim().is_empty() || r.reply.len() > MAX_REPLY_BYTES)
+            {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "reversed decision {} has a blank reply or one over {MAX_REPLY_BYTES} bytes",
+                        n + 1
+                    ),
+                ));
+            }
         }
         if self.rebase.is_some() != (self.role == Role::Rebase) {
             return Err(ContractError::invalid(

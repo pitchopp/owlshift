@@ -2477,6 +2477,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 created_at: "2026-09-28T12:00:00Z".parse().unwrap(),
                 edited_at: None,
                 body: body.to_owned(),
+                parent: None,
             };
             self.comments.borrow_mut().push(comment.clone());
             Ok(comment)

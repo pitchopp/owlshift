@@ -921,6 +921,7 @@ impl Driver {
                         question: question.clone(),
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
+                        reversed: None,
                     });
                     decided.push(question.id.clone());
                 }
@@ -1235,6 +1236,7 @@ impl Driver {
             refused_choices: Vec::new(),
             check_failure: None,
             rebase: None,
+            correction: None,
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
         };

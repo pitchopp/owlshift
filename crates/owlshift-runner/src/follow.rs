@@ -537,11 +537,13 @@ pub fn changed(
                 let event = match pushing.kind {
                     PushKind::Fix => Some(Event::FixPushed),
                     PushKind::Rebase => Some(Event::RebasePushed),
+                    PushKind::Correction => Some(Event::Corrected),
                     PushKind::Delivery => None,
                 };
                 landed(&mut delivery, pushing);
-                // A fix or rebase push a crash cut short counts as the run
-                // would have (OWL-112, OWL-210), when the bounds still allow
+                // A fix, rebase or correction push a crash cut short counts as
+                // the run would have (OWL-112, OWL-210, OWL-146), when the
+                // bounds still allow
                 // it: a stuck count never stops the following. No report is
                 // posted for it.
                 if let Some(event) = event {

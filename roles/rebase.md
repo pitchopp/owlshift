@@ -1,6 +1,6 @@
 +++
 role = "rebase"
-brief_format = 13
+brief_format = 14
 result_format = 7
 +++
 

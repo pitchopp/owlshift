@@ -22,8 +22,9 @@ use crate::Role;
 /// (OWL-184); format 9 adds Build's `decisions_refused` (OWL-186); format 10
 /// gives `result_refusal` to the resolver too (OWL-191); format 11 adds
 /// Build's `refused_choices` (OWL-198); format 12 adds Build's `check_failure`
-/// (OWL-112); format 13 the rebase role's `rebase` (OWL-210).
-pub const BRIEF_FORMAT: u32 = 13;
+/// (OWL-112); format 13 the rebase role's `rebase` (OWL-210); format 14
+/// Build's `correction` and a thread decision's `reversed` (OWL-146).
+pub const BRIEF_FORMAT: u32 = 14;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -44,12 +45,13 @@ pub const TICKET_STATE_FORMAT: u32 = 3;
 /// ask's `result_refusal` (OWL-184); format 6 Build's kept `build_refusal`
 /// (OWL-192); format 7 the resolver's kept `resolver_refusal` (OWL-191);
 /// format 8 every refused list of choices in `build_refusal` (OWL-195);
-/// format 9 the refused choices typed in it (OWL-198); formats 2 to 8 are
-/// still read.
-pub const QUESTIONS_FORMAT: u32 = 9;
+/// format 9 the refused choices typed in it (OWL-198); format 10 a
+/// decision's `reversed` (OWL-146); formats 2 to 9 are still read.
+pub const QUESTIONS_FORMAT: u32 = 10;
 /// The format version of a ticket's delivery (`delivery.json` on a ticket
-/// ref, OWL-209).
-pub const DELIVERY_FORMAT: u32 = 1;
+/// ref, OWL-209). Format 2 adds a correction run's push (OWL-146); format 1
+/// is still read.
+pub const DELIVERY_FORMAT: u32 = 2;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

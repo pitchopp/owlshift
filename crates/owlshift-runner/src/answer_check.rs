@@ -326,6 +326,7 @@ mod tests {
             created_at: at(created),
             edited_at: edited.map(at),
             body: body.into(),
+            parent: None,
         };
         let mut asked = TicketQuestions::parse(
             r#"{"format":2,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T10:10:00Z",
@@ -413,6 +414,7 @@ mod tests {
             created_at: at(created),
             edited_at: None,
             body: body.into(),
+            parent: None,
         };
         let mut comments = vec![by_decider(9, &parts[0]), by_decider(10, &parts[1])];
         let asked = TicketQuestions::parse(
@@ -455,6 +457,7 @@ mod tests {
             created_at: at(created),
             edited_at: edited.map(at),
             body: body.into(),
+            parent: None,
         };
         let marked = "[owlshift] DELIVERY\n\nDone. go\n";
         let cases = [
@@ -547,6 +550,7 @@ mod tests {
             created_at: at(created),
             edited_at: edited.map(at),
             body: body.into(),
+            parent: None,
         };
         let ids = |late: Vec<&Comment>| -> Vec<String> {
             late.into_iter().map(|c| c.id.clone()).collect()

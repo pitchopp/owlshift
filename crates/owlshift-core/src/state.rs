@@ -110,6 +110,7 @@ impl Status {
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | At Watch, a fix run's push landed on the pull request | `FixPushed` |
 /// | At Watch, a rebase run's push landed on the pull request | `RebasePushed` |
+/// | At Watch, a correction run's push landed, or it found the pull request already following the decider's replies | `Corrected` |
 /// | At Watch, the pull request was read green | `ChecksGreen` |
 /// | At Watch, a read calls for a fix run, before it runs | `FixDue` |
 /// | At Watch, a read calls for a rebase run, before it runs | `RebaseDue` |
@@ -152,6 +153,11 @@ pub enum Event {
     /// A rebase run's push landed: as [`Event::FixPushed`], counting a
     /// repair and no fix pass.
     RebasePushed,
+    /// A correction run, after the decider reversed a decision (OWL-146),
+    /// pushed its commit or found nothing to change: the ticket stays at
+    /// Watch and its failed runs are cleared. It counts no fix pass and no
+    /// repair: each correction answers a reply of the decider's.
+    Corrected,
     /// The pull request was read green: the fix passes and the failed runs
     /// are cleared, and the repairs are kept.
     ChecksGreen,
@@ -172,7 +178,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -187,6 +193,7 @@ impl Event {
         Self::Quarantined,
         Self::FixPushed,
         Self::RebasePushed,
+        Self::Corrected,
         Self::ChecksGreen,
         Self::FixDue,
         Self::RebaseDue,
@@ -511,6 +518,10 @@ impl TicketState {
                     ..*self
                 })
             }
+            (Status::Active(Stage::Watch), Event::Corrected) => Transition::To(Self {
+                failed_runs: 0,
+                ..*self
+            }),
             (Status::Active(Stage::Watch), Event::ChecksGreen) => Transition::To(Self {
                 fix_passes: 0,
                 failed_runs: 0,
@@ -742,6 +753,7 @@ mod tests {
                 Status::Active(Watch),
                 Event::FixPushed
                 | Event::RebasePushed
+                | Event::Corrected
                 | Event::ChecksGreen
                 | Event::FixDue
                 | Event::RebaseDue,
@@ -1071,6 +1083,9 @@ mod tests {
             (watch(1, 0, 0), Event::FixPushed, stays(watch(0, 1, 1))),
             (watch(1, 1, 4), Event::FixPushed, stays(watch(0, 2, 5))),
             (watch(1, 2, 0), Event::RebasePushed, stays(watch(0, 2, 1))),
+            // A correction clears the failed runs and counts nothing, at
+            // the bounds too.
+            (watch(1, 2, 6), Event::Corrected, stays(watch(0, 2, 6))),
             // Green clears the fix passes and the failed runs, never the
             // repairs.
             (watch(1, 2, 5), Event::ChecksGreen, stays(watch(0, 0, 5))),

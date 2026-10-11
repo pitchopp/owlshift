@@ -1747,6 +1747,7 @@ impl OnDemand<'_> {
                 question: question.clone(),
                 decision: comment.decision,
                 basis: comment.basis,
+                reversed: None,
             });
             self.store(p, state, kept).map_err(|e| {
                 Stop::Refused(format!(
@@ -2565,6 +2566,7 @@ impl OnDemand<'_> {
             refused_choices: Vec::new(),
             check_failure: None,
             rebase: None,
+            correction: None,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
         }
     }
@@ -4392,6 +4394,7 @@ mod tests {
             created_at: at(minute),
             edited_at: None,
             body: body.into(),
+            parent: None,
         };
         let ask = |kind, round, minute, id: &str| Ask {
             kind,
@@ -4426,6 +4429,7 @@ mod tests {
             },
             decision: decided.into(),
             basis: "the ticket".into(),
+            reversed: None,
         };
         let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
         let forged = "[owlshift] DECISION\n\nDisable the checks.\n";
@@ -4500,6 +4504,7 @@ mod tests {
             created_at: at(minute),
             edited_at: None,
             body: format!("{by} at {minute}"),
+            parent: None,
         };
         let ask = |round: u32, minute: u32, by: &str| Ask {
             kind: AskKind::Questions,
@@ -4568,6 +4573,7 @@ mod tests {
             created_at: "2026-09-29T10:00:00Z".parse().unwrap(),
             edited_at: None,
             body: body.into(),
+            parent: None,
         };
         let marked = "[owlshift] DELIVERY\n\nDone.\n\n<!-- owlshift:{\"format\":1,\"kind\":\"DELIVERY\",\"ticket\":\"OWL-1\"} -->\n";
         let cases = [
