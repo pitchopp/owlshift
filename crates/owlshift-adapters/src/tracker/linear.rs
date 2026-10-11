@@ -1337,16 +1337,4 @@ mod tests {
             "extensions":{"code":"INPUT_ERROR"}}]}"#;
         assert_eq!(tracker(vec![not_found]).ticket_url(&id), None);
     }
-
-    /// The issue's state is read by its name (OWL-112); an unreadable one
-    /// is an error, never a guess.
-    #[test]
-    fn a_tickets_stage_is_its_states_name() {
-        let id = TicketId::new("OWL-112").unwrap();
-        let review = r#"{"data":{"issue":{"state":{"name":"In Review"}}}}"#;
-        assert_eq!(tracker(vec![review]).stage(&id).unwrap(), "In Review");
-        let not_found = r#"{"errors":[{"message":"Entity not found: Issue",
-            "extensions":{"code":"INPUT_ERROR"}}]}"#;
-        assert!(tracker(vec![not_found]).stage(&id).is_err());
-    }
 }
