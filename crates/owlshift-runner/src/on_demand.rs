@@ -103,8 +103,8 @@ use crate::rules;
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::{
     DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment, Posted,
-    QuestionsComment, ReaskComment, ReplyComment, Restart, ResumeComment, VisibleStage, WriteError,
-    Writer, park_reason,
+    QuestionsComment, ReaskComment, ReopenedChoice, ReplyComment, Restart, ResumeComment,
+    VisibleStage, WriteError, Writer, park_reason,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 
@@ -313,6 +313,26 @@ pub fn tell_build(brief: &mut Brief, questions: &TicketQuestions) {
     brief.result_refusal = kept.map(BuildRefusal::told);
     brief.decisions_refused = kept.is_some_and(BuildRefusal::holds);
     brief.refused_choices = kept.map(|kept| kept.choices.clone()).unwrap_or_default();
+}
+
+/// The refused choices an accepted Build result reopens (OWL-203): each
+/// place its `refused_choices_asked` names, with the choice its `brief`
+/// gave there and the id the result gave the question that asks it, in
+/// place order. Empty when the brief gave no typed choice, the validation
+/// refusing a mapping then ([`RunResult::validate_against`]).
+pub fn asked_choices(brief: &Brief, result: &RunResult) -> Vec<ReopenedChoice> {
+    result
+        .refused_choices_asked
+        .iter()
+        .filter_map(|asked| {
+            let index = usize::try_from(asked.choice.get() - 1).ok()?;
+            Some(ReopenedChoice {
+                place: asked.choice,
+                question: asked.question.clone(),
+                choice: brief.refused_choices.get(index)?.clone(),
+            })
+        })
+        .collect()
 }
 
 /// How a run's result was refused for the build role's own decisions
@@ -727,6 +747,30 @@ struct Round {
     /// Why the questions meant for the resolver are in the round, when
     /// they are.
     fallback: Option<Fallback>,
+    /// The refused choices its questions reopen, under the round's ids
+    /// (OWL-203).
+    reopened: Vec<ReopenedChoice>,
+}
+
+impl Round {
+    /// The round of a run's questions `raised`, all but those `decided`,
+    /// renumbered, with the refused choices `asked` of the run its questions
+    /// reopen ([`resolver::reopened_in`]).
+    fn of(
+        raised: &[Question],
+        decided: &[QuestionId],
+        asked: &[ReopenedChoice],
+        fallback: Option<Fallback>,
+    ) -> Self {
+        let questions = resolver::left_for_decider(raised, decided);
+        let reopened = resolver::reopened_in(&questions, asked);
+        Round {
+            questions,
+            decided: decided.len(),
+            fallback,
+            reopened,
+        }
+    }
 }
 
 /// Which command runs.
@@ -1246,6 +1290,11 @@ impl OnDemand<'_> {
             let result = (event != Event::ResultRefused)
                 .then(|| ran.result())
                 .flatten();
+            // Which refused choices its questions reopen, from the brief the
+            // run was told: a kept decision clears the hold (OWL-203).
+            let asked = result
+                .map(|result| asked_choices(&brief, result))
+                .unwrap_or_default();
             // Questions go through the resolver before any reaches the
             // decider: the core's `Questions` comes after it, for what is
             // left, and a run whose questions were all decided runs again.
@@ -1257,11 +1306,7 @@ impl OnDemand<'_> {
                 // A run given late comments asks because it cannot follow
                 // them without the decider: the resolver never settles that
                 // in their place.
-                round = Some(Round {
-                    questions: resolver::left_for_decider(&result.questions, &[]),
-                    decided: 0,
-                    fallback: None,
-                });
+                round = Some(Round::of(&result.questions, &[], &asked, None));
             } else if event == Event::Questions
                 && let Some(result) = result
             {
@@ -1269,6 +1314,7 @@ impl OnDemand<'_> {
                     p,
                     &state,
                     result,
+                    &asked,
                     &dispatched.rules,
                     &current,
                     settled,
@@ -1423,18 +1469,29 @@ impl OnDemand<'_> {
         let ticket = p.ticket.clone();
         let (raised, questions): (Vec<QuestionId>, Vec<Question>) =
             left.questions.into_iter().unzip();
-        sink.emit(
-            &ticket,
-            Some(run),
-            EventKind::Gate,
-            data([
-                ("opened", json!("questions")),
-                ("round", json!(state.round())),
-                ("status", status_name(status)),
-                ("questions", json!(questions.len())),
-                ("raised_as", question_ids(&raised)),
-            ]),
-        );
+        let mut opened = data([
+            ("opened", json!("questions")),
+            ("round", json!(state.round())),
+            ("status", status_name(status)),
+            ("questions", json!(questions.len())),
+            ("raised_as", question_ids(&raised)),
+        ]);
+        if !left.reopened.is_empty() {
+            let reopened: Vec<Value> = left
+                .reopened
+                .iter()
+                .map(|reopened| {
+                    let at = questions.iter().position(|q| q.id == reopened.question);
+                    json!({
+                        "choice": reopened.place.get(),
+                        "question": reopened.question.as_str(),
+                        "raised_as": at.map(|at| raised[at].as_str()),
+                    })
+                })
+                .collect();
+            opened.insert("reopened".to_owned(), json!(reopened));
+        }
+        sink.emit(&ticket, Some(run), EventKind::Gate, opened);
         let stop = |posted| Stop::NeedsInput {
             ticket: ticket.clone(),
             status,
@@ -1461,6 +1518,7 @@ impl OnDemand<'_> {
             premise_false: status == result::Status::PremiseFalse,
             decided: left.decided,
             fallback: left.fallback,
+            reopened: left.reopened,
         };
         let writer = Writer::new(self.tracker).mentioning(&decider.account);
         let Posted {
@@ -1541,6 +1599,7 @@ impl OnDemand<'_> {
         p: &mut Prepared,
         state: &TicketState,
         result: &RunResult,
+        asked: &[ReopenedChoice],
         rules: &[Rule],
         current: &Person,
         settled: u32,
@@ -1549,13 +1608,7 @@ impl OnDemand<'_> {
     ) -> Result<Routing, Stop> {
         let ticket = p.ticket.clone();
         let routed = resolver::route(&p.policy, &result.questions);
-        let all = |fallback| {
-            Routing::Ask(Round {
-                questions: resolver::left_for_decider(&result.questions, &[]),
-                decided: 0,
-                fallback,
-            })
-        };
+        let all = |fallback| Routing::Ask(Round::of(&result.questions, &[], asked, fallback));
         if result.status == result::Status::PremiseFalse || routed.to_resolver.is_empty() {
             return Ok(all(None));
         }
@@ -1634,12 +1687,17 @@ impl OnDemand<'_> {
         // refused here, whatever the resolver decided (OWL-144).
         let sorted = resolver::settle(&p.policy, &routed.to_resolver, resolutions);
         for (question, decision, basis) in sorted.logged {
+            let reopened: Vec<&ReopenedChoice> = asked
+                .iter()
+                .filter(|reopened| reopened.question == question.id)
+                .collect();
             let comment = DecisionComment {
                 ticket: ticket.clone(),
                 question: question.clone(),
                 decision: decision.to_owned(),
                 basis: basis.to_owned(),
                 run: Some(ran.run.clone()),
+                reopened: reopened.iter().map(|r| r.choice.clone()).collect(),
             };
             // Never an unlogged decision: one whose comment is not on the
             // ticket goes to the decider.
@@ -1649,6 +1707,10 @@ impl OnDemand<'_> {
             };
             let mut written = comment_written("DECISION", &posted);
             written.insert("question".to_owned(), json!(question.id.as_str()));
+            if !reopened.is_empty() {
+                let places: Vec<u32> = reopened.iter().map(|r| r.place.get()).collect();
+                written.insert("reopened".to_owned(), json!(places));
+            }
             sink.emit(&ticket, Some(&ran.run), EventKind::TrackerWrite, written);
             let mut kept = p.questions();
             // As a round does, a kept decision keeps what the asking run
@@ -1692,15 +1754,11 @@ impl OnDemand<'_> {
         );
         event.insert("unposted".to_owned(), question_ids(&unposted));
         sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
-        let left = resolver::left_for_decider(&result.questions, &decided);
-        if left.is_empty() {
+        let left = Round::of(&result.questions, &decided, asked, None);
+        if left.questions.is_empty() {
             return Ok(Routing::Settled);
         }
-        Ok(Routing::Ask(Round {
-            questions: left,
-            decided: decided.len(),
-            fallback: None,
-        }))
+        Ok(Routing::Ask(left))
     }
 
     /// Runs the answer check once the decider has answered, and acts on its
@@ -3666,6 +3724,7 @@ fn late_round(late: &[Comment]) -> Round {
         questions: vec![(question.id.clone(), question)],
         decided: 0,
         fallback: None,
+        reopened: Vec::new(),
     }
 }
 

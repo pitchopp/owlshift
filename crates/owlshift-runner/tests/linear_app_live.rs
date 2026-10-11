@@ -211,6 +211,7 @@ fn a_question_round_through_the_app_reaches_its_decider() {
         premise_false: false,
         decided: 0,
         fallback: None,
+        reopened: Vec::new(),
     };
     let posted = Writer::new(&tracker)
         .mentioning(&decider)

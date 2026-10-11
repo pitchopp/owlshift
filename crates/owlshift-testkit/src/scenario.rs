@@ -129,12 +129,12 @@ use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check::{self, Readiness};
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::{
-    account_author, build_refusal_after, stage_event, tell_build, thread,
+    account_author, asked_choices, build_refusal_after, stage_event, tell_build, thread,
 };
 use owlshift_runner::resolver::{self, Fallback, Resolved};
 use owlshift_runner::writer::{
-    DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReplyComment, Restart,
-    ResumeComment, VisibleStage, Writer,
+    DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReopenedChoice, ReplyComment,
+    Restart, ResumeComment, VisibleStage, Writer,
 };
 
 use crate::git::{GitEnv, Remote, seed};
@@ -512,8 +512,8 @@ struct Driver {
     /// The project's gate policy, which routes a run's questions.
     policy: GatePolicy,
     /// The result of the last run, while its questions wait for a
-    /// `resolve` step.
-    pending: Option<RunResult>,
+    /// `resolve` step, with the refused choices they reopen (OWL-203).
+    pending: Option<(RunResult, Vec<ReopenedChoice>)>,
     /// The questions the resolver's brief gives it.
     resolving: Vec<Question>,
     /// Whether the tracker refuses this step's QUESTIONS comment
@@ -765,6 +765,9 @@ impl Driver {
         let report = self.execute(role, reply)?;
         let brief = self.last_brief.as_ref().ok_or("no brief")?;
         let (event, result) = stage_event(&report.outcome, brief);
+        let asked = result
+            .map(|result| asked_choices(brief, result))
+            .unwrap_or_default();
         let result = result.cloned();
         if let (Event::Questions, Some(result)) = (event, &result)
             && result.status != ResultStatus::PremiseFalse
@@ -773,7 +776,7 @@ impl Driver {
                 .is_empty()
         {
             self.last_run = Some(report);
-            self.pending = Some(result.clone());
+            self.pending = Some((result.clone(), asked));
             self.push_if_ahead(&self.worktree())?;
             return Ok(None);
         }
@@ -784,8 +787,8 @@ impl Driver {
         }
         self.last_run = Some(report);
         if let (Event::Questions, Some(result)) = (event, &result) {
-            let questions = left(&result.questions, &[]);
-            if !self.post_round(result, questions, 0, None)? {
+            let (questions, reopened) = left(&result.questions, &[], &asked);
+            if !self.post_round(result, questions, reopened, 0, None)? {
                 self.state = before;
                 return Ok(None);
             }
@@ -813,6 +816,7 @@ impl Driver {
         &mut self,
         result: &RunResult,
         questions: Vec<Question>,
+        reopened: Vec<ReopenedChoice>,
         decided: usize,
         fallback: Option<Fallback>,
     ) -> Result<bool, String> {
@@ -825,6 +829,7 @@ impl Driver {
             premise_false: result.status == ResultStatus::PremiseFalse,
             decided,
             fallback,
+            reopened,
         }
         .render();
         let account = self
@@ -866,7 +871,7 @@ impl Driver {
     /// decision posted as a DECISION comment, then a round of what is left,
     /// or nothing when every question was decided (no event).
     fn resolve(&mut self, reply: &Reply) -> Result<Option<Event>, String> {
-        let result = self
+        let (result, asked) = self
             .pending
             .take()
             .ok_or("no run's questions wait for the resolver")?;
@@ -905,6 +910,11 @@ impl Driver {
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
                         run: None,
+                        reopened: asked
+                            .iter()
+                            .filter(|reopened| reopened.question == question.id)
+                            .map(|reopened| reopened.choice.clone())
+                            .collect(),
                     }
                     .render();
                     let posted = self.post(&body)?;
@@ -923,13 +933,13 @@ impl Driver {
             }
         };
         self.last_run = Some(report);
-        let questions = left(&result.questions, &decided);
+        let (questions, reopened) = left(&result.questions, &decided, &asked);
         if questions.is_empty() {
             return Ok(None);
         }
         let before = self.state;
         self.apply(Event::Questions)?;
-        if !self.post_round(&result, questions, decided.len(), fallback)? {
+        if !self.post_round(&result, questions, reopened, decided.len(), fallback)? {
             self.state = before;
             return Ok(None);
         }
@@ -1526,12 +1536,19 @@ impl Driver {
 }
 
 /// The questions a round asks of a run's: all but those `decided`,
-/// renumbered Q1..Qn.
-fn left(raised: &[Question], decided: &[owlshift_contracts::ids::QuestionId]) -> Vec<Question> {
-    resolver::left_for_decider(raised, decided)
-        .into_iter()
-        .map(|(_, question)| question)
-        .collect()
+/// renumbered Q1..Qn, with the refused choices `asked` of the run they
+/// reopen, under the round's ids.
+fn left(
+    raised: &[Question],
+    decided: &[owlshift_contracts::ids::QuestionId],
+    asked: &[ReopenedChoice],
+) -> (Vec<Question>, Vec<ReopenedChoice>) {
+    let left = resolver::left_for_decider(raised, decided);
+    let reopened = resolver::reopened_in(&left, asked);
+    (
+        left.into_iter().map(|(_, question)| question).collect(),
+        reopened,
+    )
 }
 
 /// Checks a gate failure against `none` or a text its command, reason or

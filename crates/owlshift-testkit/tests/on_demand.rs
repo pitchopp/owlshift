@@ -1106,6 +1106,75 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
     }
 }
 
+/// OWL-203: a held retry asks both refused choices, Q1 for the first and
+/// Q2 for the second. The resolver decides Q1, so its DECISION comment
+/// shows the first choice, settled without the decider; the round renumbers
+/// Q2 as Q1, which shows the second. The events record both.
+#[test]
+fn a_reopened_choice_shows_where_it_went() {
+    let bench = Bench::new(true);
+    let decided = DONE.replace(
+        r#""pr":"#,
+        r#""decisions":[{"question":"Which file","decision":"GREETING.md","basis":"b"},
+{"question":"Which words","decision":"Hello","basis":"b"}],"pr":"#,
+    );
+    let asks = format!(
+        r#"{},"refused_choices_asked":[{{"choice":1,"question":"Q1"}},{{"choice":2,"question":"Q2"}}]}}"#,
+        MIXED.strip_suffix('}').unwrap()
+    );
+    let (stopped, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(&decided)),
+            bench.reply(None, Some(&asks)),
+            bench.reply(None, Some(DECIDED_Q1)),
+        ],
+        None,
+    );
+    assert!(
+        matches!(&stopped, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{stopped:?}\n{printed}"
+    );
+
+    let comments = bench.comments();
+    let [decision, round] = &comments[comments.len() - 2..] else {
+        unreachable!()
+    };
+    let refused = |question: &str, recorded: &str| {
+        format!(
+            "**Refused choice** (as the asking run lists it): {question}\n\
+             Recorded by the refused run: {recorded}"
+        )
+    };
+    assert!(
+        decision.starts_with("[owlshift] DECISION")
+            && decision.contains("Owlshift's resolver settled it here, not you.")
+            && decision.contains(&refused("Which file", "GREETING.md"))
+            && !decision.contains("Which words"),
+        "{decision}"
+    );
+    assert!(
+        round.starts_with("[owlshift] QUESTIONS · round 1")
+            && round.contains(&format!(
+                "**Q1** (scope) What should the greeting say?\n\
+                 The ticket names neither the words nor the ending.\n{}",
+                refused("Which words", "Hello")
+            ))
+            && !round.contains("Which file")
+            && !round.contains("**Q2**"),
+        "{round}"
+    );
+
+    let events = bench.events();
+    let opened = data_of(&events, EventKind::Gate, "opened");
+    assert_eq!(
+        opened.last().unwrap()["reopened"],
+        json!([{ "choice": 2, "question": "Q1", "raised_as": "Q2" }])
+    );
+    let written = data_of(&events, EventKind::TrackerWrite, "question");
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0]["reopened"], json!([1]));
+}
+
 /// OWL-192: a refusal of Build's decisions is kept in the ticket ref, made
 /// for it, through a usage limit that ends the command and a park: the
 /// Build runs of later commands, `continue` and `do` alike, are told why,
@@ -3678,10 +3747,10 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     assert_eq!(resolved[0]["to_decider"], json!(["Q2"]));
     let opened = data_of(&events, EventKind::Gate, "opened");
     assert_eq!(opened[0]["raised_as"], json!(["Q2"]));
-    assert_eq!(
-        data_of(&events, EventKind::TrackerWrite, "question")[0]["kind"],
-        "DECISION"
-    );
+    let written = &data_of(&events, EventKind::TrackerWrite, "question")[0];
+    assert_eq!(written["kind"], "DECISION");
+    // Without a hold, nothing is reopened (OWL-203).
+    assert!(opened[0].get("reopened").is_none() && written.get("reopened").is_none());
 
     // Answered, the ticket resumes: the decision sits before the round in
     // every later brief, and the delivery report lists it.

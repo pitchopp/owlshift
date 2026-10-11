@@ -10,7 +10,9 @@ why and asks, but only the first point, naming it as the one refused choice
 it asks and dropping the second: that result is refused before anything is
 posted, and the ticket parks with a PARKED comment that says which choice was
 not asked. After the restart, the Build run is told both choices and why the
-last result was refused; it asks both, naming each, and round 1 opens."""
+last result was refused; it asks both, naming each, and round 1 opens. The
+resolver decides where the README lists the example; round 1's QUESTIONS
+comment shows the other refused choice under the question that asks it."""
 ticket = "DEMO-5"
 start = "2026-10-08T15:00:00Z"
 
@@ -74,4 +76,16 @@ brief_resolve = ["Q2"]
 [step.expect.last_comment]
 author = "owlshift"
 first_line = "[owlshift] QUESTIONS · round 1"
-contains = ["**Q1** (scope) Should the example show every key with comments, or only the required ones?"]
+contains = [
+  "**Q1** (scope) Should the example show every key with comments, or only the required ones?",
+  "Some of these questions reopen a choice an earlier run made without asking you",
+  """
+Recommendation: Every key, commented
+**Refused choice** (as the asking run lists it): Every key or only the required ones
+Recorded by the refused run: Every key, commented
+
+Answer here""",
+]
+# The second choice went with Q2, which the resolver decided: its DECISION
+# comment shows it (OWL-203).
+lacks = ["Where the README lists the example"]

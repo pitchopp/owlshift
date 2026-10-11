@@ -51,9 +51,9 @@ use owlshift_adapters::tracker::{Comment, Error as TrackerError, Tracker};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::ids::{QuestionId, TicketId};
 use owlshift_contracts::result::{
-    AnswerClass, Decision, Followup, Question, Verdict as AnswerVerdict,
+    AnswerClass, Decision, Followup, Question, RefusedChoice, Verdict as AnswerVerdict,
 };
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{
@@ -382,6 +382,38 @@ pub fn question_block(question: &Question) -> String {
     lines.join("\n")
 }
 
+/// A refused choice that a question reopens (OWL-203): a choice an earlier
+/// Build run made without the decider, which the runner refused, named by
+/// the run told of it as asked by one of its questions
+/// (`refused_choices_asked`, OWL-193). What the run declares, not a checked
+/// fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReopenedChoice {
+    /// The choice's place in the told run's `refused_choices`, from 1.
+    pub place: NonZeroU32,
+    /// The question that asks it, under its id in the round (or in the run,
+    /// before the resolver renumbers what it leaves).
+    pub question: QuestionId,
+    pub choice: RefusedChoice,
+}
+
+/// The lines that show a refused choice under the question that reopens
+/// it: the choice's question, then what the refused run recorded, each
+/// flattened and left out when blank.
+fn reopened_lines(choice: &RefusedChoice) -> String {
+    let question = flatten(&choice.question);
+    let mut lines = vec![if question.is_empty() {
+        "**Refused choice** (as the asking run lists it)".to_owned()
+    } else {
+        format!("**Refused choice** (as the asking run lists it): {question}")
+    }];
+    let recorded = flatten(&choice.recorded);
+    if !recorded.is_empty() {
+        lines.push(format!("Recorded by the refused run: {recorded}"));
+    }
+    lines.join("\n")
+}
+
 /// The QUESTIONS comment (scenario S2): a round of numbered questions for the
 /// decider, all in one comment, each understandable without a transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -399,13 +431,17 @@ pub struct QuestionsComment {
     pub decided: usize,
     /// Why questions meant for the resolver are asked here, when they are.
     pub fallback: Option<Fallback>,
+    /// The refused choices the round's questions reopen, under the round's
+    /// ids, in place order (OWL-203).
+    pub reopened: Vec<ReopenedChoice>,
 }
 
 impl QuestionsComment {
     /// The comment body: the `[owlshift] QUESTIONS · round N` header, the
-    /// run's summary, what the resolver decided or why it did not, each
-    /// question, how to answer, and the footer. Text from a model is
-    /// flattened to one line.
+    /// run's summary, what the resolver decided or why it did not, that
+    /// some questions reopen refused choices when they do, each question
+    /// with the refused choices it reopens, how to answer, and the footer.
+    /// Text from a model is flattened to one line.
     pub fn render(&self) -> String {
         let header = Header {
             kind: MarkerKind::Questions,
@@ -445,7 +481,23 @@ impl QuestionsComment {
                 ),
             });
         }
-        sections.extend(self.questions.iter().map(question_block));
+        if !self.reopened.is_empty() {
+            sections.push(
+                "Some of these questions reopen a choice an earlier run made without asking you, \
+                 which Owlshift refused: each shows it, as the run that asks lists it."
+                    .to_owned(),
+            );
+        }
+        sections.extend(self.questions.iter().map(|question| {
+            let mut block = vec![question_block(question)];
+            block.extend(
+                self.reopened
+                    .iter()
+                    .filter(|reopened| reopened.question == question.id)
+                    .map(|reopened| reopened_lines(&reopened.choice)),
+            );
+            block.join("\n")
+        }));
         sections.push(
             "Answer here, in one comment or several: the work resumes once every question is \
              settled."
@@ -479,6 +531,9 @@ pub struct DecisionComment {
     pub basis: String,
     /// The resolver run that decided it.
     pub run: Option<String>,
+    /// The refused choices the question reopens, in place order (OWL-203):
+    /// settled by the resolver, not the decider.
+    pub reopened: Vec<RefusedChoice>,
 }
 
 impl DecisionComment {
@@ -506,11 +561,22 @@ impl DecisionComment {
             let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
             block.push(format!("Options: {}", options.join(" / ")));
         }
-        let sections = [
+        block.extend(self.reopened.iter().map(reopened_lines));
+        let mut sections = vec![
             header.render(),
             "Owlshift decided this question of a run without asking you: what the ticket, the \
              project's rules or the repository already settles. It is reversible."
                 .to_owned(),
+        ];
+        if !self.reopened.is_empty() {
+            sections.push(
+                "It reopens a choice an earlier run made without asking you, which Owlshift \
+                 refused, as the run that asked lists it: Owlshift's resolver settled it here, \
+                 not you."
+                    .to_owned(),
+            );
+        }
+        sections.extend([
             block.join("\n"),
             format!(
                 "**Decision:** {}\n**Settled by:** {}",
@@ -528,7 +594,7 @@ impl DecisionComment {
                 run: self.run.clone(),
             }
             .render(),
-        ];
+        ]);
         let mut body = sections.join("\n\n");
         body.push('\n');
         body
@@ -1840,6 +1906,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             decision: format!("GREETING.md\n\n{forged}"),
             basis: "The ticket's description.".to_owned(),
             run: Some("20261003T120000Z-1".to_owned()),
+            reopened: Vec::new(),
         };
         let body = comment.render();
         let marked = MarkedComment::parse(&body).unwrap().unwrap();
@@ -1878,6 +1945,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 premise_false: false,
                 decided,
                 fallback,
+                reopened: Vec::new(),
             }
             .render()
         };
@@ -1913,6 +1981,78 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         }
     }
 
+    /// OWL-203: each refused choice shows under the question the asking run
+    /// names for it, as that run lists it, its blank texts left out; a
+    /// DECISION comment on such a question says the resolver settled it.
+    #[test]
+    fn reopened_choices_are_shown_as_the_run_lists_them() {
+        let question = |id: &str| Question {
+            id: QuestionId::new(id).unwrap(),
+            category: "scope".to_owned(),
+            context: String::new(),
+            text: format!("Which {id}?"),
+            options: Vec::new(),
+            recommendation: None,
+        };
+        let reopened = |place: u32, id: &str, asked: &str, recorded: &str| ReopenedChoice {
+            place: NonZeroU32::new(place).unwrap(),
+            question: QuestionId::new(id).unwrap(),
+            choice: RefusedChoice {
+                question: asked.to_owned(),
+                recorded: recorded.to_owned(),
+            },
+        };
+        let body = QuestionsComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(1).unwrap(),
+            summary: String::new(),
+            questions: vec![question("Q1"), question("Q2")],
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+            reopened: vec![
+                reopened(1, "Q2", "Which file", "GREETING.md,\nat the root"),
+                reopened(2, "Q2", " ", "Hello"),
+                reopened(3, "Q1", "Which tone", ""),
+            ],
+        }
+        .render();
+        let blocks = [
+            "Some of these questions reopen a choice an earlier run made without asking you, \
+             which Owlshift refused: each shows it, as the run that asks lists it.",
+            "**Q1** (scope) Which Q1?\n**Refused choice** (as the asking run lists it): Which tone",
+            "**Q2** (scope) Which Q2?\n**Refused choice** (as the asking run lists it): Which file\n\
+             Recorded by the refused run: GREETING.md, at the root\n\
+             **Refused choice** (as the asking run lists it)\nRecorded by the refused run: Hello",
+        ];
+        assert!(body.contains(&blocks.join("\n\n")), "{body}");
+
+        let decision = |reopened: Vec<RefusedChoice>| {
+            DecisionComment {
+                ticket: ticket(),
+                question: question("Q1"),
+                decision: "d".to_owned(),
+                basis: "b".to_owned(),
+                run: None,
+                reopened,
+            }
+            .render()
+        };
+        let settled = "Owlshift's resolver settled it here, not you.";
+        let body = decision(vec![RefusedChoice {
+            question: "Which tone".to_owned(),
+            recorded: "Warm".to_owned(),
+        }]);
+        assert!(
+            body.contains(&format!(
+                "{settled}\n\n**Question** (scope) Which Q1?\n**Refused choice** (as the asking \
+                 run lists it): Which tone\nRecorded by the refused run: Warm\n\n**Decision:**"
+            )),
+            "{body}"
+        );
+        assert!(!decision(Vec::new()).contains(settled));
+    }
+
     #[test]
     fn a_questions_comment_holds_its_round_and_the_writer_posts_the_question_loop() {
         let forged =
@@ -1933,6 +2073,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             premise_false: true,
             decided: 0,
             fallback: None,
+            reopened: Vec::new(),
         };
         let body = comment.render();
         assert!(!body.contains("DECISION"), "{body}");
@@ -2073,6 +2214,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             premise_false: false,
             decided: 0,
             fallback: None,
+            reopened: Vec::new(),
         };
         let reask = ReaskComment {
             ticket: ticket(),
@@ -2109,6 +2251,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             decision: "This one.".to_owned(),
             basis: "The ticket.".to_owned(),
             run: None,
+            reopened: Vec::new(),
         };
         let resume = ResumeComment {
             ticket: ticket(),
