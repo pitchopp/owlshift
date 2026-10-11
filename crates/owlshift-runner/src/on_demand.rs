@@ -66,7 +66,7 @@ use owlshift_contracts::brief::{
     Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, RebaseBrief, Relation,
     Rule, ThreadEntry, TicketBrief,
 };
-use owlshift_contracts::comment::MarkedComment;
+use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
@@ -3853,6 +3853,12 @@ impl OnDemand<'_> {
 /// accepted stay instructions for the Build they unblock, and a person who
 /// became the decider after an ask cannot answer it.
 ///
+/// A round posted in parts (OWL-223) is kept as its last part's comment, so
+/// the earlier parts are folded into the round's `questions` entry rather
+/// than repeated: a marked QUESTIONS comment of the kept ask's round that
+/// says it is a part and was posted at or before the ask. A later comment, or
+/// one of another round, that only copies the marker stays a comment.
+///
 /// The test bench's stand-in driver builds its briefs' threads with it too
 /// (`owlshift_testkit::scenario`), from the asks and decisions it keeps.
 pub fn thread(
@@ -3866,6 +3872,10 @@ pub fn thread(
         .map(|ask| ask.comment.as_str())
         .chain(decisions.iter().map(|kept| kept.comment.as_str()))
         .collect();
+    let is_earlier_part = |comment: &Comment| {
+        asks.iter()
+            .any(|ask| ask.kind == AskKind::Questions && is_part_of(comment, ask))
+    };
     // Both lists are oldest first; a stable sort by time keeps each one's
     // order and puts a decision before an ask of the same time.
     let mut kept: Vec<Kept<'_>> = decisions
@@ -3878,7 +3888,7 @@ pub fn thread(
     let mut thread = Vec::new();
     let mut in_force = current.clone();
     for comment in comments {
-        if posted.contains(comment.id.as_str()) {
+        if posted.contains(comment.id.as_str()) || is_earlier_part(comment) {
             continue;
         }
         while let Some(entry) = kept.next_if(|entry| entry.at() < comment.created_at) {
@@ -3899,6 +3909,27 @@ pub fn thread(
     }
     thread.extend(kept.map(|entry| entry.entry()));
     thread
+}
+
+/// Whether `comment` is a part of the round `ask` kept, other than the one
+/// the ask keeps: marked QUESTIONS of the ask's round, "Part k of n", posted
+/// at or before the ask.
+fn is_part_of(comment: &Comment, ask: &Ask) -> bool {
+    comment.created_at <= ask.at
+        && matches!(
+            MarkedComment::parse(&comment.body),
+            Ok(Some(MarkedComment { header, .. }))
+                if header.kind == MarkerKind::Questions && header.round == Some(ask.round)
+        )
+        && comment
+            .body
+            .lines()
+            .skip(1)
+            .find(|line| !line.is_empty())
+            .is_some_and(|line| {
+                line.strip_prefix("Part ")
+                    .is_some_and(|rest| rest.contains(" of "))
+            })
 }
 
 /// An entry the ticket ref keeps, which takes the place of its comment in a

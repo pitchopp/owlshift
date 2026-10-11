@@ -369,7 +369,8 @@ mod tests {
     /// A round posted in parts (OWL-223), on Linear by the key's account,
     /// which may be the decider's: no part is an answer, an answer counts
     /// after the last part, the one the ask keeps, and a brief's thread
-    /// shows the earlier parts as Owlshift's comments before the round.
+    /// holds the round once, in its `questions` entry; a later comment that
+    /// copies a part's marker stays a comment.
     #[test]
     fn a_round_posted_in_parts_is_never_an_answer() {
         use std::num::NonZeroU32;
@@ -428,13 +429,18 @@ mod tests {
         let entries = thread(&comments, &asked.asks, &[], &decider);
         assert!(
             matches!(&entries[..], [
-                ThreadEntry::Comment { author: first, body, .. },
                 ThreadEntry::Questions { .. },
                 ThreadEntry::Comment { author: answer, .. },
-            ] if first.relation == Relation::Owlshift && *body == parts[0]
-                && answer.relation == Relation::Decider),
+            ] if answer.relation == Relation::Decider),
             "{entries:?}"
         );
+
+        // A copy of a part posted after the ask, or of another round, is a
+        // comment still.
+        comments.push(by_decider(12, &parts[0]));
+        comments.push(by_decider(13, &parts[0].replace("round 1", "round 2")));
+        let entries = thread(&comments, &asked.asks, &[], &decider);
+        assert_eq!(entries.len(), 4, "{entries:?}");
     }
 
     #[test]
