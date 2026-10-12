@@ -560,6 +560,108 @@ mod tests {
         );
     }
 
+    /// OWL-228: a RE-ASK, a REPLY and a PARKED comment cut to hold in one
+    /// comment, posted on Linear by the key's account, which may be the
+    /// decider's, are still Owlshift's: none is an answer, and the RE-ASK
+    /// the ask keeps takes the place of its comment in the thread.
+    #[test]
+    fn a_comment_cut_to_hold_is_never_an_answer() {
+        use std::num::NonZeroU32;
+
+        use owlshift_contracts::brief::ThreadEntry;
+        use owlshift_contracts::ids::{QuestionId, TicketId};
+        use owlshift_core::state::ParkReason;
+
+        use crate::on_demand::thread;
+        use crate::writer::{
+            MAX_COMMENT_CHARS, ParkedComment, ReaskComment, ReplyComment, Restart,
+        };
+
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let ticket = TicketId::new("OWL-1").unwrap();
+        let round = NonZeroU32::new(1).unwrap();
+        let question = Question {
+            id: QuestionId::new("Q1").unwrap(),
+            category: "scope".into(),
+            context: String::new(),
+            text: "t".into(),
+            options: Vec::new(),
+            recommendation: None,
+        };
+        let verdict = Verdict {
+            question: question.id.clone(),
+            class: AnswerClass::Partial,
+            reason: "m".repeat(2 * MAX_COMMENT_CHARS),
+            reply: None,
+        };
+        let open = vec![(question.clone(), verdict.clone())];
+        let bodies = [
+            ReaskComment {
+                ticket: ticket.clone(),
+                round,
+                reask: 1,
+                open: open.clone(),
+            }
+            .render(),
+            ReplyComment {
+                ticket: ticket.clone(),
+                replies: vec![(question, verdict.reason)],
+            }
+            .render(),
+            ParkedComment {
+                ticket,
+                reason: ParkReason::Reasks,
+                detail: String::new(),
+                round: Some(round),
+                open,
+                restart: Restart::Continue,
+            }
+            .render(),
+        ];
+        let comments: Vec<Comment> = bodies
+            .iter()
+            .zip(10..)
+            .map(|(body, minute)| {
+                assert!(body.chars().count() <= MAX_COMMENT_CHARS);
+                assert!(body.contains(" … (cut: "));
+                Comment {
+                    id: format!("c{minute}"),
+                    author: Author::Account(decider.clone()),
+                    created_at: at(minute),
+                    edited_at: None,
+                    body: body.clone(),
+                    parent: None,
+                }
+            })
+            .collect();
+        let asked = TicketQuestions::parse(
+            r#"{"format":2,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T10:09:00Z",
+                "comment":"c9","questions":[{"id":"Q1","category":"scope","context":"","text":"t"}],
+                "decider":{"account":"u1","by":"assignee"}},
+                {"kind":"reask","round":1,"at":"2026-10-02T10:10:00Z",
+                "comment":"c10","questions":[{"id":"Q1","category":"scope","context":"","text":"t"}],
+                "decider":{"account":"u1","by":"assignee"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(new_answer(&comments, &decider, &asked), None);
+        let entries = thread(&comments, &asked.asks, &[], &decider);
+        assert!(
+            matches!(&entries[..], [
+                ThreadEntry::Questions { .. },
+                ThreadEntry::Reask { .. },
+                ThreadEntry::Comment { author: reply, .. },
+                ThreadEntry::Comment { author: parked, .. },
+            ] if reply.relation == Relation::Owlshift && parked.relation == Relation::Owlshift),
+            "{entries:?}"
+        );
+    }
+
     #[test]
     fn the_deciders_newest_comment_counts_after_the_quiet_window_or_with_go() {
         let decider = Person {

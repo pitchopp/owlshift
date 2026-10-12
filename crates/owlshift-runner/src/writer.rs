@@ -147,6 +147,14 @@ const CORRECTED_LEAD: &str = "**Corrected after delivery,**";
 const UNCORRECTED_LEAD: &str = "**No correction needed after delivery:**";
 const LEADS: [&str; 4] = [FIX_PASS_LEAD, REBASE_LEAD, CORRECTED_LEAD, UNCORRECTED_LEAD];
 
+/// The most characters a list of a lead line takes (OWL-228): the red
+/// checks of a fix pass, the questions of a correction.
+const LEAD_LIST_CHARS: usize = 10_000;
+
+/// The most characters a list of check names takes in what remains for a
+/// human (OWL-228): the checks section lists them all.
+const REMAINS_LIST_CHARS: usize = 2_000;
+
 impl DeliveryReport {
     /// The comment body: the `[owlshift] DELIVERY` header, the pull request,
     /// the check set, the project gate, the decisions, what remains for a
@@ -155,6 +163,16 @@ impl DeliveryReport {
     /// Text from a model or the forge is flattened to one line wherever it
     /// goes, so it can neither start a Markdown block nor sit on the first or
     /// last line, where the header and the footer are read.
+    ///
+    /// The report holds in [`MAX_COMMENT_CHARS`] (OWL-228). One that does not
+    /// hold whole has its sections cut, visibly: first what is shown
+    /// elsewhere, the summary to 8,000 characters (the pull request's body
+    /// has it), the checks to 10,000 (the pull request lists them), the
+    /// gate to 2,000 and the decisions to 20,000 (each resolver decision is
+    /// a DECISION comment), then the longest. What remains for a human, the
+    /// follow-ups with it, gives way last. The lead line and the pull
+    /// request line are never cut here: the lead bounds its own lists, and
+    /// both are what a report is found by.
     pub fn render(&self) -> String {
         let pr = &self.pull_request;
         let pr_link = link(&format!("#{}", pr.number), &pr.url);
@@ -164,22 +182,7 @@ impl DeliveryReport {
                 "Review and merge {pr_link}: Owlshift never merges."
             ));
         }
-
-        let header = Header {
-            kind: MarkerKind::Delivery,
-            round: None,
-        };
-        let mut sections = vec![header.render()];
-        let (repair, pull_request) = self.lead_lines();
-        sections.extend(repair);
-        let summary = flatten(&self.summary);
-        if !summary.is_empty() {
-            sections.push(summary);
-        }
-        sections.push(pull_request);
-        sections.push(self.checks_section(&mut remains));
-        sections.push(self.gate_section());
-        sections.push(self.decisions_section());
+        let checks = self.checks_section(&mut remains);
         for followup in &self.followups {
             remains.push(format!(
                 "Proposed follow-up, not filed: **{}**: {}",
@@ -187,22 +190,46 @@ impl DeliveryReport {
                 flatten(&followup.why)
             ));
         }
-        sections.push(if remains.is_empty() {
+        let remains = if remains.is_empty() {
             "**What remains for a human:** nothing.".to_owned()
         } else {
             format!("**What remains for a human:**\n{}", bullets(&remains))
-        });
-        let footer = Footer {
-            format: Format,
-            kind: MarkerKind::Delivery,
-            ticket: self.ticket.clone(),
-            round: None,
-            run: None,
         };
-        sections.push(footer.render());
-        let mut body = sections.join("\n\n");
-        body.push('\n');
-        body
+        let texts = vec![
+            Fit::capped(flatten(&self.summary), SUMMARY_CUT, SPLIT_SUMMARY_CHARS),
+            Fit::capped(checks, "the rest is on the pull request", 10_000),
+            Fit::capped(self.gate_section(), LONGER, 2_000),
+            Fit::capped(self.decisions_section(), LONGER, 20_000),
+            Fit::new(remains, LONGER),
+        ];
+        let (repair, pull_request) = self.lead_lines();
+        fitted(MAX_COMMENT_CHARS, texts, |texts| {
+            let [summary, sections @ ..] = texts else {
+                unreachable!("a report has five texts")
+            };
+            let header = Header {
+                kind: MarkerKind::Delivery,
+                round: None,
+            };
+            let mut all = vec![header.render()];
+            all.extend(repair.clone());
+            if !summary.is_empty() {
+                all.push(summary.clone());
+            }
+            all.push(pull_request.clone());
+            all.extend(sections.iter().cloned());
+            let footer = Footer {
+                format: Format,
+                kind: MarkerKind::Delivery,
+                ticket: self.ticket.clone(),
+                round: None,
+                run: None,
+            };
+            all.push(footer.render());
+            let mut body = all.join("\n\n");
+            body.push('\n');
+            body
+        })
     }
 
     /// The line after the header of the report as rendered: its lead line,
@@ -220,6 +247,10 @@ impl DeliveryReport {
     /// The lines that tell which push the report is of: the fix pass, the
     /// rebase or the correction line (OWL-146) when there is one, and the
     /// pull request line with its head. Two reports with the same are of the same push (OWL-218).
+    ///
+    /// A list of the lead longer than [`LEAD_LIST_CHARS`] keeps its first
+    /// items and says how many more there are ([`listed`], OWL-228): the
+    /// same push always gives the same lead, so a report is still found.
     fn lead_lines(&self) -> (Option<String>, String) {
         let pr = &self.pull_request;
         let pr_link = link(&format!("#{}", pr.number), &pr.url);
@@ -235,7 +266,7 @@ impl DeliveryReport {
                 format!(
                     "{FIX_PASS_LEAD}{} of {MAX_FIX_PASSES} after delivery,** for the red checks {}.",
                     fix.pass,
-                    checks.join(", ")
+                    listed(&checks, LEAD_LIST_CHARS)
                 )
             })
         } else if let Some(rebase) = &self.rebase {
@@ -258,7 +289,7 @@ impl DeliveryReport {
                 let on = if questions.is_empty() {
                     String::new()
                 } else {
-                    format!(" on {}", questions.join(", "))
+                    format!(" on {}", listed(&questions, LEAD_LIST_CHARS))
                 };
                 if correction.pushed {
                     format!(
@@ -331,7 +362,10 @@ impl DeliveryReport {
                 let mut parts = Vec::new();
                 if !failed.is_empty() {
                     parts.push(format!("{} of {total} failed", failed.len()));
-                    remains.push(format!("Failing checks to look at: {}.", failed.join(", ")));
+                    remains.push(format!(
+                        "Failing checks to look at: {}.",
+                        listed(&failed, REMAINS_LIST_CHARS)
+                    ));
                 }
                 if set.mergeable == Mergeable::Conflicting {
                     parts.push("the pull request conflicts with its base".to_owned());
@@ -346,7 +380,7 @@ impl DeliveryReport {
                     remains.push(format!(
                         "Checks not finished when this report was posted: {}. Merge only once \
                          they pass.",
-                        pending.join(", ")
+                        listed(&pending, REMAINS_LIST_CHARS)
                     ));
                 }
                 if set.mergeable == Mergeable::Unknown {
@@ -465,22 +499,54 @@ impl DeliveryReport {
 /// to one line and cannot start a Markdown block of its own or reach the
 /// comment's first or last line.
 pub fn question_block(question: &Question) -> String {
-    let mut lines = vec![format!(
-        "**{}** ({}) {}",
-        question.id,
-        flatten(&question.category),
-        flatten(&question.text)
-    )];
-    let context = flatten(&question.context);
+    let texts: Vec<String> = question_texts(question)
+        .into_iter()
+        .map(|fit| fit.text)
+        .collect();
+    question_lines(question, &texts)
+}
+
+/// The texts of a question's block, in the order [`question_lines`] takes
+/// them: its category, text, context, options and recommendation, each
+/// flattened, and restated when a comment other than QUESTIONS shows them.
+fn question_texts(question: &Question) -> [Fit; 5] {
+    let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
+    let restated = |text: String| Fit::capped(text, RESTATED, RESTATED_TEXT_CHARS);
+    [
+        Fit::capped(
+            flatten(&question.category),
+            RESTATED,
+            RESTATED_CATEGORY_CHARS,
+        ),
+        restated(flatten(&question.text)),
+        restated(flatten(&question.context)),
+        restated(options.join(" / ")),
+        restated(
+            question
+                .recommendation
+                .as_deref()
+                .map(flatten)
+                .unwrap_or_default(),
+        ),
+    ]
+}
+
+/// A question's block of `texts`, as [`question_texts`] gives them, maybe
+/// cut: the options and recommendation lines are there when the question
+/// has them, the context line when it is not blank.
+fn question_lines(question: &Question, texts: &[String]) -> String {
+    let [category, text, context, options, recommendation] = texts else {
+        unreachable!("a question has five texts")
+    };
+    let mut lines = vec![format!("**{}** ({category}) {text}", question.id)];
     if !context.is_empty() {
-        lines.push(context);
+        lines.push(context.clone());
     }
     if !question.options.is_empty() {
-        let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
-        lines.push(format!("Options: {}", options.join(" / ")));
+        lines.push(format!("Options: {options}"));
     }
-    if let Some(recommendation) = &question.recommendation {
-        lines.push(format!("Recommendation: {}", flatten(recommendation)));
+    if question.recommendation.is_some() {
+        lines.push(format!("Recommendation: {recommendation}"));
     }
     lines.join("\n")
 }
@@ -603,7 +669,7 @@ impl QuestionsComment {
         let summary = cut(
             &flatten(&self.summary),
             SPLIT_SUMMARY_CHARS.min(room.saturating_sub(others + 2)),
-            "the run's summary is longer than a comment holds",
+            SUMMARY_CUT,
         );
         let (head, blocks) = self.sections(summary);
         let mut parts = vec![head];
@@ -734,18 +800,148 @@ fn chars(text: &str) -> usize {
 }
 
 /// `text` as is when it has at most `room` characters, otherwise its start,
-/// ending with a note of the cut that gives `why`, in `room` characters.
+/// ending with a note of the cut that gives `why`, in `room` characters. A
+/// room shorter than the note keeps the start alone, so `room` is never
+/// passed.
 fn cut(text: &str, room: usize, why: &str) -> String {
     if chars(text) <= room {
         return text.to_owned();
     }
-    let note = format!(" … (cut: {why})");
-    let mut kept: String = text
-        .chars()
-        .take(room.saturating_sub(chars(&note)))
-        .collect();
+    let note = cut_note(why);
+    if room < chars(&note) {
+        return text.chars().take(room).collect();
+    }
+    let mut kept: String = text.chars().take(room - chars(&note)).collect();
     kept.push_str(&note);
     kept
+}
+
+/// The note that ends a text [`cut`] for `why`.
+fn cut_note(why: &str) -> String {
+    format!(" … (cut: {why})")
+}
+
+/// Why a run's summary is cut.
+const SUMMARY_CUT: &str = "the run's summary is longer than a comment holds";
+
+/// Why a text is cut, when nothing else on the ticket restates it.
+const LONGER: &str = "longer than a comment holds";
+
+/// Why a question's text is cut in a RE-ASK, REPLY or PARKED comment: the
+/// round's QUESTIONS comment shows it whole, and the ticket ref keeps it.
+const RESTATED: &str = "the whole question is in this round's QUESTIONS comment";
+
+/// The most characters a question's category keeps, and each of its other
+/// texts, in a RE-ASK, REPLY or PARKED comment too long to hold whole
+/// (OWL-228): they are restated, so they give way before what is not.
+const RESTATED_CATEGORY_CHARS: usize = 80;
+const RESTATED_TEXT_CHARS: usize = 1_000;
+
+/// A text of a comment, from a model, a run or the forge, that the comment
+/// may cut to hold in [`MAX_COMMENT_CHARS`] (OWL-228).
+struct Fit {
+    text: String,
+    /// What the note of its cut says.
+    why: &'static str,
+    /// The most characters it keeps when the comment does not hold whole: a
+    /// text shown elsewhere gives way first.
+    cap: Option<usize>,
+}
+
+impl Fit {
+    fn new(text: String, why: &'static str) -> Self {
+        Self {
+            text,
+            why,
+            cap: None,
+        }
+    }
+
+    fn capped(text: String, why: &'static str, cap: usize) -> Self {
+        Self {
+            text,
+            why,
+            cap: Some(cap),
+        }
+    }
+}
+
+/// The body `body` renders of `texts`, as is when it holds in `room`
+/// characters (OWL-228); otherwise of `texts` cut to hold ([`fit`]). `body`
+/// must show each text once, as given, around a frame that does not depend
+/// on them, but for leaving out a text that is empty: the frame is what the
+/// whole body takes beyond its texts, and the texts get the rest of `room`.
+fn fitted(room: usize, texts: Vec<Fit>, body: impl Fn(&[String]) -> String) -> String {
+    let whole: Vec<String> = texts.iter().map(|fit| fit.text.clone()).collect();
+    let rendered = body(&whole);
+    let total = chars(&rendered);
+    if total <= room {
+        return rendered;
+    }
+    let frame = total - whole.iter().map(|text| chars(text)).sum::<usize>();
+    body(&fit(texts, room.saturating_sub(frame)))
+}
+
+/// `texts` cut to take at most `room` characters together, each visibly
+/// ([`cut`]): first each to its cap, then each longer than a common length
+/// to that length, the longest that holds. A text no longer than that is
+/// left whole, and every text keeps its start.
+fn fit(texts: Vec<Fit>, room: usize) -> Vec<String> {
+    let texts: Vec<(String, &str)> = texts
+        .into_iter()
+        .map(|fit| match fit.cap {
+            Some(cap) => (cut(&fit.text, cap, fit.why), fit.why),
+            None => (fit.text, fit.why),
+        })
+        .collect();
+    let mut lengths: Vec<usize> = texts.iter().map(|(text, _)| chars(text)).collect();
+    lengths.sort_unstable();
+    // The shorter texts are kept whole while what is left would give each
+    // longer one as much.
+    let mut left = room;
+    let mut length = usize::MAX;
+    for (i, &len) in lengths.iter().enumerate() {
+        let longer = lengths.len() - i;
+        if len.saturating_mul(longer) > left {
+            length = left / longer;
+            break;
+        }
+        left -= len;
+    }
+    texts
+        .into_iter()
+        .map(|(text, why)| cut(&text, length, why))
+        .collect()
+}
+
+/// `items` joined with ", " when they take at most `room` characters;
+/// otherwise the first ones that do, the first cut to `room` when it alone
+/// does not, and how many more there are. The same items always give the
+/// same text.
+fn listed(items: &[String], room: usize) -> String {
+    let all = items.join(", ");
+    if chars(&all) <= room {
+        return all;
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0;
+    for item in items {
+        let adds = chars(item) + if kept.is_empty() { 0 } else { 2 };
+        if used + adds > room {
+            break;
+        }
+        used += adds;
+        kept.push(item);
+    }
+    let first;
+    if kept.is_empty() {
+        first = cut(&items[0], room, LONGER);
+        kept.push(&first);
+    }
+    match items.len() - kept.len() {
+        0 => kept.join(", "),
+        more => format!("{} and {more} more", kept.join(", ")),
+    }
 }
 
 /// The DECISION comment (scenario S7): a question a run raised that the
@@ -840,39 +1036,59 @@ impl ReaskComment {
     /// The comment body: the `[owlshift] RE-ASK · round N` header, which
     /// re-ask this is, each open question with the verdict's class and
     /// reason, and the footer. Text from a model is flattened to one line.
+    /// It holds in [`MAX_COMMENT_CHARS`] ([`Self::render_within`]).
     pub fn render(&self) -> String {
-        let header = Header {
-            kind: MarkerKind::ReAsk,
-            round: Some(self.round),
-        };
-        let mut sections = vec![
-            header.render(),
-            format!(
-                "Some answers are still missing, so only these questions are asked again \
-                 (re-ask {} of {MAX_REASKS}: an answer still incomplete after the last one parks \
-                 the ticket).",
-                self.reask
-            ),
-        ];
-        for (question, verdict) in &self.open {
-            sections.push(format!(
-                "{}\nStill open ({}): {}",
-                question_block(question),
-                class_name(verdict.class),
-                flatten(&verdict.reason)
-            ));
-        }
-        let footer = Footer {
-            format: Format,
-            kind: MarkerKind::ReAsk,
-            ticket: self.ticket.clone(),
-            round: Some(self.round),
-            run: None,
-        };
-        sections.push(footer.render());
-        let mut body = sections.join("\n\n");
-        body.push('\n');
-        body
+        self.render_within(MAX_COMMENT_CHARS)
+    }
+
+    /// [`Self::render`] in at most `room` characters (OWL-228): a body that
+    /// does not hold whole has its texts cut, visibly, the questions'
+    /// first, which the round's QUESTIONS comment shows whole, then the
+    /// longest; every open question keeps its id and its verdict's class.
+    pub fn render_within(&self, room: usize) -> String {
+        let texts = self
+            .open
+            .iter()
+            .flat_map(|(question, verdict)| {
+                question_texts(question)
+                    .into_iter()
+                    .chain([Fit::new(flatten(&verdict.reason), LONGER)])
+            })
+            .collect();
+        fitted(room, texts, |texts| {
+            let header = Header {
+                kind: MarkerKind::ReAsk,
+                round: Some(self.round),
+            };
+            let mut sections = vec![
+                header.render(),
+                format!(
+                    "Some answers are still missing, so only these questions are asked again \
+                     (re-ask {} of {MAX_REASKS}: an answer still incomplete after the last one \
+                     parks the ticket).",
+                    self.reask
+                ),
+            ];
+            for ((question, verdict), texts) in self.open.iter().zip(texts.chunks(6)) {
+                sections.push(format!(
+                    "{}\nStill open ({}): {}",
+                    question_lines(question, &texts[..5]),
+                    class_name(verdict.class),
+                    texts[5]
+                ));
+            }
+            let footer = Footer {
+                format: Format,
+                kind: MarkerKind::ReAsk,
+                ticket: self.ticket.clone(),
+                round: Some(self.round),
+                run: None,
+            };
+            sections.push(footer.render());
+            let mut body = sections.join("\n\n");
+            body.push('\n');
+            body
+        })
     }
 }
 
@@ -891,43 +1107,60 @@ pub struct ReplyComment {
 impl ReplyComment {
     /// The comment body: the `[owlshift] REPLY` header, each question with
     /// its reply, how to go on, and the footer. Text from a model is
-    /// flattened to one line.
+    /// flattened to one line. It holds in [`MAX_COMMENT_CHARS`]
+    /// ([`Self::render_within`]).
     pub fn render(&self) -> String {
-        let header = Header {
-            kind: MarkerKind::Reply,
-            round: None,
-        };
-        let mut sections = vec![
-            header.render(),
-            "The decider asked back instead of answering, so here is an answer; nothing is \
-             asked again."
-                .to_owned(),
-        ];
-        for (question, reply) in &self.replies {
+        self.render_within(MAX_COMMENT_CHARS)
+    }
+
+    /// [`Self::render`] in at most `room` characters (OWL-228): a body that
+    /// does not hold whole has its texts cut, visibly, the questions'
+    /// first, which the round's QUESTIONS comment shows whole, then the
+    /// longest; every question keeps its id and its `Reply:` line.
+    pub fn render_within(&self, room: usize) -> String {
+        let texts = self
+            .replies
+            .iter()
+            .flat_map(|(question, reply)| {
+                let [category, text, ..] = question_texts(question);
+                [category, text, Fit::new(flatten(reply), LONGER)]
+            })
+            .collect();
+        fitted(room, texts, |texts| {
+            let header = Header {
+                kind: MarkerKind::Reply,
+                round: None,
+            };
+            let mut sections = vec![
+                header.render(),
+                "The decider asked back instead of answering, so here is an answer; nothing is \
+                 asked again."
+                    .to_owned(),
+            ];
+            for ((question, _), texts) in self.replies.iter().zip(texts.chunks(3)) {
+                sections.push(format!(
+                    "**{}** ({}) {}\nReply: {}",
+                    question.id, texts[0], texts[1], texts[2]
+                ));
+            }
             sections.push(format!(
-                "**{}** ({}) {}\nReply: {}",
-                question.id,
-                flatten(&question.category),
-                flatten(&question.text),
-                flatten(reply)
+                "Answer the questions here, then run {}: your next comment is checked again \
+                 against every question of this ask, and the work resumes once each one is \
+                 settled.",
+                code(&format!("owlshift continue {}", self.ticket))
             ));
-        }
-        sections.push(format!(
-            "Answer the questions here, then run {}: your next comment is checked again \
-             against every question of this ask, and the work resumes once each one is settled.",
-            code(&format!("owlshift continue {}", self.ticket))
-        ));
-        let footer = Footer {
-            format: Format,
-            kind: MarkerKind::Reply,
-            ticket: self.ticket.clone(),
-            round: None,
-            run: None,
-        };
-        sections.push(footer.render());
-        let mut body = sections.join("\n\n");
-        body.push('\n');
-        body
+            let footer = Footer {
+                format: Format,
+                kind: MarkerKind::Reply,
+                ticket: self.ticket.clone(),
+                round: None,
+                run: None,
+            };
+            sections.push(footer.render());
+            let mut body = sections.join("\n\n");
+            body.push('\n');
+            body
+        })
     }
 }
 
@@ -1019,14 +1252,44 @@ impl ParkedComment {
     /// The comment body: the `[owlshift] PARKED` header, the reason, what
     /// explains it, what restarts the ticket, and the footer. Text from a
     /// model or a run is flattened to one line.
+    ///
+    /// It holds in [`MAX_COMMENT_CHARS`] (OWL-228): a body that does not
+    /// hold whole has its texts cut, visibly: the detail to 8,000
+    /// characters, the open questions' texts first, which the round's
+    /// QUESTIONS comment shows whole, then the longest. Every open question
+    /// keeps its id and its verdict's class.
     pub fn render(&self) -> String {
+        let texts = match self.reason {
+            ParkReason::Reasks => self
+                .open
+                .iter()
+                .flat_map(|(question, verdict)| {
+                    let [category, text, ..] = question_texts(question);
+                    [category, text, Fit::new(flatten(&verdict.reason), LONGER)]
+                })
+                .collect(),
+            ParkReason::IsolationBreach => Vec::new(),
+            ParkReason::FailedRuns
+            | ParkReason::Blocked
+            | ParkReason::FixPasses
+            | ParkReason::Repairs
+            | ParkReason::Forge => vec![Fit::capped(
+                flatten(&self.detail),
+                LONGER,
+                SPLIT_SUMMARY_CHARS,
+            )],
+        };
+        fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
+    }
+
+    /// The body of `texts`, as [`Self::render`] gives them, maybe cut.
+    fn body(&self, texts: &[String]) -> String {
         let ticket = &self.ticket;
         let header = Header {
             kind: MarkerKind::Parked,
             round: None,
         };
         let mut sections = vec![header.render()];
-        let detail = flatten(&self.detail);
         match self.reason {
             ParkReason::Reasks => {
                 let round = self
@@ -1037,14 +1300,14 @@ impl ParkedComment {
                     "Parked: {}, after {MAX_REASKS} re-asks. Still open{round}:",
                     park_reason(self.reason)
                 ));
-                for (question, verdict) in &self.open {
+                for ((question, verdict), texts) in self.open.iter().zip(texts.chunks(3)) {
                     sections.push(format!(
                         "**{}** ({}) {}\nStill open ({}): {}",
                         question.id,
-                        flatten(&question.category),
-                        flatten(&question.text),
+                        texts[0],
+                        texts[1],
                         class_name(verdict.class),
-                        flatten(&verdict.reason)
+                        texts[2]
                     ));
                 }
             }
@@ -1058,6 +1321,7 @@ impl ParkedComment {
             | ParkReason::Repairs
             | ParkReason::Forge => {
                 let mut line = format!("Parked: {}.", park_reason(self.reason));
+                let detail = &texts[0];
                 if !detail.is_empty() {
                     line.push_str(&format!(" {}: {detail}", detail_label(self.reason)));
                 }
@@ -1559,17 +1823,23 @@ impl<'a> Writer<'a> {
         floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
         let (lead, pull_request) = report.lead_lines();
         let second = report.second_line();
+        let summary_note = cut_note(SUMMARY_CUT);
         let names = |body: &str| {
             let mut lines = body.lines().map(str::trim_end).filter(|l| !l.is_empty());
             // The header is the first line, as `is_delivery` read it.
             let after_header = lines.nth(1);
             let same_lead = match &lead {
                 Some(lead) => after_header == Some(lead.as_str()),
-                // A first report's summary may start as a lead does.
+                // A first report's summary may start as a lead does, and be
+                // cut to fit (OWL-228).
                 None => {
-                    after_header == Some(second.as_str())
-                        || !after_header
-                            .is_some_and(|line| LEADS.iter().any(|p| line.starts_with(p)))
+                    after_header.is_some_and(|line| {
+                        line == second
+                            || line
+                                .strip_suffix(summary_note.as_str())
+                                .is_some_and(|kept| !kept.is_empty() && second.starts_with(kept))
+                    }) || !after_header
+                        .is_some_and(|line| LEADS.iter().any(|p| line.starts_with(p)))
                 }
             };
             same_lead && body.lines().any(|line| line.trim_end() == pull_request)
@@ -1606,10 +1876,7 @@ impl<'a> Writer<'a> {
     /// the round there; the error says how many parts reached the ticket.
     pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Posted, WriteError> {
         let (mention, mention_dropped) = self.mention();
-        let line = mention
-            .as_deref()
-            .map_or(0, |m| chars(&waiting_line(m)) + 2);
-        let parts = comment.parts(MAX_COMMENT_CHARS.saturating_sub(line));
+        let parts = comment.parts(room_beside(mention.as_deref()));
         let n = parts.len();
         let mut posted = None;
         for (i, body) in parts.into_iter().enumerate() {
@@ -1644,14 +1911,16 @@ impl<'a> Writer<'a> {
         self.post(&comment.ticket, &comment.render())
     }
 
-    /// Posts a RE-ASK comment and returns it as the tracker recorded it.
+    /// Posts a RE-ASK comment and returns it as the tracker recorded it. It
+    /// holds in [`MAX_COMMENT_CHARS`] with the decider's mention (OWL-228).
     pub fn post_reask(&self, comment: &ReaskComment) -> Result<Posted, WriteError> {
-        self.post_waiting(&comment.ticket, comment.render())
+        self.post_waiting(&comment.ticket, |room| comment.render_within(room))
     }
 
-    /// Posts a REPLY comment and returns it as the tracker recorded it.
+    /// Posts a REPLY comment and returns it as the tracker recorded it. It
+    /// holds in [`MAX_COMMENT_CHARS`] with the decider's mention (OWL-228).
     pub fn post_reply(&self, comment: &ReplyComment) -> Result<Posted, WriteError> {
-        self.post_waiting(&comment.ticket, comment.render())
+        self.post_waiting(&comment.ticket, |room| comment.render_within(room))
     }
 
     /// Posts a RESUME comment and returns it as the tracker recorded it.
@@ -1688,12 +1957,17 @@ impl<'a> Writer<'a> {
             .map_err(WriteError::Tracker)
     }
 
-    /// Posts `body`, a marked comment that waits for the decider, with the
-    /// line naming them as its second section when the tracker can mention
-    /// them. A mention it could not give is left out, and said in the result.
-    fn post_waiting(&self, ticket: &TicketId, body: String) -> Result<Posted, WriteError> {
+    /// Posts the body `render` gives in the room the line naming the decider
+    /// leaves of a comment, a marked comment that waits for them, with that
+    /// line as its second section when the tracker can mention them. A
+    /// mention it could not give is left out, and said in the result.
+    fn post_waiting(
+        &self,
+        ticket: &TicketId,
+        render: impl FnOnce(usize) -> String,
+    ) -> Result<Posted, WriteError> {
         let (mention, mention_dropped) = self.mention();
-        let body = with_mention(body, mention.as_deref());
+        let body = with_mention(render(room_beside(mention.as_deref())), mention.as_deref());
         let comment = self.post(ticket, &body)?;
         Ok(Posted {
             comment,
@@ -1723,6 +1997,13 @@ impl<'a> Writer<'a> {
 /// The line that names the decider a comment waits for.
 fn waiting_line(mention: &str) -> String {
     format!("Waiting for {mention}")
+}
+
+/// The characters a comment's body may take beside the line naming the
+/// decider, when it has one ([`with_mention`]).
+fn room_beside(mention: Option<&str>) -> usize {
+    let line = mention.map_or(0, |m| chars(&waiting_line(m)) + 2);
+    MAX_COMMENT_CHARS.saturating_sub(line)
 }
 
 /// `body` with the line naming the decider as its second section, when
@@ -3111,5 +3392,263 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         moved.pull_request.head = CommitId::new("b".repeat(40)).unwrap();
         assert_ne!(writer.post_repair_report(&moved).unwrap(), posted);
         assert_eq!(tracker.posts.get(), 5);
+    }
+
+    /// OWL-228: `fit` leaves the shorter texts whole and cuts the longer
+    /// ones to one length, so that together they take the room exactly,
+    /// counted in characters; `fitted` keeps a body that holds as is, and
+    /// applies the caps only to one that does not.
+    #[test]
+    fn texts_are_fitted_to_the_room_longest_first() {
+        let fits = |texts: &[(&str, usize)], cap: Option<usize>| -> Vec<Fit> {
+            texts
+                .iter()
+                .map(|(c, n)| Fit {
+                    text: c.repeat(*n),
+                    why: "w",
+                    cap,
+                })
+                .collect()
+        };
+        let lengths = |texts: &[String]| texts.iter().map(|t| chars(t)).collect::<Vec<_>>();
+        let three = [("a", 10), ("é", 50), ("b", 200)];
+        let fitted_texts = fit(fits(&three, None), 150);
+        assert_eq!(lengths(&fitted_texts), [10, 50, 90]);
+        assert_eq!(fitted_texts[1], "é".repeat(50));
+        assert!(fitted_texts[2].ends_with(" … (cut: w)"));
+        assert_eq!(lengths(&fit(fits(&three, None), 260)), [10, 50, 200]);
+        assert_eq!(lengths(&fit(fits(&three, None), 259)), [10, 50, 199]);
+        // No room: nothing kept, and nothing passes it.
+        assert_eq!(lengths(&fit(fits(&three, None), 0)), [0, 0, 0]);
+
+        let body = |texts: &[String]| format!("<{}>", texts.join("|"));
+        assert_eq!(
+            fitted(264, fits(&three, Some(20)), body).chars().count(),
+            264
+        );
+        let capped = fitted(263, fits(&three, Some(20)), body);
+        assert_eq!(chars(&capped), 2 + 2 + 10 + 20 + 20);
+        assert!(capped.contains(&"é".repeat(9)) && !capped.contains(&"é".repeat(10)));
+    }
+
+    /// The open questions of a round at its bounds (`maximal_round`), each
+    /// with a verdict, one of them 300,000 characters long.
+    fn maximal_open() -> Vec<(Question, AnswerVerdict)> {
+        maximal_round()
+            .questions
+            .into_iter()
+            .enumerate()
+            .map(|(i, question)| {
+                let reason = if i == 7 { 300_000 } else { 2_000 };
+                let verdict = judged(
+                    question.id.as_str(),
+                    AnswerClass::Partial,
+                    &"m".repeat(reason),
+                );
+                (question, verdict)
+            })
+            .collect()
+    }
+
+    /// Each question of `maximal_open`, in order, keeps its id, the start of
+    /// its text and the line `then` starts after it.
+    fn every_question_in_order(body: &str, then: &str) {
+        let mut at = 0;
+        for n in 1..=64 {
+            let found = body[at..]
+                .find(&format!("**Q{n}** (scope) Which {n}?"))
+                .unwrap_or_else(|| panic!("Q{n}"));
+            at += found;
+            let line = body[at..].find(then).unwrap_or_else(|| panic!("Q{n}"));
+            at += line;
+        }
+    }
+
+    /// OWL-228: a RE-ASK and a REPLY at the bounds of a round, with
+    /// verdicts past any comment, hold in one comment with the decider's
+    /// mention; every question keeps its id and its line, and the cuts are
+    /// visible. Without a mention, the body posted is `render`'s.
+    #[test]
+    fn a_maximal_reask_or_reply_holds_in_one_comment() {
+        let open = maximal_open();
+        let reask = ReaskComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(3).unwrap(),
+            reask: 2,
+            open: open.clone(),
+        };
+        let reply = ReplyComment {
+            ticket: ticket(),
+            replies: open
+                .into_iter()
+                .map(|(question, verdict)| (question, verdict.reason))
+                .collect(),
+        };
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker).mentioning("u1");
+        let posted = [
+            (
+                writer.post_reask(&reask),
+                MarkerKind::ReAsk,
+                "\nStill open (partial): m",
+            ),
+            (writer.post_reply(&reply), MarkerKind::Reply, "\nReply: m"),
+        ];
+        for (posted, kind, then) in posted {
+            let body = posted.unwrap().comment.body;
+            assert!(
+                chars(&body) <= MAX_COMMENT_CHARS,
+                "{kind:?}: {}",
+                chars(&body)
+            );
+            assert!(
+                chars(&body) > MAX_COMMENT_CHARS - 100,
+                "{kind:?}: room left unused"
+            );
+            let marked = MarkedComment::parse(&body).unwrap().unwrap();
+            assert_eq!(marked.header.kind, kind);
+            assert_eq!(marked.footer.unwrap().ticket, ticket());
+            assert!(body.contains("\n\nWaiting for <mention of u1>\n\n"));
+            every_question_in_order(&body, then);
+            assert!(body.contains(&cut_note(RESTATED)), "{kind:?}");
+            assert!(body.contains(&cut_note(LONGER)), "{kind:?}");
+        }
+        assert_eq!(
+            reask.render().matches("\nOptions: ").count(),
+            64,
+            "the options line stays"
+        );
+        let unmentioned = Writer::new(&tracker);
+        assert_eq!(
+            unmentioned.post_reask(&reask).unwrap().comment.body,
+            reask.render()
+        );
+        assert_eq!(
+            unmentioned.post_reply(&reply).unwrap().comment.body,
+            reply.render()
+        );
+    }
+
+    /// OWL-228: a PARKED comment at the re-ask limit of a round at its
+    /// bounds, or with a detail of a whole result, holds in one comment;
+    /// the detail is cut to 8,000 characters.
+    #[test]
+    fn a_maximal_parked_comment_holds_in_one_comment() {
+        let reasks = ParkedComment {
+            ticket: ticket(),
+            reason: ParkReason::Reasks,
+            detail: String::new(),
+            round: NonZeroU32::new(3),
+            open: maximal_open(),
+            restart: Restart::Continue,
+        };
+        let blocked = ParkedComment {
+            reason: ParkReason::Blocked,
+            detail: "d".repeat(1 << 20),
+            round: None,
+            open: Vec::new(),
+            ..reasks.clone()
+        };
+        for parked in [&reasks, &blocked] {
+            let body = parked.render();
+            assert!(chars(&body) <= MAX_COMMENT_CHARS, "{}", chars(&body));
+            let marked = MarkedComment::parse(&body).unwrap().unwrap();
+            assert_eq!(marked.header.kind, MarkerKind::Parked);
+            assert!(marked.footer.is_some());
+            assert!(body.contains("**To restart it:**"));
+        }
+        every_question_in_order(&reasks.render(), "\nStill open (partial): m");
+        let body = blocked.render();
+        let kept = SPLIT_SUMMARY_CHARS - chars(&cut_note(LONGER));
+        assert!(body.contains(&format!("{}{}", "d".repeat(kept), cut_note(LONGER))));
+        assert!(!body.contains(&"d".repeat(kept + 1)));
+    }
+
+    /// A report at no bound: a summary of a whole result, 500 decisions of
+    /// 1,000 characters, 1,000 failed checks and 40 follow-ups of 500.
+    fn maximal_report() -> DeliveryReport {
+        let checks = (0..1_000)
+            .map(|n| check(&format!("job-{n}"), CheckState::Failed, "FAILURE", true))
+            .collect();
+        let mut report = report(Ok(set(Mergeable::Mergeable, checks)));
+        report.summary = "s".repeat(1 << 20);
+        report.decisions = (0..500)
+            .map(|n| Decision {
+                question: format!("Decision {n}?"),
+                decision: "d".repeat(900),
+                basis: "b".repeat(100),
+            })
+            .collect();
+        report.followups = (0..40)
+            .map(|n| Followup {
+                title: format!("Follow-up {n}"),
+                why: "w".repeat(500),
+                ..report.followups[0].clone()
+            })
+            .collect();
+        report
+    }
+
+    /// OWL-228: a DELIVERY report at no bound, a fix pass's naming 5,000
+    /// red checks or one check of a whole result, and a correction's naming
+    /// 64 long questions, each hold in one comment; their lead and pull
+    /// request lines stay whole, every follow-up stays, and each is posted
+    /// once, a first report whose cut summary starts as a lead does too.
+    #[test]
+    fn a_maximal_delivery_report_holds_in_one_comment_and_is_posted_once() {
+        let first = maximal_report();
+        let mut many = first.clone();
+        many.fix_pass = Some(FixPass {
+            pass: 2,
+            checks: (0..5_000).map(|n| format!("job-{n}")).collect(),
+        });
+        let mut one = first.clone();
+        one.fix_pass = Some(FixPass {
+            pass: 2,
+            checks: vec!["x".repeat(1 << 20)],
+        });
+        let mut corrected = first.clone();
+        corrected.correction = Some(Corrected {
+            questions: (0..64)
+                .map(|n| format!("{n} {}", "q".repeat(2_000)))
+                .collect(),
+            pushed: true,
+        });
+        let mut odd = first.clone();
+        odd.summary = format!("{FIX_PASS_LEAD}{}", "s".repeat(1 << 20));
+        for report in [&first, &many, &one, &corrected, &odd] {
+            let body = report.render();
+            assert!(chars(&body) <= MAX_COMMENT_CHARS, "{}", chars(&body));
+            let marked = MarkedComment::parse(&body).unwrap().unwrap();
+            assert_eq!(marked.header.kind, MarkerKind::Delivery);
+            assert!(marked.footer.is_some());
+            let (lead, pull_request) = report.lead_lines();
+            assert!(body.contains(&format!("\n\n{pull_request}\n\n")));
+            if let Some(lead) = lead {
+                assert!(chars(&lead) < LEAD_LIST_CHARS + 200, "{}", chars(&lead));
+                assert!(body.contains(&format!("\n\n{lead}\n\n")));
+            }
+            for n in 0..40 {
+                assert!(
+                    body.contains(&format!("**Follow-up {n}**")),
+                    "follow-up {n}"
+                );
+            }
+            assert!(body.contains(&cut_note(SUMMARY_CUT)));
+            assert!(body.contains(&cut_note("the rest is on the pull request")));
+
+            let tracker = FakeTracker::default();
+            let writer = Writer::new(&tracker);
+            let posted = writer.post_delivery_report(report).unwrap();
+            // Another try, with the checks read since, finds it.
+            let mut green = report.clone();
+            green.checks = Ok(set(Mergeable::Mergeable, Vec::new()));
+            assert_eq!(writer.post_delivery_report(&green).unwrap(), posted);
+            assert_eq!(tracker.posts.get(), 1);
+        }
+        assert!(many.lead_lines().0.unwrap().ends_with(" more."));
+        assert!(corrected.lead_lines().0.unwrap().contains(" and 60 more."));
+        let lead = one.lead_lines().0.unwrap();
+        assert!(lead.contains(&cut_note(LONGER)), "{lead}");
     }
 }
