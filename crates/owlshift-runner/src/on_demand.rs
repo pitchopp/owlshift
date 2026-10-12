@@ -1188,7 +1188,8 @@ impl OnDemand<'_> {
             }
         };
         match follow::changed(&stored.record, PIPELINE, &seen, now) {
-            Ok(Some(record)) => {
+            Ok(Some(changed)) => {
+                let record = changed.record;
                 let state = match TicketState::try_from(&record.state) {
                     Ok(state) => state,
                     Err(e) => return Err(core_error(e)),
@@ -1198,6 +1199,12 @@ impl OnDemand<'_> {
                         "keeping what the read changed in the ticket's ref",
                         e,
                     ));
+                }
+                // Told once the ref keeps it: a refused write leaves the push
+                // to be adopted, and the report replaced, by the next read
+                // (OWL-239).
+                if let Some(replaced) = &changed.replaced {
+                    self.replaced(&ticket, replaced, delivery.pushed.as_deref(), sink);
                 }
             }
             Ok(None) => {}
@@ -3873,6 +3880,7 @@ impl OnDemand<'_> {
         // The report is owed from the write that keeps the push, so a
         // tracker that refuses it, or a crash, leaves it for the next pass
         // (OWL-218).
+        let mut replaced = None;
         if let Some(pushing) = kept.pushing.take() {
             let count = match &kind {
                 RepairKind::Fix { .. } => state.fix_passes(),
@@ -3881,13 +3889,16 @@ impl OnDemand<'_> {
                 // decisions it follows the replies to (OWL-146).
                 RepairKind::Correction { questions } => questions.len() as u32,
             };
-            if let Some(replaced) = follow::landed_owing(&mut kept, pushing, count) {
-                self.replaced(&ticket, &replaced, delivery, sink);
-            }
+            replaced = follow::landed_owing(&mut kept, pushing, count);
         }
         let questions = p.questions();
         self.store_delivery(p, &state, questions, Some(kept.clone()))
             .map_err(|e| Stop::Delivery(format!("keeping the {what} in the ticket's ref: {e}")))?;
+        // Told once the ref keeps it: a refused write leaves the push to be
+        // adopted, and the report replaced, by the next read (OWL-239).
+        if let Some(replaced) = &replaced {
+            self.replaced(&ticket, replaced, delivery.pushed.as_deref(), sink);
+        }
         let checks_read = self.forge.checks(pull_request.number, &commit);
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let done = format!("the {what} {commit} was pushed and kept");
@@ -4088,13 +4099,14 @@ impl OnDemand<'_> {
         }
     }
 
-    /// A `warning` that `replaced`, the report `delivery` owed of its last
-    /// push, is dropped unposted for a newer push's (OWL-218).
-    fn replaced(
+    /// A `warning` that `replaced`, the report owed of the push `commit`, is
+    /// dropped unposted for a newer push's (OWL-218), whether the command
+    /// saw that push land or a read adopted it (OWL-239).
+    pub(crate) fn replaced(
         &self,
         ticket: &TicketId,
         replaced: &OwedReport,
-        delivery: &TicketDelivery,
+        commit: Option<&str>,
         sink: &mut EventSink<'_>,
     ) {
         sink.emit(
@@ -4106,7 +4118,7 @@ impl OnDemand<'_> {
                     "what",
                     json!(format!("{}_report_replaced", push_what(replaced.kind))),
                 ),
-                ("commit", json!(delivery.pushed)),
+                ("commit", json!(commit)),
                 ("count", json!(replaced.count)),
             ]),
         );

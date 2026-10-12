@@ -571,6 +571,17 @@ pub fn landed_owing(
     delivery.owed.replace(owed)
 }
 
+/// What [`changed`] leaves in the ticket ref, and the owed report it
+/// replaced: never posted, so the caller tells it with a
+/// `{kind}_report_replaced` warning once the record is kept (OWL-239).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Changed {
+    /// The record to keep.
+    pub record: TicketRecord,
+    /// The report the record's owed report replaced, if one was owed.
+    pub replaced: Option<OwedReport>,
+}
+
 /// The record `seen` leaves in the ticket ref, `None` when it changes
 /// nothing: the following ended, a push adopted, or the fix passes and
 /// failed runs cleared by a green read (`ChecksGreen`). A fix, a rebase or a
@@ -582,12 +593,13 @@ pub fn changed(
     pipeline: Pipeline,
     seen: &Seen,
     now: Timestamp,
-) -> Result<Option<TicketRecord>, String> {
+) -> Result<Option<Changed>, String> {
     let Some(delivery) = &record.delivery else {
         return Ok(None);
     };
     let mut next = record.clone();
     let mut delivery = delivery.clone();
+    let mut replaced = None;
     match &seen.decision {
         Decision::End(reason) => {
             let why = ended_why(*reason);
@@ -631,7 +643,7 @@ pub fn changed(
                                 .map_or(1, |kept| kept.questions.len() as u32),
                             PushKind::Fix | PushKind::Delivery => state.fix_passes(),
                         };
-                        landed_owing(&mut delivery, pushing, count);
+                        replaced = landed_owing(&mut delivery, pushing, count);
                     }
                 }
             }
@@ -647,7 +659,10 @@ pub fn changed(
         }
     }
     next.delivery = Some(delivery);
-    Ok((next != *record).then_some(next))
+    Ok((next != *record).then_some(Changed {
+        record: next,
+        replaced,
+    }))
 }
 
 impl fmt::Display for Seen {
@@ -985,7 +1000,8 @@ mod tests {
         assert_eq!(changed(&plain, pipeline, &green, at(0)).unwrap(), None);
         let cleared = changed(&record(delivery(), watching(1)), pipeline, &green, at(0))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .record;
         assert_eq!(cleared.state.failed_runs, 0);
 
         let mut pushing = delivery();
@@ -1011,6 +1027,7 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+        .record
         .delivery
         .unwrap();
         assert_eq!(next.pushed.as_deref(), Some(PUSHING));
@@ -1040,23 +1057,51 @@ mod tests {
         let next = changed(&record(reported, watching(0)), pipeline, &adopted, at(0))
             .unwrap()
             .unwrap()
+            .record
             .delivery
             .unwrap();
         assert_eq!(next.owed.unwrap().report, Some(report));
         // A fix push adopted counts its pass; past the bound it counts none,
         // and the following goes on.
         let fix = pushing;
+        let fix_under_way = fix.clone();
         let counted = changed(&record(fix.clone(), watching(1)), pipeline, &adopted, at(0))
             .unwrap()
             .unwrap();
-        let state = TicketState::try_from(&counted.state).unwrap();
+        let state = TicketState::try_from(&counted.record.state).unwrap();
         assert_eq!((state.fix_passes(), state.failed_runs()), (1, 0));
         let bound = TicketState::restore(Status::Active(Stage::Watch), 0, 0, 0, 2, 2).unwrap();
         let kept = changed(&record(fix, bound), pipeline, &adopted, at(0))
             .unwrap()
             .unwrap();
-        assert_eq!(TicketState::try_from(&kept.state).unwrap(), bound);
-        assert_eq!(kept.delivery.unwrap().owed.unwrap().count, 2);
+        assert_eq!(TicketState::try_from(&kept.record.state).unwrap(), bound);
+        assert_eq!(kept.record.delivery.unwrap().owed.unwrap().count, 2);
+        // An adopted push replaces the report already owed, which is handed
+        // back to be told (OWL-239); with none owed, nothing is.
+        let mut owing = fix_under_way.clone();
+        owing.owed = Some(OwedReport {
+            kind: PushKind::Rebase,
+            count: 3,
+            report: None,
+            unchanged: false,
+        });
+        owing.rebased_onto = Some(ONTO.to_owned());
+        let replacing = changed(&record(owing, watching(0)), pipeline, &adopted, at(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replacing.replaced.map(|owed| (owed.kind, owed.count)),
+            Some((PushKind::Rebase, 3))
+        );
+        let nothing = changed(
+            &record(fix_under_way, watching(0)),
+            pipeline,
+            &adopted,
+            at(0),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(nothing.replaced, None);
         // A delivery's own push adopted owes nothing here: `do` reports it.
         let mut first = delivery();
         first.pushing = Some(Pushing {
@@ -1069,7 +1114,7 @@ mod tests {
         let first = changed(&record(first, watching(0)), pipeline, &adopted, at(0))
             .unwrap()
             .unwrap();
-        assert_eq!(first.delivery.unwrap().owed, None);
+        assert_eq!(first.record.delivery.unwrap().owed, None);
         // A rebase push adopted counts a repair and keeps the base it was
         // rebased onto (OWL-210).
         let mut rebase = delivery();
@@ -1083,9 +1128,9 @@ mod tests {
         let rebased = changed(&record(rebase, watching(1)), pipeline, &adopted, at(0))
             .unwrap()
             .unwrap();
-        let state = TicketState::try_from(&rebased.state).unwrap();
+        let state = TicketState::try_from(&rebased.record.state).unwrap();
         assert_eq!((state.repairs(), state.failed_runs()), (1, 0));
-        let rebased = rebased.delivery.unwrap();
+        let rebased = rebased.record.delivery.unwrap();
         assert_eq!(
             (
                 rebased.base_at_push.as_deref(),
@@ -1102,6 +1147,7 @@ mod tests {
         let ended = changed(&plain, pipeline, &moved, at(5))
             .unwrap()
             .unwrap()
+            .record
             .delivery
             .unwrap();
         assert!(!ended.followed());
@@ -1120,6 +1166,7 @@ mod tests {
         let ended = changed(&record(owing, watching(0)), pipeline, &moved, at(5))
             .unwrap()
             .unwrap()
+            .record
             .delivery
             .unwrap();
         assert!(ended.ended.is_some() && ended.owed.is_some());

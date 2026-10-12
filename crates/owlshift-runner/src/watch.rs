@@ -361,9 +361,13 @@ impl Watch<'_> {
             Look::Read(seen) => seen,
             Look::Paused { .. } | Look::Unread { .. } => return,
         };
+        let mut replaced = None;
         let change =
             follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
-                Some(record) => self.write_seen(ticket, &stored.commit, &record),
+                Some(changed) => {
+                    replaced = changed.replaced;
+                    self.write_seen(ticket, &stored.commit, &changed.record)
+                }
                 None => Ok(Some(stored.commit.clone())),
             });
         let commit = match change {
@@ -375,6 +379,10 @@ impl Watch<'_> {
                 return self.unreadable(memory, sink, ticket, reason);
             }
         };
+        // Told once the ref keeps it (OWL-239).
+        if let Some(replaced) = &replaced {
+            on_demand.replaced(ticket, replaced, delivery.pushed.as_deref(), sink);
+        }
         if let Some(event) = memory.following.events(ticket, &seen) {
             sink.emit(ticket, None, EventKind::Decision, event);
             self.line(out, &format!("{ticket}: {seen}"));

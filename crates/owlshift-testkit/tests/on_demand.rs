@@ -5607,11 +5607,10 @@ fn continue_posts_an_owed_fix_report_and_an_end_drops_it() {
     );
 }
 
-/// OWL-218: a fix push a crash cut short, adopted by watch's read, gets
-/// its DELIVERY report at that pass, with what the run kept for it.
-#[test]
-fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
-    let bench = delivered();
+/// A fix push a crash cut short: the branch holds the fix, the ref still
+/// keeps it as under way, with what its run kept for its report, and `owed`
+/// as the report left owed by an earlier push. Returns the fix's commit.
+fn a_crashed_fix_push(bench: &Bench, owed: Option<owlshift_contracts::refs::OwedReport>) -> String {
     let (env, bare) = (bench.env.clone(), bench.remote.bare.clone());
     let branch = format!("refs/heads/{BRANCH}");
     let tip = bench.remote_branch().unwrap();
@@ -5632,6 +5631,14 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
     env.run(&bare, &["update-ref", &branch, &fix]).unwrap();
     let mut record = bench.record();
     let delivery = record.delivery.as_mut().unwrap();
+    // A rebase's report is owed only with the base it rebased onto.
+    if owed
+        .as_ref()
+        .is_some_and(|owed| owed.kind == owlshift_contracts::refs::PushKind::Rebase)
+    {
+        delivery.rebased_onto = Some(bench.remote_main());
+    }
+    delivery.owed = owed;
     delivery.pushing = Some(owlshift_contracts::refs::Pushing {
         commit: fix.clone(),
         kind: owlshift_contracts::refs::PushKind::Fix,
@@ -5647,6 +5654,15 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
         }),
     });
     bench.write_record(&record);
+    fix
+}
+
+/// OWL-218: a fix push a crash cut short, adopted by watch's read, gets
+/// its DELIVERY report at that pass, with what the run kept for it.
+#[test]
+fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
+    let bench = delivered();
+    let fix = a_crashed_fix_push(&bench, None);
     let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
     assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
     let reports = reports(&bench);
@@ -5661,6 +5677,105 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
     let delivery = bench.record().delivery.unwrap();
     assert_eq!(delivery.pushed.as_deref(), Some(fix.as_str()));
     assert!(delivery.owed.is_none() && delivery.pushing.is_none());
+}
+
+/// The `*_report_replaced` warnings of the events after `from`.
+fn replaced_warnings(bench: &Bench, from: usize) -> Vec<Value> {
+    data_of(&bench.events()[from..], EventKind::Warning, "what")
+        .into_iter()
+        .filter(|w| {
+            w["what"]
+                .as_str()
+                .is_some_and(|w| w.ends_with("_report_replaced"))
+        })
+        .collect()
+}
+
+/// OWL-239: a read that adopts a fix push replaces the report the ref owed
+/// of an earlier push of `kind`, and tells it, once, with the replaced
+/// report's commit and count.
+fn adopting_a_push_replaces_an_owed_report(
+    kind: owlshift_contracts::refs::PushKind,
+    what: &str,
+    count: u32,
+) {
+    let bench = delivered();
+    let earlier = bench.record().delivery.unwrap().pushed.unwrap();
+    let owed = owlshift_contracts::refs::OwedReport {
+        kind,
+        count,
+        report: None,
+        unchanged: false,
+    };
+    a_crashed_fix_push(&bench, Some(owed));
+    let from = bench.events().len();
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    let warned = replaced_warnings(&bench, from);
+    assert_eq!(warned.len(), 1, "{warned:?}\n{lines}\n{printed}");
+    assert_eq!(warned[0]["what"], format!("{what}_report_replaced"));
+    assert_eq!(warned[0]["commit"], earlier.as_str());
+    assert_eq!(warned[0]["count"], count);
+}
+
+#[test]
+fn adopting_a_push_replaces_an_owed_delivery_report_with_a_warning() {
+    adopting_a_push_replaces_an_owed_report(
+        owlshift_contracts::refs::PushKind::Delivery,
+        "delivery",
+        1,
+    );
+}
+
+#[test]
+fn adopting_a_push_replaces_an_owed_fix_report_with_a_warning() {
+    adopting_a_push_replaces_an_owed_report(owlshift_contracts::refs::PushKind::Fix, "fix", 2);
+}
+
+#[test]
+fn adopting_a_push_replaces_an_owed_rebase_report_with_a_warning() {
+    adopting_a_push_replaces_an_owed_report(
+        owlshift_contracts::refs::PushKind::Rebase,
+        "rebase",
+        2,
+    );
+}
+
+#[test]
+fn adopting_a_push_replaces_an_owed_correction_report_with_a_warning() {
+    adopting_a_push_replaces_an_owed_report(
+        owlshift_contracts::refs::PushKind::Correction,
+        "correction",
+        2,
+    );
+}
+
+/// OWL-239: `owlshift continue` at Watch tells the report its read's
+/// adoption replaces, as watch does; and an adoption that replaces nothing
+/// tells nothing.
+#[test]
+fn continue_tells_the_owed_report_an_adopted_push_replaces() {
+    let bench = delivered();
+    a_crashed_fix_push(&bench, None);
+    let from = bench.events().len();
+    let (_, printed) = bench.continue_ticket(Vec::new());
+    assert!(replaced_warnings(&bench, from).is_empty(), "{printed}");
+
+    let bench = delivered();
+    let earlier = bench.record().delivery.unwrap().pushed.unwrap();
+    let owed = owlshift_contracts::refs::OwedReport {
+        kind: owlshift_contracts::refs::PushKind::Fix,
+        count: 1,
+        report: None,
+        unchanged: false,
+    };
+    a_crashed_fix_push(&bench, Some(owed));
+    let from = bench.events().len();
+    let (_, printed) = bench.continue_ticket(Vec::new());
+    let warned = replaced_warnings(&bench, from);
+    assert_eq!(warned.len(), 1, "{warned:?}\n{printed}");
+    assert_eq!(warned[0]["what"], "fix_report_replaced");
+    assert_eq!(warned[0]["commit"], earlier.as_str());
 }
 
 /// A delivered ticket whose fix run's DELIVERY report the tracker refused:
