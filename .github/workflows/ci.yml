@@ -58,18 +58,32 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      # OWL-81: `cargo test --workspace` runs other test binaries
-      # (agent_credentials among them) before on_demand, so a warm gh hides
-      # a cold-start failure. On the Windows runner the on_demand binary
-      # runs alone first, proving it passes without another binary having
-      # warmed gh: the warm-up is shared through the testkit since OWL-70.
-      # Approved on OWL-81 on 2026-09-29, as the CI-settings floor of
-      # architecture section 8 requires.
-      - name: Test the on-demand binary alone
-        if: runner.os == 'Windows'
-        run: cargo test -p owlshift-testkit --test on_demand --locked
+      # OWL-241: the tests run under cargo-nextest, one process per test, so
+      # a child forked by one test no longer holds another test's lock and
+      # on_demand's tests use the runner's cores. Each process still warms
+      # gh before its probes (`gh::warm_up`). OWL-81's separate step, which
+      # ran on_demand alone on Windows, goes with on_demand's tests on that
+      # leg (below). nextest comes from a third-party
+      # action pinned to its full commit, with a pinned nextest; no retries.
+      # nextest runs no doctests, so they keep a step of their own.
+      # Approved on OWL-241 on 2026-10-12, with the action as a dependency,
+      # as the CI-settings floor of architecture section 8 requires.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.146
       - name: Test
-        run: cargo test --workspace --locked
+        if: runner.os != 'Windows'
+        run: cargo nextest run --workspace --locked --no-fail-fast
+      # OWL-241: on_demand runs `owlshift do` without confinement, which a
+      # native Windows user cannot reach: `do` refuses there and WSL2 is the
+      # supported path (D9, OWL-87). The refusals are tested outside that
+      # binary, so they still run here.
+      - name: Test, without on_demand
+        if: runner.os == 'Windows'
+        run: cargo nextest run --workspace --locked --no-fail-fast -E 'not binary_id(owlshift-testkit::on_demand)'
+      - name: Doctests
+        run: cargo test --workspace --doc --locked
 
   # The single check to require on main (OWL-21): it succeeds only when every
   # platform leg succeeded, and fails if one failed, was cancelled or skipped.
