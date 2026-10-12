@@ -3373,6 +3373,30 @@ impl OnDemand<'_> {
                         "a question round without its questions".to_owned(),
                     ));
                 };
+                // A false premise with no question asks the decider nothing:
+                // it parks, so a person looks rather than watch running the
+                // repair again at each pass.
+                if !result.asks() {
+                    let parked = match state.apply(PIPELINE, Event::Blocked) {
+                        Ok(Transition::Parked { state, .. }) => state,
+                        other => return Err(core_error(other)),
+                    };
+                    let detail = format!(
+                        "the {} run of pull request #{} found its premise false, with no \
+                         question: {} Look, then type `owlshift continue {}`",
+                        run.what, run.pull_request, result.summary, p.ticket
+                    );
+                    return Err(self.park_with(
+                        p,
+                        &parked,
+                        ParkReason::Blocked,
+                        Some(&ran.run),
+                        detail,
+                        None,
+                        Vec::new(),
+                        sink,
+                    ));
+                }
                 let waiting = match state.apply(PIPELINE, Event::Questions) {
                     Ok(Transition::To(waiting)) => waiting,
                     other => return Err(core_error(other)),

@@ -5247,6 +5247,34 @@ fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
     assert_eq!(asked(), 2);
 }
 
+/// A fix run that finds its premise false with no question asks the decider
+/// nothing: it parks the ticket, so watch does not run it again at each
+/// pass (OWL-211).
+#[test]
+fn a_false_premise_without_a_question_parks_the_fix() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let premise = r#"{"format":7,"status":"premise_false","summary":"The check tests a file this branch never had.","questions":[]}"#;
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(premise))]);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::Blocked,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    let parked = bench.comments().pop().unwrap();
+    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    assert!(
+        parked.contains("found its premise false, with no question"),
+        "{parked}"
+    );
+    assert!(matches!(state_of(&bench).status(), Status::Parked { .. }));
+}
+
 /// A pull request read green once the round is answered gets no fix run:
 /// nothing resumes a remembered run (OWL-211).
 #[test]
