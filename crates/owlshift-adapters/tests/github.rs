@@ -6,14 +6,16 @@
 //! schema gives it and flagged `synthesized`; the live test
 //! (`github_live.rs`) opens a real one.
 //!
-//! Watch's reads (OWL-209: `follow-*.json`, `base-checks.json`,
-//! `rate-limited.json`) are made up in the schema's shape and say so in their
-//! `recorded` line and on each exchange: GitHub refuses GraphQL to the cloud
-//! sessions that wrote them. `github_live.rs`'s `records_watch_reads`
-//! records the follow fixtures on a disposable repository.
+//! Watch's reads (OWL-209) were recorded live on 2026-10-12 (OWL-217):
+//! `follow-merged.json` and `base-checks.json` read-only here, by
+//! `record_watch_fixtures`; `follow-red.json` and `follow-conflicting.json`
+//! on a disposable repository, by `github_live.rs`'s `records_watch_reads`.
+//! `rate-limited.json` alone is made up in the shape GitHub documents, and
+//! says so and why in its `recorded` line and on each exchange.
 //!
 //! To record again, with a token that can read the repository in
-//! `OWLSHIFT_GITHUB_TOKEN`, or logged in with `gh`:
+//! `OWLSHIFT_GITHUB_TOKEN`, or logged in with `gh` (`record_fixtures` for
+//! delivery's fixtures, `record_watch_fixtures` for watch's):
 //!
 //! ```sh
 //! cargo test -p owlshift-adapters --test github -- --ignored
@@ -44,7 +46,7 @@ const FOLLOW_MERGED: &str = "follow-merged.json";
 const BASE_CHECKS: &str = "base-checks.json";
 const RATE_LIMITED: &str = "rate-limited.json";
 
-/// The pull request of the made-up watch fixtures.
+/// The pull request of the made-up rate-limited fixture.
 const FOLLOWED: u64 = 42;
 
 /// PR #16 (OWL-13), merged, with four GitHub Actions check runs.
@@ -191,64 +193,86 @@ fn watch_reads_a_pull_request_red_conflicting_then_merged() {
         replay.assert_done();
         read
     };
+    // Recorded on a disposable repository whose workflow has a passing and
+    // a failing job.
     let red = read(FOLLOW_RED);
     assert_eq!(red.checks.state, PrState::Open);
+    assert_eq!(red.checks.mergeable, Mergeable::Mergeable);
+    assert_eq!(red.checks.merge_state, "UNSTABLE");
     assert_eq!(red.checks.verdict(), Verdict::Red);
-    let failed: Vec<_> = red
+    let checks: Vec<_> = red
         .checks
         .checks
         .iter()
-        .filter(|c| c.state == CheckState::Failed)
-        .map(|c| (c.name.as_str(), c.raw.as_str()))
+        .map(|c| (c.name.as_str(), c.state, c.raw.as_str()))
         .collect();
     assert_eq!(
-        failed,
-        [("check (ubuntu-latest)", "FAILURE"), ("ci", "FAILURE")]
+        checks,
+        [
+            ("passes", CheckState::Passed, "SUCCESS"),
+            ("fails", CheckState::Failed, "FAILURE")
+        ]
     );
     // A check run's id is its job's, for the fix run's log (OWL-112).
-    assert_eq!(red.checks.checks[0].id, Some(2));
-    assert_eq!(red.checks.checks[2].id, None);
+    assert_eq!(red.checks.checks[1].id, Some(114_739_350_663));
     let rate = red.rate.expect("the query's cost");
-    assert_eq!((rate.cost, rate.remaining), (1, 4990));
+    assert_eq!((rate.cost, rate.remaining), (1, 4670));
 
+    // The same pull request once its base took a conflicting commit: the
+    // failed job is still there, the mergeability changed.
     let conflicting = read(FOLLOW_CONFLICTING);
     assert_eq!(conflicting.checks.state, PrState::Open);
+    assert_eq!(conflicting.checks.head, red.checks.head);
     assert_eq!(conflicting.checks.mergeable, Mergeable::Conflicting);
     assert_eq!(conflicting.checks.merge_state, "DIRTY");
-    assert!(conflicting.rate.is_some());
+    let rate = conflicting.rate.expect("the query's cost");
+    assert_eq!((rate.cost, rate.remaining), (1, 4667));
 
+    // PR #16: GitHub still answers its checks, the read lists none.
     let merged = read(FOLLOW_MERGED);
     assert_eq!(merged.checks.state, PrState::Merged);
+    assert_eq!(merged.checks.head, head());
     assert!(merged.checks.checks.is_empty());
+    assert_eq!(merged.rate.map(|r| r.cost), Some(1));
 }
 
-/// The base head's checks across pages and `base_at_push`'s, with the cost
-/// of both queries summed.
+/// The base head's checks and `base_at_push`'s, one per page: a first query
+/// for both, then a page query per further check, six in all, their costs
+/// summed and the budget left after the last.
 #[test]
 fn reads_the_checks_of_the_base_head_and_of_base_at_push() {
     let replay = Replay::of(&dir(), BASE_CHECKS);
-    let at_push = CommitId::new("c0c0867c0c0867c0c0867c0c0867c0c0867c0c08").unwrap();
+    let at_push = CommitId::new(FAILED_MAIN).unwrap();
     let base = forge(&replay)
         .with_check_page(1)
         .base_checks(&main_branch(), Some(&at_push))
         .unwrap();
     replay.assert_done();
-    let states = |checks: &[owlshift_adapters::forge::Check]| -> Vec<(String, CheckState)> {
-        checks.iter().map(|c| (c.name.clone(), c.state)).collect()
-    };
+    assert_eq!(support::load(&dir(), BASE_CHECKS).exchanges.len(), 6);
+    fn states(checks: &[owlshift_adapters::forge::Check]) -> Vec<(&str, CheckState)> {
+        checks.iter().map(|c| (c.name.as_str(), c.state)).collect()
+    }
+    // Recorded while the head's Windows job was still running.
     assert_eq!(
         states(&base.at_head),
         [
-            ("check (ubuntu-latest)".to_owned(), CheckState::Passed),
-            ("ci".to_owned(), CheckState::Pending)
+            ("check (ubuntu-latest)", CheckState::Passed),
+            ("check (macos-latest)", CheckState::Passed),
+            ("check (windows-latest)", CheckState::Pending)
         ]
     );
     assert_eq!(
         states(base.at_push.as_deref().unwrap()),
-        [("check (ubuntu-latest)".to_owned(), CheckState::Failed)]
+        [
+            ("check (ubuntu-latest)", CheckState::Passed),
+            ("check (macos-latest)", CheckState::Failed),
+            ("check (windows-latest)", CheckState::Passed),
+            ("ci", CheckState::Failed)
+        ]
     );
     let rate = base.rate.unwrap();
-    assert_eq!((rate.cost, rate.remaining), (2, 4989));
+    assert_eq!((rate.cost, rate.remaining), (6, 4659));
+    assert_eq!(rate.resets_at.to_string(), "2026-10-12T09:43:17Z");
 }
 
 /// GraphQL's own limit and a secondary limit both hold the reads, until the
@@ -286,9 +310,15 @@ fn fixtures_hold_no_credential_and_flag_what_is_made_up() {
             );
         }
         let fixture: support::Fixture = serde_json::from_str(&text).unwrap();
-        let made_up = fixture
-            .recorded
-            .starts_with("made up, pending live recording");
+        let made_up = fixture.recorded.starts_with("made up");
+        // Only a spent budget is made up, and it says why (OWL-217).
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(made_up, name == RATE_LIMITED, "{}", path.display());
+        assert!(
+            !made_up || fixture.recorded.contains("cannot be recorded"),
+            "{}: a made-up fixture says why",
+            path.display()
+        );
         for exchange in &fixture.exchanges {
             let query = exchange.request["query"].as_str().unwrap_or_default();
             assert_eq!(
@@ -367,4 +397,58 @@ fn record_fixtures() {
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Unauthorized, "{error}");
     r.write(UNAUTHORIZED, &recorded);
+}
+
+/// A `main` commit whose CI failed on its push (2026-10-08): `base_at_push`
+/// of the base-checks fixture, for a failed check beside the head's.
+const FAILED_MAIN: &str = "e0b59e4a1c954925d980c472a77d915b08567fa7";
+
+/// Records watch's read-only fixtures on `pitchopp/owlshift` (OWL-217): a
+/// merged pull request's read and the base's checks, one per page so that
+/// the paging is recorded too. `github_live.rs`'s `records_watch_reads`
+/// records the red and conflicting reads, which need writes.
+///
+/// ```sh
+/// cargo test -p owlshift-adapters --test github -- --ignored --nocapture record_watch_fixtures
+/// ```
+#[test]
+#[ignore = "records against the live GitHub API"]
+fn record_watch_fixtures() {
+    let token = support::github_token();
+    let recorded = format!(
+        "{} on pitchopp/owlshift, recorded live",
+        jiff::Zoned::now().date()
+    );
+    let recorder = || Recorder::over(HttpTransport::new(token.clone()), dir());
+
+    let r = recorder();
+    let merged = GitHubForge::with_transport(r.clone(), repo())
+        .follow(PR_16)
+        .unwrap();
+    assert_eq!(merged.checks.state, PrState::Merged);
+    let rate = merged.rate.expect("rateLimit in watch's query");
+    eprintln!("merged: cost {} points, {} left", rate.cost, rate.remaining);
+    r.write(FOLLOW_MERGED, &recorded);
+
+    let r = recorder();
+    let at_push = CommitId::new(FAILED_MAIN).unwrap();
+    let base = GitHubForge::with_transport(r.clone(), repo())
+        .with_check_page(1)
+        .base_checks(&main_branch(), Some(&at_push))
+        .unwrap();
+    let at_push = base.at_push.expect("the failed commit's checks");
+    assert!(base.at_head.len() > 1, "{:?}", base.at_head);
+    assert!(
+        at_push.iter().any(|c| c.state == CheckState::Failed),
+        "{at_push:?}"
+    );
+    let rate = base.rate.expect("rateLimit in watch's queries");
+    eprintln!(
+        "base checks: {} checks at head, {} at push, cost {} points, {} left",
+        base.at_head.len(),
+        at_push.len(),
+        rate.cost,
+        rate.remaining
+    );
+    r.write(BASE_CHECKS, &recorded);
 }

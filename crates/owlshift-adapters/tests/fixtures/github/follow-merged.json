@@ -1,5 +1,5 @@
 {
-  "recorded": "made up, pending live recording: GitHub GraphQL answered HTTP 403 \"GitHub GraphQL is not available from Claude Code sessions\" to OWL-209's cloud session on 2026-10-11; shaped by GitHub's schema. github_live.rs records_watch_reads records it on a disposable repository",
+  "recorded": "2026-10-12 on pitchopp/owlshift, recorded live",
   "exchanges": [
     {
       "request": {
@@ -8,7 +8,7 @@
           "after": null,
           "first": 100,
           "name": "owlshift",
-          "number": 42,
+          "number": 16,
           "owner": "pitchopp"
         }
       },
@@ -17,34 +17,21 @@
         "data": {
           "rateLimit": {
             "cost": 1,
-            "remaining": 4990,
-            "resetAt": "2026-10-11T13:00:00Z"
+            "remaining": 4665,
+            "resetAt": "2026-10-12T09:43:17Z"
           },
           "repository": {
             "pullRequest": {
-              "state": "MERGED",
-              "headRefOid": "5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f",
-              "mergeable": "UNKNOWN",
-              "mergeStateStatus": "UNKNOWN",
               "commits": {
                 "nodes": [
                   {
                     "commit": {
-                      "oid": "5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f",
+                      "oid": "36f0557116ea73f9b0805980e83b360e23b99940",
                       "statusCheckRollup": {
                         "contexts": {
-                          "totalCount": 2,
-                          "pageInfo": {
-                            "hasNextPage": false,
-                            "endCursor": null
-                          },
                           "nodes": [
                             {
                               "__typename": "CheckRun",
-                              "name": "check (ubuntu-latest)",
-                              "status": "COMPLETED",
-                              "conclusion": "SUCCESS",
-                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
                               "checkSuite": {
                                 "app": {
                                   "slug": "github-actions"
@@ -55,14 +42,15 @@
                                   }
                                 }
                               },
-                              "isRequired": false
+                              "conclusion": "SUCCESS",
+                              "databaseId": 108948335412,
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108948335412",
+                              "isRequired": false,
+                              "name": "check (ubuntu-latest)",
+                              "status": "COMPLETED"
                             },
                             {
                               "__typename": "CheckRun",
-                              "name": "ci",
-                              "status": "COMPLETED",
-                              "conclusion": "SUCCESS",
-                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
                               "checkSuite": {
                                 "app": {
                                   "slug": "github-actions"
@@ -73,20 +61,75 @@
                                   }
                                 }
                               },
-                              "isRequired": false
+                              "conclusion": "SUCCESS",
+                              "databaseId": 108948335445,
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108948335445",
+                              "isRequired": false,
+                              "name": "check (macos-latest)",
+                              "status": "COMPLETED"
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "conclusion": "SUCCESS",
+                              "databaseId": 108948335120,
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108948335120",
+                              "isRequired": false,
+                              "name": "check (windows-latest)",
+                              "status": "COMPLETED"
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI"
+                                  }
+                                }
+                              },
+                              "conclusion": "SUCCESS",
+                              "databaseId": 108950329804,
+                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/36428499374/job/108950329804",
+                              "isRequired": false,
+                              "name": "ci",
+                              "status": "COMPLETED"
                             }
-                          ]
+                          ],
+                          "pageInfo": {
+                            "endCursor": "NA",
+                            "hasNextPage": false
+                          },
+                          "totalCount": 4
                         }
                       }
                     }
                   }
                 ]
-              }
+              },
+              "headRefOid": "36f0557116ea73f9b0805980e83b360e23b99940",
+              "mergeStateStatus": "UNKNOWN",
+              "mergeable": "UNKNOWN",
+              "state": "MERGED"
             }
           }
         }
       },
-      "synthesized": "not recorded: made up in the shape of GitHub's schema (OWL-209)"
+      "rate": {
+        "remaining": 4665,
+        "reset": 1791798197
+      }
     }
   ]
 }

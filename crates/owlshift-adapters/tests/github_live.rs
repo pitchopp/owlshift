@@ -8,11 +8,15 @@
 //!   cargo test -p owlshift-adapters --test github_live -- --ignored --nocapture
 //! ```
 //!
-//! `records_watch_reads` (OWL-209) records watch's read of a conflicting
-//! pull request, with the query's cost, as `tests/fixtures/github/
-//! follow-conflicting.json`: the live checks (a) and (b) of the build plan's
-//! "Watch after delivery". It pushes a commit to the repository's `main` to
-//! make the conflict, so the repository must be one nobody else uses:
+//! `records_watch_reads` (OWL-209, OWL-217) records watch's read of a pull
+//! request gone red on real GitHub Actions jobs, then conflicting, with the
+//! query's cost, as `tests/fixtures/github/follow-red.json` and
+//! `follow-conflicting.json`: the live checks (a) and (b) of the build plan's
+//! "Watch after delivery". Its branch adds a workflow with a passing and a
+//! failing job, so the repository needs Actions enabled, and each run sends
+//! its owner a failed-run notification. It pushes a commit to the
+//! repository's `main` to make the conflict, so the repository must be one
+//! nobody else uses:
 //!
 //! ```sh
 //! OWLSHIFT_LIVE_GITHUB=<owner>/<test-repo> \
@@ -21,7 +25,9 @@
 //!
 //! The repository needs a `main` branch. The token comes from
 //! `OWLSHIFT_GITHUB_TOKEN`, or from the `gh` login; the push uses your own
-//! git credentials over SSH, or over `OWLSHIFT_LIVE_GITHUB_REMOTE` when set.
+//! git credentials over SSH, or over `OWLSHIFT_LIVE_GITHUB_REMOTE` when set,
+//! whose credential must be allowed to push a workflow (a token's `workflow`
+//! scope, over HTTPS).
 
 mod support;
 
@@ -32,7 +38,9 @@ use serde_json::json;
 
 use owlshift_adapters::forge::github::{GitHubForge, HttpTransport, NewPullRequest, Transport};
 use owlshift_adapters::forge::push::{Pushed, push_command, read_push};
-use owlshift_adapters::forge::{Branch, CommitId, ErrorKind, Mergeable, PrState, Repo};
+use owlshift_adapters::forge::{
+    Branch, CheckState, CommitId, ErrorKind, Mergeable, PrState, PullRequestRead, Repo, Verdict,
+};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -213,11 +221,12 @@ fn commit_file(checkout: &Path, file: &str, content: &str, message: &str) -> Com
     CommitId::new(git(checkout, &["rev-parse", "HEAD"])).unwrap()
 }
 
-/// OWL-209's live checks (a) and (b): a pull request made to conflict with
-/// its base reads `CONFLICTING` through watch's query, whose `rateLimit`
-/// gives its real cost; the read is recorded as the fixture the contract
-/// test replays. Only the repository `OWLSHIFT_LIVE_GITHUB` names is
-/// touched: its `main` gets one commit, and the pull request is closed and
+/// OWL-209's live checks (a) and (b): a pull request whose workflow fails
+/// reads red, then, made to conflict with its base, reads `CONFLICTING`,
+/// through watch's query, whose `rateLimit` gives its real cost; each read is
+/// recorded as the fixture the contract test replays, polled outside the
+/// recording until settled. Only the repository `OWLSHIFT_LIVE_GITHUB` names
+/// is touched: its `main` gets one commit, and the pull request is closed and
 /// its branch deleted at the end.
 #[test]
 #[ignore = "live: writes to GitHub; set OWLSHIFT_LIVE_GITHUB=<owner>/<test-repo>"]
@@ -249,10 +258,20 @@ fn records_watch_reads() {
     let base = Branch::new("main").unwrap();
     let file = "owlshift-live-conflict.txt";
 
+    // A workflow with one passing and one failing job, so the pull request
+    // goes red on real check runs before it conflicts: GitHub runs no
+    // `pull_request` workflow on a conflicting pull request, and this one
+    // runs on the push instead.
+    let workflows = checkout.join(".github/workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(workflows.join("owlshift-live.yml"), RED_WORKFLOW).unwrap();
+    git(&checkout, &["add", ".github/workflows/owlshift-live.yml"]);
+    // Both sides name the run, so a second run still conflicts with a `main`
+    // that kept the first run's base side.
     let commit = commit_file(
         &checkout,
         file,
-        "the pull request's line\n",
+        &format!("the pull request's line, run {stamp}\n"),
         "The pull request's side",
     );
     let mut cleanup = Cleanup {
@@ -276,13 +295,67 @@ fn records_watch_reads() {
         .unwrap();
     eprintln!("opened {}", pr.url);
     cleanup.pull_request_id = Some(node_id(&repo, pr.number));
+    let recorded = format!("{} on {repo}, recorded live", jiff::Zoned::now().date());
+
+    // The workflow's two jobs, finished, on the pushed head: polled outside
+    // the recording.
+    let settled = |read: &PullRequestRead| {
+        let mut jobs: Vec<_> = read
+            .checks
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.state))
+            .collect();
+        jobs.sort_unstable_by_key(|(name, _)| *name);
+        read.checks.head == commit
+            && read.checks.mergeable != Mergeable::Unknown
+            && jobs
+                == [
+                    ("fails", CheckState::Failed),
+                    ("passes", CheckState::Passed),
+                ]
+    };
+    let mut read = forge.follow(pr.number).unwrap();
+    for _ in 0..60 {
+        if settled(&read) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        read = forge.follow(pr.number).unwrap();
+    }
+    assert!(
+        settled(&read),
+        "the workflow's jobs `passes` and `fails` did not both finish in 5 minutes, as passed and \
+         failed; are Actions enabled on {repo}, with minutes left? Last read: {:?}",
+        read.checks
+    );
+    let recorder = support::Recorder::over(
+        HttpTransport::new(token.clone()),
+        support::fixtures("github"),
+    );
+    let red = GitHubForge::with_transport(recorder.clone(), repo.clone())
+        .follow(pr.number)
+        .unwrap();
+    assert!(settled(&red), "{:?}", red.checks);
+    assert_eq!(red.checks.verdict(), Verdict::Red);
+    let rate = red.rate.expect("rateLimit in watch's query");
+    eprintln!(
+        "red: merge state {}, cost {} points, {} left",
+        red.checks.merge_state, rate.cost, rate.remaining
+    );
+    recorder.write("follow-red.json", &recorded);
 
     // The base's side of the same file, pushed to main.
     git(
         &checkout,
         &["checkout", "--quiet", "--detach", &base_commit],
     );
-    let theirs = commit_file(&checkout, file, "the base's line\n", "The base's side");
+    let theirs = commit_file(
+        &checkout,
+        file,
+        &format!("the base's line, run {stamp}\n"),
+        "The base's side",
+    );
     git(
         &checkout,
         &[
@@ -293,10 +366,11 @@ fn records_watch_reads() {
         ],
     );
 
-    // GitHub computes mergeability in the background.
+    // GitHub computes mergeability in the background, and may answer the
+    // earlier `MERGEABLE` until it has.
     let mut read = forge.follow(pr.number).unwrap();
     for _ in 0..30 {
-        if read.checks.mergeable != Mergeable::Unknown {
+        if read.checks.mergeable == Mergeable::Conflicting {
             break;
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -308,16 +382,37 @@ fn records_watch_reads() {
     );
     assert_eq!(read.checks.mergeable, Mergeable::Conflicting);
 
-    let recorded = format!("{} on {repo}, recorded live", jiff::Zoned::now().date());
     let recorder = support::Recorder::over(HttpTransport::new(token), support::fixtures("github"));
     let read = GitHubForge::with_transport(recorder.clone(), repo.clone())
         .follow(pr.number)
         .unwrap();
     assert_eq!(read.checks.mergeable, Mergeable::Conflicting);
     let rate = read.rate.expect("rateLimit in watch's query");
-    eprintln!("the follow query cost {} points", rate.cost);
+    eprintln!(
+        "conflicting: merge state {}, cost {} points, {} left, resets at {}",
+        read.checks.merge_state, rate.cost, rate.remaining, rate.resets_at
+    );
     recorder.write("follow-conflicting.json", &recorded);
 }
+
+/// The workflow `records_watch_reads` adds on its branch: one job passes, one
+/// fails, on every push but to `main`.
+const RED_WORKFLOW: &str = "\
+name: Owlshift live test
+on:
+  push:
+    branches-ignore: [main]
+permissions: {}
+jobs:
+  passes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo the passing job
+  fails:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo the failing job; exit 1
+";
 
 /// Live check (c) of the build plan's "Watch after delivery" (OWL-112):
 /// whether the token Owlshift stores reads a failed job's log. Read only,
