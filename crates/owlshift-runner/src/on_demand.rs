@@ -2723,11 +2723,6 @@ impl OnDemand<'_> {
         self.store_delivery(p, &watching, questions, Some(kept.clone()))
             .map_err(|e| delivery("keeping the delivery in the ticket's ref", &e))?;
         let checks = self.forge.checks(pull_request.number, &commit);
-        if let Err(error) = &checks
-            && error.kind == ErrorKind::HeadMoved
-        {
-            return Err(delivery("reading the checks", error));
-        }
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
         let done = format!(
             "pull request #{} was delivered at {commit} and kept",
@@ -3881,7 +3876,9 @@ impl OnDemand<'_> {
     /// as posted (OWL-218, OWL-236). `done` tells what was done, for the
     /// stop: a refused report stays owed, and the next pass posts it; a
     /// failed ref write leaves it owed too, and the next pass finds it on
-    /// the ticket and posts nothing.
+    /// the ticket and posts nothing. Checks read at a head that moved post
+    /// nothing: the report stays owed until the next read of the pull
+    /// request settles it (OWL-238).
     #[allow(clippy::too_many_arguments)]
     fn post_and_settle(
         &self,
@@ -3893,6 +3890,15 @@ impl OnDemand<'_> {
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Comment, Stop> {
+        if let Err(error) = &checks
+            && head_moved(&checks)
+        {
+            return Err(Stop::Delivery(format!(
+                "{done}, but its head moved before its checks were read: {error}; the report \
+                 stays owed until the next read of the pull request ends the following or \
+                 adopts the push"
+            )));
+        }
         let ticket = p.ticket.clone();
         let comment = self
             .post_owed(&ticket, &kept, &p.questions(), checks, following, sink)
@@ -4080,7 +4086,10 @@ impl OnDemand<'_> {
     /// What settles the report `record` owes, if it owes one (OWL-218): the
     /// delivery to keep once it is posted, or dropped, with a `warning`,
     /// when watch no longer follows the pull request. `None` when nothing
-    /// is owed or the post failed, and the report stays owed.
+    /// is owed or the post failed, and the report stays owed; and when the
+    /// head moved since the pass's read of the pull request, which posts
+    /// nothing: the next read ends the following, adopts the push or reads
+    /// the head back at it (OWL-238).
     fn settle_owed(
         &self,
         ticket: &TicketId,
@@ -4112,6 +4121,9 @@ impl OnDemand<'_> {
         let number = delivery.pull_request.as_ref()?.number;
         let head = CommitId::new(delivery.pushed.as_deref()?).ok()?;
         let checks = self.forge.checks(number, &head);
+        if head_moved(&checks) {
+            return None;
+        }
         self.post_owed(ticket, delivery, &record.questions, checks, following, sink)
             .ok()
             .map(|_| settled)
@@ -4194,6 +4206,14 @@ impl OnDemand<'_> {
         self.store_delivery(p, &state, stored.record.questions, Some(delivery))
             .map_err(|e| refused("keeping the owed report as posted in the ticket's ref", e))
     }
+}
+
+/// Whether `checks` were read at a head that is no longer the pull
+/// request's: a report told with them would speak of a head that is gone.
+fn head_moved(checks: &Result<CheckSet, forge::Error>) -> bool {
+    checks
+        .as_ref()
+        .is_err_and(|error| error.kind == ErrorKind::HeadMoved)
 }
 
 /// `fix`, `rebase` or `correction`, for what the runner tells of a push of

@@ -72,6 +72,16 @@ struct FakeGitHub {
     /// The status the red job's log answers (OWL-112), and how many times
     /// it was read.
     log: Mutex<(u16, u32)>,
+    /// What happens at the next read of a head's checks, once (OWL-238).
+    at_checks: Mutex<Option<AtChecks>>,
+}
+
+/// What happens at the next read of a head's checks.
+enum AtChecks {
+    /// Someone pushes this commit to the branch just before the read.
+    Move(String),
+    /// The read fails as a network that is down.
+    Fail,
 }
 
 /// The red job's log, as GitHub Actions writes it: timestamps, an ANSI
@@ -184,6 +194,13 @@ impl FakeGitHub {
                 "atPush": { "oid": base, "statusCheckRollup": rollup },
             } })
         } else if query.starts_with("query Checks") {
+            let moved = self.at_checks.lock().unwrap().take();
+            if let Some(AtChecks::Move(commit)) = moved {
+                let branch = format!("refs/heads/{BRANCH}");
+                self.env
+                    .run(&self.bare, &["update-ref", &branch, &commit])
+                    .unwrap();
+            }
             let head = self.tip();
             let conclusion = self.followed.lock().unwrap().conclusion;
             json!({ "repository": { "pullRequest": {
@@ -212,6 +229,14 @@ struct Shared(Arc<FakeGitHub>);
 
 impl Transport for Shared {
     fn send(&self, request: &Value) -> Result<Response, String> {
+        let query = request["query"].as_str().unwrap_or_default();
+        if query.starts_with("query Checks") {
+            let mut at_checks = self.0.at_checks.lock().unwrap();
+            if matches!(*at_checks, Some(AtChecks::Fail)) {
+                *at_checks = None;
+                return Err("the network is down".to_owned());
+            }
+        }
         let data = self.0.answer(request);
         Ok(Response {
             status: 200,
@@ -511,6 +536,7 @@ impl Bench {
             followed: Mutex::default(),
             follow_reads: Mutex::new(0),
             log: Mutex::new((200, 0)),
+            at_checks: Mutex::new(None),
         });
         Self {
             data: tmp.path().join("data"),
@@ -5442,6 +5468,128 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
     let delivery = bench.record().delivery.unwrap();
     assert_eq!(delivery.pushed.as_deref(), Some(fix.as_str()));
     assert!(delivery.owed.is_none() && delivery.pushing.is_none());
+}
+
+/// A delivered ticket whose fix run's DELIVERY report the tracker refused:
+/// the ref owes it, the tracker still refuses DELIVERY reports, and the
+/// pull request reads green at the fix.
+fn owing_a_fix_report() -> Bench {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    bench.refuse.set(Some("[owlshift] DELIVERY"));
+    let (refused, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello again"), Some(FIXED))]);
+    assert!(
+        matches!(&refused, Err(Stop::Delivery(_))),
+        "{refused:?}\n{printed}"
+    );
+    assert!(bench.record().delivery.unwrap().owed.is_some());
+    assert_eq!(reports(&bench).len(), 1);
+    bench.github.followed.lock().unwrap().conclusion = "SUCCESS";
+    bench
+}
+
+/// OWL-238's acceptance: the head moves between watch's read of the pull
+/// request and its read of the checks for the owed report. The report is
+/// not posted and stays owed; a head back at the push leaves the refusal
+/// warned of once; the read that ends the following drops it, unposted.
+#[test]
+fn an_owed_report_waits_while_its_head_moved_until_the_following_ends() {
+    let bench = owing_a_fix_report();
+    let watched = bench.events().len();
+    let github = bench.github.clone();
+    let (env, bare) = (bench.env.clone(), bench.remote.bare.clone());
+    let branch = format!("refs/heads/{BRANCH}");
+    let pushed = bench.remote_branch().unwrap();
+    let main = bench.remote_main();
+    let held = |bench: &Bench| {
+        assert!(github.at_checks.lock().unwrap().is_none());
+        assert_eq!(bench.remote_branch().unwrap(), main);
+        let delivery = bench.record().delivery.unwrap();
+        assert!(delivery.owed.is_some() && delivery.ended.is_none());
+        assert_eq!(reports(bench).len(), 1);
+    };
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            // Refused, warned of at pass 1 only; the tracker now takes the
+            // report, and someone pushes before its checks are read.
+            1 | 3 => {
+                bench.refuse.set(None);
+                *github.at_checks.lock().unwrap() = Some(AtChecks::Move(main.clone()));
+            }
+            // Held at the moved head; then the head is back at the push,
+            // and the tracker refuses again.
+            2 => {
+                held(&bench);
+                env.run(&bare, &["update-ref", &branch, &pushed]).unwrap();
+                bench.refuse.set(Some("[owlshift] DELIVERY"));
+            }
+            4 => held(&bench),
+            _ => {}
+        }
+        pass < 5
+    });
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(reports(&bench).len(), 1);
+    let delivery = bench.record().delivery.unwrap();
+    assert!(delivery.owed.is_none());
+    assert_eq!(
+        delivery.ended.unwrap().why,
+        owlshift_contracts::refs::EndedWhy::HeadMoved
+    );
+    let warned = data_of(&bench.events()[watched..], EventKind::Warning, "what");
+    let named = |what: &str| warned.iter().filter(|w| w["what"] == what).count();
+    assert_eq!(
+        (named("fix_report_unposted"), named("fix_report_dropped")),
+        (1, 1),
+        "{warned:?}"
+    );
+}
+
+/// OWL-238: the head moves between a fix push and the read of its checks
+/// for the report: nothing is posted, and the ref keeps the push counted
+/// and its report owed, for the next read of the pull request to settle.
+#[test]
+fn a_fix_report_waits_while_its_head_moved_after_the_push() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    *bench.github.at_checks.lock().unwrap() = Some(AtChecks::Move(bench.remote_main()));
+    let (outcome, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello again"), Some(FIXED))]);
+    assert!(
+        matches!(&outcome, Err(Stop::Delivery(why))
+            if why.contains("its head moved before its checks were read")),
+        "{outcome:?}\n{printed}"
+    );
+    assert!(bench.github.at_checks.lock().unwrap().is_none());
+    assert_eq!(reports(&bench).len(), 1);
+    let delivery = bench.record().delivery.unwrap();
+    let owed = delivery.owed.unwrap();
+    assert_eq!(owed.kind, owlshift_contracts::refs::PushKind::Fix);
+    assert!(delivery.pushing.is_none());
+    assert_eq!(state_of(&bench).fix_passes(), 1);
+}
+
+/// OWL-238: a read of the checks that fails for another reason than a
+/// moved head still posts the owed report, which says so.
+#[test]
+fn an_owed_report_whose_checks_cannot_be_read_is_posted() {
+    let bench = owing_a_fix_report();
+    bench.refuse.set(None);
+    *bench.github.at_checks.lock().unwrap() = Some(AtChecks::Fail);
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    let reports = reports(&bench);
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    assert!(reports[1].contains(FIX_PASS_1), "{}", reports[1]);
+    assert!(
+        reports[1].contains("**Checks:** could not be read"),
+        "{}",
+        reports[1]
+    );
+    assert!(bench.record().delivery.unwrap().owed.is_none());
 }
 
 /// A Build `done` proposing a follow-up.
