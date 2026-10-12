@@ -33,10 +33,10 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 3
+      "const": 4
     },
     "owed": {
-      "description": "The DELIVERY report of `pushed`, a fix, rebase or correction run's\npush that landed, while it is not on the ticket yet (OWL-218): the\nnext pass posts it, once. Since format 2.",
+      "description": "The DELIVERY report of `pushed`, a fix, rebase or correction run's\npush that landed, while it is not on the ticket yet (OWL-218): the\nnext pass posts it, once. Since format 2; since format 4 also the\nfirst delivery's report, and a correction's that pushed nothing\n(OWL-236).",
       "anyOf": [
         {
           "$ref": "#/$defs/OwedReport"
@@ -90,6 +90,28 @@
     "base_branch"
   ],
   "$defs": {
+    "Decision": {
+      "description": "A decision the role took on its own.",
+      "type": "object",
+      "properties": {
+        "basis": {
+          "description": "What the decision rests on: the ticket, the code, the docs, a fact.",
+          "type": "string"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question",
+        "decision",
+        "basis"
+      ]
+    },
     "DeliveredPullRequest": {
       "description": "A delivered pull request.",
       "type": "object",
@@ -202,7 +224,7 @@
       ]
     },
     "KeptReport": {
-      "description": "What a fix, rebase or correction run gave its DELIVERY report (OWL-218,\nOWL-146).",
+      "description": "What a fix, rebase or correction run gave its DELIVERY report (OWL-218,\nOWL-146), or the delivering Build run (OWL-236).",
       "type": "object",
       "properties": {
         "checks": {
@@ -229,6 +251,13 @@
             "type": "string"
           }
         },
+        "notes": {
+          "description": "For the first delivery, the runner's own notes the report lists after\nthe resolver's decisions, which `questions.json` keeps: the late\ncomments a Build run was given (OWL-139). Never a resolver's decision.\nA newer report that replaces this one unposted lists none of them\n(format 4, OWL-236).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Decision"
+          }
+        },
         "questions": {
           "description": "For a correction run, the questions of the decisions the decider's\nreplies reversed (format 3, OWL-146).",
           "type": "array",
@@ -247,17 +276,17 @@
       ]
     },
     "OwedReport": {
-      "description": "A DELIVERY report still to be posted for the delivery's `pushed`\ncommit, a fix, rebase or correction run's push (OWL-218, OWL-146). The\ncommit, and for a rebase the base it rebased onto, are the delivery's\n`pushed` and `rebased_onto`.",
+      "description": "A DELIVERY report still to be posted for the delivery's `pushed`\ncommit: a fix, rebase or correction run's push (OWL-218, OWL-146), the\nfirst delivery, or a correction that pushed nothing (OWL-236). The\ncommit, and for a rebase the base it rebased onto, are the delivery's\n`pushed` and `rebased_onto`.",
       "type": "object",
       "properties": {
         "count": {
-          "description": "The fix pass or the repair the push was, from 1; for a correction,\nhow many decisions it follows the replies to.",
+          "description": "The fix pass or the repair the push was, from 1; for a correction,\nhow many decisions it follows the replies to; 1 for the first\ndelivery.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         },
         "kind": {
-          "description": "`fix`, `rebase` or `correction`.",
+          "description": "`delivery`, `fix`, `rebase` or `correction`.",
           "$ref": "#/$defs/PushKind"
         },
         "report": {
@@ -270,6 +299,10 @@
               "type": "null"
             }
           ]
+        },
+        "unchanged": {
+          "description": "A correction's report whose run found the pull request already\nfollowing the replies, and pushed nothing (format 4, OWL-236).",
+          "type": "boolean"
         }
       },
       "additionalProperties": false,

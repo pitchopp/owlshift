@@ -162,8 +162,9 @@ impl OnDemand<'_> {
             sink,
         )?;
         if done.repaired.commit == pushed_id {
-            return self
-                .already_follows(p, &delivery, &pushed_id, done, followups, &reversed, sink);
+            return self.already_follows(
+                p, &delivery, &pushed_id, done, followups, &reversed, following, sink,
+            );
         }
         self.push_correction(
             p,
@@ -215,7 +216,11 @@ impl OnDemand<'_> {
 
     /// A correction run that changed nothing: `Corrected`, the replies kept
     /// as followed, and a DELIVERY report saying so, since the decider
-    /// otherwise sees nothing come of their reply.
+    /// otherwise sees nothing come of their reply. The report is owed from
+    /// the write that keeps the replies as followed (OWL-236), so a refusal
+    /// or a crash leaves it for the next pass. It is posted only while the
+    /// pull request is still open at `pushed`; otherwise it stays owed, and
+    /// the next read that ends the following drops it.
     #[allow(clippy::too_many_arguments)]
     fn already_follows(
         &self,
@@ -225,6 +230,7 @@ impl OnDemand<'_> {
         done: RepairDone,
         followups: Vec<Followup>,
         reversed: &[Reversed<'_>],
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
@@ -232,11 +238,33 @@ impl OnDemand<'_> {
             Ok(Transition::To(next)) => next,
             other => return Err(core_error(other)),
         };
+        let corrected = question_texts(&p.questions(), reversed);
         let mut questions = p.questions();
         reversal::followed(&mut questions, reversed);
-        self.store(p, &state, questions)
+        let mut kept = p
+            .stored
+            .as_ref()
+            .and_then(|stored| stored.record.delivery.clone())
+            .unwrap_or_else(|| delivery.clone());
+        let owed = OwedReport {
+            kind: PushKind::Correction,
+            // Never 0: a correction runs for one reversed decision at least.
+            count: reversed.len() as u32,
+            report: Some(done.repaired.kept(
+                &RepairKind::Correction {
+                    questions: corrected,
+                },
+                &followups,
+            )),
+            unchanged: true,
+        };
+        if let Some(replaced) = kept.owed.replace(owed) {
+            self.replaced(&ticket, &replaced, &kept, sink);
+        }
+        self.store_delivery(p, &state, questions, Some(kept.clone()))
             .map_err(|e| refused("keeping the replies the correction followed", e))?;
         self.corrected_event(p, "unchanged", reversed, sink);
+        let what = "the correction run found the pull request already following the replies";
         let head = Branch::new(&delivery.branch).map_err(|e| refused("the ticket's branch", e))?;
         let base = Branch::new(&delivery.base_branch).map_err(|e| refused("the base branch", e))?;
         let pull_request = self
@@ -244,55 +272,23 @@ impl OnDemand<'_> {
             .find_open_pull_request(&head, &base)
             .map_err(|e| e.to_string())
             .and_then(|open| open.ok_or_else(|| "the pull request is no longer open".to_owned()))
+            .and_then(|open| {
+                if open.head == *pushed {
+                    Ok(open)
+                } else {
+                    Err(format!("its head is now {}, not {pushed}", open.head))
+                }
+            })
             .map_err(|reason| {
                 Stop::Delivery(format!(
-                    "the correction run found the pull request already following the replies, \
-                     but it could not be read for the report: {reason}"
+                    "{what}, but it could not be read at Owlshift's push for the report: \
+                     {reason}; the report stays owed while watch follows the pull request"
                 ))
             })?;
         let checks = self.forge.checks(pull_request.number, pushed);
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
-        let corrected = question_texts(&p.questions(), reversed);
-        let report = DeliveryReport {
-            ticket: ticket.clone(),
-            summary: done.repaired.summary,
-            pull_request: pull_request.clone(),
-            checks,
-            gate: done.repaired.gate,
-            decisions: p
-                .questions()
-                .decisions
-                .iter()
-                .map(|kept| resolver::reported_reversing(kept, &corrected))
-                .collect(),
-            followups,
-            fix_pass: None,
-            rebase: None,
-            correction: Some(Corrected {
-                questions: corrected.clone(),
-                pushed: false,
-            }),
-        };
-        let comment = Writer::new(self.tracker)
-            .post_delivery_report(&report)
-            .map_err(|e| {
-                Stop::Delivery(format!(
-                    "the correction run found the pull request already following the replies, \
-                     but its report could not be posted: {e}"
-                ))
-            })?;
-        sink.emit(
-            &ticket,
-            None,
-            EventKind::TrackerWrite,
-            data([
-                ("target", json!("tracker")),
-                ("action", json!("comment")),
-                ("kind", json!("DELIVERY")),
-                ("comment", json!(comment.id)),
-                ("corrected", json!(reversed.len())),
-            ]),
-        );
+        let done = format!("{what}, which were kept as followed");
+        let comment = self.post_and_settle(p, &state, kept, checks, &done, following, sink)?;
         Ok(Delivered {
             pull_request,
             opened: false,

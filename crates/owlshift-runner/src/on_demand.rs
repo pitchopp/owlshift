@@ -2701,8 +2701,26 @@ impl OnDemand<'_> {
         kept.pushed = Some(commit.to_string());
         kept.base_at_push = Some(base_at_push);
         kept.pushing = None;
+        // The report is owed from the write that keeps Watch, so a tracker
+        // that refuses it, or a crash, leaves it for the next pass (OWL-236).
+        // It lists the resolver's decisions kept on the ticket, an earlier
+        // command's included, then the runner's own note of late comments
+        // this one gave a run: Build takes no decision of its own (OWL-176).
+        kept.owed = Some(OwedReport {
+            kind: PushKind::Delivery,
+            count: 1,
+            report: Some(KeptReport {
+                summary: result.summary.clone(),
+                gate: Some(gate.commands.clone()),
+                checks: Vec::new(),
+                questions: Vec::new(),
+                notes: gathered.decisions,
+                followups: gathered.followups,
+            }),
+            unchanged: false,
+        });
         let questions = p.questions();
-        self.store_delivery(p, &watching, questions, Some(kept))
+        self.store_delivery(p, &watching, questions, Some(kept.clone()))
             .map_err(|e| delivery("keeping the delivery in the ticket's ref", &e))?;
         let checks = self.forge.checks(pull_request.number, &commit);
         if let Err(error) = &checks
@@ -2711,42 +2729,15 @@ impl OnDemand<'_> {
             return Err(delivery("reading the checks", error));
         }
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
-        // The resolver's decisions kept on the ticket, an earlier command's
-        // included, then the runner's own note of late comments this one
-        // gave a run: Build takes no decision of its own (OWL-176).
-        let mut decisions: Vec<Decision> = p
-            .questions()
-            .decisions
-            .iter()
-            .map(resolver::reported)
-            .collect();
-        gather(&mut decisions, &gathered.decisions);
-        let delivery_report = DeliveryReport {
-            ticket: ticket.clone(),
-            summary: result.summary.clone(),
-            pull_request: pull_request.clone(),
-            checks,
-            gate: Gate::Passed(gate.commands.clone()),
-            decisions,
-            followups: gathered.followups,
-            fix_pass: None,
-            rebase: None,
-            correction: None,
-        };
-        let comment = writer
-            .post_delivery_report(&delivery_report)
-            .map_err(|e| delivery("posting the delivery report", &e))?;
-        sink.emit(
-            ticket,
-            None,
-            EventKind::TrackerWrite,
-            data([
-                ("target", json!("tracker")),
-                ("action", json!("comment")),
-                ("kind", json!("DELIVERY")),
-                ("comment", json!(comment.id)),
-            ]),
+        let done = format!(
+            "pull request #{} was delivered at {commit} and kept",
+            pull_request.number
         );
+        // `do` and `continue` keep no memory of watch's: the first refusal
+        // is warned of here, and again at watch's first refused pass.
+        let mut following = Following::default();
+        let comment =
+            self.post_and_settle(p, &watching, kept, checks, &done, &mut following, sink)?;
         Ok(Delivered {
             pull_request,
             opened: opened.opened,
@@ -2892,6 +2883,7 @@ impl Repaired {
                 RepairKind::Correction { questions } => questions.clone(),
                 RepairKind::Fix { .. } | RepairKind::Rebase { .. } => Vec::new(),
             },
+            notes: Vec::new(),
             followups: followups.to_vec(),
         }
     }
@@ -3874,25 +3866,8 @@ impl OnDemand<'_> {
             .map_err(|e| Stop::Delivery(format!("keeping the {what} in the ticket's ref: {e}")))?;
         let checks_read = self.forge.checks(pull_request.number, &commit);
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
-        let comment = self
-            .post_owed(&ticket, &kept, &p.questions(), checks_read, following, sink)
-            .map_err(|error| {
-                Stop::Delivery(format!(
-                    "the {what} {commit} was pushed and kept, but its delivery report could not \
-                     be posted: {error}; the next pass posts it while watch follows the pull \
-                     request"
-                ))
-            })?;
-        kept.owed = None;
-        let questions = p.questions();
-        self.store_delivery(p, &state, questions, Some(kept))
-            .map_err(|e| {
-                Stop::Delivery(format!(
-                    "the {what} {commit} was pushed and reported, but keeping its report as \
-                     posted in the ticket's ref failed: {e}; the next pass finds it on the \
-                     ticket and posts nothing"
-                ))
-            })?;
+        let done = format!("the {what} {commit} was pushed and kept");
+        let comment = self.post_and_settle(p, &state, kept, checks_read, &done, following, sink)?;
         Ok(Delivered {
             pull_request,
             opened: false,
@@ -3901,14 +3876,55 @@ impl OnDemand<'_> {
         })
     }
 
-    /// Posts the DELIVERY report `delivery` owes (OWL-218), once
+    /// Posts the DELIVERY report `kept` owes, the delivery the ticket ref
+    /// keeps with `state`, with `checks` ([`Self::post_owed`]), then keeps it
+    /// as posted (OWL-218, OWL-236). `done` tells what was done, for the
+    /// stop: a refused report stays owed, and the next pass posts it; a
+    /// failed ref write leaves it owed too, and the next pass finds it on
+    /// the ticket and posts nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn post_and_settle(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        mut kept: TicketDelivery,
+        checks: Result<CheckSet, forge::Error>,
+        done: &str,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Comment, Stop> {
+        let ticket = p.ticket.clone();
+        let comment = self
+            .post_owed(&ticket, &kept, &p.questions(), checks, following, sink)
+            .map_err(|error| {
+                Stop::Delivery(format!(
+                    "{done}, but its delivery report could not be posted: {error}; the next \
+                     pass posts it while watch follows the pull request"
+                ))
+            })?;
+        kept.owed = None;
+        let questions = p.questions();
+        self.store_delivery(p, state, questions, Some(kept))
+            .map_err(|e| {
+                Stop::Delivery(format!(
+                    "{done}; its delivery report was posted, but keeping it as posted in the \
+                     ticket's ref failed: {e}; the next pass finds it on the ticket and posts \
+                     nothing"
+                ))
+            })?;
+        Ok(comment)
+    }
+
+    /// Posts the DELIVERY report `delivery` owes (OWL-218, OWL-236), once
     /// ([`Writer::post_repair_report`]), with `checks`, its head's check
     /// set as read now, and records the comment; a refusal is a `warning`,
     /// and the report stays owed, warned of when it is the first refusal, or
     /// its reason differs from the last one warned of in `following`
     /// (OWL-232). The report says what the run kept for it,
     /// or, for a push adopted from a ref that kept nothing, that its summary
-    /// was not kept.
+    /// was not kept. Every DELIVERY report is posted here, the first
+    /// delivery's and a correction's that pushed nothing included (OWL-236),
+    /// so a post retried renders as the first try did.
     fn post_owed(
         &self,
         ticket: &TicketId,
@@ -3932,6 +3948,9 @@ impl OnDemand<'_> {
             )
         });
         let (fix_pass, rebase, correction, counted) = match owed.kind {
+            // The first delivery's report has no lead line, and counts
+            // nothing (OWL-236).
+            PushKind::Delivery => (None, None, None, None),
             PushKind::Correction => {
                 let corrected = Corrected {
                     questions: owed
@@ -3939,9 +3958,9 @@ impl OnDemand<'_> {
                         .as_ref()
                         .map(|kept| kept.questions.clone())
                         .unwrap_or_default(),
-                    pushed: true,
+                    pushed: !owed.unchanged,
                 };
-                (None, None, Some(corrected), "corrected")
+                (None, None, Some(corrected), Some("corrected"))
             }
             PushKind::Rebase => {
                 let onto = delivery
@@ -3956,9 +3975,9 @@ impl OnDemand<'_> {
                     onto,
                     repair: owed.count,
                 };
-                (None, Some(rebased), None, "repair")
+                (None, Some(rebased), None, Some("repair"))
             }
-            PushKind::Fix | PushKind::Delivery => {
+            PushKind::Fix => {
                 let pass = FixPass {
                     pass: owed.count,
                     checks: owed
@@ -3967,9 +3986,22 @@ impl OnDemand<'_> {
                         .map(|kept| kept.checks.clone())
                         .unwrap_or_default(),
                 };
-                (Some(pass), None, None, "fix_pass")
+                (Some(pass), None, None, Some("fix_pass"))
             }
         };
+        // The resolver's decisions kept on the ticket, then the runner's own
+        // notes the first delivery kept (OWL-176, OWL-236).
+        let mut decisions: Vec<Decision> = questions
+            .decisions
+            .iter()
+            .map(|kept| {
+                let corrected = correction.as_ref().map_or(&[][..], |c| &c.questions[..]);
+                resolver::reported_reversing(kept, corrected)
+            })
+            .collect();
+        if let Some(kept) = &owed.report {
+            gather(&mut decisions, &kept.notes);
+        }
         let report = DeliveryReport {
             ticket: ticket.clone(),
             summary,
@@ -3981,14 +4013,7 @@ impl OnDemand<'_> {
             },
             checks,
             gate,
-            decisions: questions
-                .decisions
-                .iter()
-                .map(|kept| {
-                    let corrected = correction.as_ref().map_or(&[][..], |c| &c.questions[..]);
-                    resolver::reported_reversing(kept, corrected)
-                })
-                .collect(),
+            decisions,
             followups,
             fix_pass,
             rebase,
@@ -3996,18 +4021,16 @@ impl OnDemand<'_> {
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
             Ok(comment) => {
-                sink.emit(
-                    ticket,
-                    None,
-                    EventKind::TrackerWrite,
-                    data([
-                        ("target", json!("tracker")),
-                        ("action", json!("comment")),
-                        ("kind", json!("DELIVERY")),
-                        ("comment", json!(comment.id)),
-                        (counted, json!(owed.count)),
-                    ]),
-                );
+                let mut written = data([
+                    ("target", json!("tracker")),
+                    ("action", json!("comment")),
+                    ("kind", json!("DELIVERY")),
+                    ("comment", json!(comment.id)),
+                ]);
+                if let Some(counted) = counted {
+                    written.insert(counted.to_owned(), json!(owed.count));
+                }
+                sink.emit(ticket, None, EventKind::TrackerWrite, written);
                 following.report_settled(ticket);
                 Ok(comment)
             }
