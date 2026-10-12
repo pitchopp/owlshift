@@ -1,5 +1,5 @@
 {
-  "recorded": "made up, pending live recording: GitHub GraphQL answered HTTP 403 \"GitHub GraphQL is not available from Claude Code sessions\" to OWL-209's cloud session on 2026-10-11; shaped by GitHub's schema. github_live.rs records_watch_reads records it on a disposable repository",
+  "recorded": "2026-10-12 on pitchopp/owlshift-live-sandbox, recorded live",
   "exchanges": [
     {
       "request": {
@@ -7,8 +7,8 @@
         "variables": {
           "after": null,
           "first": 100,
-          "name": "owlshift",
-          "number": 42,
+          "name": "owlshift-live-sandbox",
+          "number": 1,
           "owner": "pitchopp"
         }
       },
@@ -17,95 +17,81 @@
         "data": {
           "rateLimit": {
             "cost": 1,
-            "remaining": 4990,
-            "resetAt": "2026-10-11T13:00:00Z"
+            "remaining": 4670,
+            "resetAt": "2026-10-12T09:43:17Z"
           },
           "repository": {
             "pullRequest": {
-              "state": "OPEN",
-              "headRefOid": "5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f",
-              "mergeable": "MERGEABLE",
-              "mergeStateStatus": "UNSTABLE",
               "commits": {
                 "nodes": [
                   {
                     "commit": {
-                      "oid": "5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f5e0f",
+                      "oid": "8bd84c1d279faf453f27f50c2d85984e49d005c3",
                       "statusCheckRollup": {
                         "contexts": {
-                          "totalCount": 3,
-                          "pageInfo": {
-                            "hasNextPage": false,
-                            "endCursor": null
-                          },
                           "nodes": [
                             {
                               "__typename": "CheckRun",
-                              "name": "check (ubuntu-latest)",
-                              "status": "COMPLETED",
-                              "conclusion": "FAILURE",
-                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
                               "checkSuite": {
                                 "app": {
                                   "slug": "github-actions"
                                 },
                                 "workflowRun": {
                                   "workflow": {
-                                    "name": "CI"
+                                    "name": "Owlshift live test"
                                   }
                                 }
                               },
-                              "isRequired": false,
-                              "databaseId": 2
-                            },
-                            {
-                              "__typename": "CheckRun",
-                              "name": "check (macos-latest)",
-                              "status": "COMPLETED",
                               "conclusion": "SUCCESS",
-                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
-                              "checkSuite": {
-                                "app": {
-                                  "slug": "github-actions"
-                                },
-                                "workflowRun": {
-                                  "workflow": {
-                                    "name": "CI"
-                                  }
-                                }
-                              },
-                              "isRequired": false
+                              "databaseId": 114739350931,
+                              "detailsUrl": "https://github.com/pitchopp/owlshift-live-sandbox/actions/runs/38227753616/job/114739350931",
+                              "isRequired": false,
+                              "name": "passes",
+                              "status": "COMPLETED"
                             },
                             {
                               "__typename": "CheckRun",
-                              "name": "ci",
-                              "status": "COMPLETED",
-                              "conclusion": "FAILURE",
-                              "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
                               "checkSuite": {
                                 "app": {
                                   "slug": "github-actions"
                                 },
                                 "workflowRun": {
                                   "workflow": {
-                                    "name": "CI"
+                                    "name": "Owlshift live test"
                                   }
                                 }
                               },
-                              "isRequired": false
+                              "conclusion": "FAILURE",
+                              "databaseId": 114739350663,
+                              "detailsUrl": "https://github.com/pitchopp/owlshift-live-sandbox/actions/runs/38227753616/job/114739350663",
+                              "isRequired": false,
+                              "name": "fails",
+                              "status": "COMPLETED"
                             }
-                          ]
+                          ],
+                          "pageInfo": {
+                            "endCursor": "Mg",
+                            "hasNextPage": false
+                          },
+                          "totalCount": 2
                         }
                       }
                     }
                   }
                 ]
-              }
+              },
+              "headRefOid": "8bd84c1d279faf453f27f50c2d85984e49d005c3",
+              "mergeStateStatus": "UNSTABLE",
+              "mergeable": "MERGEABLE",
+              "state": "OPEN"
             }
           }
         }
       },
-      "synthesized": "not recorded: made up in the shape of GitHub's schema (OWL-209)"
+      "rate": {
+        "remaining": 4670,
+        "reset": 1791798197
+      }
     }
   ]
 }

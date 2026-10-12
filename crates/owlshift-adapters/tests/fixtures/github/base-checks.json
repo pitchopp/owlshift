@@ -1,11 +1,11 @@
 {
-  "recorded": "made up, pending live recording: GitHub GraphQL answered HTTP 403 \"GitHub GraphQL is not available from Claude Code sessions\" to OWL-209's cloud session on 2026-10-11; shaped by GitHub's schema. github_live.rs records_watch_reads records it on a disposable repository",
+  "recorded": "2026-10-12 on pitchopp/owlshift, recorded live",
   "exchanges": [
     {
       "request": {
         "query": "query BaseChecks($owner: String!, $name: String!, $head: String!, $atPush: String!, $first: Int!) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { head: object(expression: $head) { ... on Commit { oid statusCheckRollup { contexts(first: $first) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } atPush: object(expression: $atPush) { ... on Commit { oid statusCheckRollup { contexts(first: $first) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } } }",
         "variables": {
-          "atPush": "c0c0867c0c0867c0c0867c0c0867c0c0867c0c08",
+          "atPush": "e0b59e4a1c954925d980c472a77d915b08567fa7",
           "first": 1,
           "head": "refs/heads/main",
           "name": "owlshift",
@@ -17,26 +17,17 @@
         "data": {
           "rateLimit": {
             "cost": 1,
-            "remaining": 4990,
-            "resetAt": "2026-10-11T13:00:00Z"
+            "remaining": 4664,
+            "resetAt": "2026-10-12T09:43:17Z"
           },
           "repository": {
-            "head": {
-              "oid": "ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e",
+            "atPush": {
+              "oid": "e0b59e4a1c954925d980c472a77d915b08567fa7",
               "statusCheckRollup": {
                 "contexts": {
-                  "totalCount": 2,
-                  "pageInfo": {
-                    "hasNextPage": true,
-                    "endCursor": "Y3Vyc29yOjE="
-                  },
                   "nodes": [
                     {
                       "__typename": "CheckRun",
-                      "name": "check (ubuntu-latest)",
-                      "status": "COMPLETED",
-                      "conclusion": "SUCCESS",
-                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
                       "checkSuite": {
                         "app": {
                           "slug": "github-actions"
@@ -46,28 +37,28 @@
                             "name": "CI"
                           }
                         }
-                      }
+                      },
+                      "conclusion": "SUCCESS",
+                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/37806810617/job/113414844225",
+                      "name": "check (ubuntu-latest)",
+                      "status": "COMPLETED"
                     }
-                  ]
+                  ],
+                  "pageInfo": {
+                    "endCursor": "MQ",
+                    "hasNextPage": true
+                  },
+                  "totalCount": 4
                 }
               }
             },
-            "atPush": {
-              "oid": "c0c0867c0c0867c0c0867c0c0867c0c0867c0c08",
+            "head": {
+              "oid": "c2bf7eec82a5b1ba43d3b6f26d77cd8ffc6c411a",
               "statusCheckRollup": {
                 "contexts": {
-                  "totalCount": 1,
-                  "pageInfo": {
-                    "hasNextPage": false,
-                    "endCursor": "Y3Vyc29yOjE="
-                  },
                   "nodes": [
                     {
                       "__typename": "CheckRun",
-                      "name": "check (ubuntu-latest)",
-                      "status": "COMPLETED",
-                      "conclusion": "FAILURE",
-                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
                       "checkSuite": {
                         "app": {
                           "slug": "github-actions"
@@ -77,25 +68,37 @@
                             "name": "CI"
                           }
                         }
-                      }
+                      },
+                      "conclusion": "SUCCESS",
+                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/38225640427/job/114732346051",
+                      "name": "check (ubuntu-latest)",
+                      "status": "COMPLETED"
                     }
-                  ]
+                  ],
+                  "pageInfo": {
+                    "endCursor": "MQ",
+                    "hasNextPage": true
+                  },
+                  "totalCount": 3
                 }
               }
             }
           }
         }
       },
-      "synthesized": "not recorded: made up in the shape of GitHub's schema (OWL-209)"
+      "rate": {
+        "remaining": 4664,
+        "reset": 1791798197
+      }
     },
     {
       "request": {
         "query": "query CommitChecks($owner: String!, $name: String!, $oid: String!, $first: Int!, $after: String) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { object(expression: $oid) { ... on Commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } } }",
         "variables": {
-          "after": "Y3Vyc29yOjE=",
+          "after": "MQ",
           "first": 1,
           "name": "owlshift",
-          "oid": "ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e",
+          "oid": "c2bf7eec82a5b1ba43d3b6f26d77cd8ffc6c411a",
           "owner": "pitchopp"
         }
       },
@@ -104,26 +107,17 @@
         "data": {
           "rateLimit": {
             "cost": 1,
-            "remaining": 4989,
-            "resetAt": "2026-10-11T13:00:00Z"
+            "remaining": 4663,
+            "resetAt": "2026-10-12T09:43:17Z"
           },
           "repository": {
             "object": {
-              "oid": "ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e",
+              "oid": "c2bf7eec82a5b1ba43d3b6f26d77cd8ffc6c411a",
               "statusCheckRollup": {
                 "contexts": {
-                  "totalCount": 2,
-                  "pageInfo": {
-                    "hasNextPage": false,
-                    "endCursor": "Y3Vyc29yOjI="
-                  },
                   "nodes": [
                     {
                       "__typename": "CheckRun",
-                      "name": "ci",
-                      "status": "IN_PROGRESS",
-                      "conclusion": null,
-                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/1/job/2",
                       "checkSuite": {
                         "app": {
                           "slug": "github-actions"
@@ -133,16 +127,264 @@
                             "name": "CI"
                           }
                         }
-                      }
+                      },
+                      "conclusion": "SUCCESS",
+                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/38225640427/job/114732346131",
+                      "name": "check (macos-latest)",
+                      "status": "COMPLETED"
                     }
-                  ]
+                  ],
+                  "pageInfo": {
+                    "endCursor": "Mg",
+                    "hasNextPage": true
+                  },
+                  "totalCount": 3
                 }
               }
             }
           }
         }
       },
-      "synthesized": "not recorded: made up in the shape of GitHub's schema (OWL-209)"
+      "rate": {
+        "remaining": 4663,
+        "reset": 1791798197
+      }
+    },
+    {
+      "request": {
+        "query": "query CommitChecks($owner: String!, $name: String!, $oid: String!, $first: Int!, $after: String) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { object(expression: $oid) { ... on Commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } } }",
+        "variables": {
+          "after": "Mg",
+          "first": 1,
+          "name": "owlshift",
+          "oid": "c2bf7eec82a5b1ba43d3b6f26d77cd8ffc6c411a",
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "rateLimit": {
+            "cost": 1,
+            "remaining": 4662,
+            "resetAt": "2026-10-12T09:43:17Z"
+          },
+          "repository": {
+            "object": {
+              "oid": "c2bf7eec82a5b1ba43d3b6f26d77cd8ffc6c411a",
+              "statusCheckRollup": {
+                "contexts": {
+                  "nodes": [
+                    {
+                      "__typename": "CheckRun",
+                      "checkSuite": {
+                        "app": {
+                          "slug": "github-actions"
+                        },
+                        "workflowRun": {
+                          "workflow": {
+                            "name": "CI"
+                          }
+                        }
+                      },
+                      "conclusion": null,
+                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/38225640427/job/114732345886",
+                      "name": "check (windows-latest)",
+                      "status": "IN_PROGRESS"
+                    }
+                  ],
+                  "pageInfo": {
+                    "endCursor": "Mw",
+                    "hasNextPage": false
+                  },
+                  "totalCount": 3
+                }
+              }
+            }
+          }
+        }
+      },
+      "rate": {
+        "remaining": 4662,
+        "reset": 1791798197
+      }
+    },
+    {
+      "request": {
+        "query": "query CommitChecks($owner: String!, $name: String!, $oid: String!, $first: Int!, $after: String) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { object(expression: $oid) { ... on Commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } } }",
+        "variables": {
+          "after": "MQ",
+          "first": 1,
+          "name": "owlshift",
+          "oid": "e0b59e4a1c954925d980c472a77d915b08567fa7",
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "rateLimit": {
+            "cost": 1,
+            "remaining": 4661,
+            "resetAt": "2026-10-12T09:43:17Z"
+          },
+          "repository": {
+            "object": {
+              "oid": "e0b59e4a1c954925d980c472a77d915b08567fa7",
+              "statusCheckRollup": {
+                "contexts": {
+                  "nodes": [
+                    {
+                      "__typename": "CheckRun",
+                      "checkSuite": {
+                        "app": {
+                          "slug": "github-actions"
+                        },
+                        "workflowRun": {
+                          "workflow": {
+                            "name": "CI"
+                          }
+                        }
+                      },
+                      "conclusion": "FAILURE",
+                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/37806810617/job/113414844249",
+                      "name": "check (macos-latest)",
+                      "status": "COMPLETED"
+                    }
+                  ],
+                  "pageInfo": {
+                    "endCursor": "Mg",
+                    "hasNextPage": true
+                  },
+                  "totalCount": 4
+                }
+              }
+            }
+          }
+        }
+      },
+      "rate": {
+        "remaining": 4661,
+        "reset": 1791798197
+      }
+    },
+    {
+      "request": {
+        "query": "query CommitChecks($owner: String!, $name: String!, $oid: String!, $first: Int!, $after: String) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { object(expression: $oid) { ... on Commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } } }",
+        "variables": {
+          "after": "Mg",
+          "first": 1,
+          "name": "owlshift",
+          "oid": "e0b59e4a1c954925d980c472a77d915b08567fa7",
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "rateLimit": {
+            "cost": 1,
+            "remaining": 4660,
+            "resetAt": "2026-10-12T09:43:17Z"
+          },
+          "repository": {
+            "object": {
+              "oid": "e0b59e4a1c954925d980c472a77d915b08567fa7",
+              "statusCheckRollup": {
+                "contexts": {
+                  "nodes": [
+                    {
+                      "__typename": "CheckRun",
+                      "checkSuite": {
+                        "app": {
+                          "slug": "github-actions"
+                        },
+                        "workflowRun": {
+                          "workflow": {
+                            "name": "CI"
+                          }
+                        }
+                      },
+                      "conclusion": "SUCCESS",
+                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/37806810617/job/113414843652",
+                      "name": "check (windows-latest)",
+                      "status": "COMPLETED"
+                    }
+                  ],
+                  "pageInfo": {
+                    "endCursor": "Mw",
+                    "hasNextPage": true
+                  },
+                  "totalCount": 4
+                }
+              }
+            }
+          }
+        }
+      },
+      "rate": {
+        "remaining": 4660,
+        "reset": 1791798197
+      }
+    },
+    {
+      "request": {
+        "query": "query CommitChecks($owner: String!, $name: String!, $oid: String!, $first: Int!, $after: String) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { object(expression: $oid) { ... on Commit { oid statusCheckRollup { contexts(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { app { slug } workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } } }",
+        "variables": {
+          "after": "Mw",
+          "first": 1,
+          "name": "owlshift",
+          "oid": "e0b59e4a1c954925d980c472a77d915b08567fa7",
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "rateLimit": {
+            "cost": 1,
+            "remaining": 4659,
+            "resetAt": "2026-10-12T09:43:17Z"
+          },
+          "repository": {
+            "object": {
+              "oid": "e0b59e4a1c954925d980c472a77d915b08567fa7",
+              "statusCheckRollup": {
+                "contexts": {
+                  "nodes": [
+                    {
+                      "__typename": "CheckRun",
+                      "checkSuite": {
+                        "app": {
+                          "slug": "github-actions"
+                        },
+                        "workflowRun": {
+                          "workflow": {
+                            "name": "CI"
+                          }
+                        }
+                      },
+                      "conclusion": "FAILURE",
+                      "detailsUrl": "https://github.com/pitchopp/owlshift/actions/runs/37806810617/job/113423949389",
+                      "name": "ci",
+                      "status": "COMPLETED"
+                    }
+                  ],
+                  "pageInfo": {
+                    "endCursor": "NA",
+                    "hasNextPage": false
+                  },
+                  "totalCount": 4
+                }
+              }
+            }
+          }
+        }
+      },
+      "rate": {
+        "remaining": 4659,
+        "reset": 1791798197
+      }
     }
   ]
 }
