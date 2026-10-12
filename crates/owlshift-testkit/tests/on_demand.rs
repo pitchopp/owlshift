@@ -5502,8 +5502,12 @@ fn an_owed_report_waits_while_its_head_moved_until_the_following_ends() {
     let branch = format!("refs/heads/{BRANCH}");
     let pushed = bench.remote_branch().unwrap();
     let main = bench.remote_main();
+    let briefs = bench.briefs().len();
+    // The pass ends at the hold: the read's red starts no repair, whose
+    // stop would be an outcome, and no fix run.
     let held = |bench: &Bench| {
         assert!(github.at_checks.lock().unwrap().is_none());
+        assert_eq!(bench.briefs().len(), briefs);
         assert_eq!(bench.remote_branch().unwrap(), main);
         let delivery = bench.record().delivery.unwrap();
         assert!(delivery.owed.is_some() && delivery.ended.is_none());
@@ -5514,16 +5518,19 @@ fn an_owed_report_waits_while_its_head_moved_until_the_following_ends() {
         pass += 1;
         match pass {
             // Refused, warned of at pass 1 only; the tracker now takes the
-            // report, and someone pushes before its checks are read.
+            // report, the pull request reads red, and someone pushes before
+            // the report's checks are read.
             1 | 3 => {
                 bench.refuse.set(None);
+                github.followed.lock().unwrap().conclusion = "FAILURE";
                 *github.at_checks.lock().unwrap() = Some(AtChecks::Move(main.clone()));
             }
             // Held at the moved head; then the head is back at the push,
-            // and the tracker refuses again.
+            // green, and the tracker refuses again.
             2 => {
                 held(&bench);
                 env.run(&bare, &["update-ref", &branch, &pushed]).unwrap();
+                github.followed.lock().unwrap().conclusion = "SUCCESS";
                 bench.refuse.set(Some("[owlshift] DELIVERY"));
             }
             4 => held(&bench),

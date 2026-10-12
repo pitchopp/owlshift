@@ -4086,19 +4086,24 @@ impl OnDemand<'_> {
     /// What settles the report `record` owes, if it owes one (OWL-218): the
     /// delivery to keep once it is posted, or dropped, with a `warning`,
     /// when watch no longer follows the pull request. `None` when nothing
-    /// is owed or the post failed, and the report stays owed; and when the
-    /// head moved since the pass's read of the pull request, which posts
-    /// nothing: the next read ends the following, adopts the push or reads
-    /// the head back at it (OWL-238).
+    /// is owed or the post failed, and the report stays owed. The checks'
+    /// error when the head moved since the pass's read of the pull request:
+    /// nothing is posted, the report stays owed, and the pass ends there, so
+    /// the next read ends the following, adopts the push or reads the head
+    /// back at it before any repair (OWL-238).
     fn settle_owed(
         &self,
         ticket: &TicketId,
         record: &TicketRecord,
         following: &mut Following,
         sink: &mut EventSink<'_>,
-    ) -> Option<TicketDelivery> {
-        let delivery = record.delivery.as_ref()?;
-        let owed = delivery.owed.as_ref()?;
+    ) -> Result<Option<TicketDelivery>, forge::Error> {
+        let Some(delivery) = record.delivery.as_ref() else {
+            return Ok(None);
+        };
+        let Some(owed) = delivery.owed.as_ref() else {
+            return Ok(None);
+        };
         let mut settled = delivery.clone();
         settled.owed = None;
         if let Some(ended) = &delivery.ended {
@@ -4116,25 +4121,35 @@ impl OnDemand<'_> {
                     ("ended", json!(ended.why)),
                 ]),
             );
-            return Some(settled);
+            return Ok(Some(settled));
         }
-        let number = delivery.pull_request.as_ref()?.number;
-        let head = CommitId::new(delivery.pushed.as_deref()?).ok()?;
-        let checks = self.forge.checks(number, &head);
-        if head_moved(&checks) {
-            return None;
+        let (Some(pr), Some(Ok(head))) = (
+            delivery.pull_request.as_ref(),
+            delivery.pushed.as_deref().map(CommitId::new),
+        ) else {
+            return Ok(None);
+        };
+        let checks = self.forge.checks(pr.number, &head);
+        if head_moved(&checks)
+            && let Err(error) = checks
+        {
+            return Err(error);
         }
-        self.post_owed(ticket, delivery, &record.questions, checks, following, sink)
+        Ok(self
+            .post_owed(ticket, delivery, &record.questions, checks, following, sink)
             .ok()
-            .map(|_| settled)
+            .map(|_| settled))
     }
 
     /// For `owlshift watch`, once a look at a followed pull request is kept
     /// at `commit`, the ticket ref's commit: posts the DELIVERY report the
     /// ref owes, under the project's lock and only while the ref is still
     /// `commit`, then keeps it as posted (OWL-218). Returns the ref's commit
-    /// after it. Nothing is locked or read unless `stored`, the ref the
-    /// look started from, owes a report or `seen` adopted a push.
+    /// after it, or `None` when the head moved since the look: the report
+    /// stays owed and the pass ends, with no repair or correction on a read
+    /// that is no longer the pull request's (OWL-238). Nothing is locked or
+    /// read unless `stored`, the ref the look started from, owes a report or
+    /// `seen` adopted a push.
     pub fn post_owed_report(
         &self,
         ticket: &TicketId,
@@ -4143,53 +4158,59 @@ impl OnDemand<'_> {
         commit: String,
         following: &mut Following,
         sink: &mut EventSink<'_>,
-    ) -> String {
+    ) -> Option<String> {
         let owes = stored
             .record
             .delivery
             .as_ref()
             .is_some_and(|delivery| delivery.owed.is_some());
         if !owes && !matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
-            return commit;
+            return Some(commit);
         }
         let Ok(Some(_lock)) = self.dirs.lock() else {
-            return commit;
+            return Some(commit);
         };
         if !matches!(self.dirs.unverified(), Ok(None)) {
-            return commit;
+            return Some(commit);
         }
         let git = &self.executor.git;
         let checkout = self.dirs.checkout();
         let current = match ticket_ref::read(git, &checkout, ticket) {
             Ok(Some(current)) if current.commit == commit => current,
-            _ => return commit,
+            _ => return Some(commit),
         };
-        let Some(delivery) = self.settle_owed(ticket, &current.record, following, sink) else {
-            return commit;
+        let delivery = match self.settle_owed(ticket, &current.record, following, sink) {
+            Ok(Some(delivery)) => delivery,
+            Ok(None) => return Some(commit),
+            Err(_) => return None,
         };
         let record = TicketRecord {
             delivery: Some(delivery),
             ..current.record
         };
-        match ticket_ref::write(git, &checkout, ticket, &record, Some(&commit)) {
-            Ok(written) => written,
-            Err(reason) => {
-                sink.emit(
-                    ticket,
-                    None,
-                    EventKind::Warning,
-                    data([
-                        ("what", json!("owed_report_unkept")),
-                        ("reason", json!(reason)),
-                    ]),
-                );
-                commit
-            }
-        }
+        Some(
+            match ticket_ref::write(git, &checkout, ticket, &record, Some(&commit)) {
+                Ok(written) => written,
+                Err(reason) => {
+                    sink.emit(
+                        ticket,
+                        None,
+                        EventKind::Warning,
+                        data([
+                            ("what", json!("owed_report_unkept")),
+                            ("reason", json!(reason)),
+                        ]),
+                    );
+                    commit
+                }
+            },
+        )
     }
 
     /// For `owlshift continue` at Watch, under its lock: posts the DELIVERY
-    /// report the ticket ref owes and keeps it as posted (OWL-218).
+    /// report the ticket ref owes and keeps it as posted (OWL-218). A head
+    /// that moved since the command's read of the pull request stops it
+    /// with the report owed, before any repair or correction (OWL-238).
     fn settle_owed_report(
         &self,
         p: &mut Prepared,
@@ -4199,8 +4220,16 @@ impl OnDemand<'_> {
         let Some(stored) = p.stored.clone() else {
             return Ok(());
         };
-        let Some(delivery) = self.settle_owed(&p.ticket, &stored.record, following, sink) else {
-            return Ok(());
+        let delivery = match self.settle_owed(&p.ticket, &stored.record, following, sink) {
+            Ok(Some(delivery)) => delivery,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                return Err(Stop::Delivery(format!(
+                    "the pull request's head moved before the owed report's checks were read: \
+                     {error}; the report stays owed until the next read of the pull request ends \
+                     the following or adopts the push"
+                )));
+            }
         };
         let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
         self.store_delivery(p, &state, stored.record.questions, Some(delivery))
