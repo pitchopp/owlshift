@@ -258,11 +258,13 @@ impl OnDemand<'_> {
             )),
             unchanged: true,
         };
-        if let Some(replaced) = kept.owed.replace(owed) {
-            self.replaced(&ticket, &replaced, &kept, sink);
-        }
+        let replaced = kept.owed.replace(owed);
         self.store_delivery(p, &state, questions, Some(kept.clone()))
             .map_err(|e| refused("keeping the replies the correction followed", e))?;
+        // Told once the ref keeps it (OWL-239).
+        if let Some(replaced) = &replaced {
+            self.replaced(&ticket, replaced, kept.pushed.as_deref(), sink);
+        }
         self.corrected_event(p, "unchanged", reversed, sink);
         let what = "the correction run found the pull request already following the replies";
         let head = Branch::new(&delivery.branch).map_err(|e| refused("the ticket's branch", e))?;
