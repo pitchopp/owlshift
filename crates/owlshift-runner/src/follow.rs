@@ -565,6 +565,7 @@ pub fn landed_owing(
         kind: pushing.kind,
         count: count.max(1),
         report: pushing.report.clone(),
+        unchanged: false,
     };
     landed(delivery, pushing);
     delivery.owed.replace(owed)
@@ -1022,6 +1023,7 @@ mod tests {
             gate: None,
             checks: vec!["ci".to_owned()],
             questions: vec![],
+            notes: vec![],
             followups: vec![],
         };
         assert_eq!(
@@ -1029,7 +1031,8 @@ mod tests {
             Some(OwedReport {
                 kind: PushKind::Fix,
                 count: 1,
-                report: None
+                report: None,
+                unchanged: false,
             })
         );
         let mut reported = pushing.clone();
@@ -1112,6 +1115,7 @@ mod tests {
             kind: PushKind::Fix,
             count: 1,
             report: None,
+            unchanged: false,
         });
         let ended = changed(&record(owing, watching(0)), pipeline, &moved, at(5))
             .unwrap()

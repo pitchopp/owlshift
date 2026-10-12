@@ -5423,6 +5423,7 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
             gate: Some(vec!["git grep -q Hello".to_owned()]),
             checks: vec!["ci".to_owned()],
             questions: Vec::new(),
+            notes: Vec::new(),
             followups: Vec::new(),
         }),
     });
@@ -5441,6 +5442,69 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
     let delivery = bench.record().delivery.unwrap();
     assert_eq!(delivery.pushed.as_deref(), Some(fix.as_str()));
     assert!(delivery.owed.is_none() && delivery.pushing.is_none());
+}
+
+/// A Build `done` proposing a follow-up.
+const DONE_WITH_FOLLOWUP: &str = r#"{"format":7,"status":"done","summary":"Added GREETING.md; the gate passes.",
+"pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."},
+"followups":[{"title":"Greet in French","why":"Readers asked.","source":"agent","done_when":"It says Bonjour."}]}"#;
+
+/// OWL-236's acceptance: the tracker refuses the first DELIVERY report
+/// after the ref keeps the ticket at Watch; the ref owes it, and watch's
+/// next pass posts it, once, with what the delivering run said. A crash
+/// after that post, before the ref kept it as posted, is told by the
+/// report on the ticket: `continue` then posts nothing more.
+#[test]
+fn a_first_report_the_tracker_refused_is_posted_at_the_next_pass_once() {
+    let bench = Bench::new(true);
+    bench.refuse.set(Some("[owlshift] DELIVERY"));
+    let (outcome, printed) = bench.run(
+        vec![bench.reply(Some("Hello"), Some(DONE_WITH_FOLLOWUP))],
+        None,
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
+        "{outcome:?}\n{printed}"
+    );
+    assert!(reports(&bench).is_empty());
+    let owing = bench.record();
+    assert_eq!(owing.state.stage, owlshift_contracts::Stage::Watch);
+    let owed = owing.delivery.as_ref().unwrap().owed.as_ref().unwrap();
+    assert_eq!(owed.kind, owlshift_contracts::refs::PushKind::Delivery);
+
+    bench.refuse.set(None);
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    let posted = reports(&bench);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    for text in [
+        "Added GREETING.md; the gate passes.",
+        "**Project gate:** passed: `git grep -q Hello -- GREETING.md`.",
+        "**Greet in French**",
+    ] {
+        assert!(posted[0].contains(text), "{text}: {}", posted[0]);
+    }
+    assert!(!posted[0].contains("**Fix pass "), "{}", posted[0]);
+    assert!(bench.record().delivery.unwrap().owed.is_none());
+
+    // The post landed, and a crash lost the ref's write.
+    let mut lost = bench.record();
+    lost.delivery = owing.delivery;
+    bench.write_record(&lost);
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Watched { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(reports(&bench), posted);
+    let delivery = bench.record().delivery.unwrap();
+    assert!(delivery.owed.is_none() && delivery.followed());
+    let warned = data_of(&bench.events(), EventKind::Warning, "what");
+    let unposted: Vec<&Value> = warned
+        .iter()
+        .filter(|w| w["what"] == "delivery_report_unposted")
+        .collect();
+    assert_eq!(unposted.len(), 1, "{warned:?}");
 }
 
 /// Another merge into `bare`'s `main`, writing `files`, an empty text
@@ -5935,14 +5999,38 @@ fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_r
     );
     assert_eq!(bench.briefs().len(), 4);
 
-    // A newer reply the pull request already follows.
+    // A newer reply the pull request already follows. The tracker refuses
+    // the report saying so: it is owed (OWL-236), and the next `continue`
+    // posts it, once, even after a crash that lost the ref's write.
     bench.reply_as("maintainer", &decision, "To be clear: HELLO.md. go");
     let pushed = bench.remote_branch();
+    bench.refuse.set(Some("[owlshift] DELIVERY"));
     let (unchanged, printed) = bench.continue_ticket(vec![bench.reply(
         None,
         Some(r#"{"format":7,"status":"done","summary":"HELLO.md already holds the greeting."}"#),
     )]);
-    unchanged.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(
+        matches!(&unchanged, Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
+        "{unchanged:?}\n{printed}"
+    );
+    let owing = bench.record();
+    let owed = owing.delivery.as_ref().unwrap().owed.as_ref().unwrap();
+    assert!(owed.unchanged && owed.kind == owlshift_contracts::refs::PushKind::Correction);
+    bench.refuse.set(None);
+    let reported = reports(&bench).len();
+    for _ in 0..2 {
+        let (look, printed) = bench.continue_ticket(Vec::new());
+        assert!(
+            matches!(&look, Err(Stop::Watched { .. })),
+            "{look:?}\n{printed}"
+        );
+        assert_eq!(reports(&bench).len(), reported + 1);
+        assert!(bench.record().delivery.unwrap().owed.is_none());
+        // The post landed, and a crash lost the ref's write.
+        let mut lost = bench.record();
+        lost.delivery = owing.delivery.clone();
+        bench.write_record(&lost);
+    }
     let brief = bench.briefs().pop().unwrap();
     assert_eq!(
         brief.correction.unwrap().reversed[0].reply,
