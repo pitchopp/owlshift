@@ -2540,6 +2540,30 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     })
     .unwrap();
     assert!(unchanged.owed.as_ref().unwrap().unchanged);
+    // An unchanged correction's report always names its questions, and a
+    // delivery's owed report counts 1, which the valid cases above keep.
+    let refused: [(&str, Edit, &str); 2] = [
+        (
+            "an unchanged correction without its report",
+            |v| {
+                v["owed"]["kind"] = json!("correction");
+                v["owed"]["unchanged"] = json!(true);
+                v["owed"].as_object_mut().unwrap().remove("report");
+            },
+            "an unchanged correction's owed report keeps its questions",
+        ),
+        (
+            "a delivery's owed report counting 2",
+            |v| {
+                v["owed"]["kind"] = json!("delivery");
+                v["owed"]["count"] = json!(2);
+            },
+            "a delivery's owed report counts 1",
+        ),
+    ];
+    for (case, edit, reason) in refused {
+        rejects(case, parse(edit), reason);
+    }
     let older = parse(|v| {
         v["format"] = json!(3);
         v["owed"]["kind"] = json!("correction");

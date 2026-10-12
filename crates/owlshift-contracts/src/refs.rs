@@ -1232,9 +1232,10 @@ impl TicketDelivery {
     /// Checks the commits are full ids, the branches git branch names, the
     /// link a plain `https://` URL, that a push under way names its `onto`
     /// exactly when it is a rebase's and keeps a report only for a fix, a
-    /// rebase or a correction, that an owed report counts from 1, of a
-    /// pushed commit with its pull request (and for a rebase its base), and
-    /// is unchanged only for a correction, that a report names questions
+    /// rebase or a correction, that an owed report counts from 1 (exactly 1
+    /// for a delivery), of a pushed commit with its pull request (and for a
+    /// rebase its base), and is unchanged only for a correction that kept its
+    /// report, that a report names questions
     /// exactly when it is a correction's and keeps notes only for a
     /// delivery, and that an ended delivery pushes nothing.
     pub fn validate(&self) -> Result<(), ContractError> {
@@ -1327,8 +1328,18 @@ impl TicketDelivery {
                     "an owed report is unchanged only if it is a correction's".to_owned(),
                 );
             }
+            // No push is ever adopted for it, so its run always kept its
+            // report, which names its questions (the rule above).
+            if owed.unchanged && owed.report.is_none() {
+                return invalid(
+                    "an unchanged correction's owed report keeps its questions".to_owned(),
+                );
+            }
             if owed.count == 0 {
                 return invalid("an owed report counts from 1".to_owned());
+            }
+            if owed.kind == PushKind::Delivery && owed.count != 1 {
+                return invalid("a delivery's owed report counts 1".to_owned());
             }
             if self.pushed.is_none() || self.pull_request.is_none() {
                 return invalid(
