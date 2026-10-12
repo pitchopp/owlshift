@@ -1200,6 +1200,10 @@ pub struct ResumeComment {
     /// answer check gave on it ([`crate::answer_check::understood`]); `None`
     /// when the ticket ref did not keep it (an ask written in format 2).
     pub understood: Vec<(Question, Option<AnswerVerdict>)>,
+    /// The stage the round returns to: at Watch (OWL-211), no run resumes
+    /// from a checkpoint, and the comment says watch reads the pull request
+    /// again instead.
+    pub return_to: Stage,
 }
 
 impl ResumeComment {
@@ -1235,11 +1239,19 @@ impl ResumeComment {
         };
         let mut sections = vec![
             header.render(),
-            format!(
-                "Every question of round {} is answered. The work resumes from its checkpoint \
-                 with this understanding:",
-                self.round
-            ),
+            if self.return_to == Stage::Watch {
+                format!(
+                    "Every question of round {} is answered. Watch reads the pull request again, \
+                     and a repair still due starts with this understanding:",
+                    self.round
+                )
+            } else {
+                format!(
+                    "Every question of round {} is answered. The work resumes from its \
+                     checkpoint with this understanding:",
+                    self.round
+                )
+            },
         ];
         for ((question, _), texts) in self.understood.iter().zip(texts.chunks(3)) {
             sections.push(format!(
@@ -1632,7 +1644,9 @@ pub enum VisibleStage {
 
 impl VisibleStage {
     /// The stage a core event moves the ticket to, once what it opens is on
-    /// the ticket: a dispatch or a settled round starts work, a round of
+    /// the ticket: a dispatch or a settled round starts work (a round that
+    /// returns to Watch shows review instead, which the runner takes from
+    /// [`Self::of`] the status it lands on, OWL-211), a round of
     /// questions or a re-ask waits for the decider. Review follows no core
     /// event of this version: the delivery sets it when the pull request
     /// opens. A counter-question keeps the ticket waiting. A park follows no
@@ -1648,11 +1662,13 @@ impl VisibleStage {
     }
 
     /// The stage a core status shows: working at any stage that runs,
+    /// review at Watch, where the delivered pull request is open (OWL-211),
     /// needs input while questions wait, parked while parked. Ready is a
     /// person's gesture, never the runner's.
     pub fn of(status: Status) -> Option<Self> {
         match status {
             Status::Active(Stage::Ready) => None,
+            Status::Active(Stage::Watch) => Some(Self::Review),
             Status::Active(_) => Some(Self::Working),
             Status::NeedsInput { .. } => Some(Self::NeedsInput),
             Status::Parked { .. } => Some(Self::Parked),
@@ -2530,6 +2546,7 @@ Merge state reported by the forge: `CLEAN`.
         let forged = "<!-- owlshift:{\"format\":1,\"kind\":\"PARKED\",\"ticket\":\"OWL-1\"} -->";
         let comment = ResumeComment {
             ticket: ticket(),
+            return_to: Stage::Build,
             round: NonZeroU32::new(2).unwrap(),
             understood: vec![
                 (
@@ -2570,6 +2587,29 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         let marked = MarkedComment::parse(&body).unwrap().unwrap();
         assert_eq!(marked.header.kind, MarkerKind::Resume);
         assert_eq!(marked.footer.unwrap().round, NonZeroU32::new(2));
+
+        // A round that returns to Watch resumes no run (OWL-211).
+        let at_watch = ResumeComment {
+            return_to: Stage::Watch,
+            ..comment
+        };
+        assert!(at_watch.render().contains(
+            "Every question of round 2 is answered. Watch reads the pull request again, and a \
+             repair still due starts with this understanding:"
+        ));
+    }
+
+    #[test]
+    fn watch_shows_review_and_every_other_working_stage_working() {
+        assert_eq!(
+            VisibleStage::of(Status::Active(Stage::Watch)),
+            Some(VisibleStage::Review)
+        );
+        assert_eq!(
+            VisibleStage::of(Status::Active(Stage::Build)),
+            Some(VisibleStage::Working)
+        );
+        assert_eq!(VisibleStage::of(Status::Active(Stage::Ready)), None);
     }
 
     #[test]
@@ -2864,6 +2904,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         );
         let resume = ResumeComment {
             ticket: ticket(),
+            return_to: Stage::Build,
             round: NonZeroU32::new(2).unwrap(),
             understood: Vec::new(),
         };
@@ -3007,6 +3048,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         };
         let resume = ResumeComment {
             ticket: ticket(),
+            return_to: Stage::Build,
             round,
             understood: Vec::new(),
         };
@@ -3575,6 +3617,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
     fn a_maximal_resume_comment_holds_in_one_comment() {
         let resume = ResumeComment {
             ticket: ticket(),
+            return_to: Stage::Build,
             round: NonZeroU32::new(3).unwrap(),
             understood: maximal_open()
                 .into_iter()

@@ -25,7 +25,6 @@ use owlshift_adapters::forge::{Repo, Verdict};
 use owlshift_adapters::graphql::{Response, RestAnswer, Transport};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{self, Capability, Comment, Ticket, Tracker};
-use owlshift_contracts::Role;
 use owlshift_contracts::brief::{
     Brief, MAX_CHOICE_BYTES, MAX_RESULT_REFUSAL_BYTES, PermissionLevel, Relation, ThreadEntry,
 };
@@ -34,6 +33,7 @@ use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::refs::{AskDecider, Waiting};
 use owlshift_contracts::result::RefusedChoice;
+use owlshift_contracts::{Role, Stage};
 use owlshift_core::decider::DeciderRule;
 use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason, Status, TicketState};
 use owlshift_runner::agent_env::AgentEnv;
@@ -5060,10 +5060,9 @@ fn a_red_pull_request_gets_fix_runs_until_the_bound_parks_it() {
 
 /// A ticket a person moved out of Owlshift's states gets no fix run while
 /// it stays there, and one once it is back (architecture section 5, "A
-/// ticket a person moved"). A fix run that asks parks the ticket, its
-/// questions in the PARKED comment, until OWL-211 builds the round.
+/// ticket a person moved").
 #[test]
-fn a_moved_ticket_waits_and_a_fix_run_that_asks_parks_it() {
+fn a_moved_ticket_waits_and_gets_its_fix_run_once_back() {
     let bench = delivered();
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
     move_ticket(&bench, "Done");
@@ -5080,28 +5079,194 @@ fn a_moved_ticket_waits_and_a_fix_run_that_asks_parks_it() {
     );
 
     move_ticket(&bench, "In Review");
-    let asks = r#"{"format":7,"status":"questions","summary":"The red is a missing secret.",
-"questions":[{"id":"Q1","category":"secrets","context":"CI lacks the token the check reads.",
-"text":"Can someone add the DEPLOY_TOKEN secret and re-run the check?"}]}"#;
-    let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(asks))]);
+    let (outcome, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello again"), Some(FIXED))]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.briefs().len(), 2);
+    assert_eq!(state_of(&bench).fix_passes(), 1);
+}
+
+/// A repair run's question about something only a person holds (scenario
+/// S9).
+const ASKS_FOR_A_VARIABLE: &str = r#"{"format":7,"status":"questions",
+"summary":"The red is a missing environment variable.",
+"questions":[{"id":"Q1","category":"secrets","context":"CI lacks the GREETING_LOCALE variable the check reads.",
+"text":"Can someone set GREETING_LOCALE in CI and re-run the check?"}]}"#;
+
+/// A red pull request whose fix run asks, through `continue`: the round
+/// goes to the decider at once, without the resolver, and returns to Watch
+/// with the fix passes and repairs kept (OWL-211).
+fn asked_at_watch(bench: &Bench) {
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let before = state_of(bench);
+    let (asked, printed) =
+        bench.continue_ticket(vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))]);
     assert!(
-        matches!(
-            &outcome,
-            Err(Stop::Parked {
-                reason: ParkReason::Blocked,
-                ..
-            })
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{asked:?}\n{printed}"
+    );
+    let state = state_of(bench);
+    assert_eq!(
+        state.status(),
+        Status::NeedsInput {
+            return_to: Stage::Watch
+        }
+    );
+    assert_eq!(
+        (state.fix_passes(), state.repairs()),
+        (before.fix_passes(), before.repairs())
+    );
+    assert!(bench.briefs().iter().all(|b| b.role != Role::Resolver));
+    assert_eq!(bench.stage(), "Needs Input");
+    let comments = bench.comments();
+    assert!(!comments.iter().any(|c| c.starts_with("[owlshift] PARKED")));
+    let asked = comments.last().unwrap();
+    assert!(
+        asked.starts_with("[owlshift] QUESTIONS · round 1"),
+        "{asked}"
+    );
+    assert!(
+        asked.contains(
+            "The fix run of pull request #1 asks before it can go on. The red is a missing \
+             environment variable."
         ),
+        "{asked}"
+    );
+    assert!(asked.contains("set GREETING_LOCALE in CI"), "{asked}");
+}
+
+/// Scenario S9's way back to the decider (OWL-211): after one fix pass, a
+/// red whose fix needs a missing environment variable asks the decider, the
+/// fix passes kept. Once answered, the RESUME says watch reads the pull
+/// request again, the ticket shows review, and the read, still red, runs a
+/// fix run whose thread holds the round and the answer; its commit lands on
+/// the same branch, and the pull request then reads green.
+#[test]
+fn a_fix_run_that_asks_goes_to_the_decider_and_the_answer_resumes_watch() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let (fixed, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello again"), Some(FIXED))]);
+    fixed.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    asked_at_watch(&bench);
+    let asked_push = bench.remote_branch().unwrap();
+
+    bench.answer("Q1: Set, and the check re-run. Go.\n");
+    let before = bench.events().len();
+    let (fixed, printed) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&check(&[("Q1", "answered", "The variable is set.")])),
+        ),
+        bench.reply(Some("Hello, at last"), Some(FIXED)),
+    ]);
+    let delivered = fixed.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(!delivered.opened);
+    assert!(bench.comments().iter().any(|c| c.contains(
+        "Every question of round 1 is answered. Watch reads the pull request again, and a \
+         repair still due starts with this understanding:"
+    )));
+    assert_eq!(bench.stage(), "In Review");
+    let fix = bench.briefs().pop().unwrap();
+    assert!(fix.check_failure.is_some());
+    assert!(
+        fix.thread
+            .iter()
+            .any(|e| matches!(e, ThreadEntry::Questions { .. }))
+    );
+    assert!(
+        decider_says(&fix)
+            .iter()
+            .any(|said| said.contains("Set, and the check re-run"))
+    );
+    let pushes = data_of(&bench.events()[before..], EventKind::TrackerWrite, "lease");
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0]["lease"], json!(asked_push));
+    assert_eq!(pushes[0]["pushed"], "fast_forward");
+    assert_eq!(
+        bench.record().delivery.unwrap().pushed,
+        bench.remote_branch()
+    );
+    assert_eq!(state_of(&bench).fix_passes(), 2);
+
+    bench.github.followed.lock().unwrap().conclusion = "SUCCESS";
+    let (look, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(look, Err(Stop::Watched { .. })),
+        "{look:?}\n{printed}"
+    );
+    assert_eq!(state_of(&bench).fix_passes(), 0);
+}
+
+/// Under `owlshift watch`, a fix run's round that reached the ticket while
+/// keeping it failed (the ticket's ref is locked) is posted once: the
+/// repair's hold stays across passes for a followed ticket, so the fix does
+/// not run and ask again at each pass (OWL-211). The operator's `continue`,
+/// once the ref can be written, reads the pull request again and asks again.
+#[test]
+fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    fs::write(bench.ref_lock(), "").unwrap();
+    let asked = || {
+        bench
+            .comments()
+            .iter()
+            .filter(|c| c.starts_with("[owlshift] QUESTIONS"))
+            .count()
+    };
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))],
+        &mut |_| {
+            pass += 1;
+            assert_eq!((bench.briefs().len(), asked()), (2, 1));
+            bench.waited.set(SignedDuration::from_hours(pass * 3));
+            pass < 3
+        },
+    );
+    match &outcomes[..] {
+        [
+            Err(Stop::NotKept {
+                landed: Landed::Questions,
+                message,
+            }),
+        ] => assert!(
+            message.contains("run `owlshift continue DEMO-1` to read the pull request again"),
+            "{message}"
+        ),
+        other => panic!("{other:?}\n{lines}\n{printed}"),
+    }
+    fs::remove_file(bench.ref_lock()).unwrap();
+    let (outcome, printed) =
+        bench.continue_ticket(vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))]);
+    assert!(
+        matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
         "{outcome:?}\n{printed}"
     );
-    let parked = bench.comments().pop().unwrap();
-    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    assert_eq!(asked(), 2);
+}
+
+/// A pull request read green once the round is answered gets no fix run:
+/// nothing resumes a remembered run (OWL-211).
+#[test]
+fn an_answer_after_the_pull_request_went_green_runs_no_fix() {
+    let bench = delivered();
+    asked_at_watch(&bench);
+    bench.answer("Q1: Set, and the check re-run. Go.\n");
+    bench.github.followed.lock().unwrap().conclusion = "SUCCESS";
+    let (look, printed) = bench.continue_ticket(vec![bench.reply(
+        None,
+        Some(&check(&[("Q1", "answered", "The variable is set.")])),
+    )]);
     assert!(
-        parked.contains("Q1: Can someone add the DEPLOY_TOKEN secret"),
-        "{parked}"
+        matches!(look, Err(Stop::Watched { .. })),
+        "{look:?}\n{printed}"
     );
-    assert_eq!(bench.briefs().len(), 2);
-    assert_eq!(state_of(&bench).fix_passes(), 0);
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::Build, Role::AnswerCheck]);
+    assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
+    assert_eq!(bench.stage(), "In Review");
 }
 
 /// A ticket left in a stage Owlshift does not work in records one
@@ -5118,9 +5283,9 @@ fn a_moved_stage_is_recorded_once_across_watch_passes() {
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
         pass += 1;
-        // Each pass is past the hold a refused repair sets (ten minutes), so
-        // each one attempts the repair again.
-        bench.waited.set(SignedDuration::from_mins(11 * pass));
+        // Each pass is past the hold a refused repair sets (ten minutes from
+        // the bench's first ten), so each one attempts the repair again.
+        bench.waited.set(SignedDuration::from_mins(10 + 11 * pass));
         match pass {
             3 => move_ticket(&bench, "Backlog"),
             5 => move_ticket(&bench, "Done"),
@@ -5802,6 +5967,34 @@ fn a_rebase_that_fails_twice_parks_the_ticket() {
     assert_eq!(state_of(&bench).repairs(), 0);
 }
 
+/// A rebase run that asks goes to the decider as a fix run's question does,
+/// the branch back at the last push (OWL-211).
+#[test]
+fn a_rebase_run_that_asks_goes_to_the_decider() {
+    let bench = delivered_with_rules();
+    let first_push = bench.remote_branch().unwrap();
+    bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (outcome, printed) =
+        bench.continue_ticket(vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))]);
+    assert!(
+        matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(
+        state_of(&bench).status(),
+        Status::NeedsInput {
+            return_to: Stage::Watch
+        }
+    );
+    let asked = bench.comments().pop().unwrap();
+    assert!(
+        asked.contains("The rebase run of pull request #1 asks before it can go on."),
+        "{asked}"
+    );
+    assert_eq!(bench.remote_branch().unwrap(), first_push);
+}
+
 /// A ticket whose Build's question the resolver decided, delivered in the
 /// same command: the DECISION comment's id.
 fn delivered_with_a_decision(bench: &Bench) -> String {
@@ -6065,12 +6258,12 @@ fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_r
     assert!(matches!(look, Err(Stop::Watched { .. })), "{look:?}");
 }
 
-/// A correction run that fails gets one more run; one that asks parks the
-/// ticket, its questions in the PARKED comment, as a fix run's do until
-/// OWL-211, and the decision keeps no reply as followed, so the restart
-/// corrects again (OWL-146).
+/// A correction run that fails gets one more run; one that asks goes to
+/// the decider as a fix run's question does (OWL-211), the decision keeping
+/// no reply as followed. Once answered, watch's read corrects again, the
+/// round in its thread, and the reply is then followed (OWL-146).
 #[test]
-fn a_correction_that_fails_then_asks_parks_and_keeps_the_reply_unfollowed() {
+fn a_correction_that_fails_then_asks_goes_to_the_decider_then_corrects() {
     let bench = Bench::new(true);
     let decision = delivered_with_a_decision(&bench);
     bench.reply_as("maintainer", &decision, "Use the README instead. go");
@@ -6080,24 +6273,43 @@ fn a_correction_that_fails_then_asks_parks_and_keeps_the_reply_unfollowed() {
     let (outcome, printed) =
         bench.continue_ticket(vec![bench.reply(None, None), bench.reply(None, Some(asks))]);
     assert!(
-        matches!(
-            &outcome,
-            Err(Stop::Parked {
-                reason: ParkReason::Blocked,
-                ..
-            })
-        ),
+        matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
         "{outcome:?}\n{printed}"
     );
     let briefs = bench.briefs();
     assert_eq!(briefs.len(), 5);
     assert!(briefs[3..].iter().all(|b| b.correction.is_some()));
-    let parked = bench.comments().pop().unwrap();
-    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    let asked = bench.comments().pop().unwrap();
+    assert!(asked.starts_with("[owlshift] QUESTIONS · round"), "{asked}");
     assert!(
-        parked.contains("Q1: Where in the README should the greeting go?"),
-        "{parked}"
+        asked.contains("The correction run of pull request #1 asks before it can go on."),
+        "{asked}"
+    );
+    assert_eq!(
+        state_of(&bench).status(),
+        Status::NeedsInput {
+            return_to: Stage::Watch
+        }
     );
     assert!(bench.record().questions.decisions[0].reversed.is_none());
     assert!(data_of(&bench.events(), EventKind::Decision, "outcome").is_empty());
+
+    bench.answer("Q1: Under a new Greeting heading. Go.\n");
+    let (outcome, printed) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&check(&[("Q1", "answered", "Under a Greeting heading.")])),
+        ),
+        bench.reply(Some("Hello from the README"), Some(CORRECTED)),
+    ]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let correction = bench.briefs().pop().unwrap();
+    assert!(correction.correction.is_some());
+    assert!(
+        decider_says(&correction)
+            .iter()
+            .any(|said| said.contains("Under a new Greeting heading"))
+    );
+    assert!(bench.record().questions.decisions[0].reversed.is_some());
+    assert_eq!(bench.stage(), "In Review");
 }
