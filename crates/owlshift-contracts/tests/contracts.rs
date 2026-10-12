@@ -2525,8 +2525,14 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     let owed = first_owed.owed.as_ref().unwrap();
     assert_eq!(owed.kind, PushKind::Delivery);
-    assert_eq!(owed.report.as_ref().unwrap().notes[0].question, "Late comment");
-    assert_eq!(TicketDelivery::parse(&first_owed.render()).unwrap(), first_owed);
+    assert_eq!(
+        owed.report.as_ref().unwrap().notes[0].question,
+        "Late comment"
+    );
+    assert_eq!(
+        TicketDelivery::parse(&first_owed.render()).unwrap(),
+        first_owed
+    );
     let unchanged = parse(|v| {
         v["owed"]["kind"] = json!("correction");
         v["owed"]["unchanged"] = json!(true);

@@ -1323,7 +1323,9 @@ impl TicketDelivery {
         }
         if let Some(owed) = &self.owed {
             if owed.unchanged && owed.kind != PushKind::Correction {
-                return invalid("an owed report is unchanged only if it is a correction's".to_owned());
+                return invalid(
+                    "an owed report is unchanged only if it is a correction's".to_owned(),
+                );
             }
             if owed.count == 0 {
                 return invalid("an owed report counts from 1".to_owned());
