@@ -368,3 +368,57 @@ fn record_fixtures() {
     assert_eq!(error.kind, ErrorKind::Unauthorized, "{error}");
     r.write(UNAUTHORIZED, &recorded);
 }
+
+/// A `main` commit whose CI failed on its push (2026-10-08): `base_at_push`
+/// of the base-checks fixture, for a failed check beside the head's.
+const FAILED_MAIN: &str = "e0b59e4a1c954925d980c472a77d915b08567fa7";
+
+/// Records watch's read-only fixtures on `pitchopp/owlshift` (OWL-217): a
+/// merged pull request's read and the base's checks, one per page so that
+/// the paging is recorded too. `github_live.rs`'s `records_watch_reads`
+/// records the red and conflicting reads, which need writes.
+///
+/// ```sh
+/// cargo test -p owlshift-adapters --test github -- --ignored --nocapture record_watch_fixtures
+/// ```
+#[test]
+#[ignore = "records against the live GitHub API"]
+fn record_watch_fixtures() {
+    let token = support::github_token();
+    let recorded = format!(
+        "{} on pitchopp/owlshift, recorded live",
+        jiff::Zoned::now().date()
+    );
+    let recorder = || Recorder::over(HttpTransport::new(token.clone()), dir());
+
+    let r = recorder();
+    let merged = GitHubForge::with_transport(r.clone(), repo())
+        .follow(PR_16)
+        .unwrap();
+    assert_eq!(merged.checks.state, PrState::Merged);
+    let rate = merged.rate.expect("rateLimit in watch's query");
+    eprintln!("merged: cost {} points, {} left", rate.cost, rate.remaining);
+    r.write(FOLLOW_MERGED, &recorded);
+
+    let r = recorder();
+    let at_push = CommitId::new(FAILED_MAIN).unwrap();
+    let base = GitHubForge::with_transport(r.clone(), repo())
+        .with_check_page(1)
+        .base_checks(&main_branch(), Some(&at_push))
+        .unwrap();
+    let at_push = base.at_push.expect("the failed commit's checks");
+    assert!(base.at_head.len() > 1, "{:?}", base.at_head);
+    assert!(
+        at_push.iter().any(|c| c.state == CheckState::Failed),
+        "{at_push:?}"
+    );
+    let rate = base.rate.expect("rateLimit in watch's queries");
+    eprintln!(
+        "base checks: {} checks at head, {} at push, cost {} points, {} left",
+        base.at_head.len(),
+        at_push.len(),
+        rate.cost,
+        rate.remaining
+    );
+    r.write(BASE_CHECKS, &recorded);
+}
