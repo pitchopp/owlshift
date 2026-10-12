@@ -1206,7 +1206,7 @@ impl OnDemand<'_> {
         if let Some(event) = following.events(&ticket, &seen) {
             sink.emit(&ticket, None, EventKind::Decision, event);
         }
-        self.settle_owed_report(p, sink)?;
+        self.settle_owed_report(p, &mut following, sink)?;
         // A fix run, a rebase run or a park the read decided, which the
         // repair reads again under this command's lock (OWL-112, OWL-210).
         if let FollowDecision::Follow {
@@ -1223,7 +1223,7 @@ impl OnDemand<'_> {
         // The decider's replies to a DECISION, which the correction reads
         // again under this command's lock (OWL-146).
         if !p.questions().decisions.is_empty() {
-            return self.correct(p, sink);
+            return self.correct(p, &mut following, sink);
         }
         Err(Stop::Watched {
             ticket,
@@ -3077,7 +3077,8 @@ impl OnDemand<'_> {
         }
         match action {
             FollowAction::Rebase { refresh, .. } => {
-                return self.repair_rebase(p, state, &delivery, &pr, &pushed, refresh, sink);
+                return self
+                    .repair_rebase(p, state, &delivery, &pr, &pushed, refresh, following, sink);
             }
             FollowAction::RebaseFailed { .. } => {
                 return Err(self.rebase_failed(p, state, &delivery, &pr, sink));
@@ -3167,6 +3168,7 @@ impl OnDemand<'_> {
                 fixed,
                 RepairKind::Fix { checks: names },
                 followups,
+                following,
                 sink,
             );
         }
@@ -3233,6 +3235,7 @@ impl OnDemand<'_> {
             fixed.repaired,
             RepairKind::Fix { checks: names },
             followups,
+            following,
             sink,
         )
     }
@@ -3445,6 +3448,7 @@ impl OnDemand<'_> {
         pr: &DeliveredPullRequest,
         pushed: &str,
         refresh: bool,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         match state.apply(PIPELINE, Event::RebaseDue) {
@@ -3494,6 +3498,7 @@ impl OnDemand<'_> {
                 repaired,
                 RepairKind::Rebase { onto: kept_onto },
                 followups,
+                following,
                 sink,
             );
         }
@@ -3606,6 +3611,7 @@ impl OnDemand<'_> {
             done.repaired,
             RepairKind::Rebase { onto },
             followups,
+            following,
             sink,
         )
     }
@@ -3709,6 +3715,7 @@ impl OnDemand<'_> {
         repaired: Repaired,
         kind: RepairKind,
         followups: Vec<Followup>,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
@@ -3868,7 +3875,7 @@ impl OnDemand<'_> {
         let checks_read = self.forge.checks(pull_request.number, &commit);
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let comment = self
-            .post_owed(&ticket, &kept, &p.questions(), checks_read, sink)
+            .post_owed(&ticket, &kept, &p.questions(), checks_read, following, sink)
             .map_err(|error| {
                 Stop::Delivery(format!(
                     "the {what} {commit} was pushed and kept, but its delivery report could not \
@@ -3897,7 +3904,9 @@ impl OnDemand<'_> {
     /// Posts the DELIVERY report `delivery` owes (OWL-218), once
     /// ([`Writer::post_repair_report`]), with `checks`, its head's check
     /// set as read now, and records the comment; a refusal is a `warning`,
-    /// and the report stays owed. The report says what the run kept for it,
+    /// and the report stays owed, warned of when it is the first refusal, or
+    /// its reason differs from the last one warned of in `following`
+    /// (OWL-232). The report says what the run kept for it,
     /// or, for a push adopted from a ref that kept nothing, that its summary
     /// was not kept.
     fn post_owed(
@@ -3906,6 +3915,7 @@ impl OnDemand<'_> {
         delivery: &TicketDelivery,
         questions: &TicketQuestions,
         checks: Result<CheckSet, forge::Error>,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Comment, String> {
         let (Some(owed), Some(pr), Some(pushed)) =
@@ -3998,20 +4008,24 @@ impl OnDemand<'_> {
                         (counted, json!(owed.count)),
                     ]),
                 );
+                following.report_settled(ticket);
                 Ok(comment)
             }
             Err(error) => {
-                sink.emit(
-                    ticket,
-                    None,
-                    EventKind::Warning,
-                    data([
-                        ("what", json!(format!("{what}_report_unposted"))),
-                        ("commit", json!(head.as_str())),
-                        ("reason", json!(error.to_string())),
-                    ]),
-                );
-                Err(error.to_string())
+                let reason = error.to_string();
+                if following.report_unposted(ticket, head.as_str(), &reason) {
+                    sink.emit(
+                        ticket,
+                        None,
+                        EventKind::Warning,
+                        data([
+                            ("what", json!(format!("{what}_report_unposted"))),
+                            ("commit", json!(head.as_str())),
+                            ("reason", json!(reason)),
+                        ]),
+                    );
+                }
+                Err(reason)
             }
         }
     }
@@ -4048,6 +4062,7 @@ impl OnDemand<'_> {
         &self,
         ticket: &TicketId,
         record: &TicketRecord,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<TicketDelivery> {
         let delivery = record.delivery.as_ref()?;
@@ -4055,6 +4070,7 @@ impl OnDemand<'_> {
         let mut settled = delivery.clone();
         settled.owed = None;
         if let Some(ended) = &delivery.ended {
+            following.report_settled(ticket);
             sink.emit(
                 ticket,
                 None,
@@ -4073,7 +4089,7 @@ impl OnDemand<'_> {
         let number = delivery.pull_request.as_ref()?.number;
         let head = CommitId::new(delivery.pushed.as_deref()?).ok()?;
         let checks = self.forge.checks(number, &head);
-        self.post_owed(ticket, delivery, &record.questions, checks, sink)
+        self.post_owed(ticket, delivery, &record.questions, checks, following, sink)
             .ok()
             .map(|_| settled)
     }
@@ -4090,6 +4106,7 @@ impl OnDemand<'_> {
         stored: &Stored,
         seen: &Seen,
         commit: String,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> String {
         let owes = stored
@@ -4112,7 +4129,7 @@ impl OnDemand<'_> {
             Ok(Some(current)) if current.commit == commit => current,
             _ => return commit,
         };
-        let Some(delivery) = self.settle_owed(ticket, &current.record, sink) else {
+        let Some(delivery) = self.settle_owed(ticket, &current.record, following, sink) else {
             return commit;
         };
         let record = TicketRecord {
@@ -4138,11 +4155,16 @@ impl OnDemand<'_> {
 
     /// For `owlshift continue` at Watch, under its lock: posts the DELIVERY
     /// report the ticket ref owes and keeps it as posted (OWL-218).
-    fn settle_owed_report(&self, p: &mut Prepared, sink: &mut EventSink<'_>) -> Result<(), Stop> {
+    fn settle_owed_report(
+        &self,
+        p: &mut Prepared,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), Stop> {
         let Some(stored) = p.stored.clone() else {
             return Ok(());
         };
-        let Some(delivery) = self.settle_owed(&p.ticket, &stored.record, sink) else {
+        let Some(delivery) = self.settle_owed(&p.ticket, &stored.record, following, sink) else {
             return Ok(());
         };
         let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;

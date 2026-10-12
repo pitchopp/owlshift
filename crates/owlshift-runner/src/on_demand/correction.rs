@@ -19,6 +19,7 @@ impl OnDemand<'_> {
         &self,
         ticket: &TicketId,
         seen: &str,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
         let mut p = match self.prepare(ticket, Command::Correct) {
@@ -33,7 +34,7 @@ impl OnDemand<'_> {
         {
             return None;
         }
-        Some(self.correct(&mut p, sink))
+        Some(self.correct(&mut p, following, sink))
     }
 
     /// Corrects the followed pull request of a ticket at Watch, under the
@@ -52,6 +53,7 @@ impl OnDemand<'_> {
     pub(super) fn correct(
         &self,
         p: &mut Prepared,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
@@ -120,7 +122,7 @@ impl OnDemand<'_> {
                 .map_err(|e| refused("the commit under way", e))?;
             let (repaired, followups) = Repaired::again(commit, pushing, "correction");
             return self.push_correction(
-                p, &delivery, &pushed_id, repaired, state, followups, &reversed, sink,
+                p, &delivery, &pushed_id, repaired, state, followups, &reversed, following, sink,
             );
         }
         if reversed.is_empty() {
@@ -171,6 +173,7 @@ impl OnDemand<'_> {
             done.state,
             followups,
             &reversed,
+            following,
             sink,
         )
     }
@@ -188,13 +191,16 @@ impl OnDemand<'_> {
         state: TicketState,
         followups: Vec<Followup>,
         reversed: &[Reversed<'_>],
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let commit = repaired.commit.to_string();
         let kind = RepairKind::Correction {
             questions: question_texts(&p.questions(), reversed),
         };
-        let outcome = self.push_repair(p, state, delivery, pushed, repaired, kind, followups, sink);
+        let outcome = self.push_repair(
+            p, state, delivery, pushed, repaired, kind, followups, following, sink,
+        );
         let landed = p
             .stored
             .as_ref()
