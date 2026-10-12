@@ -374,7 +374,8 @@ impl Watch<'_> {
             sink.emit(ticket, None, EventKind::Decision, event);
             self.line(out, &format!("{ticket}: {seen}"));
         }
-        let commit = on_demand.post_owed_report(ticket, stored, &seen, commit, sink);
+        let commit =
+            on_demand.post_owed_report(ticket, stored, &seen, commit, &mut memory.following, sink);
         if !matches!(
             seen.decision,
             Decision::Follow {
@@ -479,7 +480,9 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &held, now) != Admit::Go {
             return;
         }
-        let Some(outcome) = on_demand.correct_seen(ticket, &held.commit, sink) else {
+        let Some(outcome) =
+            on_demand.correct_seen(ticket, &held.commit, &mut memory.following, sink)
+        else {
             return;
         };
         continued(ticket, &outcome, sink);

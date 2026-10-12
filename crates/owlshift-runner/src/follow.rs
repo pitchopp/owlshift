@@ -307,6 +307,9 @@ pub struct Following {
     /// The stage last recorded as moved out of Owlshift's states, per ticket
     /// (OWL-219).
     moved: HashMap<TicketId, String>,
+    /// The commit and the refusal of the owed report last warned of, per
+    /// ticket (OWL-232).
+    unposted: HashMap<TicketId, (String, String)>,
 }
 
 /// A warning a look records, beside the events of what it read.
@@ -488,6 +491,25 @@ impl Following {
         self.moved.remove(ticket);
     }
 
+    /// Whether the refusal of the report owed for `commit` is to be warned
+    /// of: it is the first one, or `reason` differs from the one last warned
+    /// of for the ticket, or the report is another commit's (OWL-232). Keeps
+    /// them as warned of.
+    pub fn report_unposted(&mut self, ticket: &TicketId, commit: &str, reason: &str) -> bool {
+        let warned = (commit.to_owned(), reason.to_owned());
+        if self.unposted.get(ticket) == Some(&warned) {
+            return false;
+        }
+        self.unposted.insert(ticket.clone(), warned);
+        true
+    }
+
+    /// The report owed was posted or dropped: a later refusal is warned of
+    /// again (OWL-232).
+    pub fn report_settled(&mut self, ticket: &TicketId) {
+        self.unposted.remove(ticket);
+    }
+
     /// Forgets everything kept of `ticket`.
     pub fn forget(&mut self, ticket: &TicketId) {
         self.recorded.remove(ticket);
@@ -495,6 +517,7 @@ impl Following {
         self.unread.remove(ticket);
         self.overdue.remove(ticket);
         self.moved.remove(ticket);
+        self.unposted.remove(ticket);
     }
 
     /// Forgets the tickets `kept` does not name.
@@ -504,6 +527,7 @@ impl Following {
         self.unread.retain(|t, _| kept.contains(t));
         self.overdue.retain(|t, _| kept.contains(t));
         self.moved.retain(|t, _| kept.contains(t));
+        self.unposted.retain(|t, _| kept.contains(t));
     }
 }
 
@@ -849,6 +873,22 @@ mod tests {
 
     /// A ticket's moved stage is recorded when it changes, and again after
     /// the ticket was read back in a stage Owlshift works in (OWL-219).
+    /// An owed report's refusal is warned of once, again when its reason
+    /// or commit changes, and again after the report is posted or dropped
+    /// (OWL-232).
+    #[test]
+    fn an_unposted_report_is_warned_of_once_until_its_reason_changes_or_it_settles() {
+        let mut following = Following::default();
+        assert!(following.report_unposted(&ticket(), "c1", "down"));
+        assert!(!following.report_unposted(&ticket(), "c1", "down"));
+        assert!(following.report_unposted(&ticket(), "c1", "rate limited"));
+        assert!(following.report_unposted(&ticket(), "c2", "rate limited"));
+        following.report_settled(&ticket());
+        assert!(following.report_unposted(&ticket(), "c2", "rate limited"));
+        following.forget(&ticket());
+        assert!(following.report_unposted(&ticket(), "c2", "rate limited"));
+    }
+
     #[test]
     fn a_moved_stage_is_recorded_once_until_it_changes_or_the_ticket_is_back() {
         let mut following = Following::default();

@@ -5300,6 +5300,42 @@ fn a_fix_report_the_tracker_refused_is_posted_at_the_next_pass_once() {
     assert_eq!(unposted.len(), 1, "{warned:?}");
 }
 
+/// OWL-232's acceptance: the tracker keeps refusing the DELIVERY report
+/// across several watch passes, and the log holds one warning, not one per
+/// pass; the report is posted once the tracker accepts it.
+#[test]
+fn an_owed_fix_report_the_tracker_keeps_refusing_is_warned_of_once() {
+    let bench = delivered();
+    let delivered_events = bench.events().len();
+    let github = bench.github.clone();
+    github.followed.lock().unwrap().conclusion = "FAILURE";
+    bench.refuse.set(Some("[owlshift] DELIVERY"));
+    let mut pass = 0;
+    let (_, lines, printed) = bench.watch(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        &mut |_| {
+            pass += 1;
+            match pass {
+                1 => github.followed.lock().unwrap().conclusion = "SUCCESS",
+                4 => bench.refuse.set(None),
+                _ => {}
+            }
+            pass < 6
+        },
+    );
+    let reports = reports(&bench);
+    assert_eq!(reports.len(), 2, "{reports:?}\n{lines}\n{printed}");
+    assert!(reports[1].contains(FIX_PASS_1), "{}", reports[1]);
+    assert!(bench.record().delivery.unwrap().owed.is_none());
+    let events = &bench.events()[delivered_events..];
+    let warned = data_of(events, EventKind::Warning, "what");
+    let unposted: Vec<&Value> = warned
+        .iter()
+        .filter(|w| w["what"] == "fix_report_unposted")
+        .collect();
+    assert_eq!(unposted.len(), 1, "{warned:?}");
+}
+
 /// OWL-218: `owlshift continue` at Watch posts the report the ref owes,
 /// once; one still owed when the pull request was merged is dropped with a
 /// warning, not posted.
