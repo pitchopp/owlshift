@@ -138,6 +138,15 @@ pub enum Gate {
     Passed(Vec<String>),
 }
 
+/// How each lead line of a DELIVERY report starts (OWL-218, OWL-231): a
+/// fix pass, a rebase, a correction, or a correction with nothing to push.
+/// A first delivery's report has none.
+const FIX_PASS_LEAD: &str = "**Fix pass ";
+const REBASE_LEAD: &str = "**Rebased onto ";
+const CORRECTED_LEAD: &str = "**Corrected after delivery,**";
+const UNCORRECTED_LEAD: &str = "**No correction needed after delivery:**";
+const LEADS: [&str; 4] = [FIX_PASS_LEAD, REBASE_LEAD, CORRECTED_LEAD, UNCORRECTED_LEAD];
+
 impl DeliveryReport {
     /// The comment body: the `[owlshift] DELIVERY` header, the pull request,
     /// the check set, the project gate, the decisions, what remains for a
@@ -196,6 +205,18 @@ impl DeliveryReport {
         body
     }
 
+    /// The line after the header of the report as rendered: its lead line,
+    /// else its summary, else its pull request line.
+    fn second_line(&self) -> String {
+        let (repair, pull_request) = self.lead_lines();
+        let summary = flatten(&self.summary);
+        repair.unwrap_or(if summary.is_empty() {
+            pull_request
+        } else {
+            summary
+        })
+    }
+
     /// The lines that tell which push the report is of: the fix pass, the
     /// rebase or the correction line (OWL-146) when there is one, and the
     /// pull request line with its head. Two reports with the same are of the same push (OWL-218).
@@ -207,19 +228,19 @@ impl DeliveryReport {
             // A push adopted from a ref that kept no report names no checks.
             Some(if checks.is_empty() {
                 format!(
-                    "**Fix pass {} of {MAX_FIX_PASSES} after delivery.**",
+                    "{FIX_PASS_LEAD}{} of {MAX_FIX_PASSES} after delivery.**",
                     fix.pass
                 )
             } else {
                 format!(
-                    "**Fix pass {} of {MAX_FIX_PASSES} after delivery,** for the red checks {}.",
+                    "{FIX_PASS_LEAD}{} of {MAX_FIX_PASSES} after delivery,** for the red checks {}.",
                     fix.pass,
                     checks.join(", ")
                 )
             })
         } else if let Some(rebase) = &self.rebase {
             Some(format!(
-                "**Rebased onto {} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
+                "{REBASE_LEAD}{} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
                  branch's history was replaced, leased on Owlshift's last push.",
                 code(&flatten(&rebase.base_branch)),
                 code(short(&rebase.onto)),
@@ -241,12 +262,12 @@ impl DeliveryReport {
                 };
                 if correction.pushed {
                     format!(
-                        "**Corrected after delivery,** to follow the decider's replies to the \
+                        "{CORRECTED_LEAD} to follow the decider's replies to the \
                          decisions{on}."
                     )
                 } else {
                     format!(
-                        "**No correction needed after delivery:** the pull request already \
+                        "{UNCORRECTED_LEAD} the pull request already \
                          follows the decider's replies to the decisions{on}, and nothing was \
                          pushed."
                     )
@@ -1524,48 +1545,34 @@ impl<'a> Writer<'a> {
         })
     }
 
-    /// Posts the delivery report on its ticket and returns the comment.
-    ///
-    /// When the ticket's newest delivery report already has exactly this
-    /// body, that comment is returned and nothing is posted, so a retried
-    /// delivery does not post the same report twice. A newer state (a check
-    /// finished, another head) gives another body, which is posted.
+    /// Posts a DELIVERY report on its ticket once and returns the comment
+    /// (OWL-218, OWL-231): when a DELIVERY comment on the ticket already
+    /// names the same pull request and head, with the same lead line (the
+    /// fix pass and the checks it answers, the rebase, or the correction and
+    /// its questions), that comment is returned and nothing is posted,
+    /// whatever its checks said then. A first delivery's report has no lead
+    /// line, so a repair's or a correction's report on the same head never
+    /// stands in for it, nor it for theirs. A report posted before a crash,
+    /// or before a ticket ref that a restore rewound, is thus never posted
+    /// again, and a later try never posts a newer body of the same push.
     pub fn post_delivery_report(&self, report: &DeliveryReport) -> Result<Comment, WriteError> {
         floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
-        let body = report.render();
-        let latest = self
-            .tracker
-            .comments(&report.ticket)
-            .map_err(WriteError::Tracker)?
-            .into_iter()
-            .rev()
-            .find(|comment| is_delivery(&comment.body));
-        if let Some(latest) = latest
-            && latest.body == body
-        {
-            return Ok(latest);
-        }
-        self.tracker
-            .post_comment(&report.ticket, &body)
-            .map_err(WriteError::Tracker)
-    }
-
-    /// Posts a fix, rebase or correction run's delivery report once
-    /// (OWL-218, OWL-146): when a delivery report on the ticket already
-    /// names the same fix pass, rebase or correction and the same pull
-    /// request head, that comment is returned and
-    /// nothing is posted, whatever its checks said then. A report posted
-    /// before a crash kept it as posted is thus never posted again, and a
-    /// pass after it never posts a newer body of the same push.
-    pub fn post_repair_report(&self, report: &DeliveryReport) -> Result<Comment, WriteError> {
-        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
-        let (repair, pull_request) = report.lead_lines();
+        let (lead, pull_request) = report.lead_lines();
+        let second = report.second_line();
         let names = |body: &str| {
-            let lines: Vec<&str> = body.lines().collect();
-            repair
-                .iter()
-                .chain([&pull_request])
-                .all(|line| lines.contains(&line.as_str()))
+            let mut lines = body.lines().map(str::trim_end).filter(|l| !l.is_empty());
+            // The header is the first line, as `is_delivery` read it.
+            let after_header = lines.nth(1);
+            let same_lead = match &lead {
+                Some(lead) => after_header == Some(lead.as_str()),
+                // A first report's summary may start as a lead does.
+                None => {
+                    after_header == Some(second.as_str())
+                        || !after_header
+                            .is_some_and(|line| LEADS.iter().any(|p| line.starts_with(p)))
+                }
+            };
+            same_lead && body.lines().any(|line| line.trim_end() == pull_request)
         };
         let posted = self
             .tracker
@@ -1579,6 +1586,13 @@ impl<'a> Writer<'a> {
         self.tracker
             .post_comment(&report.ticket, &report.render())
             .map_err(WriteError::Tracker)
+    }
+
+    /// Posts a fix, rebase or correction run's delivery report once: the
+    /// rule of [`Writer::post_delivery_report`], kept under this name for
+    /// its callers.
+    pub fn post_repair_report(&self, report: &DeliveryReport) -> Result<Comment, WriteError> {
+        self.post_delivery_report(report)
     }
 
     /// Posts a round's QUESTIONS comment and returns it as the tracker
@@ -2896,43 +2910,167 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         assert_eq!(VisibleStage::Parked.state(&unnamed), "Asked");
     }
 
+    /// OWL-231: a first delivery's report is posted once per head, whatever
+    /// its checks say by the next try, as a ticket ref a restore rewound
+    /// would have it delivered again.
     #[test]
-    fn the_writer_posts_a_report_once_per_state() {
+    fn the_writer_posts_a_first_report_once_per_head() {
         let tracker = FakeTracker::default();
         let writer = Writer::new(&tracker);
         let pending = report(Ok(set(
             Mergeable::Mergeable,
             vec![check("ci", CheckState::Pending, "QUEUED", false)],
         )));
+        let green = report(Ok(set(
+            Mergeable::Mergeable,
+            vec![check("ci", CheckState::Passed, "SUCCESS", false)],
+        )));
 
         let posted = writer.post_delivery_report(&pending).unwrap();
         assert_eq!(posted.body, pending.render());
         assert_eq!(tracker.posts.get(), 1);
 
-        // A retry with the same report posts nothing and returns the first.
+        // Another try, the checks read since, posts nothing and returns the
+        // first.
         tracker.post_comment(&ticket(), "A human comment.").unwrap();
+        assert_eq!(writer.post_delivery_report(&green).unwrap(), posted);
         assert_eq!(writer.post_delivery_report(&pending).unwrap(), posted);
         assert_eq!(tracker.posts.get(), 2);
 
-        // A newer state is a new report.
-        let green = report(Ok(set(
-            Mergeable::Mergeable,
-            vec![check("ci", CheckState::Passed, "SUCCESS", false)],
-        )));
-        let newer = writer.post_delivery_report(&green).unwrap();
-        assert_ne!(newer.id, posted.id);
+        // Another head is another delivery.
+        let mut moved = green.clone();
+        moved.pull_request.head = CommitId::new("b".repeat(40)).unwrap();
+        assert_ne!(writer.post_delivery_report(&moved).unwrap(), posted);
         assert_eq!(tracker.posts.get(), 3);
-
-        // Back to the first body: it is no longer the newest report.
-        writer.post_delivery_report(&pending).unwrap();
-        assert_eq!(tracker.posts.get(), 4);
 
         // A tracker that cannot list comments gets no post.
         tracker.fail_comments.set(true);
         let error = writer.post_delivery_report(&green).unwrap_err();
         assert!(matches!(error, WriteError::Tracker(_)), "{error}");
         assert_eq!(error.to_string(), "tracker: tracker down");
-        assert_eq!(tracker.posts.get(), 4);
+        assert_eq!(tracker.posts.get(), 3);
+    }
+
+    /// OWL-231: on the same head, a fix pass's, a rebase's or a
+    /// correction's report never stands in for the first delivery's, and a
+    /// first report whose summary starts as a lead line does is still its
+    /// own.
+    #[test]
+    fn a_repair_report_is_not_the_first_report() {
+        let green = report(Ok(set(
+            Mergeable::Mergeable,
+            vec![check("ci", CheckState::Passed, "SUCCESS", false)],
+        )));
+        let repairs = leads(&green);
+        for repair in &repairs {
+            let tracker = FakeTracker::default();
+            let writer = Writer::new(&tracker);
+            writer.post_delivery_report(repair).unwrap();
+            let first = writer.post_delivery_report(&green).unwrap();
+            assert_eq!(first.body, green.render());
+            assert_eq!(tracker.posts.get(), 2);
+            // Nor the first report for the repair's, posted once.
+            assert_ne!(writer.post_repair_report(repair).unwrap(), first);
+            assert_eq!(tracker.posts.get(), 2);
+        }
+
+        for lead in LEADS {
+            let tracker = FakeTracker::default();
+            let writer = Writer::new(&tracker);
+            let mut odd = green.clone();
+            odd.summary = format!("{lead} said the model.");
+            let posted = writer.post_delivery_report(&odd).unwrap();
+            assert_eq!(writer.post_delivery_report(&odd).unwrap(), posted);
+            assert_eq!(tracker.posts.get(), 1);
+        }
+    }
+
+    /// A fix pass with and without checks, a rebase, a correction and a
+    /// correction with nothing pushed, each of `report`'s head.
+    fn leads(report: &DeliveryReport) -> Vec<DeliveryReport> {
+        let with = |f: &dyn Fn(&mut DeliveryReport)| {
+            let mut repair = report.clone();
+            f(&mut repair);
+            repair
+        };
+        let corrected = |pushed| Corrected {
+            questions: vec!["Which greeting?".to_owned()],
+            pushed,
+        };
+        vec![
+            with(&|r| {
+                r.fix_pass = Some(FixPass {
+                    pass: 1,
+                    checks: vec!["ci".to_owned()],
+                })
+            }),
+            with(&|r| {
+                r.fix_pass = Some(FixPass {
+                    pass: 1,
+                    checks: Vec::new(),
+                })
+            }),
+            with(&|r| {
+                r.rebase = Some(Rebased {
+                    base_branch: "main".to_owned(),
+                    onto: CommitId::new("c".repeat(40)).unwrap(),
+                    repair: 1,
+                })
+            }),
+            with(&|r| r.correction = Some(corrected(true))),
+            with(&|r| r.correction = Some(corrected(false))),
+        ]
+    }
+
+    /// Each lead line `lead_lines` renders starts as one of `LEADS` does.
+    #[test]
+    fn every_lead_line_is_known() {
+        let first = report(Err(forge::Error::new(ErrorKind::Unauthorized, "not read")));
+        for repair in leads(&first) {
+            let lead = repair.lead_lines().0.unwrap();
+            assert!(LEADS.iter().any(|p| lead.starts_with(p)), "{lead}");
+        }
+        assert_eq!(first.lead_lines().0, None);
+    }
+
+    /// OWL-231: a correction with nothing to push reports once per head and
+    /// questions; other questions are another report.
+    #[test]
+    fn a_report_with_nothing_corrected_is_posted_once_per_questions() {
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker);
+        let pending = report(Ok(set(
+            Mergeable::Mergeable,
+            vec![check("ci", CheckState::Pending, "QUEUED", false)],
+        )));
+        let unchanged = |mut report: DeliveryReport, question: &str| {
+            report.correction = Some(Corrected {
+                questions: vec![question.to_owned()],
+                pushed: false,
+            });
+            report
+        };
+        let posted = writer
+            .post_delivery_report(&unchanged(pending.clone(), "Which greeting?"))
+            .unwrap();
+        let mut green = pending.clone();
+        green.checks = Ok(set(
+            Mergeable::Mergeable,
+            vec![check("ci", CheckState::Passed, "SUCCESS", false)],
+        ));
+        assert_eq!(
+            writer
+                .post_delivery_report(&unchanged(green.clone(), "Which greeting?"))
+                .unwrap(),
+            posted
+        );
+        assert_ne!(
+            writer
+                .post_delivery_report(&unchanged(green, "Which language?"))
+                .unwrap(),
+            posted
+        );
+        assert_eq!(tracker.posts.get(), 2);
     }
 
     /// OWL-218: a fix or rebase report is posted once per push, whatever

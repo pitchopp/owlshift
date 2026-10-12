@@ -185,6 +185,7 @@ impl FakeGitHub {
             } })
         } else if query.starts_with("query Checks") {
             let head = self.tip();
+            let conclusion = self.followed.lock().unwrap().conclusion;
             json!({ "repository": { "pullRequest": {
                 "state": "OPEN", "headRefOid": head, "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
@@ -194,7 +195,7 @@ impl FakeGitHub {
                         "pageInfo": { "hasNextPage": false, "endCursor": null },
                         "nodes": [{
                             "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
-                            "conclusion": "SUCCESS", "isRequired": true,
+                            "conclusion": conclusion, "isRequired": true,
                             "detailsUrl": "https://github.com/demo/project/runs/1",
                             "checkSuite": null,
                         }],
@@ -1010,7 +1011,8 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
 
     // A delivery cut short after its push, before its pull request was
     // kept, is finished by `do`: the checkout is fetched, the push is up to
-    // date, and the pull request and its report are found, not made twice.
+    // date, and the pull request and its report are found, not made twice,
+    // though its checks now read red (OWL-231).
     let mut cut = kept.clone();
     cut.state = owlshift_contracts::refs::PersistedState::parse(
         r#"{"format":3,"stage":"verify","round":0,"reasks":0,"failed_runs":0,"fix_passes":0,"repairs":0}"#,
@@ -1026,9 +1028,11 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
     });
     cut.delivery = Some(pushing);
     bench.write_record(&cut);
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
     let (again, printed) = bench.run(vec![bench.reply(None, Some(DONE))], None);
     let again = again.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(!again.opened);
+    assert_eq!(again.verdict, Some(Verdict::Red));
     assert_eq!(bench.github.created.lock().unwrap().len(), 1);
     assert_eq!(bench.comments().len(), 1);
     assert!(printed.contains("pushed=up_to_date"), "{printed}");
