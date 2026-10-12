@@ -837,6 +837,18 @@ const RESTATED: &str = "the whole question is in this round's QUESTIONS comment"
 const RESTATED_CATEGORY_CHARS: usize = 80;
 const RESTATED_TEXT_CHARS: usize = 1_000;
 
+/// The most characters a decided question's category keeps, and each of its
+/// other texts, in a DECISION comment too long to hold whole (OWL-237). No
+/// other comment shows the question, so these caps are looser than the
+/// restated ones.
+const DECIDED_CATEGORY_CHARS: usize = 80;
+const DECIDED_TEXT_CHARS: usize = 5_000;
+
+/// What a RESUME comment says of an answer whose reason the ticket's record
+/// did not keep.
+const NOT_KEPT: &str =
+    "answered in an earlier check, whose reason the ticket's record did not keep.";
+
 /// A text of a comment, from a model, a run or the forge, that the comment
 /// may cut to hold in [`MAX_COMMENT_CHARS`] (OWL-228).
 struct Fit {
@@ -966,38 +978,51 @@ impl DecisionComment {
     /// contradict), the decision and what settles it, how to reverse it, and
     /// the footer, which names the resolver's run. Text from a model is
     /// flattened to one line.
+    ///
+    /// It holds in [`MAX_COMMENT_CHARS`] (OWL-237): a body that does not
+    /// hold whole has its texts cut, visibly. No other comment shows a
+    /// decided question whole (a round's QUESTIONS comment leaves it out), so its
+    /// texts are capped loosely (80 characters for the category, 5,000 for
+    /// each of the others) and the decision and its basis not at all: they
+    /// are what the decider reverses, so they are cut last, only as the
+    /// longest texts, never before a shorter one.
     pub fn render(&self) -> String {
+        let question = &self.question;
+        let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
+        let texts = vec![
+            Fit::capped(flatten(&question.category), LONGER, DECIDED_CATEGORY_CHARS),
+            Fit::capped(flatten(&question.text), LONGER, DECIDED_TEXT_CHARS),
+            Fit::capped(flatten(&question.context), LONGER, DECIDED_TEXT_CHARS),
+            Fit::capped(options.join(" / "), LONGER, DECIDED_TEXT_CHARS),
+            Fit::new(flatten(&self.decision), LONGER),
+            Fit::new(flatten(&self.basis), LONGER),
+        ];
+        fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
+    }
+
+    /// The body of `texts`, as [`Self::render`] gives them, maybe cut.
+    fn body(&self, texts: &[String]) -> String {
+        let [category, text, context, options, decision, basis] = texts else {
+            unreachable!("a decision has six texts")
+        };
         let header = Header {
             kind: MarkerKind::Decision,
             round: None,
         };
-        let question = &self.question;
-        let mut block = vec![format!(
-            "**Question** ({}) {}",
-            flatten(&question.category),
-            flatten(&question.text)
-        )];
-        let context = flatten(&question.context);
+        let mut block = vec![format!("**Question** ({category}) {text}")];
         if !context.is_empty() {
-            block.push(context);
+            block.push(context.clone());
         }
-        if !question.options.is_empty() {
-            let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
-            block.push(format!("Options: {}", options.join(" / ")));
+        if !self.question.options.is_empty() {
+            block.push(format!("Options: {options}"));
         }
-        let mut sections = vec![
+        let sections = [
             header.render(),
             "Owlshift decided this question of a run without asking you: what the ticket, the \
              project's rules or the repository already settles. It is reversible."
                 .to_owned(),
-        ];
-        sections.extend([
             block.join("\n"),
-            format!(
-                "**Decision:** {}\n**Settled by:** {}",
-                flatten(&self.decision),
-                flatten(&self.basis)
-            ),
+            format!("**Decision:** {decision}\n**Settled by:** {basis}"),
             "To reverse it, reply to this comment with what you want instead: the next run \
              follows your reply over this decision, and once the pull request is delivered, \
              Owlshift's watch corrects it to follow your reply."
@@ -1010,7 +1035,7 @@ impl DecisionComment {
                 run: self.run.clone(),
             }
             .render(),
-        ]);
+        ];
         let mut body = sections.join("\n\n");
         body.push('\n');
         body
@@ -1181,7 +1206,29 @@ impl ResumeComment {
     /// The comment body: the `[owlshift] RESUME · round N` header, each
     /// question with what was understood of its answer, and the footer. Text
     /// from a model is flattened to one line.
+    ///
+    /// It holds in [`MAX_COMMENT_CHARS`] (OWL-237): a body that does not
+    /// hold whole has its texts cut, visibly, the questions' first, which
+    /// the round's QUESTIONS comment shows whole, then the longest. Every
+    /// question keeps its id and its `Understood:` line.
     pub fn render(&self) -> String {
+        let texts = self
+            .understood
+            .iter()
+            .flat_map(|(question, verdict)| {
+                let [category, text, ..] = question_texts(question);
+                let understood = match verdict {
+                    Some(verdict) => flatten(&verdict.reason),
+                    None => NOT_KEPT.to_owned(),
+                };
+                [category, text, Fit::new(understood, LONGER)]
+            })
+            .collect();
+        fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
+    }
+
+    /// The body of `texts`, as [`Self::render`] gives them, maybe cut.
+    fn body(&self, texts: &[String]) -> String {
         let header = Header {
             kind: MarkerKind::Resume,
             round: Some(self.round),
@@ -1194,18 +1241,10 @@ impl ResumeComment {
                 self.round
             ),
         ];
-        for (question, verdict) in &self.understood {
-            let understood = match verdict {
-                Some(verdict) => flatten(&verdict.reason),
-                None => "answered in an earlier check, whose reason the ticket's record did not \
-                         keep."
-                    .to_owned(),
-            };
+        for ((question, _), texts) in self.understood.iter().zip(texts.chunks(3)) {
             sections.push(format!(
-                "**{}** ({}) {}\nUnderstood: {understood}",
-                question.id,
-                flatten(&question.category),
-                flatten(&question.text)
+                "**{}** ({}) {}\nUnderstood: {}",
+                question.id, texts[0], texts[1], texts[2]
             ));
         }
         let footer = Footer {
@@ -3527,6 +3566,111 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             unmentioned.post_reply(&reply).unwrap().comment.body,
             reply.render()
         );
+    }
+
+    /// OWL-237: a RESUME comment restating a round at its bounds, with
+    /// reasons past any comment, holds in one comment; every question keeps
+    /// its id and its `Understood:` line, and the cuts are visible.
+    #[test]
+    fn a_maximal_resume_comment_holds_in_one_comment() {
+        let resume = ResumeComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(3).unwrap(),
+            understood: maximal_open()
+                .into_iter()
+                .enumerate()
+                .map(|(i, (mut question, verdict))| {
+                    if i == 5 {
+                        // Past the cap a question's text gives way at.
+                        question.text = format!("Which 6? {}", "u".repeat(5_000));
+                    }
+                    (question, (i != 3).then_some(verdict))
+                })
+                .collect(),
+        };
+        let body = resume.render();
+        assert!(body.contains(&cut_note(RESTATED)));
+        assert!(!body.contains(&"u".repeat(RESTATED_TEXT_CHARS)));
+        assert!(chars(&body) <= MAX_COMMENT_CHARS, "{}", chars(&body));
+        assert!(chars(&body) > MAX_COMMENT_CHARS - 100, "room left unused");
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Resume);
+        assert!(marked.footer.is_some());
+        every_question_in_order(&body, "\nUnderstood: ");
+        assert!(body.contains(&cut_note(LONGER)));
+        assert!(body.contains("**Q4** (scope) Which 4?"));
+        assert!(body.contains(NOT_KEPT));
+        // A round that holds is rendered whole.
+        let small = ResumeComment {
+            understood: resume.understood[..2].to_vec(),
+            ..resume
+        };
+        assert!(!small.render().contains("(cut: "));
+    }
+
+    /// OWL-237: a DECISION comment whose question, decision and basis are
+    /// each far past a comment holds in one comment; its frame stays, the
+    /// question's texts are cut to their caps first and the decision and its
+    /// basis share what is left.
+    #[test]
+    fn a_maximal_decision_comment_holds_in_one_comment() {
+        let decision = DecisionComment {
+            ticket: ticket(),
+            question: Question {
+                id: QuestionId::new("Q1").unwrap(),
+                category: "c".repeat(1 << 20),
+                context: "x".repeat(1 << 20),
+                text: format!("Which?{}", "t".repeat(1 << 20)),
+                options: vec!["o".repeat(1 << 20), "p".repeat(1 << 20)],
+                recommendation: None,
+            },
+            decision: "d".repeat(1 << 20),
+            basis: "b".repeat(1 << 20),
+            run: Some("run-1".to_owned()),
+        };
+        let body = decision.render();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS, "{}", chars(&body));
+        assert!(chars(&body) > MAX_COMMENT_CHARS - 100, "room left unused");
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Decision);
+        assert!(marked.footer.is_some());
+        for frame in [
+            "**Question** (",
+            ") Which?",
+            "\nOptions: ",
+            "**Decision:** d",
+            "\n**Settled by:** b",
+            "To reverse it, reply to this comment",
+        ] {
+            assert!(body.contains(frame), "{frame}");
+        }
+        assert!(body.contains(&cut_note(LONGER)));
+        // The question's texts stop at their caps; the decision and its
+        // basis keep the most of what is left.
+        assert!(!body.contains(&"c".repeat(DECIDED_CATEGORY_CHARS + 1)));
+        assert!(!body.contains(&"t".repeat(DECIDED_TEXT_CHARS + 1)));
+        assert!(!body.contains(&"x".repeat(DECIDED_TEXT_CHARS + 1)));
+        assert!(!body.contains(&"o".repeat(DECIDED_TEXT_CHARS + 1)));
+        assert!(body.contains(&"d".repeat(30_000)) && body.contains(&"b".repeat(30_000)));
+        // What holds whole is rendered as it is, every text in its place.
+        let small = DecisionComment {
+            question: Question {
+                category: "naming".to_owned(),
+                context: "Context.".to_owned(),
+                text: "Which?".to_owned(),
+                options: vec!["a".to_owned(), "b".to_owned()],
+                ..decision.question.clone()
+            },
+            decision: "A.".to_owned(),
+            basis: "The ticket.".to_owned(),
+            ..decision
+        };
+        let body = small.render();
+        assert!(!body.contains("(cut: "));
+        assert!(body.contains(
+            "**Question** (naming) Which?\nContext.\nOptions: a / b\n\n**Decision:** A.\n\
+             **Settled by:** The ticket.\n\n"
+        ));
     }
 
     /// OWL-228: a PARKED comment at the re-ask limit of a round at its
