@@ -1300,10 +1300,18 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
         .collect();
     assert!(!config.stack.gate.is_empty());
     for command in &config.stack.gate {
-        assert!(
-            runs.contains(&command.as_str()),
-            "{command} is not a CI step"
-        );
+        // CI runs the tests under cargo-nextest and the doctests apart
+        // (OWL-241), where a developer runs them all with `cargo test`.
+        let in_ci: &[&str] = match command.as_str() {
+            "cargo test --workspace --locked" => &[
+                "cargo nextest run --workspace --locked --no-fail-fast",
+                "cargo test --workspace --doc --locked",
+            ],
+            command => &[command],
+        };
+        for step in in_ci {
+            assert!(runs.contains(step), "{step} is not a CI step");
+        }
     }
     for step in ["cargo fmt", "cargo clippy", "cargo test"] {
         assert!(
