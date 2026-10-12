@@ -4182,9 +4182,11 @@ fn push_what(kind: PushKind) -> &'static str {
 ///
 /// A round posted in parts (OWL-223) is kept as its last part's comment, so
 /// the earlier parts are folded into the round's `questions` entry rather
-/// than repeated: a marked QUESTIONS comment of the kept ask's round that
-/// says it is a part and was posted at or before the ask. A later comment, or
-/// one of another round, that only copies the marker stays a comment.
+/// than repeated: the marked QUESTIONS comments of the kept ask's round that
+/// directly precede the kept comment as its parts n-1 down to 1 of n, posted
+/// at or before the ask. A later comment, one of another round, one that only
+/// copies the marker, or a part of an abandoned attempt at the same round
+/// stays a comment.
 ///
 /// The test bench's stand-in driver builds its briefs' threads with it too
 /// (`owlshift_testkit::scenario`), from the asks and decisions it keeps.
@@ -4199,10 +4201,11 @@ pub fn thread(
         .map(|ask| ask.comment.as_str())
         .chain(decisions.iter().map(|kept| kept.comment.as_str()))
         .collect();
-    let is_earlier_part = |comment: &Comment| {
-        asks.iter()
-            .any(|ask| ask.kind == AskKind::Questions && is_part_of(comment, ask))
-    };
+    let earlier_parts: HashSet<&str> = asks
+        .iter()
+        .filter(|ask| ask.kind == AskKind::Questions)
+        .flat_map(|ask| earlier_parts(comments, ask))
+        .collect();
     // Both lists are oldest first; a stable sort by time keeps each one's
     // order and puts a decision before an ask of the same time.
     let mut kept: Vec<Kept<'_>> = decisions
@@ -4215,7 +4218,7 @@ pub fn thread(
     let mut thread = Vec::new();
     let mut in_force = current.clone();
     for comment in comments {
-        if posted.contains(comment.id.as_str()) || is_earlier_part(comment) {
+        if posted.contains(comment.id.as_str()) || earlier_parts.contains(comment.id.as_str()) {
             continue;
         }
         while let Some(entry) = kept.next_if(|entry| entry.at() < comment.created_at) {
@@ -4238,18 +4241,50 @@ pub fn thread(
     thread
 }
 
-/// Whether `comment` is a part of the round `ask` kept, other than the one
-/// the ask keeps: marked QUESTIONS of the ask's round, "Part k of n" with k < n,
-/// posted at or before the ask. The parts of an abandoned attempt at the
-/// same round (its ref write failed) are folded too.
-fn is_part_of(comment: &Comment, ask: &Ask) -> bool {
-    comment.created_at <= ask.at
-        && matches!(
+/// The ids of the comments that are the earlier parts of the round `ask`
+/// kept: from the kept comment, a "Part n of n", back through the comments before it:
+/// the marked QUESTIONS of the ask's round must be parts n-1 down to 1 of the
+/// same n, posted at or before the ask; other comments between them are
+/// skipped. When the kept comment is gone from the tracker, nothing is folded. The parts of
+/// an abandoned attempt (its ref write failed, or a part was refused) are
+/// not among them.
+fn earlier_parts<'a>(comments: &'a [Comment], ask: &Ask) -> Vec<&'a str> {
+    let Some(kept) = comments.iter().position(|c| c.id == ask.comment) else {
+        return Vec::new();
+    };
+    let Some((last, total)) = crate::writer::part_numbers(&comments[kept].body) else {
+        return Vec::new();
+    };
+    if last != total {
+        return Vec::new();
+    }
+    let mut wanted = (1..total).rev().peekable();
+    let mut folded = Vec::new();
+    for comment in comments[..kept].iter().rev() {
+        let Some(&part) = wanted.peek() else {
+            break;
+        };
+        let of_the_round = matches!(
             MarkedComment::parse(&comment.body),
             Ok(Some(MarkedComment { header, .. }))
                 if header.kind == MarkerKind::Questions && header.round == Some(ask.round)
-        )
-        && crate::writer::is_earlier_part(&comment.body)
+        );
+        if !of_the_round {
+            // A person's comment between two parts.
+            continue;
+        }
+        if comment.created_at > ask.at
+            || crate::writer::part_numbers(&comment.body) != Some((part, total))
+        {
+            return Vec::new();
+        }
+        folded.push(comment.id.as_str());
+        wanted.next();
+    }
+    if wanted.peek().is_some() {
+        return Vec::new();
+    }
+    folded
 }
 
 /// An entry the ticket ref keeps, which takes the place of its comment in a
