@@ -5100,6 +5100,49 @@ fn a_moved_ticket_waits_and_a_fix_run_that_asks_parks_it() {
     assert_eq!(state_of(&bench).fix_passes(), 0);
 }
 
+/// A ticket left in a stage Owlshift does not work in records one
+/// `stage_moved` event across the passes that find it there, and another
+/// each time it is moved again (OWL-219, architecture section 5, "A ticket a
+/// person moved"). The return to a working stage is the unit test's in
+/// `follow`.
+#[test]
+fn a_moved_stage_is_recorded_once_across_watch_passes() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    move_ticket(&bench, "Done");
+    let before = bench.events().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        // Each pass is past the hold a refused repair sets (ten minutes), so
+        // each one attempts the repair again.
+        bench.waited.set(SignedDuration::from_mins(11 * pass));
+        match pass {
+            3 => move_ticket(&bench, "Backlog"),
+            5 => move_ticket(&bench, "Done"),
+            _ => {}
+        }
+        pass < 7
+    });
+    assert_eq!(outcomes.len(), 7, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Err(Stop::Refused(why)) if why.contains("not a state"))),
+        "{outcomes:?}"
+    );
+    let moved: Vec<Value> = data_of(&bench.events()[before..], EventKind::Decision, "watch")
+        .iter()
+        .filter(|d| d["watch"] == "stage_moved")
+        .map(|d| d["stage"].clone())
+        .collect();
+    assert_eq!(
+        moved,
+        [json!("Done"), json!("Backlog"), json!("Done")],
+        "{lines}\n{printed}"
+    );
+}
+
 /// A red no run fixes parks the ticket without a run; restarted, a red of
 /// the code gets its fix run, and a push the forge refuses while the branch
 /// is still at Owlshift's last push parks it again, git's answer quoted.

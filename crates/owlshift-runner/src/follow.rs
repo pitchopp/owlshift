@@ -289,8 +289,9 @@ struct Recorded {
 
 /// What watch keeps of the pull requests it follows from one pass to the
 /// next. Restarting watch forgets it: the first look of each pull request is
-/// recorded again, and the hour a failure beside a running check waits
-/// starts again.
+/// recorded again, the stage of a ticket a person moved is recorded again
+/// (OWL-219), and the hour a failure beside a running check waits starts
+/// again.
 #[derive(Debug, Default)]
 pub struct Following {
     /// No forge read before then: a rate-limited answer.
@@ -303,6 +304,9 @@ pub struct Following {
     unread: HashMap<TicketId, &'static str>,
     /// The head whose overdue checks were warned of, per ticket.
     overdue: HashMap<TicketId, String>,
+    /// The stage last recorded as moved out of Owlshift's states, per ticket
+    /// (OWL-219).
+    moved: HashMap<TicketId, String>,
 }
 
 /// A warning a look records, beside the events of what it read.
@@ -467,12 +471,30 @@ impl Following {
         )
     }
 
+    /// Whether the move of `ticket` to `stage`, a stage Owlshift does not work
+    /// in, is to be recorded: it is when the last stage recorded for the
+    /// ticket differs, or none was (OWL-219). Keeps `stage` as recorded.
+    pub fn stage_moved(&mut self, ticket: &TicketId, stage: &str) -> bool {
+        if self.moved.get(ticket).is_some_and(|last| last == stage) {
+            return false;
+        }
+        self.moved.insert(ticket.clone(), stage.to_owned());
+        true
+    }
+
+    /// The ticket was read in a stage Owlshift works in: a later move out of
+    /// it is recorded, even to the stage it was last recorded at.
+    pub fn stage_back(&mut self, ticket: &TicketId) {
+        self.moved.remove(ticket);
+    }
+
     /// Forgets everything kept of `ticket`.
     pub fn forget(&mut self, ticket: &TicketId) {
         self.recorded.remove(ticket);
         self.failing_since.remove(ticket);
         self.unread.remove(ticket);
         self.overdue.remove(ticket);
+        self.moved.remove(ticket);
     }
 
     /// Forgets the tickets `kept` does not name.
@@ -481,6 +503,7 @@ impl Following {
         self.failing_since.retain(|t, _| kept.contains(t));
         self.unread.retain(|t, _| kept.contains(t));
         self.overdue.retain(|t, _| kept.contains(t));
+        self.moved.retain(|t, _| kept.contains(t));
     }
 }
 
@@ -822,6 +845,22 @@ mod tests {
         canned.push(Response::new(502, "<html>"));
         let (_, third) = following.look(&forge, &ticket(), &delivery(), at(3));
         assert_eq!(third.len(), 1);
+    }
+
+    /// A ticket's moved stage is recorded when it changes, and again after
+    /// the ticket was read back in a stage Owlshift works in (OWL-219).
+    #[test]
+    fn a_moved_stage_is_recorded_once_until_it_changes_or_the_ticket_is_back() {
+        let mut following = Following::default();
+        assert!(following.stage_moved(&ticket(), "Done"));
+        assert!(!following.stage_moved(&ticket(), "Done"));
+        assert!(following.stage_moved(&ticket(), "Backlog"));
+        following.stage_back(&ticket());
+        assert!(following.stage_moved(&ticket(), "Backlog"));
+        following.forget(&ticket());
+        assert!(following.stage_moved(&ticket(), "Backlog"));
+        following.retain(&[]);
+        assert!(following.stage_moved(&ticket(), "Backlog"));
     }
 
     /// The hour a failure beside a running check waits counts from the
