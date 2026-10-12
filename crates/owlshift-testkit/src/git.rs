@@ -5,8 +5,10 @@
 //! fake harness is launched by the executor with the agent environment,
 //! which drops every `GIT_*` variable: built from [`GitEnv::agent_parent`],
 //! it finds the same configuration as git's global one in the bench's home
-//! (`$XDG_CONFIG_HOME/git/config`). Its git also reads the host's system
-//! configuration, whose keys that matter here the bench's file overrides.
+//! (`$XDG_CONFIG_HOME/git/config`), but for the setting the agent
+//! environment carries itself (see [`GitEnv::create`]). Its git also reads
+//! the host's system configuration, whose keys that matter here the bench's
+//! file overrides.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -34,6 +36,15 @@ impl GitEnv {
     /// and a hooks folder of its own, all empty. It is written twice: as the
     /// file [`GitEnv::apply`] names, and where git looks for its global
     /// configuration under `XDG_CONFIG_HOME`, for the agent's git.
+    ///
+    /// The first copy also turns off the server information git's own
+    /// housekeeping writes when it repacks (OWL-240): the bench's git plays
+    /// agents inside a run's window, and a `git commit`, such as the one a
+    /// `git rebase --continue` runs, can start `git maintenance run --auto`,
+    /// whose repack would write the shared `info/refs` the isolation check
+    /// guards, and the run would be quarantined for nothing. The runner's
+    /// and the agent's git turn it off themselves (OWL-197), so the second
+    /// copy leaves it to the agent environment, as in production.
     pub fn create(home: PathBuf) -> Result<Self, GitError> {
         let io = |error: std::io::Error| GitError(format!("{}: {error}", home.display()));
         fs::create_dir_all(home.join("hooks")).map_err(io)?;
@@ -50,7 +61,8 @@ impl GitEnv {
             config_path(&home.join("attributes")),
             config_path(&home.join("hooks")),
         );
-        fs::write(home.join(FIXTURE_CONFIG), &config).map_err(io)?;
+        let bench = format!("{config}[repack]\n\tupdateServerInfo = false\n");
+        fs::write(home.join(FIXTURE_CONFIG), bench).map_err(io)?;
         fs::write(home.join("git").join("config"), &config).map_err(io)?;
         Ok(Self { home, date: None })
     }
@@ -297,6 +309,43 @@ mod tests {
         assert_eq!(
             stdout(git(&["check-attr", "eol", "--", "a.txt"])),
             "a.txt: eol: unspecified\n"
+        );
+    }
+
+    /// OWL-240: git's own housekeeping, started by the bench's git, writes no
+    /// `info/refs`, which the isolation check guards: a `gc` stands in for
+    /// the maintenance a commit starts, with the same repack run as a child
+    /// process. The agent's copy of the configuration leaves that to the
+    /// agent environment: git reading it, the same `gc` writes the file.
+    #[test]
+    fn the_benchs_git_leaves_the_server_info_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = GitEnv::create(tmp.path().join("home")).unwrap();
+        env.run(tmp.path(), &["init", "--quiet", "repo"]).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        env.run(&repo, &["add", "a.txt"]).unwrap();
+        env.run(&repo, &["commit", "--quiet", "-m", "a"]).unwrap();
+        let refs = repo.join(".git").join("info").join("refs");
+
+        env.run(&repo, &["gc", "--quiet"]).unwrap();
+        assert!(!refs.exists(), "the bench's git wrote {}", refs.display());
+
+        // The control: the agent's copy as git's global configuration, which
+        // `GitEnv::run` cannot name.
+        let mut command = Command::new("git");
+        command
+            .args(["gc", "--quiet"])
+            .current_dir(&repo)
+            .stdin(Stdio::null());
+        env.apply(&mut command);
+        command.env("GIT_CONFIG_GLOBAL", env.home.join("git").join("config"));
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            refs.exists(),
+            "no {} through the agent's copy",
+            refs.display()
         );
     }
 

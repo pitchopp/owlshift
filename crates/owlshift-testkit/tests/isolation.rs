@@ -206,13 +206,15 @@ fn a_runs_own_work_passes_and_every_breach_is_found() {
         [Violation::SharedGitFiles(vec!["config".into()])]
     );
     // All of `info/` stays guarded: an ignore rule, and the `info/refs` that
-    // housekeeping writes when nothing turns it off, as plain git's `gc` does.
+    // housekeeping writes when nothing turns it off, as a `gc` does with the
+    // server information turned back on (the bench's git turns it off,
+    // OWL-240).
     assert_eq!(
         f.around(|f| fs::write(f.main.join(".git/info/exclude"), "stray/\n").unwrap()),
         [Violation::SharedGitFiles(vec!["info/exclude".into()])]
     );
     assert_eq!(
-        f.around(|f| f.worktree_git(&["gc", "--quiet"])),
+        f.around(|f| f.worktree_git(&["-c", "repack.updateServerInfo=true", "gc", "--quiet"])),
         [Violation::SharedGitFiles(vec!["info/refs".into()])]
     );
 
