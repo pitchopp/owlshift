@@ -24,7 +24,7 @@ use crate::format::{
 };
 use crate::ids::TicketId;
 use crate::result::{
-    self, DECISIONS_ADVICE, Followup, Question, RefusedChoice, Verdict, check_verdicts,
+    self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
 
 /// The namespace of every Owlshift ref.
@@ -996,7 +996,9 @@ pub struct TicketDelivery {
     pub pushing: Option<Pushing>,
     /// The DELIVERY report of `pushed`, a fix, rebase or correction run's
     /// push that landed, while it is not on the ticket yet (OWL-218): the
-    /// next pass posts it, once. Since format 2.
+    /// next pass posts it, once. Since format 2; since format 4 also the
+    /// first delivery's report, and a correction's that pushed nothing
+    /// (OWL-236).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owed: Option<OwedReport>,
     /// Why and when watch stopped following the pull request.
@@ -1034,7 +1036,7 @@ pub struct Pushing {
 }
 
 /// What a fix, rebase or correction run gave its DELIVERY report (OWL-218,
-/// OWL-146).
+/// OWL-146), or the delivering Build run (OWL-236).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeptReport {
@@ -1051,27 +1053,40 @@ pub struct KeptReport {
     /// replies reversed (format 3, OWL-146).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<String>,
+    /// For the first delivery, the runner's own notes the report lists after
+    /// the resolver's decisions, which `questions.json` keeps: the late
+    /// comments a Build run was given (OWL-139). Never a resolver's decision.
+    /// A newer report that replaces this one unposted lists none of them
+    /// (format 4, OWL-236).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Decision>,
     /// The follow-ups the run proposed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub followups: Vec<Followup>,
 }
 
 /// A DELIVERY report still to be posted for the delivery's `pushed`
-/// commit, a fix, rebase or correction run's push (OWL-218, OWL-146). The
+/// commit: a fix, rebase or correction run's push (OWL-218, OWL-146), the
+/// first delivery, or a correction that pushed nothing (OWL-236). The
 /// commit, and for a rebase the base it rebased onto, are the delivery's
 /// `pushed` and `rebased_onto`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OwedReport {
-    /// `fix`, `rebase` or `correction`.
+    /// `delivery`, `fix`, `rebase` or `correction`.
     pub kind: PushKind,
     /// The fix pass or the repair the push was, from 1; for a correction,
-    /// how many decisions it follows the replies to.
+    /// how many decisions it follows the replies to; 1 for the first
+    /// delivery.
     pub count: u32,
     /// What the run gave its report; absent for a push adopted from a ref
     /// that kept none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<KeptReport>,
+    /// A correction's report whose run found the pull request already
+    /// following the replies, and pushed nothing (format 4, OWL-236).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
 }
 
 /// Which run's push.
@@ -1130,8 +1145,10 @@ impl TicketDelivery {
 
     /// Parses a `delivery.json`. A format-1 one, written before the owed
     /// report and the kept report were kept (OWL-218), is read without
-    /// them, and a format-2 one, written before a correction run's push
-    /// (OWL-146), without one; the next write gives it the current format.
+    /// them, a format-2 one, written before a correction run's push
+    /// (OWL-146), without one, and a format-3 one, written before the first
+    /// delivery's report was owed (OWL-236), without that; the next write
+    /// gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -1141,38 +1158,51 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1 or format-2 document read as the current format, or
-    /// `None` for any other. Format 1 is format 2 without `owed` and
-    /// `pushing.report`, and format 2 is format 3 without a correction's push
-    /// or report, so each is refused in an older format.
+    /// A format-1, -2 or -3 document read as the current format, or `None`
+    /// for any other. Format 1 is format 2 without `owed` and
+    /// `pushing.report`, format 2 is format 3 without a correction's push or
+    /// report, and format 3 is format 4 without an owed delivery report, a
+    /// report's `notes` or an owed report's `unchanged`, so each is refused
+    /// in an older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=2).contains(&format) {
+        if !(1..=3).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
+        let owed = fields.get("owed").and_then(serde_json::Value::as_object);
         let report = pushing.is_some_and(|pushing| pushing.contains_key("report"));
+        let reports = || {
+            [
+                pushing.and_then(|p| p.get("report")),
+                owed.and_then(|owed| owed.get("report")),
+            ]
+            .into_iter()
+            .flatten()
+        };
         let correction = [
             pushing.and_then(|p| p.get("kind")),
-            fields.get("owed").and_then(|owed| owed.get("kind")),
+            owed.and_then(|owed| owed.get("kind")),
         ]
         .into_iter()
         .flatten()
         .any(|kind| kind == "correction");
-        let questions = [
-            pushing.and_then(|p| p.get("report")),
-            fields.get("owed").and_then(|owed| owed.get("report")),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|report| report.get("questions").is_some());
+        let questions = reports().any(|report| report.get("questions").is_some());
+        let notes = reports().any(|report| report.get("notes").is_some());
+        let owed_delivery = owed
+            .and_then(|owed| owed.get("kind"))
+            .is_some_and(|kind| kind == "delivery");
+        let unchanged = owed.is_some_and(|owed| owed.contains_key("unchanged"));
         for (field, kept) in [
-            ("owed", format == 1 && fields.contains_key("owed")),
+            ("owed", format == 1 && owed.is_some()),
             ("pushing.report", format == 1 && report),
-            ("correction's push", correction),
-            ("correction's report", questions),
+            ("correction's push", format <= 2 && correction),
+            ("correction's report", format <= 2 && questions),
+            ("owed delivery report", owed_delivery),
+            ("report's notes", notes),
+            ("unchanged correction", unchanged),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -1202,10 +1232,11 @@ impl TicketDelivery {
     /// Checks the commits are full ids, the branches git branch names, the
     /// link a plain `https://` URL, that a push under way names its `onto`
     /// exactly when it is a rebase's and keeps a report only for a fix, a
-    /// rebase or a correction, that an owed report is one of theirs, from 1,
-    /// of a pushed commit with its pull request (and for a rebase its base),
-    /// that a report names questions exactly when it is a correction's, and
-    /// that an ended delivery pushes nothing.
+    /// rebase or a correction, that an owed report counts from 1, of a
+    /// pushed commit with its pull request (and for a rebase its base), and
+    /// is unchanged only for a correction, that a report names questions
+    /// exactly when it is a correction's and keeps notes only for a
+    /// delivery, and that an ended delivery pushes nothing.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
         for (field, branch) in [("branch", &self.branch), ("base_branch", &self.base_branch)] {
@@ -1282,11 +1313,17 @@ impl TicketDelivery {
                 "a report names questions if and only if it is a correction's".to_owned(),
             );
         }
+        // The runner's notes are the first delivery's (OWL-236).
+        if reports
+            .into_iter()
+            .flatten()
+            .any(|(kind, report)| kind != PushKind::Delivery && !report.notes.is_empty())
+        {
+            return invalid("a report keeps notes only if it is a delivery's".to_owned());
+        }
         if let Some(owed) = &self.owed {
-            if owed.kind == PushKind::Delivery {
-                return invalid(
-                    "an owed report is a fix's, a rebase's or a correction's".to_owned(),
-                );
+            if owed.unchanged && owed.kind != PushKind::Correction {
+                return invalid("an owed report is unchanged only if it is a correction's".to_owned());
             }
             if owed.count == 0 {
                 return invalid("an owed report counts from 1".to_owned());

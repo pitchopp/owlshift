@@ -50,9 +50,11 @@ pub const TICKET_STATE_FORMAT: u32 = 3;
 pub const QUESTIONS_FORMAT: u32 = 10;
 /// The format version of a ticket's delivery (`delivery.json` on a ticket
 /// ref, OWL-209). Format 2 adds the `owed` report and the push's kept
-/// `report` (OWL-218); format 3 a correction run's push (OWL-146); formats 1
-/// and 2 are still read.
-pub const DELIVERY_FORMAT: u32 = 3;
+/// `report` (OWL-218); format 3 a correction run's push (OWL-146); format 4
+/// the first delivery's owed report, with its kept `notes`, and a
+/// correction's owed report that pushed nothing (OWL-236); formats 1 to 3
+/// are still read.
+pub const DELIVERY_FORMAT: u32 = 4;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 
