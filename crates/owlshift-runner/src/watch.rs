@@ -307,7 +307,12 @@ impl Watch<'_> {
         }
         let ids: Vec<TicketId> = waiting.iter().map(|(ticket, _)| ticket.clone()).collect();
         let followed: Vec<TicketId> = following.iter().map(|(ticket, _)| ticket.clone()).collect();
-        memory.holds.retain(&[&ids[..], &unread[..]].concat());
+        // A followed ticket keeps its repair's hold too: otherwise a repair
+        // that left the ref as it was, or a round under it whose state was
+        // not kept (OWL-211), would run again at the next pass.
+        memory
+            .holds
+            .retain(&[&ids[..], &followed[..], &unread[..]].concat());
         memory
             .following
             .retain(&[&followed[..], &unread[..]].concat());

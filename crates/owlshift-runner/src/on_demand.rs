@@ -1624,6 +1624,16 @@ impl OnDemand<'_> {
             verdicts: Vec::new(),
             result_refusal: None,
         });
+        // At Watch, `do` is refused: `continue` reads the pull request
+        // again, and a repair still due asks again (OWL-211).
+        let again = if state.status()
+            == (Status::NeedsInput {
+                return_to: Stage::Watch,
+            }) {
+            format!("run `owlshift continue {ticket}` to read the pull request again")
+        } else {
+            format!("run `owlshift do {ticket}` to ask them again")
+        };
         if let Err(error) = self.store(p, state, asked) {
             return Stop::NotKept {
                 landed: if status == result::Status::PremiseFalse {
@@ -1633,8 +1643,8 @@ impl OnDemand<'_> {
                 },
                 message: format!(
                     "the questions of round {round} are on the ticket (comment {}), but keeping \
-                     them in the ticket's ref failed: {error}; once the ref can be written, run \
-                     `owlshift do {ticket}` to ask them again",
+                     them in the ticket's ref failed: {error}; once the ref can be written, \
+                     {again}",
                     posted.id
                 ),
             };
@@ -1928,6 +1938,7 @@ impl OnDemand<'_> {
                     ticket: ticket.clone(),
                     round,
                     understood: answer_check::understood(questions.round_asks(round)),
+                    return_to: next.stage(),
                 };
                 let posted = Writer::new(self.tracker)
                     .post_resume(&resume)
@@ -1948,7 +1959,11 @@ impl OnDemand<'_> {
                         posted.id
                     ),
                 })?;
-                self.show_after(&ticket, Some(&ran.run), Event::Answered, sink);
+                // Working at Build; review at Watch, where the pull request
+                // is open (OWL-211).
+                if let Some(stage) = VisibleStage::of(next.status()) {
+                    self.show(&ticket, Some(&ran.run), stage, sink);
+                }
                 sink.emit(
                     &ticket,
                     Some(&ran.run),
@@ -2925,7 +2940,7 @@ impl RepairKind {
 /// What a repair's runs need of their kind ([`OnDemand::repair_runs`]).
 struct RepairRun<'r> {
     role: Role,
-    /// `fix` or `rebase`, for what the runner tells.
+    /// `fix`, `rebase` or `correction`, for what the runner tells.
     what: &'static str,
     pull_request: u64,
     rules: &'r [Rule],
@@ -3284,8 +3299,8 @@ impl OnDemand<'_> {
     /// number, briefed with the gate failure of the attempt before it. A
     /// failed run, a refused result, a usage limit, a breach or a bound go
     /// as for a Build run, a `done` whose commit `run.accept` refuses is a
-    /// failed run; questions park the ticket, listed in its PARKED comment,
-    /// until OWL-211 opens a round that returns to Watch.
+    /// failed run; questions go to the decider as a round that returns to
+    /// Watch, without the resolver (OWL-211).
     fn repair_runs(
         &self,
         p: &mut Prepared,
@@ -3293,7 +3308,6 @@ impl OnDemand<'_> {
         run: &RepairRun<'_>,
         sink: &mut EventSink<'_>,
     ) -> Result<(RepairDone, Vec<Followup>), Stop> {
-        let ticket = p.ticket.clone();
         let current = person(p.current()?, &p.found);
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
@@ -3346,39 +3360,54 @@ impl OnDemand<'_> {
                 detail = Some(why);
             }
             if event == Event::Questions {
-                // Deviation until OWL-211: the questions park the ticket,
-                // listed in the PARKED comment, instead of a round that
-                // returns to Watch.
-                let parked = match state.apply(PIPELINE, Event::Blocked) {
-                    Ok(Transition::Parked { state, .. }) => state,
+                // Back to the decider (OWL-211): a round that returns to
+                // Watch, without the resolver, since these are acts and
+                // arbitrations the agent cannot settle.
+                let Some(result) = ran.result() else {
+                    return Err(Stop::Refused(
+                        "a question round without its questions".to_owned(),
+                    ));
+                };
+                // A false premise with no question asks the decider nothing:
+                // it parks, so a person looks rather than watch running the
+                // repair again at each pass.
+                if !result.asks() {
+                    let parked = match state.apply(PIPELINE, Event::Blocked) {
+                        Ok(Transition::Parked { state, .. }) => state,
+                        other => return Err(core_error(other)),
+                    };
+                    let detail = format!(
+                        "the {} run of pull request #{} found its premise false, with no \
+                         question: {} Look, then type `owlshift continue {}`",
+                        run.what, run.pull_request, result.summary, p.ticket
+                    );
+                    return Err(self.park_with(
+                        p,
+                        &parked,
+                        ParkReason::Blocked,
+                        Some(&ran.run),
+                        detail,
+                        None,
+                        Vec::new(),
+                        sink,
+                    ));
+                }
+                let waiting = match state.apply(PIPELINE, Event::Questions) {
+                    Ok(Transition::To(waiting)) => waiting,
                     other => return Err(core_error(other)),
                 };
-                let questions: Vec<String> = ran
-                    .result()
-                    .map(|result| {
-                        result
-                            .questions
-                            .iter()
-                            .map(|q| format!("{}: {}", q.id, q.text))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let summary = ran.result().map(|r| r.summary.clone()).unwrap_or_default();
-                let detail = format!(
-                    "the {} run of pull request #{} asks before it can go on: {summary} \
-                     Questions: {}. Answer on the ticket, then type `owlshift continue {ticket}`",
-                    run.what,
-                    run.pull_request,
-                    questions.join(" ")
+                let asked = asked_choices(&brief, result);
+                let summary = format!(
+                    "The {} run of pull request #{} asks before it can go on. {}",
+                    run.what, run.pull_request, result.summary
                 );
-                return Err(self.park_with(
+                return Err(self.ask(
                     p,
-                    &parked,
-                    ParkReason::Blocked,
-                    Some(&ran.run),
-                    detail,
-                    None,
-                    Vec::new(),
+                    &waiting,
+                    result.status,
+                    &summary,
+                    Round::of(&result.questions, &[], &asked, None),
+                    &ran.run,
                     sink,
                 ));
             }
