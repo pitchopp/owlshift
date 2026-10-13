@@ -5,8 +5,9 @@
 //! It was extracted at the second implementation (Linear, after the Markdown
 //! tracker) and is not frozen: principle 8 freezes a contract only once three
 //! implementations exist. It grows with the steps that need more: the
-//! visible stage came with P2 (OWL-137), listing admitted tickets comes in
-//! P4.
+//! visible stage came with P2 (OWL-137), listing admitted tickets and reading
+//! the admission gesture with P4 (OWL-246, architecture section 5, "The
+//! drain").
 
 pub mod linear;
 pub mod markdown;
@@ -16,6 +17,7 @@ use std::fmt;
 use jiff::Timestamp;
 
 use owlshift_contracts::Priority;
+use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
 
 /// What the runner needs from a tracker, as far as this build goes.
@@ -69,6 +71,101 @@ pub trait Tracker {
     fn mention(&self, _account: &str) -> Result<Option<String>, Error> {
         Ok(None)
     }
+
+    /// The tickets of the ready column that carry the admission gesture,
+    /// each with the tickets that block it, every page read (OWL-246). The
+    /// tracker's own order: the runner sorts. An error by default, and for
+    /// the `delegation` gesture, which is not built.
+    fn admitted(&self, _column: &Column<'_>) -> Result<Vec<Listed>, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not list admitted tickets",
+        ))
+    }
+
+    /// Who made the admission gesture on a ticket: the actor of the latest
+    /// history entry that added the label (or moved the ticket to the
+    /// state), or the ticket's creator when none did (architecture section
+    /// 5, "By whom"). Read once, before the ticket's first intake, so it is
+    /// not part of the listing. An error by default, and for the
+    /// `delegation` gesture.
+    fn gesture(&self, _id: &TicketId, _admit: &Admit) -> Result<Gesture, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not read an admission gesture",
+        ))
+    }
+}
+
+/// What [`Tracker::admitted`] reads: the ready column of a project.
+#[derive(Clone, Copy, Debug)]
+pub struct Column<'a> {
+    /// The project's `[tracker].team`; required by Linear, ignored by the
+    /// Markdown tracker.
+    pub team: Option<&'a str>,
+    /// The ready state's name, `[tracker].states.ready`, matched exactly.
+    pub ready: &'a str,
+    /// The admission gesture, `[tracker].admit`: a label gesture lists the
+    /// tickets carrying that label (matched exactly), a state gesture every
+    /// ticket of the column.
+    pub admit: &'a Admit,
+}
+
+/// A ticket of the ready column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub ticket: Ticket,
+    /// When the tracker created it; `None` on a tracker that keeps no time
+    /// (the Markdown tracker), whose ties then go to the identifier.
+    pub created_at: Option<Timestamp>,
+    /// The tickets that block it by the tracker's relations, once each. The
+    /// text convention is read by the core, not here.
+    pub blockers: Vec<Blocker>,
+}
+
+/// A ticket that blocks another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Blocker {
+    pub id: TicketId,
+    /// The type of the state it shows; `None` when the tracker gives it no
+    /// type (a Markdown stage other than `Done`) or does not know the
+    /// ticket. Only [`StateType::Completed`] releases a ticket: a canceled
+    /// or duplicate blocker, or one without a type, keeps it waiting
+    /// (architecture section 5, "Blockers").
+    pub state: Option<StateType>,
+}
+
+/// The type of a tracker state: Linear's `WorkflowState.type`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StateType {
+    Triage,
+    Backlog,
+    Unstarted,
+    Started,
+    Completed,
+    Canceled,
+    Duplicate,
+}
+
+/// Who made a ticket's admission gesture, and when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gesture {
+    /// An [`Author::Account`] only when a person's account made it: an app
+    /// user (Owlshift's own included), a bot, an integration or an account
+    /// the tracker no longer knows is [`Author::Other`], which never admits.
+    pub account: Author,
+    /// The tracker's time of the gesture; `None` on a tracker that keeps
+    /// no history (the Markdown tracker).
+    pub at: Option<Timestamp>,
+}
+
+/// The `delegation` gesture is not built: decision D8's app takes no
+/// delegation scope (architecture section 5, "The gesture").
+pub(crate) fn no_delegation() -> Error {
+    Error::new(
+        ErrorKind::Other,
+        "the `delegation` admission gesture is not built: admit with a label or a state",
+    )
 }
 
 /// A row of the tracker capability table in architecture section 6.

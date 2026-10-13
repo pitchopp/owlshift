@@ -1,0 +1,549 @@
+{
+  "recorded": "2026-10-13 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "variables": {
+          "after": null,
+          "filter": {
+            "state": {
+              "name": {
+                "eq": "Todo"
+              }
+            },
+            "team": {
+              "key": {
+                "eq": "OWL"
+              }
+            }
+          },
+          "first": 50
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issues": {
+            "nodes": [
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T19:04:14.558Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nFound by the P3 exit gate (OWL-212, 2026-10-13). OWL-256's fix run started at 17:18:46 and ended at 17:59:30 by the event log's timestamps, 40.7 minutes, but its `run_ended` event says `elapsed_ms=918556`, 15.3 minutes: the machine slept during the run, and the monotonic clock behind `elapsed_ms` does not count sleep on macOS. Times read from `elapsed_ms`, such as the exit gates' records, under-report what the operator waited.\n\n## Scope\n\n* Keep `elapsed_ms` (monotonic, which deadlines rely on) and add the wall-clock span between `run_started` and `run_ended`, or document that `elapsed_ms` excludes sleep where the event format is described.\n* Say in the build plan which one the gates' records use.\n\n## Acceptance\n\n* A run across a sleep shows both durations, or the event format says which one it records and why.",
+                "externalUserCreator": null,
+                "identifier": "OWL-262",
+                "inverseRelations": {
+                  "nodes": [],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Improvement"
+                    },
+                    {
+                      "name": "Core"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Record a run's wall-clock time next to its monotonic elapsed time"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:47.665Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **L · The exit gate,**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\nThe procedure is the build plan's \"P4 tasks & exit gate\": ten Owlshift tickets drained serially by `owlshift watch --drain`, at least one started by the merge of its blocker, run by the maintainer and recorded in the build plan as P2's and P3's gates were.\n\n## Acceptance\n\n* What the build plan's part L lists is built and tested, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part L; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-255",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-212",
+                        "state": {
+                          "type": "completed"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-254",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-155",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Improvement"
+                    },
+                    {
+                      "name": "Docs"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Run the P4 exit gate on real tickets"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:47.475Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **K · The scenarios**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\nS3, S4, S6, S12 and S13 played by the test bench on the Markdown tracker, as acceptance.\n\n## Acceptance\n\n* What the build plan's part K lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part K; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-254",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-253",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-251",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-250",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-249",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Improvement"
+                    },
+                    {
+                      "name": "Core"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Play scenarios S3, S4, S6, S12 and S13 on the test bench"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:47.132Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **J · Filing follow-ups**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\n`proposals.json` owed with the delivery or the repair, filed before the DELIVERY report, kept as filed; the duplicates and the three per parent; the report's lines; the floor's refusal of a proposal in the ready state or with the admission label.\n\n## Acceptance\n\n* What the build plan's part J lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part J; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-253",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-252",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-245",
+                        "state": {
+                          "type": "started"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Core"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "File runs' follow-ups as deduplicated proposals after delivery"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:46.914Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **I · Proposals in the tracker**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\nPending check (e) first. The adapter's proposal: into the triage state, or the backlog with `agent:proposed`; its relations and project; the two exact searches.\n\n## Acceptance\n\n* What the build plan's part I lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Pending live check (e), `issueCreate` into Triage with a project and relations, is run first and its dated result written in the build plan.\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part I; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-252",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-245",
+                        "state": {
+                          "type": "started"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Adapters"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Create follow-up proposals in the tracker's triage inbox"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:46.647Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **H · The open pull request cap**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\nThe count from the ticket refs, the hold on dispatch, its event and line. It waits for OWL-243, so that a parked ticket's merged pull request stops counting.\n\n## Acceptance\n\n* What the build plan's part H lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Waits for OWL-243, so that a parked ticket's merged pull request stops counting.\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part H; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-251",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-243",
+                        "state": {
+                          "type": "completed"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-250",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Core"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Hold new Builds at the open pull request cap"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:46.408Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **G · The drain in watch**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\n`--drain`; the listing each pass; the gesture's account checked and kept; one intake then at most one dispatch per pass, through `do`'s path under the lock; the reasons' events and lines.\n\n## Acceptance\n\n* What the build plan's part G lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part G; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-250",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-248",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-247",
+                        "state": {
+                          "type": "started"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-246",
+                        "state": {
+                          "type": "started"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Core"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Pick and dispatch admitted tickets in owlshift watch --drain"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:46.135Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **F · Dependencies to relations**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\nPending check (d) first. The Writer's relation write on Linear and on the Markdown tracker (`blocked_by`), and the checks before it, the cycle up to ten deep included.\n\n## Acceptance\n\n* What the build plan's part F lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Pending live check (d), `issueRelationCreate`, is run first and its dated result written in the build plan.\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part F; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-249",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-248",
+                        "state": {
+                          "type": "unstarted"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Adapters"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Turn intake's dependencies into tracker relations"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-13T09:33:45.860Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **E · Intake**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\n`roles/intake.md`; the run, read-only without network on the standard tier; the record and the INTAKE comment; its questions through the resolver to a round returning to Ready, whose RESUME moves the ticket back to the ready state; `continue` on a ticket at Intake.\n\n## Acceptance\n\n* What the build plan's part E lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part E; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-248",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-245",
+                        "state": {
+                          "type": "started"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Core"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Run intake on admitted tickets and keep its record"
+              },
+              {
+                "assignee": null,
+                "botActor": null,
+                "createdAt": "2026-10-04T09:15:59.736Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "## Why\n\nRoadmap P4, \"The drain\": Owlshift picks its own work, one ticket at a time. The design ([OWL-244](https://linear.app/owlshift/issue/OWL-244), pull request #215) splits the work into parts A to L; this issue is part **D · Doctor (OWL-155, re-scoped)**. The rules are settled there, so this issue does not decide them again.\n\n## Scope\n\n`admit.state` checked as a tracker state and against `states.ready`; the admission label and the exclusion label exist on the team or the workspace; `admitters` set, each an account of the workspace; `\"delegation\"` a warning; the team's triage inbox, or the label fallback. Each a warning, since none blocks `do`, with the note that `--drain` refuses to start.\n\n## Acceptance\n\n* What the build plan's part D lists is built and tested on the three CI platforms, and matches [architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>) section 5, \"The drain\".\n* Any deviation from the design starts with a change to the design documents.\n\n## Links\n\n* [Build plan](<https://github.com/pitchopp/owlshift/blob/main/docs/design/build-plan.md>), \"P4 · The drain\", \"Who builds what\", part D; and \"P4 tasks & exit gate\".\n* [Architecture](<https://github.com/pitchopp/owlshift/blob/main/docs/design/architecture.md>), section 5, \"The drain\".",
+                "externalUserCreator": null,
+                "identifier": "OWL-155",
+                "inverseRelations": {
+                  "nodes": [
+                    {
+                      "issue": {
+                        "identifier": "OWL-246",
+                        "state": {
+                          "type": "started"
+                        }
+                      },
+                      "type": "blocks"
+                    },
+                    {
+                      "issue": {
+                        "identifier": "OWL-245",
+                        "state": {
+                          "type": "started"
+                        }
+                      },
+                      "type": "blocks"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Improvement"
+                    },
+                    {
+                      "name": "CLI"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 3,
+                "title": "Check admission and the triage inbox in doctor"
+              }
+            ],
+            "pageInfo": {
+              "endCursor": "4a099336-d93c-40ea-9ef9-46edc045692d",
+              "hasNextPage": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}

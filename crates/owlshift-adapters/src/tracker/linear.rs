@@ -74,6 +74,28 @@
 //! the app gave the decider an `issueCommentMention` from the app user, and
 //! revoking one app token left another of the same scopes valid.
 //!
+//! Checked live on 2026-10-13 (OWL-246; build plan, "P4 · The drain"),
+//! read-only, for the drain's listing and the admission gesture:
+//!
+//! - `issues(filter: …)` with `team.key`, `state.name` and `labels.name`
+//!   each `eq` lists the column, paged by `after` (the Canceled tickets
+//!   labelled `agent`, two a page, then the next two). `labels.name.eq` is
+//!   case-sensitive: `Agent` lists nothing. A page of the listing costs about
+//!   230 complexity points.
+//! - `inverseRelations` leaves out an archived blocker unless asked with
+//!   `includeArchived: true`: OWL-116 listed none without it, and OWL-114
+//!   and OWL-23, both archived, with it. The team archives a closed issue
+//!   after a month, so a canceled blocker would otherwise vanish and release
+//!   the ticket; the listing asks for them.
+//! - `issue.history` lists newest first. Each entry has `actor` (a user,
+//!   with `app`), `botActor`, `addedLabels` (null when none) and `toState`.
+//!   OWL-129's entry adding `zone:backend/billing` has an account as its
+//!   actor, not an app. OWL-179, created with the label `agent`, and
+//!   OWL-249, created in Todo, have no entry for it: the creator made the
+//!   gesture. The GitHub integration's and Linear's workflow entries have a
+//!   `botActor` and no `actor`. One page of 50 entries costs about 411
+//!   points.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -88,10 +110,14 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use owlshift_contracts::Priority;
+use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
 
 pub use crate::graphql::{Response, Transport};
-use crate::tracker::{Author, Capability, Comment, Error, ErrorKind, Person, Ticket, Tracker};
+use crate::tracker::{
+    Author, Blocker, Capability, Column, Comment, Error, ErrorKind, Gesture, Listed, Person,
+    StateType, Ticket, Tracker, no_delegation,
+};
 
 /// Linear's GraphQL endpoint.
 pub const ENDPOINT: &str = "https://api.linear.app/graphql";
@@ -186,12 +212,15 @@ pub struct LinearTracker {
     /// The app's transport, for every write, when one is set.
     writes: Option<Shared>,
     comment_page: u32,
+    /// The page of the listing and of an issue's history.
+    page: u32,
 }
 
 impl fmt::Debug for LinearTracker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinearTracker")
             .field("comment_page", &self.comment_page)
+            .field("page", &self.page)
             .field("writes_as_app", &self.writes.is_some())
             .finish_non_exhaustive()
     }
@@ -208,8 +237,10 @@ impl LinearTracker {
     /// What the Linear adapter implements in this build.
     pub const CAPABILITIES: &'static [Capability] = &[
         Capability::ReadTicket,
+        Capability::ListAdmitted,
         Capability::Comments,
         Capability::VisibleStage,
+        Capability::BlockedBy,
     ];
 
     /// The adapter over HTTPS with this key.
@@ -223,6 +254,7 @@ impl LinearTracker {
             transport: Box::new(transport),
             writes: None,
             comment_page: MAX_PAGE,
+            page: MAX_PAGE,
         }
     }
 
@@ -276,9 +308,46 @@ impl LinearTracker {
         self
     }
 
+    /// Reads the listing of admitted tickets and an issue's history `size`
+    /// items a page (1 to [`MAX_PAGE`], the default), as
+    /// [`with_comment_page`](Self::with_comment_page) does for comments.
+    pub fn with_page(mut self, size: u32) -> Self {
+        self.page = size.clamp(1, MAX_PAGE);
+        self
+    }
+
     /// Sends one read and returns its `data`, decoded.
     fn call<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T, Error> {
         call(self.transport.as_ref(), query, variables)
+    }
+
+    /// Reads a connection page after page, `variables` taking the cursor as
+    /// `after`, until its last page or a page `enough` accepts. `connection`
+    /// takes each answer's connection out. A cursor that does not advance is
+    /// an error, never a loop.
+    fn pages<D: DeserializeOwned, T>(
+        &self,
+        what: &str,
+        query: &str,
+        mut variables: Value,
+        mut connection: impl FnMut(D) -> Connection<T>,
+        enough: impl Fn(&[T]) -> bool,
+    ) -> Result<Vec<T>, Error> {
+        let mut items = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            variables["after"] = json!(after);
+            let page = connection(self.call(query, variables.clone())?);
+            let stop = enough(&page.nodes);
+            items.extend(page.nodes);
+            if stop || !page.page_info.has_next_page {
+                return Ok(items);
+            }
+            match page.page_info.end_cursor {
+                Some(cursor) if after.as_ref() != Some(&cursor) => after = Some(cursor),
+                _ => return Err(invalid(format!("the pages of {what} do not advance"))),
+            }
+        }
     }
 
     /// Sends one write, through the app when one is set.
@@ -370,43 +439,129 @@ impl Tracker for LinearTracker {
 
     fn ticket(&self, id: &TicketId) -> Result<Ticket, Error> {
         let data: TicketData = self.call(TICKET_QUERY, json!({ "id": id.as_str() }))?;
-        let issue = data.issue;
-        if issue.labels.page_info.has_next_page {
-            return Err(invalid(format!(
-                "{id} has more than {MAX_PAGE} labels, which this adapter does not read"
-            )));
-        }
-        Ok(Ticket {
-            id: TicketId::new(issue.identifier).map_err(|e| invalid(e.to_string()))?,
-            title: issue.title,
-            description: issue.description.unwrap_or_default(),
-            priority: priority(issue.priority)?,
-            assignee: issue.assignee.map(User::into_person),
-            labels: issue.labels.nodes.into_iter().map(|l| l.name).collect(),
-            author: ticket_author(issue.creator, issue.bot_actor, issue.external_user_creator),
-        })
+        data.issue.into_ticket()
     }
 
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, Error> {
-        let mut comments = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
-            let variables =
-                json!({ "id": id.as_str(), "first": self.comment_page, "after": after });
-            let data: CommentsData = self.call(COMMENTS_QUERY, variables)?;
-            let page = data.issue.comments;
-            comments.extend(page.nodes.into_iter().map(LinearComment::into_comment));
-            if !page.page_info.has_next_page {
-                break;
-            }
-            match page.page_info.end_cursor {
-                Some(cursor) if after.as_ref() != Some(&cursor) => after = Some(cursor),
-                _ => return Err(invalid("the comment pages do not advance")),
-            }
-        }
+        let variables = json!({ "id": id.as_str(), "first": self.comment_page });
+        let mut comments: Vec<Comment> = self
+            .pages(
+                "comments",
+                COMMENTS_QUERY,
+                variables,
+                |data: CommentsData| data.issue.comments,
+                |_| false,
+            )?
+            .into_iter()
+            .map(LinearComment::into_comment)
+            .collect();
         // Linear lists newest first; the contract is oldest first.
         comments.sort_by_key(|c| c.created_at);
         Ok(comments)
+    }
+
+    /// The team's issues in the state named `ready`, carrying the label for
+    /// a label gesture, 50 a page to the last (architecture section 5, "The
+    /// ready column"). Their blockers are the `blocks` relations whose
+    /// `relatedIssue` is the ticket, archived blockers included (checked
+    /// 2026-10-13, above). More than 50 labels or relations on one ticket
+    /// is refused, never truncated, as [`Tracker::ticket`] refuses labels.
+    fn admitted(&self, column: &Column<'_>) -> Result<Vec<Listed>, Error> {
+        let Some(team) = column.team else {
+            return Err(invalid(
+                "listing the Linear ready column needs the project's `[tracker].team`",
+            ));
+        };
+        let mut filter = json!({
+            "team": { "key": { "eq": team.to_ascii_uppercase() } },
+            "state": { "name": { "eq": column.ready } },
+        });
+        match column.admit {
+            Admit::Label(label) => filter["labels"] = json!({ "name": { "eq": label } }),
+            Admit::State(_) => {}
+            Admit::Delegation => return Err(no_delegation()),
+        }
+        let variables = json!({ "filter": filter, "first": self.page });
+        self.pages(
+            "the ready column",
+            ADMITTED_QUERY,
+            variables,
+            |data: AdmittedData| data.issues,
+            |_| false,
+        )?
+        .into_iter()
+        .map(AdmittedIssue::into_listed)
+        .collect()
+    }
+
+    /// The history read newest first, page by page, up to the first page
+    /// holding an entry that made the gesture. The latest such entry is the
+    /// gesture: its actor by the rule of comments (`author`), so an app
+    /// user or a bot never admits. Two latest entries of one time by
+    /// different authors are nobody's. No entry: the creator, by the same
+    /// rule, since Linear records no entry for a label set at creation, and
+    /// an issue created through a person's API key is theirs (architecture
+    /// section 5, "By whom").
+    ///
+    /// A state gesture reads the latest move to the state, which the runner
+    /// itself makes when an intake round resumes ("Back to the ready
+    /// column"): read after that, the gesture is the app's and admits
+    /// nobody, which "Recorded once" keeps from happening before the intake
+    /// record is dropped.
+    fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<Gesture, Error> {
+        let made = |entry: &HistoryEntry| match admit {
+            Admit::Label(label) => entry
+                .added_labels
+                .iter()
+                .flatten()
+                .any(|added| &added.name == label),
+            Admit::State(state) => entry.to_state.as_ref().is_some_and(|s| &s.name == state),
+            Admit::Delegation => false,
+        };
+        if *admit == Admit::Delegation {
+            return Err(no_delegation());
+        }
+        let mut creation = None;
+        let entries = self.pages(
+            "the history",
+            GESTURE_QUERY,
+            json!({ "id": id.as_str(), "first": self.page }),
+            |data: GestureData| {
+                let issue = data.issue;
+                creation.get_or_insert((
+                    issue.created_at,
+                    issue.creator,
+                    issue.bot_actor,
+                    issue.external_user_creator,
+                ));
+                issue.history
+            },
+            |page| page.iter().any(made),
+        )?;
+        let mut made: Vec<HistoryEntry> = entries.into_iter().filter(made).collect();
+        if let Some(at) = made.iter().map(|entry| entry.created_at).max() {
+            made.retain(|entry| entry.created_at == at);
+            let mut authors = made
+                .into_iter()
+                .map(|entry| author(entry.actor.map(Actor::into_user), entry.bot_actor, None));
+            let first = authors.next().unwrap_or_else(Author::unknown);
+            let account = if authors.all(|other| other == first) {
+                first
+            } else {
+                Author::unknown()
+            };
+            return Ok(Gesture {
+                account,
+                at: Some(at),
+            });
+        }
+        let Some((created_at, creator, bot, external)) = creation else {
+            return Err(invalid(format!("Linear answered no history for {id}")));
+        };
+        Ok(Gesture {
+            account: author(creator.map(Actor::into_user), bot, external),
+            at: Some(created_at),
+        })
     }
 
     fn post_comment(&self, id: &TicketId, body: &str) -> Result<Comment, Error> {
@@ -508,10 +663,52 @@ macro_rules! comment_fields {
     };
 }
 
-const TICKET_QUERY: &str = "query Ticket($id: String!) { issue(id: $id) { \
-    identifier title description priority assignee { id displayName } \
-    creator { id displayName } botActor { name } externalUserCreator { name } \
-    labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } }";
+/// The fields read from every issue that becomes a [`Ticket`]: a ticket
+/// read alone and one read in the listing are the same value.
+macro_rules! issue_fields {
+    () => {
+        "identifier title description priority assignee { id displayName } \
+         creator { id displayName } botActor { name } externalUserCreator { name } \
+         labels(first: 50) { nodes { name } pageInfo { hasNextPage } }"
+    };
+}
+
+/// The fields of an account whose `app` decides whether it admits: never
+/// left to a default (see [`Actor`]).
+macro_rules! actor_fields {
+    () => {
+        "{ id displayName app }"
+    };
+}
+
+const TICKET_QUERY: &str = concat!(
+    "query Ticket($id: String!) { issue(id: $id) { ",
+    issue_fields!(),
+    " } }"
+);
+
+/// The ready column (OWL-246). The filter is built by
+/// [`Tracker::admitted`].
+const ADMITTED_QUERY: &str = concat!(
+    "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { \
+     issues(first: $first, after: $after, filter: $filter) { nodes { ",
+    issue_fields!(),
+    " createdAt inverseRelations(first: 50, includeArchived: true) { \
+     nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } \
+     pageInfo { hasNextPage endCursor } } }"
+);
+
+/// An issue's creation and history, for the admission gesture (OWL-246).
+const GESTURE_QUERY: &str = concat!(
+    "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { \
+     createdAt creator ",
+    actor_fields!(),
+    " botActor { name } externalUserCreator { name } \
+     history(first: $first, after: $after) { nodes { createdAt actor ",
+    actor_fields!(),
+    " botActor { name } addedLabels { name } toState { name } } \
+     pageInfo { hasNextPage endCursor } } } }"
+);
 
 const COMMENTS_QUERY: &str = concat!(
     "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { \
@@ -644,6 +841,159 @@ struct Issue {
     bot_actor: Option<Named>,
     external_user_creator: Option<Named>,
     labels: Connection<Label>,
+}
+
+impl Issue {
+    fn into_ticket(self) -> Result<Ticket, Error> {
+        let id = TicketId::new(self.identifier).map_err(|e| invalid(e.to_string()))?;
+        if self.labels.page_info.has_next_page {
+            return Err(invalid(format!(
+                "{id} has more than {MAX_PAGE} labels, which this adapter does not read"
+            )));
+        }
+        Ok(Ticket {
+            id,
+            title: self.title,
+            description: self.description.unwrap_or_default(),
+            priority: priority(self.priority)?,
+            assignee: self.assignee.map(User::into_person),
+            labels: self.labels.nodes.into_iter().map(|l| l.name).collect(),
+            author: ticket_author(self.creator, self.bot_actor, self.external_user_creator),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct AdmittedData {
+    issues: Connection<AdmittedIssue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdmittedIssue {
+    #[serde(flatten)]
+    issue: Issue,
+    created_at: Timestamp,
+    inverse_relations: Connection<Relation>,
+}
+
+#[derive(Deserialize)]
+struct Relation {
+    #[serde(rename = "type")]
+    kind: String,
+    /// The blocker for a `blocks` relation. Never expected null: a relation
+    /// Linear answers without its issue is refused rather than dropped,
+    /// since a dropped blocker would release the ticket.
+    issue: Option<RelatedIssue>,
+}
+
+#[derive(Deserialize)]
+struct RelatedIssue {
+    identifier: String,
+    state: StateOfType,
+}
+
+#[derive(Deserialize)]
+struct StateOfType {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl AdmittedIssue {
+    fn into_listed(self) -> Result<Listed, Error> {
+        let ticket = self.issue.into_ticket()?;
+        let id = &ticket.id;
+        if self.inverse_relations.page_info.has_next_page {
+            return Err(invalid(format!(
+                "{id} has more than {MAX_PAGE} relations, which this adapter does not read"
+            )));
+        }
+        let mut blockers: Vec<Blocker> = Vec::new();
+        for relation in self.inverse_relations.nodes {
+            if relation.kind != "blocks" {
+                continue;
+            }
+            let Some(blocker) = relation.issue else {
+                return Err(invalid(format!(
+                    "Linear answered a blocker of {id} without its issue"
+                )));
+            };
+            let blocker = Blocker {
+                id: TicketId::new(blocker.identifier).map_err(|e| invalid(e.to_string()))?,
+                state: Some(state_type(&blocker.state.kind)?),
+            };
+            if !blockers.contains(&blocker) {
+                blockers.push(blocker);
+            }
+        }
+        Ok(Listed {
+            ticket,
+            created_at: Some(self.created_at),
+            blockers,
+        })
+    }
+}
+
+/// Linear's `WorkflowState.type`. A type this adapter does not know is
+/// refused: guessing could release a ticket.
+fn state_type(kind: &str) -> Result<StateType, Error> {
+    Ok(match kind {
+        "triage" => StateType::Triage,
+        "backlog" => StateType::Backlog,
+        "unstarted" => StateType::Unstarted,
+        "started" => StateType::Started,
+        "completed" => StateType::Completed,
+        "canceled" => StateType::Canceled,
+        "duplicate" => StateType::Duplicate,
+        other => return Err(invalid(format!("unknown Linear state type {other:?}"))),
+    })
+}
+
+#[derive(Deserialize)]
+struct GestureData {
+    issue: GestureIssue,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GestureIssue {
+    created_at: Timestamp,
+    creator: Option<Actor>,
+    bot_actor: Option<Named>,
+    external_user_creator: Option<Named>,
+    history: Connection<HistoryEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryEntry {
+    created_at: Timestamp,
+    actor: Option<Actor>,
+    bot_actor: Option<Named>,
+    /// Null when the entry added none.
+    added_labels: Option<Vec<Label>>,
+    to_state: Option<StateName>,
+}
+
+/// An account whose gesture may admit. Unlike [`User`], `app` has no
+/// default: an answer without it is refused, so an app user can never read
+/// as an account because a query stopped asking.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Actor {
+    id: String,
+    display_name: String,
+    app: bool,
+}
+
+impl Actor {
+    fn into_user(self) -> User {
+        User {
+            id: self.id,
+            display_name: self.display_name,
+            app: self.app,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1341,6 +1691,145 @@ mod tests {
             other("Customer")
         );
         assert_eq!(author(user(), named(None), None), other("person-1"));
+    }
+
+    fn gesture_page(creator: Value, entries: Vec<Value>, more: Option<&str>) -> &'static str {
+        json!({ "data": { "issue": { "createdAt": "2026-10-01T00:00:00Z", "creator": creator,
+            "botActor": null, "externalUserCreator": null,
+            "history": { "nodes": entries,
+                "pageInfo": { "hasNextPage": more.is_some(), "endCursor": more } } } } })
+        .to_string()
+        .leak()
+    }
+
+    fn actor(id: &str, app: bool) -> Value {
+        json!({ "id": id, "displayName": id, "app": app })
+    }
+
+    fn added(at: &str, actor: Value, label: &str) -> Value {
+        json!({ "createdAt": at, "actor": actor, "botActor": null,
+            "addedLabels": [{ "name": label }], "toState": null })
+    }
+
+    /// The gesture's account (OWL-246): the latest entry that made it, read
+    /// page by page until one does; an app user's entry admits nobody, nor
+    /// do two entries of one time by different accounts; no entry, the
+    /// creator; an answer that does not say whether an account is an app is
+    /// refused.
+    #[test]
+    fn the_gesture_is_the_latest_entry_that_made_it_or_the_creator() {
+        let id = TicketId::new("OWL-1").unwrap();
+        let label = Admit::Label("agent".to_owned());
+        let person = |id: &str| {
+            Author::Account(Person {
+                id: id.to_owned(),
+                name: id.to_owned(),
+            })
+        };
+        let other = json!({ "createdAt": "2026-10-03T00:00:00Z", "actor": actor("u9", false),
+            "botActor": null, "addedLabels": [{ "name": "Agent" }], "toState": null });
+        let pages = vec![
+            gesture_page(actor("u0", false), vec![other], Some("c1")),
+            gesture_page(
+                actor("u0", false),
+                vec![
+                    added("2026-10-02T00:00:00Z", actor("u2", false), "agent"),
+                    added("2026-10-02T00:00:00Z", actor("u2", false), "agent"),
+                    added("2026-10-01T12:00:00Z", actor("u1", false), "agent"),
+                ],
+                Some("c2"),
+            ),
+        ];
+        // The second page holds the gesture: no third page is read.
+        let gesture = tracker(pages).with_page(3).gesture(&id, &label).unwrap();
+        assert_eq!(gesture.account, person("u2"));
+        assert_eq!(gesture.at, Some("2026-10-02T00:00:00Z".parse().unwrap()));
+
+        let app = vec![added("2026-10-02T00:00:00Z", actor("u2", true), "agent")];
+        let gesture = tracker(vec![gesture_page(actor("u0", false), app, None)])
+            .gesture(&id, &label)
+            .unwrap();
+        assert!(
+            matches!(gesture.account, Author::Other { .. }),
+            "{gesture:?}"
+        );
+
+        let tied = vec![
+            added("2026-10-02T00:00:00Z", actor("u2", false), "agent"),
+            added("2026-10-02T00:00:00Z", actor("u3", false), "agent"),
+        ];
+        let gesture = tracker(vec![gesture_page(actor("u0", false), tied, None)])
+            .gesture(&id, &label)
+            .unwrap();
+        assert_eq!(gesture.account, Author::unknown());
+
+        let gesture = tracker(vec![gesture_page(actor("u0", false), vec![], None)])
+            .gesture(&id, &label)
+            .unwrap();
+        assert_eq!(gesture.account, person("u0"));
+        assert_eq!(gesture.at, Some("2026-10-01T00:00:00Z".parse().unwrap()));
+
+        let unsaid = json!({ "id": "u0", "displayName": "u0" });
+        assert!(
+            tracker(vec![gesture_page(unsaid, vec![], None)])
+                .gesture(&id, &label)
+                .is_err()
+        );
+        assert!(tracker(vec![]).gesture(&id, &Admit::Delegation).is_err());
+    }
+
+    fn admitted_page(relations: Vec<Value>, more: bool) -> &'static str {
+        let issue = json!({ "identifier": "OWL-1", "title": "t", "description": null,
+            "priority": 0, "assignee": null, "creator": null, "botActor": null,
+            "externalUserCreator": null,
+            "labels": { "nodes": [], "pageInfo": { "hasNextPage": false } },
+            "createdAt": "2026-10-01T00:00:00Z",
+            "inverseRelations": { "nodes": relations, "pageInfo": { "hasNextPage": more } } });
+        json!({ "data": { "issues": { "nodes": [issue],
+            "pageInfo": { "hasNextPage": false, "endCursor": null } } } })
+        .to_string()
+        .leak()
+    }
+
+    /// The listing keeps each blocker once and never drops or guesses one:
+    /// a relation without its issue, a state type it does not know, and
+    /// more relations than a page are refused. It needs the team.
+    #[test]
+    fn the_listing_refuses_what_could_release_a_ticket() {
+        let label = Admit::Label("agent".to_owned());
+        let column = |team| Column {
+            team,
+            ready: "Todo",
+            admit: &label,
+        };
+        let blocks = |id: &str, kind: &str| json!({ "type": "blocks", "issue": { "identifier": id, "state": { "type": kind } } });
+        let related = json!({ "type": "related",
+            "issue": { "identifier": "OWL-3", "state": { "type": "started" } } });
+        let page = admitted_page(
+            vec![
+                blocks("OWL-2", "canceled"),
+                related,
+                blocks("OWL-2", "canceled"),
+            ],
+            false,
+        );
+        let listed = tracker(vec![page]).admitted(&column(Some("owl"))).unwrap();
+        assert_eq!(
+            listed[0].blockers,
+            [Blocker {
+                id: TicketId::new("OWL-2").unwrap(),
+                state: Some(StateType::Canceled),
+            }]
+        );
+
+        for page in [
+            admitted_page(vec![json!({ "type": "blocks", "issue": null })], false),
+            admitted_page(vec![blocks("OWL-2", "paused")], false),
+            admitted_page(vec![], true),
+        ] {
+            assert!(tracker(vec![page]).admitted(&column(Some("OWL"))).is_err());
+        }
+        assert!(tracker(vec![]).admitted(&column(None)).is_err());
     }
 
     #[test]

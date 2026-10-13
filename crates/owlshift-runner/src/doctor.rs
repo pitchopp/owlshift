@@ -2050,15 +2050,15 @@ always_human = []
     }
 
     #[test]
-    fn the_tracker_line_names_what_the_adapter_does_and_does_not_do_yet() {
+    fn the_tracker_line_names_what_the_adapter_does() {
         let (_dir, config) = linear_project();
         let tracker = tracker_check(&config);
         assert_well_formed(&tracker);
-        assert_eq!(tracker.status, Status::Warn);
+        assert_eq!(tracker.status, Status::Ok);
         assert_eq!(
             tracker.detail,
-            "`linear`: read a ticket, read and post comments, visible stage; \
-             not built yet: list admitted tickets"
+            "`linear`: read a ticket, list admitted tickets, read and post comments, \
+             visible stage, blocked-by relations"
         );
     }
 

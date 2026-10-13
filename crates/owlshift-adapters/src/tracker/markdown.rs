@@ -28,6 +28,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
 use owlshift_contracts::Priority;
+use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
 
 use crate::tracker::{self as shared, Capability, ErrorKind};
@@ -289,10 +290,9 @@ impl MarkdownTracker {
 /// serve the test bench, which sets comment authors and times itself; the
 /// runner posts as [`MarkdownTracker::AGENT`] at the current time.
 ///
-/// The inherent types carry more than the shared ones (the stage,
-/// blocked-by). The trait writes the visible stage but does not read it;
-/// they converge when it reads both and blocked-by relations; until then the
-/// conversion lives only here.
+/// The inherent types carry more than the shared ones: the trait reads the
+/// stage on its own ([`shared::Tracker::stage`]) and blocked-by through the
+/// listing ([`shared::Tracker::admitted`]); the conversion lives only here.
 impl shared::Tracker for MarkdownTracker {
     fn capabilities(&self) -> &'static [Capability] {
         Self::CAPABILITIES
@@ -300,19 +300,9 @@ impl shared::Tracker for MarkdownTracker {
 
     fn ticket(&self, id: &TicketId) -> Result<shared::Ticket, shared::Error> {
         self.require_ticket(id)?;
-        let ticket = MarkdownTracker::ticket(self, id).map_err(other)?;
-        Ok(shared::Ticket {
-            id: ticket.id,
-            title: ticket.title,
-            description: ticket.description,
-            priority: ticket.priority,
-            assignee: ticket.assignee.map(|name| shared::Person {
-                id: name.clone(),
-                name,
-            }),
-            labels: ticket.labels,
-            author: account(ticket.author),
-        })
+        MarkdownTracker::ticket(self, id)
+            .map(shared_ticket)
+            .map_err(other)
     }
 
     fn stage(&self, id: &TicketId) -> Result<String, shared::Error> {
@@ -337,18 +327,110 @@ impl shared::Tracker for MarkdownTracker {
         self.require_ticket(id)?;
         MarkdownTracker::set_stage(self, id, state).map_err(other)
     }
+
+    /// The tickets of `tickets/` at the stage `column.ready`, with the label
+    /// for a label gesture, in folder order. Their blockers are
+    /// `blocked_by`: one at the stage `Done` is completed; any other stage
+    /// has no type, and neither has a ticket the folder lacks, so both keep
+    /// the ticket waiting. A folder whose name is not a ticket identifier,
+    /// or a ticket that cannot be read, fails the listing with its path.
+    fn admitted(&self, column: &shared::Column<'_>) -> Result<Vec<shared::Listed>, shared::Error> {
+        let label = match column.admit {
+            Admit::Label(label) => Some(label),
+            Admit::State(_) => None,
+            Admit::Delegation => return Err(shared::no_delegation()),
+        };
+        let mut listed = Vec::new();
+        for id in self.ticket_ids().map_err(other)? {
+            let ticket = MarkdownTracker::ticket(self, &id).map_err(other)?;
+            if ticket.stage != column.ready || label.is_some_and(|l| !ticket.labels.contains(l)) {
+                continue;
+            }
+            let mut blockers: Vec<shared::Blocker> = Vec::new();
+            for blocker in &ticket.blocked_by {
+                if blockers.iter().any(|known| &known.id == blocker) {
+                    continue;
+                }
+                let state = if self.ticket_file(blocker).is_file() {
+                    let stage = MarkdownTracker::ticket(self, blocker).map_err(other)?.stage;
+                    (stage == Self::DONE).then_some(shared::StateType::Completed)
+                } else {
+                    None
+                };
+                blockers.push(shared::Blocker {
+                    id: blocker.clone(),
+                    state,
+                });
+            }
+            listed.push(shared::Listed {
+                ticket: shared_ticket(ticket),
+                created_at: None,
+                blockers,
+            });
+        }
+        Ok(listed)
+    }
+
+    /// The ticket's `author`: its files keep no history, so whoever wrote
+    /// the ticket made the gesture, label or state alike, as trusted as the
+    /// tree it is read from. No time.
+    fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<shared::Gesture, shared::Error> {
+        if *admit == Admit::Delegation {
+            return Err(shared::no_delegation());
+        }
+        self.require_ticket(id)?;
+        let ticket = MarkdownTracker::ticket(self, id).map_err(other)?;
+        Ok(shared::Gesture {
+            account: account(ticket.author),
+            at: None,
+        })
+    }
 }
 
 impl MarkdownTracker {
     /// What the Markdown tracker implements through [`shared::Tracker`].
     pub const CAPABILITIES: &'static [Capability] = &[
         Capability::ReadTicket,
+        Capability::ListAdmitted,
         Capability::Comments,
         Capability::VisibleStage,
+        Capability::BlockedBy,
     ];
 
     /// The author of the comments the runner posts.
     pub const AGENT: &'static str = "owlshift";
+
+    /// The stage at which a blocker is done (build plan, "P4 · The drain",
+    /// part B).
+    pub const DONE: &'static str = "Done";
+
+    /// The identifiers of the ticket folders, in name order. Anything in
+    /// `tickets/` but a folder is not a ticket and is skipped; a folder
+    /// whose name is not an identifier is an error. No `tickets/` folder is
+    /// no ticket.
+    fn ticket_ids(&self) -> Result<Vec<TicketId>, TrackerError> {
+        let entries = match fs::read_dir(&self.tickets) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(error(&self.tickets, e)),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| error(&self.tickets, e))?;
+            let path = entry.path();
+            if !entry.file_type().map_err(|e| error(&path, e))?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let id = name
+                .to_str()
+                .and_then(|name| TicketId::new(name).ok())
+                .ok_or_else(|| error(&path, "not a ticket folder: expected a ticket identifier"))?;
+            ids.push(id);
+        }
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(ids)
+    }
 
     fn require_ticket(&self, id: &TicketId) -> Result<(), shared::Error> {
         let path = self.ticket_file(id);
@@ -360,6 +442,22 @@ impl MarkdownTracker {
                 format!("{}: no such ticket", path.display()),
             ))
         }
+    }
+}
+
+/// A ticket file as a shared ticket: its author is an account.
+fn shared_ticket(ticket: Ticket) -> shared::Ticket {
+    shared::Ticket {
+        id: ticket.id,
+        title: ticket.title,
+        description: ticket.description,
+        priority: ticket.priority,
+        assignee: ticket.assignee.map(|name| shared::Person {
+            id: name.clone(),
+            name,
+        }),
+        labels: ticket.labels,
+        author: account(ticket.author),
     }
 }
 
@@ -786,6 +884,97 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A `ticket.md` at `stage`, with these labels and blockers.
+    fn ticket_md(author: &str, stage: &str, labels: &[&str], blocked_by: &[&str]) -> String {
+        format!(
+            "+++\ntitle = \"t\"\nauthor = \"{author}\"\nstage = \"{stage}\"\n\
+             labels = {labels:?}\nblocked_by = {blocked_by:?}\n+++\n"
+        )
+    }
+
+    /// The ready column (OWL-246): the stage, the label for a label gesture,
+    /// and the blockers' states, `Done` alone completed.
+    #[test]
+    fn the_ready_column_lists_admitted_tickets_with_their_blockers() {
+        use shared::{Blocker, Column, StateType, Tracker as _};
+        let (root, tracker, _) = repository(&ticket_md("reporter", "Todo", &["agent"], &[]));
+        let tickets = root.path().join("tickets");
+        for (id, text) in [
+            (
+                "DEMO-2",
+                ticket_md(
+                    "maintainer",
+                    "Todo",
+                    &[],
+                    &["DEMO-3", "DEMO-4", "DEMO-9", "DEMO-3"],
+                ),
+            ),
+            ("DEMO-3", ticket_md("a", "Done", &[], &[])),
+            ("DEMO-4", ticket_md("a", "Canceled", &["agent"], &[])),
+        ] {
+            fs::create_dir_all(tickets.join(id)).unwrap();
+            fs::write(tickets.join(id).join("ticket.md"), text).unwrap();
+        }
+        fs::write(tickets.join("README.md"), "not a ticket").unwrap();
+
+        let label = Admit::Label("agent".to_owned());
+        let column = |admit| Column {
+            team: None,
+            ready: "Todo",
+            admit,
+        };
+        let listed = tracker.admitted(&column(&label)).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|l| l.ticket.id.as_str()).collect();
+        assert_eq!(ids, ["DEMO-1"]);
+        assert_eq!(
+            listed[0].ticket,
+            shared_ticket(tracker.ticket(&id()).unwrap())
+        );
+        assert_eq!(listed[0].created_at, None);
+
+        let state = Admit::State("Todo".to_owned());
+        let listed = tracker.admitted(&column(&state)).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|l| l.ticket.id.as_str()).collect();
+        assert_eq!(ids, ["DEMO-1", "DEMO-2"]);
+        let blocker = |id: &str, state| Blocker {
+            id: TicketId::new(id).unwrap(),
+            state,
+        };
+        assert_eq!(
+            listed[1].blockers,
+            [
+                blocker("DEMO-3", Some(StateType::Completed)),
+                blocker("DEMO-4", None),
+                blocker("DEMO-9", None),
+            ]
+        );
+
+        let error = tracker.admitted(&column(&Admit::Delegation)).unwrap_err();
+        assert!(error.message.contains("not built"), "{error}");
+        fs::create_dir_all(tickets.join("drafts")).unwrap();
+        let error = tracker.admitted(&column(&state)).unwrap_err();
+        assert!(error.message.contains("drafts"), "{error}");
+    }
+
+    /// The gesture is the ticket's author, label or state alike, with no
+    /// time; a missing ticket is not found.
+    #[test]
+    fn the_gesture_is_the_tickets_author() {
+        use shared::Tracker as _;
+        let (_root, tracker, _) = repository(TICKET);
+        let gesture = tracker
+            .gesture(&id(), &Admit::State("Todo".to_owned()))
+            .unwrap();
+        assert_eq!(gesture.account, account("reporter".to_owned()));
+        assert_eq!(gesture.at, None);
+        let missing = TicketId::new("DEMO-9").unwrap();
+        let error = tracker
+            .gesture(&missing, &Admit::Label("agent".to_owned()))
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotFound);
+        assert!(tracker.gesture(&id(), &Admit::Delegation).is_err());
     }
 
     #[test]

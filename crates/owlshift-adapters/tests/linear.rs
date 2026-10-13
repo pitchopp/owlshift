@@ -7,8 +7,11 @@ mod support;
 use std::fs;
 
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
-use owlshift_adapters::tracker::{Author, ErrorKind, Person, Tracker};
+use owlshift_adapters::tracker::{
+    Author, Blocker, Column, ErrorKind, Gesture, Person, StateType, Tracker,
+};
 use owlshift_contracts::Priority;
+use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
 
 use support::{Recorder, Replay};
@@ -17,6 +20,118 @@ const TICKET: &str = "ticket-owl-11.json";
 const COMMENTS: &str = "comments-owl-11-paged.json";
 const UNAUTHORIZED: &str = "unauthorized.json";
 const TEAM_STATES: &str = "team-states-owl.json";
+const ADMITTED_TODO: &str = "admitted-todo.json";
+const ADMITTED_PAGED: &str = "admitted-agent-paged.json";
+const GESTURES: &str = "gestures.json";
+
+/// The ready column of the drain's exit gate, for each kind of gesture.
+fn todo_by_state() -> Admit {
+    Admit::State("Todo".to_owned())
+}
+
+fn agent_label() -> Admit {
+    Admit::Label("agent".to_owned())
+}
+
+/// The gestures recorded, in order: a label added by an account (OWL-129),
+/// a label set at creation and a move by an account (OWL-179), a ticket
+/// created in the state (OWL-249).
+fn gestures() -> [(TicketId, Admit); 4] {
+    let id = |id: &str| TicketId::new(id).unwrap();
+    [
+        (
+            id("OWL-129"),
+            Admit::Label("zone:backend/billing".to_owned()),
+        ),
+        (id("OWL-179"), agent_label()),
+        (id("OWL-179"), Admit::State("Canceled".to_owned())),
+        (id("OWL-249"), todo_by_state()),
+    ]
+}
+
+/// Team `OWL`'s Todo on 2026-10-13, a state gesture: the P4 tickets, each
+/// with its `blocks` relations and their state types, read as one page.
+/// Every ticket reads as [`Tracker::ticket`] would read it.
+#[test]
+fn lists_the_ready_column_with_its_blockers() {
+    let replay = Replay::new(ADMITTED_TODO);
+    let listed = LinearTracker::with_transport(replay.clone())
+        .admitted(&Column {
+            team: Some("owl"),
+            ready: "Todo",
+            admit: &todo_by_state(),
+        })
+        .unwrap();
+    replay.assert_done();
+    assert!(listed.len() >= 2, "{listed:?}");
+    let owl_155 = listed
+        .iter()
+        .find(|l| l.ticket.id.as_str() == "OWL-155")
+        .expect("OWL-155 in Todo");
+    assert_eq!(owl_155.ticket.priority, Priority::Medium);
+    assert!(owl_155.created_at.is_some());
+    assert!(matches!(owl_155.ticket.author, Author::Other { .. }));
+    let blocker = |id: &str| Blocker {
+        id: TicketId::new(id).unwrap(),
+        state: Some(StateType::Started),
+    };
+    assert_eq!(owl_155.blockers, [blocker("OWL-246"), blocker("OWL-245")]);
+    let types: std::collections::HashSet<_> = listed
+        .iter()
+        .flat_map(|l| l.blockers.iter().map(|b| b.state))
+        .collect();
+    assert!(types.contains(&Some(StateType::Completed)), "{types:?}");
+    assert!(types.contains(&Some(StateType::Unstarted)), "{types:?}");
+}
+
+/// A label gesture, read two a page to the last: the five P2 exit gate
+/// tickets labelled `agent`, in the Canceled state since Todo held none.
+#[test]
+fn lists_a_labelled_column_across_pages() {
+    let replay = Replay::new(ADMITTED_PAGED);
+    let listed = LinearTracker::with_transport(replay.clone())
+        .with_page(2)
+        .admitted(&Column {
+            team: Some("OWL"),
+            ready: "Canceled",
+            admit: &agent_label(),
+        })
+        .unwrap();
+    replay.assert_done();
+    let ids: Vec<&str> = listed.iter().map(|l| l.ticket.id.as_str()).collect();
+    assert_eq!(ids, ["OWL-179", "OWL-178", "OWL-175", "OWL-174", "OWL-173"]);
+    for listed in &listed {
+        assert!(listed.ticket.labels.iter().any(|l| l == "agent"));
+    }
+}
+
+/// Who made each gesture, as recorded: the account that added the label,
+/// the creator for a label set at creation, the account that moved the
+/// ticket, the creator of a ticket created in the state; the maintainer's
+/// account each time.
+#[test]
+fn reads_who_made_the_gesture() {
+    let replay = Replay::new(GESTURES);
+    let tracker = LinearTracker::with_transport(replay.clone());
+    let read: Vec<Gesture> = gestures()
+        .iter()
+        .map(|(id, admit)| tracker.gesture(id, admit).unwrap())
+        .collect();
+    replay.assert_done();
+    for gesture in &read {
+        assert_eq!(
+            gesture.account,
+            Author::Account(maintainer()),
+            "{gesture:?}"
+        );
+    }
+    let at = |gesture: &Gesture| gesture.at.unwrap().to_string();
+    // OWL-129's label came after its creation, OWL-179's with it.
+    assert_eq!(at(&read[0]), "2026-10-02T14:21:59.058Z");
+    assert_eq!(at(&read[1]), "2026-10-07T08:44:52.263Z");
+    assert_eq!(at(&read[2]), "2026-10-07T09:14:14.764Z");
+    assert_eq!(at(&read[3]), "2026-10-13T09:33:46.135Z");
+}
 
 /// The team's states as `owlshift doctor` reads them (OWL-147): the nine of
 /// `OWL` in one page, then a key no team has, sent upper case as written in
@@ -192,4 +307,44 @@ fn record_read_fixtures() {
     let unknown = tracker.team_states("NOPE").unwrap_err();
     assert_eq!(unknown.kind, ErrorKind::NotFound, "{unknown}");
     recorder.write(TEAM_STATES, &recorded);
+}
+
+/// Records the drain's fixtures (OWL-246) against the live API. Read only.
+#[test]
+#[ignore = "records against the live Linear API"]
+fn record_drain_fixtures() {
+    let key = support::live_key();
+    support::assert_owlshift_workspace(&key);
+    let recorded = format!(
+        "{} on the Owlshift workspace, recorded live",
+        jiff::Zoned::now().date()
+    );
+
+    let recorder = Recorder::new(&key);
+    LinearTracker::with_transport(recorder.clone())
+        .admitted(&Column {
+            team: Some("owl"),
+            ready: "Todo",
+            admit: &todo_by_state(),
+        })
+        .unwrap();
+    recorder.write(ADMITTED_TODO, &recorded);
+
+    let recorder = Recorder::new(&key);
+    LinearTracker::with_transport(recorder.clone())
+        .with_page(2)
+        .admitted(&Column {
+            team: Some("OWL"),
+            ready: "Canceled",
+            admit: &agent_label(),
+        })
+        .unwrap();
+    recorder.write(ADMITTED_PAGED, &recorded);
+
+    let recorder = Recorder::new(&key);
+    let tracker = LinearTracker::with_transport(recorder.clone());
+    for (id, admit) in gestures() {
+        tracker.gesture(&id, &admit).unwrap();
+    }
+    recorder.write(GESTURES, &recorded);
 }
