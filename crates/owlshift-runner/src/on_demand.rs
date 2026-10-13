@@ -913,7 +913,9 @@ impl OnDemand<'_> {
                     && let Some(pr) = &delivery.pull_request
                 {
                     return Err(Stop::Refused(format!(
-                        "{ticket}'s pull request #{} ({}) is followed until a person merges or                          closes it: `owlshift watch` follows it, and `owlshift continue {ticket}`                          reads it now",
+                        "{ticket}'s pull request #{} ({}) is followed until a person merges or \
+                         closes it: `owlshift watch` follows it, and `owlshift continue {ticket}` \
+                         reads it now",
                         pr.number, pr.url
                     )));
                 }
@@ -1180,7 +1182,8 @@ impl OnDemand<'_> {
             Look::Read(seen) => seen,
             Look::Paused { until } => {
                 return Err(Stop::Refused(format!(
-                    "GitHub's rate limit is spent until {until}: run `owlshift continue                      {ticket}` again then"
+                    "GitHub's rate limit is spent until {until}: run `owlshift continue \
+                     {ticket}` again then"
                 )));
             }
             Look::Unread { reason, .. } => {
