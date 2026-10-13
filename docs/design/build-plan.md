@@ -930,7 +930,7 @@ What the runs showed, each with its ticket:
 
 ## P4 · The drain
 
-Designed on 2026-10-13 (OWL-244). The rules are [architecture](architecture.md) section 5, "The drain": admission, picking, intake, back-pressure and follow-ups. Below, what was checked live for them, the contracts they change, who builds what, so that no implementation ticket decides them again, and how the exit gate is run. The implementation tickets live in the Linear project "P4 · The drain"; this section names the parts they build, by letter, until they are filed.
+Designed on 2026-10-13 (OWL-244). The rules are [architecture](architecture.md) section 5, "The drain": admission, picking, intake, back-pressure and follow-ups. Below, what was checked live for them, the contracts they change, who builds what, so that no implementation ticket decides them again, and how the exit gate is run. The implementation tickets live in the Linear project "P4 · The drain", one per part below, filed on 2026-10-13 with the `blocks` relations listed in pull request #215.
 
 **Checked live on 2026-10-13**, read-only, on the Owlshift workspace through the personal API key (GraphQL, `organization { urlKey }` answering `owlshift` first), and on `pitchopp/owlshift` through the maintainer's `gh` login. A one-off script, so no fixture was recorded; the adapter work records its own, as OWL-13 did.
 
@@ -959,22 +959,22 @@ Designed on 2026-10-13 (OWL-244). The rules are [architecture](architecture.md) 
 
 **Who builds what.**
 
-- **A · Configuration and ticket-ref contracts.** The keys, the `admit.state` rule, `TicketIntake`, `TicketProposals` and their schemas, `result.json` format 8.
-- **B · Reading the ready column.** The tracker trait's listing of admitted tickets (the `ListAdmitted` capability), with their blockers and their state types, and the gesture's account from the history; on Linear the query above, paged; on the Markdown tracker its folders, `blocked_by`, a blocker done at the stage `Done`, and the ticket's `author` as the gesture's account, since its files keep no history. Recorded fixtures.
-- **C · The ready set.** In `owlshift-core`: the text convention, the order, the release rule, the one slot and the reasons, extending `schedule::ready_set` and `Ticket`. `TicketState::restore` accepts a ticket at Intake with rounds asked before it was taken in again, with no re-ask and not waiting.
-- **D · Doctor (OWL-155, re-scoped).** `admit.state` checked as a tracker state and against `states.ready`; the admission label and the exclusion label exist on the team or the workspace; `admitters` set, each an account of the workspace; `"delegation"` a warning; the team's triage inbox, or the label fallback. Each a warning, since none blocks `do`, with the note that `--drain` refuses to start.
-- **E · Intake.** `roles/intake.md`; the run, read-only without network on the standard tier; the record and the INTAKE comment; its questions through the resolver to a round returning to Ready, whose RESUME moves the ticket back to the ready state; `continue` on a ticket at Intake.
-- **F · Dependencies to relations.** Pending check (d) first. The Writer's relation write on Linear and on the Markdown tracker (`blocked_by`), and the checks before it, the cycle up to ten deep included.
-- **G · The drain in watch.** `--drain`; the listing each pass; the gesture's account checked and kept; one intake then at most one dispatch per pass, through `do`'s path under the lock; the reasons' events and lines.
-- **H · The open pull request cap.** The count from the ticket refs, the hold on dispatch, its event and line. It waits for OWL-243, so that a parked ticket's merged pull request stops counting.
-- **I · Proposals in the tracker.** Pending check (e) first. The adapter's proposal: into the triage state, or the backlog with `agent:proposed`; its relations and project; the two exact searches.
-- **J · Filing follow-ups.** `proposals.json` owed with the delivery or the repair, filed before the DELIVERY report, kept as filed; the duplicates and the three per parent; the report's lines; the floor's refusal of a proposal in the ready state or with the admission label.
-- **K · The scenarios.** S3, S4, S6, S12 and S13 played by the test bench on the Markdown tracker, as acceptance.
-- **L · The exit gate,** below.
+- **A · Configuration and ticket-ref contracts.** (OWL-245) The keys, the `admit.state` rule, `TicketIntake`, `TicketProposals` and their schemas, `result.json` format 8.
+- **B · Reading the ready column.** (OWL-246) The tracker trait's listing of admitted tickets (the `ListAdmitted` capability), with their blockers and their state types, and the gesture's account from the history; on Linear the query above, paged; on the Markdown tracker its folders, `blocked_by`, a blocker done at the stage `Done`, and the ticket's `author` as the gesture's account, since its files keep no history. Recorded fixtures.
+- **C · The ready set.** (OWL-247) In `owlshift-core`: the text convention, the order, the release rule, the one slot and the reasons, extending `schedule::ready_set` and `Ticket`. `TicketState::restore` accepts a ticket at Intake with rounds asked before it was taken in again, with no re-ask and not waiting.
+- **D · Doctor.** (OWL-155) `admit.state` checked as a tracker state and against `states.ready`; the admission label and the exclusion label exist on the team or the workspace; `admitters` set, each an account of the workspace; `"delegation"` a warning; the team's triage inbox, or the label fallback. Each a warning, since none blocks `do`, with the note that `--drain` refuses to start.
+- **E · Intake.** (OWL-248) `roles/intake.md`; the run, read-only without network on the standard tier; the record and the INTAKE comment; its questions through the resolver to a round returning to Ready, whose RESUME moves the ticket back to the ready state; `continue` on a ticket at Intake.
+- **F · Dependencies to relations.** (OWL-249) Pending check (d) first. The Writer's relation write on Linear and on the Markdown tracker (`blocked_by`), and the checks before it, the cycle up to ten deep included.
+- **G · The drain in watch.** (OWL-250) `--drain`; the listing each pass; the gesture's account checked and kept; one intake then at most one dispatch per pass, through `do`'s path under the lock; the reasons' events and lines.
+- **H · The open pull request cap.** (OWL-251) The count from the ticket refs, the hold on dispatch, its event and line. It waits for OWL-243, so that a parked ticket's merged pull request stops counting.
+- **I · Proposals in the tracker.** (OWL-252) Pending check (e) first. The adapter's proposal: into the triage state, or the backlog with `agent:proposed`; its relations and project; the two exact searches.
+- **J · Filing follow-ups.** (OWL-253) `proposals.json` owed with the delivery or the repair, filed before the DELIVERY report, kept as filed; the duplicates and the three per parent; the report's lines; the floor's refusal of a proposal in the ready state or with the admission label.
+- **K · The scenarios.** (OWL-254) S3, S4, S6, S12 and S13 played by the test bench on the Markdown tracker, as acceptance.
+- **L · The exit gate** (OWL-255), below.
 
 ## P4 tasks & exit gate
 
-The tasks are the parts above, filed in the Linear project "P4 · The drain".
+The tasks are the parts above, OWL-245 to OWL-255 and OWL-155, in the Linear project "P4 · The drain".
 
 **Exit gate.** Ten Owlshift tickets drained serially, at least one started by the merge of its blocker. Run by the maintainer, as P2's was, once K passes and P3's exit gate (OWL-212) has:
 
