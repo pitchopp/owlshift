@@ -806,13 +806,13 @@ fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Whether `haystack` holds `token`'s value.
 /// The time between two readings of the system clock, `None` when the clock
 /// reads earlier at the end: it was set back during the run (OWL-262).
 fn wall_span(start: SystemTime, end: SystemTime) -> Option<Duration> {
     end.duration_since(start).ok()
 }
 
+/// Whether `haystack` holds `token`'s value.
 fn holds(haystack: &[u8], token: &Secret) -> bool {
     let needle = token.expose().as_bytes();
     !needle.is_empty()
