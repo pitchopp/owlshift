@@ -928,6 +928,41 @@ What the runs showed, each with its ticket:
 - The desktop notification shows on macOS, which the operator could not confirm for OWL-140 on 2026-10-03: shown as Script Editor's, with the ticket and its link; a click opens Script Editor. Owlshift's icon and a click that opens the ticket wait for the P11 menu-bar app (OWL-181). The Linux side is still OWL-150.
 - An answer check takes 7 to 12 s and about 0.05 USD; a round's Build run that only asks, 16 to 27 s.
 
+## P3 tasks & exit gate
+
+- [x] OWL-152 · The `owlshift watch` loop (2026-10-04, [#130](https://github.com/pitchopp/owlshift/pull/130))
+- [x] OWL-208 · How watch follows a delivered pull request, designed (2026-10-10, [#178](https://github.com/pitchopp/owlshift/pull/178))
+- [x] OWL-55, OWL-209 · The fix-pass and repair counts; following delivered pull requests' checks and mergeability (2026-10-11, [#183](https://github.com/pitchopp/owlshift/pull/183), [#185](https://github.com/pitchopp/owlshift/pull/185))
+- [x] OWL-112, OWL-210 · A fix run for a red check, a rebase run for a conflict (2026-10-11, [#188](https://github.com/pitchopp/owlshift/pull/188), [#193](https://github.com/pitchopp/owlshift/pull/193))
+- [x] OWL-146 · A correction run when the decider replies to a DECISION (2026-10-11, [#197](https://github.com/pitchopp/owlshift/pull/197))
+- [x] OWL-211 · A delivered ticket sent back to its decider from review (2026-10-12, [#209](https://github.com/pitchopp/owlshift/pull/209))
+- [x] OWL-242, OWL-243 · A waiting round, and a park, ended by the pull request's merge or close (2026-10-13, [#213](https://github.com/pitchopp/owlshift/pull/213), [#216](https://github.com/pitchopp/owlshift/pull/216))
+- [x] OWL-212 · The exit gate below (2026-10-13)
+
+The smaller P3 tickets (reports owed across a crash, comment limits, recorded fixtures, CI time) are in the Linear project "P3 · Watch mode".
+
+- [x] **Exit gate.** Three Owlshift tickets run under `owlshift watch`, from `do` to a merged pull request, with every reply continued by watch, one pull request repaired after a red check and one after a conflict, and no `continue` typed. Passed on 2026-10-13 (OWL-212): OWL-256, OWL-257 and OWL-258 below.
+
+The test tickets were written for the gate. OWL-256 staged the red check: it asked for intra-doc links from public docs to a private function, which the project's gate (fmt, clippy, tests) passes and CI's `cargo doc` with `-D warnings` refuses. OWL-257 and OWL-258 each left one open point to the decider, and added a README section at the same place, so that merging the first made the second conflict. Nothing else was staged.
+
+**Runs, 2026-10-13**, on the maintainer's machine (macOS 26.6.2, Claude Code 2.1.284, `claude-sonnet-5-5`, the account's default since `[models]` names none, on the fast tier too), with `owlshift` built from `main` at `34ae628`, every run based on that commit but the rebase run, based on `7268d34`. The Linear app was stored before the runs, so Owlshift wrote as the app user `owlshiftbot`. One `owlshift watch` ran throughout; the three `do` were typed in another terminal, one after the other, since the project lock lets one command work the project at a time. Times and costs are the sum over each ticket's agent runs (answer checks included); times are `run_ended`'s `elapsed_ms`, which leaves out the time the machine sleeps (OWL-262).
+
+- OWL-256 (doc links, the red check): the Build run delivered [#218](https://github.com/pitchopp/owlshift/pull/218), whose `check` legs failed on `cargo doc`. Watch read the red verdict and started a fix run, which asked the decider how to make the links pass (public function, lint allowed, or links dropped): a fix run's question, with Watch as its return stage. The answer was continued by watch; the next fix run allowed `rustdoc::private_intra_doc_links` on the two functions and pushed, fix pass 1, and the checks went green. 4 runs, 25.6 min (40.7 min by the clock, the machine having slept), 0.53 USD.
+- OWL-257 (README Requirements): round 1 asked which minimum versions to state; the answer was continued by watch, and the Build run delivered [#219](https://github.com/pitchopp/owlshift/pull/219). Its summary noted that runtime-and-operations.md already sets git 2.39.0, which the answer had missed (OWL-261). 3 runs, 10.7 min, 0.40 USD.
+- OWL-258 (README Quick start, the conflict): round 1 asked whether to show `watch` after `do`; continued by watch, delivered as [#220](https://github.com/pitchopp/owlshift/pull/220). Once [#219](https://github.com/pitchopp/owlshift/pull/219) was merged, GitHub first answered its mergeability unknown, and watch waited a pass; then conflicting on `README.md`, which watch classed trivial and gave a rebase run on the fast tier. It kept both sections and force-pushed with a lease, repair 1; the checks went green. 4 runs, 25.3 min, 0.42 USD.
+- Watch ended the following of each pull request once it read it merged. The maintainer merged the three after their checks passed.
+- No `continue` was typed. The first `do OWL-256` was stopped twice with Ctrl-C, to start the tickets in parallel; each stop left the marker of a run whose isolation check had not passed, and `do` and watch refused to work the project until a person looked. The dedicated checkout was found clean, the marker deleted, and `do` typed again. These are restarts of a `do`, not continues.
+- No guardrail breach: the agents committed locally only; the runner pushed, opened the three pull requests and wrote every comment and stage move; nothing was merged by Owlshift. No run recorded a warning event.
+
+What the runs showed, each with its ticket:
+
+- A repair run works under a stage that says In Review: OWL-256's fix run changed the pull request for minutes while Linear showed it in review (OWL-259).
+- The project's gate does not run rustdoc with `-D warnings`, which CI does, so a delivery can pass it and go red (OWL-260).
+- `elapsed_ms` is a monotonic time, which does not count a sleep on macOS (OWL-262).
+- `do` exits with a failure when it stops on questions, so `owlshift do A && owlshift do B` stops at the first ticket that asks. Not a fault: it stopped without delivering.
+- While waiting for its own `cargo test`, a Build run looped on `pgrep -f "cargo "`, which also waits for any other cargo process of the machine.
+- A run's Build takes 5 to 15 minutes, mostly the gate's tests; an answer check, 7 to 9 s and about 0.05 USD; a run that only asks, 19 to 30 s.
+
 ## P4 · The drain
 
 Designed on 2026-10-13 (OWL-244). The rules are [architecture](architecture.md) section 5, "The drain": admission, picking, intake, back-pressure and follow-ups. Below, what was checked live for them, the contracts they change, who builds what, so that no implementation ticket decides them again, and how the exit gate is run. The implementation tickets live in the Linear project "P4 · The drain", one per part below, filed on 2026-10-13 with the `blocks` relations listed in pull request #215.

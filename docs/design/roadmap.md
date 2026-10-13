@@ -81,7 +81,7 @@ The central bet, used by hand.
 - At least one delivered pull request is repaired after a red check, staged if none occurs, as P2's rounds were.
 - One pull request is repaired after a conflict, if a conflict occurs.
 
-Reworded on 2026-10-10 (OWL-208) from "A full day of use without typing `continue`", which these restarts, left to a person by design, would fail whatever P3 builds. Narrowed on 2026-10-13 (OWL-212) from a full working day to three tickets, as P2's gate counted tickets: the rules above are exercised by the tickets, not by the hours, and the staged red check covers the repair a short run may not meet.
+Reworded on 2026-10-10 (OWL-208) from "A full day of use without typing `continue`", which these restarts, left to a person by design, would fail whatever P3 builds. Narrowed on 2026-10-13 (OWL-212) from a full working day to three tickets, as P2's gate counted tickets: the rules above are exercised by the tickets, not by the hours, and the staged red check covers the repair a short run may not meet. Passed on 2026-10-13 (OWL-212); the runs are recorded in the [build plan](build-plan.md) ("P3 tasks & exit gate").
 
 ## P4 · The drain
 
