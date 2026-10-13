@@ -7,7 +7,7 @@
 //! implementations exist. It grows with the steps that need more: the
 //! visible stage came with P2 (OWL-137), listing admitted tickets and reading
 //! the admission gesture with P4 (OWL-246, architecture section 5, "The
-//! drain").
+//! drain"), filing proposals and finding them again with P4 too (OWL-252).
 
 pub mod linear;
 pub mod markdown;
@@ -95,6 +95,88 @@ pub trait Tracker {
             "this tracker does not read an admission gesture",
         ))
     }
+
+    /// Files a follow-up in the tracker's proposals inbox (OWL-252,
+    /// architecture section 5, "Follow-ups"): the team's triage state, or
+    /// without one its first backlog state with the [`PROPOSED_LABEL`]; in
+    /// the parent's project, related to the parent, and blocked by it when
+    /// the follow-up needs its code. Never in the ready column: a target
+    /// state named [`Proposal::ready`] is refused before anything is written.
+    ///
+    /// An error means nothing was filed, and the proposal stays owed. Once
+    /// the ticket exists, what goes wrong after it (a relation not written,
+    /// the ticket answered in another state than the one asked) is kept in
+    /// [`Filed::problems`] and the call still succeeds: the next pass would
+    /// find the ticket by its fingerprint and count it as filed, so an error
+    /// then would lose the problem without a word. An error by default.
+    fn propose(&self, _proposal: &Proposal<'_>) -> Result<Filed, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not file proposals",
+        ))
+    }
+
+    /// The two exact searches a proposal is found again by (architecture
+    /// section 5, "Not twice"): the tickets of `team` not completed that
+    /// have the title `title` in any case, or whose description contains
+    /// `marker`, the fingerprint's part of the proposal's footer as the
+    /// runner renders it. Archived tickets count: a declined proposal stays
+    /// declined once the team archives it. Each ticket once, with its
+    /// description, from which the runner reads whose proposal it is.
+    ///
+    /// An error means the tracker could not tell, never that it found
+    /// nothing: the runner then files nothing. An error by default.
+    fn proposed(
+        &self,
+        _team: Option<&str>,
+        _title: &str,
+        _marker: &str,
+    ) -> Result<Vec<Found>, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not search proposals",
+        ))
+    }
+}
+
+/// The label of a proposal on a team without a triage state (architecture
+/// section 6, "A proposals inbox for follow-ups").
+pub const PROPOSED_LABEL: &str = "agent:proposed";
+
+/// A follow-up to file, as the runner rendered it.
+#[derive(Clone, Copy, Debug)]
+pub struct Proposal<'a> {
+    /// The ticket whose run proposed it.
+    pub parent: &'a TicketId,
+    pub title: &'a str,
+    /// Markdown, the `[owlshift] PROPOSAL` footer included.
+    pub description: &'a str,
+    /// Whether the follow-up needs the parent's code: the parent then
+    /// blocks it.
+    pub blocked_by_parent: bool,
+    /// The ready state's name, `[tracker].states.ready`. A proposal filed
+    /// there would enter the queue without a person (principle 6), so the
+    /// adapter refuses a target state of that exact name before any write:
+    /// the floor's check, made where the target is known.
+    pub ready: &'a str,
+}
+
+/// A proposal the tracker filed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filed {
+    pub id: TicketId,
+    /// The name of the state the tracker answered the ticket in.
+    pub state: String,
+    /// What went wrong once the ticket existed; empty when nothing did.
+    pub problems: Vec<Error>,
+}
+
+/// A ticket one of the searches of [`Tracker::proposed`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub id: TicketId,
+    /// Markdown; empty when the ticket has none.
+    pub description: String,
 }
 
 /// What [`Tracker::admitted`] reads: the ready column of a project.

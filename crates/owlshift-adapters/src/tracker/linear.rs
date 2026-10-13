@@ -96,6 +96,23 @@
 //!   `botActor` and no `actor`. One page of 50 entries costs about 411
 //!   points.
 //!
+//! Checked live on 2026-10-13 (OWL-252; build plan, "P4 · The drain",
+//! check (e)) for proposals, through the app for the writes:
+//!
+//! - `issueCreate(input: { teamId, stateId, projectId, title, description })`
+//!   with team `OWL`'s Triage state made an issue in Triage, in the project,
+//!   created by the app user. `IssueCreateInput` has `labelIds` and no
+//!   relation field, so the relations are writes of their own.
+//! - `issueRelationCreate(input: { type, issueId, relatedIssueId })` wrote a
+//!   `related` relation, and a `blocks` relation with the parent as
+//!   `issueId`, which the proposal then listed in its `inverseRelations`.
+//! - `issues(filter: …, includeArchived: true)` with the team's key and
+//!   `title: { eqIgnoreCase }`, or `description: { contains: "fingerprint
+//!   <hex>" }`, found the issue, the latter again once it was canceled.
+//! - `issueLabels(filter: { name: { eq } })` is case-sensitive (`agent`
+//!   answered team `OWL`'s label, `Agent` nothing), each label naming its
+//!   team.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -115,8 +132,8 @@ use owlshift_contracts::ids::TicketId;
 
 pub use crate::graphql::{Response, Transport};
 use crate::tracker::{
-    Author, Blocker, Capability, Column, Comment, Error, ErrorKind, Gesture, Listed, Person,
-    StateType, Ticket, Tracker, no_delegation,
+    Author, Blocker, Capability, Column, Comment, Error, ErrorKind, Filed, Found, Gesture, Listed,
+    PROPOSED_LABEL, Person, Proposal, StateType, Ticket, Tracker, no_delegation,
 };
 
 /// Linear's GraphQL endpoint.
@@ -234,7 +251,9 @@ pub struct AppUser {
 }
 
 impl LinearTracker {
-    /// What the Linear adapter implements in this build.
+    /// What the Linear adapter implements in this build. It files proposals
+    /// already (OWL-252); the proposals inbox is declared with the runner's
+    /// filing (OWL-253), whose doctor line names it.
     pub const CAPABILITIES: &'static [Capability] = &[
         Capability::ReadTicket,
         Capability::ListAdmitted,
@@ -642,6 +661,176 @@ impl Tracker for LinearTracker {
             ))
         })
     }
+
+    /// Reads the parent's team and project, and the label when the team
+    /// has no triage inbox, through the key; then writes the issue and its
+    /// relations through the app when one is set (checked 2026-10-13,
+    /// above). The inbox is the team's first state of type `triage`, by
+    /// position, when the team has triage on; else its first `backlog`
+    /// state by position with [`PROPOSED_LABEL`], the team's label before a
+    /// workspace one. The label is never created: doctor warns of a missing
+    /// one (build plan, "P4 · The drain", part D). The relations are written
+    /// by the issues' ids: `related` from the proposal to the parent, and
+    /// `blocks` from the parent to the proposal, `issue` blocking
+    /// `relatedIssue`.
+    fn propose(&self, proposal: &Proposal<'_>) -> Result<Filed, Error> {
+        let parent = proposal.parent;
+        let data: TargetData = self.call(TARGET_QUERY, json!({ "id": parent.as_str() }))?;
+        let target = data.issue;
+        let TargetTeam {
+            id: team_id,
+            triage_enabled,
+            team,
+        } = target.team;
+        one_page(&team)?;
+        let first = |kind: &str| {
+            team.states
+                .nodes
+                .iter()
+                .filter(|state| state.kind == kind)
+                .min_by(|a, b| a.position.total_cmp(&b.position))
+        };
+        let triage = if triage_enabled {
+            first("triage")
+        } else {
+            None
+        };
+        let (state, labelled) = match (triage, first("backlog")) {
+            (Some(state), _) => (state, false),
+            (None, Some(state)) => (state, true),
+            (None, None) => {
+                return Err(invalid(format!(
+                    "team {} has no triage inbox and no backlog state to file a proposal in",
+                    team.key
+                )));
+            }
+        };
+        if state.name == proposal.ready {
+            return Err(invalid(format!(
+                "team {}'s proposals would go to {:?}, the ready state: a proposal never enters \
+                 the queue without a person",
+                team.key, state.name
+            )));
+        }
+        let mut input = json!({
+            "teamId": team_id,
+            "stateId": state.id,
+            "title": proposal.title,
+            "description": proposal.description,
+        });
+        if let Some(project) = target.project {
+            input["projectId"] = json!(project.id);
+        }
+        if labelled {
+            input["labelIds"] = json!([self.proposed_label(&team_id, &team.key)?]);
+        }
+        let data: CreateData = self.write(PROPOSE_MUTATION, json!({ "input": input }))?;
+        let IssueCreate {
+            success: true,
+            issue: Some(created),
+        } = data.issue_create
+        else {
+            return Err(invalid(format!(
+                "Linear did not file the proposal of {parent}"
+            )));
+        };
+        let id = TicketId::new(created.identifier).map_err(|e| invalid(e.to_string()))?;
+        let mut problems = Vec::new();
+        if created.state.id != state.id {
+            problems.push(invalid(format!(
+                "Linear filed {id} in {:?}, not in {:?}",
+                created.state.name, state.name
+            )));
+        }
+        let mut relate = |kind: &str, issue: &str, related: &str| {
+            let input = json!({ "type": kind, "issueId": issue, "relatedIssueId": related });
+            let what = format!("the `{kind}` relation between {parent} and {id}");
+            match self.write::<RelateData>(RELATE_MUTATION, json!({ "input": input })) {
+                Ok(RelateData {
+                    issue_relation_create: Success { success: true },
+                }) => {}
+                Ok(_) => problems.push(invalid(format!("Linear did not write {what}"))),
+                Err(e) => problems.push(Error::new(e.kind, format!("{what} was not written: {e}"))),
+            }
+        };
+        relate("related", &created.id, &target.id);
+        if proposal.blocked_by_parent {
+            relate("blocks", &target.id, &created.id);
+        }
+        Ok(Filed {
+            id,
+            state: created.state.name,
+            problems,
+        })
+    }
+
+    /// Two filters on the team's issues, `includeArchived` set, each read
+    /// to its last page: `title: { eqIgnoreCase }` and `description: {
+    /// contains }` (checked 2026-10-13, above). The completed ones are left
+    /// out here, by their state's type; a type this adapter does not know
+    /// is an error, as in the listing.
+    fn proposed(&self, team: Option<&str>, title: &str, marker: &str) -> Result<Vec<Found>, Error> {
+        let Some(team) = team else {
+            return Err(invalid(
+                "searching the Linear proposals needs the project's `[tracker].team`",
+            ));
+        };
+        // An empty `contains` matches every issue.
+        if title.trim().is_empty() || marker.trim().is_empty() {
+            return Err(invalid(
+                "a proposal is searched by a title and a marker that are not blank",
+            ));
+        }
+        let mut found: Vec<Found> = Vec::new();
+        for mut filter in [
+            json!({ "title": { "eqIgnoreCase": title } }),
+            json!({ "description": { "contains": marker } }),
+        ] {
+            filter["team"] = json!({ "key": { "eq": team.to_ascii_uppercase() } });
+            let issues = self.pages(
+                "the proposals",
+                PROPOSED_QUERY,
+                json!({ "filter": filter, "first": self.page }),
+                |data: ProposedData| data.issues,
+                |_| false,
+            )?;
+            for issue in issues {
+                if state_type(&issue.state.kind)? == StateType::Completed {
+                    continue;
+                }
+                let id = TicketId::new(issue.identifier).map_err(|e| invalid(e.to_string()))?;
+                if !found.iter().any(|f| f.id == id) {
+                    found.push(Found {
+                        id,
+                        description: issue.description.unwrap_or_default(),
+                    });
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+impl LinearTracker {
+    /// The id of the [`PROPOSED_LABEL`] a proposal in the backlog of the
+    /// team whose id is `team` carries: the team's own, else the
+    /// workspace's. Names match exactly, case included, as Linear's `eq`
+    /// does (checked 2026-10-13, above).
+    fn proposed_label(&self, team: &str, key: &str) -> Result<String, Error> {
+        let data: LabelsData = self.call(LABEL_QUERY, json!({ "name": PROPOSED_LABEL }))?;
+        let labels = data.issue_labels.nodes;
+        let ours = labels
+            .iter()
+            .find(|label| label.team.as_ref().is_some_and(|t| t.id == team));
+        ours.or_else(|| labels.iter().find(|label| label.team.is_none()))
+            .map(|label| label.id.clone())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "team {key} has no triage inbox, and neither it nor the workspace has the \
+                     label {PROPOSED_LABEL:?} that marks a proposal in its backlog"
+                ))
+            })
+    }
 }
 
 /// `url` when it is a Linear link with nothing Markdown reads as syntax.
@@ -743,6 +932,27 @@ const WORKSPACE_QUERY: &str = "query Workspace { organization { id } }";
 
 /// A mention's link (OWL-157).
 const USER_QUERY: &str = "query Mention($id: String!) { user(id: $id) { url } }";
+
+/// Where a proposal of the parent goes (OWL-252).
+const TARGET_QUERY: &str = "query ProposalTarget($id: String!) { issue(id: $id) { id \
+    project { id } team { id key triageEnabled states(first: 50) { \
+    nodes { id name type position } pageInfo { hasNextPage } } } } }";
+
+const LABEL_QUERY: &str = "query ProposedLabel($name: String!) { \
+    issueLabels(first: 50, filter: { name: { eq: $name } }) { nodes { id team { id } } } }";
+
+const PROPOSE_MUTATION: &str = "mutation Propose($input: IssueCreateInput!) { \
+    issueCreate(input: $input) { success issue { id identifier state { id name } } } }";
+
+const RELATE_MUTATION: &str = "mutation Relate($input: IssueRelationCreateInput!) { \
+    issueRelationCreate(input: $input) { success } }";
+
+/// One of the two exact searches (OWL-252); the filter is built by
+/// [`Tracker::proposed`].
+const PROPOSED_QUERY: &str = "query Proposed($filter: IssueFilter!, $first: Int!, \
+    $after: String) { issues(first: $first, after: $after, filter: $filter, \
+    includeArchived: true) { nodes { identifier description state { type } } \
+    pageInfo { hasNextPage endCursor } } }";
 
 /// Reads a GraphQL answer: its errors first, then its `data`.
 fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
@@ -1251,6 +1461,96 @@ struct StageNameData {
 }
 
 #[derive(Deserialize)]
+struct TargetData {
+    issue: Target,
+}
+
+#[derive(Deserialize)]
+struct Target {
+    id: String,
+    project: Option<Id>,
+    team: TargetTeam,
+}
+
+#[derive(Deserialize)]
+struct Id {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetTeam {
+    id: String,
+    triage_enabled: bool,
+    #[serde(flatten)]
+    team: Team<TypedState>,
+}
+
+#[derive(Deserialize)]
+struct TypedState {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    position: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LabelsData {
+    issue_labels: Teams<TeamLabel>,
+}
+
+#[derive(Deserialize)]
+struct TeamLabel {
+    id: String,
+    /// Null for a workspace label.
+    team: Option<Id>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateData {
+    issue_create: IssueCreate,
+}
+
+#[derive(Deserialize)]
+struct IssueCreate {
+    success: bool,
+    issue: Option<Created>,
+}
+
+#[derive(Deserialize)]
+struct Created {
+    id: String,
+    identifier: String,
+    state: WorkflowState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelateData {
+    issue_relation_create: Success,
+}
+
+#[derive(Deserialize)]
+struct Success {
+    success: bool,
+}
+
+#[derive(Deserialize)]
+struct ProposedData {
+    issues: Connection<ProposedIssue>,
+}
+
+#[derive(Deserialize)]
+struct ProposedIssue {
+    identifier: String,
+    description: Option<String>,
+    state: StateOfType,
+}
+
+#[derive(Deserialize)]
 struct IssueStageName {
     state: StateName,
 }
@@ -1390,17 +1690,21 @@ mod tests {
         assert_eq!(parents, [None, Some("c1")]);
     }
 
-    /// Answers each request by its operation's name, and keeps the names.
+    /// Answers each request by its operation's name, and keeps the names and
+    /// the variables. Several answers to one name are given in order, the
+    /// last one again and again.
     struct Scripted {
-        answers: Vec<(&'static str, Value)>,
+        answers: std::sync::Mutex<Vec<(&'static str, Value)>>,
         asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        sent: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
     impl Scripted {
         fn new(answers: Vec<(&'static str, Value)>) -> Self {
             Self {
-                answers,
+                answers: std::sync::Mutex::new(answers),
                 asked: Default::default(),
+                sent: Default::default(),
             }
         }
     }
@@ -1409,15 +1713,295 @@ mod tests {
         fn send(&self, request: &Value) -> Result<Response, String> {
             let query = request["query"].as_str().unwrap();
             let name = query.split([' ', '(']).nth(1).unwrap().to_owned();
-            let data = self
-                .answers
-                .iter()
-                .find(|(answers, _)| *answers == name)
-                .map(|(_, data)| data.clone())
-                .unwrap_or_else(|| panic!("unexpected {name}"));
+            let mut answers = self.answers.lock().unwrap();
+            let mut ours = answers.iter().enumerate().filter(|(_, (n, _))| *n == name);
+            let (at, (_, data)) = ours.next().unwrap_or_else(|| panic!("unexpected {name}"));
+            let data = data.clone();
+            if ours.next().is_some() {
+                answers.remove(at);
+            }
             self.asked.lock().unwrap().push(name);
+            self.sent.lock().unwrap().push(request["variables"].clone());
             Ok(answer(200, &json!({ "data": data }).to_string()))
         }
+    }
+
+    /// A parent in a team with these states (`[name, type, position]`),
+    /// triage on or off, in a project.
+    fn target(triage_enabled: bool, states: &[(&str, &str, f64)]) -> Value {
+        let nodes: Vec<Value> = states
+            .iter()
+            .map(|(name, kind, position)| {
+                json!({ "id": format!("s-{name}"), "name": name, "type": kind,
+                    "position": position })
+            })
+            .collect();
+        json!({ "issue": { "id": "parent-id", "project": { "id": "p4" },
+            "team": { "id": "team-owl", "key": "OWL", "triageEnabled": triage_enabled,
+                "states": { "nodes": nodes, "pageInfo": { "hasNextPage": false } } } } })
+    }
+
+    /// `issueCreate` as check (e) answered it, in the state `state`.
+    fn created(state: &str) -> Value {
+        json!({ "issueCreate": { "success": true, "issue": { "id": "new-id",
+            "identifier": "OWL-266", "state": { "id": format!("s-{state}"), "name": state } } } })
+    }
+
+    fn related(success: bool) -> Value {
+        json!({ "issueRelationCreate": { "success": success } })
+    }
+
+    /// Team `OWL`'s states as Linear listed them on 2026-10-13, by type.
+    const OWL_TYPED: &[(&str, &str, f64)] = &[
+        ("In Review", "started", 2.6),
+        ("Triage", "triage", 0.0),
+        ("Backlog", "backlog", 0.0),
+        ("Todo", "unstarted", 1.0),
+        ("Done", "completed", 3.0),
+        ("Canceled", "canceled", 4.0),
+    ];
+
+    fn proposal<'a>(parent: &'a TicketId, blocked_by_parent: bool) -> Proposal<'a> {
+        Proposal {
+            parent,
+            title: "Cap the retries",
+            description: "Why.\n\n[owlshift] PROPOSAL · OWL-252 · fingerprint 0123456789ab",
+            blocked_by_parent,
+            ready: "Todo",
+        }
+    }
+
+    /// Filing into Triage, as check (e) did: the parent's team and project
+    /// read through the key, the issue and its relations written through
+    /// the app, by ids, with no label, priority or estimate.
+    #[test]
+    fn a_proposal_goes_to_triage_in_the_parents_project_related_and_blocked() {
+        let key = Scripted::new(vec![
+            ("Workspace", json!({ "organization": { "id": "org-1" } })),
+            ("ProposalTarget", target(true, OWL_TYPED)),
+        ]);
+        let app = Scripted::new(vec![
+            ("App", app_seen(true, "org-1", 1)),
+            ("Propose", created("Triage")),
+            ("Relate", related(true)),
+        ]);
+        let (by_key, by_app, sent) = (key.asked.clone(), app.asked.clone(), app.sent.clone());
+        let (tracker, _) = LinearTracker::with_transport(key)
+            .writing_as_app(app, "OWL")
+            .unwrap();
+        let parent = TicketId::new("OWL-252").unwrap();
+        let filed = tracker.propose(&proposal(&parent, true)).unwrap();
+        assert_eq!(
+            filed,
+            Filed {
+                id: TicketId::new("OWL-266").unwrap(),
+                state: "Triage".to_owned(),
+                problems: vec![],
+            }
+        );
+        assert_eq!(*by_key.lock().unwrap(), ["Workspace", "ProposalTarget"]);
+        assert_eq!(
+            *by_app.lock().unwrap(),
+            ["App", "Propose", "Relate", "Relate"]
+        );
+        let sent = sent.lock().unwrap();
+        let p = proposal(&parent, true);
+        assert_eq!(
+            sent[1]["input"],
+            json!({ "teamId": "team-owl", "stateId": "s-Triage", "projectId": "p4",
+                "title": p.title, "description": p.description })
+        );
+        assert_eq!(
+            sent[2]["input"],
+            json!({ "type": "related", "issueId": "new-id", "relatedIssueId": "parent-id" })
+        );
+        assert_eq!(
+            sent[3]["input"],
+            json!({ "type": "blocks", "issueId": "parent-id", "relatedIssueId": "new-id" })
+        );
+    }
+
+    /// Without a triage inbox (no triage state, or triage off): the first
+    /// backlog state by position, with the team's label before the
+    /// workspace's, and never another team's.
+    #[test]
+    fn without_triage_a_proposal_goes_to_the_first_backlog_with_the_label() {
+        let parent = TicketId::new("OWL-252").unwrap();
+        let backlogs = [
+            ("Icebox", "backlog", 1.0),
+            ("Backlog", "backlog", 0.5),
+            ("Triage", "triage", 0.0),
+            ("Todo", "unstarted", 2.0),
+        ];
+        let label = |id: &str, team: Option<&str>| json!({ "id": id, "team": team.map(|t| json!({ "id": t })) });
+        for (states, enabled, labels, chosen) in [
+            (
+                &backlogs[..],
+                false,
+                vec![
+                    label("other", Some("team-x")),
+                    label("ws", None),
+                    label("ours", Some("team-owl")),
+                ],
+                "ours",
+            ),
+            (
+                &backlogs[..2],
+                true,
+                vec![label("other", Some("team-x")), label("ws", None)],
+                "ws",
+            ),
+        ] {
+            let key = Scripted::new(vec![
+                ("ProposalTarget", target(enabled, states)),
+                (
+                    "ProposedLabel",
+                    json!({ "issueLabels": { "nodes": labels } }),
+                ),
+                ("Propose", created("Backlog")),
+                ("Relate", related(true)),
+            ]);
+            let sent = key.sent.clone();
+            let filed = LinearTracker::with_transport(key)
+                .propose(&proposal(&parent, false))
+                .unwrap();
+            assert_eq!(filed.state, "Backlog");
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent[1], json!({ "name": "agent:proposed" }));
+            assert_eq!(sent[2]["input"]["stateId"], "s-Backlog");
+            assert_eq!(sent[2]["input"]["labelIds"], json!([chosen]));
+            assert_eq!(sent.len(), 4, "one relation only: {sent:?}");
+        }
+    }
+
+    /// What cannot be filed as the design says is refused before anything
+    /// is written, and a refused creation is an error.
+    #[test]
+    fn a_proposal_that_cannot_go_to_the_inbox_is_refused_unwritten() {
+        let parent = TicketId::new("OWL-252").unwrap();
+        let no_label =
+            json!({ "issueLabels": { "nodes": [{ "id": "x", "team": { "id": "team-x" } }] } });
+        let refused = json!({ "issueCreate": { "success": false, "issue": null } });
+        for (answers, says) in [
+            (
+                vec![(
+                    "ProposalTarget",
+                    target(true, &[("Todo", "unstarted", 0.0)]),
+                )],
+                "no triage inbox and no backlog",
+            ),
+            (
+                vec![
+                    (
+                        "ProposalTarget",
+                        target(false, &[("Backlog", "backlog", 0.0)]),
+                    ),
+                    ("ProposedLabel", no_label),
+                ],
+                "label \"agent:proposed\"",
+            ),
+            (
+                vec![("ProposalTarget", target(false, &[("Todo", "backlog", 0.0)]))],
+                "the ready state",
+            ),
+            (
+                vec![
+                    ("ProposalTarget", target(true, OWL_TYPED)),
+                    ("Propose", refused),
+                ],
+                "did not file",
+            ),
+        ] {
+            let key = Scripted::new(answers);
+            let asked = key.asked.clone();
+            let error = LinearTracker::with_transport(key)
+                .propose(&proposal(&parent, true))
+                .unwrap_err();
+            assert!(error.message.contains(says), "{error}");
+            assert!(!asked.lock().unwrap().iter().any(|n| n == "Relate"));
+        }
+    }
+
+    /// Once the issue exists, a relation not written or another state than
+    /// the one asked is a problem of the filed proposal, never an error:
+    /// the other relation is still written.
+    #[test]
+    fn what_goes_wrong_after_the_creation_is_kept_with_the_filed_proposal() {
+        let parent = TicketId::new("OWL-252").unwrap();
+        let key = Scripted::new(vec![
+            ("ProposalTarget", target(true, OWL_TYPED)),
+            ("Propose", created("Backlog")),
+            ("Relate", related(false)),
+            ("Relate", related(true)),
+        ]);
+        let asked = key.asked.clone();
+        let filed = LinearTracker::with_transport(key)
+            .propose(&proposal(&parent, true))
+            .unwrap();
+        assert_eq!(filed.state, "Backlog");
+        let problems: Vec<&str> = filed.problems.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            problems,
+            [
+                "Linear filed OWL-266 in \"Backlog\", not in \"Triage\"",
+                "Linear did not write the `related` relation between OWL-252 and OWL-266",
+            ]
+        );
+        assert_eq!(asked.lock().unwrap().len(), 4);
+    }
+
+    /// The two exact searches: the team's key, the title in any case, the
+    /// marker in the description, archived issues included; each issue once,
+    /// the completed ones left out.
+    #[test]
+    fn a_proposal_is_found_by_its_title_or_its_marker_unless_completed() {
+        let issue = |id: &str, kind: &str| json!({ "identifier": id, "description": format!("d {id}"), "state": { "type": kind } });
+        let page = |nodes: Vec<Value>| {
+            json!({ "issues": { "nodes": nodes,
+                "pageInfo": { "hasNextPage": false, "endCursor": null } } })
+        };
+        let key = Scripted::new(vec![
+            (
+                "Proposed",
+                page(vec![issue("OWL-1", "triage"), issue("OWL-2", "completed")]),
+            ),
+            (
+                "Proposed",
+                page(vec![issue("OWL-3", "canceled"), issue("OWL-1", "triage")]),
+            ),
+        ]);
+        let sent = key.sent.clone();
+        let found = LinearTracker::with_transport(key)
+            .proposed(Some("owl"), "Cap the retries", "fingerprint 0123456789ab")
+            .unwrap();
+        assert_eq!(
+            found,
+            [
+                Found {
+                    id: TicketId::new("OWL-1").unwrap(),
+                    description: "d OWL-1".to_owned()
+                },
+                Found {
+                    id: TicketId::new("OWL-3").unwrap(),
+                    description: "d OWL-3".to_owned()
+                },
+            ]
+        );
+        let sent = sent.lock().unwrap();
+        let team = json!({ "key": { "eq": "OWL" } });
+        assert_eq!(
+            sent[0]["filter"],
+            json!({ "team": team, "title": { "eqIgnoreCase": "Cap the retries" } })
+        );
+        assert_eq!(
+            sent[1]["filter"],
+            json!({ "team": team, "description": { "contains": "fingerprint 0123456789ab" } })
+        );
+        assert!(PROPOSED_QUERY.contains("includeArchived: true"));
+
+        let tracker = LinearTracker::with_transport(Scripted::new(vec![]));
+        assert!(tracker.proposed(None, "t", "m").is_err());
+        assert!(tracker.proposed(Some("OWL"), "t", " ").is_err());
     }
 
     fn app_seen(app: bool, organization: &str, teams: usize) -> Value {
