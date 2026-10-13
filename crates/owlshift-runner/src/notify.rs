@@ -75,9 +75,9 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// operator the blocker. So does an INTAKE comment whose record was not kept
 /// ([`Landed::Intake`], OWL-248): the drain cannot dispatch the ticket until
 /// a person makes its ref writable. A ticket back in the ready column
-/// ([`Stop::Ready`]) waits for the drain, not a person. The decision comment asks nothing of anyone, so a
-/// failure to keep its state stays a refusal, as does a RESUME the tracker
-/// refused, since nothing reached the ticket.
+/// ([`Stop::Ready`]) waits for the drain, not a person. The decision comment
+/// asks nothing of anyone, so a failure to keep its state stays a refusal,
+/// as does a RESUME the tracker refused, since nothing reached the ticket.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
     Some(match stop {
         Stop::NeedsInput { status, posted, .. } => match (status, posted) {
@@ -574,6 +574,7 @@ mod tests {
                 detail: "d".to_owned(),
             }),
             Err(Stop::Delivery("d".to_owned())),
+            Err(Stop::Ready { ticket: owl_7() }),
         ];
         for outcome in outcomes {
             let recording = Recording::default();
