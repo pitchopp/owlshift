@@ -23,7 +23,7 @@ pub const ZONE_LABEL_PREFIX: &str = "zone:";
 /// The zones a ticket declares with its labels: each label `zone:<folder>`,
 /// the prefix in any ASCII case, gives the folder that follows it, without
 /// the spaces around it. Other labels are left out. A `zone:` label whose
-/// folder is not one by the rules of an owned zone ([`ZoneOwners::new`]) is
+/// folder is not one by the [rules of an owned zone][`check_zone`] is
 /// refused rather than left out, since a dropped declaration would change
 /// who decides unseen.
 pub fn declared_zones<'a>(
@@ -60,8 +60,9 @@ pub struct BriefZones {
 }
 
 /// The zones a ticket's `zone:` labels declare, as the brief lists them: the
-/// folders of the well-formed labels, in the labels' order, each zone once
-/// as its first label wrote it. Unlike [`declared_zones`] it leaves a
+/// folders of the labels that are well-formed by the [rules of an owned
+/// zone][`check_zone`], in the labels' order, each zone once as its first
+/// label wrote it. Unlike [`declared_zones`] it leaves a
 /// malformed label out instead of refusing it, since it informs an agent and
 /// chooses no decider: a ticket with an assignee is not refused for a label
 /// its decider never reads. The labels it left out come back in
