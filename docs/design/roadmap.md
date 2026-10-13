@@ -68,7 +68,7 @@ The central bet, used by hand.
 **Deviation from S9** (OWL-208, 2026-10-10). P3 repairs what CI and the forge report. A red check starts a fix run, a conflict a rebase run, and a run that needs a prerequisite or an arbitration asks the decider. The rest of S9 waits:
 
 - A confirmed finding, and the review passes S9 bounds, need P5's review roles. Until then, "two review passes" means two fix passes: fixes pushed for red checks since the pull request was last green. P3 also caps all the repairs of one delivery at six.
-- The residue past the bound becomes a proposed follow-up only once P4 files follow-ups. P3 parks the ticket instead, with a PARKED comment.
+- The residue past the bound becomes a proposed follow-up only once P4 files follow-ups. P3 parks the ticket instead, with a PARKED comment. P4 keeps that park for a red check (OWL-244): passing checks are the ticket's own acceptance, which S13 forbids deferring to a follow-up, so the residue S9 proposes is a confirmed finding's, from P5.
 - Human review comments on the pull request are not read before P5. Telling whose review counts also needs P10's identity map.
 - S9 and OWL-211 send these questions to needs input "returning to review". In P3 they return to Watch, whose visible stage is review, so this is the same thing.
 - OWL-211's "through the P2 question loop (… resolver …)" is narrowed: the resolver is skipped. A fix or rebase run's questions go to the decider, as a late-comment run's do, since they are acts and arbitrations the agent cannot settle. The rest of the loop is unchanged: the answer check, re-asks and replies.
@@ -90,6 +90,15 @@ Owlshift picks its own work, one ticket at a time.
 - Admission gesture, ready-column polling in priority order, blockers from relations and from the text convention.
 - Intake stage: early questions, dependencies turned into relations, the routing record.
 - Cap on open PRs awaiting review; follow-up proposals to Triage, deduplicated. Scenarios S3, S4, S6, S12, S13.
+- `owlshift watch --drain` runs it, in the foreground; the rules are [architecture](architecture.md) section 5, "The drain" (OWL-244), and the [build plan](build-plan.md), "P4 · The drain", says who builds what and how the exit gate is run.
+
+**Readings and deviations** (OWL-244, 2026-10-13).
+
+- S6's "nothing new starts" at the pull request cap stops new Builds; intake goes on, since it opens no pull request and asks its questions early.
+- S3's intake records routing and dependencies; resources and zones wait for P6, as that step already says. The routing verdict is recorded and shown in P4, and followed from P5.
+- S12's `owlshift pause` comes with the background service (P7): until then, stopping watch stops the drain. The exclusion label is P4's.
+- Admission by delegation waits: decision D8's Linear app takes no delegation scope. A label or the ready state admits.
+- A ticket left at Build by a usage limit, a failed delivery or a refused push holds the drain's one slot until a person types `continue`, as P3 leaves those restarts to a person.
 
 **Exit gate.** Ten Owlshift tickets drained serially, at least one started by the merge of its blocker.
 
