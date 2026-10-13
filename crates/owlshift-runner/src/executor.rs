@@ -52,7 +52,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use jiff::Timestamp;
 
@@ -160,7 +160,13 @@ pub struct RunReport {
     pub model: Option<String>,
     /// The harness's version, to record with every run.
     pub harness_version: Option<String>,
+    /// The run's monotonic time. It leaves out the time the machine sleeps
+    /// on macOS, so it is not what the operator waited (OWL-262).
     pub elapsed: Duration,
+    /// The run's time by the system clock, sleep included. `None` when the
+    /// clock reads earlier at the end than at the start (it was set back);
+    /// a smaller step inside the run is not detected.
+    pub wall_elapsed: Option<Duration>,
     /// The harness's standard output, as it came.
     pub stdout_log: PathBuf,
     /// The harness's standard error.
@@ -319,6 +325,7 @@ impl Executor {
         harness: &dyn Harness,
     ) -> Result<RunReport, ExecutorError> {
         let started = Instant::now();
+        let wall_started = SystemTime::now();
         // A rebase run may end on a commit that descends from its new base
         // instead of its start (OWL-49): the base it was told, which must
         // be the commit the run was given, so the isolation check never
@@ -485,6 +492,7 @@ impl Executor {
             model: end.as_ref().and_then(|end| end.model.clone()),
             harness_version: end.and_then(|end| end.harness_version),
             elapsed: started.elapsed(),
+            wall_elapsed: wall_span(wall_started, SystemTime::now()),
             stdout_log: log.stdout_path,
             stderr_log: log.stderr_path,
             log_error: log.error,
@@ -799,6 +807,12 @@ fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
 }
 
 /// Whether `haystack` holds `token`'s value.
+/// The time between two readings of the system clock, `None` when the clock
+/// reads earlier at the end: it was set back during the run (OWL-262).
+fn wall_span(start: SystemTime, end: SystemTime) -> Option<Duration> {
+    end.duration_since(start).ok()
+}
+
 fn holds(haystack: &[u8], token: &Secret) -> bool {
     let needle = token.expose().as_bytes();
     !needle.is_empty()
@@ -810,6 +824,15 @@ fn holds(haystack: &[u8], token: &Secret) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wall_span_is_none_when_the_clock_was_set_back() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let later = start + Duration::from_secs(5);
+        assert_eq!(wall_span(start, later), Some(Duration::from_secs(5)));
+        assert_eq!(wall_span(start, start), Some(Duration::ZERO));
+        assert_eq!(wall_span(later, start), None);
+    }
 
     #[test]
     fn a_result_is_valid_for_its_contract_its_brief_and_its_branch() {
