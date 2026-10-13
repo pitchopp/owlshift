@@ -26,6 +26,7 @@ pub const ZONE_LABEL_PREFIX: &str = "zone:";
 /// folder is not one by the [rules of an owned zone][`check_zone`] is
 /// refused rather than left out, since a dropped declaration would change
 /// who decides unseen.
+#[allow(rustdoc::private_intra_doc_links)]
 pub fn declared_zones<'a>(
     labels: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<Resource>, ZoneLabelError> {
@@ -67,6 +68,7 @@ pub struct BriefZones {
 /// chooses no decider: a ticket with an assignee is not refused for a label
 /// its decider never reads. The labels it left out come back in
 /// [`BriefZones::left_out`], so that the omission is not silent.
+#[allow(rustdoc::private_intra_doc_links)]
 pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> BriefZones {
     let mut found = BriefZones::default();
     for label in labels {
