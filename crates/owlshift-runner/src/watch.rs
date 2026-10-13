@@ -19,7 +19,9 @@
 //! repaired through [`OnDemand::repair_seen`] (OWL-112, OWL-210), held as a
 //! continue is. A read that asks for no repair leaves room for a correction:
 //! the decider's replies to a DECISION comment, once they count, go to
-//! [`OnDemand::correct_seen`] (OWL-146).
+//! [`OnDemand::correct_seen`] (OWL-146). A ticket whose round waits at
+//! Watch ([`outlived`]) has its pull request read before its comments, for
+//! an end alone, which closes the round (OWL-242).
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -73,6 +75,21 @@ pub fn watched(status: Status) -> bool {
 /// parked, whose delivery has a pull request and has not ended (OWL-209).
 pub fn followed(status: Status, stored: &Stored) -> bool {
     status == Status::Active(Stage::Watch)
+        && stored
+            .record
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.followed())
+}
+
+/// Whether watch reads the pull request of a ticket in `status` whose ref
+/// keeps `stored` for whether its following ended: a ticket whose round
+/// waits at Watch, whose delivery is still followed (OWL-242).
+pub fn outlived(status: Status, stored: &Stored) -> bool {
+    status
+        == (Status::NeedsInput {
+            return_to: Stage::Watch,
+        })
         && stored
             .record
             .delivery
@@ -291,7 +308,10 @@ impl Watch<'_> {
                     .map_err(|e| format!("its ticket ref keeps no valid state: {e:?}"))
             });
             match state {
-                Ok((stored, state)) if watched(state.status()) => waiting.push((ticket, stored)),
+                Ok((stored, state)) if watched(state.status()) => {
+                    let outlived = outlived(state.status(), &stored);
+                    waiting.push((ticket, stored, outlived));
+                }
                 Ok((stored, state)) if followed(state.status(), &stored) => {
                     memory.failing.remove(&ticket);
                     following.push((ticket, stored));
@@ -305,7 +325,17 @@ impl Watch<'_> {
                 }
             }
         }
-        let ids: Vec<TicketId> = waiting.iter().map(|(ticket, _)| ticket.clone()).collect();
+        let ids: Vec<TicketId> = waiting
+            .iter()
+            .map(|(ticket, _, _)| ticket.clone())
+            .collect();
+        // A waiting ticket whose pull request is read keeps the forge failure
+        // warned of (OWL-242).
+        let read: Vec<TicketId> = waiting
+            .iter()
+            .filter(|(_, _, outlived)| *outlived)
+            .map(|(ticket, _, _)| ticket.clone())
+            .collect();
         let followed: Vec<TicketId> = following.iter().map(|(ticket, _)| ticket.clone()).collect();
         // A followed ticket keeps its repair's hold too: otherwise a repair
         // that left the ref as it was, or a round under it whose state was
@@ -315,7 +345,7 @@ impl Watch<'_> {
             .retain(&[&ids[..], &followed[..], &unread[..]].concat());
         memory
             .following
-            .retain(&[&followed[..], &unread[..]].concat());
+            .retain(&[&followed[..], &read[..], &unread[..]].concat());
         self.note(
             memory,
             out,
@@ -324,7 +354,12 @@ impl Watch<'_> {
                 followed,
             },
         );
-        for (ticket, stored) in waiting {
+        for (ticket, stored, outlived) in waiting {
+            // A pass whose read ended the following reads no comment: an
+            // answer posted with the merge starts nothing.
+            if outlived && self.close_round(memory, sink, out, &ticket, &stored) {
+                continue;
+            }
             self.look(memory, sink, out, continued, &ticket, &stored);
         }
         for (ticket, stored) in following {
@@ -442,6 +477,72 @@ impl Watch<'_> {
         memory
             .holds
             .after(ticket, held, &outcome, after.as_deref(), now);
+    }
+
+    /// A ticket whose round waits at Watch (OWL-242): its pull request read
+    /// for an end alone, never its base. An end moves the ticket's stage to
+    /// review while it shows needs input, then closes the round in the ticket
+    /// ref, with the following's end, from the ref the snapshot read; then
+    /// its event, and the owed report dropped. A stage or ref that cannot be
+    /// read or written is warned of once and leaves the round to the next
+    /// pass. Returns whether the read ended the following, which no comment
+    /// read in this pass outweighs.
+    fn close_round(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        stored: &Stored,
+    ) -> bool {
+        let on_demand = self.on_demand;
+        let Some(delivery) = &stored.record.delivery else {
+            return false;
+        };
+        let now = (on_demand.clock)();
+        let (look, warnings) = memory
+            .following
+            .look_ending(on_demand.forge, ticket, delivery, now);
+        for warning in warnings {
+            sink.emit(ticket, None, EventKind::Warning, warning);
+        }
+        let seen = match look {
+            Look::Read(seen) if matches!(seen.decision, Decision::End(_)) => seen,
+            _ => return false,
+        };
+        // The stage first: a round closed in the ref is no longer read, so a
+        // stage left at needs input would stay there.
+        if let Err(reason) = on_demand.review_after_round(ticket, sink) {
+            self.unreadable(memory, sink, ticket, reason);
+            return true;
+        }
+        let change =
+            follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
+                Some(changed) => self.write_seen(ticket, &stored.commit, &changed.record),
+                None => Ok(None),
+            });
+        let commit = match change {
+            Ok(Some(commit)) => commit,
+            // Busy, or the ref moved: the next pass reads it again.
+            Ok(None) => return true,
+            Err(reason) => {
+                let reason = format!("closing its round: {reason}");
+                self.unreadable(memory, sink, ticket, reason);
+                return true;
+            }
+        };
+        let round = stored.record.state.round;
+        if let Some(mut event) = memory.following.events(ticket, &seen) {
+            event.insert("round".to_owned(), json!(round));
+            sink.emit(ticket, None, EventKind::Decision, event);
+            self.line(
+                out,
+                &format!("{ticket}: {seen}; its round {round} no longer waits for an answer"),
+            );
+        }
+        // Dropped, the following having ended.
+        on_demand.post_owed_report(ticket, stored, &seen, commit, &mut memory.following, sink);
+        true
     }
 
     /// A followed pull request whose ticket keeps decisions (OWL-146): its

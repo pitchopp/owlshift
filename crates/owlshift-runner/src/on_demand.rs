@@ -2488,28 +2488,69 @@ impl OnDemand<'_> {
         stage: VisibleStage,
         sink: &mut EventSink<'_>,
     ) {
-        let states = &self.config.tracker.states;
-        let (kind, data) = match Writer::new(self.tracker).set_stage(ticket, stage, states) {
-            Ok(state) => (
-                EventKind::TrackerWrite,
-                data([
-                    ("target", json!("tracker")),
-                    ("action", json!("stage")),
-                    ("stage", json!(stage.key())),
-                    ("state", json!(state)),
-                ]),
-            ),
-            Err(error) => (
+        if let Err(reason) = self.move_stage(ticket, run, stage, sink) {
+            let states = &self.config.tracker.states;
+            sink.emit(
+                ticket,
+                run,
                 EventKind::Warning,
                 data([
                     ("what", json!("stage_not_moved")),
                     ("stage", json!(stage.key())),
                     ("state", json!(stage.state(states))),
-                    ("reason", json!(error.to_string())),
+                    ("reason", json!(reason)),
                 ]),
-            ),
-        };
-        sink.emit(ticket, run, kind, data);
+            );
+        }
+    }
+
+    /// Moves the ticket's visible stage through the Writer, with its
+    /// `tracker_write` event; the write's error otherwise, nothing recorded.
+    fn move_stage(
+        &self,
+        ticket: &TicketId,
+        run: Option<&str>,
+        stage: VisibleStage,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), String> {
+        let states = &self.config.tracker.states;
+        let state = Writer::new(self.tracker)
+            .set_stage(ticket, stage, states)
+            .map_err(|error| error.to_string())?;
+        sink.emit(
+            ticket,
+            run,
+            EventKind::TrackerWrite,
+            data([
+                ("target", json!("tracker")),
+                ("action", json!("stage")),
+                ("stage", json!(stage.key())),
+                ("state", json!(state)),
+            ]),
+        );
+        Ok(())
+    }
+
+    /// For `owlshift watch`, before it closes a round the pull request
+    /// outlived (OWL-242): moves the ticket to review while the tracker still
+    /// shows the project's needs input state, and keeps any other stage, one
+    /// a person or an integration moved it to. The stage read or written
+    /// otherwise is the error, for watch to warn of and read again at its
+    /// next pass before it closes the round.
+    pub(crate) fn review_after_round(
+        &self,
+        ticket: &TicketId,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), String> {
+        let stage = self
+            .tracker
+            .stage(ticket)
+            .map_err(|e| format!("reading its stage: {e}"))?;
+        if stage != self.config.tracker.states.needs_input {
+            return Ok(());
+        }
+        self.move_stage(ticket, None, VisibleStage::Review, sink)
+            .map_err(|e| format!("moving it to review: {e}"))
     }
 
     /// Moves the visible stage as `event` does ([`VisibleStage::after`]).
