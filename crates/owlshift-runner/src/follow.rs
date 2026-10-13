@@ -633,6 +633,21 @@ pub fn landed_owing(
     delivery.owed.replace(owed)
 }
 
+/// Whether an end of the following brings a ticket in `status` back to
+/// Watch with the core's [`Event::FollowingEnded`]: a round waiting at Watch
+/// (OWL-242), or a park at Watch (OWL-243).
+pub fn ends_with_following(status: Status) -> bool {
+    matches!(
+        status,
+        Status::NeedsInput {
+            return_to: Stage::Watch
+        } | Status::Parked {
+            at: Stage::Watch,
+            ..
+        }
+    )
+}
+
 /// What [`changed`] leaves in the ticket ref, and the owed report it
 /// replaced: never posted, so the caller tells it with a
 /// `{kind}_report_replaced` warning once the record is kept (OWL-239).
@@ -646,7 +661,8 @@ pub struct Changed {
 
 /// The record `seen` leaves in the ticket ref, `None` when it changes
 /// nothing: the following ended, closing a round that waited at Watch
-/// (OWL-242), a push adopted, or the fix passes and
+/// (OWL-242) or ending a park there (OWL-243), a push adopted, or the fix
+/// passes and
 /// failed runs cleared by a green read (`ChecksGreen`). A fix, a rebase or a
 /// park is decided only: the repair runs them ([`OnDemand::repair_seen`]).
 ///
@@ -665,13 +681,10 @@ pub fn changed(
     let mut replaced = None;
     match &seen.decision {
         Decision::End(reason) => {
-            // A round waiting at Watch ends with the following (OWL-242).
+            // A round waiting at Watch, or a park there, ends with the
+            // following (OWL-242, OWL-243).
             let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
-            if state.status()
-                == (Status::NeedsInput {
-                    return_to: Stage::Watch,
-                })
-            {
+            if ends_with_following(state.status()) {
                 match state.apply(pipeline, Event::FollowingEnded) {
                     Ok(Transition::To(closed)) => next.state = (&closed).into(),
                     other => return Err(format!("the core state machine: {other:?}")),
@@ -1288,6 +1301,44 @@ mod tests {
                     state.repairs()
                 ),
                 (Status::Active(Stage::Watch), 1, 0, 1, 1, 2)
+            );
+        }
+    }
+
+    /// An end ends a park at Watch (OWL-243), whether it waited for answers
+    /// or not: back at Watch with its round, fix passes and repairs, its
+    /// failed runs and re-asks cleared.
+    #[test]
+    fn an_end_ends_a_park_at_watch() {
+        let pipeline = Pipeline::new(owlshift_core::vocab::Variant::Trivial);
+        let parked = |awaiting_input, reasks, failed_runs| {
+            let status = Status::Parked {
+                at: Stage::Watch,
+                awaiting_input,
+            };
+            TicketState::restore(status, 2, reasks, failed_runs, 2, 3).unwrap()
+        };
+        for (park, reason) in [
+            (parked(false, 0, 2), EndReason::Merged),
+            (parked(true, 3, 1), EndReason::HeadMoved),
+        ] {
+            let ended = changed(
+                &record(delivery(), park),
+                pipeline,
+                &seen_with(Decision::End(reason), PUSHING),
+                at(5),
+            )
+            .unwrap()
+            .unwrap()
+            .record;
+            assert_eq!(
+                ended.delivery.unwrap().ended.unwrap().why,
+                ended_why(reason)
+            );
+            assert_eq!(
+                TicketState::try_from(&ended.state).unwrap(),
+                TicketState::restore(Status::Active(Stage::Watch), 2, 0, 0, 2, 3).unwrap(),
+                "{park:?}"
             );
         }
     }

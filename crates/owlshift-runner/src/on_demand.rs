@@ -2535,21 +2535,28 @@ impl OnDemand<'_> {
     }
 
     /// For `owlshift watch`, before it closes a round the pull request
-    /// outlived (OWL-242): moves the ticket to review while the tracker still
-    /// shows the project's needs input state, and keeps any other stage, one
-    /// a person or an integration moved it to. The stage read or written
-    /// otherwise is the error, for watch to warn of and read again at its
-    /// next pass before it closes the round.
-    pub(crate) fn review_after_round(
+    /// outlived (OWL-242) or ends a park there (OWL-243), the ticket being
+    /// in `status`: moves the ticket to review while the tracker still shows
+    /// the state `status` set ([`VisibleStage::of`]: needs input for a
+    /// round, the project's parked state for a park, or needs input when it
+    /// maps none), and keeps any other stage, one a person or an integration
+    /// moved it to. The stage read or written otherwise is the error, for
+    /// watch to warn of and read again at its next pass before it writes the
+    /// ref.
+    pub(crate) fn review_after_end(
         &self,
         ticket: &TicketId,
+        status: Status,
         sink: &mut EventSink<'_>,
     ) -> Result<(), String> {
+        let Some(shown) = VisibleStage::of(status) else {
+            return Ok(());
+        };
         let stage = self
             .tracker
             .stage(ticket)
             .map_err(|e| format!("reading its stage: {e}"))?;
-        if stage != self.config.tracker.states.needs_input {
+        if stage != shown.state(&self.config.tracker.states) {
             return Ok(());
         }
         self.move_stage(ticket, None, VisibleStage::Review, sink)
