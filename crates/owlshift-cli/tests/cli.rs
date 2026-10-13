@@ -1294,12 +1294,41 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
     let config = owlshift_contracts::config::ProjectConfig::parse(&text).unwrap();
     assert_eq!(config.tracker.team.as_deref(), Some("OWL"));
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-    let runs: Vec<&str> = ci
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("run: "))
+    let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
+    let runs: Vec<&str> = ci_lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("run: "))
         .collect();
     assert!(!config.stack.gate.is_empty());
     for command in &config.stack.gate {
+        // The gate runs a line through `sh -c`, so a variable CI sets in a
+        // step's `env:` is an inline `NAME='value' ` assignment there (OWL-260).
+        // It must match that step's `env:` exactly.
+        let (assignment, command) = match command.split_once("' ") {
+            Some((head, rest))
+                if head.split_once("='").is_some_and(|(name, _)| {
+                    !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                }) =>
+            {
+                (Some(head), rest)
+            }
+            _ => (None, command.as_str()),
+        };
+        if let Some(head) = assignment {
+            let (name, value) = head.split_once("='").unwrap();
+            let step = ci_lines
+                .iter()
+                .position(|line| line.strip_prefix("run: ") == Some(command))
+                .unwrap_or_else(|| panic!("{command} is not a CI step"));
+            assert_eq!(ci_lines[step + 1], "env:", "{command} has no env in CI");
+            assert_eq!(
+                ci_lines[step + 2],
+                format!("{name}: {value}"),
+                "{command}: the gate's variable differs from CI's"
+            );
+        }
+        let command = command.to_owned();
+        let command = &command;
         // CI runs the tests under cargo-nextest and the doctests apart
         // (OWL-241), where a developer runs them all with `cargo test`.
         let in_ci: &[&str] = match command.as_str() {
@@ -1313,9 +1342,9 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
             assert!(runs.contains(step), "{step} is not a CI step");
         }
     }
-    for step in ["cargo fmt", "cargo clippy", "cargo test"] {
+    for step in ["cargo fmt", "cargo clippy", "cargo doc", "cargo test"] {
         assert!(
-            config.stack.gate.iter().any(|c| c.starts_with(step)),
+            config.stack.gate.iter().any(|c| c.contains(step)),
             "the gate misses CI's {step}"
         );
     }
