@@ -124,6 +124,27 @@ pub fn is_repository_part(part: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Whether `text` is exactly `len` lowercase hexadecimal digits, as a commit
+/// id, a SHA-256 or a fingerprint is written.
+pub(crate) fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// Checks a name a person writes and Owlshift compares exactly, such as a
+/// tracker account's identifier or a label: not blank, no space at either
+/// end, no control character. Gives what is wrong.
+pub(crate) fn check_name(name: &str) -> Result<(), &'static str> {
+    if name.trim().is_empty() {
+        Err("is blank")
+    } else if name.trim() != name {
+        Err("has a space at either end")
+    } else if name.chars().any(char::is_control) {
+        Err("holds a control character")
+    } else {
+        Ok(())
+    }
+}
+
 /// An identifier that does not match its pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdError {

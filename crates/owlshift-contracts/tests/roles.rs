@@ -44,6 +44,33 @@ const RESOLVER_ONLY: &[&str] = &["resolutions", "outcome", "decided", "passed_on
 /// decisions still carry. The prompt names `decisions` itself, to leave it out.
 const NOT_BUILD: &[&str] = &["basis"];
 
+/// `result.json` fields and values only the intake role writes (OWL-245): the
+/// build prompt need not name them, and a build result carrying them is
+/// refused.
+const INTAKE_ONLY: &[&str] = &[
+    "intake",
+    "variant",
+    "trivial",
+    "risky",
+    "routing",
+    "harness",
+    "claude",
+    "codex",
+    "tier",
+    "deep",
+    "standard",
+    "fast",
+    "effort",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "dependencies",
+    "ticket",
+    "quote",
+];
+
 /// Brief fields the build prompt relies on, as dotted paths from the brief's
 /// root; arrays and alternatives are crossed on the way.
 const BUILD_BRIEF_FIELDS: &[&str] = &[
@@ -286,6 +313,7 @@ fn build_prompt_names_every_result_field_and_value() {
         .iter()
         .chain(RESOLVER_ONLY)
         .chain(NOT_BUILD)
+        .chain(INTAKE_ONLY)
     {
         assert!(
             expected.remove(*word),

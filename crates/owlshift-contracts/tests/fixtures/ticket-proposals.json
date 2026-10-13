@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "proposals": [
+    {
+      "fingerprint": "3c1f0a9b7e22",
+      "proposal": {
+        "title": "Cache the label lookup",
+        "why": "Each pass reads the labels again.",
+        "evidence": ["crates/owlshift-adapters/src/tracker/linear.rs:412"],
+        "source": "agent",
+        "done_when": "A pass reads the labels once.",
+        "blocked_by_parent": true
+      },
+      "run": {
+        "kind": "delivery",
+        "count": 1
+      },
+      "outcome": {
+        "kind": "filed",
+        "ticket": "OWL-57"
+      }
+    },
+    {
+      "fingerprint": "a0b1c2d3e4f5",
+      "proposal": {
+        "title": "Name the cap in the report",
+        "why": "The report does not say the cap was reached.",
+        "source": "reviewer",
+        "done_when": "The report names the cap."
+      },
+      "run": {
+        "kind": "fix",
+        "count": 2
+      },
+      "outcome": {
+        "kind": "owed",
+        "refusal": "the tracker answered 429"
+      }
+    }
+  ]
+}

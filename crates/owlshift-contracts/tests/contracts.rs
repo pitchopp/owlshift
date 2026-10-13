@@ -12,6 +12,7 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
+use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::Event;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
@@ -254,7 +255,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(8);
+            v["format"] = json!(9);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -303,20 +304,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 8, "status""#),
+        RunResult::parse(r#"{"format": 9, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 7, "status""#),
+        RunResult::parse(r#"{"format": 8, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(8));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(9));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 8,
-            supported: 7,
+            found: 9,
+            supported: 8,
             ..
         })
     ));
@@ -517,6 +518,80 @@ fn questions_are_bounded() {
 
 /// Verdicts against the brief of the run: from the answer check only, one for
 /// each question of the thread's latest ask (OWL-23).
+#[test]
+fn intake_comes_from_the_intake_role_only() {
+    let brief = |role: &str| {
+        let input = edited("brief.json", |v| {
+            v.as_object_mut().unwrap().remove("result_refusal");
+            v["role"] = json!(role);
+        });
+        Brief::parse(&input).unwrap()
+    };
+    let intake = brief("intake");
+    let result = |edit: fn(&mut Value)| RunResult::parse(&edited("result-intake.json", edit));
+
+    result(|_| {}).unwrap().validate_against(&intake).unwrap();
+    let asks = result(|v| {
+        v["status"] = json!("questions");
+        v["questions"] = json!([{ "id": "Q1", "category": "scope", "context": "c", "text": "t" }]);
+    })
+    .unwrap();
+    asks.validate_against(&intake).unwrap();
+    let blocked = result(|v| {
+        v["status"] = json!("blocked");
+        v.as_object_mut().unwrap().remove("intake");
+    })
+    .unwrap();
+    blocked.validate_against(&intake).unwrap();
+
+    rejects(
+        "intake with another status",
+        result(|v| v["status"] = json!("premise_false")),
+        "intake is given but status is neither done nor questions",
+    );
+    rejects(
+        "a done intake run without its record",
+        result(|v| {
+            v.as_object_mut().unwrap().remove("intake");
+        })
+        .unwrap()
+        .validate_against(&intake),
+        "status is done or questions but no intake is given",
+    );
+    rejects(
+        "intake from another role",
+        result(|_| {}).unwrap().validate_against(&brief("build")),
+        "intake is given but the run's role is build, not intake",
+    );
+    rejects(
+        "a blank quote",
+        result(|v| v["intake"]["dependencies"][0]["quote"] = json!(" ")),
+        "the quote of dependency OWL-41 is blank",
+    );
+    rejects(
+        "a long quote",
+        result(|v| v["intake"]["dependencies"][0]["quote"] = json!("a".repeat(513))),
+        "weighs 513 bytes, past the 512",
+    );
+    rejects(
+        "too many dependencies",
+        result(|v| {
+            let one = v["intake"]["dependencies"][0].clone();
+            v["intake"]["dependencies"] = json!(vec![one; 65]);
+        }),
+        "65 dependencies are named, past the 64",
+    );
+    rejects(
+        "an unknown effort",
+        result(|v| v["intake"]["routing"]["effort"] = json!("minimal")),
+        "unknown variant `minimal`",
+    );
+
+    // The drain's ticket-ref documents read their fixtures.
+    TicketIntake::parse(&fixture("ticket-intake.json")).unwrap();
+    TicketProposals::parse(&fixture("ticket-proposals.json")).unwrap();
+}
+
 #[test]
 fn result_against_the_brief() {
     // The fixture is Build's brief: an answer check's carries no refused

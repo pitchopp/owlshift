@@ -74,17 +74,20 @@ fn committed_schemas_match_the_types() {
 
 #[test]
 fn fixtures_validate_against_the_committed_schemas() {
-    let cases: [(&str, &str); 13] = [
+    let cases: [(&str, &str); 16] = [
         ("result", "result-sample.json"),
         ("result", "result-answer-check.json"),
         ("result", "result-counter-question.json"),
         ("result", "result-resolver.json"),
+        ("result", "result-intake.json"),
         ("brief", "brief.json"),
         ("event", "event.json"),
         ("claim", "claim.json"),
         ("ticket-state", "ticket-state.json"),
         ("ticket-questions", "ticket-questions.json"),
         ("ticket-delivery", "ticket-delivery.json"),
+        ("ticket-intake", "ticket-intake.json"),
+        ("ticket-proposals", "ticket-proposals.json"),
         ("comment-footer", "footer.json"),
         ("project-config", "owlshift.toml"),
         ("personal-config", "personal.toml"),
@@ -108,7 +111,7 @@ fn fixtures_validate_against_the_committed_schemas() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
-    let base = |status: &str| json!({ "format": 7, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 8, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -139,10 +142,19 @@ fn result_schema_carries_the_expressible_rules() {
     named["refused_choices_asked"][0]["choice"] = json!(0);
     assert!(!validator.is_valid(&named));
 
-    for format in [1, 2, 3, 4, 5, 6, 8] {
+    for format in [1, 2, 3, 4, 5, 6, 7, 9] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
+    }
+
+    // The intake record goes with `done` or `questions` only (OWL-245).
+    let intake: Value = serde_json::from_str(&fixture("result-intake.json")).unwrap();
+    assert!(validator.is_valid(&intake));
+    for status in ["blocked", "failed", "premise_false"] {
+        let mut other = intake.clone();
+        other["status"] = json!(status);
+        assert!(!validator.is_valid(&other), "{status}");
     }
 
     // Resolutions go with `done` only; a decision carries a decision and a

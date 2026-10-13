@@ -5,6 +5,7 @@ use schemars::{JsonSchema, Schema, schema_for};
 use crate::brief::Brief;
 use crate::comment::Footer;
 use crate::config::{PersonalConfig, ProjectConfig};
+use crate::drain::{TicketIntake, TicketProposals};
 use crate::event::Event;
 use crate::refs::{Claim, PersistedState, TicketDelivery, TicketQuestions};
 use crate::result::RunResult;
@@ -21,6 +22,8 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("ticket-state", schema::<PersistedState>()),
         ("ticket-questions", schema::<TicketQuestions>()),
         ("ticket-delivery", schema::<TicketDelivery>()),
+        ("ticket-intake", schema::<TicketIntake>()),
+        ("ticket-proposals", schema::<TicketProposals>()),
         ("comment-footer", schema::<Footer>()),
     ]
 }

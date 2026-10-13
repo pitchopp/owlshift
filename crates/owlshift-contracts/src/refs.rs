@@ -3,7 +3,9 @@
 //! `refs/owlshift/claims/<ticket>` points to a commit whose tree holds
 //! [`CLAIM_FILE`]; `refs/owlshift/tickets/<ticket>` points to a commit whose
 //! tree holds [`STATE_FILE`], [`QUESTIONS_FILE`], once a delivery was made
-//! [`DELIVERY_FILE`] (OWL-209), and, later, the ticket's artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
+//! [`DELIVERY_FILE`] (OWL-209), once the drain took it in or a run proposed a
+//! follow-up [`INTAKE_FILE`] and [`PROPOSALS_FILE`] (OWL-245), and, later, the
+//! ticket's artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
 //! checkout only; pushing it to the remote comes with claims (P7).
 
 use std::num::NonZeroU32;
@@ -22,7 +24,7 @@ use crate::format::{
     self, CLAIM_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
     TICKET_STATE_FORMAT,
 };
-use crate::ids::TicketId;
+use crate::ids::{TicketId, is_lower_hex};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
@@ -48,6 +50,12 @@ pub const QUESTIONS_FILE: &str = "questions.json";
 /// The pull request Owlshift delivered and follows, in a ticket ref's tree
 /// (OWL-209).
 pub const DELIVERY_FILE: &str = "delivery.json";
+/// The intake record, in a ticket ref's tree once intake ran (OWL-245,
+/// [`crate::drain::TicketIntake`]).
+pub const INTAKE_FILE: &str = "intake.json";
+/// The follow-ups proposed by the ticket's runs, in a ticket ref's tree once
+/// one was (OWL-245, [`crate::drain::TicketProposals`]).
+pub const PROPOSALS_FILE: &str = "proposals.json";
 /// The review findings, in a ticket ref's tree.
 pub const FINDINGS_FILE: &str = "findings.json";
 
@@ -1362,7 +1370,7 @@ impl TicketDelivery {
 
 /// A full commit id: 40 or 64 lowercase hexadecimal digits.
 fn is_commit_id(id: &str) -> bool {
-    matches!(id.len(), 40 | 64) && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+    is_lower_hex(id, 40) || is_lower_hex(id, 64)
 }
 
 /// Git's rules for a branch name (`git check-ref-format --branch`), the

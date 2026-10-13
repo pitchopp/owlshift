@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket proposals",
+  "description": "The follow-ups the ticket's runs proposed, owed until filed, then kept\nwith what became of them (architecture section 5, \"Follow-ups\").",
+  "type": "object",
+  "properties": {
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "proposals": {
+      "description": "At least one: a ref keeps no `proposals.json` without a proposal.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/KeptProposal"
+      },
+      "minItems": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "proposals"
+  ],
+  "$defs": {
+    "Followup": {
+      "description": "A follow-up ticket proposed to a human.",
+      "type": "object",
+      "properties": {
+        "blocked_by_parent": {
+          "description": "Whether the follow-up waits for the current ticket to be done.",
+          "type": "boolean",
+          "default": false
+        },
+        "done_when": {
+          "description": "When the follow-up counts as done.",
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/FollowupSource"
+        },
+        "title": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "why",
+        "source",
+        "done_when"
+      ]
+    },
+    "FollowupSource": {
+      "description": "Who found the follow-up.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "reviewer",
+        "ci"
+      ]
+    },
+    "KeptProposal": {
+      "description": "One proposed follow-up.",
+      "type": "object",
+      "properties": {
+        "fingerprint": {
+          "description": "The first 12 lowercase hexadecimal digits of the SHA-256 of its\nnormalized title, as its footer shows them.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{12}$"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ProposalOutcome"
+        },
+        "proposal": {
+          "description": "The follow-up as the run proposed it, kept whole so that a filing\nthe tracker refused can be made again by a later pass.",
+          "$ref": "#/$defs/Followup"
+        },
+        "run": {
+          "$ref": "#/$defs/ProposingRun"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "proposal",
+        "run",
+        "outcome"
+      ]
+    },
+    "ProposalOutcome": {
+      "description": "What became of a proposal.",
+      "oneOf": [
+        {
+          "description": "Not filed yet; with why the tracker refused the last filing, if one\nwas tried.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owed"
+            },
+            "refusal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Filed as this ticket.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "filed"
+            },
+            "ticket": {
+              "$ref": "#/$defs/TicketId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "ticket"
+          ]
+        },
+        {
+          "description": "Already proposed as this ticket, so not filed.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "duplicate"
+            },
+            "ticket": {
+              "$ref": "#/$defs/TicketId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "ticket"
+          ]
+        },
+        {
+          "description": "Not filed: the parent had its three filed already.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "over_limit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ProposingRun": {
+      "description": "The run that proposed a follow-up: the delivering Build, or a fix,\nrebase or correction run whose push landed, counted as its push is in\n`delivery.json`.",
+      "type": "object",
+      "properties": {
+        "count": {
+          "description": "The fix pass or the repair the run was, from 1; 1 for the delivery.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "kind": {
+          "$ref": "#/$defs/PushKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "count"
+      ]
+    },
+    "PushKind": {
+      "description": "Which run's push.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "delivery",
+            "fix",
+            "rebase"
+          ]
+        },
+        {
+          "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146).",
+          "type": "string",
+          "const": "correction"
+        }
+      ]
+    },
+    "TicketId": {
+      "description": "A tracker's ticket identifier, safe as a git ref component and a file name.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    }
+  }
+}

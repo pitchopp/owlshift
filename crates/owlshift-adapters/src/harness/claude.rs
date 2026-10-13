@@ -177,28 +177,9 @@ const BEYOND_RUN_TOOLS: &[&str] = &[
 /// The tools removed from a run that has no network access.
 const NETWORK_TOOLS: &[&str] = &["WebFetch", "WebSearch"];
 
-/// How hard the model thinks, as `claude --effort` names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl Effort {
-    /// The value `claude --effort` takes.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
-}
+/// How hard the model thinks, as `claude --effort` names it: the contracts'
+/// vocabulary, which intake's routing verdict uses too (OWL-245).
+pub use owlshift_contracts::result::Effort;
 
 /// One role run, as the executor asks for it.
 #[derive(Clone, Debug, PartialEq)]

@@ -149,6 +149,16 @@
             "type": "string"
           }
         },
+        "max_open_prs": {
+          "description": "How many pull requests Owlshift delivered may be open at once before\nthe drain dispatches no new Build, a whole number from 1 to 20.\nAbsent: 3 (OWL-245).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "maximum": 20,
+          "minimum": 1
+        },
         "quiet_window_minutes": {
           "description": "How long the decider's latest comment must be left unedited before\ntheir answer counts, in whole minutes from 1 to 1440 (a day). Absent:\n10 minutes. Zero is refused: every edit would count at once, which is\nwhat ending a comment with `go` is for.",
           "type": [
@@ -260,8 +270,26 @@
       "type": "object",
       "properties": {
         "admit": {
-          "description": "The gesture by which a person admits a ticket to the queue.",
+          "description": "The gesture by which a person admits a ticket to the queue. A state\ngesture is the move to the ready column, so it names\n`states.ready`.",
           "$ref": "#/$defs/Admit"
+        },
+        "admitters": {
+          "description": "The tracker accounts whose gesture admits a ticket to the drain\n(`owlshift watch --drain`), each by its identifier as the tracker\nreports it (a Linear user's id, the name on the Markdown tracker),\nwritten exactly, as a zone's owner is. Optional for the file;\n`--drain` refuses to start without it. When set, at least one, each\nonce, none blank, padded or holding a control character. A file\nusing it requires an Owlshift that reads it (OWL-245).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "exclude": {
+          "description": "A label that keeps a ticket out of the drain, whatever else it\ncarries; optional, and never the admission label (OWL-245).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "kind": {
           "$ref": "#/$defs/TrackerKind"
