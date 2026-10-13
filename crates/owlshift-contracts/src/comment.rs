@@ -44,10 +44,12 @@ pub enum MarkerKind {
     Delivery,
     /// An answer to a counter-question in the thread.
     Reply,
+    /// The intake's verdict and the dependencies it found (OWL-248).
+    Intake,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -55,6 +57,7 @@ impl MarkerKind {
         Self::Parked,
         Self::Delivery,
         Self::Reply,
+        Self::Intake,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -66,6 +69,7 @@ impl MarkerKind {
             Self::Parked => "PARKED",
             Self::Delivery => "DELIVERY",
             Self::Reply => "REPLY",
+            Self::Intake => "INTAKE",
         }
     }
 

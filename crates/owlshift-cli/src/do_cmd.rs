@@ -26,7 +26,9 @@ use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
-use owlshift_runner::roles::{ANSWER_CHECK_ROLE, BUILD_ROLE, REBASE_ROLE, RESOLVER_ROLE};
+use owlshift_runner::roles::{
+    ANSWER_CHECK_ROLE, BUILD_ROLE, INTAKE_ROLE, REBASE_ROLE, RESOLVER_ROLE,
+};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_runner::{forge, tracker};
@@ -110,6 +112,8 @@ fn run_with(
         .map_err(|error| format!("the built-in resolver role: {error}"))?;
     let rebase_prompt = strip_role_front_matter(Role::Rebase, REBASE_ROLE)
         .map_err(|error| format!("the built-in rebase role: {error}"))?;
+    let intake_prompt = strip_role_front_matter(Role::Intake, INTAKE_ROLE)
+        .map_err(|error| format!("the built-in intake role: {error}"))?;
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
@@ -168,6 +172,11 @@ fn run_with(
         prompt: resolver_prompt,
         ..harness.clone()
     };
+    // Intake (OWL-248) on the standard tier, as Build's routing is.
+    let intake = ClaudeHarness {
+        prompt: intake_prompt,
+        ..harness.clone()
+    };
     // A rebase run (OWL-210) on the Build routing, and its fast tier for a
     // trivial conflict's first run: `[models].fast`, else the standard
     // tier's model.
@@ -191,6 +200,7 @@ fn run_with(
         tracker: tracker.as_ref(),
         forge: &forge,
         build: &harness,
+        intake: &intake,
         answer_check: &check,
         resolver: &resolver,
         rebase: &rebase,
@@ -338,8 +348,9 @@ fn finish(
         }
         Err(stop) => {
             let _ = writeln!(stdout, "\n{}", printable(&stop.to_string()));
-            // A look at a followed pull request is no failure (OWL-209).
-            if matches!(stop, Stop::Watched { .. }) {
+            // A look at a followed pull request is no failure (OWL-209),
+            // nor is a ticket back in the ready column (OWL-248).
+            if matches!(stop, Stop::Watched { .. } | Stop::Ready { .. }) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE

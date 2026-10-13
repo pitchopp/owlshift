@@ -74,6 +74,11 @@
           "description": "The dependency is already blocked by the ticket, directly or through\nits own blockers.",
           "type": "string",
           "const": "cycle"
+        },
+        {
+          "description": "Not checked yet: intake records every dependency so, and the relation\nwrite (part F) turns it into one of the outcomes above.",
+          "type": "string",
+          "const": "pending"
         }
       ]
     },

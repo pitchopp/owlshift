@@ -16,6 +16,8 @@ owlshift-platform.workspace = true
 jiff.workspace = true
 semver.workspace = true
 serde_json.workspace = true
+# The hash of a ticket's text an intake record keeps (OWL-248).
+sha2.workspace = true
 toml.workspace = true
 # Each run's own temporary folder, private to the user and removed with the
 # run (OWL-41).

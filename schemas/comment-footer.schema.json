@@ -76,6 +76,11 @@
           "description": "An answer to a counter-question in the thread.",
           "type": "string",
           "const": "REPLY"
+        },
+        {
+          "description": "The intake's verdict and the dependencies it found (OWL-248).",
+          "type": "string",
+          "const": "INTAKE"
         }
       ]
     },

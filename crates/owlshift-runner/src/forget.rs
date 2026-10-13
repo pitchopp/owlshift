@@ -187,6 +187,9 @@ fn dropped(record: &TicketRecord) -> Vec<String> {
     if questions.checked_through.is_some() {
         parts.push("what the last answer check read".to_owned());
     }
+    if record.intake.is_some() {
+        parts.push("its intake record, so the drain runs intake again".to_owned());
+    }
     let round = record.state.round;
     parts.push(match record.state.waiting {
         None => "its state".to_owned(),

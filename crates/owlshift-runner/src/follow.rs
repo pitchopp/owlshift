@@ -1044,6 +1044,7 @@ mod tests {
             state: PersistedState::from(&state),
             questions: TicketQuestions::new(),
             delivery: Some(delivery),
+            intake: None,
         }
     }
 

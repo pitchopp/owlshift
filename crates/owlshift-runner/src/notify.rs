@@ -72,7 +72,10 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// person, whatever reached the ticket. So does a RESUME whose state was not
 /// kept ([`Landed::Resume`], OWL-169): it asks nothing of the decider, but
 /// Build did not resume and only a person's act resumes it, which makes the
-/// operator the blocker. The decision comment asks nothing of anyone, so a
+/// operator the blocker. So does an INTAKE comment whose record was not kept
+/// ([`Landed::Intake`], OWL-248): the drain cannot dispatch the ticket until
+/// a person makes its ref writable. A ticket back in the ready column
+/// ([`Stop::Ready`]) waits for the drain, not a person. The decision comment asks nothing of anyone, so a
 /// failure to keep its state stays a refusal, as does a RESUME the tracker
 /// refused, since nothing reached the ticket.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
@@ -116,6 +119,10 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
                     "the ticket is parked: a person must look",
                     "its PARKED comment was not posted and Owlshift's state was not kept",
                 ),
+                Landed::Intake => (
+                    "the intake's verdict is on the ticket",
+                    "its record was not kept, so the drain cannot dispatch it",
+                ),
             };
             format!("{ticket}: {what}, but {lost}; see the terminal")
         }
@@ -132,7 +139,8 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         | Stop::Settling { .. }
         | Stop::CheckFailed { .. }
         | Stop::Delivery(_)
-        | Stop::Watched { .. } => return None,
+        | Stop::Watched { .. }
+        | Stop::Ready { .. } => return None,
     })
 }
 

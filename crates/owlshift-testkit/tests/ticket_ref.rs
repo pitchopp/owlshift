@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use owlshift_adapters::forge::Repo as ForgeRepo;
+use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{PersistedState, TicketDelivery, TicketQuestions};
@@ -99,6 +100,7 @@ fn record(state: &str, round: u32) -> TicketRecord {
         state: PersistedState::parse(state).unwrap(),
         questions: TicketQuestions::parse(&questions(round)).unwrap(),
         delivery: None,
+        intake: None,
     }
 }
 
@@ -165,6 +167,34 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
     let four = ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&three)).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().record, second);
     assert_eq!(repo.git(&["rev-parse", &format!("{four}:plan.md")]), plan);
+
+    // So is an intake record (OWL-248).
+    let taken_in = TicketRecord {
+        intake: Some(intake()),
+        ..second.clone()
+    };
+    let five = ticket_ref::write(&repo.git, &repo.root, &ticket(), &taken_in, Some(&four)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, taken_in);
+    ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&five)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, second);
+}
+
+fn intake() -> TicketIntake {
+    TicketIntake::parse(include_str!(
+        "../../owlshift-contracts/tests/fixtures/ticket-intake.json"
+    ))
+    .unwrap()
+}
+
+/// The hash of a ticket's text is the SHA-256 of its title, a NUL byte and
+/// its description (architecture section 5, "Intake").
+#[test]
+fn the_text_hash_is_the_sha256_of_title_nul_description() {
+    // `printf 'Add a greeting\0Say Hello.' | sha256sum`
+    assert_eq!(
+        ticket_ref::text_sha256("Add a greeting", "Say Hello."),
+        "360737837ab88ae651577d3bcf3f947cacde900692cea7b75a700a8a22f25193"
+    );
 }
 
 /// A waiting record whose `questions.json` renders to `len` bytes, its
@@ -179,6 +209,7 @@ fn record_of(len: usize) -> TicketRecord {
             state: PersistedState::parse(WAITING).unwrap(),
             questions: TicketQuestions::parse(&questions).unwrap(),
             delivery: None,
+            intake: None,
         }
     };
     let base = with(1).questions.render().len();
@@ -276,13 +307,15 @@ fn kept_everything() -> TicketRecord {
             "../../owlshift-contracts/tests/fixtures/ticket-questions.json"
         ))
         .unwrap(),
-        // Forgetting drops the delivery too (OWL-209).
+        // Forgetting drops the delivery too (OWL-209), and the intake
+        // record, so the drain runs intake again (OWL-248).
         delivery: Some(
             TicketDelivery::parse(include_str!(
                 "../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
             ))
             .unwrap(),
         ),
+        intake: Some(intake()),
     }
 }
 
@@ -300,6 +333,7 @@ fn forgotten(round: u32, questions: &TicketQuestions) -> TicketRecord {
             ..TicketQuestions::new()
         },
         delivery: None,
+        intake: None,
     }
 }
 

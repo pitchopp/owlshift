@@ -63,6 +63,11 @@ pub const RESOLVER_ROLE: &str = include_str!("../../../roles/resolver.md");
 /// (OWL-210).
 pub const REBASE_ROLE: &str = include_str!("../../../roles/rebase.md");
 
+/// The default intake role prompt, `roles/intake.md`, as this binary was
+/// built with it: what the drain and `owlshift continue` hand Claude Code to
+/// take an admitted ticket in (OWL-248).
+pub const INTAKE_ROLE: &str = include_str!("../../../roles/intake.md");
+
 /// Reads `<roles_dir>/<role>.md` and strips its front matter, per
 /// [`owlshift_contracts::format::strip_role_front_matter`].
 pub fn load_role_prompt(roles_dir: &Path, role: Role) -> Result<String, RoleLoadError> {
@@ -114,6 +119,8 @@ mod tests {
         assert!(prompt.trim_start().starts_with("# Resolver"), "{prompt}");
         let prompt = format::strip_role_front_matter(Role::Rebase, REBASE_ROLE).expect("strips");
         assert!(prompt.trim_start().starts_with("# Rebase"), "{prompt}");
+        let prompt = format::strip_role_front_matter(Role::Intake, INTAKE_ROLE).expect("strips");
+        assert!(prompt.trim_start().starts_with("# Intake"), "{prompt}");
     }
 
     #[test]

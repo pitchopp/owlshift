@@ -96,6 +96,9 @@ pub enum DependencyOutcome {
     /// The dependency is already blocked by the ticket, directly or through
     /// its own blockers.
     Cycle,
+    /// Not checked yet: intake records every dependency so, and the relation
+    /// write (part F) turns it into one of the outcomes above.
+    Pending,
 }
 
 impl TicketIntake {
@@ -269,6 +272,11 @@ mod tests {
         assert_eq!(parsed.gesture.kind, GestureKind::Label);
         assert_eq!(parsed.dependencies[0].outcome, DependencyOutcome::Written);
         assert_eq!(TicketIntake::parse(&parsed.render()).unwrap(), parsed);
+        // Intake records every dependency `pending` until part F checks it.
+        let mut pending = intake();
+        pending["dependencies"][0]["outcome"] = "pending".into();
+        let pending = TicketIntake::parse(&pending.to_string()).unwrap();
+        assert_eq!(pending.dependencies[0].outcome, DependencyOutcome::Pending);
 
         let refused = |edit: &dyn Fn(&mut serde_json::Value)| {
             let mut document = intake();
@@ -296,7 +304,7 @@ mod tests {
                 "control character",
             ),
             (
-                &|d| d["dependencies"][0]["outcome"] = "pending".into(),
+                &|d| d["dependencies"][0]["outcome"] = "owed".into(),
                 "unknown variant",
             ),
             (&|d| d["format"] = 2.into(), "upgrade Owlshift"),

@@ -456,6 +456,28 @@ const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024;
 /// No project file at the base means no owners. A file over 64 KiB, not
 /// text, requiring a newer Owlshift or invalid is an error naming it.
 pub fn zone_owners_at(git: &Git, checkout: &Path, base: &Base) -> Result<ZoneOwners, String> {
+    match config_at(git, checkout, base)? {
+        Some(config) => config
+            .zone_owners()
+            .map_err(|e| format!("{PROJECT_FILE} on {}: {e}", base.remote_ref)),
+        None => Ok(ZoneOwners::default()),
+    }
+}
+
+/// The `[tracker].admitters` of the project file as the base commit holds
+/// it, read as [`zone_owners_at`] reads the owners, for the same reason: a
+/// run cannot choose who admits (architecture section 5, "By whom"). `None`
+/// when the file, or its key, is absent.
+pub fn admitters_at(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+) -> Result<Option<Vec<String>>, String> {
+    Ok(config_at(git, checkout, base)?.and_then(|config| config.tracker.admitters))
+}
+
+/// The project file at the base commit, parsed; `None` when there is none.
+fn config_at(git: &Git, checkout: &Path, base: &Base) -> Result<Option<ProjectConfig>, String> {
     let file = PROJECT_FILE;
     let Some(text) = rules::text_at_base(
         git,
@@ -466,12 +488,12 @@ pub fn zone_owners_at(git: &Git, checkout: &Path, base: &Base) -> Result<ZoneOwn
         "the project file",
     )?
     else {
-        return Ok(ZoneOwners::default());
+        return Ok(None);
     };
     let current = Version::parse(OWLSHIFT_VERSION).expect("the crate version is semver");
     check_requires(&text, &current)
         .and_then(|()| ProjectConfig::parse(&text))
-        .and_then(|config| config.zone_owners())
+        .map(Some)
         .map_err(|e| format!("{file} on {}: {e}", base.remote_ref))
 }
 
