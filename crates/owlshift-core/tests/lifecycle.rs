@@ -6,7 +6,7 @@ use owlshift_core::gate::{GatePolicy, Route};
 use owlshift_core::resource::Resource;
 use owlshift_core::schedule::{Caps, Load, Wait, ready_set};
 use owlshift_core::state::{Event, Finish, ParkReason, Status, TicketState, Transition};
-use owlshift_core::ticket::{Admission, Blocker, Ticket};
+use owlshift_core::ticket::{Admission, Blocker, BlockerState, Ticket};
 use owlshift_core::vocab::{PlanApproval, Priority, Stage, Variant};
 
 /// Applies an event the ticket must accept, and returns its new state.
@@ -27,14 +27,20 @@ fn a_standard_ticket_from_admission_to_merge() {
     let mut ticket = Ticket {
         id: "OWL-42".to_owned(),
         priority: Priority::High,
+        created_ms: 1_760_000_000_000,
         admission: Admission::Admitted,
+        has_decider: true,
+        text_hash: "hash".to_owned(),
+        intake_hash: Some("hash".to_owned()),
         blocked_by: vec![Blocker {
             id: "OWL-41".to_owned(),
-            done: false,
+            tracker: BlockerState::Open,
+            merged: false,
         }],
         variant: Variant::Standard,
         resources: vec![Resource::Zone("crates/owlshift-core".to_owned())],
         state: TicketState::admitted(),
+        delivery_followed: false,
     };
     let policy = GatePolicy::new(["billing"], PlanApproval::OnFork);
 
@@ -65,9 +71,9 @@ fn a_standard_ticket_from_admission_to_merge() {
             Wait::BlockedBy(vec!["OWL-41".to_owned()])
         )]
     );
-    ticket.blocked_by[0].done = true;
+    ticket.blocked_by[0].tracker = BlockerState::Completed;
     let ready = ready_set(std::slice::from_ref(&ticket), caps, Load::default());
-    assert_eq!(ready.dispatch, ["OWL-42".to_owned()]);
+    assert_eq!(ready.dispatch, Some("OWL-42".to_owned()));
     step(&mut ticket, Event::Dispatched);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
 

@@ -329,7 +329,9 @@ impl TicketState {
     ///   more;
     /// - waiting for input means a question round was asked, and never at
     ///   Intake (intake questions return to Ready);
-    /// - a ticket at Intake has asked no question round;
+    /// - a ticket at Intake asked no question round since it was taken in:
+    ///   rounds asked before it was taken in again, its text edited, are kept,
+    ///   and it neither waits for input nor has re-asks there;
     /// - nothing runs at Ready, so nothing is parked there unless it was
     ///   waiting for input;
     /// - at most [`MAX_FIX_PASSES`] fix passes and [`MAX_REPAIRS`] repairs,
@@ -353,8 +355,6 @@ impl TicketState {
             Some("waiting for input with no question round")
         } else if status.awaits_input() && status.stage() == Stage::Intake {
             Some("waiting for input at intake")
-        } else if status.stage() == Stage::Intake && round > 0 {
-            Some("a question round asked at intake")
         } else if status
             == (Status::Parked {
                 at: Stage::Ready,
@@ -910,6 +910,36 @@ mod tests {
         assert_eq!(waiting.failed_runs(), 1);
     }
 
+    /// A ticket taken in again after its text changed is back at Intake with
+    /// the rounds it already asked (architecture, section 5, "Intake").
+    #[test]
+    fn a_ticket_taken_in_again_keeps_its_rounds() {
+        let again = state(Status::Active(Stage::Intake), 2, 0, 0);
+        let waiting = to(again.apply(STANDARD, Event::Questions));
+        assert_eq!(
+            waiting.status(),
+            Status::NeedsInput {
+                return_to: Stage::Ready
+            }
+        );
+        assert_eq!(waiting.round(), 3);
+        assert_eq!(
+            to(again.apply(STANDARD, Event::Completed)),
+            state(Status::Active(Stage::Ready), 2, 0, 0)
+        );
+
+        let parked = state(
+            Status::Parked {
+                at: Stage::Intake,
+                awaiting_input: false,
+            },
+            2,
+            0,
+            MAX_FAILED_RUNS,
+        );
+        assert_eq!(to(parked.apply(STANDARD, Event::Restarted)), again);
+    }
+
     #[test]
     fn a_question_round_past_u32_max_is_refused() {
         let build = state(Status::Active(Stage::Build), u32::MAX, 0, 0);
@@ -1354,8 +1384,8 @@ mod tests {
                 0,
             ),
             (parked(Stage::Intake, true), 1, 0, 0, 0, 0),
-            (Status::Active(Stage::Intake), 1, 0, 0, 0, 0),
-            (parked(Stage::Intake, false), 1, 0, 0, 0, 0),
+            (Status::Active(Stage::Intake), 1, 1, 0, 0, 0),
+            (parked(Stage::Intake, false), 1, 1, 0, 0, 0),
             (parked(Stage::Ready, false), 0, 0, 0, 0, 0),
             (watching, 1, 0, 0, MAX_FIX_PASSES + 1, MAX_FIX_PASSES + 1),
             (watching, 1, 0, 0, 0, MAX_REPAIRS + 1),
