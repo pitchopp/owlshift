@@ -69,6 +69,8 @@ struct FakeGitHub {
     followed: Mutex<Followed>,
     /// Watch's reads of the pull request so far.
     follow_reads: Mutex<u32>,
+    /// Reads of the base branch's checks so far.
+    base_reads: Mutex<u32>,
     /// The status the red job's log answers (OWL-112), and how many times
     /// it was read.
     log: Mutex<(u16, u32)>,
@@ -177,6 +179,7 @@ impl FakeGitHub {
                 } } }] },
             } } })
         } else if query.starts_with("query BaseChecks") {
+            *self.base_reads.lock().unwrap() += 1;
             let followed = self.followed.lock().unwrap().clone();
             let base = self
                 .env
@@ -535,6 +538,7 @@ impl Bench {
             stale_reads: Mutex::new(0),
             followed: Mutex::default(),
             follow_reads: Mutex::new(0),
+            base_reads: Mutex::new(0),
             log: Mutex::new((200, 0)),
             at_checks: Mutex::new(None),
         });
@@ -5321,6 +5325,124 @@ fn an_answer_after_the_pull_request_went_green_runs_no_fix() {
     assert_eq!(roles, [Role::Build, Role::Build, Role::AnswerCheck]);
     assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
     assert_eq!(bench.stage(), "In Review");
+}
+
+/// OWL-242's acceptance: a round waiting at Watch ends with its pull
+/// request. A red read leaves it waiting, with no base read and no event; the
+/// merge, read while the ticket ref cannot be written, moves the stage to
+/// review and leaves the round to the next pass, which closes it: the ticket
+/// back at Watch, the following ended, one `ended` event naming the round.
+/// The decider's answer, posted with the merge, starts nothing.
+#[test]
+fn a_round_waiting_at_watch_closes_when_its_pull_request_is_merged() {
+    let bench = delivered();
+    asked_at_watch(&bench);
+    let waiting = state_of(&bench);
+    let (briefs, comments) = (bench.briefs().len(), bench.comments().len() + 1);
+    let before = bench.events().len();
+    let github = bench.github.clone();
+    let reads = || {
+        (
+            *github.follow_reads.lock().unwrap(),
+            *github.base_reads.lock().unwrap(),
+        )
+    };
+    let (follow_reads, base_reads) = reads();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            // Red: still waiting, nothing recorded.
+            1 => {
+                assert_eq!(state_of(&bench), waiting);
+                assert_eq!(bench.events().len(), before);
+                // Past the quiet window: the answer counts.
+                bench.answer("Q1: Set, and the check re-run. Go.\n");
+                bench.waited.set(SignedDuration::from_mins(30));
+                github.followed.lock().unwrap().state = "MERGED";
+                fs::write(bench.ref_lock(), "").unwrap();
+            }
+            // The stage moved, the ref not written: still waiting.
+            2 => {
+                assert_eq!(state_of(&bench), waiting);
+                assert_eq!(bench.stage(), "In Review");
+                fs::remove_file(bench.ref_lock()).unwrap();
+            }
+            _ => {}
+        }
+        pass < 4
+    });
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    // Three reads of the pull request, the fourth pass reading none, and
+    // never the base's.
+    assert_eq!(reads(), (follow_reads + 3, base_reads));
+    let state = state_of(&bench);
+    assert_eq!(state.status(), Status::Active(Stage::Watch));
+    assert_eq!(
+        (state.round(), state.fix_passes(), state.repairs()),
+        (waiting.round(), waiting.fix_passes(), waiting.repairs())
+    );
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(
+        delivery.ended.unwrap().why,
+        owlshift_contracts::refs::EndedWhy::Merged
+    );
+    assert_eq!(bench.stage(), "In Review");
+    // No answer check, no comment of Owlshift's.
+    assert_eq!(bench.briefs().len(), briefs);
+    assert_eq!(bench.comments().len(), comments);
+
+    let events = &bench.events()[before..];
+    let decided = data_of(events, EventKind::Decision, "watch");
+    assert_eq!(decided.len(), 1, "{events:?}");
+    assert_eq!(
+        (
+            &decided[0]["watch"],
+            &decided[0]["reason"],
+            &decided[0]["round"]
+        ),
+        (&json!("ended"), &json!("merged"), &json!(1))
+    );
+    let staged = data_of(events, EventKind::TrackerWrite, "stage");
+    assert_eq!(staged.len(), 1);
+    assert_eq!(staged[0]["stage"], "review");
+    let warned = data_of(events, EventKind::Warning, "what");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0]["what"], "watch_unreadable");
+    assert!(
+        warned[0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("closing its round:"),
+        "{warned:?}"
+    );
+    assert!(
+        lines.contains(
+            "it was merged: watch no longer follows it; its round 1 no longer waits for an answer"
+        ),
+        "{lines}"
+    );
+}
+
+/// A round whose pull request was closed unmerged closes too, and a stage a
+/// person set meanwhile is kept (OWL-242).
+#[test]
+fn a_round_closed_with_its_pull_request_keeps_a_stage_a_person_set() {
+    let bench = delivered();
+    asked_at_watch(&bench);
+    move_ticket(&bench, "Done");
+    bench.github.followed.lock().unwrap().state = "CLOSED";
+    let before = bench.events().len();
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
+    assert_eq!(
+        bench.record().delivery.unwrap().ended.unwrap().why,
+        owlshift_contracts::refs::EndedWhy::Closed
+    );
+    assert_eq!(bench.stage(), "Done");
+    let events = &bench.events()[before..];
+    assert!(data_of(events, EventKind::TrackerWrite, "stage").is_empty());
 }
 
 /// A ticket left in a stage Owlshift does not work in records one

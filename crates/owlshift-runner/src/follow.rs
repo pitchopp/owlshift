@@ -24,12 +24,15 @@ use owlshift_adapters::forge::{
     PrState, PullRequestRead, Verdict,
 };
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Ended, EndedWhy, OwedReport, PushKind, Pushing, TicketDelivery};
+use owlshift_contracts::refs::{
+    DeliveredPullRequest, Ended, EndedWhy, OwedReport, PushKind, Pushing, TicketDelivery,
+};
 use owlshift_core::follow::{
     self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
 };
 use owlshift_core::pipeline::Pipeline;
-use owlshift_core::state::{Event, TicketState, Transition};
+use owlshift_core::state::{Event, Status, TicketState, Transition};
+use owlshift_core::vocab::Stage;
 
 use crate::events::{Data, data};
 use crate::ticket_ref::TicketRecord;
@@ -133,11 +136,7 @@ pub fn read(
 ) -> Result<Fresh, owlshift_adapters::forge::Error> {
     let PullRequestRead { checks, .. } = forge.follow(number)?;
     let core = read_of(&checks);
-    let followed = Followed {
-        pushed,
-        pushing: delivery.pushing.as_ref().map(|p| p.commit.as_str()),
-        rebased_onto: delivery.rebased_onto.as_deref(),
-    };
+    let followed = followed_of(delivery, pushed);
     let failing_for = failing_for(&core);
     let mut decision = follow::decide(&core, followed, None, failing_for);
     let mut base = None;
@@ -163,6 +162,16 @@ pub fn read(
         decision,
         failing_for,
     })
+}
+
+/// What the core's table follows of `delivery`, whose last push is
+/// `pushed`.
+fn followed_of<'d>(delivery: &'d TicketDelivery, pushed: &'d str) -> Followed<'d> {
+    Followed {
+        pushed,
+        pushing: delivery.pushing.as_ref().map(|p| p.commit.as_str()),
+        rebased_onto: delivery.rebased_onto.as_deref(),
+    }
 }
 
 /// What a look at a followed pull request found.
@@ -328,18 +337,9 @@ impl Following {
         now: Timestamp,
     ) -> (Look, Vec<Warning>) {
         let mut warnings = Vec::new();
-        if let Some(until) = self.paused_until {
-            if now < until {
-                return (Look::Paused { until }, warnings);
-            }
-            self.paused_until = None;
-        }
-        let (Some(pr), Some(pushed)) = (&delivery.pull_request, &delivery.pushed) else {
-            let look = Look::Unread {
-                kind: "not_followed",
-                reason: "its delivery has no pull request or pushed commit".to_owned(),
-            };
-            return (look, warnings);
+        let (pr, pushed) = match self.readable(delivery, now) {
+            Ok(readable) => readable,
+            Err(look) => return (*look, warnings),
         };
         let failing = |core: &Read| self.failing_for(ticket, core, now);
         let fresh = match read(forge, delivery, pr.number, pushed, failing) {
@@ -364,6 +364,68 @@ impl Following {
             ]));
         }
         (Look::Read(seen), warnings)
+    }
+
+    /// A look at the pull request of a ticket whose round waits at Watch
+    /// (OWL-242), for whether the following ended: one read of it, never of
+    /// its base, decided with no base and no failure clock, since the core
+    /// decides an end before it needs either. Only the forge failure warned
+    /// of is kept of the ticket, the rest forgotten as a waiting ticket's was
+    /// before, so the read after the round's answer starts afresh. The
+    /// decision of a pull request still open is no action's to take: it may
+    /// want a base it was not given.
+    pub fn look_ending(
+        &mut self,
+        forge: &GitHubForge,
+        ticket: &TicketId,
+        delivery: &TicketDelivery,
+        now: Timestamp,
+    ) -> (Look, Vec<Warning>) {
+        let unread = self.unread.get(ticket).copied();
+        self.forget(ticket);
+        if let Some(kind) = unread {
+            self.unread.insert(ticket.clone(), kind);
+        }
+        let warnings = Vec::new();
+        let (pr, pushed) = match self.readable(delivery, now) {
+            Ok(readable) => readable,
+            Err(look) => return (*look, warnings),
+        };
+        let checks = match forge.follow(pr.number) {
+            Ok(PullRequestRead { checks, .. }) => checks,
+            Err(error) => return self.failed(ticket, &error, now, warnings),
+        };
+        let decision = follow::decide(&read_of(&checks), followed_of(delivery, pushed), None, None);
+        let fresh = Fresh {
+            checks,
+            base: None,
+            decision,
+            failing_for: None,
+        };
+        self.unread.remove(ticket);
+        (Look::Read(fresh.seen(pr.number, &pr.url)), warnings)
+    }
+
+    /// The pull request and the pushed commit to read, or the look without
+    /// a read: the forge's budget spent, or a delivery with nothing to read.
+    fn readable<'d>(
+        &mut self,
+        delivery: &'d TicketDelivery,
+        now: Timestamp,
+    ) -> Result<(&'d DeliveredPullRequest, &'d str), Box<Look>> {
+        if let Some(until) = self.paused_until {
+            if now < until {
+                return Err(Box::new(Look::Paused { until }));
+            }
+            self.paused_until = None;
+        }
+        match (&delivery.pull_request, &delivery.pushed) {
+            (Some(pr), Some(pushed)) => Ok((pr, pushed)),
+            _ => Err(Box::new(Look::Unread {
+                kind: "not_followed",
+                reason: "its delivery has no pull request or pushed commit".to_owned(),
+            })),
+        }
     }
 
     /// How long ago a failure was first read on `read`'s head; a read with
@@ -583,7 +645,8 @@ pub struct Changed {
 }
 
 /// The record `seen` leaves in the ticket ref, `None` when it changes
-/// nothing: the following ended, a push adopted, or the fix passes and
+/// nothing: the following ended, closing a round that waited at Watch
+/// (OWL-242), a push adopted, or the fix passes and
 /// failed runs cleared by a green read (`ChecksGreen`). A fix, a rebase or a
 /// park is decided only: the repair runs them ([`OnDemand::repair_seen`]).
 ///
@@ -602,6 +665,18 @@ pub fn changed(
     let mut replaced = None;
     match &seen.decision {
         Decision::End(reason) => {
+            // A round waiting at Watch ends with the following (OWL-242).
+            let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
+            if state.status()
+                == (Status::NeedsInput {
+                    return_to: Stage::Watch,
+                })
+            {
+                match state.apply(pipeline, Event::FollowingEnded) {
+                    Ok(Transition::To(closed)) => next.state = (&closed).into(),
+                    other => return Err(format!("the core state machine: {other:?}")),
+                }
+            }
             let why = ended_why(*reason);
             delivery.pushing = None;
             delivery.ended = Some(Ended {
@@ -1170,5 +1245,50 @@ mod tests {
             .delivery
             .unwrap();
         assert!(ended.ended.is_some() && ended.owed.is_some());
+    }
+
+    /// An end closes a round waiting at Watch (OWL-242): the ticket is back
+    /// at Watch with its counts, whatever ended the following.
+    #[test]
+    fn an_end_closes_a_round_waiting_at_watch() {
+        let pipeline = Pipeline::new(owlshift_core::vocab::Variant::Trivial);
+        let waiting = TicketState::restore(
+            Status::NeedsInput {
+                return_to: Stage::Watch,
+            },
+            1,
+            1,
+            1,
+            1,
+            2,
+        )
+        .unwrap();
+        for reason in [EndReason::Merged, EndReason::Closed, EndReason::HeadMoved] {
+            let closed = changed(
+                &record(delivery(), waiting),
+                pipeline,
+                &seen_with(Decision::End(reason), PUSHING),
+                at(5),
+            )
+            .unwrap()
+            .unwrap()
+            .record;
+            assert_eq!(
+                closed.delivery.unwrap().ended.unwrap().why,
+                ended_why(reason)
+            );
+            let state = TicketState::try_from(&closed.state).unwrap();
+            assert_eq!(
+                (
+                    state.status(),
+                    state.round(),
+                    state.reasks(),
+                    state.failed_runs(),
+                    state.fix_passes(),
+                    state.repairs()
+                ),
+                (Status::Active(Stage::Watch), 1, 0, 1, 1, 2)
+            );
+        }
     }
 }

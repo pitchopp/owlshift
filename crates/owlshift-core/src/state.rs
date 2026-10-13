@@ -115,6 +115,7 @@ impl Status {
 /// | At Watch, a read calls for a fix run, before it runs | `FixDue` |
 /// | At Watch, a read calls for a rebase run, before it runs | `RebaseDue` |
 /// | At Watch, a red no run fixes, or a push the forge refused | `ForgeBlocked` |
+/// | While a round waits at Watch, its pull request was merged, closed, or pushed to by someone else | `FollowingEnded` |
 /// | A human restarted a parked ticket | `Restarted` |
 /// | A human merged the pull request | `Merged` |
 /// | A human canceled, closed or excluded the ticket | `Withdrawn` |
@@ -171,6 +172,11 @@ pub enum Event {
     RebaseDue,
     /// A red no run fixes, or a push the forge refused: the ticket parks.
     ForgeBlocked,
+    /// Watch stopped following the pull request (merged, closed, or a head
+    /// someone else pushed) while a round waited at Watch (OWL-242): the
+    /// round is closed unanswered and the ticket is back at Watch, its
+    /// counts kept. Valid only while waiting with Watch as the return stage.
+    FollowingEnded,
     Restarted,
     Merged,
     Withdrawn,
@@ -178,7 +184,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -198,6 +204,7 @@ impl Event {
         Self::FixDue,
         Self::RebaseDue,
         Self::ForgeBlocked,
+        Self::FollowingEnded,
         Self::Restarted,
         Self::Merged,
         Self::Withdrawn,
@@ -469,6 +476,15 @@ impl TicketState {
                 }
             }
             (Status::NeedsInput { .. }, Event::CounterQuestion) => Transition::To(*self),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Watch,
+                },
+                Event::FollowingEnded,
+            ) => Transition::To(Self {
+                reasks: 0,
+                ..self.enter(Status::Active(Stage::Watch))
+            }),
 
             (status, Event::RunFailed) if status.runs() => {
                 let failed_runs = self.failed_runs + 1;
@@ -778,6 +794,9 @@ mod tests {
             ) => Expect::To(status),
             (Status::NeedsInput { return_to }, Event::Quarantined) => {
                 Expect::Parked(parked(return_to, true), ParkReason::IsolationBreach)
+            }
+            (Status::NeedsInput { return_to: Watch }, Event::FollowingEnded) => {
+                Expect::To(Status::Active(Watch))
             }
 
             (
@@ -1145,6 +1164,20 @@ mod tests {
         assert_eq!(
             to(repaired.apply(STANDARD, Event::LoopBack)),
             state(Status::Active(Stage::Build), 1, 0, 0)
+        );
+
+        // A round the pull request outlives (OWL-242) closes unanswered: back
+        // at Watch with the round and the counts, its re-asks cleared.
+        let reasked = TicketState {
+            reasks: 2,
+            ..waiting
+        };
+        assert_eq!(
+            to(reasked.apply(STANDARD, Event::FollowingEnded)),
+            TicketState {
+                round: 2,
+                ..repaired
+            }
         );
     }
 
