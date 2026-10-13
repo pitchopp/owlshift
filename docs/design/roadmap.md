@@ -73,7 +73,7 @@ The central bet, used by hand.
 - S9 and OWL-211 send these questions to needs input "returning to review". In P3 they return to Watch, whose visible stage is review, so this is the same thing.
 - OWL-211's "through the P2 question loop (… resolver …)" is narrowed: the resolver is skipped. A fix or rebase run's questions go to the decider, as a late-comment run's do, since they are acts and arbitrations the agent cannot settle. The rest of the loop is unchanged: the answer check, re-asks and replies.
 
-**Exit gate.** A full working day with `owlshift watch` running on Owlshift's own backlog, meeting all of these:
+**Exit gate.** Three Owlshift tickets run under `owlshift watch`, from `do` to a merged or parked pull request, meeting all of these:
 
 - Every reply that counts is continued by watch.
 - Every delivered pull request that goes red or conflicts is repaired or parked by watch.
@@ -81,7 +81,7 @@ The central bet, used by hand.
 - At least one delivered pull request is repaired after a red check, staged if none occurs, as P2's rounds were.
 - One pull request is repaired after a conflict, if a conflict occurs.
 
-Reworded on 2026-10-10 (OWL-208) from "A full day of use without typing `continue`", which these restarts, left to a person by design, would fail whatever P3 builds.
+Reworded on 2026-10-10 (OWL-208) from "A full day of use without typing `continue`", which these restarts, left to a person by design, would fail whatever P3 builds. Narrowed on 2026-10-13 (OWL-212) from a full working day to three tickets, as P2's gate counted tickets: the rules above are exercised by the tickets, not by the hours, and the staged red check covers the repair a short run may not meet.
 
 ## P4 · The drain
 
