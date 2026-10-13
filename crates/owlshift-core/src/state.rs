@@ -115,7 +115,7 @@ impl Status {
 /// | At Watch, a read calls for a fix run, before it runs | `FixDue` |
 /// | At Watch, a read calls for a rebase run, before it runs | `RebaseDue` |
 /// | At Watch, a red no run fixes, or a push the forge refused | `ForgeBlocked` |
-/// | While a round waits at Watch, its pull request was merged, closed, or pushed to by someone else | `FollowingEnded` |
+/// | While a round waits at Watch, or the ticket is parked there, its pull request was merged, closed, or pushed to by someone else | `FollowingEnded` |
 /// | A human restarted a parked ticket | `Restarted` |
 /// | A human merged the pull request | `Merged` |
 /// | A human canceled, closed or excluded the ticket | `Withdrawn` |
@@ -175,7 +175,11 @@ pub enum Event {
     /// Watch stopped following the pull request (merged, closed, or a head
     /// someone else pushed) while a round waited at Watch (OWL-242): the
     /// round is closed unanswered and the ticket is back at Watch, its
-    /// counts kept. Valid only while waiting with Watch as the return stage.
+    /// counts kept. Since OWL-243 it also ends a park at Watch, the park
+    /// a person was to look at: back at Watch with the round, the fix passes
+    /// and the repairs kept, its re-asks and failed runs cleared. Nothing
+    /// runs after it, and no bound is reset. Valid only while waiting with
+    /// Watch as the return stage, or parked at Watch.
     FollowingEnded,
     Restarted,
     Merged,
@@ -483,6 +487,19 @@ impl TicketState {
                 Event::FollowingEnded,
             ) => Transition::To(Self {
                 reasks: 0,
+                ..self.enter(Status::Active(Stage::Watch))
+            }),
+            // The park a person was to look at ends with its pull request
+            // (OWL-243): the failed runs it may have parked on are cleared,
+            // the fix passes and repairs kept, so no bound is reset.
+            (
+                Status::Parked {
+                    at: Stage::Watch, ..
+                },
+                Event::FollowingEnded,
+            ) => Transition::To(Self {
+                reasks: 0,
+                failed_runs: 0,
                 ..self.enter(Status::Active(Stage::Watch))
             }),
 
@@ -795,9 +812,10 @@ mod tests {
             (Status::NeedsInput { return_to }, Event::Quarantined) => {
                 Expect::Parked(parked(return_to, true), ParkReason::IsolationBreach)
             }
-            (Status::NeedsInput { return_to: Watch }, Event::FollowingEnded) => {
-                Expect::To(Status::Active(Watch))
-            }
+            (
+                Status::NeedsInput { return_to: Watch } | Status::Parked { at: Watch, .. },
+                Event::FollowingEnded,
+            ) => Expect::To(Status::Active(Watch)),
 
             (
                 Status::Parked {
@@ -1226,6 +1244,47 @@ mod tests {
         assert_eq!(
             to(bounded.apply(STANDARD, Event::Restarted)),
             watch(0, 0, 0)
+        );
+    }
+
+    /// A park the pull request outlives (OWL-243) ends back at Watch: the
+    /// round, the fix passes and the repairs kept, so no bound is reset; the
+    /// failed runs and re-asks cleared, whatever the park waited on.
+    #[test]
+    fn a_park_at_watch_ends_with_its_pull_request_keeping_the_bounds() {
+        let parked = |from: TicketState, event| match from.apply(STANDARD, event) {
+            Ok(Transition::Parked { state, .. }) => state,
+            other => panic!("expected a park, got {other:?}"),
+        };
+        let bounded = parked(watch(1, MAX_FIX_PASSES, 3), Event::FixDue);
+        assert_eq!(
+            to(bounded.apply(STANDARD, Event::FollowingEnded)),
+            watch(0, MAX_FIX_PASSES, 3)
+        );
+        let failed = parked(watch(1, 1, 2), Event::RunFailed);
+        assert_eq!(failed.failed_runs(), MAX_FAILED_RUNS);
+        assert_eq!(
+            to(failed.apply(STANDARD, Event::FollowingEnded)),
+            watch(0, 1, 2)
+        );
+        let reasked = TicketState {
+            reasks: MAX_REASKS,
+            ..to(watch(0, 1, 2).apply(STANDARD, Event::Questions))
+        };
+        let unanswered = parked(reasked, Event::Incomplete);
+        assert_eq!(
+            unanswered.status(),
+            Status::Parked {
+                at: Stage::Watch,
+                awaiting_input: true
+            }
+        );
+        assert_eq!(
+            to(unanswered.apply(STANDARD, Event::FollowingEnded)),
+            TicketState {
+                round: 2,
+                ..watch(0, 1, 2)
+            }
         );
     }
 

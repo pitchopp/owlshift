@@ -4954,7 +4954,11 @@ const FIXED: &str = r#"{"format":7,"status":"done","summary":"Kept the greeting 
 
 /// A delivered ticket, its pull request followed.
 fn delivered() -> Bench {
-    let bench = Bench::new(true);
+    deliver(Bench::new(true))
+}
+
+/// `bench`, its ticket delivered by `owlshift do`.
+fn deliver(bench: Bench) -> Bench {
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     bench
@@ -5443,6 +5447,123 @@ fn a_round_closed_with_its_pull_request_keeps_a_stage_a_person_set() {
     assert_eq!(bench.stage(), "Done");
     let events = &bench.events()[before..];
     assert!(data_of(events, EventKind::TrackerWrite, "stage").is_empty());
+}
+
+/// The ticket parked at Watch by a red no run fixes, through `continue`.
+fn parked_at_watch(bench: &Bench) -> TicketState {
+    bench.github.followed.lock().unwrap().conclusion = "CANCELLED";
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::Forge,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    let parked = state_of(bench);
+    assert_eq!(
+        parked.status(),
+        Status::Parked {
+            at: Stage::Watch,
+            awaiting_input: false
+        }
+    );
+    parked
+}
+
+/// OWL-243's acceptance: a ticket parked at Watch leaves needs input once
+/// its pull request is merged. Still open, the pull request changes
+/// nothing; merged, it moves the stage to review and ends the park: the
+/// ticket back at Watch with its fix passes and repairs, with no run, no
+/// comment and no read of the base, and one `ended` event marking the park.
+/// `continue` then has nothing to restart.
+#[test]
+fn a_ticket_parked_at_watch_leaves_needs_input_once_its_pull_request_is_merged() {
+    let bench = delivered();
+    let parked = parked_at_watch(&bench);
+    assert_eq!(bench.stage(), "Needs Input");
+    let (briefs, comments) = (bench.briefs().len(), bench.comments().len());
+    let before = bench.events().len();
+    let github = bench.github.clone();
+    let reads = || {
+        (
+            *github.follow_reads.lock().unwrap(),
+            *github.base_reads.lock().unwrap(),
+        )
+    };
+    let (follow_reads, base_reads) = reads();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        if pass == 1 {
+            assert_eq!(state_of(&bench), parked);
+            assert_eq!(bench.stage(), "Needs Input");
+            assert_eq!(bench.events().len(), before);
+            github.followed.lock().unwrap().state = "MERGED";
+        }
+        pass < 3
+    });
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    // Read open, then merged; the third pass reads nothing, the park over.
+    assert_eq!(reads(), (follow_reads + 2, base_reads));
+    assert_eq!(bench.stage(), "In Review");
+    let state = state_of(&bench);
+    assert_eq!(state.status(), Status::Active(Stage::Watch));
+    assert_eq!(
+        (
+            state.round(),
+            state.failed_runs(),
+            state.fix_passes(),
+            state.repairs()
+        ),
+        (parked.round(), 0, parked.fix_passes(), parked.repairs())
+    );
+    assert_eq!(
+        bench.record().delivery.unwrap().ended.unwrap().why,
+        owlshift_contracts::refs::EndedWhy::Merged
+    );
+    assert_eq!(
+        (bench.briefs().len(), bench.comments().len()),
+        (briefs, comments)
+    );
+    let decided = data_of(&bench.events()[before..], EventKind::Decision, "watch");
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(
+        (
+            &decided[0]["watch"],
+            &decided[0]["reason"],
+            &decided[0]["parked"]
+        ),
+        (&json!("ended"), &json!("merged"), &json!(true))
+    );
+    assert!(decided[0].get("round").is_none(), "{decided:?}");
+    assert!(
+        lines.contains("it was merged: watch no longer follows it; it is no longer parked"),
+        "{lines}"
+    );
+
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Refused(why)) if why.starts_with("nothing to continue")),
+        "{outcome:?}\n{printed}"
+    );
+}
+
+/// On a project that maps a parked state, a park whose pull request was
+/// closed unmerged leaves that state for review (OWL-243).
+#[test]
+fn a_park_whose_pull_request_is_closed_leaves_the_parked_state() {
+    let bench = deliver(Bench::parking());
+    parked_at_watch(&bench);
+    assert_eq!(bench.stage(), "Parked");
+    bench.github.followed.lock().unwrap().state = "CLOSED";
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.stage(), "In Review");
+    assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
 }
 
 /// A ticket left in a stage Owlshift does not work in records one

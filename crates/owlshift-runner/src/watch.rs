@@ -21,7 +21,8 @@
 //! the decider's replies to a DECISION comment, once they count, go to
 //! [`OnDemand::correct_seen`] (OWL-146). A ticket whose round waits at
 //! Watch ([`outlived`]) has its pull request read before its comments, for
-//! an end alone, which closes the round (OWL-242).
+//! an end alone, which closes the round (OWL-242); so has a ticket parked at
+//! Watch, whose park an end ends without restarting anything (OWL-243).
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -49,7 +50,7 @@ use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
 
 use crate::answer_check::{self, Readiness};
-use crate::events::{EventSink, data, printable};
+use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
 use crate::on_demand::{self, Delivered, Landed, OnDemand, PIPELINE, Stop};
 use crate::reversal::{self, Current};
@@ -64,8 +65,9 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// Whether watch continues a ticket in `status`: one whose questions wait
-/// for its decider. A parked ticket waits for a person's `continue`, and one
-/// at a stage waits for no answer.
+/// for its decider. A parked ticket waits for a person's `continue`, which
+/// alone restarts it (watch only ends a park at Watch whose pull request
+/// ended, [`outlived`]), and one at a stage waits for no answer.
 pub fn watched(status: Status) -> bool {
     matches!(status, Status::NeedsInput { .. })
 }
@@ -84,12 +86,10 @@ pub fn followed(status: Status, stored: &Stored) -> bool {
 
 /// Whether watch reads the pull request of a ticket in `status` whose ref
 /// keeps `stored` for whether its following ended: a ticket whose round
-/// waits at Watch, whose delivery is still followed (OWL-242).
+/// waits at Watch (OWL-242), or parked there (OWL-243), whose delivery is
+/// still followed.
 pub fn outlived(status: Status, stored: &Stored) -> bool {
-    status
-        == (Status::NeedsInput {
-            return_to: Stage::Watch,
-        })
+    follow::ends_with_following(status)
         && stored
             .record
             .delivery
@@ -308,9 +308,13 @@ impl Watch<'_> {
                     .map_err(|e| format!("its ticket ref keeps no valid state: {e:?}"))
             });
             match state {
-                Ok((stored, state)) if watched(state.status()) => {
+                // A ticket parked at Watch is read for an end alone (OWL-243),
+                // its comments never: only a waiting ticket's are.
+                Ok((stored, state))
+                    if watched(state.status()) || outlived(state.status(), &stored) =>
+                {
                     let outlived = outlived(state.status(), &stored);
-                    waiting.push((ticket, stored, outlived));
+                    waiting.push((ticket, stored, state.status(), outlived));
                 }
                 Ok((stored, state)) if followed(state.status(), &stored) => {
                     memory.failing.remove(&ticket);
@@ -325,16 +329,19 @@ impl Watch<'_> {
                 }
             }
         }
+        // A parked ticket keeps no hold: only a person's `continue` restarts
+        // it.
         let ids: Vec<TicketId> = waiting
             .iter()
-            .map(|(ticket, _, _)| ticket.clone())
+            .filter(|(_, _, status, _)| watched(*status))
+            .map(|(ticket, _, _, _)| ticket.clone())
             .collect();
-        // A waiting ticket whose pull request is read keeps the forge failure
-        // warned of (OWL-242).
+        // A waiting or parked ticket whose pull request is read keeps the
+        // forge failure warned of (OWL-242, OWL-243).
         let read: Vec<TicketId> = waiting
             .iter()
-            .filter(|(_, _, outlived)| *outlived)
-            .map(|(ticket, _, _)| ticket.clone())
+            .filter(|(_, _, _, outlived)| *outlived)
+            .map(|(ticket, _, _, _)| ticket.clone())
             .collect();
         let followed: Vec<TicketId> = following.iter().map(|(ticket, _)| ticket.clone()).collect();
         // A followed ticket keeps its repair's hold too: otherwise a repair
@@ -354,13 +361,15 @@ impl Watch<'_> {
                 followed,
             },
         );
-        for (ticket, stored, outlived) in waiting {
+        for (ticket, stored, status, outlived) in waiting {
             // A pass whose read ended the following reads no comment: an
             // answer posted with the merge starts nothing.
-            if outlived && self.close_round(memory, sink, out, &ticket, &stored) {
+            if outlived && self.close_outlived(memory, sink, out, &ticket, &stored, status) {
                 continue;
             }
-            self.look(memory, sink, out, continued, &ticket, &stored);
+            if watched(status) {
+                self.look(memory, sink, out, continued, &ticket, &stored);
+            }
         }
         for (ticket, stored) in following {
             self.follow(memory, sink, out, continued, &ticket, &stored);
@@ -479,21 +488,23 @@ impl Watch<'_> {
             .after(ticket, held, &outcome, after.as_deref(), now);
     }
 
-    /// A ticket whose round waits at Watch (OWL-242): its pull request read
-    /// for an end alone, never its base. An end moves the ticket's stage to
-    /// review while it shows needs input, then closes the round in the ticket
-    /// ref, with the following's end, from the ref the snapshot read; then
-    /// its event, and the owed report dropped. A stage or ref that cannot be
-    /// read or written is warned of once and leaves the round to the next
-    /// pass. Returns whether the read ended the following, which no comment
-    /// read in this pass outweighs.
-    fn close_round(
+    /// A ticket in `status`, its round waiting at Watch (OWL-242) or parked
+    /// there (OWL-243): its pull request read for an end alone, never its
+    /// base. An end moves the ticket's stage to review while it shows the
+    /// state `status` set, then closes the round or ends the park in the
+    /// ticket ref, with the following's end, from the ref the snapshot read;
+    /// then its event, and the owed report dropped. A stage or ref that
+    /// cannot be read or written is warned of once and leaves the ticket to
+    /// the next pass. Returns whether the read ended the following, which no
+    /// comment read in this pass outweighs.
+    fn close_outlived(
         &self,
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         ticket: &TicketId,
         stored: &Stored,
+        status: Status,
     ) -> bool {
         let on_demand = self.on_demand;
         let Some(delivery) = &stored.record.delivery else {
@@ -510,9 +521,9 @@ impl Watch<'_> {
             Look::Read(seen) if matches!(seen.decision, Decision::End(_)) => seen,
             _ => return false,
         };
-        // The stage first: a round closed in the ref is no longer read, so a
-        // stage left at needs input would stay there.
-        if let Err(reason) = on_demand.review_after_round(ticket, sink) {
+        // The stage first: a round closed or a park ended in the ref is no
+        // longer read, so a stage left at needs input would stay there.
+        if let Err(reason) = on_demand.review_after_end(ticket, status, sink) {
             self.unreadable(memory, sink, ticket, reason);
             return true;
         }
@@ -526,19 +537,20 @@ impl Watch<'_> {
             // Busy, or the ref moved: the next pass reads it again.
             Ok(None) => return true,
             Err(reason) => {
-                let reason = format!("closing its round: {reason}");
-                self.unreadable(memory, sink, ticket, reason);
+                let doing = if matches!(status, Status::Parked { .. }) {
+                    "ending its park"
+                } else {
+                    "closing its round"
+                };
+                self.unreadable(memory, sink, ticket, format!("{doing}: {reason}"));
                 return true;
             }
         };
-        let round = stored.record.state.round;
         if let Some(mut event) = memory.following.events(ticket, &seen) {
-            event.insert("round".to_owned(), json!(round));
+            let (marks, said) = ended_marks(status, stored.record.state.round);
+            event.extend(marks);
             sink.emit(ticket, None, EventKind::Decision, event);
-            self.line(
-                out,
-                &format!("{ticket}: {seen}; its round {round} no longer waits for an answer"),
-            );
+            self.line(out, &format!("{ticket}: {seen}; {said}"));
         }
         // Dropped, the following having ended.
         on_demand.post_owed_report(ticket, stored, &seen, commit, &mut memory.following, sink);
@@ -851,6 +863,31 @@ impl Watch<'_> {
     }
 }
 
+/// What an end of the following adds to the `ended` event, and the words it
+/// adds to watch's line, for a ticket in `status` whose ref keeps `round`:
+/// `parked` for a park at Watch it ends (OWL-243), and the round for one
+/// whose questions waited, closed unanswered (OWL-242).
+fn ended_marks(status: Status, round: u32) -> (Data, String) {
+    let mut marks = Data::new();
+    let mut said = Vec::new();
+    if matches!(status, Status::Parked { .. }) {
+        marks.insert("parked".to_owned(), json!(true));
+        said.push("it is no longer parked".to_owned());
+    }
+    if matches!(
+        status,
+        Status::NeedsInput { .. }
+            | Status::Parked {
+                awaiting_input: true,
+                ..
+            }
+    ) {
+        marks.insert("round".to_owned(), json!(round));
+        said.push(format!("its round {round} no longer waits for an answer"));
+    }
+    (marks, said.join(", and "))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -888,6 +925,44 @@ mod tests {
             },
         ] {
             assert!(!watched(status), "{status:?}");
+        }
+    }
+
+    /// An end marks a park (OWL-243) and names a round whose questions
+    /// waited (OWL-242), both for a park that waited for answers.
+    #[test]
+    fn an_end_marks_the_park_and_the_round_it_closes() {
+        let parked = |awaiting_input| Status::Parked {
+            at: Stage::Watch,
+            awaiting_input,
+        };
+        let waiting = Status::NeedsInput {
+            return_to: Stage::Watch,
+        };
+        let cases = [
+            (
+                waiting,
+                json!({ "round": 2 }),
+                "its round 2 no longer waits for an answer",
+            ),
+            (
+                parked(false),
+                json!({ "parked": true }),
+                "it is no longer parked",
+            ),
+            (
+                parked(true),
+                json!({ "parked": true, "round": 2 }),
+                "it is no longer parked, and its round 2 no longer waits for an answer",
+            ),
+        ];
+        for (status, marks, said) in cases {
+            let (actual, words) = ended_marks(status, 2);
+            assert_eq!(
+                (serde_json::Value::Object(actual), words.as_str()),
+                (marks, said),
+                "{status:?}"
+            );
         }
     }
 
