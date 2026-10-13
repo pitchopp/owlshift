@@ -44,7 +44,8 @@ curl -s https://api.linear.app/graphql -H "Authorization: $KEY" -H "Content-Type
 **Working an issue.**
 
 - Pick from Todo only. Blockers are relations of type `blocks`; read them with `inverseRelations { nodes { type issue { identifier state { type } } } }` and do not start while one is not `completed`.
-- Move the issue to In Progress when work starts. Until the Linear GitHub integration is connected, also move it to In Review when the pull request opens (with the PR link as a comment), and to Done after the merge.
+- Move the issue to In Progress when work starts. The Linear GitHub integration does the rest from the branch name: it links the pull request, moves the issue to In Review when the pull request opens and to Done when it merges (checked on 2026-10-13, OWL-239 and OWL-242).
+- A pull request that does not finish its issue, such as a design change for an issue whose work is a gate run, uses a branch without the issue ID and names the issue in its description; otherwise its merge closes the issue.
 - Open pull requests against `main`; never merge them.
 
 **Creating issues.**
