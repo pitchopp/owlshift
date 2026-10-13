@@ -53,6 +53,22 @@ The "Development" section of [CONTRIBUTING.md](CONTRIBUTING.md#development) cove
 - **Tracker and forge accounts:** one on the tracker whose tickets Owlshift works and one on the forge that hosts the repository; `owlshift init` keeps their secrets in the system keychain ([Adapters & contracts](docs/design/architecture.md#6-adapters--contracts)).
 - **Rust toolchain 1.98 or later**, only for a build from source ([Technology choices](docs/design/architecture.md#10-technology-choices)).
 
+## Quick start
+
+From a clone of the repository you want worked, once `owlshift` is installed:
+
+```bash
+owlshift init
+owlshift doctor
+owlshift do OWL-12
+owlshift watch
+```
+
+- `owlshift init`: write a commented `owlshift.toml` and store the tracker and forge secrets and the agent runs' Claude Code token in the system keychain.
+- `owlshift doctor`: check that this machine is ready, and say how to fix what is not.
+- `owlshift do OWL-12`: run that ticket to a verified pull request, in the foreground; if the run needs a decision, it posts its questions on the ticket.
+- `owlshift watch`: continue the ticket once its questions are answered there, until Ctrl-C.
+
 ## Project tracking
 
 The backlog lives in a Linear workspace (team `OWL`), with one project per roadmap step. It moves to public GitHub issues when the repository opens (step P9).
