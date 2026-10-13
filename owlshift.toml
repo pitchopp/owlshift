@@ -24,9 +24,14 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
 # repository root. The build role runs it before it reports done, then
 # Owlshift runs it again on the commit it delivers. With no command, the
 # build role stops with `blocked`.
+# Each command runs through the platform's shell (`sh -c` on Unix), so the
+# rustdoc line sets RUSTDOCFLAGS with an inline `VAR=value` assignment, as
+# CI's Rustdoc step does with `env:`. That is `sh` syntax: `cmd.exe` on
+# Windows does not read it.
 gate = [
     "cargo fmt --all -- --check",
     "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked",
     "cargo test --workspace --locked",
 ]
 
