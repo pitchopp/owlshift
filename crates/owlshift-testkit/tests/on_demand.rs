@@ -28,10 +28,11 @@ use owlshift_adapters::tracker::{self, Capability, Comment, Ticket, Tracker};
 use owlshift_contracts::brief::{
     Brief, MAX_CHOICE_BYTES, MAX_RESULT_REFUSAL_BYTES, PermissionLevel, Relation, ThreadEntry,
 };
-use owlshift_contracts::config::ProjectConfig;
+use owlshift_contracts::config::{Admit, ProjectConfig};
+use owlshift_contracts::drain::{DependencyOutcome, Gesture, GestureKind, TicketIntake};
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
-use owlshift_contracts::refs::{AskDecider, Waiting};
+use owlshift_contracts::refs::{AskDecider, PersistedState, Waiting};
 use owlshift_contracts::result::RefusedChoice;
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::decider::DeciderRule;
@@ -421,6 +422,10 @@ impl Tracker for Clocked<'_> {
         Tracker::set_stage(&self.inner, id, state)
     }
 
+    fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<tracker::Gesture, tracker::Error> {
+        Tracker::gesture(&self.inner, id, admit)
+    }
+
     /// A tracker that notifies on a mention, as Linear does (OWL-157).
     fn mention(&self, account: &str) -> Result<Option<String>, tracker::Error> {
         if self.refuse_mention {
@@ -499,8 +504,26 @@ impl Bench {
         )
     }
 
+    /// A bench for intake (OWL-248): the project admits with the label
+    /// `agent`, by `maintainer` alone, and names `Parked` as the parked
+    /// state; the ticket's decider is its assignee.
+    fn drained() -> Self {
+        Self::build_admitting(
+            "maintainer",
+            "assignee = \"maintainer\"\n",
+            "",
+            ", parked = \"Parked\"",
+            "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+        )
+    }
+
     /// [`Self::with`], with `states` added to the project's tracker states.
     fn build(author: &str, front: &str, zones: &str, states: &str) -> Self {
+        Self::build_admitting(author, front, zones, states, "admit = \"delegation\"")
+    }
+
+    /// [`Self::build`], with `admit` as the project's admission lines.
+    fn build_admitting(author: &str, front: &str, zones: &str, states: &str, admit: &str) -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("owlshift do ")
             .tempdir()
@@ -511,7 +534,7 @@ impl Bench {
         fs::write(
             project.join("owlshift.toml"),
             format!(
-                "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = \"delegation\"\n\
+                "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\n{admit}\n\
                  states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\"{states} }}\n\
                  [stack]\ngate = [\"git grep -q Hello -- GREETING.md\"]\n\
                  [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n\
@@ -878,6 +901,7 @@ impl Bench {
             forge: &forge,
             // One harness plays every run, a reply each, whatever its role.
             build: &harness,
+            intake: &harness,
             answer_check: &harness,
             resolver: &harness,
             rebase: &harness,
@@ -2029,6 +2053,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         tracker: &tracker,
         forge: &forge,
         build: &harness,
+        intake: &harness,
         answer_check: &harness,
         resolver: &harness,
         rebase: &harness,
@@ -2099,6 +2124,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         tracker: &tracker,
         forge: &forge,
         build: &harness,
+        intake: &harness,
         answer_check: &harness,
         resolver: &harness,
         rebase: &harness,
@@ -6992,4 +7018,228 @@ fn a_correction_that_fails_then_asks_goes_to_the_decider_then_corrects() {
     );
     assert!(bench.record().questions.decisions[0].reversed.is_some());
     assert_eq!(bench.stage(), "In Review");
+}
+
+/// An intake result (OWL-248): `status`, with the record naming `DEMO-2`
+/// when `dependency` is given, and `questions` when it asks.
+fn intake_result(status: &str, dependency: Option<&str>, questions: &str) -> String {
+    let dependencies: Vec<Value> = dependency
+        .map(|id| json!({ "ticket": id, "quote": format!("Blocked by {id}.") }))
+        .into_iter()
+        .collect();
+    let mut result = json!({
+        "format": 8,
+        "status": status,
+        "summary": "A small greeting.",
+        "intake": {
+            "variant": "trivial",
+            "routing": { "harness": "claude", "tier": "fast", "effort": "low" },
+            "dependencies": dependencies,
+        },
+    });
+    if !questions.is_empty() {
+        result["questions"] = serde_json::from_str(questions).unwrap();
+    }
+    result.to_string()
+}
+
+/// A gesture of `account`, by the label the drained bench admits with.
+fn gesture(account: &str) -> Gesture {
+    Gesture {
+        kind: GestureKind::Label,
+        name: "agent".to_owned(),
+        account: account.to_owned(),
+        at: "2026-10-02T08:00:00Z".parse().unwrap(),
+    }
+}
+
+impl Bench {
+    /// Runs intake on DEMO-1 for the drain, under `gesture`, with one reply
+    /// per run.
+    fn intake(&self, replies: Vec<Reply>, gesture: Gesture) -> Result<TicketIntake, Stop> {
+        self.with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+            on_demand.intake(&ticket(), gesture, sink)
+        })
+        .0
+    }
+}
+
+/// Intake for the drain (OWL-248): a gesture by an account `admitters` does
+/// not list runs nothing; the intake role runs read-only and without
+/// network; a dependency the ticket's text does not name is refused, a
+/// failed run; the next run's record is kept in the ticket ref, every
+/// dependency pending, and shown in an INTAKE comment; the ticket, already
+/// in the ready column, is not moved.
+#[test]
+fn intake_keeps_its_record_and_leaves_the_ticket_in_the_ready_column() {
+    let bench = Bench::drained();
+    let stop = bench
+        .intake(Vec::new(), gesture("stranger"))
+        .expect_err("not an admitter");
+    assert!(
+        matches!(&stop, Stop::Refused(why) if why.contains("does not list")),
+        "{stop}"
+    );
+
+    bench.comment_as("maintainer", "Blocked by DEMO-2.");
+    let guessed = bench.reply(None, Some(&intake_result("done", Some("DEMO-9"), "")));
+    let done = bench.reply(None, Some(&intake_result("done", Some("DEMO-2"), "")));
+    let record = bench
+        .intake(vec![guessed, done], gesture("maintainer"))
+        .unwrap();
+    assert_eq!(record.dependencies[0].outcome, DependencyOutcome::Pending);
+    assert_eq!(record.gesture.account, "maintainer");
+    let kept = bench.record();
+    assert_eq!(kept.intake, Some(record));
+    let state = TicketState::try_from(&kept.state).unwrap();
+    assert_eq!(state.status(), Status::Active(Stage::Ready));
+
+    let briefs = bench.briefs();
+    assert_eq!(briefs.len(), 2);
+    for brief in &briefs {
+        assert_eq!(brief.role, Role::Intake);
+        assert_eq!(brief.permissions.level, PermissionLevel::ReadOnly);
+        assert!(!brief.permissions.network);
+        assert!(!brief.rules.is_empty(), "the project's rules");
+    }
+    let refused: Vec<Event> = bench
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("intake_refused"))
+        .collect();
+    assert_eq!(refused.len(), 1);
+    let comments = bench.comments();
+    assert!(comments.last().unwrap().starts_with("[owlshift] INTAKE"));
+    assert!(comments.last().unwrap().contains("not checked yet"));
+    assert_eq!(bench.stage(), "Todo");
+    assert!(
+        !kinds(&bench.events()).contains(&EventKind::Dispatch),
+        "intake dispatches nothing"
+    );
+}
+
+/// An intake round (OWL-248): its questions go to the decider, the record
+/// kept with the round; intake is refused while they wait; the answers'
+/// RESUME moves the ticket back to the ready column, and intake does not
+/// run again.
+#[test]
+fn an_intake_round_returns_the_ticket_to_the_ready_column() {
+    let bench = Bench::drained();
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"scope","context":"The ticket names no language.",
+                "text":"Which language should the greeting use?"}]"#,
+        )),
+    );
+    let stop = bench
+        .intake(vec![asks], gesture("maintainer"))
+        .expect_err("questions");
+    assert!(
+        matches!(&stop, Stop::NeedsInput { posted: Ok(round), .. } if round.get() == 1),
+        "{stop}"
+    );
+    let kept = bench.record();
+    assert!(kept.intake.is_some(), "the record is kept with the round");
+    assert_eq!(
+        TicketState::try_from(&kept.state).unwrap().status(),
+        Status::NeedsInput {
+            return_to: Stage::Ready
+        }
+    );
+    assert_eq!(bench.stage(), "Needs Input");
+    let stop = bench
+        .intake(Vec::new(), gesture("maintainer"))
+        .expect_err("waiting");
+    assert!(matches!(stop, Stop::Refused(_)), "{stop}");
+
+    bench.answer("English.");
+    let (outcome, _) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+    ]);
+    let stop = outcome.expect_err("back to the ready column");
+    assert!(matches!(stop, Stop::Ready { .. }), "{stop}");
+    assert_eq!(bench.stage(), "Todo");
+    let kept = bench.record();
+    assert!(kept.intake.is_some());
+    assert_eq!(
+        TicketState::try_from(&kept.state).unwrap().status(),
+        Status::Active(Stage::Ready)
+    );
+    assert!(
+        bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] RESUME") && c.contains("back in the ready column"))
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Intake, Role::AnswerCheck]);
+}
+
+/// The second failed intake run parks the ticket at Intake, making its
+/// ticket ref; `continue` restarts intake, under the gesture read again,
+/// and the ticket goes back from parked to the ready column (OWL-248).
+#[test]
+fn a_parked_intake_is_restarted_by_continue_and_returns_to_ready() {
+    let bench = Bench::drained();
+    let failed = || {
+        bench.reply(
+            None,
+            Some(r#"{"format":8,"status":"failed","summary":"Lost."}"#),
+        )
+    };
+    let stop = bench
+        .intake(vec![failed(), failed()], gesture("maintainer"))
+        .expect_err("parked");
+    assert!(matches!(stop, Stop::Parked { .. }), "{stop}");
+    assert_eq!(bench.stage(), "Parked");
+    assert!(
+        bench
+            .comments()
+            .last()
+            .unwrap()
+            .contains("owlshift continue")
+    );
+
+    let done = bench.reply(None, Some(&intake_result("done", None, "")));
+    let (outcome, _) = bench.continue_ticket(vec![done]);
+    let stop = outcome.expect_err("back to the ready column");
+    assert!(matches!(stop, Stop::Ready { .. }), "{stop}");
+    // Kept parked while intake ran, then moved back.
+    assert_eq!(
+        bench.stage_events(EventKind::TrackerWrite),
+        ["Parked", "Todo"]
+    );
+    let record = bench.record().intake.expect("the record");
+    // The Markdown tracker keeps no history: the ticket's author made it.
+    assert_eq!(record.gesture.account, "maintainer");
+}
+
+/// `continue` on a ticket left at Intake, by a usage limit or a crash, runs
+/// intake again (OWL-248).
+#[test]
+fn continue_runs_intake_on_a_ticket_at_intake() {
+    let bench = Bench::drained();
+    // A park makes the checkout and the ref; the ticket is then left at
+    // Intake, as a usage limit leaves it.
+    let failed = || {
+        bench.reply(
+            None,
+            Some(r#"{"format":8,"status":"failed","summary":"Lost."}"#),
+        )
+    };
+    bench
+        .intake(vec![failed(), failed()], gesture("maintainer"))
+        .expect_err("parked");
+    let at_intake = TicketState::restore(Status::Active(Stage::Intake), 0, 0, 0, 0, 0).unwrap();
+    bench.write_record(&TicketRecord {
+        state: PersistedState::from(&at_intake),
+        ..bench.record()
+    });
+    let done = bench.reply(None, Some(&intake_result("done", None, "")));
+    let (outcome, _) = bench.continue_ticket(vec![done]);
+    assert!(matches!(outcome, Err(Stop::Ready { .. })), "{outcome:?}");
+    assert!(bench.record().intake.is_some());
 }

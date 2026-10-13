@@ -639,3 +639,79 @@ fn resolver_example_result_parses() {
 fn resolver_dotted_fields_exist() {
     dotted_fields_exist("resolver.md", &resolver_prompt());
 }
+
+fn intake_prompt() -> String {
+    prompt("intake.md")
+}
+
+/// Brief fields the intake prompt relies on (OWL-248).
+const INTAKE_BRIEF_FIELDS: &[&str] = &[
+    "ticket.id",
+    "ticket.title",
+    "ticket.description",
+    "ticket.author.relation",
+    "thread.author.relation",
+    "thread.decision",
+    "decider",
+    "rules.text",
+    "rules.source",
+    "result_path",
+];
+
+#[test]
+fn intake_prompt_matches_the_contracts() {
+    let text = intake_prompt();
+    strip_role_front_matter(Role::Intake, &text).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        text.contains(&format!("JSON with `format` {RESULT_FORMAT},")),
+        "roles/intake.md does not say result.json has `format` {RESULT_FORMAT}"
+    );
+    let bounds = format!(
+        "at most {MAX_QUESTIONS} questions, each at most {MAX_QUESTION_BYTES} bytes, \
+         all together at most {MAX_QUESTIONS_BYTES} bytes."
+    );
+    assert!(
+        text.contains(&bounds),
+        "roles/intake.md does not state the question bounds"
+    );
+    let missing: Vec<_> = FloorCategory::ALL
+        .iter()
+        .map(|c| c.token())
+        .filter(|token| !text.contains(&format!("`{token}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "roles/intake.md does not name these floor categories: {missing:?}"
+    );
+    brief_fields_exist("intake.md", &text, INTAKE_BRIEF_FIELDS);
+    dotted_fields_exist("intake.md", &text);
+    // Every routing value it names is one the result takes.
+    let result = generated("result");
+    let mut values = BTreeSet::new();
+    names_and_values(&result, &mut values);
+    for value in [
+        "trivial", "standard", "risky", "claude", "fast", "deep", "xhigh", "max",
+    ] {
+        assert!(values.contains(value), "the result takes no {value:?}");
+        assert!(names(&text, value), "roles/intake.md does not name {value}");
+    }
+}
+
+#[test]
+fn intake_example_result_parses() {
+    let text = intake_prompt();
+    let blocks = json_examples(&text);
+    assert_eq!(blocks.len(), 1, "roles/intake.md holds one json example");
+    let result = RunResult::parse(blocks[0]).unwrap_or_else(|e| {
+        panic!("the example in roles/intake.md is not a valid result.json: {e}")
+    });
+    assert_eq!(result.status, owlshift_contracts::result::Status::Done);
+    let intake = result.intake.expect("the example records its intake");
+    assert!(
+        intake
+            .dependencies
+            .iter()
+            .all(|d| d.quote.contains(d.ticket.as_str())),
+        "each example dependency's quote names its ticket"
+    );
+}

@@ -2083,10 +2083,17 @@ fn comment_headers() {
     };
     assert_eq!(delivery.render(), "[owlshift] DELIVERY");
     assert_eq!(Header::parse(&delivery.render()).unwrap(), delivery);
+    let intake = Header {
+        kind: MarkerKind::Intake,
+        round: None,
+    };
+    assert_eq!(intake.render(), "[owlshift] INTAKE");
+    assert_eq!(Header::parse(&intake.render()).unwrap(), intake);
 
     for (line, needle) in [
         ("[owlshift] QUESTIONS", "needs a round"),
         ("[owlshift] DELIVERY · round 1", "takes no round"),
+        ("[owlshift] INTAKE · round 1", "takes no round"),
         ("[owlshift] QUESTIONS · round 0", "invalid round"),
         ("[owlshift] QUESTIONS · round 02", "invalid round"),
         ("[owlshift] QUESTIONS · round two", "invalid round"),

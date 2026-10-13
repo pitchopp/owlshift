@@ -42,6 +42,10 @@
 //! is open, parked once the PARKED comment is (OWL-148), and back to what the
 //! ticket waits for when `continue` restarts it. A stage write that fails is a
 //! `warning` event and nothing more.
+//!
+//! Intake ([`OnDemand::intake`], OWL-248) runs the intake role on an admitted
+//! ticket for the drain, and `continue` runs it again on a ticket at Intake;
+//! see the `intake` module.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -69,6 +73,7 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
+use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
@@ -126,6 +131,9 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 const HEAD_READS: u32 = 5;
 
 mod correction;
+mod intake;
+
+pub use intake::admission;
 
 /// The pipeline of this version: the build stage alone, in the core machine.
 pub(crate) const PIPELINE: Pipeline = Pipeline::new(Variant::Trivial);
@@ -368,6 +376,9 @@ pub struct OnDemand<'a> {
     pub forge: &'a GitHubForge,
     /// Runs the build role.
     pub build: &'a dyn Harness,
+    /// Runs the intake role (`roles/intake.md`) on the standard tier
+    /// (OWL-248).
+    pub intake: &'a dyn Harness,
     /// Runs the answer check (`roles/answer_check.md`).
     pub answer_check: &'a dyn Harness,
     /// Runs the resolver (`roles/resolver.md`).
@@ -443,6 +454,10 @@ pub enum Landed {
     Reply,
     /// The PARKED comment.
     Parked,
+    /// The INTAKE comment of an intake run (OWL-248). It asks nothing of
+    /// anyone, but its record was not kept, so a person makes the ref
+    /// writable before the drain runs intake again.
+    Intake,
     /// No comment: the PARKED comment could not be posted either. The run
     /// still parked the ticket, which waits for a person whatever reached it,
     /// as a park whose state was kept does (OWL-159).
@@ -522,6 +537,10 @@ pub enum Stop {
     /// a person acts rather than posting the comment again (OWL-158, and
     /// OWL-169 for a RESUME).
     NotKept { landed: Landed, message: String },
+    /// The ticket is back in the ready column with its intake record, after
+    /// an intake that ends at Ready under `continue` (OWL-248): the drain
+    /// dispatches it. Nobody is the blocker.
+    Ready { ticket: TicketId },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
     /// The run was done and its gate passed, but its delivery failed.
@@ -702,6 +721,11 @@ impl fmt::Display for Stop {
                 f,
                 "Watching {ticket}: {seen}. Owlshift never merges: review and merge it."
             ),
+            Self::Ready { ticket } => write!(
+                f,
+                "{ticket} is back in the ready column with its intake record: `owlshift watch \
+                 --drain` dispatches it in its turn, or `owlshift do {ticket}` runs it now."
+            ),
         }
     }
 }
@@ -792,6 +816,9 @@ enum Command {
     /// A repair of a delivered pull request, by watch or by `continue` at
     /// Watch (OWL-112): as `continue` before its run.
     Fix,
+    /// An intake run for the drain (OWL-248): as `do` before its run, which
+    /// clones the checkout and needs a decider.
+    Intake,
     /// A rebase run's dispatch (OWL-210), in a repair.
     Rebase,
     /// A correction run after the decider replied to a DECISION (OWL-146),
@@ -807,6 +834,7 @@ impl Command {
             Command::Fix => "fix",
             Command::Rebase => "rebase",
             Command::Correct => "correct",
+            Command::Intake => "intake",
         }
     }
 }
@@ -843,6 +871,9 @@ struct Prepared {
     /// which its end moves a stage left at working back to review
     /// ([`OnDemand::back_from_repair`], OWL-259).
     repairing: bool,
+    /// The intake record, as the ticket ref keeps it or as intake just made
+    /// it: every write of the ref carries it ([`OnDemand::store_delivery`]).
+    intake: Option<TicketIntake>,
 }
 
 impl Prepared {
@@ -1016,13 +1047,31 @@ impl OnDemand<'_> {
                 data([("restarted", json!(true)), ("stage", json!(stage_name(at)))]),
             );
             // The ticket leaves the parked stage now: whatever stops this
-            // command next, it no longer shows Owlshift stopped on it.
-            if let Some(stage) = VisibleStage::of(state.status()) {
+            // command next, it no longer shows Owlshift stopped on it. A
+            // ticket parked at Intake keeps it while intake runs, out of the
+            // ready column, and goes back there once intake ends at Ready
+            // (OWL-248).
+            if at != Stage::Intake
+                && let Some(stage) = VisibleStage::of(state.status())
+            {
                 self.show(ticket, None, stage, sink);
             }
         }
         if let Status::NeedsInput { .. } = state.status() {
             state = self.check_answers(&mut p, state, sink)?;
+        }
+        // At Intake, intake runs again (OWL-248).
+        if state.status() == Status::Active(Stage::Intake) {
+            return Err(self.intake_again(&mut p, state, sink));
+        }
+        // At Ready with its intake record: an intake round was answered, or
+        // a move back to the ready column did not land. The move again, then
+        // the ticket waits for the drain.
+        if state.status() == Status::Active(Stage::Ready) && p.intake.is_some() {
+            self.back_to_ready(ticket, None, sink);
+            return Err(Stop::Ready {
+                ticket: ticket.clone(),
+            });
         }
         // At Watch, what watch does for the ticket, once (OWL-209).
         if state.status() == Status::Active(Stage::Watch)
@@ -1085,7 +1134,7 @@ impl OnDemand<'_> {
             .agent
             .sandbox_ready()
             .map_err(|e| Stop::Refused(e.to_string()))?;
-        for harness in [self.build, self.answer_check, self.resolver] {
+        for harness in [self.build, self.answer_check, self.resolver, self.intake] {
             harness
                 .sandbox_needs(&self.executor.agent)
                 .map_err(|e| Stop::Refused(e.to_string()))?;
@@ -1093,7 +1142,8 @@ impl OnDemand<'_> {
         // The ticket ref lives in the dedicated checkout: without one,
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
-        if !matches!(command, Command::Do) && fs::symlink_metadata(&checkout).is_err() {
+        let takes_in = matches!(command, Command::Do | Command::Intake);
+        if !takes_in && fs::symlink_metadata(&checkout).is_err() {
             return Err(nothing_to_continue(ticket));
         }
         let found = self
@@ -1103,7 +1153,7 @@ impl OnDemand<'_> {
         // `do` needs a decider: refused before anything is cloned when the
         // ticket alone says it has none.
         let pending = pending_decider(&found);
-        if let (Command::Do, Err(why)) = (command, &pending) {
+        if let (true, Err(why)) = (takes_in, &pending) {
             return Err(Stop::Refused(why.clone()));
         }
 
@@ -1117,7 +1167,7 @@ impl OnDemand<'_> {
             Pending::Owners(declared) => project::zone_owners_at(git, &checkout, &base)
                 .and_then(|owners| decide(&found, &declared, &owners)),
         });
-        if let (Command::Do, Err(why)) = (command, &decider) {
+        if let (true, Err(why)) = (takes_in, &decider) {
             return Err(Stop::Refused(why.clone()));
         }
         let worktree = self.dirs.worktree(ticket);
@@ -1154,6 +1204,9 @@ impl OnDemand<'_> {
             checkout,
             worktree,
             branch: branch_for(ticket),
+            intake: stored
+                .as_ref()
+                .and_then(|stored| stored.record.intake.clone()),
             stored,
             heeded: false,
             repairing: false,
@@ -1646,13 +1699,15 @@ impl OnDemand<'_> {
         });
         // At Watch, `do` is refused: `continue` reads the pull request
         // again, and a repair still due asks again (OWL-211).
-        let again = if state.status()
-            == (Status::NeedsInput {
+        let again = match state.status() {
+            Status::NeedsInput {
                 return_to: Stage::Watch,
-            }) {
-            format!("run `owlshift continue {ticket}` to read the pull request again")
-        } else {
-            format!("run `owlshift do {ticket}` to ask them again")
+            } => format!("run `owlshift continue {ticket}` to read the pull request again"),
+            // An intake round: the drain runs intake again (OWL-248).
+            Status::NeedsInput {
+                return_to: Stage::Ready,
+            } => "the drain's next intake of the ticket asks them again".to_owned(),
+            _ => format!("run `owlshift do {ticket}` to ask them again"),
         };
         if let Err(error) = self.store(p, state, asked) {
             return Stop::NotKept {
@@ -2363,6 +2418,7 @@ impl OnDemand<'_> {
             state: PersistedState::from(state),
             questions,
             delivery,
+            intake: p.intake.clone(),
         };
         if p.stored
             .as_ref()
@@ -2635,7 +2691,8 @@ impl OnDemand<'_> {
                 | Stop::CheckFailed { .. }
                 | Stop::UsageLimit { .. }
                 | Stop::Delivery(_)
-                | Stop::Watched { .. } => false,
+                | Stop::Watched { .. }
+                | Stop::Ready { .. } => false,
             },
         };
         if !moved_itself {

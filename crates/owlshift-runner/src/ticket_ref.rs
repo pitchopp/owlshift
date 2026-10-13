@@ -3,8 +3,9 @@
 //! commit whose tree holds the ticket's core state ([`STATE_FILE`]) and the
 //! questions the runner asked on it ([`QUESTIONS_FILE`]), so `owlshift
 //! continue` knows the round, its re-asks and failed runs, and which comments
-//! are the runner's asks; and, once a delivery was made, the pull request
-//! `owlshift watch` follows ([`DELIVERY_FILE`], OWL-209).
+//! are the runner's asks; once a delivery was made, the pull request
+//! `owlshift watch` follows ([`DELIVERY_FILE`], OWL-209); and once intake
+//! ran, its record ([`INTAKE_FILE`], OWL-248).
 //!
 //! The ref lives in the dedicated checkout only (decided 2026-10-02): it is
 //! not pushed, which architecture section 7 plans for once claims exist
@@ -29,10 +30,13 @@
 
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
+use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    DELIVERY_FILE, PersistedState, QUESTIONS_FILE, STATE_FILE, TICKETS_PREFIX, TicketDelivery,
-    TicketQuestions, ticket_ref,
+    DELIVERY_FILE, INTAKE_FILE, PersistedState, QUESTIONS_FILE, STATE_FILE, TICKETS_PREFIX,
+    TicketDelivery, TicketQuestions, ticket_ref,
 };
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
@@ -53,6 +57,23 @@ pub struct TicketRecord {
     /// The delivery, once one was made: `None` when the tree holds no
     /// [`DELIVERY_FILE`].
     pub delivery: Option<TicketDelivery>,
+    /// The intake record, once intake ran: `None` when the tree holds no
+    /// [`INTAKE_FILE`] (OWL-248).
+    pub intake: Option<TicketIntake>,
+}
+
+/// The hash an intake record keeps of a ticket's text (architecture section
+/// 5, "Intake"): the SHA-256 of its title, a NUL byte and its description,
+/// in lowercase hex. Intake runs again once the text no longer has it.
+pub fn text_sha256(title: &str, description: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(title.as_bytes());
+    hash.update([0]);
+    hash.update(description.as_bytes());
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A ticket record and the commit it was read from, or last written as.
@@ -67,7 +88,8 @@ pub struct Stored {
 /// point to a commit, a tree without both files as regular blobs, a file
 /// that does not parse, or asks that do not match the state (a ticket
 /// waiting for answers to a round the asks do not end with) is an error.
-/// [`DELIVERY_FILE`] is optional, checked like the two others when present.
+/// [`DELIVERY_FILE`] and [`INTAKE_FILE`] are optional, checked like the two
+/// others when present.
 /// Other entries of the tree are left alone.
 pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stored>, String> {
     let name = ticket_ref(ticket);
@@ -160,12 +182,22 @@ fn read_listed(
     } else {
         None
     };
+    let intake = if entries.iter().any(|entry| entry.name == INTAKE_FILE) {
+        let text = read_file(git, checkout, name, &entries, INTAKE_FILE)?;
+        Some(
+            TicketIntake::parse(&text)
+                .map_err(|e| broken(format!("holds an invalid {INTAKE_FILE}: {e}")))?,
+        )
+    } else {
+        None
+    };
     check_consistent(&state, &questions).map_err(broken)?;
     Ok(Stored {
         record: TicketRecord {
             state,
             questions,
             delivery,
+            intake,
         },
         commit: listed.oid.clone(),
     })
@@ -221,8 +253,8 @@ pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
 /// the new commit. `previous` is the commit the ref was read at, `None` when
 /// it did not exist: the ref moves only from there, and the new commit has
 /// it as its parent and keeps every other entry of its tree but
-/// [`DELIVERY_FILE`], written when the record has a delivery and left out
-/// when it has none.
+/// [`DELIVERY_FILE`] and [`INTAKE_FILE`], each written when the record has
+/// it and left out when it has none.
 ///
 /// A file that would hold more than [`MAX_FILE`] bytes is refused before
 /// any git command runs (OWL-200): [`read`] would refuse it, leaving the
@@ -242,6 +274,9 @@ pub fn write(
     ];
     if let Some(delivery) = &record.delivery {
         files.push((DELIVERY_FILE, delivery.render()));
+    }
+    if let Some(intake) = &record.intake {
+        files.push((INTAKE_FILE, intake.render()));
     }
     for (file, content) in &files {
         // The blob holds these bytes exactly (`--no-filters`), so their
@@ -263,7 +298,9 @@ pub fn write(
     let mut tree = Vec::new();
     if let Some(previous) = previous {
         for entry in tree_entries(git, checkout, previous)? {
-            if ![STATE_FILE, QUESTIONS_FILE, DELIVERY_FILE].contains(&entry.name.as_str()) {
+            if ![STATE_FILE, QUESTIONS_FILE, DELIVERY_FILE, INTAKE_FILE]
+                .contains(&entry.name.as_str())
+            {
                 tree.extend_from_slice(
                     format!(
                         "{} {} {}\t{}\0",
@@ -346,7 +383,8 @@ pub enum Previous {
 /// commit its parent: Ready, its round count kept and every other counter at
 /// zero, and of `questions.json` only Build's and the resolver's kept
 /// refusals, which the next runs are told. `delivery.json` goes: nothing is
-/// followed any more, and `owlshift do` delivers again (OWL-209). The asks, their verdicts, what
+/// followed any more, and `owlshift do` delivers again (OWL-209). So does
+/// `intake.json`: the drain runs intake again (OWL-245). The asks, their verdicts, what
 /// the last answer check read and the decisions go; their comments stay on
 /// the ticket. A record that cannot be read gives what still reads on its
 /// own: the round of a `state.json` that parses, the refusals of a
@@ -422,6 +460,7 @@ fn kept(round: u32, questions: Option<&TicketQuestions>) -> Result<TicketRecord,
             ..TicketQuestions::new()
         },
         delivery: None,
+        intake: None,
     })
 }
 
