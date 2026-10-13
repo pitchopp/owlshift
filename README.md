@@ -48,7 +48,7 @@ The "Development" section of [CONTRIBUTING.md](CONTRIBUTING.md#development) cove
 ## Requirements
 
 - **Operating system:** macOS or Linux; Windows through WSL2, running as Linux ([Platforms](docs/design/runtime-and-operations.md#platforms)).
-- **git:** a prerequisite that `owlshift doctor` checks ([Install, lifecycle & uninstall](docs/design/runtime-and-operations.md#install-lifecycle--uninstall)).
+- **git:** 2.39.0 or later, a prerequisite that `owlshift doctor` checks ([Install, lifecycle & uninstall](docs/design/runtime-and-operations.md#install-lifecycle--uninstall)).
 - **A harness CLI:** at least one of Claude Code (`claude`) or Codex (`codex`), on your own subscription ([Install, lifecycle & uninstall](docs/design/runtime-and-operations.md#install-lifecycle--uninstall)).
 - **Tracker and forge accounts:** one on the tracker whose tickets Owlshift works and one on the forge that hosts the repository; `owlshift init` keeps their secrets in the system keychain ([Adapters & contracts](docs/design/architecture.md#6-adapters--contracts)).
 - **Rust toolchain 1.98 or later**, only for a build from source ([Technology choices](docs/design/architecture.md#10-technology-choices)).
