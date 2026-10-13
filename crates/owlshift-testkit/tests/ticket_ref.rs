@@ -526,8 +526,9 @@ fn forget_holds_the_project_lock_and_says_what_it_dropped() {
     let said = forgotten.to_string();
     for part in [
         "Forgot what Owlshift kept on DEMO-1: dropped 2 asks of round 1 with their verdicts, 1 \
-         decision of the resolver, what the last answer check read and its state, waiting for \
-         the answers of round 1: those questions are abandoned",
+         decision of the resolver, what the last answer check read, its intake record (the drain \
+         runs intake again) and its state, waiting for the answers of round 1: those questions \
+         are abandoned",
         "; kept round 1 (the next round is 2), Build's held refusal and the resolver's refusal.",
         &format!("refs/owlshift/tickets/DEMO-1 now points to {commit}, whose parent {old}"),
         "its stage on the tracker moves at the next `owlshift do DEMO-1`",
