@@ -4924,6 +4924,14 @@ fn run_ended(report: &RunReport) -> Data {
         "elapsed_ms".to_owned(),
         json!(u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX)),
     );
+    // The system clock's span, which counts a sleep that `elapsed_ms` does
+    // not (OWL-262).
+    if let Some(wall) = report.wall_elapsed {
+        details.insert(
+            "wall_ms".to_owned(),
+            json!(u64::try_from(wall.as_millis()).unwrap_or(u64::MAX)),
+        );
+    }
     if let Some(model) = &report.model {
         details.insert("model".to_owned(), json!(model));
     }
@@ -4986,6 +4994,33 @@ mod tests {
     use crate::executor::Failure;
 
     use super::*;
+
+    fn report(wall_elapsed: Option<Duration>) -> RunReport {
+        RunReport {
+            outcome: Outcome::UsageLimit { resets_at: None },
+            exit_code: Some(0),
+            usage: None,
+            model: None,
+            harness_version: None,
+            elapsed: Duration::from_millis(900),
+            wall_elapsed,
+            stdout_log: PathBuf::from("stdout.log"),
+            stderr_log: PathBuf::from("stderr.log"),
+            log_error: None,
+            gate: None,
+        }
+    }
+
+    #[test]
+    fn run_ended_records_the_monotonic_and_the_wall_time() {
+        let slept = run_ended(&report(Some(Duration::from_millis(2400))));
+        assert_eq!(slept["elapsed_ms"], json!(900));
+        assert_eq!(slept["wall_ms"], json!(2400));
+        // A clock set back leaves the wall time out, never a wrong one.
+        let set_back = run_ended(&report(None));
+        assert_eq!(set_back["elapsed_ms"], json!(900));
+        assert!(!set_back.contains_key("wall_ms"));
+    }
 
     #[test]
     fn an_origin_must_be_github_without_a_credential() {
