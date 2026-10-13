@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket intake",
+  "description": "The intake record of a ticket: the text intake read, the gesture that\nadmitted the ticket, the verdict and the dependencies with what became of\neach. Intake runs again when the ticket's text no longer has this hash.",
+  "type": "object",
+  "properties": {
+    "dependencies": {
+      "description": "The dependencies intake found, at most\n[`MAX_DEPENDENCIES`].",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/KeptDependency"
+      },
+      "maxItems": 64
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "gesture": {
+      "$ref": "#/$defs/Gesture"
+    },
+    "routing": {
+      "$ref": "#/$defs/Routing"
+    },
+    "text_sha256": {
+      "description": "The SHA-256 of the ticket's title, a NUL byte and its description, as\n64 lowercase hexadecimal digits.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "variant": {
+      "$ref": "#/$defs/Variant"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "text_sha256",
+    "gesture",
+    "variant",
+    "routing"
+  ],
+  "$defs": {
+    "DependencyOutcome": {
+      "description": "What became of a dependency (architecture section 5, \"Dependencies to\nrelations\"): a `blocks` relation written from it to the ticket, or why\nnone was.",
+      "oneOf": [
+        {
+          "description": "The runner wrote the relation.",
+          "type": "string",
+          "const": "written"
+        },
+        {
+          "description": "The relation was already there.",
+          "type": "string",
+          "const": "existed"
+        },
+        {
+          "description": "The dependency is already done.",
+          "type": "string",
+          "const": "done"
+        },
+        {
+          "description": "The tracker knows no such ticket.",
+          "type": "string",
+          "const": "unknown"
+        },
+        {
+          "description": "It names the ticket itself.",
+          "type": "string",
+          "const": "itself"
+        },
+        {
+          "description": "The dependency is already blocked by the ticket, directly or through\nits own blockers.",
+          "type": "string",
+          "const": "cycle"
+        }
+      ]
+    },
+    "Effort": {
+      "description": "How hard a model thinks, as `claude --effort` names its levels (checked\non 2026-10-13 with Claude Code 2.1.296: `claude --help` lists `low`,\n`medium`, `high`, `xhigh` and `max`). A harness with other levels maps\nfrom these when routing follows the verdict (P5).",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "Gesture": {
+      "description": "The admission gesture, read just before the ticket's first intake: the\nlabel put on it or the state it was moved to, the tracker account that\nmade it, and when the tracker says it was made. Later passes ask only\nthat the gesture is still on the ticket.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account's identifier as the tracker reports it, one of\n`[tracker].admitters`.",
+          "type": "string"
+        },
+        "at": {
+          "description": "The tracker's time of the gesture.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "kind": {
+          "$ref": "#/$defs/GestureKind"
+        },
+        "name": {
+          "description": "The label's or the state's name, as `[tracker].admit` names it.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "name",
+        "account",
+        "at"
+      ]
+    },
+    "GestureKind": {
+      "description": "Which gesture admitted the ticket.",
+      "type": "string",
+      "enum": [
+        "label",
+        "state"
+      ]
+    },
+    "Harness": {
+      "description": "A harness: a vendor CLI that runs one role headless.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex"
+      ]
+    },
+    "KeptDependency": {
+      "description": "A dependency intake found, with what became of it.",
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/DependencyOutcome"
+        },
+        "quote": {
+          "description": "The words of the ticket that name it.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "ticket": {
+          "$ref": "#/$defs/TicketId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ticket",
+        "quote",
+        "outcome"
+      ]
+    },
+    "Routing": {
+      "description": "The routing verdict: the harness, tier and effort of the ticket's runs\n(section 9, \"One routing verdict per ticket\").",
+      "type": "object",
+      "properties": {
+        "effort": {
+          "$ref": "#/$defs/Effort"
+        },
+        "harness": {
+          "$ref": "#/$defs/Harness"
+        },
+        "tier": {
+          "$ref": "#/$defs/Tier"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "harness",
+        "tier",
+        "effort"
+      ]
+    },
+    "TicketId": {
+      "description": "A tracker's ticket identifier, safe as a git ref component and a file name.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    },
+    "Tier": {
+      "description": "A model tier; the configuration maps each tier to a model per harness.",
+      "type": "string",
+      "enum": [
+        "deep",
+        "standard",
+        "fast"
+      ]
+    },
+    "Variant": {
+      "description": "A pipeline variant.",
+      "type": "string",
+      "enum": [
+        "trivial",
+        "standard",
+        "risky"
+      ]
+    }
+  }
+}

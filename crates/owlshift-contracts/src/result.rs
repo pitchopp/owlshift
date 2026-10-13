@@ -6,11 +6,11 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::Role;
 use crate::brief::{Brief, MAX_CHOICE_BYTES};
 use crate::format::{self, ContractError, Format, RESULT_FORMAT};
-use crate::ids::{QuestionId, RelativePath};
+use crate::ids::{QuestionId, RelativePath, TicketId};
 use crate::refs::cut_to;
+use crate::{Harness, Role, Tier, Variant};
 
 /// The answer check's classes live in the core, which folds them into one
 /// state-machine event.
@@ -65,8 +65,10 @@ pub const MAX_QUESTIONS: usize = 64;
 /// exactly its latest ask, resolutions from the resolver only, covering
 /// exactly the questions it was given, no decisions from the build role,
 /// no `done` from a Build run told that its predecessor's decisions were
-/// refused, and, from such a run when it asks, every refused choice of its
-/// brief named in `refused_choices_asked` (OWL-193).
+/// refused, from such a run when it asks, every refused choice of its
+/// brief named in `refused_choices_asked` (OWL-193), and `intake` from the
+/// intake role only, which gives it whenever it ends `done` or `questions`
+/// (OWL-245).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift result.json", transform = result_invariants)]
@@ -111,6 +113,122 @@ pub struct RunResult {
     /// refused choices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused_choices_asked: Vec<RefusedChoiceAsked>,
+    /// The intake role's record (format 8, OWL-245): required from it when
+    /// it ends `done` or `questions`, refused with any other status and from
+    /// any other role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake: Option<IntakeVerdict>,
+}
+
+/// The most dependencies one intake record names (OWL-245): the record is
+/// kept in the ticket ref, whose files are read up to 1 MiB.
+pub const MAX_DEPENDENCIES: usize = 64;
+
+/// The most bytes a dependency's quote weighs (OWL-245): the words of the
+/// ticket that name the dependency, not a passage.
+pub const MAX_QUOTE_BYTES: usize = 512;
+
+/// What the intake role found on a ticket (architecture section 5,
+/// "Intake"): its pipeline variant, its routing verdict and the tickets it
+/// depends on. In P4 the verdict is recorded and shown, and the Build runs
+/// as `do`'s does; per-ticket routing follows it from P5.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeVerdict {
+    pub variant: Variant,
+    pub routing: Routing,
+    /// The tickets this one depends on, each named by its identifier in the
+    /// ticket's text or thread; at most [`MAX_DEPENDENCIES`]. A dependency
+    /// named without an identifier is a question, never a guess.
+    #[serde(default)]
+    #[schemars(length(max = MAX_DEPENDENCIES))]
+    pub dependencies: Vec<IntakeDependency>,
+}
+
+/// The routing verdict: the harness, tier and effort of the ticket's runs
+/// (section 9, "One routing verdict per ticket").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Routing {
+    pub harness: Harness,
+    pub tier: Tier,
+    pub effort: Effort,
+}
+
+/// How hard a model thinks, as `claude --effort` names its levels (checked
+/// on 2026-10-13 with Claude Code 2.1.296: `claude --help` lists `low`,
+/// `medium`, `high`, `xhigh` and `max`). A harness with other levels maps
+/// from these when routing follows the verdict (P5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    /// The value `claude --effort` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// A ticket the intake role found this one depends on: its identifier and
+/// the words of the ticket that name it, not blank, on one line and at most
+/// [`MAX_QUOTE_BYTES`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeDependency {
+    pub ticket: TicketId,
+    #[schemars(regex(pattern = r"\S"))]
+    pub quote: String,
+}
+
+/// The rules of an intake record's dependencies, in `result.json` and in
+/// `intake.json` alike: at most [`MAX_DEPENDENCIES`], each quote not blank,
+/// without a control character and at most [`MAX_QUOTE_BYTES`].
+pub(crate) fn check_dependencies<'a>(
+    contract: &'static str,
+    dependencies: impl ExactSizeIterator<Item = (&'a TicketId, &'a str)>,
+) -> Result<(), ContractError> {
+    if dependencies.len() > MAX_DEPENDENCIES {
+        return Err(ContractError::invalid(
+            contract,
+            format!(
+                "{} dependencies are named, past the {MAX_DEPENDENCIES} an intake record holds",
+                dependencies.len()
+            ),
+        ));
+    }
+    for (ticket, quote) in dependencies {
+        let broken = if quote.trim().is_empty() {
+            "is blank".to_owned()
+        } else if quote.chars().any(char::is_control) {
+            "holds a control character: quote the words on one line".to_owned()
+        } else if quote.len() > MAX_QUOTE_BYTES {
+            format!(
+                "weighs {} bytes, past the {MAX_QUOTE_BYTES} a quote may weigh: quote only the \
+                 words that name the dependency",
+                quote.len()
+            )
+        } else {
+            continue;
+        };
+        return Err(ContractError::invalid(
+            contract,
+            format!("the quote of dependency {ticket} {broken}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Where a Build run told of refused choices asks one of them (OWL-193):
@@ -369,6 +487,21 @@ impl RunResult {
                 ),
             ));
         }
+        if self.intake.is_some() && !matches!(self.status, Status::Done | Status::Questions) {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                "intake is given but status is neither done nor questions",
+            ));
+        }
+        if let Some(intake) = &self.intake {
+            check_dependencies(
+                CONTRACT,
+                intake
+                    .dependencies
+                    .iter()
+                    .map(|d| (&d.ticket, d.quote.as_str())),
+            )?;
+        }
         check_verdicts(CONTRACT, &self.verdicts)?;
         check_resolutions(&self.resolutions)
     }
@@ -397,6 +530,7 @@ impl RunResult {
         self.decisions_refused(brief).map_err(|(_, error)| error)?;
         self.refused_choices_against(brief)?;
         self.resolutions_against(brief)?;
+        self.intake_against(brief)?;
         if brief.role != Role::AnswerCheck {
             if !self.verdicts.is_empty() {
                 return Err(ContractError::invalid(
@@ -580,6 +714,28 @@ impl RunResult {
             reason.push_str(&format!(". The choices not named: {}", quoted.join("; ")));
         }
         Err(ContractError::invalid(CONTRACT, reason))
+    }
+
+    /// The intake record comes from the intake role only, which gives it
+    /// whenever it ends `done` or `questions` (OWL-245).
+    fn intake_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        let ends_with_record = matches!(self.status, Status::Done | Status::Questions);
+        match (brief.role, &self.intake) {
+            (Role::Intake, None) if ends_with_record => Err(ContractError::invalid(
+                CONTRACT,
+                "status is done or questions but no intake is given: the intake role records \
+                 the variant, the routing and the dependencies it found",
+            )),
+            (role, Some(_)) if role != Role::Intake => Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "intake is given but the run's role is {}, not {}",
+                    role.as_str(),
+                    Role::Intake.as_str()
+                ),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Resolutions come from the resolver only, and a `done` resolver gives
@@ -824,7 +980,7 @@ pub(crate) fn check_question_order(
     Ok(())
 }
 
-/// Adds to the schema the five rules of [`RunResult::validate`] that JSON
+/// Adds to the schema the six rules of [`RunResult::validate`] that JSON
 /// Schema can express.
 fn result_invariants(schema: &mut Schema) {
     let rules = json!([
@@ -853,6 +1009,10 @@ fn result_invariants(schema: &mut Schema) {
                 },
                 "required": ["questions"]
             }
+        },
+        {
+            "if": { "properties": { "intake": { "type": "object" } }, "required": ["intake"] },
+            "then": { "properties": { "status": { "enum": ["done", "questions"] } } }
         }
     ]);
     schema.insert("allOf".to_owned(), rules);

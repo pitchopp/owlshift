@@ -28,8 +28,9 @@ pub const BRIEF_FORMAT: u32 = 14;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
-/// (OWL-176); format 7 adds Build's `refused_choices_asked` (OWL-193).
-pub const RESULT_FORMAT: u32 = 7;
+/// (OWL-176); format 7 adds Build's `refused_choices_asked` (OWL-193);
+/// format 8 the intake role's `intake` (OWL-245).
+pub const RESULT_FORMAT: u32 = 8;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -55,6 +56,12 @@ pub const QUESTIONS_FORMAT: u32 = 10;
 /// correction's owed report that pushed nothing (OWL-236); formats 1 to 3
 /// are still read.
 pub const DELIVERY_FORMAT: u32 = 4;
+/// The format version of a ticket's intake record (`intake.json` on a ticket
+/// ref, OWL-245).
+pub const INTAKE_FORMAT: u32 = 1;
+/// The format version of a ticket's proposed follow-ups (`proposals.json` on
+/// a ticket ref, OWL-245).
+pub const PROPOSALS_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

@@ -5,6 +5,8 @@ requires = ">=0.1"
 kind = "linear"
 team = "LOC"
 admit = { label = "agent" }
+admitters = ["u-ann"]
+exclude = "agent:hold"
 states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review", parked = "Parked" }
 
 [stack]
@@ -23,3 +25,4 @@ fast     = { claude = "claude-haiku-4-5" }
 
 [policy]
 always_human = ["billing", "auth"]   # adds to the floor, never removes
+max_open_prs = 3

@@ -9,6 +9,7 @@
 pub mod brief;
 pub mod comment;
 pub mod config;
+pub mod drain;
 pub mod event;
 pub mod format;
 pub mod ids;

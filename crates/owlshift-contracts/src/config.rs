@@ -17,7 +17,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 use crate::format::ContractError;
-use crate::ids::is_repository_part;
+use crate::ids::{check_name, is_repository_part};
 use crate::{Harness, PlanApproval, Variant};
 
 const PROJECT: &str = "owlshift.toml";
@@ -51,8 +51,24 @@ pub struct Tracker {
     /// The tracker's team key; required for Linear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
-    /// The gesture by which a person admits a ticket to the queue.
+    /// The gesture by which a person admits a ticket to the queue. A state
+    /// gesture is the move to the ready column, so it names
+    /// `states.ready`.
     pub admit: Admit,
+    /// The tracker accounts whose gesture admits a ticket to the drain
+    /// (`owlshift watch --drain`), each by its identifier as the tracker
+    /// reports it (a Linear user's id, the name on the Markdown tracker),
+    /// written exactly, as a zone's owner is. Optional for the file;
+    /// `--drain` refuses to start without it. When set, at least one, each
+    /// once, none blank, padded or holding a control character. A file
+    /// using it requires an Owlshift that reads it (OWL-245).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub admitters: Option<Vec<String>>,
+    /// A label that keeps a ticket out of the drain, whatever else it
+    /// carries; optional, and never the admission label (OWL-245).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<String>,
     /// The tracker states that show a ticket's visible stage.
     pub states: States,
 }
@@ -211,11 +227,24 @@ pub struct Policy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 1440))]
     pub quiet_window_minutes: Option<u16>,
+    /// How many pull requests Owlshift delivered may be open at once before
+    /// the drain dispatches no new Build, a whole number from 1 to 20.
+    /// Absent: 3 (OWL-245).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 20))]
+    pub max_open_prs: Option<u8>,
 }
 
 /// The range of `policy.quiet_window_minutes`, in minutes (the schema
 /// attribute on the field repeats it as literals).
 const QUIET_WINDOW_MINUTES: std::ops::RangeInclusive<u16> = 1..=1440;
+
+/// The range of `policy.max_open_prs` (the schema attribute on the field
+/// repeats it as literals).
+const MAX_OPEN_PRS: std::ops::RangeInclusive<u8> = 1..=20;
+
+/// The cap on open pull requests when `policy.max_open_prs` is absent.
+pub const DEFAULT_MAX_OPEN_PRS: u8 = 3;
 
 impl Policy {
     /// The quiet window: the project's, or the default. A value outside
@@ -228,6 +257,64 @@ impl Policy {
                     minutes.clamp(*QUIET_WINDOW_MINUTES.start(), *QUIET_WINDOW_MINUTES.end());
                 Duration::from_secs(u64::from(minutes) * 60)
             })
+    }
+
+    /// The cap on open pull requests: the project's, or
+    /// [`DEFAULT_MAX_OPEN_PRS`]. A value outside the range, possible only in
+    /// a configuration built in code, is clamped into it.
+    pub fn max_open_prs(&self) -> u8 {
+        self.max_open_prs.map_or(DEFAULT_MAX_OPEN_PRS, |cap| {
+            cap.clamp(*MAX_OPEN_PRS.start(), *MAX_OPEN_PRS.end())
+        })
+    }
+}
+
+impl Tracker {
+    /// Checks admission: a state gesture names `states.ready`; the
+    /// admitters, when listed, are at least one, each once and each a name
+    /// written exactly; the exclusion label is one too, and not the
+    /// admission label in any case, which would exclude every ticket.
+    fn check_admission(&self) -> Result<(), String> {
+        if let Admit::State(state) = &self.admit
+            && *state != self.states.ready
+        {
+            return Err(format!(
+                "tracker.admit names the state {state:?}, but a state gesture is the move to \
+                 the ready column: it must be tracker.states.ready, {:?}",
+                self.states.ready
+            ));
+        }
+        if let Some(admitters) = &self.admitters {
+            if admitters.is_empty() {
+                return Err(
+                    "tracker.admitters lists no account: list at least one, or leave \
+                            the key out"
+                        .to_owned(),
+                );
+            }
+            for (i, account) in admitters.iter().enumerate() {
+                if let Err(broken) = check_name(account) {
+                    return Err(format!("tracker.admitters: {account:?} {broken}"));
+                }
+                if admitters[..i].contains(account) {
+                    return Err(format!("tracker.admitters: {account:?} is listed twice"));
+                }
+            }
+        }
+        if let Some(exclude) = &self.exclude {
+            if let Err(broken) = check_name(exclude) {
+                return Err(format!("tracker.exclude {exclude:?} {broken}"));
+            }
+            if let Admit::Label(label) = &self.admit
+                && label.to_lowercase() == exclude.to_lowercase()
+            {
+                return Err(format!(
+                    "tracker.exclude {exclude:?} is the admission label: no ticket could be \
+                     taken in"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -267,6 +354,9 @@ impl ProjectConfig {
                 "tracker.team is required for Linear",
             ));
         }
+        self.tracker
+            .check_admission()
+            .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         self.stack
             .check_rules()
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.rules: {reason}")))?;
@@ -276,6 +366,14 @@ impl ProjectConfig {
             return Err(ContractError::invalid(
                 PROJECT,
                 "policy.quiet_window_minutes must be a whole number of minutes from 1 to 1440",
+            ));
+        }
+        if let Some(cap) = self.policy.max_open_prs
+            && !MAX_OPEN_PRS.contains(&cap)
+        {
+            return Err(ContractError::invalid(
+                PROJECT,
+                "policy.max_open_prs must be a whole number from 1 to 20",
             ));
         }
         self.zone_owners()?;
@@ -700,6 +798,7 @@ mod tests {
         let built = Policy {
             always_human: Vec::new(),
             quiet_window_minutes: Some(0),
+            max_open_prs: None,
         };
         assert_eq!(built.quiet_window(), Duration::from_secs(60));
 
@@ -720,6 +819,129 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("from 1 to 1440"), "{error}");
+    }
+
+    /// A project file whose `[tracker]` admits by `admit` and adds `extra`.
+    fn project_with_tracker(admit: &str, extra: &str) -> Result<ProjectConfig, ContractError> {
+        ProjectConfig::parse(&format!(
+            r#"
+            requires = ">=0.1"
+            [tracker]
+            kind = "markdown"
+            admit = {admit}
+            {extra}
+            states = {{ ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }}
+            [stack]
+            gate = []
+            [pipeline]
+            default = "trivial"
+            plan_approval = "never"
+            [models]
+            [policy]
+            always_human = []
+            "#
+        ))
+    }
+
+    #[test]
+    fn the_drains_tracker_keys_are_optional_and_checked() {
+        let absent = project_with_tracker(r#"{ label = "agent" }"#, "").unwrap();
+        assert_eq!(absent.tracker.admitters, None);
+        assert_eq!(absent.tracker.exclude, None);
+        let rendered = absent.render();
+        assert!(
+            !rendered.contains("admitters") && !rendered.contains("exclude"),
+            "{rendered}"
+        );
+
+        // Identifiers are compared exactly, so these are two accounts.
+        let set = project_with_tracker(
+            r#"{ label = "agent" }"#,
+            r#"admitters = ["u-ann", "U-ann"]
+            exclude = "agent:hold""#,
+        )
+        .unwrap();
+        assert_eq!(
+            set.tracker.admitters.as_deref(),
+            Some(&["u-ann".to_owned(), "U-ann".to_owned()][..])
+        );
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+
+        for (admit, extra, reason) in [
+            (
+                r#"{ label = "agent" }"#,
+                "admitters = []",
+                "tracker.admitters lists no account",
+            ),
+            (
+                r#"{ label = "agent" }"#,
+                r#"admitters = ["u-ann", "u-ann"]"#,
+                "tracker.admitters: \"u-ann\" is listed twice",
+            ),
+            (
+                r#"{ label = "agent" }"#,
+                r#"admitters = ["u-ann "]"#,
+                "tracker.admitters: \"u-ann \" has a space at either end",
+            ),
+            (
+                r#"{ label = "agent" }"#,
+                r#"admitters = [" "]"#,
+                "tracker.admitters: \" \" is blank",
+            ),
+            (
+                r#"{ label = "agent" }"#,
+                r#"admitters = ["u-ann\u0007"]"#,
+                "holds a control character",
+            ),
+            (
+                r#"{ label = "Ágent" }"#,
+                r#"exclude = "ágent""#,
+                "tracker.exclude \"ágent\" is the admission label",
+            ),
+            (
+                r#"{ label = "agent" }"#,
+                "exclude = ''",
+                "tracker.exclude \"\" is blank",
+            ),
+            (
+                r#"{ state = "Doing" }"#,
+                "",
+                "tracker.admit names the state \"Doing\", but a state gesture is the move to \
+                 the ready column: it must be tracker.states.ready, \"Todo\"",
+            ),
+        ] {
+            let error = project_with_tracker(admit, extra).unwrap_err().to_string();
+            assert!(
+                error.starts_with("invalid owlshift.toml: ") && error.contains(reason),
+                "{extra}: {error}"
+            );
+        }
+
+        // A state gesture naming the ready column is accepted, with any
+        // exclusion label.
+        let state = project_with_tracker(r#"{ state = "Todo" }"#, r#"exclude = "Todo""#).unwrap();
+        assert_eq!(state.tracker.admit, Admit::State("Todo".into()));
+    }
+
+    #[test]
+    fn the_open_pull_request_cap_is_a_policy_key_with_a_default_and_a_range() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.policy.max_open_prs(), DEFAULT_MAX_OPEN_PRS);
+        assert!(!absent.render().contains("max_open_prs"));
+
+        let set = project("", "max_open_prs = 20").unwrap();
+        assert_eq!(set.policy.max_open_prs(), 20);
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+        project("", "max_open_prs = 1").unwrap();
+
+        for bad in ["0", "21", "300", "-1", "2.5", "\"3\""] {
+            let error = project("", &format!("max_open_prs = {bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_open_prs"), "{bad}: {error}");
+        }
+        let error = project("", "max_open_prs = 0").unwrap_err().to_string();
+        assert!(error.contains("from 1 to 20"), "{error}");
     }
 
     #[test]

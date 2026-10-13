@@ -1,0 +1,19 @@
+{
+  "format": 8,
+  "status": "done",
+  "summary": "A standard ticket for the standard tier; it waits for OWL-41.",
+  "intake": {
+    "variant": "standard",
+    "routing": {
+      "harness": "claude",
+      "tier": "standard",
+      "effort": "medium"
+    },
+    "dependencies": [
+      {
+        "ticket": "OWL-41",
+        "quote": "Blocked by OWL-41."
+      }
+    ]
+  }
+}
