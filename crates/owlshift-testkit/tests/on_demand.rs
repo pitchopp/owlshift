@@ -5120,6 +5120,115 @@ fn a_moved_ticket_waits_and_gets_its_fix_run_once_back() {
     assert_eq!(state_of(&bench).fix_passes(), 1);
 }
 
+/// The visible stages the commands after event `from` moved the ticket to,
+/// by their `[tracker].states` key.
+fn stage_moves(bench: &Bench, from: usize) -> Vec<String> {
+    data_of(&bench.events()[from..], EventKind::TrackerWrite, "action")
+        .into_iter()
+        .filter(|write| write["action"] == "stage")
+        .map(|write| write["stage"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// While the `run`th run of a command works, the ticket's stage on the
+/// tracker, kept in `seen`.
+fn stage_during(bench: &Bench, run: usize, seen: &Rc<RefCell<Option<String>>>) -> During {
+    let (checkout, seen) = (bench.remote.checkout.clone(), seen.clone());
+    (
+        run,
+        Box::new(move || {
+            let stage = MarkdownTracker::new(&checkout)
+                .ticket(&ticket())
+                .unwrap()
+                .stage;
+            *seen.borrow_mut() = Some(stage);
+        }),
+    )
+}
+
+/// OWL-259: a fix run shows its ticket as working while it works the pull
+/// request, and as review again once its push has landed.
+#[test]
+fn a_fix_run_shows_working_until_its_push_lands() {
+    let bench = delivered();
+    assert_eq!(bench.stage(), "In Review");
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let from = bench.events().len();
+    let seen = Rc::new(RefCell::new(None));
+    let (fixed, printed) = bench.continue_during(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        vec![stage_during(&bench, 1, &seen)],
+    );
+    fixed.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(seen.borrow().as_deref(), Some("In Progress"));
+    assert_eq!(stage_moves(&bench, from), ["working", "review"]);
+    assert_eq!(bench.stage(), "In Review");
+}
+
+/// OWL-259: a fix run a usage limit stops leaves the ticket at Watch, with
+/// no run working: it shows review again.
+#[test]
+fn a_fix_run_a_usage_limit_stops_shows_review_again() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let from = bench.events().len();
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (stopped, printed) = bench.continue_ticket(vec![limited]);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    assert_eq!(stage_moves(&bench, from), ["working", "review"]);
+    assert_eq!(bench.stage(), "In Review");
+}
+
+/// OWL-259: a stage a person or an integration sets while a fix run works
+/// (done, at a merge) is kept when the run ends: the move back to review is
+/// made only from working.
+#[test]
+fn a_stage_set_during_a_fix_run_is_kept() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let from = bench.events().len();
+    let file = bench.ticket_file();
+    let (fixed, printed) = bench.continue_during(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        vec![(
+            1,
+            Box::new(move || {
+                let text = fs::read_to_string(&file).unwrap();
+                let line = text.lines().find(|l| l.starts_with("stage = ")).unwrap();
+                fs::write(&file, text.replace(line, "stage = \"Done\"")).unwrap();
+            }),
+        )],
+    );
+    fixed.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(stage_moves(&bench, from), ["working"]);
+    assert_eq!(bench.stage(), "Done");
+}
+
+/// OWL-259: a tracker that refuses the move to working is warned of, and
+/// the fix run goes on and pushes.
+#[test]
+fn a_refused_move_to_working_is_a_warning_and_the_fix_runs() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    bench.refuse_stage.set(true);
+    let from = bench.events().len();
+    let (fixed, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello again"), Some(FIXED))]);
+    fixed.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let warned: Vec<Value> = data_of(&bench.events()[from..], EventKind::Warning, "what")
+        .into_iter()
+        .filter(|w| w["what"] == "stage_not_moved")
+        .collect();
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0]["stage"], "working");
+    assert_eq!(state_of(&bench).fix_passes(), 1);
+    assert_eq!(bench.stage(), "In Review");
+}
+
 /// A repair run's question about something only a person holds (scenario
 /// S9).
 const ASKS_FOR_A_VARIABLE: &str = r#"{"format":7,"status":"questions",
@@ -5133,6 +5242,7 @@ const ASKS_FOR_A_VARIABLE: &str = r#"{"format":7,"status":"questions",
 fn asked_at_watch(bench: &Bench) {
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
     let before = state_of(bench);
+    let from = bench.events().len();
     let (asked, printed) =
         bench.continue_ticket(vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))]);
     assert!(
@@ -5151,6 +5261,9 @@ fn asked_at_watch(bench: &Bench) {
         (before.fix_passes(), before.repairs())
     );
     assert!(bench.briefs().iter().all(|b| b.role != Role::Resolver));
+    // Working while the fix run worked, then waiting for the decider
+    // (OWL-259).
+    assert_eq!(stage_moves(bench, from), ["working", "needs_input"]);
     assert_eq!(bench.stage(), "Needs Input");
     let comments = bench.comments();
     assert!(!comments.iter().any(|c| c.starts_with("[owlshift] PARKED")));
@@ -5906,8 +6019,12 @@ fn a_crashed_fix_push(bench: &Bench, owed: Option<owlshift_contracts::refs::Owed
 fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
     let bench = delivered();
     let fix = a_crashed_fix_push(&bench, None);
+    // The crash left the ticket at working; the adoption ends the run
+    // (OWL-259).
+    move_ticket(&bench, "In Progress");
     let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
     assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.stage(), "In Review");
     let reports = reports(&bench);
     assert_eq!(reports.len(), 2, "{reports:?}");
     for text in [
@@ -5920,6 +6037,21 @@ fn an_adopted_fix_push_is_reported_with_what_its_run_kept() {
     let delivery = bench.record().delivery.unwrap();
     assert_eq!(delivery.pushed.as_deref(), Some(fix.as_str()));
     assert!(delivery.owed.is_none() && delivery.pushing.is_none());
+}
+
+/// OWL-259: `continue` at Watch adopting a fix push a crash cut short
+/// moves the ticket the crash left at working back to review.
+#[test]
+fn continue_adopting_a_crashed_push_shows_review_again() {
+    let bench = delivered();
+    a_crashed_fix_push(&bench, None);
+    move_ticket(&bench, "In Progress");
+    let (look, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(look, Err(Stop::Watched { .. })),
+        "{look:?}\n{printed}"
+    );
+    assert_eq!(bench.stage(), "In Review");
 }
 
 /// The `*_report_replaced` warnings of the events after `from`.
@@ -6329,6 +6461,9 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
     );
     let delivered = outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(!delivered.opened);
+    // Working while the rebase run worked, review once pushed (OWL-259).
+    assert_eq!(stage_moves(&bench, delivered_events), ["working", "review"]);
+    assert_eq!(bench.stage(), "In Review");
 
     // One run, of the rebase role on the fast tier, told what to rebase.
     let events = &bench.events()[delivered_events..];
@@ -6612,6 +6747,10 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
         "{outcomes:?}\n{printed}"
     );
     assert_eq!(ran(), 4);
+    // Working while the correction run worked, review once pushed, its
+    // report refused or not (OWL-259).
+    assert_eq!(stage_moves(&bench, delivered_events), ["working", "review"]);
+    assert_eq!(bench.stage(), "In Review");
 
     // The build role at Watch, given the decider's reply alone.
     let brief = bench.briefs().pop().unwrap();

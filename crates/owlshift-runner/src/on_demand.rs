@@ -839,6 +839,10 @@ struct Prepared {
     /// The project's gate policy, built once for the command: it routes the
     /// questions and gives the brief the project's additions.
     policy: GatePolicy,
+    /// A repair of this command ran, or pushed again without a run, after
+    /// which its end moves a stage left at working back to review
+    /// ([`OnDemand::back_from_repair`], OWL-259).
+    repairing: bool,
 }
 
 impl Prepared {
@@ -1152,6 +1156,7 @@ impl OnDemand<'_> {
             branch: branch_for(ticket),
             stored,
             heeded: false,
+            repairing: false,
             policy: GatePolicy::new(
                 &self.config.policy.always_human,
                 self.config.pipeline.plan_approval,
@@ -1208,6 +1213,11 @@ impl OnDemand<'_> {
                 // (OWL-239).
                 if let Some(replaced) = &changed.replaced {
                     self.replaced(&ticket, replaced, delivery.pushed.as_deref(), sink);
+                }
+                // A push a crash cut short ends as its run would have
+                // (OWL-259).
+                if matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
+                    self.review_after_working(&ticket, sink);
                 }
             }
             Ok(None) => {}
@@ -2549,9 +2559,21 @@ impl OnDemand<'_> {
         status: Status,
         sink: &mut EventSink<'_>,
     ) -> Result<(), String> {
-        let Some(shown) = VisibleStage::of(status) else {
-            return Ok(());
-        };
+        match VisibleStage::of(status) {
+            Some(shown) => self.review_while(ticket, shown, sink),
+            None => Ok(()),
+        }
+    }
+
+    /// Moves the ticket to review while the tracker still shows `shown`,
+    /// keeping any other stage, one a person or an integration moved it to;
+    /// the stage read or written otherwise is the error.
+    fn review_while(
+        &self,
+        ticket: &TicketId,
+        shown: VisibleStage,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), String> {
         let stage = self
             .tracker
             .stage(ticket)
@@ -2561,6 +2583,64 @@ impl OnDemand<'_> {
         }
         self.move_stage(ticket, None, VisibleStage::Review, sink)
             .map_err(|e| format!("moving it to review: {e}"))
+    }
+
+    /// Moves a ticket the tracker still shows as working back to review
+    /// (architecture section 5, "The stage while a repair runs", OWL-259):
+    /// after a repair's runs end, and after a read adopts a push a crash
+    /// left. A stage read or move that fails is a `stage_not_moved` warning.
+    pub(crate) fn review_after_working(&self, ticket: &TicketId, sink: &mut EventSink<'_>) {
+        if let Err(reason) = self.review_while(ticket, VisibleStage::Working, sink) {
+            let states = &self.config.tracker.states;
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("stage_not_moved")),
+                    ("stage", json!(VisibleStage::Review.key())),
+                    ("state", json!(VisibleStage::Review.state(states))),
+                    ("reason", json!(reason)),
+                ]),
+            );
+        }
+    }
+
+    /// The end of a repair (OWL-259): once its runs started, or its push was
+    /// pushed again without a run, the stage goes back to review while it
+    /// still shows working, unless the end moved it itself: a park to
+    /// parked, a round on the ticket to needs input, which keep their stage
+    /// even when the ref write after them failed.
+    fn back_from_repair(
+        &self,
+        p: &Prepared,
+        outcome: &Result<Delivered, Stop>,
+        sink: &mut EventSink<'_>,
+    ) {
+        if !p.repairing {
+            return;
+        }
+        let moved_itself = match outcome {
+            Ok(_) => false,
+            Err(stop) => match stop {
+                Stop::Parked { .. } | Stop::NotKept { .. } => true,
+                Stop::NeedsInput { posted, .. } => posted.is_ok(),
+                Stop::Busy(_)
+                | Stop::Refused(_)
+                | Stop::Unverified { .. }
+                | Stop::Waiting { .. }
+                | Stop::Settling { .. }
+                | Stop::Reasked { .. }
+                | Stop::CounterQuestion { .. }
+                | Stop::CheckFailed { .. }
+                | Stop::UsageLimit { .. }
+                | Stop::Delivery(_)
+                | Stop::Watched { .. } => false,
+            },
+        };
+        if !moved_itself {
+            self.review_after_working(&p.ticket, sink);
+        }
     }
 
     /// Moves the visible stage as `event` does ([`VisibleStage::after`]).
@@ -3065,8 +3145,22 @@ impl OnDemand<'_> {
     /// rebase run ([`Self::repair_rebase`], OWL-210), and a conflict with
     /// the base its last rebase was pushed onto a failed run of that rebase
     /// ([`Self::rebase_failed`]). Any other decision runs nothing and is
-    /// told as a look.
+    /// told as a look. Its end moves a stage its runs left at working back
+    /// to review ([`Self::back_from_repair`], OWL-259).
     fn repair(
+        &self,
+        p: &mut Prepared,
+        failing_for: Option<Duration>,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        let outcome = self.repair_due(p, failing_for, following, sink);
+        self.back_from_repair(p, &outcome, sink);
+        outcome
+    }
+
+    /// [`Self::repair`] before its end moves the stage.
+    fn repair_due(
         &self,
         p: &mut Prepared,
         failing_for: Option<Duration>,
@@ -3220,6 +3314,7 @@ impl OnDemand<'_> {
             let commit = CommitId::new(pushing.commit.as_str())
                 .map_err(|e| refused("the commit under way", e))?;
             let (fixed, followups) = Repaired::again(commit, pushing, "fix");
+            p.repairing = true;
             return self.push_repair(
                 p,
                 state,
@@ -3366,6 +3461,10 @@ impl OnDemand<'_> {
         run: &RepairRun<'_>,
         sink: &mut EventSink<'_>,
     ) -> Result<(RepairDone, Vec<Followup>), Stop> {
+        // Working from the runs' start, until the repair's end moves it
+        // back (OWL-259).
+        self.show(&p.ticket, None, VisibleStage::Working, sink);
+        p.repairing = true;
         let current = person(p.current()?, &p.found);
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
@@ -3564,6 +3663,7 @@ impl OnDemand<'_> {
             let kept_onto =
                 CommitId::new(kept_onto.as_str()).map_err(|e| refused("the rebase's base", e))?;
             let (repaired, followups) = Repaired::again(commit, pushing, "rebase");
+            p.repairing = true;
             return self.push_repair(
                 p,
                 state,

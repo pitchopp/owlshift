@@ -427,6 +427,11 @@ impl Watch<'_> {
         if let Some(replaced) = &replaced {
             on_demand.replaced(ticket, replaced, delivery.pushed.as_deref(), sink);
         }
+        // A push a crash cut short ends as its run would have: an adoption
+        // always changes the ref, which keeps it now (OWL-259).
+        if matches!(seen.decision, Decision::Follow { adopt: true, .. }) {
+            on_demand.review_after_working(ticket, sink);
+        }
         if let Some(event) = memory.following.events(ticket, &seen) {
             sink.emit(ticket, None, EventKind::Decision, event);
             self.line(out, &format!("{ticket}: {seen}"));

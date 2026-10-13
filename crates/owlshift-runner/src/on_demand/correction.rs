@@ -49,8 +49,22 @@ impl OnDemand<'_> {
     /// replies in its brief's `correction`; a `done` on a new commit is
     /// pushed and reported, a `done` on Owlshift's last push changed nothing
     /// and is reported so. Either way the decisions keep the replies as
-    /// followed, and only once the push has landed.
+    /// followed, and only once the push has landed. Its end moves a stage
+    /// its run left at working back to review ([`Self::back_from_repair`],
+    /// OWL-259).
     pub(super) fn correct(
+        &self,
+        p: &mut Prepared,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        let outcome = self.correct_due(p, following, sink);
+        self.back_from_repair(p, &outcome, sink);
+        outcome
+    }
+
+    /// [`Self::correct`] before its end moves the stage.
+    fn correct_due(
         &self,
         p: &mut Prepared,
         following: &mut Following,
@@ -121,6 +135,7 @@ impl OnDemand<'_> {
             let commit = CommitId::new(pushing.commit.as_str())
                 .map_err(|e| refused("the commit under way", e))?;
             let (repaired, followups) = Repaired::again(commit, pushing, "correction");
+            p.repairing = true;
             return self.push_correction(
                 p, &delivery, &pushed_id, repaired, state, followups, &reversed, following, sink,
             );
