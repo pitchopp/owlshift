@@ -1,0 +1,349 @@
+{
+  "recorded": "2026-10-13 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 50,
+          "id": "OWL-129"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "botActor": null,
+            "createdAt": "2026-10-02T13:28:32.606Z",
+            "creator": {
+              "app": false,
+              "displayName": "person-1",
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
+            "externalUserCreator": null,
+            "history": {
+              "nodes": [
+                {
+                  "actor": null,
+                  "addedLabels": null,
+                  "botActor": {
+                    "name": "GitHub"
+                  },
+                  "createdAt": "2026-10-02T16:44:52.691Z",
+                  "toState": {
+                    "name": "Done"
+                  }
+                },
+                {
+                  "actor": null,
+                  "addedLabels": null,
+                  "botActor": {
+                    "name": "GitHub"
+                  },
+                  "createdAt": "2026-10-02T14:28:43.653Z",
+                  "toState": null
+                },
+                {
+                  "actor": null,
+                  "addedLabels": null,
+                  "botActor": {
+                    "name": "GitHub"
+                  },
+                  "createdAt": "2026-10-02T14:28:43.591Z",
+                  "toState": {
+                    "name": "In Review"
+                  }
+                },
+                {
+                  "actor": null,
+                  "addedLabels": null,
+                  "botActor": {
+                    "name": "Linear"
+                  },
+                  "createdAt": "2026-10-02T14:28:43.521Z",
+                  "toState": null
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": [
+                    {
+                      "name": "zone:backend/billing"
+                    }
+                  ],
+                  "botActor": null,
+                  "createdAt": "2026-10-02T14:21:59.058Z",
+                  "toState": null
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-02T14:20:01.079Z",
+                  "toState": {
+                    "name": "In Progress"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "f94c33f4-7162-48e0-9d4b-1f75bc952350",
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 50,
+          "id": "OWL-179"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "botActor": null,
+            "createdAt": "2026-10-07T08:44:52.263Z",
+            "creator": {
+              "app": false,
+              "displayName": "person-1",
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
+            "externalUserCreator": null,
+            "history": {
+              "nodes": [
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T09:14:14.764Z",
+                  "toState": {
+                    "name": "Canceled"
+                  }
+                },
+                {
+                  "actor": null,
+                  "addedLabels": null,
+                  "botActor": {
+                    "name": "Linear"
+                  },
+                  "createdAt": "2026-10-07T09:11:22.781Z",
+                  "toState": null
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T09:11:20.163Z",
+                  "toState": {
+                    "name": "In Review"
+                  }
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T09:04:17.460Z",
+                  "toState": {
+                    "name": "In Progress"
+                  }
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T08:48:11.228Z",
+                  "toState": {
+                    "name": "Needs Input"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "f6587ff4-ab9c-4408-9dce-758b1d765dde",
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 50,
+          "id": "OWL-179"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "botActor": null,
+            "createdAt": "2026-10-07T08:44:52.263Z",
+            "creator": {
+              "app": false,
+              "displayName": "person-1",
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
+            "externalUserCreator": null,
+            "history": {
+              "nodes": [
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T09:14:14.764Z",
+                  "toState": {
+                    "name": "Canceled"
+                  }
+                },
+                {
+                  "actor": null,
+                  "addedLabels": null,
+                  "botActor": {
+                    "name": "Linear"
+                  },
+                  "createdAt": "2026-10-07T09:11:22.781Z",
+                  "toState": null
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T09:11:20.163Z",
+                  "toState": {
+                    "name": "In Review"
+                  }
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T09:04:17.460Z",
+                  "toState": {
+                    "name": "In Progress"
+                  }
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-07T08:48:11.228Z",
+                  "toState": {
+                    "name": "Needs Input"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "f6587ff4-ab9c-4408-9dce-758b1d765dde",
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "variables": {
+          "after": null,
+          "first": 50,
+          "id": "OWL-249"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "botActor": null,
+            "createdAt": "2026-10-13T09:33:46.135Z",
+            "creator": {
+              "app": false,
+              "displayName": "person-1",
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
+            "externalUserCreator": null,
+            "history": {
+              "nodes": [
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-13T09:34:01.169Z",
+                  "toState": null
+                },
+                {
+                  "actor": {
+                    "app": false,
+                    "displayName": "person-1",
+                    "id": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "addedLabels": null,
+                  "botActor": null,
+                  "createdAt": "2026-10-13T09:33:46.437Z",
+                  "toState": null
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "40b2e4b9-3322-41b3-bb8d-dd0313668f52",
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

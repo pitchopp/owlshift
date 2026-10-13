@@ -1,0 +1,317 @@
+{
+  "recorded": "2026-10-13 on the Owlshift workspace, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "variables": {
+          "after": null,
+          "filter": {
+            "labels": {
+              "name": {
+                "eq": "agent"
+              }
+            },
+            "state": {
+              "name": {
+                "eq": "Canceled"
+              }
+            },
+            "team": {
+              "key": {
+                "eq": "OWL"
+              }
+            }
+          },
+          "first": 2
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issues": {
+            "nodes": [
+              {
+                "assignee": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "botActor": null,
+                "createdAt": "2026-10-07T08:44:52.263Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "Add a short \"Privacy\" section to the README saying what Owlshift sends off the machine, and to whom.\n\nOpen points, to be decided on the ticket before building:\n\n* Which outgoing data the section names: ticket text and comments to the tracker, code and briefs to the model provider, branches and pull requests to the forge, or a shorter summary.\n* Whether it says anything about the model provider's own retention, or only links to the provider's terms.\n* Whether it is a README section or a separate `PRIVACY.md` linked from the README.\n\n---\n\n**Test ticket** for the P2 exit gate (OWL-142), replacing OWL-173, which was delivered after a single question round. Run it with `owlshift do`, never with `/parallel`. Its pull request is not merged; cancel the ticket and close the PR once the run is recorded.",
+                "externalUserCreator": null,
+                "identifier": "OWL-179",
+                "inverseRelations": {
+                  "nodes": [],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Docs"
+                    },
+                    {
+                      "name": "agent"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 4,
+                "title": "[Test] Add a privacy note to the README"
+              },
+              {
+                "assignee": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "botActor": null,
+                "createdAt": "2026-10-06T18:59:54.797Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "Add a `SECURITY.md` at the repository root telling people how to report a vulnerability in Owlshift.\n\nOpen points, to be decided on the ticket before building:\n\n* Where a vulnerability is reported: GitHub private security advisories, an e-mail address, or both.\n* Which versions are supported, given there is no release yet.\n* Whether the policy commits to a response time, and which.\n\n---\n\n**Test ticket** for the P2 exit gate (OWL-142), replacing OWL-174, whose run decided its open points itself and asked nothing. Run it with `owlshift do`, never with `/parallel`. Its pull request is not merged; cancel the ticket and close the PR once the run is recorded.",
+                "externalUserCreator": null,
+                "identifier": "OWL-178",
+                "inverseRelations": {
+                  "nodes": [],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Docs"
+                    },
+                    {
+                      "name": "agent"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 4,
+                "title": "[Test] Add a SECURITY.md"
+              }
+            ],
+            "pageInfo": {
+              "endCursor": "f26ce2df-ee2c-4123-a86f-9c3718d23efe",
+              "hasNextPage": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "variables": {
+          "after": "f26ce2df-ee2c-4123-a86f-9c3718d23efe",
+          "filter": {
+            "labels": {
+              "name": {
+                "eq": "agent"
+              }
+            },
+            "state": {
+              "name": {
+                "eq": "Canceled"
+              }
+            },
+            "team": {
+              "key": {
+                "eq": "OWL"
+              }
+            }
+          },
+          "first": 2
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issues": {
+            "nodes": [
+              {
+                "assignee": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "botActor": null,
+                "createdAt": "2026-10-06T18:37:21.670Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "Add a `CHANGELOG.md` at the repository root.\n\nOpen points, to be decided on the ticket before building:\n\n* Its format (Keep a Changelog or another).\n* The first version heading, given there is no release yet.\n* Whether past roadmap steps (P0, P1) get entries, and how detailed.\n\n(Use this one for the deliberately incomplete answer: answer only the first point and check the run asks again.)\n\n---\n\n**Test ticket** for the P2 exit gate (OWL-142). Run it with `owlshift do`, never with `/parallel`. Its pull request is not merged; cancel the ticket and close the PR once the run is recorded.",
+                "externalUserCreator": null,
+                "identifier": "OWL-175",
+                "inverseRelations": {
+                  "nodes": [],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Docs"
+                    },
+                    {
+                      "name": "agent"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 4,
+                "title": "[Test] Add a CHANGELOG.md"
+              },
+              {
+                "assignee": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "botActor": null,
+                "createdAt": "2026-10-06T18:37:21.444Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "Add an example `owlshift.toml` under `examples/` for someone trying Owlshift on their own repository.\n\nOpen points, to be decided on the ticket before building:\n\n* Which tracker and which pipeline the example uses.\n* Whether every key is shown with comments, or only the required ones.\n* Whether the README links to it.\n\n---\n\n**Test ticket** for the P2 exit gate (OWL-142). Run it with `owlshift do`, never with `/parallel`. Its pull request is not merged; cancel the ticket and close the PR once the run is recorded.",
+                "externalUserCreator": null,
+                "identifier": "OWL-174",
+                "inverseRelations": {
+                  "nodes": [],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "Docs"
+                    },
+                    {
+                      "name": "agent"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 4,
+                "title": "[Test] Add an example configuration under examples/"
+              }
+            ],
+            "pageInfo": {
+              "endCursor": "cf6530f1-c6b2-4bb5-96e2-263c9d50ca07",
+              "hasNextPage": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "variables": {
+          "after": "cf6530f1-c6b2-4bb5-96e2-263c9d50ca07",
+          "filter": {
+            "labels": {
+              "name": {
+                "eq": "agent"
+              }
+            },
+            "state": {
+              "name": {
+                "eq": "Canceled"
+              }
+            },
+            "team": {
+              "key": {
+                "eq": "OWL"
+              }
+            }
+          },
+          "first": 2
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issues": {
+            "nodes": [
+              {
+                "assignee": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "botActor": null,
+                "createdAt": "2026-10-06T18:37:21.240Z",
+                "creator": {
+                  "displayName": "person-1",
+                  "id": "00000000-0000-4000-8000-000000000001"
+                },
+                "description": "Add a `owlshift hello` subcommand that greets the user.\n\nOpen points, to be decided on the ticket before building:\n\n* What it prints, and in which language.\n* Whether it takes an optional name argument, and what it prints without one.\n* Whether it appears in `owlshift --help` or stays hidden.\n\n---\n\n**Test ticket** for the P2 exit gate (OWL-142). Run it with `owlshift do`, never with `/parallel`. Its pull request is not merged; cancel the ticket and close the PR once the run is recorded.",
+                "externalUserCreator": null,
+                "identifier": "OWL-173",
+                "inverseRelations": {
+                  "nodes": [],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "labels": {
+                  "nodes": [
+                    {
+                      "name": "Feature"
+                    },
+                    {
+                      "name": "CLI"
+                    },
+                    {
+                      "name": "agent"
+                    }
+                  ],
+                  "pageInfo": {
+                    "hasNextPage": false
+                  }
+                },
+                "priority": 4,
+                "title": "[Test] Add an owlshift hello command"
+              }
+            ],
+            "pageInfo": {
+              "endCursor": "156dc51d-66bc-45d2-8896-dcfe2df786c2",
+              "hasNextPage": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}
