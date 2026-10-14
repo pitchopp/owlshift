@@ -17,11 +17,12 @@
 //! | Decider, who answers a ticket's gates | [`decider`] |
 //! | When the decider's reply counts: the quiet window, `go` | [`reply`] |
 //! | Resource | [`resource`] |
-//! | Scheduler | [`schedule`] |
+//! | Scheduler | [`schedule`]; dependencies to relations, [`dependency`] |
 //! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
 
 pub mod agent_env;
 pub mod decider;
+pub mod dependency;
 pub mod floor;
 pub mod follow;
 pub mod gate;

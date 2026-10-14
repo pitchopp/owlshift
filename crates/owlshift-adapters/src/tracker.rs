@@ -137,6 +137,47 @@ pub trait Tracker {
             "this tracker does not search proposals",
         ))
     }
+
+    /// A ticket as intake's dependency check reads it (OWL-249,
+    /// architecture section 5, "Dependencies to relations"): the tracker's
+    /// own identifier, the type of its state, its description, for its
+    /// "Blocked by" line, and the tickets its relations say block it, as the
+    /// listing reads them. [`ErrorKind::NotFound`] only when the tracker
+    /// answered it knows no such ticket: any other failure is
+    /// [`ErrorKind::Other`], since an unknown dependency writes nothing. An
+    /// error by default.
+    fn relations(&self, _id: &TicketId) -> Result<Relations, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not read a ticket's relations",
+        ))
+    }
+
+    /// Records that `blocker` blocks `blocked`: on Linear a `blocks`
+    /// relation, on the Markdown tracker `blocked`'s `blocked_by` (OWL-249).
+    /// Writing one already there changes nothing. An error means the
+    /// relation may not be there; nothing else was written. An error by
+    /// default.
+    fn block(&self, _blocker: &TicketId, _blocked: &TicketId) -> Result<(), Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not write relations",
+        ))
+    }
+}
+
+/// What [`Tracker::relations`] reads of a ticket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relations {
+    /// The tracker's own identifier: a Linear issue asked by its UUID
+    /// answers its `KEY-n`.
+    pub id: TicketId,
+    /// The type of the state it shows; `None` as for a [`Blocker`].
+    pub state: Option<StateType>,
+    /// Markdown; empty when the ticket has none.
+    pub description: String,
+    /// The tickets that block it by the tracker's relations, once each.
+    pub blockers: Vec<Blocker>,
 }
 
 /// The label of a proposal on a team without a triage state (architecture
