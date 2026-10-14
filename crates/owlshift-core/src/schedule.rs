@@ -55,6 +55,10 @@ pub enum Wait<K> {
     /// until a person removes the relation or the line. Checked before the
     /// open blockers, since nothing but a person ends this wait.
     BlockerCanceled(Vec<K>),
+    /// The tracker knows no ticket by these identifiers, in identifier order;
+    /// the ticket waits until a person corrects the line that names them.
+    /// Checked before the open blockers, for the same reason.
+    BlockerUnknown(Vec<K>),
     /// These blockers are neither completed nor merged yet, in identifier
     /// order.
     BlockedBy(Vec<K>),
@@ -132,26 +136,45 @@ fn trim_zeros(digits: &[u8]) -> &[u8] {
     &digits[zeros..]
 }
 
-/// The blockers that still hold a ticket, merged by identifier (one released
-/// copy releases it), each list in identifier order: the canceled ones, then
-/// the open ones.
-fn holding<K: Clone + Ord + AsRef<str>>(blockers: &[Blocker<K>]) -> (Vec<K>, Vec<K>) {
-    let mut ids: Vec<&K> = blockers.iter().map(|b| &b.id).collect();
+/// The blockers that still hold a ticket, each list in identifier order.
+struct Holding<K> {
+    canceled: Vec<K>,
+    unknown: Vec<K>,
+    open: Vec<K>,
+}
+
+/// The blockers that still hold the ticket `own`, merged by identifier: the
+/// ticket's own identifier is ignored, since a ticket is never its own
+/// prerequisite; one released copy releases the identifier; else one canceled
+/// copy makes it canceled, and one copy the tracker knows makes it open; it is
+/// unknown only when the tracker knows no copy.
+fn holding<K: Clone + Ord + AsRef<str>>(own: &K, blockers: &[Blocker<K>]) -> Holding<K> {
+    let mut ids: Vec<&K> = blockers
+        .iter()
+        .map(|b| &b.id)
+        .filter(|id| *id != own)
+        .collect();
     ids.sort_by(|a, b| natural_cmp(a.as_ref(), b.as_ref()).then_with(|| a.cmp(b)));
     ids.dedup();
-    let (mut canceled, mut open) = (Vec::new(), Vec::new());
+    let mut held = Holding {
+        canceled: Vec::new(),
+        unknown: Vec::new(),
+        open: Vec::new(),
+    };
     for id in ids {
         let copies = || blockers.iter().filter(move |b| &b.id == id);
         if copies().any(Blocker::released) {
             continue;
         }
         if copies().any(|b| b.tracker == BlockerState::Canceled) {
-            canceled.push(id.clone());
+            held.canceled.push(id.clone());
+        } else if copies().all(|b| b.tracker == BlockerState::Unknown) {
+            held.unknown.push(id.clone());
         } else {
-            open.push(id.clone());
+            held.open.push(id.clone());
         }
     }
-    (canceled, open)
+    held
 }
 
 /// Whether a ticket's ref lets the drain dispatch it: at Ready, or at Watch
@@ -172,7 +195,7 @@ fn dispatchable<K>(ticket: &Ticket<K>) -> bool {
 /// first in this order is the one kept. A ticket is dispatched when it is
 /// admitted and not excluded, has a decider, its intake record holds its
 /// current text, its ref is at Ready (or at Watch with its following ended),
-/// every blocker released it, the open pull requests are under their cap, the
+/// every blocker but itself released it, the open pull requests are under their cap, the
 /// slot is free and this machine has a run free.
 pub fn ready_set<K: Clone + Ord + AsRef<str>>(
     tickets: &[Ticket<K>],
@@ -219,11 +242,13 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
         } else if !dispatchable(ticket) {
             Some(Wait::NotReady)
         } else {
-            let (canceled, open) = holding(&ticket.blocked_by);
-            if !canceled.is_empty() {
-                Some(Wait::BlockerCanceled(canceled))
-            } else if !open.is_empty() {
-                Some(Wait::BlockedBy(open))
+            let held = holding(&ticket.id, &ticket.blocked_by);
+            if !held.canceled.is_empty() {
+                Some(Wait::BlockerCanceled(held.canceled))
+            } else if !held.unknown.is_empty() {
+                Some(Wait::BlockerUnknown(held.unknown))
+            } else if !held.open.is_empty() {
+                Some(Wait::BlockedBy(held.open))
             } else if pr_cap_reached {
                 Some(Wait::PrCap)
             } else {
@@ -366,8 +391,14 @@ mod tests {
                     blocker("X-1", BlockerState::Canceled),
                 ];
             }),
-            with("A-8", &open),
-            with("A-9", &|_| {}),
+            with("A-8", &|t| {
+                t.blocked_by = vec![
+                    blocker("X-1", BlockerState::Open),
+                    blocker("UTF-8", BlockerState::Unknown),
+                ];
+            }),
+            with("A-9", &open),
+            with("A-10", &|_| {}),
         ];
         let ready = ready_set(
             &tickets,
@@ -392,8 +423,9 @@ mod tests {
                 ("A-5", Wait::StaleIntake),
                 ("A-6", Wait::NotReady),
                 ("A-7", Wait::BlockerCanceled(vec!["X-1", "X-10"])),
-                ("A-8", Wait::BlockedBy(vec!["X-1"])),
-                ("A-9", Wait::PrCap),
+                ("A-8", Wait::BlockerUnknown(vec!["UTF-8"])),
+                ("A-9", Wait::BlockedBy(vec!["X-1"])),
+                ("A-10", Wait::PrCap),
             ]
         );
     }
@@ -446,6 +478,76 @@ mod tests {
         let ready = ready_set(&[released, canceled], ROOMY, IDLE);
         assert_eq!(ready.dispatch, Some("B-1"));
         assert_eq!(ready.waiting, [("B-2", Wait::BlockerCanceled(vec!["X-4"]))]);
+    }
+
+    #[test]
+    fn an_unknown_blocker_holds_the_ticket_and_names_it() {
+        let held = |blocked_by| {
+            let mut t = ticket("U-1", Priority::High);
+            t.blocked_by = blocked_by;
+            ready_set(&[t], ROOMY, IDLE)
+        };
+        // "Blocked by OWL-1 (not UTF-8 related)", OWL-1 done.
+        let ready = held(vec![
+            blocker("OWL-1", BlockerState::Completed),
+            blocker("UTF-8", BlockerState::Unknown),
+        ]);
+        assert_eq!(ready.dispatch, None);
+        assert_eq!(
+            ready.waiting,
+            [("U-1", Wait::BlockerUnknown(vec!["UTF-8"]))]
+        );
+        // A copy the tracker knows decides: open, canceled or released.
+        let open = held(vec![
+            blocker("X-1", BlockerState::Unknown),
+            blocker("X-1", BlockerState::Open),
+        ]);
+        assert_eq!(open.waiting, [("U-1", Wait::BlockedBy(vec!["X-1"]))]);
+        let canceled = held(vec![
+            blocker("X-1", BlockerState::Unknown),
+            blocker("X-1", BlockerState::Canceled),
+        ]);
+        assert_eq!(
+            canceled.waiting,
+            [("U-1", Wait::BlockerCanceled(vec!["X-1"]))]
+        );
+        let released = held(vec![
+            blocker("X-1", BlockerState::Unknown),
+            blocker("X-1", BlockerState::Completed),
+        ]);
+        assert_eq!(released.dispatch, Some("U-1"));
+    }
+
+    #[test]
+    fn a_ticket_naming_itself_is_not_held_by_it() {
+        let naming = |blocked_by| {
+            let mut t = ticket("S-1", Priority::High);
+            t.blocked_by = blocked_by;
+            ready_set(&[t], ROOMY, IDLE)
+        };
+        for tracker in [
+            BlockerState::Open,
+            BlockerState::Canceled,
+            BlockerState::Unknown,
+            BlockerState::Completed,
+        ] {
+            let ready = naming(vec![blocker("S-1", tracker)]);
+            assert_eq!(ready.dispatch, Some("S-1"), "{tracker:?}");
+            let ready = naming(vec![
+                blocker("S-1", tracker),
+                blocker("X-1", BlockerState::Open),
+            ]);
+            assert_eq!(
+                ready.waiting,
+                [("S-1", Wait::BlockedBy(vec!["X-1"]))],
+                "{tracker:?}"
+            );
+        }
+        let merged_self = Blocker {
+            merged: true,
+            ..blocker("S-1", BlockerState::Canceled)
+        };
+        assert_eq!(naming(vec![merged_self]).dispatch, Some("S-1"));
     }
 
     #[test]
