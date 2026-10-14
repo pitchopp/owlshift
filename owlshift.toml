@@ -16,6 +16,10 @@ team = "OWL"
 # { state = "..." } or "delegation". `owlshift do TICKET` does not use
 # it: it runs the ticket it is given.
 admit = { label = "agent" }
+# The tracker accounts whose admission gesture counts, by Linear user id.
+# `owlshift watch --drain` refuses to start without it. The maintainer's
+# account, for the P4 exit gate (OWL-255).
+admitters = ["782fed6b-e07e-4647-9d70-961856bdf80c"]
 # The tracker states that show where a ticket stands.
 states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
 
