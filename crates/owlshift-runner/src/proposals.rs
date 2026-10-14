@@ -174,7 +174,12 @@ pub struct Filing<'a> {
 /// filed while fewer than [`MAX_PER_PARENT`] are filed, and past that are
 /// over the limit. A refusal keeps the proposal owed with its reason, a
 /// `proposal_unfiled` warning when the reason is new; what went wrong once
-/// a ticket was filed is a `proposal_incomplete` warning each.
+/// a ticket was filed is a `proposal_incomplete` warning each, and the
+/// proposal counts as filed. A relation not written then is never written
+/// again: the description's "Blocked by" line holds the proposal once a
+/// person promotes it, and its intake reads the parent as a dependency,
+/// which part F relates while the parent is not done (OWL-268,
+/// architecture section 5, "A relation lost after filing").
 pub fn file_owed(
     filing: &Filing<'_>,
     proposals: &mut TicketProposals,

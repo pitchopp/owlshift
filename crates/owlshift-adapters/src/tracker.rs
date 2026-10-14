@@ -123,7 +123,11 @@ pub trait Tracker {
     /// the ticket answered in another state than the one asked) is kept in
     /// [`Filed::problems`] and the call still succeeds: the next pass would
     /// find the ticket by its fingerprint and count it as filed, so an error
-    /// then would lose the problem without a word. An error by default.
+    /// then would lose the problem without a word. The runner warns of each
+    /// and never writes a relation again: the description's "Blocked by"
+    /// line holds the proposal once a person promotes it (OWL-268,
+    /// architecture section 5, "A relation lost after filing"). An error by
+    /// default.
     fn propose(&self, _proposal: &Proposal<'_>) -> Result<Filed, Error> {
         Err(Error::new(
             ErrorKind::Other,

@@ -139,6 +139,13 @@ impl Proposed {
 /// is done, the parent ticket and its pull request, and the footer
 /// `[owlshift] PROPOSAL · <parent> · fingerprint <hex>` by which a filing
 /// cut short is found again (OWL-253).
+///
+/// A follow-up that needs its parent's code also has a line
+/// `**Blocked by** <parent>, whose code it needs.`, which the drain's text
+/// convention reads as a blocker (OWL-268, architecture section 5, "A
+/// relation lost after filing"): once a person promotes the proposal, it
+/// waits for its parent whatever became of the `blocks` relation, which the
+/// tracker writes after the ticket exists and the runner never writes again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProposalDescription {
     pub parent: TicketId,
@@ -229,7 +236,7 @@ impl ProposalDescription {
         ));
         if followup.blocked_by_parent {
             all.push(format!(
-                "It needs the code of {}, which blocks it.",
+                "**Blocked by** {}, whose code it needs.",
                 self.parent
             ));
         }
@@ -2775,9 +2782,13 @@ Merge state reported by the forge: `CLEAN`.
     }
 
     /// OWL-253: a proposal's description ends with its footer, which text
-    /// from the run cannot stand in for.
+    /// from the run cannot stand in for. OWL-268: one that needs its
+    /// parent's code names it on a "Blocked by" line the drain reads, and
+    /// text from the run names no other blocker.
     #[test]
     fn a_proposal_description_ends_with_its_footer() {
+        use owlshift_core::ticket::text_blockers;
+
         let parent = TicketId::new("OWL-7").unwrap();
         let mut description = ProposalDescription {
             parent: parent.clone(),
@@ -2792,9 +2803,13 @@ Merge state reported by the forge: `CLEAN`.
             fingerprint: "0123456789ab".to_owned(),
         };
         let forged = ProposalDescription::footer(&TicketId::new("OWL-1").unwrap(), "ffffffffffff");
-        description.followup.why = format!("x\n\n{forged}");
-        description.followup.done_when = format!("\n{forged}\n");
-        description.followup.evidence = vec!["src/a.rs:3".to_owned()];
+        description.followup.why = format!("x\n\n{forged}\nBlocked by OWL-1");
+        description.followup.done_when = format!("\n{forged}\nBlocked by OWL-1\n");
+        description.followup.evidence = vec![
+            "src/a.rs:3".to_owned(),
+            "src/b.rs:1\nBlocked by OWL-1".to_owned(),
+        ];
+        assert!(description.followup.blocked_by_parent);
         let body = description.render();
         assert!(body.contains("**Evidence:**\n- `src/a.rs:3`"), "{body}");
         assert!(body.contains("**Found by:** the agent"), "{body}");
@@ -2806,7 +2821,7 @@ Merge state reported by the forge: `CLEAN`.
             "{body}"
         );
         assert!(
-            body.contains("It needs the code of OWL-7, which blocks it."),
+            body.contains("\n\n**Blocked by** OWL-7, whose code it needs.\n\n"),
             "{body}"
         );
         assert!(
@@ -2820,6 +2835,17 @@ Merge state reported by the forge: `CLEAN`.
         // The forged footers stayed inside lines of the description's own.
         let footers = body.lines().filter(|l| l.starts_with(PROPOSAL_FOOTER));
         assert_eq!(footers.count(), 1, "{body}");
+        // The drain reads the parent alone as a blocker, whatever became of
+        // the `blocks` relation. The run's own "Blocked by OWL-1" is in the
+        // body three times, flattened into lines that start `**Why:**`,
+        // `**Done when:**` and `- ``, where the text convention reads none.
+        assert_eq!(body.matches("Blocked by OWL-1").count(), 3, "{body}");
+        assert_eq!(text_blockers(&body), ["OWL-7"], "{body}");
+        // A follow-up that does not need the parent's code names no blocker.
+        description.followup.blocked_by_parent = false;
+        let body = description.render();
+        assert!(!body.contains("**Blocked by**"), "{body}");
+        assert!(text_blockers(&body).is_empty(), "{body}");
     }
 
     /// The INTAKE comment (OWL-248): the verdict, each dependency with its
