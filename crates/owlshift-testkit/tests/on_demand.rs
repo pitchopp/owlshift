@@ -8025,6 +8025,57 @@ fn a_slot_taken_since_the_snapshot_holds_the_dispatch() {
     );
 }
 
+/// The open pull request cap (OWL-251): with `max_open_prs = 1`, DEMO-1's
+/// delivered pull request is the one open; DEMO-2 is still taken in (intake
+/// goes on) but not built, the cap told once with the count, and no
+/// `waits` event for it.
+#[test]
+fn the_open_pr_cap_holds_the_next_build_and_is_told_once() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\npriority = \"high\"\n",
+        "max_open_prs = 1\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    let dir = bench.remote.checkout.join("tickets").join("DEMO-2");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("ticket.md"),
+        "+++\ntitle = \"Second\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n\
+         assignee = \"maintainer\"\nlabels = [\"agent\"]\n+++\n\nSomething else.\n",
+    )
+    .unwrap();
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let (outcomes, lines, _) = bench.drain(replies, 5, |_| {});
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}");
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Intake, Role::Intake, Role::Build], "{lines}");
+    let capped: Vec<Value> = bench
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("pr_cap")))
+        .map(|e| {
+            json!([
+                e.ticket.as_ref().map(|t| t.as_str().to_owned()),
+                e.data["open_prs"],
+                e.data["max_open_prs"]
+            ])
+        })
+        .collect();
+    assert_eq!(capped, [json!(["DEMO-2", 1, 1])], "{lines}");
+    assert_eq!(
+        lines.matches("reached their cap (1 of 1)").count(),
+        1,
+        "{lines}"
+    );
+    assert!(!lines.contains("DEMO-2 waits: the open"), "{lines}");
+}
+
 /// A first intake refused before any ticket ref is made is held as a
 /// continue is (OWL-250): the next pass does not run it again.
 #[test]

@@ -18,7 +18,15 @@
 //! event (`not_admitted`) and one line per ticket and account, and the ticket
 //! is tried again after [`RETRY_AFTER`]. An intake or a dispatch is held as
 //! a continue is, in watch's own [`Holds`](super::Holds), so a usage limit
-//! anywhere pauses both. The PR cap (OWL-251) is not counted yet.
+//! anywhere pauses both.
+//!
+//! The open pull request cap (OWL-251, part H): the pull requests counted
+//! are the ticket refs whose delivery is still followed, whatever their
+//! ticket's state, with no call to the forge. At `policy.max_open_prs` no
+//! ticket is dispatched, and intake goes on. Reaching the cap is one
+//! `decision` event (`drain` = `pr_cap`, with the count and the cap) and one
+//! line, not one per pass; the tickets it holds back are not told one by
+//! one.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -79,6 +87,9 @@ pub(super) struct Memory {
     unlisted: Option<String>,
     /// The ticket refs that could not be read, as last said.
     unread: Vec<TicketId>,
+    /// Whether the cap was told as reached and the count has not fallen
+    /// below it since.
+    capped: bool,
 }
 
 impl Memory {
@@ -227,6 +238,15 @@ fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
     }
 }
 
+/// Whether a ticket ref's delivery is a pull request still followed.
+fn delivery_followed(stored: &Stored) -> bool {
+    stored
+        .record
+        .delivery
+        .as_ref()
+        .is_some_and(|delivery| delivery.followed())
+}
+
 /// How an intake's outcome is reported, as a continue's: a record kept is
 /// the ticket back in the column, waiting for its dispatch.
 fn as_reported(ticket: &TicketId, outcome: Result<impl Sized, Stop>) -> Result<Delivered, Stop> {
@@ -339,20 +359,62 @@ impl Watch<'_> {
         let slot_taken = refs.values().any(|stored| {
             TicketState::try_from(&stored.record.state).map_or(true, |s| schedule::holds_slot(&s))
         });
-        // The PR cap is OWL-251's; one project, one run at a time.
+        // The pull requests still followed, from the refs read this pass
+        // (an unread ref stops every dispatch below). One project, one run
+        // at a time.
+        let cap = u32::from(on_demand.config.policy.max_open_prs());
+        let open_prs = u32::try_from(
+            refs.values()
+                .filter(|stored| delivery_followed(stored))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         let ready = schedule::ready_set(
             &tickets,
             Caps {
                 concurrent_runs: 1,
-                open_prs: None,
+                open_prs: Some(cap),
             },
             Load {
                 runs: 0,
-                open_prs: 0,
+                open_prs,
                 slot_taken,
             },
         );
+        // A pass with an unread ref counts short: it neither re-arms nor
+        // tells the cap.
+        if !unread.is_empty() {
+        } else if open_prs < cap {
+            memory.drain.capped = false;
+        } else if !memory.drain.capped
+            && let Some((held, _)) = ready.waiting.iter().find(|(_, wait)| *wait == Wait::PrCap)
+            && let Ok(held) = TicketId::new(held)
+        {
+            // Told when a ticket is first held by it, once for each time
+            // the count reaches the cap.
+            sink.emit(
+                &held,
+                None,
+                EventKind::Decision,
+                data([
+                    ("drain", json!("pr_cap")),
+                    ("open_prs", json!(open_prs)),
+                    ("max_open_prs", json!(cap)),
+                ]),
+            );
+            self.line(
+                out,
+                &format!(
+                    "the open pull requests reached their cap ({open_prs} of {cap}): no new Build \
+                     starts until one is merged or closed; intake goes on"
+                ),
+            );
+            memory.drain.capped = true;
+        }
         for (id, wait) in &ready.waiting {
+            if *wait == Wait::PrCap {
+                continue;
+            }
             let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
                 continue;
             };
