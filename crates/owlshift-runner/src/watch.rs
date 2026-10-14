@@ -62,6 +62,10 @@ use crate::reversal::{self, Current};
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::VisibleStage;
 
+mod drain;
+
+pub use drain::refusal as drain_refusal;
+
 /// How long watch sleeps after each pass.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -267,6 +271,8 @@ struct Memory {
     following: Following,
     /// What watch keeps of the stages it found left at working.
     stale: Stale,
+    /// What the drain keeps (OWL-250).
+    drain: drain::Memory,
 }
 
 /// What watch keeps, per ticket, of the stages a stop left at working
@@ -306,9 +312,36 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         sleep: &mut dyn FnMut(Duration) -> bool,
     ) {
+        self.run_passes(false, sink, out, continued, sleep);
+    }
+
+    /// `owlshift watch --drain` (OWL-250): [`Self::run`], each pass then
+    /// taking admitted tickets in from the ready column and dispatching one
+    /// at a time. The caller has checked [`drain_refusal`].
+    pub fn run_drain(
+        &self,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        continued: &mut Continued<'_>,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) {
+        self.run_passes(true, sink, out, continued, sleep);
+    }
+
+    fn run_passes(
+        &self,
+        draining: bool,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        continued: &mut Continued<'_>,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) {
         let mut memory = Memory::default();
         loop {
             self.pass(&mut memory, sink, out, continued);
+            if draining {
+                self.drain(&mut memory, sink, out, continued);
+            }
             if !sleep(self.interval) {
                 return;
             }
@@ -377,9 +410,16 @@ impl Watch<'_> {
         // A followed ticket keeps its repair's hold too: otherwise a repair
         // that left the ref as it was, or a round under it whose state was
         // not kept (OWL-211), would run again at the next pass.
-        memory
-            .holds
-            .retain(&[&ids[..], &followed[..], &unread[..]].concat());
+        // The drain's intakes and dispatches are held there too (OWL-250).
+        memory.holds.retain(
+            &[
+                &ids[..],
+                &followed[..],
+                &unread[..],
+                &memory.drain.listed[..],
+            ]
+            .concat(),
+        );
         memory
             .following
             .retain(&[&followed[..], &read[..], &unread[..]].concat());

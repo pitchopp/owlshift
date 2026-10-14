@@ -36,39 +36,71 @@ pub fn admission(
     ticket: &TicketId,
     now: Timestamp,
 ) -> Result<Gesture, String> {
+    read_admission(tracker, admit, admitters, ticket, now).map_err(|refusal| refusal.reason)
+}
+
+/// Why no gesture admits a ticket. `account` names who made the gesture the
+/// tracker read, the account's identifier or what the tracker calls a bot,
+/// when one was read and does not admit: the drain warns of it once per
+/// ticket and account (OWL-250). `None` when nothing was read: delegation,
+/// no `admitters`, or a read that failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Unadmitted {
+    pub account: Option<String>,
+    pub reason: String,
+}
+
+/// [`admission`], with the account of a gesture that does not admit.
+pub(crate) fn read_admission(
+    tracker: &dyn Tracker,
+    admit: &Admit,
+    admitters: Option<&[String]>,
+    ticket: &TicketId,
+    now: Timestamp,
+) -> Result<Gesture, Unadmitted> {
+    let unread = |reason: String| Unadmitted {
+        account: None,
+        reason,
+    };
     let (kind, name) = match admit {
         Admit::Label(label) => (GestureKind::Label, label),
         Admit::State(state) => (GestureKind::State, state),
         Admit::Delegation => {
-            return Err(
+            return Err(unread(
                 "the `delegation` admission gesture is not built: admit with a label or a state"
                     .to_owned(),
-            );
-        }
-    };
-    let Some(admitters) = admitters else {
-        return Err(
-            "`[tracker].admitters` in owlshift.toml lists no account, so no gesture admits"
-                .to_owned(),
-        );
-    };
-    let TrackerGesture { account, at } = tracker
-        .gesture(ticket, admit)
-        .map_err(|e| format!("reading the admission gesture of {ticket}: {e}"))?;
-    let account = match account {
-        TrackerAuthor::Account(person) => person.id,
-        TrackerAuthor::Other { name } => {
-            return Err(format!(
-                "the admission gesture on {ticket} was made by {name:?}, not a person's account: \
-                 only an account `[tracker].admitters` lists admits"
             ));
         }
     };
-    if !admitters.contains(&account) {
-        return Err(format!(
-            "the admission gesture on {ticket} was made by {account:?}, whom \
-             `[tracker].admitters` does not list"
+    let Some(admitters) = admitters else {
+        return Err(unread(
+            "`[tracker].admitters` in owlshift.toml lists no account, so no gesture admits"
+                .to_owned(),
         ));
+    };
+    let TrackerGesture { account, at } = tracker
+        .gesture(ticket, admit)
+        .map_err(|e| unread(format!("reading the admission gesture of {ticket}: {e}")))?;
+    let account = match account {
+        TrackerAuthor::Account(person) => person.id,
+        TrackerAuthor::Other { name } => {
+            return Err(Unadmitted {
+                reason: format!(
+                    "the admission gesture on {ticket} was made by {name:?}, not a person's \
+                     account: only an account `[tracker].admitters` lists admits"
+                ),
+                account: Some(name),
+            });
+        }
+    };
+    if !admitters.contains(&account) {
+        return Err(Unadmitted {
+            reason: format!(
+                "the admission gesture on {ticket} was made by {account:?}, whom \
+                 `[tracker].admitters` does not list"
+            ),
+            account: Some(account),
+        });
     }
     Ok(Gesture {
         kind,
@@ -118,6 +150,17 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<TicketIntake, Stop> {
         let mut p = self.prepare(ticket, Command::Intake)?;
+        self.intake_prepared(&mut p, gesture, sink)
+    }
+
+    /// [`Self::intake`] once the command holds the project.
+    pub(super) fn intake_prepared(
+        &self,
+        p: &mut Prepared,
+        gesture: Gesture,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketIntake, Stop> {
+        let ticket = &p.ticket.clone();
         let round = match &p.stored {
             None => 0,
             Some(stored) => {
@@ -142,7 +185,34 @@ impl OnDemand<'_> {
         };
         let state = TicketState::restore(Status::Active(Stage::Intake), round, 0, 0, 0, 0)
             .map_err(core_error)?;
-        self.run_intake(&mut p, state, gesture, sink)
+        self.run_intake(p, state, gesture, sink)
+    }
+
+    /// The gesture intake runs under, `admitters` being the base's: the kept
+    /// one while the intake record holds the ticket's current text and its
+    /// account is still listed, else the gesture read again, which must be a
+    /// listed account's (build plan, "P4 · The drain", part E). `continue` at
+    /// Intake and the drain (OWL-250) both take it.
+    pub(super) fn gesture_for(
+        &self,
+        p: &Prepared,
+        admitters: Option<&[String]>,
+    ) -> Result<Gesture, Unadmitted> {
+        let text = text_sha256(&p.found.title, &p.found.description);
+        let kept = p.intake.as_ref().filter(|record| {
+            record.text_sha256 == text
+                && admitters.is_some_and(|listed| listed.contains(&record.gesture.account))
+        });
+        match kept {
+            Some(record) => Ok(record.gesture.clone()),
+            None => read_admission(
+                self.tracker,
+                &self.config.tracker.admit,
+                admitters,
+                &p.ticket,
+                (self.clock)(),
+            ),
+        }
     }
 
     /// `continue` on a ticket at Intake: intake runs again, under the kept
@@ -155,31 +225,13 @@ impl OnDemand<'_> {
         state: TicketState,
         sink: &mut EventSink<'_>,
     ) -> Stop {
-        let text = text_sha256(&p.found.title, &p.found.description);
-        let kept = p
-            .intake
-            .as_ref()
-            .filter(|record| record.text_sha256 == text)
-            .map(|record| record.gesture.clone());
-        let gesture = match kept {
-            Some(gesture) => gesture,
-            None => {
-                let admitters =
-                    match project::admitters_at(&self.executor.git, &p.checkout, &p.base) {
-                        Ok(admitters) => admitters,
-                        Err(why) => return Stop::Refused(why),
-                    };
-                match admission(
-                    self.tracker,
-                    &self.config.tracker.admit,
-                    admitters.as_deref(),
-                    &p.ticket,
-                    (self.clock)(),
-                ) {
-                    Ok(gesture) => gesture,
-                    Err(why) => return Stop::Refused(why),
-                }
-            }
+        let admitters = match project::admitters_at(&self.executor.git, &p.checkout, &p.base) {
+            Ok(admitters) => admitters,
+            Err(why) => return Stop::Refused(why),
+        };
+        let gesture = match self.gesture_for(p, admitters.as_deref()) {
+            Ok(gesture) => gesture,
+            Err(refusal) => return Stop::Refused(refusal.reason),
         };
         match self.run_intake(p, state, gesture, sink) {
             Ok(_) => Stop::Ready {
