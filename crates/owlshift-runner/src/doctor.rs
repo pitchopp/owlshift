@@ -1187,8 +1187,10 @@ fn drain_admission_check(
 /// Whether a follow-up Owlshift proposes can be filed (OWL-155): the team's
 /// triage inbox, or the label fallback `agent:proposed` on its first backlog
 /// state, chosen as the adapter chooses (`propose`). A warning when neither
-/// works. None unless a Linear project's facts were read; a tracker error is
-/// the admission line's to report.
+/// works. For a Linear project, none unless its facts were read; a tracker
+/// error is the admission line's to report. A Markdown project files at the
+/// stage `Triage` (OWL-267), read from its file alone: a warning when that
+/// is its ready state, where `propose` refuses every filing.
 fn proposals_inbox_check(
     config: &Effective,
     facts: Option<&Result<AdmissionFacts, StatesError>>,
@@ -1197,6 +1199,27 @@ fn proposals_inbox_check(
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
     };
+    if config.tracker.kind == TrackerKind::Markdown {
+        let triage = MarkdownTracker::TRIAGE;
+        return Some(if config.tracker.states.ready == triage {
+            Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!("the ready state is {triage:?}, the stage proposals are filed at"),
+                format!(
+                    "{DOES_NOT_BLOCK} Owlshift cannot file the follow-ups it proposes, since a \
+                     proposal there would enter the queue without a person. Name another \
+                     state under `[tracker].states.ready`."
+                ),
+            )
+        } else {
+            Check::ok(
+                Section::Project,
+                SUBJECT,
+                format!("proposals are filed as tickets at the stage {triage:?}"),
+            )
+        });
+    }
     let team = config.tracker.team.as_deref()?;
     let Some(Ok(found)) = facts else {
         return None;
@@ -2625,7 +2648,24 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             warned.detail,
             "`admit = \"delegation\"` is not built; `admitters` is not set under `[tracker]`"
         );
-        assert!(report.checks.iter().all(|c| c.subject != "proposals inbox"));
+        let inbox = line(&report, "proposals inbox");
+        assert_eq!(inbox.status, Status::Ok);
+        assert_eq!(
+            inbox.detail,
+            "proposals are filed as tickets at the stage \"Triage\""
+        );
+        assert!(report.ready(), "{report}");
+
+        // OWL-267: a ready state named as the inbox refuses every filing.
+        let (_dir, triage) = project_tracked_by(
+            r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Triage", working = "Doing", needs_input = "Asked", review = "Review" }"#,
+        );
+        let report = run(&system, &triage);
+        let refused = line(&report, "proposals inbox");
+        assert_eq!(refused.status, Status::Warn);
+        assert!(refused.detail.contains("\"Triage\""), "{refused:?}");
         assert!(report.ready(), "{report}");
 
         let (_dir, labelled) = project_tracked_by(
