@@ -63,7 +63,12 @@ enum Command {
     /// and continue each one as `owlshift continue` would once its decider's
     /// reply counts; checked every minute, until Ctrl-C. A parked ticket, or
     /// one left at Build, still needs `owlshift continue`.
-    Watch,
+    Watch {
+        /// Also take admitted tickets in from the ready column, intake
+        /// first, and dispatch them to Build one at a time.
+        #[arg(long)]
+        drain: bool,
+    },
     /// Start over what Owlshift keeps on a ticket between commands, when it
     /// has no room left or cannot be read: its asks and decisions go, their
     /// comments staying on the ticket; its round count and the refusals its
@@ -155,7 +160,8 @@ fn main() -> ExitCode {
         Command::Continue { ticket } => {
             do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket))
         }
-        Command::Watch => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
+        Command::Watch { drain: false } => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
+        Command::Watch { drain: true } => do_cmd::run(&system, &config, do_cmd::Mode::Drain),
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
         Command::Logs {
             ticket,

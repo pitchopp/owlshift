@@ -12,8 +12,8 @@ use std::thread;
 use std::time::Duration;
 
 use owlshift_adapters::notifier::Notifier;
-use owlshift_adapters::tracker::Tracker;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
+use owlshift_adapters::tracker::{Capability, Tracker};
 use owlshift_contracts::Role;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::format::strip_role_front_matter;
@@ -30,7 +30,7 @@ use owlshift_runner::roles::{
     ANSWER_CHECK_ROLE, BUILD_ROLE, INTAKE_ROLE, REBASE_ROLE, RESOLVER_ROLE,
 };
 use owlshift_runner::system::System;
-use owlshift_runner::watch::{POLL_INTERVAL, Watch};
+use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
 use owlshift_runner::{forge, tracker};
 
 use crate::fail;
@@ -41,12 +41,14 @@ const HEAD_WAIT: Duration = Duration::from_secs(2);
 
 /// Which command runs: `owlshift do` from Ready, `owlshift continue` from
 /// where the ticket's ref left it, each on its ticket, or `owlshift watch`
-/// over the project's tickets whose questions wait.
+/// over the project's tickets whose questions wait, also draining the ready
+/// column with `--drain` (OWL-250).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode<'a> {
     Do(&'a str),
     Continue(&'a str),
     Watch,
+    Drain,
 }
 
 impl<'a> Mode<'a> {
@@ -55,6 +57,7 @@ impl<'a> Mode<'a> {
             Mode::Do(_) => "`owlshift do`",
             Mode::Continue(_) => "`owlshift continue`",
             Mode::Watch => "`owlshift watch`",
+            Mode::Drain => "`owlshift watch --drain`",
         }
     }
 
@@ -62,7 +65,7 @@ impl<'a> Mode<'a> {
     fn ticket(self) -> Option<&'a str> {
         match self {
             Mode::Do(ticket) | Mode::Continue(ticket) => Some(ticket),
-            Mode::Watch => None,
+            Mode::Watch | Mode::Drain => None,
         }
     }
 }
@@ -85,6 +88,11 @@ fn run_with(
         .transpose()
         .map_err(|error| error.to_string())?;
     let (project_file, project) = loaded_project(config, mode.command())?;
+    if mode == Mode::Drain
+        && let Some(refusal) = drain_refusal(project)
+    {
+        return Err(refusal);
+    }
     if let Some(ticket) = &ticket {
         on_demand::check_team(project, ticket)?;
     }
@@ -135,6 +143,11 @@ fn run_with(
         }
         TrackerKind::Markdown => Box::new(MarkdownTracker::new(root)),
     };
+    if mode == Mode::Drain && !tracker.capabilities().contains(&Capability::ListAdmitted) {
+        return Err(
+            "`owlshift watch --drain` needs a tracker that lists admitted tickets".to_owned(),
+        );
+    }
     let forge = forge::github(&keychain, repo.clone())?;
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
@@ -222,28 +235,38 @@ fn run_with(
         (Mode::Continue(_), Some(ticket)) => (ticket, on_demand.continue_ticket(ticket, &mut sink)),
         _ => {
             // OWL-152: until Ctrl-C ends the process; each continue's outcome
-            // is reported as `continue`'s.
+            // is reported as `continue`'s, and so is each intake and dispatch
+            // of the drain (OWL-250).
+            let draining = if mode == Mode::Drain {
+                format!(
+                    "; admitted tickets of {} are taken in, then built one at a time",
+                    project.tracker.states.ready
+                )
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 io::stdout(),
                 "Watching {repo}: each ticket whose questions wait is continued once its \
-                 decider's reply counts, checked every {} seconds. Ctrl-C stops.",
+                 decider's reply counts{draining}, checked every {} seconds. Ctrl-C stops.",
                 POLL_INTERVAL.as_secs()
             );
             let watch = Watch {
                 on_demand: &on_demand,
                 interval: POLL_INTERVAL,
             };
-            watch.run(
-                &mut sink,
-                &mut io::stdout(),
-                &mut |ticket, outcome, sink| {
-                    report(system, desktop, tracker.as_ref(), ticket, outcome, sink);
-                },
-                &mut |interval| {
-                    thread::sleep(interval);
-                    true
-                },
-            );
+            let mut continued = |ticket: &TicketId, outcome: &_, sink: &mut EventSink<'_>| {
+                report(system, desktop, tracker.as_ref(), ticket, outcome, sink);
+            };
+            let mut sleep = |interval| {
+                thread::sleep(interval);
+                true
+            };
+            if mode == Mode::Drain {
+                watch.run_drain(&mut sink, &mut io::stdout(), &mut continued, &mut sleep);
+            } else {
+                watch.run(&mut sink, &mut io::stdout(), &mut continued, &mut sleep);
+            }
             return Ok(ExitCode::SUCCESS);
         }
     };

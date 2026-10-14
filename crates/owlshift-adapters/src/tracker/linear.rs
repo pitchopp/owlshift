@@ -774,6 +774,14 @@ impl Tracker for LinearTracker {
         Ok(data.issue.state.name)
     }
 
+    /// The issue's workflow state type (OWL-250). An identifier Linear does
+    /// not know answers `Entity not found: Issue`, which is
+    /// [`ErrorKind::NotFound`] (checked live on 2026-10-14, OWL-264).
+    fn state_type(&self, id: &TicketId) -> Result<Option<StateType>, Error> {
+        let data: StateTypeData = self.call(STATE_TYPE_QUERY, json!({ "id": id.as_str() }))?;
+        state_type(&data.issue.state.kind).map(Some)
+    }
+
     /// The account's profile link (`User.url`), which Linear turns into a
     /// mention of them (checked 2026-10-04, OWL-157). Read each time, a few
     /// times a ticket: a person may rename their profile while `watch`
@@ -1707,6 +1715,9 @@ const URL_QUERY: &str = "query TicketUrl($id: String!) { issue(id: $id) { url } 
 
 const STAGE_QUERY: &str = "query TicketStage($id: String!) { issue(id: $id) { state { name } } }";
 
+const STATE_TYPE_QUERY: &str =
+    "query TicketStateType($id: String!) { issue(id: $id) { state { type } } }";
+
 impl LinearTracker {
     /// The link Linear gives an issue, as Linear gives it: whoever shows it
     /// checks it is fit to show.
@@ -1763,6 +1774,16 @@ struct IssueUrl {
 #[derive(Deserialize)]
 struct StageNameData {
     issue: IssueStageName,
+}
+
+#[derive(Deserialize)]
+struct StateTypeData {
+    issue: IssueStateType,
+}
+
+#[derive(Deserialize)]
+struct IssueStateType {
+    state: StateOfType,
 }
 
 #[derive(Deserialize)]
@@ -2976,6 +2997,27 @@ mod tests {
         let not_found = r#"{"errors":[{"message":"Entity not found: Issue",
             "extensions":{"code":"INPUT_ERROR"}}]}"#;
         assert_eq!(tracker(vec![not_found]).ticket_url(&id), None);
+    }
+
+    /// A blocker of the text convention (OWL-250): its state type, or a
+    /// definite not-found as on 2026-10-14 (OWL-264), told from another
+    /// failure.
+    #[test]
+    fn a_state_type_is_read_and_an_unknown_issue_is_not_found() {
+        let id = TicketId::new("OWL-264").unwrap();
+        let started = r#"{"data":{"issue":{"state":{"type":"started"}}}}"#;
+        let canceled = r#"{"data":{"issue":{"state":{"type":"canceled"}}}}"#;
+        let not_found = r#"{"data":null,"errors":[{"message":"Entity not found: Issue",
+            "extensions":{"code":"INPUT_ERROR","type":"invalid input"}}]}"#;
+        let refused = r#"{"errors":[{"message":"boom","extensions":{"code":"INTERNAL"}}]}"#;
+        let linear = tracker(vec![started, canceled, not_found, refused]);
+        assert_eq!(linear.state_type(&id), Ok(Some(StateType::Started)));
+        assert_eq!(linear.state_type(&id), Ok(Some(StateType::Canceled)));
+        assert_eq!(
+            linear.state_type(&id).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        assert_eq!(linear.state_type(&id).unwrap_err().kind, ErrorKind::Other);
     }
 
     /// The dependency check's read (OWL-249): the identifier Linear answers,

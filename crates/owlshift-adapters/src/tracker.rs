@@ -96,6 +96,21 @@ pub trait Tracker {
         ))
     }
 
+    /// The type of the state a ticket shows, for a blocker the text
+    /// convention names (OWL-250, architecture section 5, "Blockers"): the
+    /// drain reads each "Blocked by" identifier that is not among the
+    /// ticket's relations once a pass. `Ok(None)` when the tracker gives the
+    /// state no type (a Markdown stage other than `Done`). A ticket the
+    /// tracker does not know is an [`ErrorKind::NotFound`] error, which alone
+    /// makes the blocker unknown; any other error counts it open. An error
+    /// by default.
+    fn state_type(&self, _id: &TicketId) -> Result<Option<StateType>, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not read a ticket's state type",
+        ))
+    }
+
     /// Files a follow-up in the tracker's proposals inbox (OWL-252,
     /// architecture section 5, "Follow-ups"): the team's triage state, or
     /// without one its first backlog state with the [`PROPOSED_LABEL`]; in

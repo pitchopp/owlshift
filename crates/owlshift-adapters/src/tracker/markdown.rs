@@ -420,6 +420,14 @@ impl shared::Tracker for MarkdownTracker {
         Ok(listed)
     }
 
+    /// `Completed` at the stage `Done`, no type at any other; a ticket the
+    /// folder lacks is not found (OWL-250).
+    fn state_type(&self, id: &TicketId) -> Result<Option<shared::StateType>, shared::Error> {
+        self.require_ticket(id)?;
+        let stage = MarkdownTracker::ticket(self, id).map_err(other)?.stage;
+        Ok((stage == Self::DONE).then_some(shared::StateType::Completed))
+    }
+
     /// The ticket's `author`: its files keep no history, so whoever wrote
     /// the ticket made the gesture, label or state alike, as trusted as the
     /// tree it is read from. No time.
@@ -1085,6 +1093,25 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::NotFound);
         assert!(tracker.gesture(&id(), &Admit::Delegation).is_err());
+    }
+
+    /// A blocker of the text convention (OWL-250): `Done` is completed, any
+    /// other stage has no type, a missing folder is not found.
+    #[test]
+    fn a_state_type_is_completed_at_done_and_a_missing_ticket_not_found() {
+        use shared::{StateType, Tracker as _};
+        let (root, tracker, _) = repository(&ticket_md("a", "Todo", &[], &[]));
+        assert_eq!(tracker.state_type(&id()), Ok(None));
+        let done = root.path().join("tickets").join("DEMO-3");
+        fs::create_dir_all(&done).unwrap();
+        fs::write(done.join("ticket.md"), ticket_md("a", "Done", &[], &[])).unwrap();
+        let done = TicketId::new("DEMO-3").unwrap();
+        assert_eq!(tracker.state_type(&done), Ok(Some(StateType::Completed)));
+        let missing = TicketId::new("UTF-8").unwrap();
+        assert_eq!(
+            tracker.state_type(&missing).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
     }
 
     #[test]
