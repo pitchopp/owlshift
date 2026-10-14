@@ -423,9 +423,9 @@ impl Snapshot {
             return Ok(None);
         }
         let end = trimmed(&git.run(worktree, &["rev-parse", "--verify", "HEAD"])?);
-        let accepted = is_ancestor(git, worktree, &self.start, &end)?
+        let accepted = git.is_ancestor(worktree, &self.start, &end)?
             || match &self.onto {
-                Some(onto) => is_ancestor(git, worktree, onto, &end)?,
+                Some(onto) => git.is_ancestor(worktree, onto, &end)?,
                 None => false,
             };
         if !accepted {
@@ -436,19 +436,6 @@ impl Snapshot {
             });
         }
         Ok(Some(end))
-    }
-}
-
-/// Whether `end` is `ancestor` or descends from it.
-fn is_ancestor(git: &Git, dir: &Path, ancestor: &str, end: &str) -> Result<bool, SnapshotError> {
-    let ancestry = git.output(dir, &["merge-base", "--is-ancestor", ancestor, end], None)?;
-    match ancestry.code {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        code => Err(SnapshotError(format!(
-            "git merge-base failed with {}",
-            exit_text(code)
-        ))),
     }
 }
 

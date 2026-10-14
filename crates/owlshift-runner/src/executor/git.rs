@@ -193,6 +193,38 @@ impl Git {
         }
     }
 
+    /// Whether `end` is `ancestor` or descends from it, in the repository at
+    /// `dir`: `merge-base --is-ancestor`, whose exit 1 is a no and any other
+    /// failure an error.
+    pub(crate) fn is_ancestor(
+        &self,
+        dir: &Path,
+        ancestor: &str,
+        end: &str,
+    ) -> Result<bool, GitError> {
+        let args = [
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            ancestor,
+            end,
+        ];
+        let ancestry = self.output(dir, &args, None)?;
+        match ancestry.code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => Err(GitError::new(
+                dir,
+                &args,
+                format!(
+                    "failed with {}: {}",
+                    exit_text(code),
+                    tail(&String::from_utf8_lossy(&ancestry.stderr))
+                ),
+            )),
+        }
+    }
+
     /// [`Git::run`] with its own deadline.
     pub(crate) fn run_within<S: AsRef<OsStr>>(
         &self,

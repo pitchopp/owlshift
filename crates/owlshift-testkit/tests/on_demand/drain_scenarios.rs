@@ -3,7 +3,9 @@
 //! watch --drain` (`Watch::run_drain`) on the bench of `on_demand.rs`: the
 //! Markdown tracker, the fake harness and the fake GitHub. Each test plays
 //! the bullets of its scenario that P4 builds; part K says which wait for a
-//! later step.
+//! later step. Beside S4, the guards of its branch start (OWL-274): a kept
+//! branch with commits of its own, and a fast-forward that would overwrite
+//! a file.
 
 use owlshift_adapters::tracker::markdown;
 use owlshift_runner::notify;
@@ -262,15 +264,114 @@ fn scenario_s4_unblocked_by_a_merge() {
 
 /// Scenario S4's "Its branch starts from the updated default branch", on
 /// [`drain_a_chain`]: DEMO-2's branch holds DEMO-1's merge, DEMO-3's holds
-/// DEMO-2's. It fails on `main` as of OWL-254: the first intake makes the
-/// ticket's worktree and branch at the base of its time, and the Build
-/// dispatched after the merge works on that branch.
+/// DEMO-2's. The first intake made each ticket's worktree and branch at the
+/// base of its time; the dispatch after the merge fast-forwards the branch
+/// to the base it fetched (OWL-274).
 #[test]
-#[ignore = "OWL-274: a drained Build's branch starts where its intake made it, before the merge"]
 fn scenario_s4_the_blocked_branch_starts_from_the_merge() {
     let (bench, _, mains, _) = drain_a_chain();
     assert!(is_ancestor(&bench, &mains[0], &bench.tip_of("DEMO-2")));
     assert!(is_ancestor(&bench, &mains[1], &bench.tip_of("DEMO-3")));
+}
+
+impl Bench {
+    /// The head of DEMO-1's branch in the dedicated checkout.
+    fn kept_head(&self) -> String {
+        let out = self
+            .env
+            .run(&self.dirs().checkout(), &["rev-parse", "--verify", BRANCH])
+            .unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
+    }
+}
+
+/// A kept branch with commits of its own is dispatched as it is, never
+/// moved to a newer base (OWL-274): a person's commit on it, after a `do`
+/// that stopped, is in the delivery, and the merge made since is not.
+#[test]
+fn a_kept_branch_with_commits_of_its_own_is_dispatched_as_it_is() {
+    let bench = Bench::new(true);
+    let blocked = r#"{"format":8,"status":"blocked","summary":"Waiting."}"#;
+    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], None);
+    assert!(
+        matches!(outcome, Err(Stop::Parked { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    bench
+        .env
+        .run(
+            &bench.worktree(),
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "A person's commit",
+            ],
+        )
+        .unwrap();
+    let own = bench.kept_head();
+    let merged = bench.merge_into_main(&[("MERGED.md", "merged\n")]);
+
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let tip = bench.remote_branch().expect("the branch was pushed");
+    assert!(is_ancestor(&bench, &own, &tip));
+    assert!(!is_ancestor(&bench, &merged, &tip));
+}
+
+/// A drained dispatch whose fast-forward would overwrite a file the worktree
+/// holds is refused with nothing moved, and the ticket is held as after any
+/// refusal (OWL-274): the next pass leaves it, and once a person removed the
+/// file and the hold passed, its Build starts from the merge.
+#[test]
+fn a_start_that_would_overwrite_a_local_change_holds_the_drained_ticket() {
+    let bench = Bench::draining("maintainer");
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let obstacle = bench.worktree().join("NEW.md");
+    let merged = RefCell::new(String::new());
+    let before = RefCell::new((String::new(), String::new()));
+    let (outcomes, lines, printed) = bench.drain(replies, 4, |pass| match pass {
+        // Intake made the worktree; a file sits where the merge adds one.
+        1 => {
+            fs::write(&obstacle, "mine\n").unwrap();
+            *merged.borrow_mut() = bench.merge_into_main(&[("NEW.md", "merged\n")]);
+            *before.borrow_mut() = (bench.kept_head(), bench.ref_commit());
+        }
+        // The dispatch was refused, nothing moved.
+        2 => {
+            assert_eq!(*before.borrow(), (bench.kept_head(), bench.ref_commit()));
+            assert_eq!(fs::read_to_string(&obstacle).unwrap(), "mine\n");
+        }
+        3 => {
+            fs::remove_file(&obstacle).unwrap();
+            let later = bench.clock.get().checked_add(SignedDuration::from_mins(11));
+            bench.clock.set(later.unwrap());
+        }
+        _ => {}
+    });
+    let refused: Vec<&String> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            Err(Stop::Refused(reason)) => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused.len(), 1, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(refused[0].contains("NEW.md"), "{}", refused[0]);
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, TICKET.to_owned()),
+            (Role::Build, TICKET.to_owned())
+        ]
+    );
+    assert_eq!(dispatched(&bench.events()), [TICKET]);
+    let tip = bench.remote_branch().expect("the branch was pushed");
+    assert!(is_ancestor(&bench, &merged.borrow(), &tip));
 }
 
 /// An intake result of `status`, asking `questions` when not empty, whose

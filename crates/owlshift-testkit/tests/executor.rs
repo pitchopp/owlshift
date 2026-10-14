@@ -210,11 +210,16 @@ fn a_worktree_on_another_branch_refuses_the_run() {
             ],
         )
         .unwrap();
+    // The dispatch's start of the branch refuses it as the run does
+    // (OWL-274).
+    let started = bench.start("origin/main");
     let error = bench.run();
-    assert!(
-        matches!(&error, ExecutorError::Worktree(reason) if reason.contains("refs/heads/other")),
-        "{error:?}"
-    );
+    for error in [&started.expect_err("refused"), &error] {
+        assert!(
+            matches!(error, ExecutorError::Worktree(reason) if reason.contains("refs/heads/other")),
+            "{error:?}"
+        );
+    }
 }
 
 impl Bench {
@@ -578,4 +583,134 @@ fn the_runners_git_runs_no_hook_and_no_monitor() {
         .unwrap();
     assert!(checkout_hook.exists(), "the control's hook never ran");
     assert!(monitor.exists(), "the control's monitor never ran");
+}
+
+impl Bench {
+    /// A commit on the main checkout's `main` writing `files`: the base a
+    /// later dispatch fetched. Returns its full id.
+    fn new_base(&self, files: &[(&str, &str)]) -> String {
+        for (path, text) in files {
+            let path = self.main.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let mut add = vec!["add", "--force", "--"];
+        add.extend(files.iter().map(|(path, _)| *path));
+        self.env.run(&self.main, &add).unwrap();
+        self.env
+            .run(&self.main, &["commit", "--quiet", "-m", "A merge"])
+            .unwrap();
+        self.commit("HEAD")
+    }
+
+    /// The ticket's worktree and branch made at `origin/main` by an earlier
+    /// run, such as its intake; returns the branch's head.
+    fn kept(&self) -> String {
+        let error = self.run();
+        assert!(matches!(error, ExecutorError::Command(_)), "{error:?}");
+        self.head_of(&self.worktree)
+    }
+
+    /// The dispatch's start of the ticket's branch from `base`.
+    fn start(&self, base: &str) -> Result<(), ExecutorError> {
+        self.executor
+            .start_from_base(&self.main, &self.worktree, BRANCH, base)
+    }
+
+    fn branch_head(&self) -> String {
+        self.commit(&format!("refs/heads/{BRANCH}"))
+    }
+
+    fn read(&self, path: &str) -> String {
+        fs::read_to_string(self.worktree.join(path)).unwrap()
+    }
+}
+
+/// A kept branch with no commits of its own moves to the base fetched at
+/// the dispatch, its worktree's files with it (OWL-274): an edit the base
+/// does not touch, an untracked file and the ignored plan under the run
+/// folder stay as they were. Started again, nothing moves.
+#[test]
+fn a_kept_branch_with_no_commits_of_its_own_moves_to_the_base() {
+    let bench = Bench::new();
+    bench.kept();
+    fs::write(bench.worktree.join("README.md"), "mine\n").unwrap();
+    fs::write(bench.worktree.join("mine.txt"), "untracked\n").unwrap();
+    fs::write(bench.worktree.join(".owlshift/run/plan.md"), "1. Greet.\n").unwrap();
+    let base = bench.new_base(&[("MERGED.md", "merged\n")]);
+
+    for _ in 0..2 {
+        bench.start(&base).unwrap();
+        assert_eq!(bench.branch_head(), base);
+        assert_eq!(bench.head_of(&bench.worktree), base);
+        assert_eq!(bench.read("MERGED.md"), "merged\n");
+        assert_eq!(bench.read("README.md"), "mine\n");
+        assert_eq!(bench.read("mine.txt"), "untracked\n");
+        assert_eq!(bench.read(".owlshift/run/plan.md"), "1. Greet.\n");
+    }
+}
+
+/// A kept branch with commits of its own is kept as it is: on an older base
+/// than the dispatch's, and ahead of it (OWL-274).
+#[test]
+fn a_kept_branch_with_commits_of_its_own_is_kept() {
+    let bench = Bench::new();
+    let older = bench.kept();
+    bench
+        .env
+        .run(
+            &bench.worktree,
+            &["commit", "--quiet", "--allow-empty", "-m", "Mine"],
+        )
+        .unwrap();
+    let own = bench.head_of(&bench.worktree);
+    let base = bench.new_base(&[("MERGED.md", "merged\n")]);
+    for base in [base.as_str(), older.as_str()] {
+        bench.start(base).unwrap();
+        assert_eq!(bench.branch_head(), own, "{base}");
+        assert_eq!(bench.head_of(&bench.worktree), own, "{base}");
+    }
+}
+
+/// A fast-forward that would overwrite a local change moves nothing and
+/// names the file (OWL-274): a tracked edit, an untracked file and an
+/// ignored one under the run folder, each where the base writes.
+#[test]
+fn a_start_that_would_overwrite_a_local_change_moves_nothing() {
+    for path in ["README.md", "MERGED.md", ".owlshift/run/plan.md"] {
+        let bench = Bench::new();
+        let head = bench.kept();
+        fs::write(bench.worktree.join(path), "mine\n").unwrap();
+        let base = bench.new_base(&[(path, "merged\n")]);
+        let error = bench.start(&base).expect_err(path);
+        assert!(
+            matches!(&error, ExecutorError::Worktree(reason) if reason.contains(path)),
+            "{path}: {error:?}"
+        );
+        assert_eq!(bench.branch_head(), head, "{path}");
+        assert_eq!(bench.head_of(&bench.worktree), head, "{path}");
+        assert_eq!(bench.read(path), "mine\n", "{path}");
+    }
+}
+
+/// Without a worktree, a missing branch is left for the run to create, and
+/// a kept one moves to the base alone (OWL-274).
+#[test]
+fn a_branch_without_a_worktree_moves_and_a_missing_one_is_left() {
+    let bench = Bench::new();
+    let base = bench.new_base(&[("MERGED.md", "merged\n")]);
+    let branch = format!("refs/heads/{BRANCH}");
+    bench.start(&base).unwrap();
+    let missing = bench
+        .env
+        .run(&bench.main, &["show-ref", "--verify", "--quiet", &branch]);
+    assert!(missing.is_err());
+
+    bench
+        .env
+        .run(&bench.main, &["branch", BRANCH, "origin/main"])
+        .unwrap();
+    bench.start(&base).unwrap();
+    assert_eq!(bench.branch_head(), base);
+    assert!(!bench.worktree.exists());
 }
