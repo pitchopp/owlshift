@@ -96,6 +96,14 @@
 //!   `botActor` and no `actor`. One page of 50 entries costs about 411
 //!   points.
 //!
+//! Checked live on 2026-10-14 (OWL-263), read-only, for a state gesture: the
+//! moves the runner made through the app (OWL-256, OWL-257, OWL-258: Todo to
+//! In Progress, In Progress to Needs Input, Needs Input to In Review) have an
+//! `actor` with `app` true, no `botActor`, and both `fromState` and
+//! `toState`. OWL-249, created in Todo, has no move of state. No move to Todo
+//! by the app was found among the 50 most recently updated issues, so
+//! skipping one is tested on made-up histories only.
+//!
 //! Checked live on 2026-10-13 (OWL-252; build plan, "P4 · The drain",
 //! check (e)) for proposals, through the app for the writes:
 //!
@@ -629,27 +637,24 @@ impl Tracker for LinearTracker {
     }
 
     /// The history read newest first, page by page, up to the first page
-    /// holding an entry that made the gesture. The latest such entry is the
-    /// gesture: its actor by the rule of comments (`author`), so an app
-    /// user or a bot never admits. Two latest entries of one time by
-    /// different authors are nobody's. No entry: the creator, by the same
-    /// rule, since Linear records no entry for a label set at creation, and
-    /// an issue created through a person's API key is theirs (architecture
-    /// section 5, "By whom").
+    /// holding an entry that decides the gesture; two deciding entries of one
+    /// time split by a page boundary are not both read, an accepted residual.
     ///
-    /// A state gesture reads the latest move to the state, which the runner
-    /// itself makes when an intake round resumes ("Back to the ready
-    /// column"): read after that, the gesture is the app's and admits
-    /// nobody, which "Recorded once" keeps from happening before the intake
-    /// record is dropped.
+    /// A label gesture is the latest entry that added the label: its actor
+    /// by the rule of comments (`author`), so an app user or a bot never
+    /// admits. Two latest entries of one time by different authors are
+    /// nobody's. No entry: the creator, by the same rule, since Linear
+    /// records no entry for a label set at creation, and an issue created
+    /// through a person's API key is theirs (architecture section 5, "By
+    /// whom"). A state gesture is read by `state_gesture`.
     fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<Gesture, Error> {
-        let made = |entry: &HistoryEntry| match admit {
+        let decides = |entry: &HistoryEntry| match admit {
             Admit::Label(label) => entry
                 .added_labels
                 .iter()
                 .flatten()
                 .any(|added| &added.name == label),
-            Admit::State(state) => entry.to_state.as_ref().is_some_and(|s| &s.name == state),
+            Admit::State(_) => entry.to_state.is_some() && !entry.by_app(),
             Admit::Delegation => false,
         };
         if *admit == Admit::Delegation {
@@ -670,31 +675,25 @@ impl Tracker for LinearTracker {
                 ));
                 issue.history
             },
-            |page| page.iter().any(made),
+            |page| page.iter().any(decides),
         )?;
-        let mut made: Vec<HistoryEntry> = entries.into_iter().filter(made).collect();
-        if let Some(at) = made.iter().map(|entry| entry.created_at).max() {
-            made.retain(|entry| entry.created_at == at);
-            let mut authors = made
-                .into_iter()
-                .map(|entry| author(entry.actor.map(Actor::into_user), entry.bot_actor, None));
-            let first = authors.next().unwrap_or_else(Author::unknown);
-            let account = if authors.all(|other| other == first) {
-                first
-            } else {
-                Author::unknown()
-            };
-            return Ok(Gesture {
-                account,
-                at: Some(at),
-            });
-        }
         let Some((created_at, creator, bot, external)) = creation else {
             return Err(invalid(format!("Linear answered no history for {id}")));
         };
-        Ok(Gesture {
+        let creator = Gesture {
             account: author(creator.map(Actor::into_user), bot, external),
             at: Some(created_at),
+        };
+        if let Admit::State(ready) = admit {
+            return Ok(state_gesture(entries, ready, creator));
+        }
+        let made = entries.into_iter().filter(decides).collect();
+        Ok(match latest(made) {
+            Some((at, latest)) => Gesture {
+                account: one_author(latest),
+                at: Some(at),
+            },
+            None => creator,
         })
     }
 
@@ -1028,7 +1027,7 @@ const GESTURE_QUERY: &str = concat!(
     " botActor { name } externalUserCreator { name } \
      history(first: $first, after: $after) { nodes { createdAt actor ",
     actor_fields!(),
-    " botActor { name } addedLabels { name } toState { name } } \
+    " botActor { name } addedLabels { name } fromState { name } toState { name } } \
      pageInfo { hasNextPage endCursor } } } }"
 );
 
@@ -1327,7 +1326,81 @@ struct HistoryEntry {
     bot_actor: Option<Named>,
     /// Null when the entry added none.
     added_labels: Option<Vec<Label>>,
+    /// Read only for the oldest move, to tell whether the issue was created
+    /// in the ready state ([`state_gesture`]).
+    from_state: Option<StateName>,
     to_state: Option<StateName>,
+}
+
+impl HistoryEntry {
+    /// Made by an app user, as the runner's own moves are through the app.
+    fn by_app(&self) -> bool {
+        self.actor.as_ref().is_some_and(|actor| actor.app)
+    }
+
+    fn moved_to(&self, state: &str) -> bool {
+        self.to_state.as_ref().is_some_and(|s| s.name == state)
+    }
+}
+
+/// The entries of the latest time among `entries`, with that time.
+fn latest(mut entries: Vec<HistoryEntry>) -> Option<(Timestamp, Vec<HistoryEntry>)> {
+    let at = entries.iter().map(|entry| entry.created_at).max()?;
+    entries.retain(|entry| entry.created_at == at);
+    Some((at, entries))
+}
+
+/// The one author of `entries`, by the rule of comments (`author`), or
+/// nobody when they differ.
+fn one_author(entries: Vec<HistoryEntry>) -> Author {
+    let mut authors = entries
+        .into_iter()
+        .map(|entry| author(entry.actor.map(Actor::into_user), entry.bot_actor, None));
+    let first = authors.next().unwrap_or_else(Author::unknown);
+    if authors.all(|other| other == first) {
+        first
+    } else {
+        Author::unknown()
+    }
+}
+
+/// A state gesture (architecture section 5, "By whom"), from the history
+/// read and the creator's gesture. The moves of state an app user made are
+/// skipped: the runner moves a ticket back to `ready` through the app ("Back
+/// to the ready column"), and an app never admits. The latest move left
+/// decides: to `ready`, its author is the gesture; anywhere else, the
+/// ticket was taken out of the column, and the gesture is nobody's. No move
+/// left: the creator when the issue was created in `ready`, which the oldest
+/// move's `fromState` tells, or no move at all; otherwise nobody's.
+fn state_gesture(entries: Vec<HistoryEntry>, ready: &str, creator: Gesture) -> Gesture {
+    let (moves, by_apps): (Vec<HistoryEntry>, Vec<HistoryEntry>) = entries
+        .into_iter()
+        .filter(|entry| entry.to_state.is_some())
+        .partition(|entry| !entry.by_app());
+    if let Some((at, latest)) = latest(moves) {
+        let account = if latest.iter().all(|entry| entry.moved_to(ready)) {
+            one_author(latest)
+        } else {
+            Author::unknown()
+        };
+        return Gesture {
+            account,
+            at: Some(at),
+        };
+    }
+    let oldest = by_apps.iter().map(|entry| entry.created_at).min();
+    let created_ready = by_apps
+        .iter()
+        .filter(|entry| Some(entry.created_at) == oldest)
+        .all(|entry| entry.from_state.as_ref().is_some_and(|s| s.name == ready));
+    if created_ready {
+        creator
+    } else {
+        Gesture {
+            account: Author::unknown(),
+            ..creator
+        }
+    }
 }
 
 /// An account whose gesture may admit. Unlike [`User`], `app` has no
@@ -2624,6 +2697,117 @@ mod tests {
                 .is_err()
         );
         assert!(tracker(vec![]).gesture(&id, &Admit::Delegation).is_err());
+    }
+
+    fn moved(at: &str, actor: Value, from: Option<&str>, to: &str) -> Value {
+        json!({ "createdAt": at, "actor": actor, "botActor": null, "addedLabels": null,
+            "fromState": from.map(|name| json!({ "name": name })), "toState": { "name": to } })
+    }
+
+    /// A state gesture (OWL-263): the app's moves are skipped, so a
+    /// person's move to ready outlives the runner's move back; the latest
+    /// other move decides, and a move out of the column by a person or a
+    /// bot is nobody's gesture; with only the app's moves, the creator when
+    /// the issue was created in ready. Read newest first, as Linear lists.
+    #[test]
+    fn the_state_gesture_skips_the_apps_moves() {
+        let at = |t: &str| format!("2026-10-0{t}T00:00:00Z");
+        let app = || actor("app", true);
+        let person = |id: &str| actor(id, false);
+        let gitbot = json!({ "createdAt": at("5"), "actor": null,
+            "botActor": { "name": "GitHub" }, "addedLabels": null,
+            "fromState": { "name": "Todo" }, "toState": { "name": "In Review" } });
+        let round = |from: &str| {
+            vec![
+                moved(&at("7"), app(), Some("Needs Input"), "Todo"),
+                moved(&at("6"), app(), Some(from), "Needs Input"),
+            ]
+        };
+        let cases: Vec<(&str, Vec<Value>, Author)> = vec![
+            (
+                "a person's move outlives the round",
+                [
+                    round("Todo"),
+                    vec![moved(&at("4"), person("p"), Some("Backlog"), "Todo")],
+                ]
+                .concat(),
+                Author::Account(Person {
+                    id: "p".to_owned(),
+                    name: "p".to_owned(),
+                }),
+            ),
+            (
+                "a person took it out of the column",
+                [
+                    round("Backlog"),
+                    vec![
+                        moved(&at("5"), person("q"), Some("Todo"), "Backlog"),
+                        moved(&at("4"), person("p"), Some("Backlog"), "Todo"),
+                    ],
+                ]
+                .concat(),
+                Author::unknown(),
+            ),
+            (
+                "a bot took it out of the column",
+                [
+                    round("In Review"),
+                    vec![
+                        gitbot,
+                        moved(&at("4"), person("p"), Some("Backlog"), "Todo"),
+                    ],
+                ]
+                .concat(),
+                Author::unknown(),
+            ),
+            (
+                "two moves of one time, one out of the column",
+                vec![
+                    moved(&at("4"), person("p"), Some("Backlog"), "Todo"),
+                    moved(&at("4"), person("p"), Some("Todo"), "Backlog"),
+                ],
+                Author::unknown(),
+            ),
+            (
+                "only the app's moves, created in ready",
+                round("Todo"),
+                Author::Account(Person {
+                    id: "u0".to_owned(),
+                    name: "u0".to_owned(),
+                }),
+            ),
+            (
+                "only the app's moves, created elsewhere",
+                round("Backlog"),
+                Author::unknown(),
+            ),
+            (
+                "only the app's moves, the first not saying where from",
+                vec![moved(&at("6"), app(), None, "Todo")],
+                Author::unknown(),
+            ),
+        ];
+        let id = TicketId::new("OWL-1").unwrap();
+        let todo = Admit::State("Todo".to_owned());
+        for (case, entries, expected) in cases {
+            let gesture = tracker(vec![gesture_page(person("u0"), entries, None)])
+                .gesture(&id, &todo)
+                .unwrap();
+            assert_eq!(gesture.account, expected, "{case}");
+        }
+
+        // The page of the app's moves does not decide: the next is read, and
+        // the one after it is not.
+        let pages = vec![
+            gesture_page(person("u0"), round("Todo"), Some("c1")),
+            gesture_page(
+                person("u0"),
+                vec![moved(&at("4"), person("p"), Some("Backlog"), "Todo")],
+                Some("c2"),
+            ),
+        ];
+        let gesture = tracker(pages).with_page(2).gesture(&id, &todo).unwrap();
+        assert_eq!(gesture.at, Some(at("4").parse().unwrap()));
     }
 
     fn admitted_page(relations: Vec<Value>, more: bool) -> &'static str {

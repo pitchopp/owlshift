@@ -1,9 +1,9 @@
 {
-  "recorded": "2026-10-13 on the Owlshift workspace, recorded live",
+  "recorded": "2026-10-14 on the Owlshift workspace, recorded live",
   "exchanges": [
     {
       "request": {
-        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } fromState { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -31,6 +31,9 @@
                     "name": "GitHub"
                   },
                   "createdAt": "2026-10-02T16:44:52.691Z",
+                  "fromState": {
+                    "name": "In Review"
+                  },
                   "toState": {
                     "name": "Done"
                   }
@@ -42,6 +45,7 @@
                     "name": "GitHub"
                   },
                   "createdAt": "2026-10-02T14:28:43.653Z",
+                  "fromState": null,
                   "toState": null
                 },
                 {
@@ -51,6 +55,9 @@
                     "name": "GitHub"
                   },
                   "createdAt": "2026-10-02T14:28:43.591Z",
+                  "fromState": {
+                    "name": "In Progress"
+                  },
                   "toState": {
                     "name": "In Review"
                   }
@@ -62,6 +69,7 @@
                     "name": "Linear"
                   },
                   "createdAt": "2026-10-02T14:28:43.521Z",
+                  "fromState": null,
                   "toState": null
                 },
                 {
@@ -77,6 +85,7 @@
                   ],
                   "botActor": null,
                   "createdAt": "2026-10-02T14:21:59.058Z",
+                  "fromState": null,
                   "toState": null
                 },
                 {
@@ -88,6 +97,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-02T14:20:01.079Z",
+                  "fromState": {
+                    "name": "Todo"
+                  },
                   "toState": {
                     "name": "In Progress"
                   }
@@ -104,7 +116,7 @@
     },
     {
       "request": {
-        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } fromState { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -134,6 +146,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T09:14:14.764Z",
+                  "fromState": {
+                    "name": "In Review"
+                  },
                   "toState": {
                     "name": "Canceled"
                   }
@@ -145,6 +160,7 @@
                     "name": "Linear"
                   },
                   "createdAt": "2026-10-07T09:11:22.781Z",
+                  "fromState": null,
                   "toState": null
                 },
                 {
@@ -156,6 +172,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T09:11:20.163Z",
+                  "fromState": {
+                    "name": "In Progress"
+                  },
                   "toState": {
                     "name": "In Review"
                   }
@@ -169,6 +188,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T09:04:17.460Z",
+                  "fromState": {
+                    "name": "Needs Input"
+                  },
                   "toState": {
                     "name": "In Progress"
                   }
@@ -182,6 +204,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T08:48:11.228Z",
+                  "fromState": {
+                    "name": "In Progress"
+                  },
                   "toState": {
                     "name": "Needs Input"
                   }
@@ -198,7 +223,7 @@
     },
     {
       "request": {
-        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } fromState { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -228,6 +253,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T09:14:14.764Z",
+                  "fromState": {
+                    "name": "In Review"
+                  },
                   "toState": {
                     "name": "Canceled"
                   }
@@ -239,6 +267,7 @@
                     "name": "Linear"
                   },
                   "createdAt": "2026-10-07T09:11:22.781Z",
+                  "fromState": null,
                   "toState": null
                 },
                 {
@@ -250,6 +279,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T09:11:20.163Z",
+                  "fromState": {
+                    "name": "In Progress"
+                  },
                   "toState": {
                     "name": "In Review"
                   }
@@ -263,6 +295,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T09:04:17.460Z",
+                  "fromState": {
+                    "name": "Needs Input"
+                  },
                   "toState": {
                     "name": "In Progress"
                   }
@@ -276,6 +311,9 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-07T08:48:11.228Z",
+                  "fromState": {
+                    "name": "In Progress"
+                  },
                   "toState": {
                     "name": "Needs Input"
                   }
@@ -292,7 +330,7 @@
     },
     {
       "request": {
-        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Gesture($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt creator { id displayName app } botActor { name } externalUserCreator { name } history(first: $first, after: $after) { nodes { createdAt actor { id displayName app } botActor { name } addedLabels { name } fromState { name } toState { name } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -314,6 +352,16 @@
             "history": {
               "nodes": [
                 {
+                  "actor": null,
+                  "addedLabels": null,
+                  "botActor": {
+                    "name": "Linear"
+                  },
+                  "createdAt": "2026-10-13T23:13:37.155Z",
+                  "fromState": null,
+                  "toState": null
+                },
+                {
                   "actor": {
                     "app": false,
                     "displayName": "person-1",
@@ -322,6 +370,7 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-13T09:34:01.169Z",
+                  "fromState": null,
                   "toState": null
                 },
                 {
@@ -333,6 +382,7 @@
                   "addedLabels": null,
                   "botActor": null,
                   "createdAt": "2026-10-13T09:33:46.437Z",
+                  "fromState": null,
                   "toState": null
                 }
               ],
