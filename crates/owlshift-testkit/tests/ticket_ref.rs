@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use owlshift_adapters::forge::Repo as ForgeRepo;
-use owlshift_contracts::drain::TicketIntake;
+use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{PersistedState, TicketDelivery, TicketQuestions};
@@ -17,7 +17,7 @@ use owlshift_runner::executor::Git;
 use owlshift_runner::forget;
 use owlshift_runner::on_demand::Stop;
 use owlshift_runner::project::ProjectDirs;
-use owlshift_runner::ticket_ref::{self, Forgot, Previous, TicketRecord};
+use owlshift_runner::ticket_ref::{self, Forgot, Previous, ProposalsFile, TicketRecord};
 use owlshift_testkit::git::GitEnv;
 use serde_json::json;
 
@@ -617,4 +617,67 @@ fn a_broken_ticket_ref_is_refused() {
     repo.git(&["update-ref", REF, &state]);
     let error = repo.read().unwrap_err();
     assert!(error.contains("points to a blob, not a commit"), "{error}");
+}
+
+fn proposals() -> TicketProposals {
+    TicketProposals::parse(include_str!(
+        "../../owlshift-contracts/tests/fixtures/ticket-proposals.json"
+    ))
+    .unwrap()
+}
+
+/// OWL-253: the proposals are written when named, kept by every write that
+/// does not name them and by `forget`, which drops only one that no longer
+/// parses, so nothing is filed twice.
+#[test]
+fn the_proposals_outlive_every_write_and_forget() {
+    let repo = Repo::new();
+    let waiting = record(WAITING, 1);
+    let one = ticket_ref::write_proposals(
+        &repo.git,
+        &repo.root,
+        &ticket(),
+        &waiting,
+        ProposalsFile::Write(&proposals()),
+        None,
+    )
+    .unwrap();
+    let stored = repo.read().unwrap().unwrap();
+    assert_eq!(
+        (&stored.record, stored.proposals.as_ref()),
+        (&waiting, Some(&proposals()))
+    );
+    let two = ticket_ref::write(&repo.git, &repo.root, &ticket(), &waiting, Some(&one)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().proposals, Some(proposals()));
+    let Some(Forgot::Rewritten { commit, .. }) =
+        ticket_ref::forget(&repo.git, &repo.root, &ticket()).unwrap()
+    else {
+        panic!("not forgotten");
+    };
+    assert_ne!(commit, two);
+    assert_eq!(repo.read().unwrap().unwrap().proposals, Some(proposals()));
+
+    // A record broken elsewhere: forget keeps the proposals that parse.
+    let state = repo.blob(r#"{"format":2,"stage":"build","round":3,"reasks":0,"failed_runs":0}"#);
+    let kept = repo.blob(&proposals().render());
+    let broken = repo.blob("{");
+    repo.plant(&[
+        ("100644", &state, "state.json"),
+        ("100644", &broken, "questions.json"),
+        ("100644", &kept, "proposals.json"),
+    ]);
+    ticket_ref::forget(&repo.git, &repo.root, &ticket()).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().proposals, Some(proposals()));
+
+    // One that no longer parses makes the ref unreadable, and goes.
+    let questions = repo.blob(&TicketQuestions::new().render());
+    repo.plant(&[
+        ("100644", &state, "state.json"),
+        ("100644", &questions, "questions.json"),
+        ("100644", &broken, "proposals.json"),
+    ]);
+    let error = repo.read().unwrap_err();
+    assert!(error.contains("holds an invalid proposals.json"), "{error}");
+    ticket_ref::forget(&repo.git, &repo.root, &ticket()).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().proposals, None);
 }

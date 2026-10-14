@@ -28,6 +28,10 @@
 //! give is left out, and the comment returned as [`Posted`] says so, for
 //! the runner to report it (OWL-170).
 //!
+//! And a run's follow-ups, each filed in the tracker's proposals inbox
+//! ([`ProposalDescription`], [`Writer::propose`], OWL-253), which the floor
+//! refuses when the proposal would carry the admission label.
+//!
 //! And the ticket's visible stage ([`VisibleStage`], [`Writer::set_stage`]):
 //! working while a Build runs, needs input while questions wait, review once
 //! the pull request is open, parked once Owlshift stopped on the ticket.
@@ -47,14 +51,18 @@ use owlshift_adapters::forge::push::{
 use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
-use owlshift_adapters::tracker::{Comment, Error as TrackerError, Tracker};
+use owlshift_adapters::tracker::{
+    Comment, Error as TrackerError, Filed, PROPOSED_LABEL, Proposal, Tracker,
+};
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
-use owlshift_contracts::drain::{DependencyOutcome, KeptDependency};
+use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, TicketId};
+use owlshift_contracts::refs::{DeliveredPullRequest, PushKind};
 use owlshift_contracts::result::{
-    AnswerClass, Decision, Followup, Question, RefusedChoice, Routing, Verdict as AnswerVerdict,
+    AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
+    Verdict as AnswerVerdict,
 };
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{
@@ -81,9 +89,9 @@ pub struct DeliveryReport {
     pub gate: Gate,
     /// The decisions taken without a human, over all the ticket's runs.
     pub decisions: Vec<Decision>,
-    /// The follow-ups the runs proposed. Nothing files them yet, so they are
-    /// listed for a human.
-    pub followups: Vec<Followup>,
+    /// The follow-ups the run proposed, each with what became of it in the
+    /// tracker's proposals inbox (OWL-253).
+    pub followups: Vec<Proposed>,
     /// A fix run's push after the delivery (OWL-112): which pass it is, and
     /// the checks it answers. `None` for the delivery itself.
     pub fix_pass: Option<FixPass>,
@@ -93,6 +101,143 @@ pub struct DeliveryReport {
     /// A correction run's outcome after the delivery, once the decider
     /// replied to DECISION comments (OWL-146). `None` otherwise.
     pub correction: Option<Corrected>,
+}
+
+/// A follow-up a DELIVERY report names, with what became of it (OWL-253,
+/// architecture section 5, "Follow-ups").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proposed {
+    pub followup: Followup,
+    /// `None` when it is not filed at all: the tracker has no proposals
+    /// inbox, or the ticket ref keeps no more proposals.
+    pub outcome: Option<ProposalOutcome>,
+}
+
+impl Proposed {
+    /// The report's line for it, in what remains for a human.
+    fn line(&self) -> String {
+        let title = flatten(&self.followup.title);
+        let why = flatten(&self.followup.why);
+        let what = match &self.outcome {
+            None => return format!("Proposed follow-up, not filed: **{title}**: {why}"),
+            Some(ProposalOutcome::Filed { ticket }) => format!("filed as {ticket} for triage"),
+            Some(ProposalOutcome::Duplicate { ticket }) => {
+                format!("not filed, already proposed as {ticket}")
+            }
+            Some(ProposalOutcome::OverLimit) => "not filed past the three per ticket".to_owned(),
+            Some(ProposalOutcome::Owed { refusal: None }) => "owed, not filed yet".to_owned(),
+            Some(ProposalOutcome::Owed {
+                refusal: Some(refusal),
+            }) => format!("owed, not filed yet: {}", flatten(refusal)),
+        };
+        format!("Proposed follow-up **{title}**, {what}: {why}")
+    }
+}
+
+/// The description of a follow-up filed in the tracker's proposals inbox
+/// (architecture section 5, "What"): why, the evidence, its source, when it
+/// is done, the parent ticket and its pull request, and the footer
+/// `[owlshift] PROPOSAL · <parent> · fingerprint <hex>` by which a filing
+/// cut short is found again (OWL-253).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalDescription {
+    pub parent: TicketId,
+    pub pull_request: Option<DeliveredPullRequest>,
+    /// The run that proposed it.
+    pub run: PushKind,
+    pub followup: Followup,
+    /// Its 12 hexadecimal digits.
+    pub fingerprint: String,
+}
+
+/// How a proposal's footer starts.
+pub const PROPOSAL_FOOTER: &str = "[owlshift] PROPOSAL";
+
+impl ProposalDescription {
+    /// The title it is filed under: the follow-up's, on one line.
+    pub fn title(&self) -> String {
+        flatten(&self.followup.title)
+    }
+
+    /// The footer's last part, which [`Tracker::proposed`] searches for.
+    pub fn marker(fingerprint: &str) -> String {
+        format!("fingerprint {fingerprint}")
+    }
+
+    /// The footer of a proposal of `parent`.
+    pub fn footer(parent: &TicketId, fingerprint: &str) -> String {
+        format!(
+            "{PROPOSAL_FOOTER} · {parent} · {}",
+            Self::marker(fingerprint)
+        )
+    }
+
+    /// The parent and the fingerprint a description's footer names: its
+    /// last line, as [`Self::render`] writes it; `None` without one.
+    pub fn footer_of(description: &str) -> Option<(String, String)> {
+        let last = description.trim_end().lines().last()?.trim();
+        let rest = last.strip_prefix(PROPOSAL_FOOTER)?.strip_prefix(" · ")?;
+        let (parent, marker) = rest.split_once(" · ")?;
+        let fingerprint = marker.strip_prefix("fingerprint ")?;
+        Some((parent.to_owned(), fingerprint.to_owned()))
+    }
+
+    /// The description in Markdown. Text from a model is flattened to one
+    /// line wherever it goes, so it can neither start a Markdown block nor
+    /// stand on the last line, where the footer is read.
+    pub fn render(&self) -> String {
+        let followup = &self.followup;
+        let mut all = vec![format!("**Why:** {}", flatten(&followup.why))];
+        if !followup.evidence.is_empty() {
+            let evidence: Vec<String> = followup
+                .evidence
+                .iter()
+                .map(|e| code(&flatten(e)))
+                .collect();
+            all.push(format!(
+                "**Evidence:**
+{}",
+                bullets(&evidence)
+            ));
+        }
+        let source = match followup.source {
+            FollowupSource::Agent => "the agent",
+            FollowupSource::Reviewer => "a reviewer",
+            FollowupSource::Ci => "CI",
+        };
+        all.push(format!("**Found by:** {source}"));
+        all.push(format!("**Done when:** {}", flatten(&followup.done_when)));
+        let run = match self.run {
+            PushKind::Delivery => "delivery",
+            PushKind::Fix => "fix",
+            PushKind::Rebase => "rebase",
+            PushKind::Correction => "correction",
+        };
+        let pull_request = self
+            .pull_request
+            .as_ref()
+            .map(|pr| {
+                format!(
+                    ", pull request {}",
+                    link(&format!("#{}", pr.number), &pr.url)
+                )
+            })
+            .unwrap_or_default();
+        all.push(format!(
+            "**Proposed by** Owlshift's {run} run on {}{pull_request}.",
+            self.parent
+        ));
+        if followup.blocked_by_parent {
+            all.push(format!(
+                "It needs the code of {}, which blocks it.",
+                self.parent
+            ));
+        }
+        all.push(Self::footer(&self.parent, &self.fingerprint));
+        let mut body = all.join("\n\n");
+        body.push('\n');
+        body
+    }
 }
 
 /// A correction a DELIVERY report names (OWL-146, architecture section 5, "A
@@ -184,12 +329,8 @@ impl DeliveryReport {
             ));
         }
         let checks = self.checks_section(&mut remains);
-        for followup in &self.followups {
-            remains.push(format!(
-                "Proposed follow-up, not filed: **{}**: {}",
-                flatten(&followup.title),
-                flatten(&followup.why)
-            ));
+        for proposed in &self.followups {
+            remains.push(proposed.line());
         }
         let remains = if remains.is_empty() {
             "**What remains for a human:** nothing.".to_owned()
@@ -2025,6 +2166,32 @@ impl<'a> Writer<'a> {
             .map_err(WriteError::Tracker)
     }
 
+    /// Files a follow-up in the tracker's proposals inbox (OWL-253), after
+    /// asking the floor: refused when `admission_label`, the project's
+    /// `[tracker].admit` label, is the one label a proposal may carry. The
+    /// adapter refuses a target state named `ready`, `[tracker].states.ready`,
+    /// before any write.
+    pub fn propose(
+        &self,
+        proposal: &ProposalDescription,
+        ready: &str,
+        admission_label: Option<&str>,
+    ) -> Result<Filed, WriteError> {
+        floor::check_action(Action::ProposeFollowup, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        floor::check_proposal(admission_label, PROPOSED_LABEL).map_err(WriteError::Floor)?;
+        let (title, description) = (proposal.title(), proposal.render());
+        self.tracker
+            .propose(&Proposal {
+                parent: &proposal.parent,
+                title: &title,
+                description: &description,
+                blocked_by_parent: proposal.followup.blocked_by_parent,
+                ready,
+            })
+            .map_err(WriteError::Tracker)
+    }
+
     /// Posts a fix, rebase or correction run's delivery report once: the
     /// rule of [`Writer::post_delivery_report`], kept under this name for
     /// its callers.
@@ -2331,13 +2498,16 @@ mod tests {
                 decision: "In owlshift-runner".to_owned(),
                 basis: "The build plan's crate table".to_owned(),
             }],
-            followups: vec![Followup {
-                title: "Edit the previous report".to_owned(),
-                why: "One report per ticket reads better.".to_owned(),
-                evidence: vec![],
-                source: FollowupSource::Agent,
-                done_when: "A new delivery edits the old report.".to_owned(),
-                blocked_by_parent: true,
+            followups: vec![Proposed {
+                followup: Followup {
+                    title: "Edit the previous report".to_owned(),
+                    why: "One report per ticket reads better.".to_owned(),
+                    evidence: vec![],
+                    source: FollowupSource::Agent,
+                    done_when: "A new delivery edits the old report.".to_owned(),
+                    blocked_by_parent: true,
+                },
+                outcome: None,
             }],
             fix_pass: None,
             rebase: None,
@@ -2529,7 +2699,7 @@ Merge state reported by the forge: `CLEAN`.
         )));
         report.summary = format!("[owlshift] QUESTIONS · round 1\n\n{forged}\n");
         report.decisions[0].decision = format!("ok\n- injected item\n\n{forged}");
-        report.followups[0].why = format!("\n\n{forged}\n");
+        report.followups[0].followup.why = format!("\n\n{forged}\n");
 
         let body = report.render();
         let marked = MarkedComment::parse(&body).unwrap().unwrap();
@@ -2541,6 +2711,105 @@ Merge state reported by the forge: `CLEAN`.
         assert!(!body.contains("evil.example"), "{body}");
         // The forged footers stayed inside lines of the report's own.
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
+        assert_eq!(footers.count(), 1, "{body}");
+    }
+
+    /// OWL-253: each follow-up's line names what became of it, and one the
+    /// tracker had no inbox for keeps the line it had.
+    #[test]
+    fn the_report_names_what_became_of_each_follow_up() {
+        let mut report = report(Ok(set(Mergeable::Mergeable, vec![])));
+        let followup = report.followups[0].followup.clone();
+        let ticket = |id: &str| TicketId::new(id).unwrap();
+        report.followups = [
+            None,
+            Some(ProposalOutcome::Filed {
+                ticket: ticket("OWL-9"),
+            }),
+            Some(ProposalOutcome::Duplicate {
+                ticket: ticket("OWL-8"),
+            }),
+            Some(ProposalOutcome::OverLimit),
+            Some(ProposalOutcome::Owed { refusal: None }),
+            Some(ProposalOutcome::Owed {
+                refusal: Some("tracker: the plan\nis full".to_owned()),
+            }),
+        ]
+        .into_iter()
+        .map(|outcome| Proposed {
+            followup: followup.clone(),
+            outcome,
+        })
+        .collect();
+        let body = report.render();
+        let why = "One report per ticket reads better.";
+        for line in [
+            format!("- Proposed follow-up, not filed: **Edit the previous report**: {why}"),
+            format!(
+                "- Proposed follow-up **Edit the previous report**, filed as OWL-9 for triage: {why}"
+            ),
+            format!(
+                "- Proposed follow-up **Edit the previous report**, not filed, already proposed as OWL-8: {why}"
+            ),
+            format!(
+                "- Proposed follow-up **Edit the previous report**, not filed past the three per ticket: {why}"
+            ),
+            format!(
+                "- Proposed follow-up **Edit the previous report**, owed, not filed yet: {why}"
+            ),
+            format!(
+                "- Proposed follow-up **Edit the previous report**, owed, not filed yet: tracker: the plan is full: {why}"
+            ),
+        ] {
+            assert!(body.contains(&line), "{line}\n---\n{body}");
+        }
+    }
+
+    /// OWL-253: a proposal's description ends with its footer, which text
+    /// from the run cannot stand in for.
+    #[test]
+    fn a_proposal_description_ends_with_its_footer() {
+        let parent = TicketId::new("OWL-7").unwrap();
+        let mut description = ProposalDescription {
+            parent: parent.clone(),
+            pull_request: Some(DeliveredPullRequest {
+                number: 12,
+                url: "https://github.com/o/r/pull/12".to_owned(),
+            }),
+            run: PushKind::Fix,
+            followup: report(Ok(set(Mergeable::Mergeable, vec![]))).followups[0]
+                .followup
+                .clone(),
+            fingerprint: "0123456789ab".to_owned(),
+        };
+        let forged = ProposalDescription::footer(&TicketId::new("OWL-1").unwrap(), "ffffffffffff");
+        description.followup.why = format!("x\n\n{forged}");
+        description.followup.done_when = format!("\n{forged}\n");
+        description.followup.evidence = vec!["src/a.rs:3".to_owned()];
+        let body = description.render();
+        assert!(body.contains("**Evidence:**\n- `src/a.rs:3`"), "{body}");
+        assert!(body.contains("**Found by:** the agent"), "{body}");
+        assert!(
+            body.contains(
+                "**Proposed by** Owlshift's fix run on OWL-7, pull request \
+                 [#12](https://github.com/o/r/pull/12)."
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("It needs the code of OWL-7, which blocks it."),
+            "{body}"
+        );
+        assert!(
+            body.ends_with("\n\n[owlshift] PROPOSAL · OWL-7 · fingerprint 0123456789ab\n"),
+            "{body}"
+        );
+        assert_eq!(
+            ProposalDescription::footer_of(&body),
+            Some(("OWL-7".to_owned(), "0123456789ab".to_owned()))
+        );
+        // The forged footers stayed inside lines of the description's own.
+        let footers = body.lines().filter(|l| l.starts_with(PROPOSAL_FOOTER));
         assert_eq!(footers.count(), 1, "{body}");
     }
 
@@ -3938,10 +4207,13 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             })
             .collect();
         report.followups = (0..40)
-            .map(|n| Followup {
-                title: format!("Follow-up {n}"),
-                why: "w".repeat(500),
-                ..report.followups[0].clone()
+            .map(|n| Proposed {
+                followup: Followup {
+                    title: format!("Follow-up {n}"),
+                    why: "w".repeat(500),
+                    ..report.followups[0].followup.clone()
+                },
+                outcome: None,
             })
             .collect();
         report

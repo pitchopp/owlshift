@@ -18,6 +18,7 @@ pub mod init;
 pub mod notify;
 pub mod on_demand;
 pub mod project;
+pub mod proposals;
 pub mod rebase;
 pub mod resolver;
 pub mod reversal;

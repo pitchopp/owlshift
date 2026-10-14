@@ -29,7 +29,9 @@ use owlshift_contracts::brief::{
     Brief, MAX_CHOICE_BYTES, MAX_RESULT_REFUSAL_BYTES, PermissionLevel, Relation, ThreadEntry,
 };
 use owlshift_contracts::config::{Admit, ProjectConfig};
-use owlshift_contracts::drain::{DependencyOutcome, Gesture, GestureKind, TicketIntake};
+use owlshift_contracts::drain::{
+    DependencyOutcome, Gesture, GestureKind, ProposalOutcome, TicketIntake,
+};
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::refs::{AskDecider, PersistedState, Waiting};
@@ -352,7 +354,30 @@ struct Clocked<'a> {
     fail_reads: &'a Cell<u32>,
     /// What happens once, right after the next stage read.
     after_stage_read: &'a RefCell<Option<Box<dyn FnOnce()>>>,
+    /// The proposals inbox, when it is on (OWL-253).
+    inbox: &'a RefCell<FakeInbox>,
 }
+
+/// A proposals inbox beside the Markdown tracker, which has none (OWL-253):
+/// off unless a test turns it on.
+#[derive(Default)]
+struct FakeInbox {
+    on: bool,
+    /// The tickets filed or already there: id, title, description.
+    tickets: Vec<(TicketId, String, String)>,
+    /// Every filing is refused with this.
+    refuse: Option<&'static str>,
+}
+
+/// The Markdown tracker's capabilities and a proposals inbox.
+const WITH_INBOX: &[Capability] = &[
+    Capability::ReadTicket,
+    Capability::ListAdmitted,
+    Capability::Comments,
+    Capability::VisibleStage,
+    Capability::BlockedBy,
+    Capability::ProposalsInbox,
+];
 
 /// The clock's time, then a minute later.
 fn tick(clock: &Cell<Timestamp>) -> Timestamp {
@@ -363,7 +388,48 @@ fn tick(clock: &Cell<Timestamp>) -> Timestamp {
 
 impl Tracker for Clocked<'_> {
     fn capabilities(&self) -> &'static [Capability] {
-        Tracker::capabilities(&self.inner)
+        if self.inbox.borrow().on {
+            WITH_INBOX
+        } else {
+            Tracker::capabilities(&self.inner)
+        }
+    }
+
+    fn propose(&self, proposal: &tracker::Proposal<'_>) -> Result<tracker::Filed, tracker::Error> {
+        let mut inbox = self.inbox.borrow_mut();
+        if let Some(why) = inbox.refuse {
+            return Err(tracker::Error::new(tracker::ErrorKind::Other, why));
+        }
+        let id = TicketId::new(format!("DEMO-{}", 100 + inbox.tickets.len())).unwrap();
+        inbox.tickets.push((
+            id.clone(),
+            proposal.title.to_owned(),
+            proposal.description.to_owned(),
+        ));
+        Ok(tracker::Filed {
+            id,
+            state: "Triage".to_owned(),
+            problems: Vec::new(),
+        })
+    }
+
+    fn proposed(
+        &self,
+        _team: Option<&str>,
+        title: &str,
+        marker: &str,
+    ) -> Result<Vec<tracker::Found>, tracker::Error> {
+        Ok(self
+            .inbox
+            .borrow()
+            .tickets
+            .iter()
+            .filter(|(_, t, d)| t.eq_ignore_ascii_case(title) || d.contains(marker))
+            .map(|(id, _, description)| tracker::Found {
+                id: id.clone(),
+                description: description.clone(),
+            })
+            .collect())
     }
 
     fn ticket(&self, id: &TicketId) -> Result<Ticket, tracker::Error> {
@@ -490,6 +556,8 @@ struct Bench {
     /// machine's clock: by default the quiet window, so the decider's
     /// latest comment, a minute older, counts.
     waited: Cell<SignedDuration>,
+    /// The tracker's proposals inbox (OWL-253).
+    inbox: RefCell<FakeInbox>,
 }
 
 const DONE: &str = r#"{"format":8,"status":"done","summary":"Added GREETING.md; the gate passes.",
@@ -606,6 +674,7 @@ impl Bench {
             fail_reads: Cell::new(0),
             after_stage_read: RefCell::new(None),
             waited: Cell::new(SignedDuration::from_mins(10)),
+            inbox: RefCell::default(),
         }
     }
 
@@ -918,6 +987,7 @@ impl Bench {
             refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
             after_stage_read: &self.after_stage_read,
+            inbox: &self.inbox,
         };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
@@ -7417,6 +7487,172 @@ fn continue_runs_intake_on_a_ticket_at_intake() {
     let (outcome, _) = bench.continue_ticket(vec![done]);
     assert!(matches!(outcome, Err(Stop::Ready { .. })), "{outcome:?}");
     assert!(bench.record().intake.is_some());
+}
+
+/// A Build run's `done` with two follow-ups (OWL-253).
+const PROPOSING: &str = r#"{"format":8,"status":"done","summary":"Added GREETING.md; the gate passes.",
+"pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."},
+"followups":[
+ {"title":"Translate the greeting","why":"Readers abroad.","evidence":["GREETING.md:1"],"source":"agent","done_when":"A French greeting exists."},
+ {"title":"Lint the docs","why":"Typos slip in.","source":"reviewer","done_when":"A linter runs in CI."}]}"#;
+
+/// The proposals the ticket ref keeps, with what became of each, in order.
+fn proposal_outcomes(bench: &Bench) -> Vec<ProposalOutcome> {
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    ticket_ref::read(&git, &bench.dirs().checkout(), &ticket())
+        .unwrap()
+        .expect("a ticket ref")
+        .proposals
+        .expect("proposals kept")
+        .proposals
+        .into_iter()
+        .map(|kept| kept.outcome)
+        .collect()
+}
+
+/// The outcomes of the `decision` events about proposals, and the `what`
+/// of their warnings, oldest first.
+fn proposal_events(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::Decision if event.data.get("drain") == Some(&json!("proposal")) => {
+                Some(event.data["outcome"].as_str().unwrap().to_owned())
+            }
+            EventKind::Warning => event.data["what"]
+                .as_str()
+                .filter(|what| what.starts_with("proposal_"))
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// OWL-253: a delivery's follow-ups are filed in the tracker's proposals
+/// inbox before its DELIVERY report, which names what became of each, and
+/// kept as filed; one already proposed is a duplicate, never filed.
+#[test]
+fn follow_ups_are_filed_before_the_delivery_report_which_names_them() {
+    let bench = Bench::new(true);
+    {
+        let mut inbox = bench.inbox.borrow_mut();
+        inbox.on = true;
+        // Someone filed the second one by hand already.
+        inbox.tickets.push((
+            TicketId::new("DEMO-99").unwrap(),
+            "lint the docs".to_owned(),
+            String::new(),
+        ));
+    }
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(PROPOSING))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    let inbox = bench.inbox.borrow();
+    assert_eq!(inbox.tickets.len(), 2);
+    let (id, title, description) = &inbox.tickets[1];
+    assert_eq!(
+        (id.as_str(), title.as_str()),
+        ("DEMO-101", "Translate the greeting")
+    );
+    assert!(
+        description.ends_with(&format!(
+            "\n[owlshift] PROPOSAL · DEMO-1 · fingerprint {}\n",
+            owlshift_runner::proposals::fingerprint("Translate the greeting")
+        )),
+        "{description}"
+    );
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    for line in [
+        "- Proposed follow-up **Translate the greeting**, filed as DEMO-101 for triage: \
+         Readers abroad.",
+        "- Proposed follow-up **Lint the docs**, not filed, already proposed as DEMO-99: \
+         Typos slip in.",
+    ] {
+        assert!(comments[0].contains(line), "{line}\n---\n{}", comments[0]);
+    }
+    assert_eq!(
+        proposal_outcomes(&bench),
+        [
+            ProposalOutcome::Filed {
+                ticket: TicketId::new("DEMO-101").unwrap()
+            },
+            ProposalOutcome::Duplicate {
+                ticket: TicketId::new("DEMO-99").unwrap()
+            },
+        ]
+    );
+    // Filed, then the report.
+    let events = bench.events();
+    assert_eq!(proposal_events(&events), ["duplicate", "filed"]);
+    let at = |kind: &str| {
+        events
+            .iter()
+            .position(|e| e.kind == EventKind::TrackerWrite && e.data["action"] == json!(kind))
+            .unwrap_or_else(|| panic!("no {kind}"))
+    };
+    let delivery = events
+        .iter()
+        .position(|e| {
+            e.kind == EventKind::TrackerWrite && e.data.get("kind") == Some(&json!("DELIVERY"))
+        })
+        .unwrap();
+    assert!(at("propose") < delivery, "{events:?}");
+}
+
+/// OWL-253: a filing the tracker refuses stays owed, warned of once, and the
+/// report says why; the next watch pass files it, with no second report.
+#[test]
+fn a_refused_filing_stays_owed_and_a_watch_pass_files_it_without_a_second_report() {
+    let bench = Bench::new(true);
+    {
+        let mut inbox = bench.inbox.borrow_mut();
+        inbox.on = true;
+        inbox.refuse = Some("the plan holds 250 issues");
+    }
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(PROPOSING))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let line = "- Proposed follow-up **Translate the greeting**, owed, not filed yet: tracker: \
+                the plan holds 250 issues: Readers abroad.";
+    assert!(comments[0].contains(line), "{}", comments[0]);
+    let owed = ProposalOutcome::Owed {
+        refusal: Some("tracker: the plan holds 250 issues".to_owned()),
+    };
+    assert_eq!(proposal_outcomes(&bench), [owed.clone(), owed]);
+    assert_eq!(
+        proposal_events(&bench.events()),
+        ["proposal_unfiled", "proposal_unfiled"]
+    );
+
+    bench.inbox.borrow_mut().refuse = None;
+    let before = bench.events().len();
+    let mut passes = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        passes += 1;
+        passes < 2
+    });
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.inbox.borrow().tickets.len(), 2);
+    assert_eq!(bench.comments().len(), 1, "no second report");
+    assert_eq!(
+        proposal_outcomes(&bench),
+        [
+            ProposalOutcome::Filed {
+                ticket: TicketId::new("DEMO-100").unwrap()
+            },
+            ProposalOutcome::Filed {
+                ticket: TicketId::new("DEMO-101").unwrap()
+            },
+        ]
+    );
+    // Filed once, by the first pass.
+    assert_eq!(
+        proposal_events(&bench.events()[before..]),
+        ["filed", "filed"]
+    );
 }
 
 /// An intake result whose record names each of `ids`, each quoted as
