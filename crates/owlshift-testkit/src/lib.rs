@@ -2,6 +2,7 @@
 //! network and no tracker account.
 //!
 //! - [`gh`]: the real gh, started once before the credential probes time it.
+//! - [`gate_p4`]: a small word-counting helper written for the P4 exit gate.
 //! - [`git`]: git with none of the host's configuration, and a project
 //!   seeded into a local bare remote.
 //! - [`reply`]: what the fake harness (`owlshift-fake-harness`) does in one
@@ -13,6 +14,7 @@
 //! This crate is test only: it is never published and no shipped crate
 //! depends on it. See "The test bench" in `docs/design/build-plan.md`.
 
+pub mod gate_p4;
 pub mod gh;
 pub mod git;
 pub mod harness;
