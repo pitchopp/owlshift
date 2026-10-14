@@ -28,6 +28,14 @@
 //! holds the project's lock is moved to the stage its ref shows (OWL-265,
 //! architecture section 5, "The stage while a repair runs").
 //!
+//! Since OWL-273, a ticket an answered intake round left at Intake
+//! (`left_at_intake`), its second intake cut off by a usage limit or a
+//! refusal, is resumed while the tracker still shows it needs input: its
+//! intake runs again through [`OnDemand::continue_shown`], held as a
+//! continue is. One shown elsewhere, in the ready column (the drain's) or
+//! moved by a person, is left alone, its stage read again once its ref moves
+//! or after [`RETRY_AFTER`].
+//!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
 //! continue that left the ticket ref as it was is held for [`RETRY_AFTER`],
@@ -105,6 +113,14 @@ pub fn outlived(status: Status, stored: &Stored) -> bool {
             .delivery
             .as_ref()
             .is_some_and(|delivery| delivery.followed())
+}
+
+/// Whether watch resumes a ticket in `state` once the tracker shows it still
+/// needs input (OWL-273): at Intake after a question round, as an answered
+/// intake round leaves it while intake runs again, and a cut-off run leaves
+/// it. A ticket at Intake that asked no round is the drain's.
+fn left_at_intake(state: &TicketState) -> bool {
+    state.status() == Status::Active(Stage::Intake) && state.round() > 0
 }
 
 /// What a continue starts from: the ticket ref's commit and the decider's
@@ -273,6 +289,10 @@ struct Memory {
     stale: Stale,
     /// What the drain keeps (OWL-250).
     drain: drain::Memory,
+    /// The tickets left at Intake found shown in another stage than needs
+    /// input (OWL-273): the commit their ref was at, and until when their
+    /// stage is not read again unless the ref moves.
+    elsewhere: HashMap<TicketId, (String, Timestamp)>,
 }
 
 /// What watch keeps, per ticket, of the stages a stop left at working
@@ -361,6 +381,7 @@ impl Watch<'_> {
         };
         let mut waiting = Vec::new();
         let mut following = Vec::new();
+        let mut resumable = Vec::new();
         // A ticket whose ref cannot be read now keeps its hold: only one
         // read and found not waiting, or gone from the list, loses it.
         let mut unread = Vec::new();
@@ -382,6 +403,10 @@ impl Watch<'_> {
                 Ok((stored, state)) if followed(state.status(), &stored) => {
                     memory.failing.remove(&ticket);
                     following.push((ticket, stored));
+                }
+                // Its failing read is cleared once its stage reads (OWL-273).
+                Ok((stored, state)) if left_at_intake(&state) => {
+                    resumable.push((ticket, stored));
                 }
                 Ok(_) => {
                     memory.failing.remove(&ticket);
@@ -407,19 +432,25 @@ impl Watch<'_> {
             .map(|(ticket, _, _, _)| ticket.clone())
             .collect();
         let followed: Vec<TicketId> = following.iter().map(|(ticket, _)| ticket.clone()).collect();
+        let left: Vec<TicketId> = resumable.iter().map(|(ticket, _)| ticket.clone()).collect();
         // A followed ticket keeps its repair's hold too: otherwise a repair
         // that left the ref as it was, or a round under it whose state was
         // not kept (OWL-211), would run again at the next pass.
-        // The drain's intakes and dispatches are held there too (OWL-250).
+        // The drain's intakes and dispatches are held there too (OWL-250),
+        // and the resumes of tickets left at Intake (OWL-273).
         memory.holds.retain(
             &[
                 &ids[..],
                 &followed[..],
+                &left[..],
                 &unread[..],
                 &memory.drain.listed[..],
             ]
             .concat(),
         );
+        memory
+            .elsewhere
+            .retain(|ticket, _| left.contains(ticket) || unread.contains(ticket));
         memory
             .following
             .retain(&[&followed[..], &read[..], &unread[..]].concat());
@@ -449,6 +480,9 @@ impl Watch<'_> {
             if watched(status) {
                 self.look(memory, sink, out, continued, &ticket, &stored);
             }
+        }
+        for (ticket, stored) in resumable {
+            self.resume_intake(memory, sink, out, continued, &ticket, &stored);
         }
         for (ticket, stored) in following {
             // A repair this pass decides moves the stage to working again
@@ -986,6 +1020,103 @@ impl Watch<'_> {
                     ),
                 )
             }
+            Some(Admit::Paused { until }) => self.line(
+                out,
+                &format!("no ticket is continued before the usage limit resets at {until}"),
+            ),
+            Some(Admit::Go) | None => {}
+        }
+    }
+
+    /// A ticket left at Intake by an answered round whose second intake was
+    /// cut off (OWL-273, architecture section 5, "Intake"): resumed, its
+    /// intake run again, while the tracker still shows it needs input, held
+    /// as a continue is ([`Holds`]). The stage is read first without the
+    /// lock, so a ticket shown elsewhere costs no lock, checkout or ticket
+    /// read, and [`OnDemand::continue_shown`] reads it again under the lock,
+    /// so a person's move meanwhile is kept.
+    fn resume_intake(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        continued: &mut Continued<'_>,
+        ticket: &TicketId,
+        stored: &Stored,
+    ) {
+        let on_demand = self.on_demand;
+        let now = (on_demand.clock)();
+        if memory
+            .elsewhere
+            .get(ticket)
+            .is_some_and(|(commit, until)| *commit == stored.commit && now < *until)
+        {
+            return;
+        }
+        let seen = Seen {
+            commit: stored.commit.clone(),
+            answer: None,
+        };
+        if memory.holds.admit(ticket, &seen, now) != Admit::Go {
+            return;
+        }
+        let shown = match on_demand.tracker.stage(ticket) {
+            Ok(shown) => shown,
+            Err(e) => {
+                let reason = format!("reading its stage: {e}");
+                return self.unreadable(memory, sink, ticket, reason);
+            }
+        };
+        memory.failing.remove(ticket);
+        let needs_input = VisibleStage::NeedsInput;
+        if shown != needs_input.state(&on_demand.config.tracker.states) {
+            let until = now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX);
+            memory
+                .elsewhere
+                .insert(ticket.clone(), (stored.commit.clone(), until));
+            return;
+        }
+        memory.elsewhere.remove(ticket);
+        // Recorded by `continue_shown` once the ticket ref and its stage are
+        // confirmed under the lock.
+        let decision = data([("watch", json!("continue")), ("stage", json!("intake"))]);
+        let Some(outcome) =
+            on_demand.continue_shown(ticket, &seen.commit, needs_input, decision, sink)
+        else {
+            // The ref moved, or the ticket was moved, since the reads: the
+            // next pass reads it again.
+            return;
+        };
+        continued(ticket, &outcome, sink);
+        let repo = &on_demand.executor.git;
+        let commit = ticket_ref::read(repo, &on_demand.dirs.checkout(), ticket)
+            .ok()
+            .flatten()
+            .map(|stored| stored.commit);
+        let now = (on_demand.clock)();
+        match memory
+            .holds
+            .after(ticket, seen, &outcome, commit.as_deref(), now)
+        {
+            Some(Admit::Held {
+                until: Until::At(until),
+            }) => self.line(
+                out,
+                &format!(
+                    "{ticket} is at Intake as it was before that resume: watch resumes it again \
+                     at {until}, or sooner once a command moves its ticket ref"
+                ),
+            ),
+            Some(Admit::Held {
+                until: Until::Person,
+            }) => self.line(
+                out,
+                &format!(
+                    "{ticket} waits for a person to act, but its state was not kept: run \
+                     `owlshift continue` once the ticket ref can be written; watch resumes it \
+                     again only once a command moves its ticket ref"
+                ),
+            ),
             Some(Admit::Paused { until }) => self.line(
                 out,
                 &format!("no ticket is continued before the usage limit resets at {until}"),
