@@ -1,0 +1,957 @@
+//! The drain's scenarios (OWL-254, build plan part K): S3, S4, S6, S12 and
+//! S13 of `docs/design/scenarios.md`, each played end to end by `owlshift
+//! watch --drain` (`Watch::run_drain`) on the bench of `on_demand.rs`: the
+//! Markdown tracker, the fake harness and the fake GitHub. Each test plays
+//! the bullets of its scenario that P4 builds; part K says which wait for a
+//! later step.
+
+use owlshift_adapters::tracker::markdown;
+use owlshift_runner::notify;
+
+use super::*;
+
+/// A Build run's `done` delivering `id` on its own branch.
+fn done_for(id: &str) -> String {
+    DONE.replace(BRANCH, &format!("owlshift/{}", id.to_lowercase()))
+}
+
+impl Bench {
+    /// Writes the ticket `id` at `stage`, created by `author`, decided by
+    /// `maintainer`, labelled `labels`, with `front` added to its front
+    /// matter, and `description`.
+    fn put_ticket(
+        &self,
+        id: &str,
+        author: &str,
+        stage: &str,
+        labels: &[&str],
+        front: &str,
+        description: &str,
+    ) {
+        let dir = self.remote.checkout.join("tickets").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("ticket.md"),
+            format!(
+                "+++\ntitle = \"Ticket {id}\"\nauthor = \"{author}\"\nstage = \"{stage}\"\n\
+                 assignee = \"maintainer\"\nlabels = {labels:?}\n{front}+++\n\n{description}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The ticket `id` as the tracker shows it.
+    fn shown(&self, id: &str) -> markdown::Ticket {
+        MarkdownTracker::new(&self.remote.checkout)
+            .ticket(&TicketId::new(id).unwrap())
+            .unwrap()
+    }
+
+    /// The bodies of the comments on `id`, oldest first.
+    fn comments_on(&self, id: &str) -> Vec<String> {
+        MarkdownTracker::new(&self.remote.checkout)
+            .comments(&TicketId::new(id).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|comment| comment.body)
+            .collect()
+    }
+
+    /// What the ticket ref of `id` holds, if it has one.
+    fn record_of(&self, id: &str) -> Option<TicketRecord> {
+        let env = self.env.clone();
+        let git = Git::with_setup("git", move |command| env.apply(command));
+        ticket_ref::read(&git, &self.dirs().checkout(), &TicketId::new(id).unwrap())
+            .unwrap()
+            .map(|stored| stored.record)
+    }
+
+    /// The tip of `id`'s branch on the remote.
+    fn tip_of(&self, id: &str) -> String {
+        let branch = format!("refs/heads/owlshift/{}", id.to_lowercase());
+        let out = self.env.run(&self.remote.bare, &["rev-parse", &branch]);
+        String::from_utf8(out.unwrap()).unwrap().trim().to_owned()
+    }
+
+    /// Merges `id`'s pull request as the forge does: `main` moves to its
+    /// branch, a fast-forward, and the pull request reads merged. Nothing
+    /// moves the ticket's stage. Returns `main`'s new head.
+    fn merge(&self, id: &str) -> String {
+        let tip = self.tip_of(id);
+        self.env
+            .run(&self.remote.bare, &["update-ref", "refs/heads/main", &tip])
+            .unwrap();
+        self.github.followed.lock().unwrap().state = "MERGED";
+        let open = self.github.open.lock().unwrap().take();
+        assert!(open.is_some(), "{id} has no open pull request to merge");
+        tip
+    }
+
+    /// The next pull request read is the one opened since the merge: open.
+    fn reopened(&self) {
+        self.github.followed.lock().unwrap().state = "OPEN";
+    }
+
+    /// Each run's role and ticket, oldest first.
+    fn runs(&self) -> Vec<(Role, String)> {
+        self.briefs()
+            .iter()
+            .map(|brief| (brief.role, brief.ticket.id.as_str().to_owned()))
+            .collect()
+    }
+}
+
+/// The ticket of each `dispatch` event of `events`, checking that the drain
+/// made it.
+fn dispatched(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::Dispatch)
+        .map(|event| {
+            assert_eq!(event.data["command"], json!("drain"), "{event:?}");
+            event.ticket.as_ref().unwrap().as_str().to_owned()
+        })
+        .collect()
+}
+
+/// The events of each pass of a drain: `events` from `start`, cut at `ends`,
+/// the event count after each pass but the last.
+fn by_pass(events: &[Event], start: usize, ends: &[usize]) -> Vec<Vec<Event>> {
+    let mut cuts = vec![start];
+    cuts.extend_from_slice(ends);
+    cuts.push(events.len());
+    cuts.windows(2)
+        .map(|w| events[w[0]..w[1]].to_vec())
+        .collect()
+}
+
+/// Each `waits` decision of `events`: its ticket, reason and the tickets it
+/// names.
+fn waits(events: &[Event]) -> Vec<(String, Value, Value)> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("waits")))
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str().to_owned(),
+                e.data["reason"].clone(),
+                e.data.get("tickets").cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect()
+}
+
+/// The position in `events` of watch's reading `id`'s pull request merged.
+fn merge_read(events: &[Event], id: &str) -> Option<usize> {
+    events.iter().position(|e| {
+        e.kind == EventKind::Decision
+            && e.ticket.as_ref().is_some_and(|t| t.as_str() == id)
+            && e.data.get("watch") == Some(&json!("ended"))
+            && e.data["reason"] == json!("merged")
+    })
+}
+
+/// S4's chain in one `watch --drain` of six passes: DEMO-2 waits for DEMO-1
+/// by a relation, DEMO-3 for DEMO-2 by a "Blocked by" line; DEMO-1's pull
+/// request is merged on the forge after pass 3, DEMO-2's after pass 5.
+/// Returns the bench, the event count after each pass but the last, `main`
+/// after each merge, and watch's lines.
+fn drain_a_chain() -> (Bench, Vec<usize>, Vec<String>, String) {
+    let bench = Bench::draining("maintainer");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-1\"]\n",
+        "Greet again.",
+    );
+    bench.put_ticket(
+        "DEMO-3",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "Greet at last.\n\nBlocked by DEMO-2.",
+    );
+    let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let replies = vec![
+        intake(),
+        intake(),
+        bench.reply(Some("Hello"), Some(&done_for("DEMO-1"))),
+        intake(),
+        bench.reply(Some("Hello again"), Some(&done_for("DEMO-2"))),
+        bench.reply(Some("Hello at last"), Some(&done_for("DEMO-3"))),
+    ];
+    let ends = RefCell::new(Vec::new());
+    let mains = RefCell::new(Vec::new());
+    let (outcomes, lines, printed) = bench.drain(replies, 6, |pass| {
+        ends.borrow_mut().push(bench.events().len());
+        match pass {
+            3 => mains.borrow_mut().push(bench.merge("DEMO-1")),
+            4 => bench.reopened(),
+            5 => mains.borrow_mut().push(bench.merge("DEMO-2")),
+            _ => {}
+        }
+    });
+    let delivered = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(delivered, 3, "{outcomes:?}\n{lines}\n{printed}");
+    (bench, ends.into_inner(), mains.into_inner(), lines)
+}
+
+/// Scenario S4, "Unblocked by a merge", on [`drain_a_chain`]: the drain
+/// builds DEMO-1; the pass that reads its merge dispatches DEMO-2, and the
+/// pass that reads DEMO-2's merge dispatches DEMO-3. No stage is moved to
+/// Done: watch's read of each merge releases the next. Where each branch
+/// starts is [`scenario_s4_the_blocked_branch_starts_from_the_merge`]'s.
+#[test]
+fn scenario_s4_unblocked_by_a_merge() {
+    let (bench, ends, _, lines) = drain_a_chain();
+    let events = bench.events();
+    let passes = by_pass(&events, 0, &ends);
+    let per_pass: Vec<Vec<String>> = passes.iter().map(|pass| dispatched(pass)).collect();
+    assert_eq!(
+        per_pass,
+        [
+            vec![],
+            vec!["DEMO-1".to_owned()],
+            vec![],
+            vec!["DEMO-2".to_owned()],
+            vec![],
+            vec!["DEMO-3".to_owned()],
+        ],
+        "{lines}"
+    );
+    // Each blocked ticket is dispatched in the pass that reads its blocker's
+    // merge, after that read.
+    for (pass, blocker, blocked) in [(3, "DEMO-1", "DEMO-2"), (5, "DEMO-2", "DEMO-3")] {
+        let read = merge_read(&passes[pass], blocker).expect("the merge read");
+        let dispatch = passes[pass]
+            .iter()
+            .position(|e| e.kind == EventKind::Dispatch)
+            .unwrap();
+        assert!(
+            read < dispatch,
+            "{blocked} dispatched before {blocker}'s merge"
+        );
+    }
+    // Told why each waited, by relation and by line.
+    let told = waits(&events);
+    for (blocked, blocker) in [("DEMO-2", "DEMO-1"), ("DEMO-3", "DEMO-2")] {
+        assert!(
+            told.contains(&(blocked.to_owned(), json!("blocked_by"), json!([blocker]))),
+            "{told:?}"
+        );
+    }
+    // The release came from the merges watch read, not from a stage.
+    for id in ["DEMO-1", "DEMO-2", "DEMO-3"] {
+        assert_eq!(bench.shown(id).stage, "In Review", "{id}");
+    }
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-2".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-3".to_owned()),
+            (Role::Build, "DEMO-2".to_owned()),
+            (Role::Build, "DEMO-3".to_owned()),
+        ]
+    );
+}
+
+/// Scenario S4's "Its branch starts from the updated default branch", on
+/// [`drain_a_chain`]: DEMO-2's branch holds DEMO-1's merge, DEMO-3's holds
+/// DEMO-2's. It fails on `main` as of OWL-254: the first intake makes the
+/// ticket's worktree and branch at the base of its time, and the Build
+/// dispatched after the merge works on that branch.
+#[test]
+#[ignore = "OWL-274: a drained Build's branch starts where its intake made it, before the merge"]
+fn scenario_s4_the_blocked_branch_starts_from_the_merge() {
+    let (bench, _, mains, _) = drain_a_chain();
+    assert!(is_ancestor(&bench, &mains[0], &bench.tip_of("DEMO-2")));
+    assert!(is_ancestor(&bench, &mains[1], &bench.tip_of("DEMO-3")));
+}
+
+/// An intake result of `status`, asking `questions` when not empty, whose
+/// record names each `(ticket, quote)` of `dependencies`.
+fn intake_quoting(status: &str, dependencies: &[(&str, &str)], questions: &str) -> String {
+    let mut result: Value = serde_json::from_str(&intake_result(status, None, questions)).unwrap();
+    result["intake"]["dependencies"] = dependencies
+        .iter()
+        .map(|(ticket, quote)| json!({ "ticket": ticket, "quote": quote }))
+        .collect();
+    result.to_string()
+}
+
+/// The INTAKE comments on `id`, oldest first.
+fn intake_comments(bench: &Bench, id: &str) -> Vec<String> {
+    bench
+        .comments_on(id)
+        .into_iter()
+        .filter(|comment| comment.starts_with("[owlshift] INTAKE"))
+        .collect()
+}
+
+/// Scenario S3, "Questions at intake", under `watch --drain`: the first
+/// intake asks the decider, the ticket waiting at needs input to return to
+/// Intake, and relates the dependency DEMO-1's text names in prose; watch
+/// continues the answer, intake runs again and relates the prerequisite the
+/// answer alone names, then the ticket is back in the column, blocked. Intake
+/// does not run again for the same text; once a person edits it, intake runs
+/// again before any dispatch, even with every blocker done. Each INTAKE
+/// comment shows the routing and the dependencies; no model runs between the
+/// last intake and Build.
+#[test]
+fn scenario_s3_questions_at_intake() {
+    let bench = Bench::draining("maintainer");
+    let prose = "It reuses the banner DEMO-3 adds.";
+    bench.describe(prose);
+    bench.other_ticket("DEMO-2", "In Progress");
+    bench.other_ticket("DEMO-3", "In Progress");
+    let answer = "It is DEMO-2: it must land first.";
+    let question = r#"[{"id":"Q1","category":"scope",
+        "context":"The ticket waits for the billing rework, named without its identifier.",
+        "text":"Which ticket is the billing rework?"}]"#;
+    let both = [("DEMO-3", prose), ("DEMO-2", answer)];
+    let replies = vec![
+        bench.reply(
+            None,
+            Some(&intake_quoting("questions", &both[..1], question)),
+        ),
+        bench.reply(None, Some(&check(&[("Q1", "answered", "DEMO-2.")]))),
+        bench.reply(None, Some(&intake_quoting("done", &both, ""))),
+        bench.reply(None, Some(&intake_quoting("done", &both, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let routing = "**Routing:** claude on the fast tier, effort low";
+    let ends = RefCell::new(Vec::new());
+    let (outcomes, lines, printed) = bench.drain(replies, 6, |pass| {
+        ends.borrow_mut().push(bench.events().len());
+        match pass {
+            1 => {
+                // The round waits at needs input, to return to Intake, the
+                // dependency in prose already related.
+                let state = TicketState::try_from(&bench.record().state).unwrap();
+                assert_eq!(
+                    state.status(),
+                    Status::NeedsInput {
+                        return_to: Stage::Intake
+                    }
+                );
+                assert_eq!(bench.stage(), "Needs Input");
+                assert_eq!(bench.blocked_by(), ["DEMO-3"]);
+                let intake = intake_comments(&bench, TICKET).pop().unwrap();
+                assert!(intake.contains(routing), "{intake}");
+                assert!(
+                    intake.contains(&format!("DEMO-3, named by `{prose}`: relation written")),
+                    "{intake}"
+                );
+            }
+            2 => bench.answer(answer),
+            4 => {
+                bench.other_ticket("DEMO-2", "Done");
+                bench.other_ticket("DEMO-3", "Done");
+                bench.describe("Say it in English.");
+            }
+            _ => {}
+        }
+    });
+    // The questions reach the decider, told as a person's blocker; the
+    // ticket back in the column is not.
+    assert_eq!(outcomes.len(), 4, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(
+        matches!(&outcomes[0], Err(Stop::NeedsInput { .. })),
+        "{outcomes:?}"
+    );
+    assert!(notify::blocker_line(&ticket(), outcomes[0].as_ref().unwrap_err()).is_some());
+    for outcome in &outcomes[1..3] {
+        let stop = outcome.as_ref().unwrap_err();
+        assert!(matches!(stop, Stop::Ready { .. }), "{stop}");
+        assert_eq!(notify::blocker_line(&ticket(), stop), None);
+    }
+    assert!(outcomes[3].is_ok(), "{outcomes:?}");
+
+    let events = bench.events();
+    let passes = by_pass(&events, 0, &ends.borrow());
+    let runs_in = |pass: &[Event]| -> Vec<Value> {
+        pass.iter()
+            .filter(|e| e.kind == EventKind::RunStarted)
+            .map(|e| e.data["role"].clone())
+            .collect()
+    };
+    let per_pass: Vec<Vec<Value>> = passes.iter().map(|pass| runs_in(pass)).collect();
+    assert_eq!(
+        per_pass,
+        [
+            vec![json!("intake")],
+            vec![],
+            vec![json!("answer_check"), json!("intake")],
+            vec![],
+            vec![json!("intake")],
+            vec![json!("build")],
+        ],
+        "{lines}"
+    );
+    // Dispatched once, after the intake of the edited text.
+    let dispatches: Vec<usize> = passes
+        .iter()
+        .enumerate()
+        .filter(|(_, pass)| !dispatched(pass).is_empty())
+        .map(|(n, _)| n + 1)
+        .collect();
+    assert_eq!(dispatches, [6]);
+    let build = bench.briefs().pop().unwrap();
+    assert_eq!(build.role, Role::Build);
+    assert!(build.ticket.description.contains("Say it in English."));
+    // Back in the column after the answered round, blocked by both.
+    let mut told = waits(&passes[2]);
+    assert_eq!(told.len(), 1, "{told:?}");
+    let (id, reason, mut blockers) = told.pop().unwrap();
+    blockers
+        .as_array_mut()
+        .unwrap()
+        .sort_by_key(ToString::to_string);
+    assert_eq!(
+        (id.as_str(), reason, blockers),
+        ("DEMO-1", json!("blocked_by"), json!(["DEMO-2", "DEMO-3"]))
+    );
+    // Each dependency related once, the one named only in the answer too.
+    assert_eq!(
+        bench.relations_written(),
+        ["DEMO-3 -> DEMO-1", "DEMO-2 -> DEMO-1"]
+    );
+    let record = bench.record().intake.unwrap();
+    let kept: Vec<(&str, DependencyOutcome)> = record
+        .dependencies
+        .iter()
+        .map(|d| (d.ticket.as_str(), d.outcome))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("DEMO-3", DependencyOutcome::Existed),
+            ("DEMO-2", DependencyOutcome::Existed),
+        ]
+    );
+    let intakes = intake_comments(&bench, TICKET);
+    assert_eq!(intakes.len(), 3, "{intakes:?}");
+    assert!(intakes.iter().all(|c| c.contains(routing)), "{intakes:?}");
+    assert!(
+        intakes[1].contains(&format!("DEMO-2, named by `{answer}`: relation written")),
+        "{}",
+        intakes[1]
+    );
+    assert!(
+        intakes[2].contains(&format!(
+            "DEMO-2, named by `{answer}`: relation already there"
+        )),
+        "{}",
+        intakes[2]
+    );
+}
+
+/// Scenario S6, "The human is the bottleneck", with `max_open_prs = 1`. The
+/// drain's Build of DEMO-1 stops at a usage limit, which tells the operator,
+/// and leaves DEMO-1 at Build: after the reset, DEMO-2, taken in, waits for
+/// the one slot until a person types `continue`, which delivers DEMO-1. In
+/// a new `watch --drain`, DEMO-1's open pull request holds DEMO-2's Build at
+/// the cap, told once, while nothing is notified; the pass that reads
+/// DEMO-1 merged builds DEMO-2.
+#[test]
+fn scenario_s6_the_human_is_the_bottleneck() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "max_open_prs = 1\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "Greet once more.",
+    );
+
+    // DEMO-1's Build cut by the usage limit; after the reset, DEMO-2 waits
+    // for the slot DEMO-1 holds.
+    let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let reset: Timestamp = "2026-10-02T12:00:00Z".parse().unwrap();
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some(reset);
+    let ends = RefCell::new(Vec::new());
+    let (held, lines, printed) = bench.drain(vec![intake(), intake(), limited], 4, |pass| {
+        ends.borrow_mut().push(bench.events().len());
+        if pass == 2 {
+            bench.clock.set(reset);
+        }
+    });
+    assert_eq!(held.len(), 3, "{held:?}\n{lines}\n{printed}");
+    let stop = held[2].as_ref().expect_err("the usage limit");
+    assert!(matches!(stop, Stop::UsageLimit { .. }), "{stop}");
+    assert!(notify::blocker_line(&ticket(), stop).is_some());
+    let at = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!(at.status(), Status::Active(Stage::Build));
+    let events = bench.events();
+    let passes = by_pass(&events, 0, &ends.borrow());
+    assert_eq!(
+        waits(&passes[2]),
+        [("DEMO-2".to_owned(), json!("slot"), Value::Null)],
+        "{lines}"
+    );
+    assert!(passes[2..].iter().all(|pass| dispatched(pass).is_empty()));
+
+    // The person continues DEMO-1, which delivers its pull request.
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    // At the cap, then released by the merge.
+    let before = bench.events().len();
+    let ends = RefCell::new(Vec::new());
+    let build = bench.reply(Some("Hello there"), Some(&done_for("DEMO-2")));
+    let (drained, lines, printed) = bench.drain(vec![build], 3, |pass| {
+        ends.borrow_mut().push(bench.events().len());
+        if pass == 2 {
+            bench.merge("DEMO-1");
+        }
+    });
+    assert_eq!(drained.len(), 1, "{drained:?}\n{lines}\n{printed}");
+    assert!(drained[0].is_ok(), "{drained:?}");
+    let events = bench.events();
+    let capped: Vec<Value> = events[before..]
+        .iter()
+        .filter(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("pr_cap")))
+        .map(|e| {
+            json!([
+                e.ticket.as_ref().map(|t| t.as_str().to_owned()),
+                e.data["open_prs"],
+                e.data["max_open_prs"]
+            ])
+        })
+        .collect();
+    assert_eq!(capped, [json!(["DEMO-2", 1, 1])], "{lines}");
+    assert_eq!(
+        lines.matches("reached their cap (1 of 1)").count(),
+        1,
+        "{lines}"
+    );
+    let passes = by_pass(&events, before, &ends.borrow());
+    let per_pass: Vec<Vec<String>> = passes.iter().map(|pass| dispatched(pass)).collect();
+    assert_eq!(per_pass, [vec![], vec![], vec!["DEMO-2".to_owned()]]);
+    let read = merge_read(&passes[2], "DEMO-1").expect("the merge read");
+    let dispatch = passes[2]
+        .iter()
+        .position(|e| e.kind == EventKind::Dispatch)
+        .unwrap();
+    assert!(read < dispatch);
+
+    // No intake that ends done, no delivery and no cap told the operator.
+    for outcome in held[..2].iter().chain(&drained) {
+        if let Err(stop) = outcome {
+            assert_eq!(notify::blocker_line(&ticket(), stop), None, "{stop}");
+        }
+    }
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-2".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Build, "DEMO-2".to_owned()),
+        ]
+    );
+}
+
+impl Bench {
+    /// What the ticket `id` holds on the tracker: its `ticket.md` and its
+    /// comments.
+    fn on_tracker(&self, id: &str) -> (String, Vec<String>) {
+        let dir = self.remote.checkout.join("tickets").join(id);
+        let file = fs::read_to_string(dir.join("ticket.md")).unwrap();
+        let comments = if dir.join("comments").exists() {
+            self.comments_on(id)
+        } else {
+            Vec::new()
+        };
+        (file, comments)
+    }
+
+    /// A person rewrites the `labels` line of `id` to `labels`.
+    fn label(&self, id: &str, labels: &[&str]) {
+        let file = self
+            .remote
+            .checkout
+            .join("tickets")
+            .join(id)
+            .join("ticket.md");
+        let text = fs::read_to_string(&file).unwrap();
+        let line = text.lines().find(|l| l.starts_with("labels = ")).unwrap();
+        fs::write(&file, text.replace(line, &format!("labels = {labels:?}"))).unwrap();
+    }
+
+    /// A person moves `id` to `stage`.
+    fn move_to(&self, id: &str, stage: &str) {
+        MarkdownTracker::new(&self.remote.checkout)
+            .set_stage(&TicketId::new(id).unwrap(), stage)
+            .unwrap();
+    }
+}
+
+/// Scenario S12, "The human keeps control", with the exclusion label
+/// `manual`. DEMO-2 carries it from the start: never taken in. DEMO-1,
+/// taken in, gets it from a person: never dispatched, told once. DEMO-3
+/// lacks the admission label, DEMO-4's gesture is a stranger's, and a
+/// person moves DEMO-6 out of the column before its turn: none gets a
+/// comment, a stage or a ticket ref. A person moves DEMO-5 out once it is
+/// taken in: nothing more is written on it.
+#[test]
+fn scenario_s12_the_human_keeps_control() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]\nexclude = \"manual\"",
+    );
+    let admitted = ["agent"];
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent", "manual"],
+        "",
+        "Mine.",
+    );
+    bench.put_ticket("DEMO-3", "maintainer", "Todo", &[], "", "Not for agents.");
+    bench.put_ticket("DEMO-4", "stranger", "Todo", &admitted, "", "Please do it.");
+    bench.put_ticket(
+        "DEMO-5",
+        "maintainer",
+        "Todo",
+        &admitted,
+        "",
+        "Greet twice.",
+    );
+    bench.put_ticket(
+        "DEMO-6",
+        "maintainer",
+        "Todo",
+        &admitted,
+        "",
+        "Greet thrice.",
+    );
+    let untouched = ["DEMO-2", "DEMO-3", "DEMO-4", "DEMO-6"];
+    let kept = RefCell::new(Vec::new());
+    let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let (outcomes, lines, printed) = bench.drain(vec![intake(), intake()], 4, |pass| match pass {
+        1 => {
+            bench.label(TICKET, &["agent", "manual"]);
+            bench.move_to("DEMO-6", "In Progress");
+            for id in untouched {
+                kept.borrow_mut().push(bench.on_tracker(id));
+            }
+        }
+        2 => {
+            bench.move_to("DEMO-5", "In Progress");
+            kept.borrow_mut().push(bench.on_tracker("DEMO-5"));
+        }
+        _ => {}
+    });
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-5".to_owned()),
+        ]
+    );
+    let events = bench.events();
+    assert!(dispatched(&events).is_empty(), "{lines}");
+
+    // Nothing written on the tickets Owlshift did not take, nor after a
+    // person took one back.
+    let kept = kept.borrow();
+    for (id, before) in untouched.iter().chain(&["DEMO-5"]).zip(kept.iter()) {
+        assert_eq!(&bench.on_tracker(id), before, "{id}");
+    }
+    for id in untouched {
+        assert!(bench.on_tracker(id).1.is_empty(), "{id}");
+        assert!(bench.record_of(id).is_none(), "{id}");
+    }
+    assert_eq!(bench.shown("DEMO-5").stage, "In Progress");
+    // Only the two intakes wrote on the tracker, and only their comments.
+    let written: Vec<(String, Value)> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::TrackerWrite)
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str().to_owned(),
+                e.data["kind"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        written,
+        [
+            ("DEMO-1".to_owned(), json!("INTAKE")),
+            ("DEMO-5".to_owned(), json!("INTAKE")),
+        ]
+    );
+    assert_eq!(bench.stage(), "Todo");
+
+    // Each exclusion told once, in watch's log only; the stranger warned of
+    // once.
+    let excluded: Vec<_> = waits(&events)
+        .into_iter()
+        .filter(|(_, reason, _)| *reason == json!("excluded"))
+        .collect();
+    assert_eq!(
+        excluded,
+        [
+            ("DEMO-2".to_owned(), json!("excluded"), Value::Null),
+            ("DEMO-1".to_owned(), json!("excluded"), Value::Null),
+        ],
+        "{lines}"
+    );
+    let warned: Vec<(String, Value)> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("not_admitted"))
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str().to_owned(),
+                e.data["account"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(warned, [("DEMO-4".to_owned(), json!("stranger"))]);
+}
+
+/// A Build `done` delivering DEMO-1 with seven follow-ups: one that needs
+/// DEMO-1's code; one titled as an open ticket; one titled as another
+/// parent's declined proposal; two more; the first again in other words of
+/// the same fingerprint; and one past the three per parent.
+fn proposing() -> String {
+    let followup = |title: &str, why: &str, source: &str| json!({ "title": title, "why": why, "source": source, "done_when": format!("{title}: done.") });
+    let mut first = followup("Translate the greeting", "Readers abroad.", "agent");
+    first["evidence"] = json!(["GREETING.md:1"]);
+    first["blocked_by_parent"] = json!(true);
+    let mut result: Value = serde_json::from_str(DONE).unwrap();
+    result["followups"] = json!([
+        first,
+        followup("Lint the docs", "Typos slip in.", "reviewer"),
+        followup("Cache the greeting", "It is read often.", "agent"),
+        followup(
+            "Document the greeting",
+            "Nobody knows it is there.",
+            "reviewer"
+        ),
+        followup("translate the greeting!", "Readers abroad, again.", "agent"),
+        followup("Test the greeting", "It could break unseen.", "ci"),
+        followup("Style the greeting", "It looks plain.", "agent"),
+    ]);
+    result.to_string()
+}
+
+/// Scenario S13, "Proposed follow-ups", through the Markdown tracker's own
+/// inbox. DEMO-1's delivery files its follow-ups as tickets at `Triage`,
+/// authored `owlshift`, related to DEMO-1 and blocked by it when they need
+/// its code, each standing on its own; a duplicate of an open ticket or of
+/// a declined proposal is not filed, a follow-up given twice is filed once,
+/// and past three the rest are only named in the DELIVERY report. No
+/// proposal is taken in at `Triage`, at `Backlog`, nor in the column while
+/// `owlshift` is its author; once a person makes DEMO-9 theirs, it is, and
+/// waits for DEMO-1.
+#[test]
+fn scenario_s13_proposed_follow_ups() {
+    let bench = Bench::draining("maintainer");
+    bench.inbox.borrow_mut().markdown = true;
+    let tickets = bench.remote.checkout.join("tickets");
+    for (id, front, description) in [
+        (
+            "DEMO-7",
+            "title = \"Lint the docs\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n",
+            "A person's own ticket.".to_owned(),
+        ),
+        (
+            "DEMO-8",
+            "title = \"Cache the greeting\"\nauthor = \"owlshift\"\nstage = \"Canceled\"\n",
+            format!(
+                "Declined.\n\n[owlshift] PROPOSAL · DEMO-5 · fingerprint {}",
+                owlshift_runner::proposals::fingerprint("Cache the greeting")
+            ),
+        ),
+    ] {
+        fs::create_dir_all(tickets.join(id)).unwrap();
+        fs::write(
+            tickets.join(id).join("ticket.md"),
+            format!("+++\n{front}+++\n\n{description}\n"),
+        )
+        .unwrap();
+    }
+    let proposals = ["DEMO-9", "DEMO-10", "DEMO-11"];
+    let filed = RefCell::new(Vec::new());
+    let left = RefCell::new(Vec::new());
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(&proposing())),
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+    ];
+    let ends = RefCell::new(Vec::new());
+    let file_9 = tickets.join("DEMO-9").join("ticket.md");
+    let rewrite = |from: &str, to: &str| {
+        let text = fs::read_to_string(&file_9).unwrap();
+        assert!(text.contains(from), "{text}");
+        fs::write(&file_9, text.replace(from, to)).unwrap();
+    };
+    let (outcomes, lines, printed) = bench.drain(replies, 6, |pass| {
+        ends.borrow_mut().push(bench.events().len());
+        match pass {
+            2 => {
+                for id in proposals {
+                    filed.borrow_mut().push(bench.shown(id));
+                }
+            }
+            3 => {
+                // DEMO-9 put in the column by a person who leaves it
+                // Owlshift's; DEMO-11 accepted into the backlog.
+                bench.move_to("DEMO-9", "Todo");
+                rewrite(
+                    "author = \"owlshift\"\n",
+                    "author = \"owlshift\"\nassignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+                );
+                bench.move_to("DEMO-11", "Backlog");
+                for id in &proposals[1..] {
+                    left.borrow_mut().push(bench.on_tracker(id));
+                }
+            }
+            4 => {
+                // The person makes it theirs, and watch's hold has passed.
+                rewrite("author = \"owlshift\"", "author = \"maintainer\"");
+                let later = bench.clock.get().checked_add(SignedDuration::from_mins(11));
+                bench.clock.set(later.unwrap());
+            }
+            _ => {}
+        }
+    });
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(outcomes[1].is_ok(), "the delivery: {outcomes:?}");
+
+    // Filed at Triage, each standing on its own; nothing past three.
+    let filed = filed.borrow();
+    for (proposal, (title, blocked)) in filed.iter().zip([
+        ("Translate the greeting", true),
+        ("Document the greeting", false),
+        ("Test the greeting", false),
+    ]) {
+        let parent = vec![ticket()];
+        assert_eq!(proposal.title, title);
+        assert_eq!(
+            (proposal.stage.as_str(), proposal.author.as_str()),
+            ("Triage", "owlshift")
+        );
+        assert_eq!(proposal.related, parent, "{title}");
+        assert_eq!(proposal.blocked_by, if blocked { parent } else { vec![] });
+        assert!(proposal.labels.is_empty() && proposal.assignee.is_none());
+        for part in [
+            "**Why:** ",
+            "**Found by:** ",
+            "**Done when:** ",
+            "**Proposed by** Owlshift's delivery run on DEMO-1",
+        ] {
+            assert!(
+                proposal.description.contains(part),
+                "{part}\n{}",
+                proposal.description
+            );
+        }
+        let footer = format!(
+            "[owlshift] PROPOSAL · DEMO-1 · fingerprint {}",
+            owlshift_runner::proposals::fingerprint(title)
+        );
+        assert!(proposal.description.trim_end().ends_with(&footer));
+    }
+    assert!(filed[0].description.contains("`GREETING.md:1`"));
+    assert!(!tickets.join("DEMO-12").exists());
+    let id = |s: &str| TicketId::new(s).unwrap();
+    assert_eq!(
+        proposal_outcomes(&bench),
+        [
+            ProposalOutcome::Filed {
+                ticket: id("DEMO-9")
+            },
+            ProposalOutcome::Duplicate {
+                ticket: id("DEMO-7")
+            },
+            ProposalOutcome::Duplicate {
+                ticket: id("DEMO-8")
+            },
+            ProposalOutcome::Filed {
+                ticket: id("DEMO-10")
+            },
+            ProposalOutcome::Filed {
+                ticket: id("DEMO-11")
+            },
+            ProposalOutcome::OverLimit,
+        ]
+    );
+    let report = bench
+        .comments()
+        .into_iter()
+        .find(|c| c.starts_with("[owlshift] DELIVERY"))
+        .unwrap();
+    for line in [
+        "- Proposed follow-up **Translate the greeting**, filed as DEMO-9 for triage: Readers abroad.",
+        "- Proposed follow-up **Lint the docs**, not filed, already proposed as DEMO-7: Typos slip in.",
+        "- Proposed follow-up **Cache the greeting**, not filed, already proposed as DEMO-8: It is \
+         read often.",
+        "- Proposed follow-up **translate the greeting!**, filed as DEMO-9 for triage: Readers \
+         abroad, again.",
+        "- Proposed follow-up **Style the greeting**, not filed past the three per ticket: It \
+         looks plain.",
+    ] {
+        assert!(report.contains(line), "{line}\n---\n{report}");
+    }
+
+    // No proposal taken in before a person made it theirs.
+    let events = bench.events();
+    let passes = by_pass(&events, 0, &ends.borrow());
+    assert!(
+        passes[2..4]
+            .iter()
+            .all(|pass| pass.iter().all(|e| e.kind != EventKind::RunStarted))
+    );
+    let warned: Vec<(String, Value)> = passes[3]
+        .iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("not_admitted"))
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str().to_owned(),
+                e.data["account"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(warned, [("DEMO-9".to_owned(), json!("owlshift"))]);
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-9".to_owned()),
+        ]
+    );
+    let record = bench.record_of("DEMO-9").unwrap().intake.unwrap();
+    assert_eq!(record.gesture.account, "maintainer");
+    assert!(
+        waits(&passes[5]).contains(&("DEMO-9".to_owned(), json!("blocked_by"), json!(["DEMO-1"]))),
+        "{lines}"
+    );
+    // The others are left as the person left them.
+    for (id, before) in proposals[1..].iter().zip(left.borrow().iter()) {
+        assert_eq!(&bench.on_tracker(id), before, "{id}");
+        assert!(bench.record_of(id).is_none(), "{id}");
+    }
+}
