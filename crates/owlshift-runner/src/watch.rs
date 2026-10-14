@@ -23,6 +23,10 @@
 //! Watch ([`outlived`]) has its pull request read before its comments, for
 //! an end alone, which closes the round (OWL-242); so has a ticket parked at
 //! Watch, whose park an end ends without restarting anything (OWL-243).
+//! Before either, the stage of each ticket at Watch whose delivery is
+//! followed is read: one a stop left at working while no run holds the
+//! project's lock is moved to the stage its ref shows (OWL-265,
+//! [`OnDemand::unstick`]).
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -53,8 +57,10 @@ use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
 use crate::on_demand::{self, Delivered, Landed, OnDemand, PIPELINE, Stop};
+use crate::project::ProjectLock;
 use crate::reversal::{self, Current};
 use crate::ticket_ref::{self, Stored, TicketRecord};
+use crate::writer::VisibleStage;
 
 /// How long watch sleeps after each pass.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -259,6 +265,30 @@ struct Memory {
     failing: HashMap<TicketId, String>,
     /// What watch keeps of the pull requests it follows.
     following: Following,
+    /// What watch keeps of the stages it found left at working.
+    stale: Stale,
+}
+
+/// What watch keeps, per ticket, of the stages a stop left at working
+/// (OWL-265, architecture section 5, "The stage while a repair runs").
+#[derive(Default)]
+struct Stale {
+    /// The ticket ref's commit when watch last moved its stage: no stage is
+    /// read again, nor a person's working moved, until the ref moves.
+    moved: HashMap<TicketId, String>,
+    /// Until when a move the tracker refused is not tried again.
+    held: HashMap<TicketId, Timestamp>,
+    /// Why the stage could not be read or moved, as last warned of.
+    warned: HashMap<TicketId, String>,
+}
+
+impl Stale {
+    /// Forgets the tickets `kept` does not name.
+    fn retain(&mut self, kept: &[TicketId]) {
+        self.moved.retain(|ticket, _| kept.contains(ticket));
+        self.held.retain(|ticket, _| kept.contains(ticket));
+        self.warned.retain(|ticket, _| kept.contains(ticket));
+    }
 }
 
 /// Called with each continue's outcome, for the caller to print it and tell
@@ -353,6 +383,9 @@ impl Watch<'_> {
         memory
             .following
             .retain(&[&followed[..], &read[..], &unread[..]].concat());
+        memory
+            .stale
+            .retain(&[&followed[..], &read[..], &unread[..]].concat());
         self.note(
             memory,
             out,
@@ -362,6 +395,12 @@ impl Watch<'_> {
             },
         );
         for (ticket, stored, status, outlived) in waiting {
+            // A stage a stop left at working first (OWL-265): an end then
+            // moves the stage it shows to review, which it would not do
+            // from working, so the two may make two moves in one pass.
+            if outlived {
+                self.unstick(memory, sink, out, &ticket, &stored, status);
+            }
             // A pass whose read ended the following reads no comment: an
             // answer posted with the merge starts nothing.
             if outlived && self.close_outlived(memory, sink, out, &ticket, &stored, status) {
@@ -372,6 +411,16 @@ impl Watch<'_> {
             }
         }
         for (ticket, stored) in following {
+            // A repair this pass decides moves the stage to working again
+            // once it starts, and back once it ends.
+            self.unstick(
+                memory,
+                sink,
+                out,
+                &ticket,
+                &stored,
+                Status::Active(Stage::Watch),
+            );
             self.follow(memory, sink, out, continued, &ticket, &stored);
         }
     }
@@ -562,6 +611,100 @@ impl Watch<'_> {
         true
     }
 
+    /// A ticket in `status` at Watch whose delivery is followed, its stage
+    /// left at working by a stop that did not move it back (OWL-265): a
+    /// kill or a crash before any push, a park or a round whose own move
+    /// the tracker refused, a move back that failed. Its stage is read
+    /// without the lock; one that shows working is moved to the stage
+    /// `status` shows only under the lock, so no repair runs, while the
+    /// project is not quarantined and the ticket ref is the one the snapshot
+    /// read, and only while a second read still shows working. Once moved,
+    /// nothing is read again until the ref moves, so a person's own working
+    /// is moved at most once; a move the tracker refused is tried again
+    /// after [`RETRY_AFTER`]. A read or move that fails is a
+    /// `stage_not_moved` warning, once until its reason changes.
+    fn unstick(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        stored: &Stored,
+        status: Status,
+    ) {
+        let on_demand = self.on_demand;
+        let Some(to) = VisibleStage::of(status) else {
+            return;
+        };
+        let stale = &memory.stale;
+        let now = (on_demand.clock)();
+        if stale.moved.get(ticket) == Some(&stored.commit)
+            || stale.held.get(ticket).is_some_and(|until| now < *until)
+        {
+            return;
+        }
+        match on_demand.shows_working(ticket) {
+            Ok(true) => {}
+            Ok(false) => {
+                memory.stale.warned.remove(ticket);
+                return;
+            }
+            Err(reason) => return self.stale_warning(memory, sink, ticket, to, reason),
+        }
+        let _lock = match self.locked_at(ticket, &stored.commit) {
+            Ok(Some(lock)) => lock,
+            // Busy, or the ref moved: the next pass reads it again.
+            Ok(None) => return,
+            Err(reason) => return self.stale_warning(memory, sink, ticket, to, reason),
+        };
+        // A run stopped since the snapshot may have left the project for a
+        // person to look at first.
+        if !matches!(on_demand.dirs.unverified(), Ok(None)) {
+            return;
+        }
+        match on_demand.unstick(ticket, status, sink) {
+            Ok(moved) => {
+                memory.stale.warned.remove(ticket);
+                if moved {
+                    memory
+                        .stale
+                        .moved
+                        .insert(ticket.clone(), stored.commit.clone());
+                    self.line(
+                        out,
+                        &format!(
+                            "{ticket} showed working with no run working it: shown as {} again",
+                            to.key()
+                        ),
+                    );
+                }
+            }
+            Err((to, reason)) => {
+                let until = now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX);
+                memory.stale.held.insert(ticket.clone(), until);
+                self.stale_warning(memory, sink, ticket, to, reason);
+            }
+        }
+    }
+
+    /// Warns that `ticket`'s stage could not be read or moved to `to`, unless
+    /// the last warning said the same.
+    fn stale_warning(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        ticket: &TicketId,
+        to: VisibleStage,
+        reason: String,
+    ) {
+        if memory.stale.warned.get(ticket) == Some(&reason) {
+            return;
+        }
+        self.on_demand
+            .stage_not_moved(ticket, None, to, &reason, sink);
+        memory.stale.warned.insert(ticket.clone(), reason);
+    }
+
     /// A followed pull request whose ticket keeps decisions (OWL-146): its
     /// comments, and a correction once the decider's replies to a DECISION
     /// count, by the quiet window as an answer does, held as a continue is
@@ -642,19 +785,35 @@ impl Watch<'_> {
         seen: &str,
         record: &TicketRecord,
     ) -> Result<Option<String>, String> {
+        let Some(_lock) = self.locked_at(ticket, seen)? else {
+            return Ok(None);
+        };
+        let git = &self.on_demand.executor.git;
+        ticket_ref::write(
+            git,
+            &self.on_demand.dirs.checkout(),
+            ticket,
+            record,
+            Some(seen),
+        )
+        .map(Some)
+    }
+
+    /// The project's lock, once the ticket ref read under it is still
+    /// `seen`, the commit the snapshot read: `None` when the project is busy
+    /// or the ref moved.
+    fn locked_at(&self, ticket: &TicketId, seen: &str) -> Result<Option<ProjectLock>, String> {
         let dirs = self.on_demand.dirs;
-        let _lock = match dirs.lock() {
+        let lock = match dirs.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return Ok(None),
             Err(e) => return Err(format!("the project's lock: {e}")),
         };
-        let git = &self.on_demand.executor.git;
-        let checkout = dirs.checkout();
-        let current = ticket_ref::read(git, &checkout, ticket)?;
+        let current = ticket_ref::read(&self.on_demand.executor.git, &dirs.checkout(), ticket)?;
         if current.map(|stored| stored.commit).as_deref() != Some(seen) {
             return Ok(None);
         }
-        ticket_ref::write(git, &checkout, ticket, record, Some(seen)).map(Some)
+        Ok(Some(lock))
     }
 
     /// The ticket refs, read under the project's lock, once its marker says

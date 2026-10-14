@@ -2558,19 +2558,32 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) {
         if let Err(reason) = self.move_stage(ticket, run, stage, sink) {
-            let states = &self.config.tracker.states;
-            sink.emit(
-                ticket,
-                run,
-                EventKind::Warning,
-                data([
-                    ("what", json!("stage_not_moved")),
-                    ("stage", json!(stage.key())),
-                    ("state", json!(stage.state(states))),
-                    ("reason", json!(reason)),
-                ]),
-            );
+            self.stage_not_moved(ticket, run, stage, &reason, sink);
         }
+    }
+
+    /// The `stage_not_moved` warning: `stage` could not be shown, for
+    /// `reason`.
+    pub(crate) fn stage_not_moved(
+        &self,
+        ticket: &TicketId,
+        run: Option<&str>,
+        stage: VisibleStage,
+        reason: &str,
+        sink: &mut EventSink<'_>,
+    ) {
+        let states = &self.config.tracker.states;
+        sink.emit(
+            ticket,
+            run,
+            EventKind::Warning,
+            data([
+                ("what", json!("stage_not_moved")),
+                ("stage", json!(stage.key())),
+                ("state", json!(stage.state(states))),
+                ("reason", json!(reason)),
+            ]),
+        );
     }
 
     /// Moves the ticket's visible stage through the Writer, with its
@@ -2616,29 +2629,35 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<(), String> {
         match VisibleStage::of(status) {
-            Some(shown) => self.review_while(ticket, shown, sink),
+            Some(shown) => self
+                .move_while(ticket, shown, VisibleStage::Review, sink)
+                .map(|_| ()),
             None => Ok(()),
         }
     }
 
-    /// Moves the ticket to review while the tracker still shows `shown`,
-    /// keeping any other stage, one a person or an integration moved it to;
-    /// the stage read or written otherwise is the error.
-    fn review_while(
+    /// Moves the ticket to `to` while the tracker still shows `shown`,
+    /// keeping any other stage, one a person or an integration moved it to,
+    /// and returns whether it moved; the stage read or written otherwise is
+    /// the error.
+    fn move_while(
         &self,
         ticket: &TicketId,
         shown: VisibleStage,
+        to: VisibleStage,
         sink: &mut EventSink<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
+        let states = &self.config.tracker.states;
         let stage = self
             .tracker
             .stage(ticket)
             .map_err(|e| format!("reading its stage: {e}"))?;
-        if stage != shown.state(&self.config.tracker.states) {
-            return Ok(());
+        if stage != shown.state(states) || to.state(states) == shown.state(states) {
+            return Ok(false);
         }
-        self.move_stage(ticket, None, VisibleStage::Review, sink)
-            .map_err(|e| format!("moving it to review: {e}"))
+        self.move_stage(ticket, None, to, sink)
+            .map_err(|e| format!("moving it to {}: {e}", to.key()))?;
+        Ok(true)
     }
 
     /// Moves a ticket the tracker still shows as working back to review
@@ -2646,20 +2665,42 @@ impl OnDemand<'_> {
     /// after a repair's runs end, and after a read adopts a push a crash
     /// left. A stage read or move that fails is a `stage_not_moved` warning.
     pub(crate) fn review_after_working(&self, ticket: &TicketId, sink: &mut EventSink<'_>) {
-        if let Err(reason) = self.review_while(ticket, VisibleStage::Working, sink) {
-            let states = &self.config.tracker.states;
-            sink.emit(
-                ticket,
-                None,
-                EventKind::Warning,
-                data([
-                    ("what", json!("stage_not_moved")),
-                    ("stage", json!(VisibleStage::Review.key())),
-                    ("state", json!(VisibleStage::Review.state(states))),
-                    ("reason", json!(reason)),
-                ]),
-            );
+        if let Err(reason) =
+            self.move_while(ticket, VisibleStage::Working, VisibleStage::Review, sink)
+        {
+            self.stage_not_moved(ticket, None, VisibleStage::Review, &reason, sink);
         }
+    }
+
+    /// Whether the tracker shows the ticket as working, read without the
+    /// project's lock, for `owlshift watch` to look for a stage a stop left
+    /// (OWL-265); the stage read otherwise is the error.
+    pub(crate) fn shows_working(&self, ticket: &TicketId) -> Result<bool, String> {
+        let stage = self
+            .tracker
+            .stage(ticket)
+            .map_err(|e| format!("reading its stage: {e}"))?;
+        Ok(stage == VisibleStage::Working.state(&self.config.tracker.states))
+    }
+
+    /// For `owlshift watch`, under the project's lock, so no repair runs
+    /// (OWL-265, architecture section 5, "The stage while a repair runs"):
+    /// moves a ticket in `status` that the tracker still shows as working to
+    /// the stage `status` shows ([`VisibleStage::of`]: review at Watch, needs
+    /// input for a round waiting there, parked for a park), keeping any other
+    /// stage. Returns whether it moved; the stage read or written otherwise
+    /// is the error, with the stage it was to show.
+    pub(crate) fn unstick(
+        &self,
+        ticket: &TicketId,
+        status: Status,
+        sink: &mut EventSink<'_>,
+    ) -> Result<bool, (VisibleStage, String)> {
+        let Some(to) = VisibleStage::of(status) else {
+            return Ok(false);
+        };
+        self.move_while(ticket, VisibleStage::Working, to, sink)
+            .map_err(|reason| (to, reason))
     }
 
     /// The end of a repair (OWL-259): once its runs started, or its push was
