@@ -8250,3 +8250,164 @@ fn a_dropped_admitter_does_not_hold_up_the_next_ticket() {
         .collect();
     assert_eq!(dispatched, ["DEMO-1"]);
 }
+
+/// OWL-273: an answered intake round's second intake, cut off by a usage
+/// limit, leaves the ticket at Intake, shown waiting, out of the ready
+/// column; plain `watch` holds it until the limit resets, then resumes it,
+/// with no `continue` typed: intake runs again and the ticket goes back to
+/// the ready column.
+#[test]
+fn watch_resumes_an_intake_cut_off_after_its_answered_round() {
+    let bench = Bench::drained();
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"scope","context":"The ticket names no language.",
+                "text":"Which language should the greeting use?"}]"#,
+        )),
+    );
+    bench
+        .intake(vec![asks], gesture("maintainer"))
+        .expect_err("questions");
+    bench.answer("English.");
+    let reset: Timestamp = "2026-10-03T18:00:00Z".parse().unwrap();
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some(reset);
+    let replies = vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+        limited,
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+    ];
+    let intakes = || {
+        bench
+            .briefs()
+            .iter()
+            .filter(|brief| brief.role == Role::Intake)
+            .count()
+    };
+    let mut pass = 0;
+    let (outcomes, lines, _) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        match pass {
+            // Cut off: at Intake, still shown waiting.
+            1 => {
+                let state = TicketState::try_from(&bench.record().state).unwrap();
+                assert_eq!(state.status(), Status::Active(Stage::Intake));
+                assert_eq!(bench.stage(), "Needs Input");
+                assert_eq!(intakes(), 2);
+            }
+            // Paused until the reset: nothing ran. Past it now.
+            2 => {
+                assert_eq!(intakes(), 2);
+                let past = reset.duration_since(bench.clock.get()) + SignedDuration::from_mins(1);
+                bench.waited.set(past);
+            }
+            _ => return false,
+        }
+        true
+    });
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}");
+    assert!(
+        matches!(outcomes[0], Err(Stop::UsageLimit { .. })),
+        "{outcomes:?}"
+    );
+    assert!(matches!(outcomes[1], Err(Stop::Ready { .. })), "{outcomes:?}");
+    assert!(
+        lines.contains("no ticket is continued before the usage limit resets"),
+        "{lines}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(
+        roles,
+        [Role::Intake, Role::AnswerCheck, Role::Intake, Role::Intake]
+    );
+    let state = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!(state.status(), Status::Active(Stage::Ready));
+    assert_eq!(bench.stage(), "Todo");
+    assert_eq!(
+        bench.stage_events(EventKind::TrackerWrite),
+        ["Needs Input", "Todo"]
+    );
+    let resumed: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["stage"] == json!("intake"))
+        .collect();
+    assert_eq!(resumed.len(), 1, "{resumed:?}");
+    assert_eq!(resumed[0]["watch"], json!("continue"));
+}
+
+/// OWL-273: watch leaves a ticket at Intake shown in another stage than
+/// needs input, here back in the ready column, which is the drain's; one
+/// shown waiting whose resume leaves its ticket ref as it was, its INTAKE
+/// comment refused, is held for the ten minutes a continue is.
+#[test]
+fn a_resume_of_an_intake_is_held_and_one_shown_ready_is_left() {
+    let bench = Bench::drained();
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"scope","context":"The ticket names no language.",
+                "text":"Which language should the greeting use?"}]"#,
+        )),
+    );
+    bench
+        .intake(vec![asks], gesture("maintainer"))
+        .expect_err("questions");
+    bench.answer("English.");
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (outcome, _) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+        limited,
+    ]);
+    assert!(
+        matches!(outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}"
+    );
+    let ran = || bench.briefs().len();
+    assert_eq!(ran(), 3);
+
+    MarkdownTracker::new(&bench.remote.checkout)
+        .set_stage(&ticket(), "Todo")
+        .unwrap();
+    let (outcomes, lines, _) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}");
+    assert_eq!(ran(), 3);
+
+    MarkdownTracker::new(&bench.remote.checkout)
+        .set_stage(&ticket(), "Needs Input")
+        .unwrap();
+    bench.refuse.set(Some("[owlshift] INTAKE"));
+    let done = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let mut pass = 0;
+    let (outcomes, lines, _) = bench.watch(vec![done(), done()], &mut |_| {
+        pass += 1;
+        match pass {
+            1 => assert_eq!(ran(), 4),
+            // Held: nothing ran. Eleven minutes on, it is resumed again.
+            2 => {
+                assert_eq!(ran(), 4);
+                bench
+                    .waited
+                    .set(bench.waited.get() + SignedDuration::from_mins(11));
+            }
+            _ => return false,
+        }
+        true
+    });
+    assert_eq!(ran(), 5, "{lines}");
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    assert!(
+        outcomes.iter().all(|o| matches!(o, Err(Stop::Refused(_)))),
+        "{outcomes:?}"
+    );
+    assert!(
+        lines.contains("DEMO-1 is at Intake as it was before that resume"),
+        "{lines}"
+    );
+    assert_eq!(bench.stage(), "Needs Input");
+}
