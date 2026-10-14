@@ -350,6 +350,8 @@ struct Clocked<'a> {
     refuse_mention: bool,
     /// How many of the next comment reads fail, as a tracker that is down.
     fail_reads: &'a Cell<u32>,
+    /// What happens once, right after the next stage read.
+    after_stage_read: &'a RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 /// The clock's time, then a minute later.
@@ -409,7 +411,11 @@ impl Tracker for Clocked<'_> {
     }
 
     fn stage(&self, id: &TicketId) -> Result<String, tracker::Error> {
-        Tracker::stage(&self.inner, id)
+        let stage = Tracker::stage(&self.inner, id);
+        if let Some(after) = self.after_stage_read.borrow_mut().take() {
+            after();
+        }
+        stage
     }
 
     fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), tracker::Error> {
@@ -459,6 +465,8 @@ struct Bench {
     refuse_mention: Cell<bool>,
     /// How many of the next comment reads the tracker refuses.
     fail_reads: Cell<u32>,
+    /// What happens once, right after the tracker's next stage read.
+    after_stage_read: RefCell<Option<Box<dyn FnOnce()>>>,
     /// How long after the time of the next comment `continue` reads this
     /// machine's clock: by default the quiet window, so the decider's
     /// latest comment, a minute older, counts.
@@ -577,6 +585,7 @@ impl Bench {
             refuse_stage: Cell::new(false),
             refuse_mention: Cell::new(false),
             fail_reads: Cell::new(0),
+            after_stage_read: RefCell::new(None),
             waited: Cell::new(SignedDuration::from_mins(10)),
         }
     }
@@ -889,6 +898,7 @@ impl Bench {
             refuse_stage: self.refuse_stage.get(),
             refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
+            after_stage_read: &self.after_stage_read,
         };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
@@ -5253,6 +5263,151 @@ fn a_refused_move_to_working_is_a_warning_and_the_fix_runs() {
     assert_eq!(warned[0]["stage"], "working");
     assert_eq!(state_of(&bench).fix_passes(), 1);
     assert_eq!(bench.stage(), "In Review");
+}
+
+/// A delivered ticket whose first watch pass has run, so the owed report
+/// is posted and the ticket ref stays as it is while its pull request does,
+/// shown as working, as a stop that did not move it back leaves it (OWL-265).
+fn left_working(bench: &Bench) {
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.stage(), "In Review");
+    move_ticket(bench, "In Progress");
+}
+
+/// OWL-265's acceptance: a ticket at Watch that a stop left at working, with
+/// no run working it, shows review again at the next pass. A person who moves
+/// it to working again, its ticket ref unchanged, is left alone.
+#[test]
+fn a_stage_a_stop_left_at_working_shows_review_again_once() {
+    let bench = delivered();
+    left_working(&bench);
+    let (from, commit) = (bench.events().len(), bench.ref_commit());
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        if pass == 1 {
+            // Moved at the first pass, then to working again by a person.
+            assert_eq!(bench.stage(), "In Review");
+            move_ticket(&bench, "In Progress");
+        }
+        pass < 2
+    });
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(stage_moves(&bench, from), ["review"]);
+    assert_eq!(bench.stage(), "In Progress");
+    assert_eq!(bench.ref_commit(), commit);
+    assert!(
+        lines.contains("DEMO-1 showed working with no run working it: shown as In Review again"),
+        "{lines}"
+    );
+}
+
+/// OWL-265: a park or a round at Watch whose own move the tracker refused,
+/// left at working, shows the stage it waits in: parked, needs input.
+#[test]
+fn a_park_or_a_round_left_at_working_shows_its_own_stage() {
+    let parked = deliver(Bench::parking());
+    parked_at_watch(&parked);
+    move_ticket(&parked, "In Progress");
+    let (outcomes, lines, printed) = parked.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(parked.stage(), "Parked");
+
+    let asked = delivered();
+    asked_at_watch(&asked);
+    move_ticket(&asked, "In Progress");
+    let (outcomes, lines, printed) = asked.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(asked.stage(), "Needs Input");
+}
+
+/// OWL-265's guard: a stage read as working is moved only under the
+/// project's lock, while the project is not quarantined, the ticket ref is
+/// the one the pass read and a second read still shows working. Whatever
+/// changes right after the first read, the pass moves nothing; the next pass
+/// moves a stage still left at working once the lock is free.
+#[test]
+fn a_stage_left_at_working_is_moved_only_under_the_lock_and_unchanged() {
+    // The lock taken, as by a command typed meanwhile.
+    let bench = delivered();
+    left_working(&bench);
+    let held = Rc::new(RefCell::new(None));
+    let (dirs, keep) = (bench.dirs(), held.clone());
+    *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
+        *keep.borrow_mut() = Some(dirs.lock().unwrap().expect("a free lock"));
+    }));
+    let from = bench.events().len();
+    bench.watch(Vec::new(), &mut |_| false);
+    assert!(held.borrow().is_some());
+    assert_eq!(stage_moves(&bench, from), Vec::<String>::new());
+    assert_eq!(bench.stage(), "In Progress");
+    held.borrow_mut().take();
+    bench.watch(Vec::new(), &mut |_| false);
+    assert_eq!(stage_moves(&bench, from), ["review"]);
+
+    // A run stopped meanwhile, leaving the project for a person to look at.
+    let bench = delivered();
+    left_working(&bench);
+    let marker = bench.dirs().unverified_file();
+    *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
+        fs::write(&marker, "a run stopped\n").unwrap();
+    }));
+    let from = bench.events().len();
+    bench.watch(Vec::new(), &mut |_| false);
+    assert_eq!(stage_moves(&bench, from), Vec::<String>::new());
+    assert_eq!(bench.stage(), "In Progress");
+
+    // The ticket ref moved, as by a command typed meanwhile.
+    let bench = delivered();
+    left_working(&bench);
+    let (env, checkout) = (bench.env.clone(), bench.dirs().checkout());
+    let (record, commit) = (bench.record(), bench.ref_commit());
+    *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
+        let git = Git::with_setup("git", move |command| env.apply(command));
+        let moved = ticket_ref::write(&git, &checkout, &ticket(), &record, Some(&commit)).unwrap();
+        assert_ne!(moved, commit);
+    }));
+    let from = bench.events().len();
+    bench.watch(Vec::new(), &mut |_| false);
+    assert_eq!(stage_moves(&bench, from), Vec::<String>::new());
+    assert_eq!(bench.stage(), "In Progress");
+
+    // A repair ended meanwhile, moving the stage back itself.
+    let bench = delivered();
+    left_working(&bench);
+    let file = bench.ticket_file();
+    *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
+        let text = fs::read_to_string(&file).unwrap();
+        let line = text.lines().find(|l| l.starts_with("stage = ")).unwrap();
+        fs::write(&file, text.replace(line, "stage = \"In Review\"")).unwrap();
+    }));
+    let from = bench.events().len();
+    bench.watch(Vec::new(), &mut |_| false);
+    assert_eq!(stage_moves(&bench, from), Vec::<String>::new());
+    assert_eq!(bench.stage(), "In Review");
+}
+
+/// OWL-265: a tracker that refuses the move is warned of once, and the move
+/// is not tried again at each pass.
+#[test]
+fn a_refused_move_from_a_stage_left_at_working_is_warned_of_once() {
+    let bench = delivered();
+    left_working(&bench);
+    bench.refuse_stage.set(true);
+    let from = bench.events().len();
+    let mut pass = 0;
+    bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        pass < 3
+    });
+    let warned: Vec<Value> = data_of(&bench.events()[from..], EventKind::Warning, "what")
+        .into_iter()
+        .filter(|w| w["what"] == "stage_not_moved")
+        .collect();
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0]["stage"], "review");
+    assert_eq!(bench.stage(), "In Progress");
 }
 
 /// A repair run's question about something only a person holds (scenario
