@@ -149,21 +149,23 @@ impl Row {
     }
 
     /// Whether intake runs on it (architecture section 5, "Intake", "When"):
-    /// not excluded, with a decider, its intake record absent or for another
-    /// text, its ref absent, at Intake, at Ready, or at Watch with its
-    /// following ended.
+    /// not excluded, with a decider, and its ref at Intake, an intake that
+    /// has not ended, whatever its record; or its ref absent, at Ready, or at
+    /// Watch with its following ended, its intake record absent or for
+    /// another text. A ref at Intake in the column is one a person moved
+    /// back after a round, or the drain's own intake cut off (OWL-275).
     fn intake_due(&self, exclude: Option<&str>) -> bool {
         let Some(state) = &self.state else {
             return false;
         };
-        let at = match state.status() {
-            Status::Active(Stage::Intake | Stage::Ready) => true,
-            Status::Active(Stage::Watch) => !self.followed(),
+        let stale = self.intake_hash() != Some(self.text.as_str());
+        let due = match state.status() {
+            Status::Active(Stage::Intake) => true,
+            Status::Active(Stage::Ready) => stale,
+            Status::Active(Stage::Watch) => !self.followed() && stale,
             _ => false,
         };
-        at && !self.excluded(exclude)
-            && on_demand::has_decider(&self.listed.ticket)
-            && self.intake_hash() != Some(self.text.as_str())
+        due && !self.excluded(exclude) && on_demand::has_decider(&self.listed.ticket)
     }
 
     /// The core's order: priority, then the first created, then the
