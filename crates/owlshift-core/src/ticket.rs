@@ -26,7 +26,10 @@ pub struct Ticket<K> {
     /// The tickets that block this one: the tracker's relations and the
     /// identifiers of its description's "Blocked by" line ([`text_blockers`]),
     /// each with the state the runner read for it. An identifier the tracker
-    /// does not know is the runner's to resolve before it gets here.
+    /// answered it does not know is [`BlockerState::Unknown`]; the ticket's own
+    /// identifier is ignored by the ready set (architecture, section 5,
+    /// "Blockers"). The runner passes identifiers as the tracker writes them,
+    /// so the ticket's own compares equal.
     pub blocked_by: Vec<Blocker<K>>,
     /// The pipeline variant: picked at intake, or forced by a label.
     pub variant: Variant,
@@ -89,6 +92,12 @@ pub enum BlockerState {
     /// Dropped: on Linear, a state of type `canceled` or `duplicate`. The
     /// ticket it blocks waits until a person removes the relation or the line.
     Canceled,
+    /// The tracker answered that no such ticket exists: an identifier of the
+    /// text convention that names no ticket, such as `UTF-8` or a typo. Only
+    /// a definite "not found" is unknown; a read that failed otherwise is
+    /// passed as open. The ticket it blocks waits until a person corrects the
+    /// line.
+    Unknown,
 }
 
 /// The blockers a description names by the text convention (architecture,
@@ -238,6 +247,7 @@ mod tests {
         };
         assert!(!blocker(BlockerState::Open, false).released());
         assert!(!blocker(BlockerState::Canceled, false).released());
+        assert!(!blocker(BlockerState::Unknown, false).released());
         assert!(blocker(BlockerState::Completed, false).released());
         assert!(blocker(BlockerState::Open, true).released());
     }
