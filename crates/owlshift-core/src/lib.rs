@@ -19,6 +19,7 @@
 //! | Resource | [`resource`] |
 //! | Scheduler | [`schedule`] |
 //! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
+//! | A follow-up proposal's title, for its fingerprint | [`proposal`] |
 
 pub mod agent_env;
 pub mod decider;
@@ -26,6 +27,7 @@ pub mod floor;
 pub mod follow;
 pub mod gate;
 pub mod pipeline;
+pub mod proposal;
 pub mod reply;
 pub mod resource;
 pub mod schedule;

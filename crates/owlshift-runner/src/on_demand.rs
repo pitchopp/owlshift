@@ -72,8 +72,8 @@ use owlshift_contracts::brief::{
     Rule, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
-use owlshift_contracts::config::{ProjectConfig, States, TrackerKind};
-use owlshift_contracts::drain::TicketIntake;
+use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
+use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
@@ -104,11 +104,12 @@ use crate::executor::{
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
+use crate::proposals::{self, Filing};
 use crate::rebase;
 use crate::resolver::{self, Fallback, Resolved};
 use crate::reversal;
 use crate::rules;
-use crate::ticket_ref::{self, Stored, TicketRecord};
+use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
     Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment,
     Posted, QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart,
@@ -2414,27 +2415,51 @@ impl OnDemand<'_> {
         questions: TicketQuestions,
         delivery: Option<TicketDelivery>,
     ) -> Result<(), String> {
+        self.store_proposing(p, state, questions, delivery, None)
+    }
+
+    /// [`Self::store_delivery`], with `proposals` as the ref's
+    /// `proposals.json` when given, in the same write (OWL-253); the ref
+    /// keeps the one it has otherwise.
+    fn store_proposing(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        questions: TicketQuestions,
+        delivery: Option<TicketDelivery>,
+        proposals: Option<&TicketProposals>,
+    ) -> Result<(), String> {
         let record = TicketRecord {
             state: PersistedState::from(state),
             questions,
             delivery,
             intake: p.intake.clone(),
         };
+        let kept = p
+            .stored
+            .as_ref()
+            .and_then(|stored| stored.proposals.clone());
         if p.stored
             .as_ref()
             .is_some_and(|stored| stored.record == record)
+            && proposals.is_none_or(|proposals| kept.as_ref() == Some(proposals))
         {
             return Ok(());
         }
         let previous = p.stored.as_ref().map(|stored| stored.commit.as_str());
-        let commit = ticket_ref::write(
+        let commit = ticket_ref::write_proposals(
             &self.executor.git,
             &p.checkout,
             &p.ticket,
             &record,
+            proposals.map_or(ProposalsFile::Keep, ProposalsFile::Write),
             previous,
         )?;
-        p.stored = Some(Stored { record, commit });
+        p.stored = Some(Stored {
+            record,
+            commit,
+            proposals: proposals.cloned().or(kept),
+        });
         Ok(())
     }
 
@@ -2970,8 +2995,10 @@ impl OnDemand<'_> {
             }),
             unchanged: false,
         });
+        // Its follow-ups are owed in the same write (OWL-253).
+        let owed = self.owe(p, kept.owed.iter());
         let questions = p.questions();
-        self.store_delivery(p, &watching, questions, Some(kept.clone()))
+        self.store_proposing(p, &watching, questions, Some(kept.clone()), owed.as_ref())
             .map_err(|e| delivery("keeping the delivery in the ticket's ref", &e))?;
         let checks = self.forge.checks(pull_request.number, &commit);
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
@@ -4140,8 +4167,11 @@ impl OnDemand<'_> {
             };
             replaced = follow::landed_owing(&mut kept, pushing, count);
         }
+        // Its follow-ups are owed in the same write, and those of the report
+        // it replaces, which is never posted (OWL-253).
+        let owed = self.owe(p, replaced.iter().chain(kept.owed.iter()));
         let questions = p.questions();
-        self.store_delivery(p, &state, questions, Some(kept.clone()))
+        self.store_proposing(p, &state, questions, Some(kept.clone()), owed.as_ref())
             .map_err(|e| Stop::Delivery(format!("keeping the {what} in the ticket's ref: {e}")))?;
         // Told once the ref keeps it: a refused write leaves the push to be
         // adopted, and the report replaced, by the next read (OWL-239).
@@ -4189,8 +4219,30 @@ impl OnDemand<'_> {
             )));
         }
         let ticket = p.ticket.clone();
+        // The follow-ups are filed before the report, and kept as filed, so
+        // the report names what became of them (OWL-253).
+        let stored = p.stored.as_ref().and_then(|s| s.proposals.as_ref());
+        if let Some(filed) = self.file_proposals(&ticket, &kept, stored, sink) {
+            let questions = p.questions();
+            self.store_proposing(p, state, questions, Some(kept.clone()), Some(&filed))
+                .map_err(|e| {
+                    Stop::Delivery(format!(
+                        "{done}; its follow-ups were filed, but keeping them as filed in the \
+                         ticket's ref failed: {e}; the next pass finds them by their fingerprint"
+                    ))
+                })?;
+        }
+        let proposals = p.stored.as_ref().and_then(|s| s.proposals.clone());
         let comment = self
-            .post_owed(&ticket, &kept, &p.questions(), checks, following, sink)
+            .post_owed(
+                &ticket,
+                &kept,
+                &p.questions(),
+                proposals.as_ref(),
+                checks,
+                following,
+                sink,
+            )
             .map_err(|error| {
                 Stop::Delivery(format!(
                     "{done}, but its delivery report could not be posted: {error}; the next \
@@ -4220,11 +4272,13 @@ impl OnDemand<'_> {
     /// was not kept. Every DELIVERY report is posted here, the first
     /// delivery's and a correction's that pushed nothing included (OWL-236),
     /// so a post retried renders as the first try did.
+    #[allow(clippy::too_many_arguments)]
     fn post_owed(
         &self,
         ticket: &TicketId,
         delivery: &TicketDelivery,
         questions: &TicketQuestions,
+        proposals: Option<&TicketProposals>,
         checks: Result<CheckSet, forge::Error>,
         following: &mut Following,
         sink: &mut EventSink<'_>,
@@ -4309,7 +4363,7 @@ impl OnDemand<'_> {
             checks,
             gate,
             decisions,
-            followups,
+            followups: proposals::reported(&followups, proposals),
             fix_pass,
             rebase,
             correction,
@@ -4373,26 +4427,34 @@ impl OnDemand<'_> {
         );
     }
 
-    /// What settles the report `record` owes, if it owes one (OWL-218): the
-    /// delivery to keep once it is posted, or dropped, with a `warning`,
-    /// when watch no longer follows the pull request. `None` when nothing
-    /// is owed or the post failed, and the report stays owed. The checks'
-    /// error when the head moved since the pass's read of the pull request:
-    /// nothing is posted, the report stays owed, and the pass ends there, so
-    /// the next read ends the following, adopts the push or reads the head
-    /// back at it before any repair (OWL-238).
+    /// What settles the report `record` owes, if it owes one (OWL-218),
+    /// once the follow-ups owed are filed (OWL-253), `proposals` being what
+    /// the ref keeps of them: the delivery to keep once it is posted, or
+    /// dropped, with a `warning`, when watch no longer follows the pull
+    /// request, and the proposals to keep when their filing changed them.
+    /// No delivery when nothing is owed or the post failed, and the report
+    /// stays owed. The checks' error when the head moved since the pass's
+    /// read of the pull request: nothing is posted, the report stays owed,
+    /// and the pass ends there, so the next read ends the following, adopts
+    /// the push or reads the head back at it before any repair (OWL-238).
     fn settle_owed(
         &self,
         ticket: &TicketId,
         record: &TicketRecord,
+        proposals: Option<&TicketProposals>,
         following: &mut Following,
         sink: &mut EventSink<'_>,
-    ) -> Result<Option<TicketDelivery>, forge::Error> {
+    ) -> Settled {
+        let mut done = Settled::default();
         let Some(delivery) = record.delivery.as_ref() else {
-            return Ok(None);
+            return done;
         };
+        // Filed before the report, even one that is dropped: a follow-up
+        // outlives the pull request.
+        done.proposals = self.file_proposals(ticket, delivery, proposals, sink);
+        let proposals = done.proposals.as_ref().or(proposals);
         let Some(owed) = delivery.owed.as_ref() else {
-            return Ok(None);
+            return done;
         };
         let mut settled = delivery.clone();
         settled.owed = None;
@@ -4411,24 +4473,85 @@ impl OnDemand<'_> {
                     ("ended", json!(ended.why)),
                 ]),
             );
-            return Ok(Some(settled));
+            done.delivery = Some(settled);
+            return done;
         }
         let (Some(pr), Some(Ok(head))) = (
             delivery.pull_request.as_ref(),
             delivery.pushed.as_deref().map(CommitId::new),
         ) else {
-            return Ok(None);
+            return done;
         };
         let checks = self.forge.checks(pr.number, &head);
         if head_moved(&checks)
             && let Err(error) = checks
         {
-            return Err(error);
+            done.moved = Some(error);
+            return done;
         }
-        Ok(self
-            .post_owed(ticket, delivery, &record.questions, checks, following, sink)
+        done.delivery = self
+            .post_owed(
+                ticket,
+                delivery,
+                &record.questions,
+                proposals,
+                checks,
+                following,
+                sink,
+            )
             .ok()
-            .map(|_| settled))
+            .map(|_| settled);
+        done
+    }
+
+    /// The follow-ups `delivery`'s owed report proposed that `current` does
+    /// not keep yet, owed, then every owed one filed (OWL-253): the
+    /// proposals to keep when that changed them, `None` otherwise and on a
+    /// tracker without a proposals inbox.
+    fn file_proposals(
+        &self,
+        ticket: &TicketId,
+        delivery: &TicketDelivery,
+        current: Option<&TicketProposals>,
+        sink: &mut EventSink<'_>,
+    ) -> Option<TicketProposals> {
+        if !proposals::has_inbox(self.tracker) {
+            return None;
+        }
+        let owed = proposals::owe(current, delivery.owed.iter());
+        let added = owed.is_some();
+        let mut next = owed.or_else(|| current.cloned())?;
+        let tracker = &self.config.tracker;
+        let filing = Filing {
+            tracker: self.tracker,
+            team: tracker.team.as_deref(),
+            ready: &tracker.states.ready,
+            admission_label: match &tracker.admit {
+                Admit::Label(label) => Some(label),
+                Admit::Delegation | Admit::State(_) => None,
+            },
+            parent: ticket,
+            pull_request: delivery.pull_request.as_ref(),
+        };
+        let filed = proposals::file_owed(&filing, &mut next, sink);
+        (added || filed).then_some(next)
+    }
+
+    /// The follow-ups of `owed`, oldest first, owed in the proposals the
+    /// ticket ref of `p` keeps (OWL-253): the proposals to keep in the write
+    /// of the delivery or the repair, `None` when nothing is added and on a
+    /// tracker without a proposals inbox, where they stay in the report
+    /// alone.
+    fn owe<'r>(
+        &self,
+        p: &Prepared,
+        owed: impl IntoIterator<Item = &'r OwedReport>,
+    ) -> Option<TicketProposals> {
+        if !proposals::has_inbox(self.tracker) {
+            return None;
+        }
+        let current = p.stored.as_ref().and_then(|s| s.proposals.as_ref());
+        proposals::owe(current, owed)
     }
 
     /// For `owlshift watch`, once a look at a followed pull request is kept
@@ -4453,7 +4576,8 @@ impl OnDemand<'_> {
             .record
             .delivery
             .as_ref()
-            .is_some_and(|delivery| delivery.owed.is_some());
+            .is_some_and(|delivery| delivery.owed.is_some())
+            || (proposals::has_inbox(self.tracker) && proposals::owes(stored.proposals.as_ref()));
         if !owes && !matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
             return Some(commit);
         }
@@ -4469,32 +4593,44 @@ impl OnDemand<'_> {
             Ok(Some(current)) if current.commit == commit => current,
             _ => return Some(commit),
         };
-        let delivery = match self.settle_owed(ticket, &current.record, following, sink) {
-            Ok(Some(delivery)) => delivery,
-            Ok(None) => return Some(commit),
-            Err(_) => return None,
-        };
+        let settled = self.settle_owed(
+            ticket,
+            &current.record,
+            current.proposals.as_ref(),
+            following,
+            sink,
+        );
+        if settled.delivery.is_none() && settled.proposals.is_none() {
+            return settled.moved.is_none().then_some(commit);
+        }
         let record = TicketRecord {
-            delivery: Some(delivery),
+            delivery: settled.delivery.or(current.record.delivery),
             ..current.record
         };
-        Some(
-            match ticket_ref::write(git, &checkout, ticket, &record, Some(&commit)) {
-                Ok(written) => written,
-                Err(reason) => {
-                    sink.emit(
-                        ticket,
-                        None,
-                        EventKind::Warning,
-                        data([
-                            ("what", json!("owed_report_unkept")),
-                            ("reason", json!(reason)),
-                        ]),
-                    );
-                    commit
-                }
-            },
-        )
+        let proposals = settled
+            .proposals
+            .as_ref()
+            .map_or(ProposalsFile::Keep, ProposalsFile::Write);
+        let written =
+            ticket_ref::write_proposals(git, &checkout, ticket, &record, proposals, Some(&commit));
+        if settled.moved.is_some() {
+            return None;
+        }
+        Some(match written {
+            Ok(written) => written,
+            Err(reason) => {
+                sink.emit(
+                    ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("owed_report_unkept")),
+                        ("reason", json!(reason)),
+                    ]),
+                );
+                commit
+            }
+        })
     }
 
     /// For `owlshift continue` at Watch, under its lock: posts the DELIVERY
@@ -4510,21 +4646,45 @@ impl OnDemand<'_> {
         let Some(stored) = p.stored.clone() else {
             return Ok(());
         };
-        let delivery = match self.settle_owed(&p.ticket, &stored.record, following, sink) {
-            Ok(Some(delivery)) => delivery,
-            Ok(None) => return Ok(()),
-            Err(error) => {
-                return Err(Stop::Delivery(format!(
-                    "the pull request's head moved before the owed report's checks were read: \
-                     {error}; the report stays owed until the next read of the pull request ends \
-                     the following or adopts the push"
-                )));
-            }
-        };
-        let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
-        self.store_delivery(p, &state, stored.record.questions, Some(delivery))
-            .map_err(|e| refused("keeping the owed report as posted in the ticket's ref", e))
+        let settled = self.settle_owed(
+            &p.ticket,
+            &stored.record,
+            stored.proposals.as_ref(),
+            following,
+            sink,
+        );
+        if settled.delivery.is_some() || settled.proposals.is_some() {
+            let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
+            let delivery = settled.delivery.or(stored.record.delivery);
+            self.store_proposing(
+                p,
+                &state,
+                stored.record.questions,
+                delivery,
+                settled.proposals.as_ref(),
+            )
+            .map_err(|e| refused("keeping the owed report as posted in the ticket's ref", e))?;
+        }
+        match settled.moved {
+            None => Ok(()),
+            Some(error) => Err(Stop::Delivery(format!(
+                "the pull request's head moved before the owed report's checks were read: \
+                 {error}; the report stays owed until the next read of the pull request ends \
+                 the following or adopts the push"
+            ))),
+        }
     }
+}
+
+/// What [`OnDemand::settle_owed`] settled.
+#[derive(Default)]
+struct Settled {
+    /// The delivery to keep: its owed report posted or dropped.
+    delivery: Option<TicketDelivery>,
+    /// The proposals to keep, when their filing changed them (OWL-253).
+    proposals: Option<TicketProposals>,
+    /// The checks' error when the head moved: nothing was posted.
+    moved: Option<forge::Error>,
 }
 
 /// Whether `checks` were read at a head that is no longer the pull

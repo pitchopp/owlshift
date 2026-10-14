@@ -2286,7 +2286,7 @@ always_human = []
         assert_eq!(
             tracker.detail,
             "`linear`: read a ticket, list admitted tickets, read and post comments, \
-             visible stage, blocked-by relations"
+             visible stage, blocked-by relations, proposals inbox"
         );
     }
 

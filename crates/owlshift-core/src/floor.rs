@@ -57,6 +57,24 @@ pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), Floor
     }
 }
 
+/// Checks a follow-up proposal against the floor (architecture section 5,
+/// "Where", OWL-253): one that carries the admission label would enter the
+/// queue without a person (principle 6), so it is refused before it is
+/// filed. `carried` is the one label a proposal may carry, the proposals
+/// inbox's label on a team without a triage state; `admission_label` is the
+/// project's `[tracker].admit` label, `None` for another gesture. Names
+/// compare ASCII case-insensitively, the stricter reading. A proposal filed
+/// in the ready state is refused by the tracker adapter, where the target
+/// state is known.
+pub fn check_proposal(admission_label: Option<&str>, carried: &str) -> Result<(), FloorViolation> {
+    match admission_label {
+        Some(label) if label.eq_ignore_ascii_case(carried) => {
+            Err(FloorViolation::ProposalAdmitted(label.to_owned()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Environment variables that carry a model, tracker, forge or cloud
 /// credential. No agent receives one, even when a project declares it for its
 /// gate. A guardrail, not a proof: agents also start from an empty
@@ -220,6 +238,8 @@ pub enum FloorViolation {
     Unapproved(Action),
     /// These credential variables would reach an agent.
     CredentialVariables(Vec<String>),
+    /// A proposal would carry this admission label (OWL-253).
+    ProposalAdmitted(String),
 }
 
 impl fmt::Display for FloorViolation {
@@ -234,6 +254,11 @@ impl fmt::Display for FloorViolation {
                 f,
                 "agents never receive credentials; refused variables: {}",
                 names.join(", ")
+            ),
+            Self::ProposalAdmitted(label) => write!(
+                f,
+                "a proposal would carry the admission label {label:?} and enter the queue \
+                 without a person"
             ),
         }
     }
@@ -344,6 +369,18 @@ mod tests {
         for other in ["testing", "naming", "securities", "scoped", "datalossy"] {
             assert!(!is_floor_category(other), "{other:?}");
         }
+    }
+
+    #[test]
+    fn a_proposal_never_carries_the_admission_label() {
+        assert_eq!(check_proposal(None, "agent:proposed"), Ok(()));
+        assert_eq!(check_proposal(Some("agent"), "agent:proposed"), Ok(()));
+        assert_eq!(
+            check_proposal(Some("Agent:Proposed"), "agent:proposed"),
+            Err(FloorViolation::ProposalAdmitted(
+                "Agent:Proposed".to_owned()
+            ))
+        );
     }
 
     #[test]

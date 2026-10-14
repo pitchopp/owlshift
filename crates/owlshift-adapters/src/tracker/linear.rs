@@ -270,14 +270,14 @@ pub struct AppUser {
 
 impl LinearTracker {
     /// What the Linear adapter implements in this build. It files proposals
-    /// already (OWL-252); the proposals inbox is declared with the runner's
-    /// filing (OWL-253), whose doctor line names it.
+    /// (OWL-252), which the runner does since OWL-253: the proposals inbox.
     pub const CAPABILITIES: &'static [Capability] = &[
         Capability::ReadTicket,
         Capability::ListAdmitted,
         Capability::Comments,
         Capability::VisibleStage,
         Capability::BlockedBy,
+        Capability::ProposalsInbox,
     ];
 
     /// The adapter over HTTPS with this key.
