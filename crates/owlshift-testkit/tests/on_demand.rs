@@ -7636,3 +7636,60 @@ fn a_refused_first_intake_is_held() {
     assert!(matches!(outcomes[0], Err(Stop::Refused(_))), "{outcomes:?}");
     assert_eq!(bench.briefs().len(), 1);
 }
+
+/// A ticket taken in whose admitter is then dropped from `admitters` at the
+/// base is refused at its dispatch, warned of, and left out of the next
+/// picks, so the next ready ticket is built meanwhile (OWL-250).
+#[test]
+fn a_dropped_admitter_does_not_hold_up_the_next_ticket() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\", \"ann\"]",
+    );
+    // DEMO-2, more urgent, was admitted by ann.
+    let dir = bench.remote.checkout.join("tickets").join("DEMO-2");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("ticket.md"),
+        "+++\ntitle = \"Urgent\"\nauthor = \"ann\"\nstage = \"Todo\"\npriority = \"high\"\n\
+         assignee = \"maintainer\"\nlabels = [\"agent\"]\n+++\n\nSomething urgent.\n",
+    )
+    .unwrap();
+    let project_file = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
+    let dropped = project_file.replace(
+        "admitters = [\"maintainer\", \"ann\"]",
+        "admitters = [\"maintainer\"]",
+    );
+    assert_ne!(dropped, project_file);
+    let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let replies = vec![intake(), intake(), bench.reply(Some("Hello"), Some(DONE))];
+    let (outcomes, lines, _) = bench.drain(replies, 3, |pass| {
+        if pass == 1 {
+            bench.merge_into_main(&[("owlshift.toml", &dropped)]);
+        }
+    });
+    assert_eq!(outcomes.len(), 3, "{lines}");
+    assert!(outcomes[2].is_ok(), "DEMO-1 is built: {outcomes:?}");
+    let warned: Vec<(String, Value)> = bench
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("not_admitted"))
+        .map(|e| {
+            (
+                e.ticket.unwrap().as_str().to_owned(),
+                e.data["account"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(warned, [("DEMO-2".to_owned(), json!("ann"))]);
+    let dispatched: Vec<String> = bench
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Dispatch)
+        .map(|e| e.ticket.unwrap().as_str().to_owned())
+        .collect();
+    assert_eq!(dispatched, ["DEMO-1"]);
+}

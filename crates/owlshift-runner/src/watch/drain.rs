@@ -463,7 +463,10 @@ impl Watch<'_> {
             Some(Taken::NotAdmitted { account, reason }) => {
                 self.not_admitted(memory, ticket, account, &reason, sink, out);
             }
-            Some(Taken::Ran(outcome)) => self.ran(memory, ticket, seen, &outcome, sink, continued),
+            Some(Taken::Ran(outcome)) => {
+                memory.drain.warned.remove(ticket);
+                self.ran(memory, ticket, seen, &outcome, sink, continued);
+            }
         }
     }
 
@@ -548,9 +551,18 @@ impl Watch<'_> {
             .stored
             .as_ref()
             .and_then(|stored| stored.record.intake.as_ref());
+        // A gesture found not admitting, at intake or at a dispatch (its
+        // admitter dropped from the list), keeps the ticket out of the pick
+        // until it is read again, so the next ticket goes meanwhile.
+        let now = (self.on_demand.clock)();
+        let warned = memory
+            .drain
+            .warned
+            .get(row.id())
+            .is_some_and(|(_, retry)| now < *retry);
         let admission = if row.excluded(exclude) {
             Admission::Excluded
-        } else if record.is_none() && memory.drain.warned.contains_key(row.id()) {
+        } else if warned {
             Admission::NotAdmitted
         } else {
             Admission::Admitted
