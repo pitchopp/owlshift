@@ -44,18 +44,20 @@ fn a_standard_ticket_from_admission_to_merge() {
     };
     let policy = GatePolicy::new(["billing"], PlanApproval::OnFork);
 
-    // Intake asks a scope question: a human decides, and the ticket will
-    // return to Ready.
+    // Intake asks a scope question: a human decides, and intake runs again
+    // with the answers before the ticket is ready (OWL-269).
     assert_eq!(policy.route("scope"), Route::Human);
     step(&mut ticket, Event::Questions);
     assert_eq!(
         ticket.state.status(),
         Status::NeedsInput {
-            return_to: Stage::Ready
+            return_to: Stage::Intake
         }
     );
     step(&mut ticket, Event::Incomplete);
     step(&mut ticket, Event::Answered);
+    assert_eq!(ticket.state.status(), Status::Active(Stage::Intake));
+    step(&mut ticket, Event::Completed);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Ready));
 
     // Blocked until OWL-41 is done, then dispatched.

@@ -5,8 +5,10 @@
 //! verdict and the dependencies it found. The runner keeps the record in the
 //! ticket ref (`intake.json`, with the text's hash and the admission
 //! gesture) and shows it in an INTAKE comment. Questions go through the
-//! resolver, then to the decider in a round whose return stage is Ready; the
-//! record is kept with the round, so answering does not run intake again.
+//! resolver, then to the decider in a round whose return stage is Intake; the
+//! record is kept with the round, and once the round is answered intake runs
+//! again, the answers in its thread, so that a prerequisite named only in an
+//! answer is recorded too (OWL-269).
 //! Before a verdict is kept, its dependencies become `blocks` relations on
 //! the tracker, or say why not (OWL-249, "Dependencies to relations").
 //! An intake that ends at Ready moves the ticket back to the ready column
@@ -425,8 +427,9 @@ impl OnDemand<'_> {
                             message: format!(
                                 "the INTAKE comment of {} is on the ticket, but keeping its \
                                  record in the ticket's ref failed: {error}; once the ref can be \
-                                 written, the drain runs intake again",
-                                p.ticket
+                                 written, the drain runs intake again, or `owlshift continue {}` \
+                                 does when an answered round left it at Intake",
+                                p.ticket, p.ticket
                             ),
                         });
                     }

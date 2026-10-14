@@ -46,8 +46,9 @@ pub enum Status {
     /// for the scheduler to dispatch it.
     Active(Stage),
     /// Questions wait for the decider. Once they are answered the ticket
-    /// resumes at `return_to`: the stage that asked, or Ready for questions
-    /// asked at Intake.
+    /// resumes at `return_to`, the stage that asked: at Intake, intake runs
+    /// again with the answers (OWL-269). A round asked at Intake before
+    /// OWL-269 returned to Ready, which refs written then still keep.
     NeedsInput { return_to: Stage },
     /// Parked by a circuit breaker, a blocked run or an isolation breach; a
     /// human restarts it. `awaiting_input` is set when it was parked while
@@ -327,11 +328,12 @@ impl TicketState {
     ///   input;
     /// - fewer than [`MAX_FAILED_RUNS`] failed runs unless parked, and never
     ///   more;
-    /// - waiting for input means a question round was asked, and never at
-    ///   Intake (intake questions return to Ready);
-    /// - a ticket at Intake asked no question round since it was taken in:
-    ///   rounds asked before it was taken in again, its text edited, are kept,
-    ///   and it neither waits for input nor has re-asks there;
+    /// - waiting for input means a question round was asked; a round asked
+    ///   at Intake returns to Intake (OWL-269), and one that returns to Ready,
+    ///   which a ref written before OWL-269 keeps, is still restored, though
+    ///   the machine no longer reaches it;
+    /// - a ticket at Intake may count rounds: those it asked before it was
+    ///   taken in again, its text edited, and those answered there;
     /// - nothing runs at Ready, so nothing is parked there unless it was
     ///   waiting for input;
     /// - at most [`MAX_FIX_PASSES`] fix passes and [`MAX_REPAIRS`] repairs,
@@ -353,8 +355,6 @@ impl TicketState {
             Some("failed runs past the breaker without parking")
         } else if status.awaits_input() && round == 0 {
             Some("waiting for input with no question round")
-        } else if status.awaits_input() && status.stage() == Stage::Intake {
-            Some("waiting for input at intake")
         } else if status
             == (Status::Parked {
                 at: Stage::Ready,
@@ -448,17 +448,14 @@ impl TicketState {
                 let target = pipeline.loop_back(stage).ok_or(invalid)?;
                 Transition::To(self.enter(Status::Active(target)))
             }
+            // Every stage's round returns to it, Intake's included: intake
+            // runs again with the answers (OWL-269).
             (Status::Active(stage), Event::Questions) if stage != Stage::Ready => {
                 let round = self.round.checked_add(1).ok_or(invalid)?;
-                let return_to = if stage == Stage::Intake {
-                    Stage::Ready
-                } else {
-                    stage
-                };
                 Transition::To(Self {
                     round,
                     reasks: 0,
-                    ..self.enter(Status::NeedsInput { return_to })
+                    ..self.enter(Status::NeedsInput { return_to: stage })
                 })
             }
             (Status::Active(stage), Event::Blocked) if stage != Stage::Ready => {
@@ -712,7 +709,7 @@ mod tests {
     /// The state with this status and the lowest counters it allows, or `None`
     /// for a status the machine never has.
     fn baseline(status: Status) -> Option<TicketState> {
-        let round = u32::from(status.stage() != Stage::Intake);
+        let round = u32::from(status.stage() != Stage::Intake || status.awaits_input());
         TicketState::restore(status, round, 0, 0, 0, 0).ok()
     }
 
@@ -768,9 +765,6 @@ mod tests {
             (Status::Active(Verify), Event::LoopBack) => Expect::To(Status::Active(Build)),
             (Status::Active(Watch), Event::LoopBack) => Expect::To(Status::Active(Build)),
 
-            (Status::Active(Intake), Event::Questions) => {
-                Expect::To(Status::NeedsInput { return_to: Ready })
-            }
             (Status::Active(stage), Event::Questions) if stage != Ready => {
                 Expect::To(Status::NeedsInput { return_to: stage })
             }
@@ -839,9 +833,10 @@ mod tests {
     #[test]
     fn every_state_and_event_pair_follows_the_transition_table() {
         let states: Vec<_> = all_statuses().into_iter().filter_map(baseline).collect();
-        // 8 active, 7 needs-input (never Intake), 7 parked at a stage that ran
-        // (never Ready), 7 parked while waiting for input (never Intake).
-        assert_eq!(states.len(), 29);
+        // 8 active, 8 needs-input, 7 parked at a stage that ran (never
+        // Ready), 8 parked while waiting for input: those returning to Ready
+        // are a round asked at Intake before OWL-269, still restored.
+        assert_eq!(states.len(), 31);
         for state in states {
             for event in Event::ALL {
                 let actual = match state.apply(STANDARD, event) {
@@ -888,19 +883,26 @@ mod tests {
         );
     }
 
+    /// An intake round returns to Intake, so intake runs again with the
+    /// answers (OWL-269); the stage is the same throughout, so a failed run
+    /// before the round still counts after it, as at Build.
     #[test]
-    fn questions_open_a_new_round_and_intake_questions_return_to_ready() {
+    fn questions_open_a_new_round_and_intake_questions_return_to_intake() {
         let intake = state(Status::Active(Stage::Intake), 0, 0, 1);
         let waiting = to(intake.apply(STANDARD, Event::Questions));
         assert_eq!(
             waiting.status(),
             Status::NeedsInput {
-                return_to: Stage::Ready
+                return_to: Stage::Intake
             }
         );
         assert_eq!(waiting.round(), 1);
-        // The stage changed from Intake to Ready: its failure count restarts.
-        assert_eq!(waiting.failed_runs(), 0);
+        let answered = to(waiting.apply(STANDARD, Event::Answered));
+        assert_eq!(answered, state(Status::Active(Stage::Intake), 1, 0, 1));
+        assert_eq!(
+            to(answered.apply(STANDARD, Event::Completed)),
+            state(Status::Active(Stage::Ready), 1, 0, 0)
+        );
 
         let build = state(Status::Active(Stage::Build), 1, 0, 1);
         let waiting = to(build.apply(STANDARD, Event::Questions));
@@ -919,7 +921,7 @@ mod tests {
         assert_eq!(
             waiting.status(),
             Status::NeedsInput {
-                return_to: Stage::Ready
+                return_to: Stage::Intake
             }
         );
         assert_eq!(waiting.round(), 3);
@@ -1333,9 +1335,10 @@ mod tests {
                 }
             }
         }
-        // Every status the table test uses is reachable, and so is each
-        // bound: the fix passes', and the repairs' below it, green having
-        // cleared the passes and not the repairs.
+        // Every status the table test uses is reachable but the two of a
+        // round that returned to Ready, asked at Intake before OWL-269, and
+        // so is each bound: the fix passes', and the repairs' below it, green
+        // having cleared the passes and not the repairs.
         let statuses: HashSet<_> = seen.iter().map(TicketState::status).collect();
         assert_eq!(statuses.len(), 29);
         assert!(seen.iter().any(|s| s.fix_passes() == MAX_FIX_PASSES));
@@ -1373,17 +1376,6 @@ mod tests {
             (parked(Stage::Build, false), 0, 0, MAX_FAILED_RUNS + 1, 0, 0),
             (waiting, 0, 0, 0, 0, 0),
             (parked(Stage::Build, true), 0, 0, 0, 0, 0),
-            (
-                Status::NeedsInput {
-                    return_to: Stage::Intake,
-                },
-                1,
-                0,
-                0,
-                0,
-                0,
-            ),
-            (parked(Stage::Intake, true), 1, 0, 0, 0, 0),
             (Status::Active(Stage::Intake), 1, 1, 0, 0, 0),
             (parked(Stage::Intake, false), 1, 1, 0, 0, 0),
             (parked(Stage::Ready, false), 0, 0, 0, 0, 0),

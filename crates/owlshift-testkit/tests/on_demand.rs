@@ -7372,9 +7372,10 @@ fn intake_keeps_its_record_and_leaves_the_ticket_in_the_ready_column() {
 }
 
 /// An intake round (OWL-248): its questions go to the decider, the record
-/// kept with the round; intake is refused while they wait; the answers'
-/// RESUME moves the ticket back to the ready column, and intake does not
-/// run again.
+/// kept with the round; intake is refused while they wait; a park while
+/// they wait restarts to waiting, shown as such (OWL-269); the answers'
+/// RESUME returns to Intake, which runs again before the ticket goes back
+/// to the ready column (OWL-269).
 #[test]
 fn an_intake_round_returns_the_ticket_to_the_ready_column() {
     let bench = Bench::drained();
@@ -7399,7 +7400,7 @@ fn an_intake_round_returns_the_ticket_to_the_ready_column() {
     assert_eq!(
         TicketState::try_from(&kept.state).unwrap().status(),
         Status::NeedsInput {
-            return_to: Stage::Ready
+            return_to: Stage::Intake
         }
     );
     assert_eq!(bench.stage(), "Needs Input");
@@ -7408,9 +7409,35 @@ fn an_intake_round_returns_the_ticket_to_the_ready_column() {
         .expect_err("waiting");
     assert!(matches!(stop, Stop::Refused(_)), "{stop}");
 
+    // Parked while the round waits: `continue` restarts it to waiting, and
+    // the ticket shows it waits, not that it is parked.
+    let parked = TicketState::restore(
+        Status::Parked {
+            at: Stage::Intake,
+            awaiting_input: true,
+        },
+        1,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
+    bench.write_record(&TicketRecord {
+        state: PersistedState::from(&parked),
+        ..bench.record()
+    });
+    MarkdownTracker::new(&bench.remote.checkout)
+        .set_stage(&ticket(), "Parked")
+        .unwrap();
+    let (outcome, _) = bench.continue_ticket(Vec::new());
+    assert!(matches!(outcome, Err(Stop::Waiting { .. })), "{outcome:?}");
+    assert_eq!(bench.stage(), "Needs Input");
+
     bench.answer("English.");
     let (outcome, _) = bench.continue_ticket(vec![
         bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+        bench.reply(None, Some(&intake_result("done", None, ""))),
     ]);
     let stop = outcome.expect_err("back to the ready column");
     assert!(matches!(stop, Stop::Ready { .. }), "{stop}");
@@ -7425,10 +7452,80 @@ fn an_intake_round_returns_the_ticket_to_the_ready_column() {
         bench
             .comments()
             .iter()
-            .any(|c| c.starts_with("[owlshift] RESUME") && c.contains("back in the ready column"))
+            .any(|c| c.starts_with("[owlshift] RESUME")
+                && c.contains("Intake reads the ticket again"))
     );
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(roles, [Role::Intake, Role::AnswerCheck]);
+    assert_eq!(roles, [Role::Intake, Role::AnswerCheck, Role::Intake]);
+}
+
+/// A prerequisite the decider names only in an answer to an intake round
+/// (OWL-269): the answers' RESUME returns to Intake, which runs again with
+/// them; cut off there by a usage limit, the ticket stays at Intake, shown
+/// waiting, out of the ready column, its record the round's; `continue`
+/// runs intake again, which records the prerequisite, quoted from the
+/// answer, writes its relation, and moves the ticket back to the column.
+#[test]
+fn a_dependency_named_only_in_an_answer_becomes_a_relation() {
+    let bench = Bench::drained();
+    bench.add_ticket("DEMO-2", "Todo", &[]);
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"scope",
+                "context":"The ticket waits for the billing rework, named without its identifier.",
+                "text":"Which ticket is the billing rework?"}]"#,
+        )),
+    );
+    bench
+        .intake(vec![asks], gesture("maintainer"))
+        .expect_err("questions");
+    let answer = "It is DEMO-2: it must land first.";
+    bench.answer(answer);
+
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (outcome, _) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "DEMO-2.")]))),
+        limited,
+    ]);
+    assert!(
+        matches!(outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}"
+    );
+    let held = bench.record();
+    assert_eq!(
+        TicketState::try_from(&held.state).unwrap().status(),
+        Status::Active(Stage::Intake)
+    );
+    assert_eq!(bench.stage(), "Needs Input");
+    assert!(held.intake.unwrap().dependencies.is_empty());
+    assert!(bench.relations_written().is_empty());
+
+    let mut done: Value = serde_json::from_str(&intake_result("done", None, "")).unwrap();
+    done["intake"]["dependencies"] = json!([{ "ticket": "DEMO-2", "quote": answer }]);
+    let (outcome, _) = bench.continue_ticket(vec![bench.reply(None, Some(&done.to_string()))]);
+    assert!(matches!(outcome, Err(Stop::Ready { .. })), "{outcome:?}");
+    let record = bench.record().intake.expect("the record");
+    assert_eq!(record.dependencies[0].ticket.as_str(), "DEMO-2");
+    assert_eq!(record.dependencies[0].quote, answer);
+    assert_eq!(record.dependencies[0].outcome, DependencyOutcome::Written);
+    assert_eq!(bench.blocked_by(), ["DEMO-2"]);
+    assert_eq!(bench.relations_written(), ["DEMO-2 -> DEMO-1"]);
+    // Shown waiting from the round to the second intake's end.
+    assert_eq!(
+        bench.stage_events(EventKind::TrackerWrite),
+        ["Needs Input", "Todo"]
+    );
+    let intakes: Vec<String> = bench
+        .comments()
+        .into_iter()
+        .filter(|c| c.starts_with("[owlshift] INTAKE"))
+        .collect();
+    assert_eq!(intakes.len(), 2);
+    assert!(intakes[1].contains("DEMO-2"), "{}", intakes[1]);
 }
 
 /// The second failed intake run parks the ticket at Intake, making its

@@ -1440,8 +1440,10 @@ pub struct ResumeComment {
     pub understood: Vec<(Question, Option<AnswerVerdict>)>,
     /// The stage the round returns to: at Watch (OWL-211), no run resumes
     /// from a checkpoint, and the comment says watch reads the pull request
-    /// again instead; at Ready, an intake round's (OWL-248), the ticket goes
-    /// back to the ready column.
+    /// again instead; at Intake, an intake round's (OWL-269), intake reads
+    /// the ticket again before it goes back to the ready column; at Ready, an
+    /// intake round asked before OWL-269 (OWL-248), the ticket goes back to
+    /// the ready column.
     pub return_to: Stage,
 }
 
@@ -1482,6 +1484,13 @@ impl ResumeComment {
                 format!(
                     "Every question of round {} is answered. Watch reads the pull request again, \
                      and a repair still due starts with this understanding:",
+                    self.round
+                )
+            } else if self.return_to == Stage::Intake {
+                format!(
+                    "Every question of round {} is answered. Intake reads the ticket again with \
+                     these answers before it goes back to the ready column, with this \
+                     understanding:",
                     self.round
                 )
             } else if self.return_to == Stage::Ready {
