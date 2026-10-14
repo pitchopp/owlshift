@@ -9,7 +9,7 @@ use std::fmt;
 
 use owlshift_adapters::tracker;
 use owlshift_adapters::tracker::linear::app::{AppTransport, ClientCredentials, HttpOAuth};
-use owlshift_adapters::tracker::linear::{ApiKey, AppUser, LinearTracker};
+use owlshift_adapters::tracker::linear::{AdmissionFacts, ApiKey, AppUser, LinearTracker};
 use owlshift_platform::keychain::{Keychain, SERVICE};
 
 /// The keychain account, under [`SERVICE`], that holds the Linear API key:
@@ -160,6 +160,27 @@ pub fn linear_team_states(keychain: &Keychain, team: &str) -> Result<Vec<String>
     match read_key(keychain) {
         Ok(Some(key)) => LinearTracker::new(key)
             .team_states(team)
+            .map_err(StatesError::Tracker),
+        Ok(None) => Err(StatesError::NoKey),
+        Err(reason) => Err(StatesError::Keychain(reason)),
+    }
+}
+
+/// What `owlshift doctor` checks of the admission and proposals setup of the
+/// Linear team `team` (OWL-155), read with the key in `keychain`: the labels
+/// named `labels`, the accounts `accounts` and the inbox for proposals, given
+/// the ready state `ready`. The key is read once more, as
+/// [`linear_team_states`] reads it.
+pub fn linear_admission(
+    keychain: &Keychain,
+    team: &str,
+    ready: &str,
+    labels: &[&str],
+    accounts: &[&str],
+) -> Result<AdmissionFacts, StatesError> {
+    match read_key(keychain) {
+        Ok(Some(key)) => LinearTracker::new(key)
+            .admission_facts(team, ready, labels, accounts)
             .map_err(StatesError::Tracker),
         Ok(None) => Err(StatesError::NoKey),
         Err(reason) => Err(StatesError::Keychain(reason)),
