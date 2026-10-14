@@ -993,6 +993,13 @@ impl OnDemand<'_> {
             Ok(Transition::To(state)) => state,
             other => return Err(core_error(other)),
         };
+        // The branch starts from the base this command fetched (OWL-274):
+        // one an earlier run, such as the ticket's intake, made at an older
+        // base is fast-forwarded when it has no commits of its own. Before
+        // the dispatch, so a refused fast-forward dispatches nothing.
+        self.executor
+            .start_from_base(&p.checkout, &p.worktree, &p.branch, &p.base.commit)
+            .map_err(|e| refused("starting the ticket's branch from the base", e))?;
         let dispatched = self.dispatch(p, command, sink)?;
         self.show_after(ticket, None, Event::Dispatched, sink);
         self.build(p, &dispatched, state, sink)

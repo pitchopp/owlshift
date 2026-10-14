@@ -131,8 +131,9 @@ pub struct RunSpec<'a> {
     pub worktree: &'a Path,
     /// The ticket's branch, checked out in the worktree.
     pub branch: &'a str,
-    /// What a new branch starts from, read only when the branch is created:
-    /// a full commit id, or a remote-tracking name such as `origin/main`,
+    /// What a new branch starts from, read only when the branch is created
+    /// (a dispatch from Ready first brings a kept branch with no commits of
+    /// its own to it, [`Executor::start_from_base`]): a full commit id, or a remote-tracking name such as `origin/main`,
     /// looked up as exactly `refs/remotes/<name>` so a local branch named
     /// like it cannot stand in for it (OWL-66). An abbreviated id, a local
     /// branch name and a revision expression such as `origin/main~1` are
@@ -318,6 +319,23 @@ fn list(items: &[impl fmt::Display]) -> String {
 }
 
 impl Executor {
+    /// Brings the ticket's kept `branch` to `base` before a dispatch to Build
+    /// from Ready when it has no commits of its own, its head an ancestor of
+    /// `base`; any other branch is kept as it is, and a missing one is left
+    /// for the run to create (OWL-274). `main`, `worktree`, `branch` and
+    /// `base` are a [`RunSpec`]'s, and a worktree found is checked as a run
+    /// checks it. A fast-forward that would overwrite a local change moves
+    /// nothing and is an [`ExecutorError::Worktree`].
+    pub fn start_from_base(
+        &self,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+        base: &str,
+    ) -> Result<(), ExecutorError> {
+        worktree::start_from_base(&self.git, main, worktree, branch, base)
+    }
+
     /// Runs one role on `harness`. See the module documentation.
     pub fn run(
         &self,

@@ -14,60 +14,13 @@ use super::{BRIEF_PATH, ExecutorError, RUN_DIR, RunSpec};
 /// found is: the root of a linked worktree of the main checkout's
 /// repository, on the branch, at the commit the branch points to there.
 pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
-    check_spec(git, spec)?;
-    let head_ref = format!("refs/heads/{}", spec.branch);
-    let worktree_error = |e: super::GitError| ExecutorError::Worktree(e.to_string());
-
+    check_spec(git, spec.main, spec.worktree, spec.branch)?;
     if fs::symlink_metadata(spec.worktree).is_ok() {
-        // The kept worktree's `.git` is checked before any git runs in it:
-        // an earlier run could have pointed it elsewhere.
-        let common = common_dir(git, spec.main)?;
-        super::isolation::check_worktree_link(&common, spec.worktree)
-            .map_err(ExecutorError::Worktree)?;
-        check_linked(git, spec)?;
-        let head = git
-            .output(spec.worktree, &["symbolic-ref", "-q", "HEAD"], None)
-            .map_err(worktree_error)?;
-        let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
-        if head != head_ref {
-            return Err(ExecutorError::Worktree(format!(
-                "{} is on {}, not {head_ref}",
-                spec.worktree.display(),
-                if head.is_empty() { "no branch" } else { &head }
-            )));
-        }
-        let here = git
-            .run(spec.worktree, &["rev-parse", "HEAD"])
-            .map_err(worktree_error)?;
-        let there = git
-            .run(
-                spec.main,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--end-of-options",
-                    head_ref.as_str(),
-                ],
-            )
-            .map_err(worktree_error)?;
-        if here != there {
-            return Err(ExecutorError::Worktree(format!(
-                "{} is not at the commit {head_ref} has in {}",
-                spec.worktree.display(),
-                spec.main.display()
-            )));
-        }
-        return Ok(());
+        return check_kept(git, spec.main, spec.worktree, spec.branch);
     }
 
-    let exists = git
-        .output(
-            spec.main,
-            &["show-ref", "--verify", "--quiet", head_ref.as_str()],
-            None,
-        )
-        .map_err(worktree_error)?
-        .success();
+    let head_ref = format!("refs/heads/{}", spec.branch);
+    let exists = branch_exists(git, spec.main, &head_ref)?;
     let mut args: Vec<&OsStr> = vec!["worktree".as_ref(), "add".as_ref(), "--quiet".as_ref()];
     let base;
     if exists {
@@ -84,6 +37,152 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
     }
     git.run(spec.main, &args).map_err(worktree_error)?;
     Ok(())
+}
+
+fn worktree_error(error: GitError) -> ExecutorError {
+    ExecutorError::Worktree(error.to_string())
+}
+
+/// Whether `head_ref`, a full branch ref, exists in `main`.
+fn branch_exists(git: &Git, main: &Path, head_ref: &str) -> Result<bool, ExecutorError> {
+    Ok(git
+        .output(main, &["show-ref", "--verify", "--quiet", head_ref], None)
+        .map_err(worktree_error)?
+        .success())
+}
+
+/// Checks a kept worktree before it is used: its `.git` first, before any
+/// git runs in it, since an earlier run could have pointed it elsewhere;
+/// then that it is the root of a linked worktree of `main`'s repository,
+/// on `branch`, at the commit the branch points to in `main`.
+fn check_kept(git: &Git, main: &Path, worktree: &Path, branch: &str) -> Result<(), ExecutorError> {
+    let head_ref = format!("refs/heads/{branch}");
+    let common = common_dir(git, main)?;
+    super::isolation::check_worktree_link(&common, worktree).map_err(ExecutorError::Worktree)?;
+    check_linked(git, main, worktree)?;
+    let head = git
+        .output(worktree, &["symbolic-ref", "-q", "HEAD"], None)
+        .map_err(worktree_error)?;
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    if head != head_ref {
+        return Err(ExecutorError::Worktree(format!(
+            "{} is on {}, not {head_ref}",
+            worktree.display(),
+            if head.is_empty() { "no branch" } else { &head }
+        )));
+    }
+    let here = git
+        .run(worktree, &["rev-parse", "HEAD"])
+        .map_err(worktree_error)?;
+    let there = git
+        .run(
+            main,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                head_ref.as_str(),
+            ],
+        )
+        .map_err(worktree_error)?;
+    if here != there {
+        return Err(ExecutorError::Worktree(format!(
+            "{} is not at the commit {head_ref} has in {}",
+            worktree.display(),
+            main.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Brings a kept `branch` with no commits of its own to `base`, at a
+/// dispatch to Build from Ready (OWL-274): the run's own branch may have
+/// been made by an earlier run, such as the ticket's intake, at the base of
+/// its time. A worktree found is checked first, as [`prepare`] checks it.
+///
+/// - No branch: nothing to do, the run creates it from `base`.
+/// - A head that is an ancestor of `base` is fast-forwarded to it: in the
+///   worktree by `git merge --ff-only`, which carries uncommitted work
+///   along; without a worktree by `git branch -f`, which refuses a branch
+///   another worktree has checked out. Moving from an ancestor to a
+///   descendant loses no commit: every commit of the old head is
+///   reachable from the new one.
+/// - Any other head, with commits of its own or ahead of `base`, is kept.
+///
+/// The merge refuses to overwrite a local change, tracked, untracked or
+/// ignored (`--no-overwrite-ignore`), and moves nothing then: the error
+/// carries git's message. `--no-squash` and `--no-autostash` keep a
+/// branch's `mergeOptions` and `merge.autoStash` from changing what it
+/// does.
+pub(super) fn start_from_base(
+    git: &Git,
+    main: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(), ExecutorError> {
+    check_spec(git, main, worktree, branch)?;
+    let kept = fs::symlink_metadata(worktree).is_ok();
+    if kept {
+        check_kept(git, main, worktree, branch)?;
+    }
+    let head_ref = format!("refs/heads/{branch}");
+    if !branch_exists(git, main, &head_ref)? {
+        return Ok(());
+    }
+    let base = resolve_base(git, main, base)
+        .map_err(|e| ExecutorError::Spec(format!("base {base:?}: {e}")))?;
+    let head = git
+        .run(
+            main,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                head_ref.as_str(),
+            ],
+        )
+        .map_err(worktree_error)?;
+    let head = String::from_utf8_lossy(&head).trim().to_owned();
+    if head == base
+        || !git
+            .is_ancestor(main, &head, &base)
+            .map_err(worktree_error)?
+    {
+        return Ok(());
+    }
+    let moved = if kept {
+        git.run(
+            worktree,
+            &[
+                "merge",
+                "--ff-only",
+                "--no-squash",
+                "--no-autostash",
+                "--no-overwrite-ignore",
+                "--quiet",
+                "--end-of-options",
+                base.as_str(),
+            ],
+        )
+    } else {
+        git.run(
+            main,
+            &[
+                "branch",
+                "--force",
+                "--end-of-options",
+                branch,
+                base.as_str(),
+            ],
+        )
+    };
+    moved.map(drop).map_err(|e| {
+        ExecutorError::Worktree(format!(
+            "fast-forwarding {branch} from {head} to {base}: {}",
+            e.detail
+        ))
+    })
 }
 
 /// The commit a new branch starts from. A full object id is taken as the
@@ -129,19 +228,19 @@ fn resolve_base(git: &Git, main: &Path, base: &str) -> Result<String, GitError> 
 /// the main checkout's, so the main checkout itself, or a folder inside
 /// either, is refused too. Paths are compared once resolved, links
 /// included.
-fn check_linked(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
+fn check_linked(git: &Git, main: &Path, worktree: &Path) -> Result<(), ExecutorError> {
     let top = ["rev-parse", "--path-format=absolute", "--show-toplevel"];
-    let worktree_top = resolved(git, spec.worktree, &top)?;
-    let linked = common_dir(git, spec.worktree)? == common_dir(git, spec.main)?
-        && worktree_top != resolved(git, spec.main, &top)?
-        && worktree_top == canonical(spec.worktree)?;
+    let worktree_top = resolved(git, worktree, &top)?;
+    let linked = common_dir(git, worktree)? == common_dir(git, main)?
+        && worktree_top != resolved(git, main, &top)?
+        && worktree_top == canonical(worktree)?;
     if linked {
         Ok(())
     } else {
         Err(ExecutorError::Worktree(format!(
             "{} is not a linked worktree of {}",
-            spec.worktree.display(),
-            spec.main.display()
+            worktree.display(),
+            main.display()
         )))
     }
 }
@@ -170,29 +269,24 @@ fn canonical(path: &Path) -> Result<PathBuf, ExecutorError> {
 /// Refuses a branch name git would not take as is (an option, a name it
 /// rejects or expands, such as `@{-1}`), and a worktree path that is not
 /// absolute.
-fn check_spec(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
-    if !spec.worktree.is_absolute() {
+fn check_spec(git: &Git, main: &Path, worktree: &Path, branch: &str) -> Result<(), ExecutorError> {
+    if !worktree.is_absolute() {
         return Err(ExecutorError::Spec(format!(
             "the worktree path {} is not absolute",
-            spec.worktree.display()
+            worktree.display()
         )));
     }
-    let valid = !spec.branch.starts_with('-') && {
+    let valid = !branch.starts_with('-') && {
         let checked = git
-            .output(
-                spec.main,
-                &["check-ref-format", "--branch", spec.branch],
-                None,
-            )
+            .output(main, &["check-ref-format", "--branch", branch], None)
             .map_err(|e| ExecutorError::Spec(e.to_string()))?;
-        checked.success() && String::from_utf8_lossy(&checked.stdout).trim() == spec.branch
+        checked.success() && String::from_utf8_lossy(&checked.stdout).trim() == branch
     };
     if valid {
         Ok(())
     } else {
         Err(ExecutorError::Spec(format!(
-            "{:?} is not a branch name",
-            spec.branch
+            "{branch:?} is not a branch name"
         )))
     }
 }
