@@ -11,7 +11,7 @@ pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
 pub use crate::tracker::{AppError, StatesError};
-pub use owlshift_adapters::tracker::linear::AppUser;
+pub use owlshift_adapters::tracker::linear::{AccountFact, AdmissionFacts, AppUser};
 
 /// How long a probe such as `git --version` may take. C8 measured about
 /// 0.1 s for the harness status commands.
@@ -56,6 +56,25 @@ pub trait System {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| StatesError::Keychain(error.to_string()))
             .and_then(|keychain| crate::tracker::linear_team_states(&keychain, team))
+    }
+    /// What the admission and proposals setup of the Linear team `team`
+    /// looks like (OWL-155): which of `labels` the team can carry, which of
+    /// `accounts` the workspace knows, and where a proposal would be filed,
+    /// given the ready state `ready`. Read over the network with the key in
+    /// the system keychain. Only `owlshift doctor` asks, and only for a
+    /// Linear project.
+    fn linear_admission(
+        &self,
+        team: &str,
+        ready: &str,
+        labels: &[&str],
+        accounts: &[&str],
+    ) -> Result<AdmissionFacts, StatesError> {
+        owlshift_platform::keychain::Keychain::system()
+            .map_err(|error| StatesError::Keychain(error.to_string()))
+            .and_then(|keychain| {
+                crate::tracker::linear_admission(&keychain, team, ready, labels, accounts)
+            })
     }
     /// The Linear app user Owlshift writes as, with the credentials in the
     /// system keychain, checked over the network as `owlshift do` checks it
@@ -182,6 +201,9 @@ pub(crate) mod fake {
         /// What Linear answers for a team's workflow states, the key being
         /// stored; `None`: it cannot be reached.
         linear_states: Option<Result<Vec<String>, owlshift_adapters::tracker::Error>>,
+        /// What Linear answers for a team's admission facts, the key being
+        /// stored; `None`: it cannot be reached.
+        linear_admission: Option<Result<AdmissionFacts, owlshift_adapters::tracker::Error>>,
         /// What checking the Linear app gives, both of its entries being
         /// stored; `None`: no app is stored.
         linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
@@ -240,6 +262,15 @@ pub(crate) mod fake {
         ) -> Self {
             let answer = answer.map(|names| names.iter().map(|&n| n.to_owned()).collect());
             self.linear_states = Some(answer);
+            self
+        }
+
+        /// Linear answers so for a team's admission facts.
+        pub(crate) fn linear_admission_is(
+            mut self,
+            answer: Result<AdmissionFacts, owlshift_adapters::tracker::Error>,
+        ) -> Self {
+            self.linear_admission = Some(answer);
             self
         }
 
@@ -331,6 +362,34 @@ pub(crate) mod fake {
                     .clone()
                     .unwrap_or_else(|| {
                         Err(Error::new(ErrorKind::Other, "Linear: no network in tests"))
+                    })
+                    .map_err(StatesError::Tracker),
+            }
+        }
+
+        /// Follows [`Self::linear_states`]'s key rules; never the network.
+        /// Only the labels and accounts the answer holds come back.
+        fn linear_admission(
+            &self,
+            _team: &str,
+            _ready: &str,
+            labels: &[&str],
+            accounts: &[&str],
+        ) -> Result<AdmissionFacts, StatesError> {
+            use owlshift_adapters::tracker::{Error, ErrorKind};
+            match self.secret_stored(crate::tracker::LINEAR_ACCOUNT) {
+                Err(reason) => Err(StatesError::Keychain(reason)),
+                Ok(false) => Err(StatesError::NoKey),
+                Ok(true) => self
+                    .linear_admission
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Err(Error::new(ErrorKind::Other, "Linear: no network in tests"))
+                    })
+                    .map(|mut facts| {
+                        facts.labels.retain(|l| labels.contains(&l.as_str()));
+                        facts.accounts.retain(|a| accounts.contains(&a.id.as_str()));
+                        facts
                     })
                     .map_err(StatesError::Tracker),
             }

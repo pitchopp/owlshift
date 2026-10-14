@@ -10,6 +10,10 @@
 //! keychain and the team's workflow states from Linear, and reports state
 //! names and Linear's error text only, never the key.
 //!
+//! The same goes for the two lines that follow it, `drain admission` and
+//! `proposals inbox` (OWL-155): they read the labels, the accounts and the
+//! team's inbox from Linear in one more call.
+//!
 //! Each check carries its own texts: a failure says why the check exists and
 //! the steps that fix it, a warning says why it does not block `owlshift do`.
 //! How the report is laid out, as text or JSON, is [`render`]'s (OWL-99).
@@ -19,11 +23,13 @@ pub mod render;
 use std::path::{MAIN_SEPARATOR, Path};
 
 use owlshift_adapters::harness::{self, Login, tested};
-use owlshift_adapters::tracker::linear::{LinearTracker, StateMismatch, find_state};
+use owlshift_adapters::tracker::linear::{
+    AdmissionFacts, LinearTracker, StateMismatch, find_state,
+};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
-use owlshift_adapters::tracker::{Capability, ErrorKind};
+use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
 use owlshift_contracts::Harness;
-use owlshift_contracts::config::{States, TrackerKind};
+use owlshift_contracts::config::{Admit, States, Tracker, TrackerKind};
 use owlshift_platform::keychain::SERVICE;
 use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
 use serde_json::Value;
@@ -259,6 +265,9 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(tracker_check(config));
     checks.extend(tracker_states_check(system, config));
     checks.extend(tracker_identity_check(system, config));
+    let facts = admission_facts(system, config);
+    checks.extend(drain_admission_check(config, facts.as_ref()));
+    checks.extend(proposals_inbox_check(config, facts.as_ref()));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
@@ -975,7 +984,10 @@ fn tracker_states_check(system: &dyn System, config: &Effective) -> Option<Check
             };
         }
     };
-    let configured = configured_states(&config.tracker.states);
+    let mut configured = configured_states(&config.tracker.states);
+    if let Admit::State(name) = &config.tracker.admit {
+        configured.push(("admit.state".to_owned(), name.clone()));
+    }
     let mut problems = Vec::new();
     let mut ambiguous = false;
     for (key, name) in &configured {
@@ -1016,6 +1028,222 @@ fn tracker_states_check(system: &dyn System, config: &Effective) -> Option<Check
         SUBJECT,
         format!("team `{team}` has {}", problems.join("; ")),
         why,
+    ))
+}
+
+/// What Linear says of the admission and proposals setup of a Linear
+/// project: the labels it names, its admitters, and its proposals inbox
+/// (OWL-155). None for a Markdown project or none loaded.
+fn admission_facts(
+    system: &dyn System,
+    config: &Effective,
+) -> Option<Result<AdmissionFacts, StatesError>> {
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
+        return None;
+    };
+    let tracker = &config.tracker;
+    let mut labels = vec![PROPOSED_LABEL];
+    if let Admit::Label(label) = &tracker.admit {
+        labels.push(label);
+    }
+    labels.extend(tracker.exclude.as_deref());
+    let accounts: Vec<&str> = tracker
+        .admitters
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    Some(system.linear_admission(team, &tracker.states.ready, &labels, &accounts))
+}
+
+/// Whether the project is set up to admit tickets to the drain (OWL-155,
+/// build plan "P4 · The drain", part D): a gesture that can be made, the
+/// admission and exclusion labels on the team or the workspace, and
+/// admitters who are accounts of the workspace. Each fault is a warning,
+/// since none blocks `do`; `--drain` refuses to start on them. Offline for a
+/// Markdown project, which has only the faults that need no tracker. A
+/// missing key or an unreadable keychain adds nothing: the tracker states
+/// line fails on it. `admitters` is read from the working tree here; the
+/// drain reads it at the base commit.
+fn drain_admission_check(
+    config: &Effective,
+    facts: Option<&Result<AdmissionFacts, StatesError>>,
+) -> Option<Check> {
+    const SUBJECT: &str = "drain admission";
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let tracker: &Tracker = &config.tracker;
+    let mut problems = Vec::new();
+    let mut fixes = Vec::new();
+    match &tracker.admit {
+        Admit::Delegation => {
+            problems.push("`admit = \"delegation\"` is not built".to_owned());
+            fixes.push(
+                "Decision D8's app takes no delegation scope, so nothing can be delegated to \
+                 Owlshift: set `admit` under `[tracker]` to `{ label = … }` or `{ state = … }`.",
+            );
+        }
+        Admit::Label(_) | Admit::State(_) => {}
+    }
+    if tracker.admitters.is_none() {
+        problems.push("`admitters` is not set under `[tracker]`".to_owned());
+        fixes.push(
+            "List under `admitters` the Linear user ids whose gesture admits a ticket; with none, \
+             no ticket is ever admitted.",
+        );
+    }
+    let checked = matches!(facts, Some(Ok(_)));
+    match facts {
+        Some(Ok(found)) => {
+            let mut missing_label = |what: &str, name: &str| {
+                if !found.labels.iter().any(|l| l == name) {
+                    problems.push(format!(
+                        "the {what} label {name:?} exists on neither team nor workspace"
+                    ));
+                    return true;
+                }
+                false
+            };
+            let mut absent = false;
+            if let Admit::Label(label) = &tracker.admit {
+                absent |= missing_label("admission", label);
+            }
+            if let Some(exclude) = &tracker.exclude {
+                absent |= missing_label("exclusion", exclude);
+            }
+            if absent {
+                fixes.push(
+                    "Create the label in Linear, on the team or the workspace, or set the name \
+                     as Linear has it: names match exactly, case included.",
+                );
+            }
+            let mut accounts = false;
+            for id in tracker.admitters.iter().flatten() {
+                match found.accounts.iter().find(|a| &a.id == id) {
+                    None => {
+                        problems.push(format!("admitter {id:?} is no account of the workspace"))
+                    }
+                    Some(a) if a.app => {
+                        problems.push(format!(
+                            "admitter {id:?} is an app user, which never admits"
+                        ));
+                    }
+                    Some(a) if !a.active => {
+                        problems.push(format!("admitter {id:?} is a deactivated account"));
+                    }
+                    Some(_) => continue,
+                }
+                accounts = true;
+            }
+            if accounts {
+                fixes.push(
+                    "Set `admitters` to the ids of active people of the workspace, as Linear \
+                     gives them (a user's `id`).",
+                );
+            }
+        }
+        Some(Err(StatesError::Tracker(error))) => {
+            problems.push(format!("labels and admitters not checked: {error}"));
+        }
+        Some(Err(StatesError::NoKey | StatesError::Keychain(_))) | None => {}
+    }
+    if problems.is_empty() {
+        let gesture = match &tracker.admit {
+            Admit::Label(label) => format!("label {label:?}"),
+            Admit::State(state) => format!("state {state:?}"),
+            Admit::Delegation => unreachable!("delegation is a problem"),
+        };
+        let admitters = tracker.admitters.iter().flatten().count();
+        let scope = if checked {
+            "labels and admitters exist in Linear"
+        } else {
+            "not checked against the tracker"
+        };
+        return Some(Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "admitted by {gesture}, {admitters} admitter(s) in the working tree (the drain \
+                 reads the base commit); {scope}"
+            ),
+        ));
+    }
+    Some(Check::warn(
+        Section::Project,
+        SUBJECT,
+        problems.join("; "),
+        format!(
+            "{DOES_NOT_BLOCK} `owlshift watch --drain` refuses to start, and would admit nothing, \
+             until it is fixed. {}",
+            fixes.join(" ")
+        ),
+    ))
+}
+
+/// Whether a follow-up Owlshift proposes can be filed (OWL-155): the team's
+/// triage inbox, or the label fallback `agent:proposed` on its first backlog
+/// state, chosen as the adapter chooses (`propose`). A warning when neither
+/// works. None unless a Linear project's facts were read; a tracker error is
+/// the admission line's to report.
+fn proposals_inbox_check(
+    config: &Effective,
+    facts: Option<&Result<AdmissionFacts, StatesError>>,
+) -> Option<Check> {
+    const SUBJECT: &str = "proposals inbox";
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let team = config.tracker.team.as_deref()?;
+    let Some(Ok(found)) = facts else {
+        return None;
+    };
+    let labelled = match &found.inbox {
+        Ok(false) => {
+            return Some(Check::ok(
+                Section::Project,
+                SUBJECT,
+                format!("team `{team}` files proposals in its triage inbox"),
+            ));
+        }
+        Ok(true) if found.labels.iter().any(|l| l == PROPOSED_LABEL) => {
+            return Some(Check::ok(
+                Section::Project,
+                SUBJECT,
+                format!(
+                    "team `{team}` has no triage inbox: proposals go to its first backlog state \
+                     with the label {PROPOSED_LABEL:?}"
+                ),
+            ));
+        }
+        Ok(true) => true,
+        Err(_) => false,
+    };
+    let detail = match &found.inbox {
+        Err(reason) => reason.clone(),
+        Ok(_) => format!(
+            "team `{team}` has no triage inbox, and neither it nor the workspace has the label \
+             {PROPOSED_LABEL:?} that marks a proposal in its backlog"
+        ),
+    };
+    let fix = if labelled {
+        format!("Create the label {PROPOSED_LABEL:?} in Linear, on the team or the workspace.")
+    } else {
+        "Turn Triage on for the team in Linear (team settings), or give it a backlog state \
+         other than the ready state."
+            .to_owned()
+    };
+    Some(Check::warn(
+        Section::Project,
+        SUBJECT,
+        detail,
+        format!(
+            "{DOES_NOT_BLOCK} Owlshift cannot file the follow-ups it proposes, and `owlshift \
+             watch --drain` refuses to start, until a proposals inbox exists. {fix}"
+        ),
     ))
 }
 
@@ -2240,5 +2468,235 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 ("ready".to_owned(), "Todo".to_owned())
             ]
         );
+    }
+    const LABELLED_TRACKER: &str = r#"kind = "linear"
+team = "OWL"
+admit = { label = "agent" }
+admitters = ["u-ann"]
+exclude = "hold"
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }"#;
+
+    fn facts(
+        inbox: Result<bool, &str>,
+        labels: &[&str],
+        accounts: &[(&str, bool, bool)],
+    ) -> AdmissionFacts {
+        AdmissionFacts {
+            inbox: inbox.map_err(str::to_owned),
+            labels: labels.iter().map(|&l| l.to_owned()).collect(),
+            accounts: accounts
+                .iter()
+                .map(|&(id, app, active)| crate::system::AccountFact {
+                    id: id.to_owned(),
+                    app,
+                    active,
+                })
+                .collect(),
+        }
+    }
+
+    /// OWL-155: the state gesture is checked with the other states, by the
+    /// same rule, under the key `admit.state`.
+    #[test]
+    fn the_admission_state_is_a_tracker_state_too() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = project_tracked_by(
+            r#"kind = "linear"
+team = "OWL"
+admit = { state = "Todo" }
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }"#,
+        );
+        let report = run(&ready().linear_states_are(Ok(OWL_STATES)), &config);
+        let found = line(&report, "tracker states");
+        assert_eq!(found.status, Status::Ok, "{found:?}");
+        assert!(
+            found
+                .detail
+                .ends_with("review, working, admit.state is one workflow state of team `OWL`")
+                || found.detail.contains("admit.state"),
+            "{found:?}"
+        );
+
+        let without_todo: Vec<&str> = OWL_STATES
+            .iter()
+            .copied()
+            .filter(|s| *s != "Todo")
+            .collect();
+        let report = run(&ready().linear_states_are(Ok(&without_todo)), &config);
+        let warned = line(&report, "tracker states");
+        assert_eq!(warned.status, Status::Warn);
+        assert!(
+            warned
+                .detail
+                .contains("no state named \"Todo\" (`admit.state`)"),
+            "{warned:?}"
+        );
+    }
+
+    /// OWL-155: the admission label, the exclusion label and the admitters
+    /// must exist; each fault is one warning that does not block `do`.
+    #[test]
+    fn the_admission_setup_is_checked_against_linear() {
+        use owlshift_adapters::tracker::Error;
+
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = project_tracked_by(LABELLED_TRACKER);
+        let admission = |system: &FakeSystem| {
+            let report = run(system, &config);
+            assert!(report.ready(), "{report}");
+            line(&report, "drain admission").clone()
+        };
+
+        let all = facts(Ok(false), &["agent", "hold"], &[("u-ann", false, true)]);
+        let found = admission(&ready().linear_admission_is(Ok(all)));
+        assert_eq!(found.status, Status::Ok, "{found:?}");
+        assert!(
+            found.detail.contains("label \"agent\", 1 admitter(s)"),
+            "{found:?}"
+        );
+        assert!(found.detail.contains("exist in Linear"), "{found:?}");
+
+        for (answer, expected) in [
+            (
+                facts(Ok(false), &["hold"], &[("u-ann", false, true)]),
+                "the admission label \"agent\" exists on neither team nor workspace",
+            ),
+            (
+                facts(Ok(false), &["agent"], &[("u-ann", false, true)]),
+                "the exclusion label \"hold\" exists on neither team nor workspace",
+            ),
+            (
+                facts(Ok(false), &["agent", "hold"], &[]),
+                "admitter \"u-ann\" is no account of the workspace",
+            ),
+            (
+                facts(Ok(false), &["agent", "hold"], &[("u-ann", true, true)]),
+                "admitter \"u-ann\" is an app user, which never admits",
+            ),
+            (
+                facts(Ok(false), &["agent", "hold"], &[("u-ann", false, false)]),
+                "admitter \"u-ann\" is a deactivated account",
+            ),
+        ] {
+            let warned = admission(&ready().linear_admission_is(Ok(answer)));
+            assert_eq!(warned.status, Status::Warn, "{warned:?}");
+            assert_eq!(warned.detail, expected);
+            let why = warned.why.as_deref().unwrap();
+            assert!(why.starts_with("Does not block `owlshift do`:"), "{why}");
+            assert!(
+                why.contains("`owlshift watch --drain` refuses to start"),
+                "{why}"
+            );
+        }
+
+        // Linear out of reach: one warning that nothing was checked. A
+        // missing key adds nothing, the states line fails on it.
+        let offline = admission(&ready());
+        assert_eq!(offline.status, Status::Warn);
+        assert_eq!(
+            offline.detail,
+            "labels and admitters not checked: Linear: no network in tests"
+        );
+        let refused = Error::new(ErrorKind::Unauthorized, "Linear: AUTHENTICATION_ERROR: no");
+        let refused = admission(&ready().linear_admission_is(Err(refused)));
+        assert!(
+            refused.detail.contains("not checked: Linear: AUTH"),
+            "{refused:?}"
+        );
+        let report = run(&ready().unstored(LINEAR_ACCOUNT), &config);
+        assert_eq!(line(&report, "drain admission").status, Status::Ok);
+    }
+
+    /// OWL-155: delegation and a missing `admitters` warn without the
+    /// tracker, in a Markdown project, which reaches neither the
+    /// keychain nor the network.
+    #[test]
+    fn delegation_and_missing_admitters_warn_offline() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, markdown) = project_tracked_by(
+            r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#,
+        );
+        let report = run(&system, &markdown);
+        let warned = line(&report, "drain admission");
+        assert_eq!(warned.status, Status::Warn);
+        assert_eq!(
+            warned.detail,
+            "`admit = \"delegation\"` is not built; `admitters` is not set under `[tracker]`"
+        );
+        assert!(report.checks.iter().all(|c| c.subject != "proposals inbox"));
+        assert!(report.ready(), "{report}");
+
+        let (_dir, labelled) = project_tracked_by(
+            r#"kind = "markdown"
+admit = { label = "agent" }
+admitters = ["ann"]
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#,
+        );
+        let report = run(&system, &labelled);
+        let found = line(&report, "drain admission");
+        assert_eq!(found.status, Status::Ok, "{found:?}");
+        assert!(
+            found.detail.ends_with("not checked against the tracker"),
+            "{found:?}"
+        );
+
+        // No project file: nothing to check.
+        let report = run(&system, &no_config());
+        assert!(report.checks.iter().all(|c| c.subject != "drain admission"));
+    }
+
+    /// OWL-155: a proposal goes to the triage inbox, else to the backlog
+    /// with the label; neither is a warning, as `propose` would refuse.
+    #[test]
+    fn the_proposals_inbox_is_the_one_propose_would_use() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = project_tracked_by(LABELLED_TRACKER);
+        let inbox = |answer: AdmissionFacts| {
+            let report = run(&ready().linear_admission_is(Ok(answer)), &config);
+            assert!(report.ready(), "{report}");
+            line(&report, "proposals inbox").clone()
+        };
+
+        let triage = inbox(facts(Ok(false), &[], &[]));
+        assert_eq!(triage.status, Status::Ok);
+        assert_eq!(
+            triage.detail,
+            "team `OWL` files proposals in its triage inbox"
+        );
+
+        let labelled = inbox(facts(Ok(true), &["agent:proposed"], &[]));
+        assert_eq!(labelled.status, Status::Ok);
+        assert!(
+            labelled.detail.contains("first backlog state"),
+            "{labelled:?}"
+        );
+
+        let no_label = inbox(facts(Ok(true), &[], &[]));
+        assert_eq!(no_label.status, Status::Warn);
+        assert!(
+            no_label.detail.contains("\"agent:proposed\""),
+            "{no_label:?}"
+        );
+        let why = no_label.why.as_deref().unwrap();
+        assert!(why.contains("Create the label \"agent:proposed\""), "{why}");
+        assert!(
+            why.contains("`owlshift watch --drain` refuses to start"),
+            "{why}"
+        );
+
+        let refused = inbox(facts(
+            Err("team OWL has no triage inbox and no backlog state to file a proposal in"),
+            &[],
+            &[],
+        ));
+        assert_eq!(refused.status, Status::Warn);
+        assert!(refused.detail.contains("no backlog state"), "{refused:?}");
+
+        // Nothing read, nothing said: a tracker error is the admission
+        // line's, a missing key the states line's.
+        let report = run(&ready(), &config);
+        assert!(report.checks.iter().all(|c| c.subject != "proposals inbox"));
     }
 }

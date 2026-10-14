@@ -113,6 +113,16 @@
 //!   answered team `OWL`'s label, `Agent` nothing), each label naming its
 //!   team.
 //!
+//! Read only, for `owlshift doctor` (OWL-155, checked 2026-10-14):
+//!
+//! - `teams(filter: { key })` answers `triageEnabled` and the states with
+//!   their `type`; `issueLabels(filter: { name: { in } })` is exact too
+//!   (`agent` and `Agent` asked, `agent` answered) and each label has
+//!   `team` (null for a workspace label) and `isGroup`;
+//!   `users(filter: { id: { in } }, includeDisabled: true)` answers
+//!   `active` and `app`, and leaves an unknown id out, where `user(id:)`
+//!   fails with an input error.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -410,6 +420,111 @@ impl LinearTracker {
     }
 }
 
+/// What `owlshift doctor` learns of a team's admission and proposals setup
+/// (OWL-155).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionFacts {
+    /// Where a proposal would be filed, as `propose` chooses: `Ok(false)`
+    /// in the triage inbox, `Ok(true)` in the first backlog state with the
+    /// [`PROPOSED_LABEL`], else why it cannot be filed.
+    pub inbox: Result<bool, String>,
+    /// Of the label names asked, those a team ticket can carry: exactly
+    /// named, on the team or on the workspace, not a label group.
+    pub labels: Vec<String>,
+    /// Of the account ids asked, those Linear knows, deactivated ones
+    /// included.
+    pub accounts: Vec<AccountFact>,
+}
+
+/// One account of the workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountFact {
+    pub id: String,
+    /// An app user, which never admits.
+    pub app: bool,
+    /// Not deactivated.
+    pub active: bool,
+}
+
+impl LinearTracker {
+    /// The facts behind doctor's admission lines, read only (checked
+    /// 2026-10-14, build plan "P4 · The drain"): the team's states and
+    /// triage setting; the labels named `labels`, on the team or the
+    /// workspace; the accounts `accounts` by id, deactivated ones included.
+    /// `ready` is the project's ready state, which a proposal never goes to.
+    /// No team of that key is [`ErrorKind::NotFound`]. More answers than one
+    /// page holds are refused, not truncated.
+    pub fn admission_facts(
+        &self,
+        team: &str,
+        ready: &str,
+        labels: &[&str],
+        accounts: &[&str],
+    ) -> Result<AdmissionFacts, Error> {
+        let key = team.to_ascii_uppercase();
+        let data: AdmissionTeamData = self.call(ADMISSION_TEAM_QUERY, json!({ "key": key }))?;
+        let Some(found) = data.teams.nodes.into_iter().next() else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("Linear has no team with the key {key:?}"),
+            ));
+        };
+        let TargetTeam {
+            id: team_id,
+            triage_enabled,
+            team: found,
+        } = found;
+        one_page(&found)?;
+        let inbox = proposals_inbox(triage_enabled, &found.states.nodes, &found.key, ready)
+            .map(|(_, labelled)| labelled)
+            .map_err(|e| e.message);
+        let mut present = Vec::new();
+        if !labels.is_empty() {
+            let data: AdmissionLabelsData =
+                self.call(ADMISSION_LABELS_QUERY, json!({ "names": labels }))?;
+            if data.issue_labels.page_info.has_next_page {
+                return Err(invalid(format!(
+                    "more than {MAX_PAGE} labels are named like {labels:?}, which this adapter \
+                     does not read"
+                )));
+            }
+            for label in data.issue_labels.nodes {
+                let ours = label.team.as_ref().is_none_or(|t| t.id == team_id);
+                if ours && !label.is_group && labels.contains(&label.name.as_str()) {
+                    present.push(label.name);
+                }
+            }
+        }
+        let mut known = Vec::new();
+        if !accounts.is_empty() {
+            if accounts.len() > MAX_PAGE as usize {
+                return Err(invalid(format!(
+                    "{} admitters are listed, more than the {MAX_PAGE} this adapter checks",
+                    accounts.len()
+                )));
+            }
+            let data: AdmissionUsersData =
+                self.call(ADMISSION_USERS_QUERY, json!({ "ids": accounts }))?;
+            known = data
+                .users
+                .nodes
+                .into_iter()
+                .filter(|user| accounts.contains(&user.id.as_str()))
+                .map(|user| AccountFact {
+                    id: user.id,
+                    app: user.app,
+                    active: user.active,
+                })
+                .collect();
+        }
+        Ok(AdmissionFacts {
+            inbox,
+            labels: present,
+            accounts: known,
+        })
+    }
+}
+
 /// Why no single workflow state answers to a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateMismatch {
@@ -683,35 +798,12 @@ impl Tracker for LinearTracker {
             team,
         } = target.team;
         one_page(&team)?;
-        let first = |kind: &str| {
-            team.states
-                .nodes
-                .iter()
-                .filter(|state| state.kind == kind)
-                .min_by(|a, b| a.position.total_cmp(&b.position))
-        };
-        let triage = if triage_enabled {
-            first("triage")
-        } else {
-            None
-        };
-        let (state, labelled) = match (triage, first("backlog")) {
-            (Some(state), _) => (state, false),
-            (None, Some(state)) => (state, true),
-            (None, None) => {
-                return Err(invalid(format!(
-                    "team {} has no triage inbox and no backlog state to file a proposal in",
-                    team.key
-                )));
-            }
-        };
-        if state.name == proposal.ready {
-            return Err(invalid(format!(
-                "team {}'s proposals would go to {:?}, the ready state: a proposal never enters \
-                 the queue without a person",
-                team.key, state.name
-            )));
-        }
+        let (state, labelled) = proposals_inbox(
+            triage_enabled,
+            &team.states.nodes,
+            &team.key,
+            proposal.ready,
+        )?;
         let mut input = json!({
             "teamId": team_id,
             "stateId": state.id,
@@ -833,6 +925,47 @@ impl LinearTracker {
     }
 }
 
+/// Where a proposal goes in a team: the first `triage` state by position
+/// when the team has triage on, else its first `backlog` state, which then
+/// takes [`PROPOSED_LABEL`] (the `bool`). Never the ready state `ready`: a
+/// proposal never enters the queue without a person. What `propose` files
+/// by and `owlshift doctor` checks (OWL-155).
+fn proposals_inbox<'a>(
+    triage_enabled: bool,
+    states: &'a [TypedState],
+    key: &str,
+    ready: &str,
+) -> Result<(&'a TypedState, bool), Error> {
+    let first = |kind: &str| {
+        states
+            .iter()
+            .filter(|state| state.kind == kind)
+            .min_by(|a, b| a.position.total_cmp(&b.position))
+    };
+    let triage = if triage_enabled {
+        first("triage")
+    } else {
+        None
+    };
+    let (state, labelled) = match (triage, first("backlog")) {
+        (Some(state), _) => (state, false),
+        (None, Some(state)) => (state, true),
+        (None, None) => {
+            return Err(invalid(format!(
+                "team {key} has no triage inbox and no backlog state to file a proposal in"
+            )));
+        }
+    };
+    if state.name == ready {
+        return Err(invalid(format!(
+            "team {key}'s proposals would go to {:?}, the ready state: a proposal never enters \
+             the queue without a person",
+            state.name
+        )));
+    }
+    Ok((state, labelled))
+}
+
 /// `url` when it is a Linear link with nothing Markdown reads as syntax.
 fn profile_link(url: &str) -> Option<String> {
     let plain = url
@@ -940,6 +1073,18 @@ const TARGET_QUERY: &str = "query ProposalTarget($id: String!) { issue(id: $id) 
 
 const LABEL_QUERY: &str = "query ProposedLabel($name: String!) { \
     issueLabels(first: 50, filter: { name: { eq: $name } }) { nodes { id team { id } } } }";
+
+const ADMISSION_TEAM_QUERY: &str = "query AdmissionTeam($key: String!) { \
+    teams(filter: { key: { eq: $key } }) { nodes { id key triageEnabled states(first: 50) { \
+    nodes { id name type position } pageInfo { hasNextPage } } } } }";
+
+const ADMISSION_LABELS_QUERY: &str = "query AdmissionLabels($names: [String!]) { \
+    issueLabels(first: 50, filter: { name: { in: $names } }) { \
+    nodes { name isGroup team { id } } pageInfo { hasNextPage } } }";
+
+const ADMISSION_USERS_QUERY: &str = "query AdmissionUsers($ids: [ID!]) { \
+    users(first: 50, includeDisabled: true, filter: { id: { in: $ids } }) { \
+    nodes { id active app } } }";
 
 const PROPOSE_MUTATION: &str = "mutation Propose($input: IssueCreateInput!) { \
     issueCreate(input: $input) { success issue { id identifier state { id name } } } }";
@@ -1493,6 +1638,37 @@ struct TypedState {
     #[serde(rename = "type")]
     kind: String,
     position: f64,
+}
+
+#[derive(Deserialize)]
+struct AdmissionTeamData {
+    teams: Teams<TargetTeam>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdmissionLabelsData {
+    issue_labels: Connection<AdmissionLabel>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdmissionLabel {
+    name: String,
+    is_group: bool,
+    team: Option<Id>,
+}
+
+#[derive(Deserialize)]
+struct AdmissionUsersData {
+    users: Teams<AdmissionUser>,
+}
+
+#[derive(Deserialize)]
+struct AdmissionUser {
+    id: String,
+    active: bool,
+    app: bool,
 }
 
 #[derive(Deserialize)]
@@ -2230,6 +2406,94 @@ mod tests {
         let error = tracker(vec![more]).team_states("OWL").unwrap_err();
         assert_eq!(error.kind, ErrorKind::Other);
         assert!(error.message.contains("more than 50"), "{error}");
+    }
+
+    /// OWL-155, checked live on 2026-10-14: the team's inbox as `propose`
+    /// chooses it, the labels a team ticket can carry (the team's or the
+    /// workspace's, exactly named, never another team's or a group), and
+    /// the accounts Linear knows with whether each is an app or deactivated.
+    #[test]
+    fn admission_facts_read_the_inbox_the_labels_and_the_accounts() {
+        let team = |triage: bool| {
+            json!({ "data": { "teams": { "nodes": [{ "id": "team-owl", "key": "OWL",
+                "triageEnabled": triage,
+                "states": { "nodes": [
+                    { "id": "s1", "name": "Triage", "type": "triage", "position": 0.0 },
+                    { "id": "s2", "name": "Backlog", "type": "backlog", "position": 0.0 },
+                    { "id": "s3", "name": "Todo", "type": "unstarted", "position": 1.0 }],
+                    "pageInfo": { "hasNextPage": false } } }] } } })
+            .to_string()
+        };
+        let labels = json!({ "data": { "issueLabels": { "nodes": [
+            { "name": "agent", "isGroup": false, "team": { "id": "team-owl" } },
+            { "name": "hold", "isGroup": false, "team": { "id": "team-other" } },
+            { "name": "wide", "isGroup": false, "team": null },
+            { "name": "group", "isGroup": true, "team": null }],
+            "pageInfo": { "hasNextPage": false } } } })
+        .to_string();
+        let users = json!({ "data": { "users": { "nodes": [
+            { "id": "u-ann", "active": true, "app": false },
+            { "id": "u-bot", "active": true, "app": true },
+            { "id": "u-gone", "active": false, "app": false }] } } })
+        .to_string();
+        let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+
+        let facts = tracker(vec![
+            leak(team(true)),
+            leak(labels.clone()),
+            leak(users.clone()),
+        ])
+        .admission_facts(
+            "owl",
+            "Todo",
+            &["agent", "hold", "wide", "group", "Agent"],
+            &["u-ann", "u-bot", "u-gone", "u-none"],
+        )
+        .unwrap();
+        assert_eq!(facts.inbox, Ok(false));
+        assert_eq!(facts.labels, ["agent", "wide"]);
+        let account = |id: &str, app, active| AccountFact {
+            id: id.to_owned(),
+            app,
+            active,
+        };
+        assert_eq!(
+            facts.accounts,
+            [
+                account("u-ann", false, true),
+                account("u-bot", true, true),
+                account("u-gone", false, false)
+            ]
+        );
+
+        // Triage off: the backlog with the label. The ready state is refused.
+        let facts = tracker(vec![leak(team(false))])
+            .admission_facts("OWL", "Todo", &[], &[])
+            .unwrap();
+        assert_eq!(facts.inbox, Ok(true));
+        assert!(facts.labels.is_empty() && facts.accounts.is_empty());
+        let facts = tracker(vec![leak(team(false))])
+            .admission_facts("OWL", "Backlog", &[], &[])
+            .unwrap();
+        assert!(facts.inbox.unwrap_err().contains("the ready state"));
+
+        let none = r#"{"data":{"teams":{"nodes":[]}}}"#;
+        let error = tracker(vec![none])
+            .admission_facts("OWL", "Todo", &[], &[])
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotFound);
+
+        let more = r#"{"data":{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}"#;
+        let error = tracker(vec![leak(team(true)), more])
+            .admission_facts("OWL", "Todo", &["agent"], &[])
+            .unwrap_err();
+        assert!(error.message.contains("more than 50"), "{error}");
+        let many: Vec<String> = (0..51).map(|n| format!("u{n}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let error = tracker(vec![leak(team(true))])
+            .admission_facts("OWL", "Todo", &[], &many)
+            .unwrap_err();
+        assert!(error.message.contains("51 admitters"), "{error}");
     }
 
     /// OWL-1 as Linear gave it on 2026-09-29, made by its onboarding
