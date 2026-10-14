@@ -59,12 +59,16 @@ const BRANCH: &str = "owlshift/demo-1";
 const REPO: &str = "demo/project";
 
 /// GitHub's API as the adapter sees it: at most one open pull request,
-/// whose head is the ticket branch's tip on the bare remote, unless
-/// `stale_reads` says to report an older head for that many reads.
+/// whose head is its branch's tip on the bare remote, unless `stale_reads`
+/// says to report an older head for that many reads. One pull request is
+/// live at a time: every read answers about the latest one opened.
 struct FakeGitHub {
     env: GitEnv,
     bare: PathBuf,
     open: Mutex<Option<u64>>,
+    /// The branch of the latest pull request opened, DEMO-1's until one is:
+    /// another ticket's delivers once the first is merged (OWL-254).
+    head: Mutex<String>,
     created: Mutex<Vec<Value>>,
     stale_reads: Mutex<u32>,
     /// What watch's read of the pull request finds (OWL-209): its state,
@@ -118,8 +122,9 @@ impl Default for Followed {
 
 impl FakeGitHub {
     fn tip(&self) -> String {
+        let head = self.head.lock().unwrap().clone();
         self.env
-            .run(&self.bare, &["rev-parse", &format!("refs/heads/{BRANCH}")])
+            .run(&self.bare, &["rev-parse", &format!("refs/heads/{head}")])
             .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
             .unwrap_or_else(|_| "0".repeat(40))
     }
@@ -143,7 +148,8 @@ impl FakeGitHub {
     fn answer(&self, request: &Value) -> Value {
         let query = request["query"].as_str().unwrap();
         if query.starts_with("query OpenPullRequests") {
-            let open = self.open.lock().unwrap().is_some();
+            let open = self.open.lock().unwrap().is_some()
+                && request["variables"]["head"] == json!(*self.head.lock().unwrap());
             let nodes = if open {
                 vec![self.pull_request()]
             } else {
@@ -153,10 +159,9 @@ impl FakeGitHub {
         } else if query.starts_with("query RepositoryId") {
             json!({ "repository": { "id": "R_1" } })
         } else if query.starts_with("mutation OpenPullRequest") {
-            self.created
-                .lock()
-                .unwrap()
-                .push(request["variables"]["input"].clone());
+            let input = &request["variables"]["input"];
+            self.created.lock().unwrap().push(input.clone());
+            *self.head.lock().unwrap() = input["headRefName"].as_str().unwrap().to_owned();
             *self.open.lock().unwrap() = Some(1);
             json!({ "createPullRequest": { "pullRequest": self.pull_request() } })
         } else if query.starts_with("query Follow") {
@@ -364,6 +369,8 @@ struct Clocked<'a> {
 #[derive(Default)]
 struct FakeInbox {
     on: bool,
+    /// The Markdown tracker's own inbox instead of this one (OWL-254).
+    markdown: bool,
     /// The tickets filed or already there: id, title, description.
     tickets: Vec<(TicketId, String, String)>,
     /// Every filing is refused with this.
@@ -396,7 +403,8 @@ fn tick(clock: &Cell<Timestamp>) -> Timestamp {
 
 impl Tracker for Clocked<'_> {
     fn capabilities(&self) -> &'static [Capability] {
-        if self.inbox.borrow().on {
+        let inbox = self.inbox.borrow();
+        if inbox.on || inbox.markdown {
             Tracker::capabilities(&self.inner)
         } else {
             WITHOUT_INBOX
@@ -404,6 +412,9 @@ impl Tracker for Clocked<'_> {
     }
 
     fn propose(&self, proposal: &tracker::Proposal<'_>) -> Result<tracker::Filed, tracker::Error> {
+        if self.inbox.borrow().markdown {
+            return Tracker::propose(&self.inner, proposal);
+        }
         let mut inbox = self.inbox.borrow_mut();
         if let Some(why) = inbox.refuse {
             return Err(tracker::Error::new(tracker::ErrorKind::Other, why));
@@ -423,10 +434,13 @@ impl Tracker for Clocked<'_> {
 
     fn proposed(
         &self,
-        _team: Option<&str>,
+        team: Option<&str>,
         title: &str,
         marker: &str,
     ) -> Result<Vec<tracker::Found>, tracker::Error> {
+        if self.inbox.borrow().markdown {
+            return Tracker::proposed(&self.inner, team, title, marker);
+        }
         Ok(self
             .inbox
             .borrow()
@@ -660,6 +674,7 @@ impl Bench {
             env: env.clone(),
             bare: remote.bare.clone(),
             open: Mutex::new(None),
+            head: Mutex::new(BRANCH.to_owned()),
             created: Mutex::new(Vec::new()),
             stale_reads: Mutex::new(0),
             followed: Mutex::default(),
@@ -8414,3 +8429,8 @@ fn a_resume_of_an_intake_is_held_and_one_shown_ready_is_left() {
     );
     assert_eq!(bench.stage(), "Needs Input");
 }
+
+/// The drain's scenarios, S3, S4, S6, S12 and S13, played on this bench
+/// (OWL-254, build plan part K).
+#[path = "on_demand/drain_scenarios.rs"]
+mod drain_scenarios;
