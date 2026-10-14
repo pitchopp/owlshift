@@ -15,6 +15,11 @@
 //! that second before it by n (OWL-136): the times then order the comments
 //! as the tracker lists them, as Linear's do, which the runner's comparisons
 //! need. It is not the instant the comment was written, only its place.
+//!
+//! The proposals inbox (OWL-267) is the stage [`MarkdownTracker::TRIAGE`]:
+//! a follow-up is filed as a new ticket folder after the parent's key's
+//! highest number, authored [`MarkdownTracker::AGENT`], `related` to its
+//! parent and, when it needs the parent's code, `blocked_by` it.
 
 use std::fmt;
 use std::fs;
@@ -47,6 +52,8 @@ pub struct Ticket {
     pub assignee: Option<String>,
     pub labels: Vec<String>,
     pub blocked_by: Vec<TicketId>,
+    /// The tickets it relates to: a proposal's parent (OWL-267).
+    pub related: Vec<TicketId>,
     pub description: String,
 }
 
@@ -114,6 +121,7 @@ impl MarkdownTracker {
             assignee: front.assignee,
             labels: front.labels,
             blocked_by: front.blocked_by,
+            related: front.related,
             description: description.to_owned(),
         })
     }
@@ -255,18 +263,128 @@ impl MarkdownTracker {
             }
             let mut blocked_by = before.blocked_by.clone();
             blocked_by.push(blocker.clone());
-            let value = toml::Value::Array(
-                blocked_by
-                    .iter()
-                    .map(|id| toml::Value::String(id.as_str().to_owned()))
-                    .collect(),
-            );
+            let value = ids_value(&blocked_by);
             let expected = FrontMatter {
                 blocked_by,
                 ..before.clone()
             };
             Some((value, expected))
         })
+    }
+
+    /// Files a follow-up of `parent` in the proposals inbox (OWL-267) and
+    /// returns its identifier: a new folder `<KEY>-<n>`, `KEY` the parent's
+    /// key and `n` one past the highest number among that key's folders,
+    /// holding a `ticket.md` at the stage [`Self::TRIAGE`], authored
+    /// [`Self::AGENT`], `related` to the parent and, with
+    /// `blocked_by_parent`, blocked by it; no priority, assignee or label.
+    /// The description follows one blank line, as given but for leading
+    /// line breaks, which the format never reads.
+    ///
+    /// The folder is claimed by creating it, which fails when it exists, so
+    /// a ticket is never overwritten: a number taken meanwhile (by another
+    /// filing, or by a folder of that name in another case on a file system
+    /// that ignores case) moves on to the next one, at most 64 times. A
+    /// `ticket.md` that cannot be written leaves no folder behind. A parent that is not there, whose identifier ends in no number, or a
+    /// title blank or on several lines is refused before anything is
+    /// written.
+    pub fn propose(
+        &self,
+        parent: &TicketId,
+        title: &str,
+        description: &str,
+        blocked_by_parent: bool,
+    ) -> Result<TicketId, TrackerError> {
+        let parent_file = self.ticket_file(parent);
+        if !parent_file.is_file() {
+            return Err(error(&parent_file, "no such ticket"));
+        }
+        if title.trim().is_empty() || title.contains(['\n', '\r']) {
+            return Err(error(
+                &parent_file,
+                "a proposal's title must be one line, not blank",
+            ));
+        }
+        let Some((key, _)) = numbered(parent) else {
+            return Err(error(
+                &parent_file,
+                format!("{parent} ends in no number to file a proposal after"),
+            ));
+        };
+        let front = FrontMatter {
+            title: title.to_owned(),
+            author: Self::AGENT.to_owned(),
+            stage: Self::TRIAGE.to_owned(),
+            priority: Priority::Unset,
+            assignee: None,
+            labels: Vec::new(),
+            blocked_by: if blocked_by_parent {
+                vec![parent.clone()]
+            } else {
+                Vec::new()
+            },
+            related: vec![parent.clone()],
+        };
+        let description = description.trim_start_matches(['\r', '\n']);
+        let text = format!(
+            "+++\n{}+++\n\n{description}",
+            render_front(&front).map_err(|e| error(&parent_file, e))?
+        );
+        if !matches!(parse(&text), Ok((read, rest)) if read == front && rest == description) {
+            return Err(error(
+                &parent_file,
+                "the proposal does not read back as written",
+            ));
+        }
+        let highest = self
+            .ticket_ids()?
+            .iter()
+            .filter_map(numbered)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, n)| n)
+            .max()
+            .unwrap_or(0);
+        let (id, dir) = self.claim(key, highest, CLAIM_TRIES)?;
+        let path = dir.join("ticket.md");
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(text.as_bytes()));
+        if let Err(e) = written {
+            // The folder is this filing's own, just made: nothing else is
+            // in it.
+            let _ = fs::remove_dir_all(&dir);
+            return Err(error(&path, e));
+        }
+        Ok(id)
+    }
+
+    /// Creates the first free folder `<key>-<n>` for `n` past `after`,
+    /// trying at most `tries` numbers, and returns its identifier and path.
+    fn claim(
+        &self,
+        key: &str,
+        after: u64,
+        tries: u32,
+    ) -> Result<(TicketId, PathBuf), TrackerError> {
+        let mut n = after;
+        for _ in 0..tries {
+            n = n
+                .checked_add(1)
+                .ok_or_else(|| error(&self.tickets, format!("no number left after {key}-{n}")))?;
+            let id = TicketId::new(format!("{key}-{n}")).map_err(|e| error(&self.tickets, e))?;
+            let dir = self.tickets.join(id.as_str());
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok((id, dir)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(error(&dir, e)),
+            }
+        }
+        Err(error(
+            &self.tickets,
+            format!("no free identifier among the {tries} after {key}-{after}"),
+        ))
     }
 
     /// Rewrites the line of the front matter that sets `key`, the one line
@@ -465,6 +583,74 @@ impl shared::Tracker for MarkdownTracker {
         self.require_ticket_file(blocked)?;
         MarkdownTracker::add_blocked_by(self, blocked, blocker).map_err(other)
     }
+
+    /// Files the proposal at the stage [`MarkdownTracker::TRIAGE`]
+    /// ([`MarkdownTracker::propose`]), refusing first a ready state of that
+    /// name, which would put it in the queue without a person. A parent
+    /// that is not there is [`ErrorKind::NotFound`]. One file is written,
+    /// so a filing that succeeds has no problem to report.
+    fn propose(&self, proposal: &shared::Proposal<'_>) -> Result<shared::Filed, shared::Error> {
+        if proposal.ready == Self::TRIAGE {
+            return Err(shared::Error::new(
+                ErrorKind::Other,
+                format!(
+                    "the proposals inbox, the stage {:?}, is the ready state: a proposal \
+                     there would enter the queue without a person",
+                    Self::TRIAGE
+                ),
+            ));
+        }
+        self.require_ticket(proposal.parent)?;
+        let id = MarkdownTracker::propose(
+            self,
+            proposal.parent,
+            proposal.title,
+            proposal.description,
+            proposal.blocked_by_parent,
+        )
+        .map_err(other)?;
+        Ok(shared::Filed {
+            id,
+            state: Self::TRIAGE.to_owned(),
+            problems: Vec::new(),
+        })
+    }
+
+    /// Every ticket of `tickets/` not at the stage `Done` whose title is
+    /// `title` once both are lowercased, or whose description contains
+    /// `marker`, in folder order. Unicode's lowercasing, wider than the
+    /// ASCII of the fingerprint's normalization, is as close as a file
+    /// comes to Linear's `eqIgnoreCase`. A declined proposal is at another
+    /// stage, so it still stops a duplicate. `team` is ignored, as in the
+    /// listing; a ticket that cannot be read fails the search.
+    fn proposed(
+        &self,
+        _team: Option<&str>,
+        title: &str,
+        marker: &str,
+    ) -> Result<Vec<shared::Found>, shared::Error> {
+        if title.trim().is_empty() || marker.trim().is_empty() {
+            return Err(shared::Error::new(
+                ErrorKind::Other,
+                "a proposal is searched by a title and a marker that are not blank",
+            ));
+        }
+        let title = title.to_lowercase();
+        let mut found = Vec::new();
+        for id in self.ticket_ids().map_err(other)? {
+            let ticket = MarkdownTracker::ticket(self, &id).map_err(other)?;
+            if ticket.stage == Self::DONE {
+                continue;
+            }
+            if ticket.title.to_lowercase() == title || ticket.description.contains(marker) {
+                found.push(shared::Found {
+                    id,
+                    description: ticket.description,
+                });
+            }
+        }
+        Ok(found)
+    }
 }
 
 impl MarkdownTracker {
@@ -475,10 +661,17 @@ impl MarkdownTracker {
         Capability::Comments,
         Capability::VisibleStage,
         Capability::BlockedBy,
+        Capability::ProposalsInbox,
     ];
 
-    /// The author of the comments the runner posts.
+    /// The author of the comments the runner posts, and of the proposals it
+    /// files. A Markdown ticket's admission gesture being its author's, a
+    /// proposal is admitted only once a person has made it theirs (OWL-267).
     pub const AGENT: &'static str = "owlshift";
+
+    /// The stage a proposal is filed at: the proposals inbox, a name fixed
+    /// as [`Self::DONE`] is (OWL-267).
+    pub const TRIAGE: &'static str = "Triage";
 
     /// The stage at which a blocker is done (build plan, "P4 · The drain",
     /// part B).
@@ -630,10 +823,68 @@ struct FrontMatter {
     labels: Vec<String>,
     #[serde(default)]
     blocked_by: Vec<TicketId>,
+    #[serde(default)]
+    related: Vec<TicketId>,
 }
 
 fn no_priority() -> Priority {
     Priority::Unset
+}
+
+/// How many numbers a filing tries past the highest one before giving up
+/// ([`MarkdownTracker::propose`]).
+const CLAIM_TRIES: u32 = 64;
+
+/// A list of ticket identifiers as a TOML value.
+fn ids_value(ids: &[TicketId]) -> toml::Value {
+    toml::Value::Array(
+        ids.iter()
+            .map(|id| toml::Value::String(id.as_str().to_owned()))
+            .collect(),
+    )
+}
+
+/// A front matter's text, one `key = value` line per key in the format's
+/// order, a key at its default left out.
+fn render_front(front: &FrontMatter) -> Result<String, String> {
+    let string = |s: &str| toml::Value::String(s.to_owned());
+    let mut lines = vec![
+        ("title", string(&front.title)),
+        ("author", string(&front.author)),
+        ("stage", string(&front.stage)),
+    ];
+    if front.priority != Priority::Unset {
+        let priority = toml::Value::try_from(front.priority).map_err(|e| e.to_string())?;
+        lines.push(("priority", priority));
+    }
+    if let Some(assignee) = &front.assignee {
+        lines.push(("assignee", string(assignee)));
+    }
+    if !front.labels.is_empty() {
+        let labels = front.labels.iter().map(|label| string(label)).collect();
+        lines.push(("labels", toml::Value::Array(labels)));
+    }
+    if !front.blocked_by.is_empty() {
+        lines.push(("blocked_by", ids_value(&front.blocked_by)));
+    }
+    if !front.related.is_empty() {
+        lines.push(("related", ids_value(&front.related)));
+    }
+    Ok(lines
+        .into_iter()
+        .map(|(key, value)| format!("{key} = {value}\n"))
+        .collect())
+}
+
+/// The key and the number of an identifier written `<key>-<digits>`; `None`
+/// for any other, and for a number past `u64`. Leading zeros read as the
+/// number: `DEMO-007` is 7.
+fn numbered(id: &TicketId) -> Option<(&str, u64)> {
+    let (key, digits) = id.as_str().rsplit_once('-')?;
+    if key.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((key, digits.parse().ok()?))
 }
 
 /// Parses `ticket.md` into its front matter and its description.
@@ -835,6 +1086,7 @@ mod tests {
                 assignee: Some("maintainer".to_owned()),
                 labels: vec!["docs".to_owned()],
                 blocked_by: vec![TicketId::new("DEMO-0").unwrap()],
+                related: Vec::new(),
                 description: "Say hello in the README.\r\n".to_owned(),
             }
         );
@@ -1210,5 +1462,192 @@ mod tests {
             tracker.block(&id(), &missing).unwrap_err().kind,
             ErrorKind::NotFound
         );
+    }
+
+    /// A proposal as the runner hands it over.
+    fn proposal<'a>(
+        parent: &'a TicketId,
+        title: &'a str,
+        description: &'a str,
+        blocked_by_parent: bool,
+        ready: &'a str,
+    ) -> shared::Proposal<'a> {
+        shared::Proposal {
+            parent,
+            title,
+            description,
+            blocked_by_parent,
+            ready,
+        }
+    }
+
+    const FOOTER: &str = "[owlshift] PROPOSAL · DEMO-1 · fingerprint 0123456789ab\n";
+
+    /// A proposal (OWL-267) is a new folder one past the parent's key's
+    /// highest number, other keys and unnumbered folders aside, written at
+    /// `Triage` by `owlshift`, related to its parent and blocked by it only
+    /// when asked; the two searches find it until it is done.
+    #[test]
+    fn a_proposal_is_filed_after_the_highest_number_and_found_again() {
+        use shared::Tracker as _;
+        let (root, tracker, _) = repository(TICKET);
+        let tickets = root.path().join("tickets");
+        for (id, stage) in [
+            ("DEMO-07", "Todo"),
+            ("OTHER-40", "Todo"),
+            ("DEMO-x", "Done"),
+        ] {
+            fs::create_dir_all(tickets.join(id)).unwrap();
+            fs::write(
+                tickets.join(id).join("ticket.md"),
+                ticket_md("a", stage, &[], &[]),
+            )
+            .unwrap();
+        }
+        let description = format!("**Why:** the docs drift.\n\n{FOOTER}");
+        let filed = shared::Tracker::propose(
+            &tracker,
+            &proposal(&id(), "Lint the docs", &description, false, "Todo"),
+        )
+        .unwrap();
+        let first = TicketId::new("DEMO-8").unwrap();
+        assert_eq!(
+            filed,
+            shared::Filed {
+                id: first.clone(),
+                state: "Triage".to_owned(),
+                problems: Vec::new(),
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(tickets.join("DEMO-8/ticket.md")).unwrap(),
+            format!(
+                "+++\ntitle = \"Lint the docs\"\nauthor = \"owlshift\"\nstage = \"Triage\"\n\
+                 related = [\"DEMO-1\"]\n+++\n\n{description}"
+            )
+        );
+
+        let blocked = shared::Tracker::propose(
+            &tracker,
+            &proposal(&id(), "Ship \"it\"", "\n\nText.\n", true, "Todo"),
+        )
+        .unwrap();
+        assert_eq!(blocked.id.as_str(), "DEMO-9");
+        let read = tracker.ticket(&blocked.id).unwrap();
+        assert_eq!(read.title, "Ship \"it\"");
+        assert_eq!(
+            (read.author.as_str(), read.stage.as_str()),
+            ("owlshift", "Triage")
+        );
+        assert_eq!((read.blocked_by, read.related), (vec![id()], vec![id()]));
+        assert_eq!(read.description, "Text.\n");
+        assert_eq!((read.priority, read.assignee), (Priority::Unset, None));
+        assert!(read.labels.is_empty());
+
+        let ids = |found: Vec<shared::Found>| -> Vec<String> {
+            found
+                .into_iter()
+                .map(|f| f.id.as_str().to_owned())
+                .collect()
+        };
+        let marker = "fingerprint 0123456789ab";
+        let both = tracker.proposed(None, "LINT THE DOCS", marker).unwrap();
+        assert_eq!(both[0].description, description);
+        assert_eq!(ids(both), ["DEMO-8"]);
+        assert_eq!(
+            ids(tracker.proposed(None, "ship \"IT\"", "none").unwrap()),
+            ["DEMO-9"]
+        );
+        assert_eq!(
+            ids(tracker.proposed(Some("X"), "Other", marker).unwrap()),
+            ["DEMO-8"]
+        );
+        tracker.set_stage(&first, "Canceled").unwrap();
+        assert_eq!(
+            ids(tracker.proposed(None, "Other", marker).unwrap()),
+            ["DEMO-8"]
+        );
+        tracker.set_stage(&first, "Done").unwrap();
+        assert!(
+            tracker
+                .proposed(None, "Lint the docs", marker)
+                .unwrap()
+                .is_empty()
+        );
+        for (title, marker) in [("", marker), ("Lint the docs", " ")] {
+            assert!(tracker.proposed(None, title, marker).is_err());
+        }
+        fs::write(tickets.join("DEMO-07/ticket.md"), "no front matter").unwrap();
+        let error = tracker.proposed(None, "Lint the docs", marker).unwrap_err();
+        assert!(error.message.contains("DEMO-07"), "{error}");
+    }
+
+    /// Each refusal comes before anything is written: a ready state named
+    /// as the inbox, a parent that is not there, a title blank or on
+    /// several lines, a parent whose identifier ends in no number.
+    #[test]
+    fn a_refused_proposal_writes_nothing() {
+        let (root, tracker, _) = repository(TICKET);
+        let tickets = root.path().join("tickets");
+        fs::create_dir_all(tickets.join("DEMO")).unwrap();
+        fs::write(
+            tickets.join("DEMO/ticket.md"),
+            ticket_md("a", "Todo", &[], &[]),
+        )
+        .unwrap();
+        let listing = || {
+            let mut names: Vec<_> = fs::read_dir(&tickets)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing();
+        let missing = TicketId::new("DEMO-9").unwrap();
+        let unnumbered = TicketId::new("DEMO").unwrap();
+        for (parent, title, ready, kind) in [
+            (&id(), "Lint", "Triage", ErrorKind::Other),
+            (&missing, "Lint", "Todo", ErrorKind::NotFound),
+            (&id(), " ", "Todo", ErrorKind::Other),
+            (&id(), "Lint\nthe docs", "Todo", ErrorKind::Other),
+            (&unnumbered, "Lint", "Todo", ErrorKind::Other),
+        ] {
+            let error =
+                shared::Tracker::propose(&tracker, &proposal(parent, title, FOOTER, false, ready))
+                    .unwrap_err();
+            assert_eq!(error.kind, kind, "{title:?}: {error}");
+        }
+        assert_eq!(listing(), before);
+    }
+
+    /// A folder taken meanwhile is passed over, never written into; past
+    /// the tries allowed, the filing fails.
+    #[test]
+    fn a_taken_number_is_passed_over_within_the_tries() {
+        let (root, tracker, _) = repository(TICKET);
+        let taken = root.path().join("tickets/DEMO-2");
+        fs::create_dir_all(&taken).unwrap();
+        fs::write(taken.join("keep.md"), "mine").unwrap();
+        let (id, dir) = tracker.claim("DEMO", 1, 2).unwrap();
+        assert_eq!((id.as_str(), dir.is_dir()), ("DEMO-3", true));
+        assert_eq!(fs::read_to_string(taken.join("keep.md")).unwrap(), "mine");
+        let error = tracker.claim("DEMO", 1, 2).unwrap_err();
+        assert!(error.reason.contains("no free identifier"), "{error}");
+    }
+
+    #[test]
+    fn a_number_is_read_after_the_last_dash() {
+        for (id, read) in [
+            ("DEMO-12", Some(("DEMO", 12))),
+            ("DEMO-007", Some(("DEMO", 7))),
+            ("A-B-3", Some(("A-B", 3))),
+            ("DEMO", None),
+            ("DEMO-", None),
+            ("DEMO-1a", None),
+            ("DEMO-99999999999999999999", None),
+        ] {
+            assert_eq!(numbered(&TicketId::new(id).unwrap()), read, "{id}");
+        }
     }
 }

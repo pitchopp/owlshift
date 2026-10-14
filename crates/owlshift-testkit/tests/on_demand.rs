@@ -358,8 +358,9 @@ struct Clocked<'a> {
     inbox: &'a RefCell<FakeInbox>,
 }
 
-/// A proposals inbox beside the Markdown tracker, which has none (OWL-253):
-/// off unless a test turns it on.
+/// A proposals inbox in place of the Markdown tracker's own (OWL-253,
+/// OWL-267), so a test can read what was filed and make the filing fail:
+/// off unless a test turns it on, the tracker then having no inbox at all.
 #[derive(Default)]
 struct FakeInbox {
     on: bool,
@@ -369,15 +370,22 @@ struct FakeInbox {
     refuse: Option<&'static str>,
 }
 
-/// The Markdown tracker's capabilities and a proposals inbox.
-const WITH_INBOX: &[Capability] = &[
+/// The Markdown tracker's capabilities without its proposals inbox.
+const WITHOUT_INBOX: &[Capability] = &[
     Capability::ReadTicket,
     Capability::ListAdmitted,
     Capability::Comments,
     Capability::VisibleStage,
     Capability::BlockedBy,
-    Capability::ProposalsInbox,
 ];
+
+/// [`WITHOUT_INBOX`] is the Markdown tracker's list less the inbox alone.
+#[test]
+fn the_bench_without_an_inbox_keeps_every_other_capability() {
+    let mut expected = MarkdownTracker::CAPABILITIES.to_vec();
+    expected.retain(|c| *c != Capability::ProposalsInbox);
+    assert_eq!(WITHOUT_INBOX, expected);
+}
 
 /// The clock's time, then a minute later.
 fn tick(clock: &Cell<Timestamp>) -> Timestamp {
@@ -389,9 +397,9 @@ fn tick(clock: &Cell<Timestamp>) -> Timestamp {
 impl Tracker for Clocked<'_> {
     fn capabilities(&self) -> &'static [Capability] {
         if self.inbox.borrow().on {
-            WITH_INBOX
-        } else {
             Tracker::capabilities(&self.inner)
+        } else {
+            WITHOUT_INBOX
         }
     }
 
