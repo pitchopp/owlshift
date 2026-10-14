@@ -8313,7 +8313,10 @@ fn watch_resumes_an_intake_cut_off_after_its_answered_round() {
         matches!(outcomes[0], Err(Stop::UsageLimit { .. })),
         "{outcomes:?}"
     );
-    assert!(matches!(outcomes[1], Err(Stop::Ready { .. })), "{outcomes:?}");
+    assert!(
+        matches!(outcomes[1], Err(Stop::Ready { .. })),
+        "{outcomes:?}"
+    );
     assert!(
         lines.contains("no ticket is continued before the usage limit resets"),
         "{lines}"
