@@ -166,8 +166,14 @@ fn a_state_the_machine_cannot_be_in_is_refused() {
         "repairs": 0,
     })
     .to_string();
+    // Waiting at Intake is a round of intake's own (OWL-269); waiting with no
+    // round is not.
+    assert!(PersistedState::parse(&document).is_ok());
     assert!(
-        invalid_reason(PersistedState::parse(&document)).ends_with("waiting for input at intake")
+        invalid_reason(PersistedState::parse(
+            &document.replace("\"round\":1", "\"round\":0")
+        ))
+        .ends_with("waiting for input with no question round")
     );
 
     let built = PersistedState {
