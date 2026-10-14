@@ -1029,12 +1029,52 @@ impl OnDemand<'_> {
         decision: Data,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
+        self.continue_guarded(ticket, seen, None, decision, sink)
+    }
+
+    /// [`Self::continue_seen`], run only while the tracker, read under the
+    /// lock, also still shows `shown`: `None`, with nothing run, kept or
+    /// recorded, once it shows another stage. Watch resumes through it a
+    /// ticket an answered intake round left at Intake (OWL-273, architecture
+    /// section 5, "Intake"), which shows needs input until its intake ends:
+    /// one a person moved since is theirs, one in the ready column the
+    /// drain's.
+    pub fn continue_shown(
+        &self,
+        ticket: &TicketId,
+        seen: &str,
+        shown: VisibleStage,
+        decision: Data,
+        sink: &mut EventSink<'_>,
+    ) -> Option<Result<Delivered, Stop>> {
+        self.continue_guarded(ticket, seen, Some(shown), decision, sink)
+    }
+
+    /// [`Self::continue_seen`], with [`Self::continue_shown`]'s guard when
+    /// `shown` names a stage.
+    fn continue_guarded(
+        &self,
+        ticket: &TicketId,
+        seen: &str,
+        shown: Option<VisibleStage>,
+        decision: Data,
+        sink: &mut EventSink<'_>,
+    ) -> Option<Result<Delivered, Stop>> {
         let p = match self.prepare(ticket, Command::Continue) {
             Ok(p) => p,
             Err(stop) => return Some(Err(stop)),
         };
         if p.stored.as_ref().map(|stored| stored.commit.as_str()) != Some(seen) {
             return None;
+        }
+        if let Some(shown) = shown {
+            match self.tracker.stage(ticket) {
+                Ok(stage) if stage == shown.state(&self.config.tracker.states) => {}
+                Ok(_) => return None,
+                Err(e) => {
+                    return Some(Err(refused(&format!("reading the stage of {ticket}"), e)));
+                }
+            }
         }
         sink.emit(ticket, None, EventKind::Decision, decision);
         Some(self.continue_prepared(p, sink))
