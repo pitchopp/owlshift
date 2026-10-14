@@ -432,6 +432,14 @@ impl Tracker for Clocked<'_> {
         Tracker::gesture(&self.inner, id, admit)
     }
 
+    fn relations(&self, id: &TicketId) -> Result<tracker::Relations, tracker::Error> {
+        Tracker::relations(&self.inner, id)
+    }
+
+    fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), tracker::Error> {
+        Tracker::block(&self.inner, blocker, blocked)
+    }
+
     /// A tracker that notifies on a mention, as Linear does (OWL-157).
     fn mention(&self, account: &str) -> Result<Option<String>, tracker::Error> {
         if self.refuse_mention {
@@ -7222,9 +7230,10 @@ impl Bench {
 /// Intake for the drain (OWL-248): a gesture by an account `admitters` does
 /// not list runs nothing; the intake role runs read-only and without
 /// network; a dependency the ticket's text does not name is refused, a
-/// failed run; the next run's record is kept in the ticket ref, every
-/// dependency pending, and shown in an INTAKE comment; the ticket, already
-/// in the ready column, is not moved.
+/// failed run; the next run's record is kept in the ticket ref, its
+/// dependency unknown since the tracker has no such ticket (OWL-249), and
+/// shown in an INTAKE comment; the ticket, already in the ready column, is
+/// not moved.
 #[test]
 fn intake_keeps_its_record_and_leaves_the_ticket_in_the_ready_column() {
     let bench = Bench::drained();
@@ -7242,7 +7251,7 @@ fn intake_keeps_its_record_and_leaves_the_ticket_in_the_ready_column() {
     let record = bench
         .intake(vec![guessed, done], gesture("maintainer"))
         .unwrap();
-    assert_eq!(record.dependencies[0].outcome, DependencyOutcome::Pending);
+    assert_eq!(record.dependencies[0].outcome, DependencyOutcome::Unknown);
     assert_eq!(record.gesture.account, "maintainer");
     let kept = bench.record();
     assert_eq!(kept.intake, Some(record));
@@ -7265,7 +7274,7 @@ fn intake_keeps_its_record_and_leaves_the_ticket_in_the_ready_column() {
     assert_eq!(refused.len(), 1);
     let comments = bench.comments();
     assert!(comments.last().unwrap().starts_with("[owlshift] INTAKE"));
-    assert!(comments.last().unwrap().contains("not checked yet"));
+    assert!(comments.last().unwrap().contains("no such ticket"));
     assert_eq!(bench.stage(), "Todo");
     assert!(
         !kinds(&bench.events()).contains(&EventKind::Dispatch),
@@ -7397,4 +7406,160 @@ fn continue_runs_intake_on_a_ticket_at_intake() {
     let (outcome, _) = bench.continue_ticket(vec![done]);
     assert!(matches!(outcome, Err(Stop::Ready { .. })), "{outcome:?}");
     assert!(bench.record().intake.is_some());
+}
+
+/// An intake result whose record names each of `ids`, each quoted as
+/// "Blocked by <id>.", asking `questions` when they are not empty.
+fn intake_naming(status: &str, ids: &[&str], questions: &str) -> String {
+    let mut result: Value = serde_json::from_str(&intake_result(status, None, questions)).unwrap();
+    result["intake"]["dependencies"] = ids
+        .iter()
+        .map(|id| json!({ "ticket": id, "quote": format!("Blocked by {id}.") }))
+        .collect();
+    result.to_string()
+}
+
+impl Bench {
+    /// Adds the ticket `id` at `stage` to the tracker, `blocked_by` these.
+    fn add_ticket(&self, id: &str, stage: &str, blocked_by: &[&str]) {
+        let dir = self.remote.checkout.join("tickets").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("ticket.md"),
+            format!(
+                "+++\ntitle = \"{id}\"\nauthor = \"maintainer\"\nstage = \"{stage}\"\n\
+                 blocked_by = {blocked_by:?}\n+++\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// What DEMO-1's front matter lists as blocking it.
+    fn blocked_by(&self) -> Vec<String> {
+        MarkdownTracker::new(&self.remote.checkout)
+            .ticket(&ticket())
+            .unwrap()
+            .blocked_by
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect()
+    }
+
+    /// The relations the runner wrote, as `from -> to`.
+    fn relations_written(&self) -> Vec<String> {
+        self.events()
+            .iter()
+            .filter(|e| e.kind == EventKind::TrackerWrite && e.data["action"] == json!("relation"))
+            .map(|e| {
+                format!(
+                    "{} -> {}",
+                    e.data["from"].as_str().unwrap(),
+                    e.data["to"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+}
+
+/// Dependencies to relations (OWL-249): each dependency of a kept verdict
+/// gets its outcome, in the record and the INTAKE comment, and a `blocks`
+/// relation is written, as DEMO-1's `blocked_by`, only for the open one
+/// that neither blocks DEMO-1 already nor is blocked by it.
+#[test]
+fn intake_writes_a_relation_for_each_open_dependency_and_names_the_rest() {
+    let bench = Bench::drained();
+    bench.add_ticket("DEMO-2", "Todo", &[]);
+    bench.add_ticket("DEMO-3", "Done", &[]);
+    bench.add_ticket("DEMO-4", "Todo", &["DEMO-6"]);
+    bench.add_ticket("DEMO-6", "Todo", &["DEMO-1"]);
+    bench.add_ticket("DEMO-5", "Todo", &[]);
+    MarkdownTracker::new(&bench.remote.checkout)
+        .add_blocked_by(&ticket(), &TicketId::new("DEMO-5").unwrap())
+        .unwrap();
+    let named = [
+        "DEMO-2", "DEMO-3", "DEMO-9", "DEMO-1", "DEMO-4", "DEMO-5", "DEMO-2",
+    ];
+    bench.comment_as("maintainer", &format!("Blocked by {}.", named.join(", ")));
+
+    let done = bench.reply(None, Some(&intake_naming("done", &named, "")));
+    let record = bench.intake(vec![done], gesture("maintainer")).unwrap();
+    let outcomes: Vec<(&str, DependencyOutcome)> = record
+        .dependencies
+        .iter()
+        .map(|d| (d.ticket.as_str(), d.outcome))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("DEMO-2", DependencyOutcome::Written),
+            ("DEMO-3", DependencyOutcome::Done),
+            ("DEMO-9", DependencyOutcome::Unknown),
+            ("DEMO-1", DependencyOutcome::Itself),
+            ("DEMO-4", DependencyOutcome::Cycle),
+            ("DEMO-5", DependencyOutcome::Existed),
+        ]
+    );
+    assert_eq!(bench.record().intake, Some(record));
+    assert_eq!(bench.blocked_by(), ["DEMO-5", "DEMO-2"]);
+    assert_eq!(bench.relations_written(), ["DEMO-2 -> DEMO-1"]);
+    let intake = bench.comments().pop().unwrap();
+    for said in [
+        "DEMO-2, named by `Blocked by DEMO-2.`: relation written",
+        "DEMO-4, named by `Blocked by DEMO-4.`: already blocked by this ticket",
+        "relation already there",
+        "already done",
+        "no such ticket",
+        "this ticket itself",
+    ] {
+        assert!(intake.contains(said), "{said}:\n{intake}");
+    }
+}
+
+/// A dependency the tracker cannot read (OWL-249) is a failed intake run,
+/// with a `relations_not_written` warning, and nothing is kept; a verdict
+/// kept with its round writes its relations before the round is asked.
+#[test]
+fn a_dependency_not_read_fails_the_run_and_a_round_writes_its_relations() {
+    let bench = Bench::drained();
+    bench.add_ticket("DEMO-2", "Todo", &[]);
+    let broken = bench.remote.checkout.join("tickets").join("DEMO-7");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("ticket.md"), "not a ticket\n").unwrap();
+    bench.comment_as("maintainer", "Blocked by DEMO-7, then DEMO-2.");
+    let question = r#"[{"id":"Q1","category":"scope","context":"The ticket names no language.",
+        "text":"Which language should the greeting use?"}]"#;
+
+    let unread = bench.reply(
+        None,
+        Some(&intake_naming("questions", &["DEMO-7"], question)),
+    );
+    let asks = bench.reply(
+        None,
+        Some(&intake_naming("questions", &["DEMO-2"], question)),
+    );
+    let stop = bench
+        .intake(vec![unread, asks], gesture("maintainer"))
+        .expect_err("questions");
+    assert!(matches!(&stop, Stop::NeedsInput { .. }), "{stop}");
+    let warnings: Vec<Event> = bench
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.kind == EventKind::Warning && e.data["what"] == json!("relations_not_written")
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].data["reason"]
+            .as_str()
+            .unwrap()
+            .contains("DEMO-7"),
+        "{:?}",
+        warnings[0].data
+    );
+    assert_eq!(bench.briefs().len(), 2);
+    let kept = bench.record().intake.unwrap();
+    assert_eq!(kept.dependencies[0].outcome, DependencyOutcome::Written);
+    assert_eq!(bench.blocked_by(), ["DEMO-2"]);
+    assert_eq!(bench.stage(), "Needs Input");
 }

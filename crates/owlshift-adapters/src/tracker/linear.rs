@@ -121,6 +121,19 @@
 //!   answered team `OWL`'s label, `Agent` nothing), each label naming its
 //!   team.
 //!
+//! Checked live on 2026-10-14 (OWL-249; build plan, "P4 · The drain",
+//! check (d)) through the API key, on two throwaway issues then canceled:
+//!
+//! - `issueRelationCreate(input: { type: blocks, issueId, relatedIssueId })`
+//!   takes identifiers (`OWL-271` blocking `OWL-272`), and the blocked
+//!   issue then lists the relation in its `inverseRelations`.
+//! - The same write again answers `success: true` with the same relation:
+//!   it is idempotent.
+//! - The reverse write answers a new relation: Linear does not refuse a
+//!   cycle, so the runner's walk is the only guard.
+//! - An unknown `issueId` answers `issue not found`, code `INPUT_ERROR`,
+//!   which the adapter reads as [`ErrorKind::NotFound`].
+//!
 //! Read only, for `owlshift doctor` (OWL-155, checked 2026-10-14):
 //!
 //! - `teams(filter: { key })` answers `triageEnabled` and the states with
@@ -151,7 +164,7 @@ use owlshift_contracts::ids::TicketId;
 pub use crate::graphql::{Response, Transport};
 use crate::tracker::{
     Author, Blocker, Capability, Column, Comment, Error, ErrorKind, Filed, Found, Gesture, Listed,
-    PROPOSED_LABEL, Person, Proposal, StateType, Ticket, Tracker, no_delegation,
+    PROPOSED_LABEL, Person, Proposal, Relations, StateType, Ticket, Tracker, no_delegation,
 };
 
 /// Linear's GraphQL endpoint.
@@ -900,6 +913,41 @@ impl Tracker for LinearTracker {
         }
         Ok(found)
     }
+
+    /// One read through the key: the issue's identifier, which Linear
+    /// answers whatever spelling asked it, its state's type, its
+    /// description and its blockers, read as the listing reads them. An
+    /// unknown issue is [`ErrorKind::NotFound`] (`Entity not found: Issue`,
+    /// OWL-264).
+    fn relations(&self, id: &TicketId) -> Result<Relations, Error> {
+        let data: RelationsData = self.call(RELATIONS_QUERY, json!({ "id": id.as_str() }))?;
+        let issue = data.issue;
+        let id = TicketId::new(issue.identifier).map_err(|e| invalid(e.to_string()))?;
+        let blockers = blockers(&id, issue.inverse_relations)?;
+        Ok(Relations {
+            id,
+            state: Some(state_type(&issue.state.kind)?),
+            description: issue.description.unwrap_or_default(),
+            blockers,
+        })
+    }
+
+    /// `issueRelationCreate` of type `blocks`, `blocker` as `issueId` and
+    /// `blocked` as `relatedIssueId`, by their identifiers, through the app
+    /// when one is set (check (d), 2026-10-14, above): a relation already
+    /// there is answered again, not doubled.
+    fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), Error> {
+        let input = json!({ "type": "blocks", "issueId": blocker.as_str(),
+            "relatedIssueId": blocked.as_str() });
+        let data: RelateData = self.write(RELATE_MUTATION, json!({ "input": input }))?;
+        if data.issue_relation_create.success {
+            Ok(())
+        } else {
+            Err(invalid(format!(
+                "Linear did not write that {blocker} blocks {blocked}"
+            )))
+        }
+    }
 }
 
 impl LinearTracker {
@@ -1002,6 +1050,16 @@ macro_rules! actor_fields {
     };
 }
 
+/// The `blocks` relations whose `relatedIssue` is the issue, archived
+/// blockers included (checked 2026-10-13, above), each blocker with the type
+/// of its state: the listing's and the dependency check's read alike.
+macro_rules! blocker_fields {
+    () => {
+        "inverseRelations(first: 50, includeArchived: true) { \
+         nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } }"
+    };
+}
+
 const TICKET_QUERY: &str = concat!(
     "query Ticket($id: String!) { issue(id: $id) { ",
     issue_fields!(),
@@ -1014,9 +1072,16 @@ const ADMITTED_QUERY: &str = concat!(
     "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { \
      issues(first: $first, after: $after, filter: $filter) { nodes { ",
     issue_fields!(),
-    " createdAt inverseRelations(first: 50, includeArchived: true) { \
-     nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } \
-     pageInfo { hasNextPage endCursor } } }"
+    " createdAt ",
+    blocker_fields!(),
+    " } pageInfo { hasNextPage endCursor } } }"
+);
+
+/// A ticket as intake's dependency check reads it (OWL-249).
+const RELATIONS_QUERY: &str = concat!(
+    "query Relations($id: String!) { issue(id: $id) { identifier description state { type } ",
+    blocker_fields!(),
+    " } }"
 );
 
 /// An issue's creation and history, for the admission gesture (OWL-246).
@@ -1256,36 +1321,58 @@ struct StateOfType {
 impl AdmittedIssue {
     fn into_listed(self) -> Result<Listed, Error> {
         let ticket = self.issue.into_ticket()?;
-        let id = &ticket.id;
-        if self.inverse_relations.page_info.has_next_page {
-            return Err(invalid(format!(
-                "{id} has more than {MAX_PAGE} relations, which this adapter does not read"
-            )));
-        }
-        let mut blockers: Vec<Blocker> = Vec::new();
-        for relation in self.inverse_relations.nodes {
-            if relation.kind != "blocks" {
-                continue;
-            }
-            let Some(blocker) = relation.issue else {
-                return Err(invalid(format!(
-                    "Linear answered a blocker of {id} without its issue"
-                )));
-            };
-            let blocker = Blocker {
-                id: TicketId::new(blocker.identifier).map_err(|e| invalid(e.to_string()))?,
-                state: Some(state_type(&blocker.state.kind)?),
-            };
-            if !blockers.contains(&blocker) {
-                blockers.push(blocker);
-            }
-        }
+        let blockers = blockers(&ticket.id, self.inverse_relations)?;
         Ok(Listed {
             ticket,
             created_at: Some(self.created_at),
             blockers,
         })
     }
+}
+
+/// The blockers of the issue `id`, each once, from its `inverseRelations`.
+/// More relations than a page, a relation without its issue and a state
+/// type this adapter does not know are refused, never dropped: a dropped
+/// blocker would release the ticket.
+fn blockers(id: &TicketId, relations: Connection<Relation>) -> Result<Vec<Blocker>, Error> {
+    if relations.page_info.has_next_page {
+        return Err(invalid(format!(
+            "{id} has more than {MAX_PAGE} relations, which this adapter does not read"
+        )));
+    }
+    let mut blockers: Vec<Blocker> = Vec::new();
+    for relation in relations.nodes {
+        if relation.kind != "blocks" {
+            continue;
+        }
+        let Some(blocker) = relation.issue else {
+            return Err(invalid(format!(
+                "Linear answered a blocker of {id} without its issue"
+            )));
+        };
+        let blocker = Blocker {
+            id: TicketId::new(blocker.identifier).map_err(|e| invalid(e.to_string()))?,
+            state: Some(state_type(&blocker.state.kind)?),
+        };
+        if !blockers.contains(&blocker) {
+            blockers.push(blocker);
+        }
+    }
+    Ok(blockers)
+}
+
+#[derive(Deserialize)]
+struct RelationsData {
+    issue: RelationsIssue,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelationsIssue {
+    identifier: String,
+    description: Option<String>,
+    state: StateOfType,
+    inverse_relations: Connection<Relation>,
 }
 
 /// Linear's `WorkflowState.type`. A type this adapter does not know is
@@ -2889,5 +2976,84 @@ mod tests {
         let not_found = r#"{"errors":[{"message":"Entity not found: Issue",
             "extensions":{"code":"INPUT_ERROR"}}]}"#;
         assert_eq!(tracker(vec![not_found]).ticket_url(&id), None);
+    }
+
+    /// The dependency check's read (OWL-249): the identifier Linear answers,
+    /// whatever spelling asked, the state's type, the description, and the
+    /// `blocks` blockers once each, as the listing reads them; an unknown
+    /// issue is not found, as `issue(id:)` answered on 2026-10-14.
+    #[test]
+    fn a_tickets_relations_are_read_as_the_listing_reads_them() {
+        let blocks = |id: &str, kind: &str| json!({ "type": kind, "issue": { "identifier": id, "state": { "type": "started" } } });
+        let key = Scripted::new(vec![(
+            "Relations",
+            json!({ "issue": { "identifier": "OWL-7", "description": "Blocked by OWL-3.",
+                "state": { "type": "canceled" },
+                "inverseRelations": { "nodes": [blocks("OWL-2", "blocks"),
+                    blocks("OWL-2", "blocks"), blocks("OWL-5", "related")],
+                    "pageInfo": { "hasNextPage": false } } } }),
+        )]);
+        let sent = key.sent.clone();
+        let asked = TicketId::new("0f3c2a52-6d2b-4e0e-9d55-6c1b1c7e2a10").unwrap();
+        let relations = LinearTracker::with_transport(key)
+            .relations(&asked)
+            .unwrap();
+        assert_eq!(sent.lock().unwrap()[0]["id"], json!(asked.as_str()));
+        assert_eq!(
+            relations,
+            Relations {
+                id: TicketId::new("OWL-7").unwrap(),
+                state: Some(StateType::Canceled),
+                description: "Blocked by OWL-3.".to_owned(),
+                blockers: vec![Blocker {
+                    id: TicketId::new("OWL-2").unwrap(),
+                    state: Some(StateType::Started),
+                }],
+            }
+        );
+
+        let not_found = r#"{"data":null,"errors":[{"message":"Entity not found: Issue",
+            "extensions":{"code":"INPUT_ERROR"}}]}"#;
+        let error = tracker(vec![not_found])
+            .relations(&TicketId::new("OWL-99999").unwrap())
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotFound, "{error}");
+    }
+
+    /// The relation write (OWL-249, check (d)): `blocks`, the blocker as
+    /// `issueId`, by identifiers, through the app; a write Linear answers
+    /// unsuccessful, or with check (d)'s `issue not found`, is an error.
+    #[test]
+    fn a_blocks_relation_is_written_through_the_app_by_identifiers() {
+        let key = Scripted::new(vec![(
+            "Workspace",
+            json!({ "organization": { "id": "org-1" } }),
+        )]);
+        let app = Scripted::new(vec![
+            ("App", app_seen(true, "org-1", 1)),
+            ("Relate", related(true)),
+            ("Relate", related(false)),
+        ]);
+        let (by_app, sent) = (app.asked.clone(), app.sent.clone());
+        let (linear, _) = LinearTracker::with_transport(key)
+            .writing_as_app(app, "OWL")
+            .unwrap();
+        let blocker = TicketId::new("OWL-271").unwrap();
+        let blocked = TicketId::new("OWL-272").unwrap();
+        linear.block(&blocker, &blocked).unwrap();
+        assert_eq!(*by_app.lock().unwrap(), ["App", "Relate"]);
+        assert_eq!(
+            sent.lock().unwrap()[1]["input"],
+            json!({ "type": "blocks", "issueId": "OWL-271", "relatedIssueId": "OWL-272" })
+        );
+        assert!(linear.block(&blocker, &blocked).is_err());
+
+        let unknown = r#"{"data":null,"errors":[{"message":"issue not found",
+            "extensions":{"type":"invalid input","code":"INPUT_ERROR","statusCode":400,
+            "userError":true,"userPresentableMessage":"Issue 'OWL-99999' not found."}}]}"#;
+        let error = tracker(vec![unknown])
+            .block(&TicketId::new("OWL-99999").unwrap(), &blocked)
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotFound, "{error}");
     }
 }

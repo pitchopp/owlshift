@@ -7,16 +7,21 @@
 //! gesture) and shows it in an INTAKE comment. Questions go through the
 //! resolver, then to the decider in a round whose return stage is Ready; the
 //! record is kept with the round, so answering does not run intake again.
+//! Before a verdict is kept, its dependencies become `blocks` relations on
+//! the tracker, or say why not (OWL-249, "Dependencies to relations").
 //! An intake that ends at Ready moves the ticket back to the ready column
 //! while the tracker still shows the state the runner set.
 //!
 //! The drain (part G) calls [`OnDemand::intake`] with the gesture it checked;
 //! `continue` runs intake again on a ticket at Intake.
 
-use owlshift_adapters::tracker::Gesture as TrackerGesture;
+use std::collections::HashMap;
+
+use owlshift_adapters::tracker::{ErrorKind, Gesture as TrackerGesture, StateType};
 use owlshift_contracts::config::Admit;
 use owlshift_contracts::drain::{DependencyOutcome, Gesture, GestureKind, KeptDependency};
 use owlshift_contracts::result::IntakeVerdict;
+use owlshift_core::dependency::{self, Node};
 
 use super::*;
 use crate::ticket_ref::text_sha256;
@@ -281,23 +286,47 @@ impl OnDemand<'_> {
                         settled += 1;
                         continue;
                     }
-                    Routing::Ask(round) => {
-                        let record = self.keep_intake(p, &text, &gesture, verdict, &ran, sink)?;
-                        let asked = match state.apply(PIPELINE, Event::Questions) {
-                            Ok(Transition::To(asked)) => asked,
-                            other => return Err(core_error(other)),
-                        };
-                        p.intake = Some(record);
-                        return Err(self.ask(
-                            p,
-                            &asked,
-                            result.status,
-                            &result.summary,
-                            round,
-                            &ran.run,
-                            sink,
-                        ));
-                    }
+                    // The verdict is kept with the round: its dependencies
+                    // become relations now, and a failure is a failed run.
+                    Routing::Ask(round) => match self.relate_dependencies(p, verdict, &ran, sink) {
+                        Ok(dependencies) => {
+                            let record = self.keep_intake(
+                                p,
+                                &text,
+                                &gesture,
+                                verdict,
+                                dependencies,
+                                &ran,
+                                sink,
+                            )?;
+                            let asked = match state.apply(PIPELINE, Event::Questions) {
+                                Ok(Transition::To(asked)) => asked,
+                                other => return Err(core_error(other)),
+                            };
+                            p.intake = Some(record);
+                            return Err(self.ask(
+                                p,
+                                &asked,
+                                result.status,
+                                &result.summary,
+                                round,
+                                &ran.run,
+                                sink,
+                            ));
+                        }
+                        Err(()) => event = Event::RunFailed,
+                    },
+                }
+            }
+            // A `done` verdict is kept: its dependencies become relations
+            // first, and a failure is a failed run.
+            let mut dependencies = None;
+            if event == Event::Completed
+                && let Some(verdict) = verdict
+            {
+                match self.relate_dependencies(p, verdict, &ran, sink) {
+                    Ok(related) => dependencies = Some(related),
+                    Err(()) => event = Event::RunFailed,
                 }
             }
             match state.apply(PIPELINE, event) {
@@ -329,12 +358,13 @@ impl OnDemand<'_> {
                     }
                 }
                 Status::Active(Stage::Ready) => {
-                    let Some(verdict) = verdict else {
+                    let (Some(verdict), Some(dependencies)) = (verdict, dependencies) else {
                         return Err(Stop::Refused(
                             "an intake run done without its record".to_owned(),
                         ));
                     };
-                    let record = self.keep_intake(p, &text, &gesture, verdict, &ran, sink)?;
+                    let record =
+                        self.keep_intake(p, &text, &gesture, verdict, dependencies, &ran, sink)?;
                     p.intake = Some(record.clone());
                     let questions = p.questions();
                     if let Err(error) = self.store(p, &state, questions) {
@@ -358,15 +388,17 @@ impl OnDemand<'_> {
         }
     }
 
-    /// The record of an intake run whose `verdict` is accepted, posted as the
-    /// INTAKE comment; the caller keeps it. Every dependency is `pending`
-    /// until part F checks it.
+    /// The record of an intake run whose `verdict` is accepted, with its
+    /// `dependencies` as [`Self::relate_dependencies`] left them, posted as
+    /// the INTAKE comment; the caller keeps it.
+    #[allow(clippy::too_many_arguments)]
     fn keep_intake(
         &self,
         p: &Prepared,
         text: &str,
         gesture: &Gesture,
         verdict: &IntakeVerdict,
+        dependencies: Vec<KeptDependency>,
         ran: &Ran,
         sink: &mut EventSink<'_>,
     ) -> Result<TicketIntake, Stop> {
@@ -376,15 +408,7 @@ impl OnDemand<'_> {
             gesture: gesture.clone(),
             variant: verdict.variant,
             routing: verdict.routing,
-            dependencies: verdict
-                .dependencies
-                .iter()
-                .map(|dependency| KeptDependency {
-                    ticket: dependency.ticket.clone(),
-                    quote: dependency.quote.clone(),
-                    outcome: DependencyOutcome::Pending,
-                })
-                .collect(),
+            dependencies,
         };
         record
             .validate()
@@ -417,6 +441,92 @@ impl OnDemand<'_> {
             comment_written("INTAKE", &posted),
         );
         Ok(record)
+    }
+
+    /// Turns the dependencies of the `verdict` intake keeps into relations
+    /// (OWL-249, architecture section 5, "Dependencies to relations"): each
+    /// one, once, gets the outcome [`dependency::check`] gives on the
+    /// tracker's reads, and a `blocks` relation from it to the ticket,
+    /// written through the Writer, when the outcome is to write one, with a
+    /// `tracker_write` event. A read or a write that fails otherwise than
+    /// with the tracker's "not found" stops the check with a `warning`
+    /// (`relations_not_written`): the caller counts the run failed. The
+    /// relations written before it stay, and the next run finds them there.
+    fn relate_dependencies(
+        &self,
+        p: &Prepared,
+        verdict: &IntakeVerdict,
+        ran: &Ran,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Vec<KeptDependency>, ()> {
+        let related = self.related(&p.ticket, verdict, ran, sink);
+        related.map_err(|reason| {
+            sink.emit(
+                &p.ticket,
+                Some(&ran.run),
+                EventKind::Warning,
+                data([
+                    ("what", json!("relations_not_written")),
+                    ("reason", json!(reason)),
+                ]),
+            );
+        })
+    }
+
+    /// [`Self::relate_dependencies`], failing with the reason.
+    fn related(
+        &self,
+        ticket: &TicketId,
+        verdict: &IntakeVerdict,
+        ran: &Ran,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Vec<KeptDependency>, String> {
+        let mut read = Reads::new(self.tracker);
+        let own = self
+            .tracker
+            .relations(ticket)
+            .map_err(|e| format!("reading the relations of {ticket}: {e}"))?;
+        let blockers: Vec<TicketId> = own.blockers.iter().map(|b| b.id.clone()).collect();
+        let mut kept: Vec<KeptDependency> = Vec::new();
+        for named in &verdict.dependencies {
+            if kept.iter().any(|known| known.ticket == named.ticket) {
+                continue;
+            }
+            let outcome = dependency::check(&own.id, &blockers, &named.ticket, |id| read.node(id))?;
+            let outcome = match outcome {
+                dependency::Outcome::Write => {
+                    // The tracker's own identifier, as the check compared it.
+                    let blocker = read.id(&named.ticket);
+                    Writer::new(self.tracker)
+                        .relate(&blocker, &own.id)
+                        .map_err(|e| format!("writing that {blocker} blocks {}: {e}", own.id))?;
+                    sink.emit(
+                        ticket,
+                        Some(&ran.run),
+                        EventKind::TrackerWrite,
+                        data([
+                            ("target", json!("tracker")),
+                            ("action", json!("relation")),
+                            ("type", json!("blocks")),
+                            ("from", json!(blocker.as_str())),
+                            ("to", json!(own.id.as_str())),
+                        ]),
+                    );
+                    DependencyOutcome::Written
+                }
+                dependency::Outcome::Existed => DependencyOutcome::Existed,
+                dependency::Outcome::Done => DependencyOutcome::Done,
+                dependency::Outcome::Unknown => DependencyOutcome::Unknown,
+                dependency::Outcome::Itself => DependencyOutcome::Itself,
+                dependency::Outcome::Cycle => DependencyOutcome::Cycle,
+            };
+            kept.push(KeptDependency {
+                ticket: named.ticket.clone(),
+                quote: named.quote.clone(),
+                outcome,
+            });
+        }
+        Ok(kept)
     }
 
     /// Moves the ticket back to the ready column after an intake that ends
@@ -459,6 +569,60 @@ impl OnDemand<'_> {
                     ("reason", json!(reason)),
                 ]),
             );
+        }
+    }
+}
+
+/// The tickets the dependency check read, each read once over all the
+/// dependencies of a verdict.
+struct Reads<'t> {
+    tracker: &'t dyn Tracker,
+    nodes: HashMap<TicketId, Option<Node<TicketId>>>,
+}
+
+impl<'t> Reads<'t> {
+    fn new(tracker: &'t dyn Tracker) -> Self {
+        Self {
+            tracker,
+            nodes: HashMap::new(),
+        }
+    }
+
+    /// The ticket `id` as the check walks it: what blocks it by relation or
+    /// by its "Blocked by" line, and whether it is done; `None` when the
+    /// tracker answered it knows no such ticket.
+    fn node(&mut self, id: &TicketId) -> Result<Option<Node<TicketId>>, String> {
+        if let Some(node) = self.nodes.get(id) {
+            return Ok(node.clone());
+        }
+        let node = match self.tracker.relations(id) {
+            Ok(relations) => {
+                let blockers = dependency::blockers_of(
+                    relations.id.as_str(),
+                    relations.blockers.iter().map(|b| b.id.as_str()),
+                    &relations.description,
+                )
+                .into_iter()
+                .filter_map(|id| TicketId::new(id).ok())
+                .collect();
+                Some(Node {
+                    done: relations.state == Some(StateType::Completed),
+                    blockers,
+                    id: relations.id,
+                })
+            }
+            Err(e) if e.kind == ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("reading {id}: {e}")),
+        };
+        self.nodes.insert(id.clone(), node.clone());
+        Ok(node)
+    }
+
+    /// The tracker's own identifier of `id`, once read.
+    fn id(&self, id: &TicketId) -> TicketId {
+        match self.nodes.get(id) {
+            Some(Some(node)) => node.id.clone(),
+            _ => id.clone(),
         }
     }
 }
