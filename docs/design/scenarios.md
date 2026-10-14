@@ -36,9 +36,9 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 *As soon as a ticket is admitted, the predictable questions reach me before the ticket can block anything.*
 
-- Intake runs once per ticket, and again only when the description changes (content hash).
+- Intake runs once per ticket, again once its questions are answered, and again when the description changes (content hash).
 - A ticket without a valid intake record is never dispatched.
-- Intake questions send the ticket to needs-input with "ready" as the stage to return to.
+- Intake questions send the ticket to needs-input with "intake" as the stage to return to: intake reads the answers before the ticket is ready, so a prerequisite named only in an answer becomes a relation too.
 - Intake turns dependencies written in plain text into tracker relations (or the parsed convention), and records routing and resources.
 - After intake, readiness is computed without any model.
 

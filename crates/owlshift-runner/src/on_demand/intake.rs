@@ -427,8 +427,9 @@ impl OnDemand<'_> {
                             message: format!(
                                 "the INTAKE comment of {} is on the ticket, but keeping its \
                                  record in the ticket's ref failed: {error}; once the ref can be \
-                                 written, the drain runs intake again",
-                                p.ticket
+                                 written, the drain runs intake again, or `owlshift continue {}` \
+                                 does when an answered round left it at Intake",
+                                p.ticket, p.ticket
                             ),
                         });
                     }
