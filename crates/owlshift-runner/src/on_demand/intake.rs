@@ -147,9 +147,10 @@ impl OnDemand<'_> {
     /// Runs intake on `ticket` for the drain, `gesture` being the admission
     /// the drain checked ([`admission`]). The ticket ref must be absent, at
     /// Intake, at Ready, or at Watch with its following ended; the ticket is
-    /// put back at Intake keeping its round count. Returns the record kept
-    /// once intake ends at Ready; a round of questions, a park or anything
-    /// else that stops it is the stop.
+    /// put back at Intake keeping its round count, and a ref already at
+    /// Intake keeps its state, so its failed runs still count (OWL-275).
+    /// Returns the record kept once intake ends at Ready; a round of
+    /// questions, a park or anything else that stops it is the stop.
     pub fn intake(
         &self,
         ticket: &TicketId,
@@ -178,7 +179,12 @@ impl OnDemand<'_> {
                     .as_ref()
                     .is_none_or(|delivery| !delivery.followed());
                 match state.status() {
-                    Status::Active(Stage::Intake | Stage::Ready) => {}
+                    // An intake that has not ended: its failed runs count
+                    // against the stage's bound across its rounds.
+                    Status::Active(Stage::Intake) => {
+                        return self.run_intake(p, state, gesture, sink);
+                    }
+                    Status::Active(Stage::Ready) => {}
                     Status::Active(Stage::Watch) if ended => {}
                     status => {
                         return Err(Stop::Refused(format!(

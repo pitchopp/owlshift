@@ -8430,6 +8430,165 @@ fn a_resume_of_an_intake_is_held_and_one_shown_ready_is_left() {
     assert_eq!(bench.stage(), "Needs Input");
 }
 
+/// OWL-275: under `watch --drain`, watch's resume of an answered intake
+/// round is cut off by a usage limit; a person moves the ticket, left at
+/// Intake with a record holding its text, back to the ready column. Nothing
+/// runs before the reset; then the drain takes it in, intake running again,
+/// and dispatches it to Build, with no `continue` typed.
+#[test]
+fn the_drain_takes_in_an_intake_moved_back_to_todo_after_its_round() {
+    let bench = Bench::draining("maintainer");
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"scope","context":"The ticket names no language.",
+                "text":"Which language should the greeting use?"}]"#,
+        )),
+    );
+    bench
+        .intake(vec![asks], gesture("maintainer"))
+        .expect_err("questions");
+    bench.answer("English.");
+    let reset: Timestamp = "2026-10-03T18:00:00Z".parse().unwrap();
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some(reset);
+    let replies = vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+        limited,
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let ran = || bench.briefs().len();
+    let (outcomes, lines, _) = bench.drain(replies, 4, |pass| match pass {
+        // Cut off at Intake, its record holding its text; moved to Todo.
+        1 => {
+            let state = TicketState::try_from(&bench.record().state).unwrap();
+            assert_eq!(state.status(), Status::Active(Stage::Intake));
+            assert_eq!(state.round(), 1);
+            assert_eq!(ran(), 3);
+            MarkdownTracker::new(&bench.remote.checkout)
+                .set_stage(&ticket(), "Todo")
+                .unwrap();
+        }
+        // Paused until the reset: nothing ran. Past it now.
+        2 => {
+            assert_eq!(ran(), 3);
+            let past = reset.duration_since(bench.clock.get()) + SignedDuration::from_mins(1);
+            bench.waited.set(past);
+        }
+        _ => {}
+    });
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}");
+    assert!(
+        matches!(outcomes[0], Err(Stop::UsageLimit { .. })),
+        "{outcomes:?}"
+    );
+    assert!(
+        matches!(outcomes[1], Err(Stop::Ready { .. })),
+        "{outcomes:?}"
+    );
+    assert!(outcomes[2].is_ok(), "{outcomes:?}");
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(
+        roles,
+        [
+            Role::Intake,
+            Role::AnswerCheck,
+            Role::Intake,
+            Role::Intake,
+            Role::Build
+        ]
+    );
+    // Watch continued the answered round once; the restart is the drain's.
+    let continued: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["stage"] == json!("intake"))
+        .collect();
+    assert!(continued.is_empty(), "{continued:?}");
+    assert_eq!(
+        bench
+            .drain_decisions()
+            .iter()
+            .filter(|(drain, _)| drain == "intake")
+            .count(),
+        1
+    );
+    let dispatches: Vec<Value> = bench
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Dispatch)
+        .map(|e| e.data["command"].clone())
+        .collect();
+    assert_eq!(dispatches, [json!("drain")]);
+}
+
+/// OWL-275: the drain's intake on a ticket left at Intake keeps its state,
+/// so a failed run before the answered round still counts: the first failed
+/// run after it parks the ticket at Intake, as it would under `continue`.
+#[test]
+fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
+    let bench = Bench::draining("maintainer");
+    let failed = || {
+        bench.reply(
+            None,
+            Some(r#"{"format":8,"status":"failed","summary":"Lost."}"#),
+        )
+    };
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"scope","context":"The ticket names no language.",
+                "text":"Which language should the greeting use?"}]"#,
+        )),
+    );
+    bench
+        .intake(vec![failed(), asks], gesture("maintainer"))
+        .expect_err("questions");
+    bench.answer("English.");
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (outcome, _) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+        limited,
+    ]);
+    assert!(
+        matches!(outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}"
+    );
+    let state = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!(state.status(), Status::Active(Stage::Intake));
+    assert_eq!(state.failed_runs(), 1);
+    assert_eq!(bench.briefs().len(), 4);
+
+    MarkdownTracker::new(&bench.remote.checkout)
+        .set_stage(&ticket(), "Todo")
+        .unwrap();
+    let (outcomes, lines, _) = bench.drain(vec![failed()], 1, |_| {});
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}\n{lines}");
+    assert!(
+        matches!(outcomes[0], Err(Stop::Parked { .. })),
+        "{outcomes:?}"
+    );
+    assert_eq!(bench.briefs().len(), 5, "one run, then the park");
+    let state = TicketState::try_from(&bench.record().state).unwrap();
+    assert!(
+        matches!(
+            state.status(),
+            Status::Parked {
+                at: Stage::Intake,
+                ..
+            }
+        ),
+        "{:?}",
+        state.status()
+    );
+    assert_eq!(bench.stage(), "Parked");
+}
+
 /// The drain's scenarios, S3, S4, S6, S12 and S13, played on this bench
 /// (OWL-254, build plan part K).
 #[path = "on_demand/drain_scenarios.rs"]
