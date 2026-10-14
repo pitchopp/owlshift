@@ -1069,8 +1069,9 @@ impl OnDemand<'_> {
             // command next, it no longer shows Owlshift stopped on it. A
             // ticket parked at Intake keeps it while intake runs, out of the
             // ready column, and goes back there once intake ends at Ready
-            // (OWL-248).
-            if at != Stage::Intake
+            // (OWL-248); one parked while its intake round waited waits
+            // again, and shows it (OWL-269).
+            if state.status() != Status::Active(Stage::Intake)
                 && let Some(stage) = VisibleStage::of(state.status())
             {
                 self.show(ticket, None, stage, sink);
@@ -1079,13 +1080,15 @@ impl OnDemand<'_> {
         if let Status::NeedsInput { .. } = state.status() {
             state = self.check_answers(&mut p, state, sink)?;
         }
-        // At Intake, intake runs again (OWL-248).
+        // At Intake, intake runs again (OWL-248): after a park, a usage
+        // limit, or the answers to its round (OWL-269).
         if state.status() == Status::Active(Stage::Intake) {
             return Err(self.intake_again(&mut p, state, sink));
         }
-        // At Ready with its intake record: an intake round was answered, or
-        // a move back to the ready column did not land. The move again, then
-        // the ticket waits for the drain.
+        // At Ready with its intake record: a move back to the ready column
+        // did not land, or an intake round asked before OWL-269, which
+        // returned to Ready, was answered. The move again, then the ticket
+        // waits for the drain.
         if state.status() == Status::Active(Stage::Ready) && p.intake.is_some() {
             self.back_to_ready(ticket, None, sink);
             return Err(Stop::Ready {
@@ -1722,10 +1725,15 @@ impl OnDemand<'_> {
             Status::NeedsInput {
                 return_to: Stage::Watch,
             } => format!("run `owlshift continue {ticket}` to read the pull request again"),
-            // An intake round: the drain runs intake again (OWL-248).
+            // An intake round: the drain runs intake again (OWL-248), or,
+            // once a round was answered, `continue` does (OWL-269), the ref
+            // then keeping a record of the current text and Intake.
             Status::NeedsInput {
-                return_to: Stage::Ready,
-            } => "the drain's next intake of the ticket asks them again".to_owned(),
+                return_to: Stage::Intake,
+            } => format!(
+                "the drain's next intake of the ticket asks them again, or `owlshift continue \
+                 {ticket}` when an answered round left it at Intake"
+            ),
             _ => format!("run `owlshift do {ticket}` to ask them again"),
         };
         if let Err(error) = self.store(p, state, asked) {
@@ -2054,8 +2062,13 @@ impl OnDemand<'_> {
                     ),
                 })?;
                 // Working at Build; review at Watch, where the pull request
-                // is open (OWL-211).
-                if let Some(stage) = VisibleStage::of(next.status()) {
+                // is open (OWL-211). At Intake, the ticket keeps needs input
+                // while intake runs again (OWL-269): `back_to_ready` moves it
+                // to the ready column once the record is kept, and only from
+                // needs input or parked, never from working.
+                if next.stage() != Stage::Intake
+                    && let Some(stage) = VisibleStage::of(next.status())
+                {
                     self.show(&ticket, Some(&ran.run), stage, sink);
                 }
                 sink.emit(
