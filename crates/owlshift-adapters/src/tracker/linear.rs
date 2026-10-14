@@ -104,6 +104,15 @@
 //! by the app was found among the 50 most recently updated issues, so
 //! skipping one is tested on made-up histories only.
 //!
+//! Checked live on 2026-10-14 at 11:02 UTC (OWL-270), read-only, for whose
+//! moves a state gesture skips: through a client credentials token of the
+//! app (scopes `read,write`, revoked right after), `viewer` answers `app`
+//! true and an `id`, and every move of state with an app actor on OWL-256,
+//! OWL-257 and OWL-258 (ten in all) has that `id` as its actor's. So the
+//! adapter keeps the id that [`LinearTracker::writing_as_app`] reads and
+//! skips only that app user's moves. No other app's move was observed: that
+//! its actor has another id rests on Linear giving each app its own user.
+//!
 //! Checked live on 2026-10-13 (OWL-252; build plan, "P4 · The drain",
 //! check (e)) for proposals, through the app for the writes:
 //!
@@ -259,6 +268,9 @@ pub struct LinearTracker {
     transport: Shared,
     /// The app's transport, for every write, when one is set.
     writes: Option<Shared>,
+    /// The id of the app user writing through `writes`, whose moves a state
+    /// gesture is read past ([`state_gesture`]).
+    app_user: Option<String>,
     comment_page: u32,
     /// The page of the listing and of an issue's history.
     page: u32,
@@ -303,6 +315,7 @@ impl LinearTracker {
         Self {
             transport: Box::new(transport),
             writes: None,
+            app_user: None,
             comment_page: MAX_PAGE,
             page: MAX_PAGE,
         }
@@ -318,7 +331,8 @@ impl LinearTracker {
     /// is `team`. An app reaches the workspace's public teams only, and app
     /// credentials of another workspace would write to the issue of that
     /// workspace with the same identifier. Refused otherwise, with the
-    /// reason; nothing is written either way.
+    /// reason; nothing is written either way. The app user's id, read by the
+    /// same request, is kept: a state gesture is read past its moves.
     pub fn writing_as_app(
         mut self,
         app: impl Transport + Send + Sync + 'static,
@@ -348,6 +362,7 @@ impl LinearTracker {
             ));
         }
         self.writes = Some(Box::new(app));
+        self.app_user = Some(seen.viewer.id);
         Ok((self, AppUser { name }))
     }
 
@@ -659,15 +674,18 @@ impl Tracker for LinearTracker {
     /// nobody's. No entry: the creator, by the same rule, since Linear
     /// records no entry for a label set at creation, and an issue created
     /// through a person's API key is theirs (architecture section 5, "By
-    /// whom"). A state gesture is read by `state_gesture`.
+    /// whom"). A state gesture is read by `state_gesture`: any move of
+    /// state but Owlshift's own app user's decides it, another app's
+    /// included, so the read stops at the page holding one.
     fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<Gesture, Error> {
+        let ours = self.app_user.as_deref();
         let decides = |entry: &HistoryEntry| match admit {
             Admit::Label(label) => entry
                 .added_labels
                 .iter()
                 .flatten()
                 .any(|added| &added.name == label),
-            Admit::State(_) => entry.to_state.is_some() && !entry.by_app(),
+            Admit::State(_) => entry.to_state.is_some() && !entry.by(ours),
             Admit::Delegation => false,
         };
         if *admit == Admit::Delegation {
@@ -698,7 +716,7 @@ impl Tracker for LinearTracker {
             at: Some(created_at),
         };
         if let Admit::State(ready) = admit {
-            return Ok(state_gesture(entries, ready, creator));
+            return Ok(state_gesture(entries, ready, creator, ours));
         }
         let made = entries.into_iter().filter(decides).collect();
         Ok(match latest(made) {
@@ -1129,7 +1147,7 @@ const STAGE_MUTATION: &str = "mutation SetStage($id: String!, $stateId: String!)
     issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }";
 
 /// What [`LinearTracker::writing_as_app`] asks through the app.
-const APP_QUERY: &str = "query App($key: String!) { viewer { displayName app } \
+const APP_QUERY: &str = "query App($key: String!) { viewer { id displayName app } \
     organization { id } teams(filter: { key: { eq: $key } }) { nodes { id } } }";
 
 /// What [`LinearTracker::writing_as_app`] asks through the API key.
@@ -1428,9 +1446,14 @@ struct HistoryEntry {
 }
 
 impl HistoryEntry {
-    /// Made by an app user, as the runner's own moves are through the app.
-    fn by_app(&self) -> bool {
-        self.actor.as_ref().is_some_and(|actor| actor.app)
+    /// Made by the app user whose id is `app_user`, as the runner's own
+    /// moves are through the app; never when there is none. The actor must
+    /// also say it is an app, so a person's entry is never taken for the
+    /// app's.
+    fn by(&self, app_user: Option<&str>) -> bool {
+        self.actor
+            .as_ref()
+            .is_some_and(|actor| actor.app && Some(actor.id.as_str()) == app_user)
     }
 
     fn moved_to(&self, state: &str) -> bool {
@@ -1460,18 +1483,25 @@ fn one_author(entries: Vec<HistoryEntry>) -> Author {
 }
 
 /// A state gesture (architecture section 5, "By whom"), from the history
-/// read and the creator's gesture. The moves of state an app user made are
-/// skipped: the runner moves a ticket back to `ready` through the app ("Back
-/// to the ready column"), and an app never admits. The latest move left
-/// decides: to `ready`, its author is the gesture; anywhere else, the
-/// ticket was taken out of the column, and the gesture is nobody's. No move
-/// left: the creator when the issue was created in `ready`, which the oldest
-/// move's `fromState` tells, or no move at all; otherwise nobody's.
-fn state_gesture(entries: Vec<HistoryEntry>, ready: &str, creator: Gesture) -> Gesture {
+/// read and the creator's gesture. The moves of state Owlshift's own app
+/// user made, whose id is `app_user`, are skipped: the runner moves a ticket
+/// back to `ready` through the app ("Back to the ready column"), and an app
+/// never admits. Another app's moves are not (OWL-270). The latest move left
+/// decides: to `ready`, its author is the gesture, which an app's never
+/// admits; anywhere else, the ticket was taken out of the column, and the
+/// gesture is nobody's. No move left: the creator when the issue was created
+/// in `ready`, which the oldest move's `fromState` tells, or no move at all;
+/// otherwise nobody's.
+fn state_gesture(
+    entries: Vec<HistoryEntry>,
+    ready: &str,
+    creator: Gesture,
+    app_user: Option<&str>,
+) -> Gesture {
     let (moves, by_apps): (Vec<HistoryEntry>, Vec<HistoryEntry>) = entries
         .into_iter()
         .filter(|entry| entry.to_state.is_some())
-        .partition(|entry| !entry.by_app());
+        .partition(|entry| !entry.by(app_user));
     if let Some((at, latest)) = latest(moves) {
         let account = if latest.iter().all(|entry| entry.moved_to(ready)) {
             one_author(latest)
@@ -1752,6 +1782,7 @@ struct AppSeen {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppViewer {
+    id: String,
     display_name: String,
     app: bool,
 }
@@ -2362,7 +2393,7 @@ mod tests {
     }
 
     fn app_seen(app: bool, organization: &str, teams: usize) -> Value {
-        json!({ "viewer": { "displayName": "owlshiftbot", "app": app },
+        json!({ "viewer": { "id": "app", "displayName": "owlshiftbot", "app": app },
             "organization": { "id": organization },
             "teams": { "nodes": vec![json!({ "id": "t1" }); teams] } })
     }
@@ -2409,6 +2440,8 @@ mod tests {
             .writing_as_app(app, "owl")
             .unwrap();
         assert_eq!(user.name, "owlshiftbot");
+        // Kept from the same request, for the state gesture (OWL-270).
+        assert_eq!(tracker.app_user.as_deref(), Some("app"));
         let id = TicketId::new("OWL-1").unwrap();
         tracker.comments(&id).unwrap();
         let posted = tracker.post_comment(&id, "x").unwrap();
@@ -2812,16 +2845,31 @@ mod tests {
             "fromState": from.map(|name| json!({ "name": name })), "toState": { "name": to } })
     }
 
-    /// A state gesture (OWL-263): the app's moves are skipped, so a
-    /// person's move to ready outlives the runner's move back; the latest
-    /// other move decides, and a move out of the column by a person or a
-    /// bot is nobody's gesture; with only the app's moves, the creator when
-    /// the issue was created in ready. Read newest first, as Linear lists.
+    /// A tracker writing as the app user `app`, as `writing_as_app` sets.
+    fn ours(bodies: Vec<&'static str>) -> LinearTracker {
+        LinearTracker {
+            app_user: Some("app".to_owned()),
+            ..tracker(bodies)
+        }
+    }
+
+    /// A state gesture (OWL-263): Owlshift's own app's moves are skipped,
+    /// so a person's move to ready outlives the runner's move back; the
+    /// latest other move decides, and a move out of the column by a person,
+    /// a bot or another app is nobody's gesture, while another app's move to
+    /// ready is that app's, which never admits (OWL-270); with only
+    /// Owlshift's moves, the creator when the issue was created in ready.
+    /// Without an app, no move is skipped. Read newest first, as Linear
+    /// lists.
     #[test]
-    fn the_state_gesture_skips_the_apps_moves() {
+    fn the_state_gesture_skips_only_owlshifts_own_app_moves() {
         let at = |t: &str| format!("2026-10-0{t}T00:00:00Z");
         let app = || actor("app", true);
+        let other = || actor("other", true);
         let person = |id: &str| actor(id, false);
+        let by_other = Author::Other {
+            name: "other".to_owned(),
+        };
         let gitbot = json!({ "createdAt": at("5"), "actor": null,
             "botActor": { "name": "GitHub" }, "addedLabels": null,
             "fromState": { "name": "Todo" }, "toState": { "name": "In Review" } });
@@ -2894,15 +2942,68 @@ mod tests {
                 vec![moved(&at("6"), app(), None, "Todo")],
                 Author::unknown(),
             ),
+            (
+                "another app took it out of the column and back",
+                vec![
+                    moved(&at("6"), other(), Some("In Progress"), "Todo"),
+                    moved(&at("5"), other(), Some("Todo"), "In Progress"),
+                    moved(&at("4"), person("p"), Some("Backlog"), "Todo"),
+                ],
+                by_other.clone(),
+            ),
+            (
+                "another app took it out, the runner's round after",
+                [
+                    round("In Progress"),
+                    vec![
+                        moved(&at("5"), other(), Some("Todo"), "In Progress"),
+                        moved(&at("4"), person("p"), Some("Backlog"), "Todo"),
+                    ],
+                ]
+                .concat(),
+                Author::unknown(),
+            ),
+            (
+                "created in ready, another app took it out and back",
+                vec![
+                    moved(&at("6"), other(), Some("Backlog"), "Todo"),
+                    moved(&at("5"), other(), Some("Todo"), "Backlog"),
+                ],
+                by_other,
+            ),
         ];
         let id = TicketId::new("OWL-1").unwrap();
         let todo = Admit::State("Todo".to_owned());
         for (case, entries, expected) in cases {
-            let gesture = tracker(vec![gesture_page(person("u0"), entries, None)])
+            let gesture = ours(vec![gesture_page(person("u0"), entries, None)])
                 .gesture(&id, &todo)
                 .unwrap();
             assert_eq!(gesture.account, expected, "{case}");
         }
+
+        // Without an app, Owlshift writes through the key and no move is
+        // skipped: an app's move back to ready is that app's.
+        let entries = [
+            round("Todo"),
+            vec![moved(&at("4"), person("p"), Some("Backlog"), "Todo")],
+        ]
+        .concat();
+        let gesture = tracker(vec![gesture_page(person("u0"), entries, None)])
+            .gesture(&id, &todo)
+            .unwrap();
+        let by_app = Author::Other {
+            name: "app".to_owned(),
+        };
+        assert_eq!(gesture.account, by_app);
+
+        // Another app's move decides: the page holding it is the last read.
+        let page = gesture_page(
+            person("u0"),
+            vec![moved(&at("5"), other(), Some("Todo"), "Backlog")],
+            Some("c1"),
+        );
+        let gesture = ours(vec![page]).gesture(&id, &todo).unwrap();
+        assert_eq!(gesture.account, Author::unknown());
 
         // The page of the app's moves does not decide: the next is read, and
         // the one after it is not.
@@ -2914,7 +3015,7 @@ mod tests {
                 Some("c2"),
             ),
         ];
-        let gesture = tracker(pages).with_page(2).gesture(&id, &todo).unwrap();
+        let gesture = ours(pages).with_page(2).gesture(&id, &todo).unwrap();
         assert_eq!(gesture.at, Some(at("4").parse().unwrap()));
     }
 
