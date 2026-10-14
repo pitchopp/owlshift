@@ -5298,7 +5298,7 @@ fn a_stage_a_stop_left_at_working_shows_review_again_once() {
     assert_eq!(bench.stage(), "In Progress");
     assert_eq!(bench.ref_commit(), commit);
     assert!(
-        lines.contains("DEMO-1 showed working with no run working it: shown as review again"),
+        lines.contains("DEMO-1 showed working with no run working it: shown as In Review again"),
         "{lines}"
     );
 }

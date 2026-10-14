@@ -23,10 +23,10 @@
 //! Watch ([`outlived`]) has its pull request read before its comments, for
 //! an end alone, which closes the round (OWL-242); so has a ticket parked at
 //! Watch, whose park an end ends without restarting anything (OWL-243).
-//! Before either, the stage of each ticket at Watch whose delivery is
-//! followed is read: one a stop left at working while no run holds the
-//! project's lock is moved to the stage its ref shows (OWL-265,
-//! [`OnDemand::unstick`]).
+//! Before its pull request is read, each ticket at Watch whose delivery is
+//! followed has its stage read: one a stop left at working while no run
+//! holds the project's lock is moved to the stage its ref shows (OWL-265,
+//! architecture section 5, "The stage while a repair runs").
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -674,7 +674,7 @@ impl Watch<'_> {
                         out,
                         &format!(
                             "{ticket} showed working with no run working it: shown as {} again",
-                            to.key()
+                            to.state(&on_demand.config.tracker.states)
                         ),
                     );
                 }
