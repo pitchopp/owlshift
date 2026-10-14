@@ -132,8 +132,10 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 const HEAD_READS: u32 = 5;
 
 mod correction;
+mod drain;
 mod intake;
 
+pub use drain::{Taken, still_ready};
 pub use intake::admission;
 
 /// The pipeline of this version: the build stage alone, in the core machine.
@@ -820,6 +822,9 @@ enum Command {
     /// An intake run for the drain (OWL-248): as `do` before its run, which
     /// clones the checkout and needs a decider.
     Intake,
+    /// The drain's dispatch to Build (OWL-250): `do`'s path, its `dispatch`
+    /// event naming `drain`.
+    Drain,
     /// A rebase run's dispatch (OWL-210), in a repair.
     Rebase,
     /// A correction run after the decider replied to a DECISION (OWL-146),
@@ -836,6 +841,7 @@ impl Command {
             Command::Rebase => "rebase",
             Command::Correct => "correct",
             Command::Intake => "intake",
+            Command::Drain => "drain",
         }
     }
 }
@@ -939,6 +945,18 @@ impl OnDemand<'_> {
     /// see the module documentation. Refused while its questions wait.
     pub fn run(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
         let mut p = self.prepare(ticket, Command::Do)?;
+        self.run_prepared(&mut p, Command::Do, sink)
+    }
+
+    /// [`Self::run`] once `command`, `do` or the drain's dispatch, holds the
+    /// project.
+    fn run_prepared(
+        &self,
+        p: &mut Prepared,
+        command: Command,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        let ticket = &p.ticket.clone();
         let round = match &p.stored {
             Some(stored) => {
                 let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
@@ -975,9 +993,9 @@ impl OnDemand<'_> {
             Ok(Transition::To(state)) => state,
             other => return Err(core_error(other)),
         };
-        let dispatched = self.dispatch(&p, Command::Do, sink)?;
+        let dispatched = self.dispatch(p, command, sink)?;
         self.show_after(ticket, None, Event::Dispatched, sink);
-        self.build(&mut p, &dispatched, state, sink)
+        self.build(p, &dispatched, state, sink)
     }
 
     /// `owlshift continue`: picks `ticket` up where its ticket ref left it. A
@@ -1143,7 +1161,7 @@ impl OnDemand<'_> {
         // The ticket ref lives in the dedicated checkout: without one,
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
-        let takes_in = matches!(command, Command::Do | Command::Intake);
+        let takes_in = matches!(command, Command::Do | Command::Intake | Command::Drain);
         if !takes_in && fs::symlink_metadata(&checkout).is_err() {
             return Err(nothing_to_continue(ticket));
         }
@@ -4881,6 +4899,13 @@ fn pending_decider(ticket: &Ticket) -> Result<Pending, String> {
         return decide(ticket, &declared, &ZoneOwners::default()).map(Pending::Known);
     }
     Ok(Pending::Owners(declared))
+}
+
+/// Whether the ticket alone gives it a decider, for the drain's ready set
+/// (OWL-250): its assignee, or zones whose owners the project file at the
+/// base commit names, which only a command reads.
+pub(crate) fn has_decider(ticket: &Ticket) -> bool {
+    pending_decider(ticket).is_ok()
 }
 
 /// The ticket's decider as the ticket alone tells (its assignee), for

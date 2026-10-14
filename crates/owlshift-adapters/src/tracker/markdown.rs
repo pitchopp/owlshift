@@ -229,49 +229,113 @@ impl MarkdownTracker {
     /// one line written `stage = …`, and every other value must read the same
     /// afterwards.
     pub fn set_stage(&self, id: &TicketId, stage: &str) -> Result<(), TrackerError> {
+        self.rewrite_key(id, "stage", false, |before| {
+            let value = toml::Value::String(stage.to_owned());
+            let expected = FrontMatter {
+                stage: stage.to_owned(),
+                ..before.clone()
+            };
+            Some((value, expected))
+        })
+    }
+
+    /// Adds `blocker` to the ticket's `blocked_by` (OWL-249), rewriting
+    /// that key's line of the front matter, and only that line, or adding
+    /// it before the closing `+++` when the front matter has none. One
+    /// already listed changes nothing. The key must be written on one line,
+    /// `blocked_by = [...]`, and every other value must read the same
+    /// afterwards; a ticket is never its own blocker.
+    pub fn add_blocked_by(&self, id: &TicketId, blocker: &TicketId) -> Result<(), TrackerError> {
+        if blocker == id {
+            return Err(error(&self.ticket_file(id), "a ticket never blocks itself"));
+        }
+        self.rewrite_key(id, "blocked_by", true, |before| {
+            if before.blocked_by.contains(blocker) {
+                return None;
+            }
+            let mut blocked_by = before.blocked_by.clone();
+            blocked_by.push(blocker.clone());
+            let value = toml::Value::Array(
+                blocked_by
+                    .iter()
+                    .map(|id| toml::Value::String(id.as_str().to_owned()))
+                    .collect(),
+            );
+            let expected = FrontMatter {
+                blocked_by,
+                ..before.clone()
+            };
+            Some((value, expected))
+        })
+    }
+
+    /// Rewrites the line of the front matter that sets `key`, the one line
+    /// written `key = …`, to the value `change` gives, or, when `insert` is
+    /// set and no line sets it, adds one before the closing `+++`. `change`
+    /// returns the value and the front matter expected once it is written,
+    /// or `None` when nothing is to change; the file is written only when
+    /// it reads back exactly as expected, so no other value moves.
+    fn rewrite_key(
+        &self,
+        id: &TicketId,
+        key: &str,
+        insert: bool,
+        change: impl FnOnce(&FrontMatter) -> Option<(toml::Value, FrontMatter)>,
+    ) -> Result<(), TrackerError> {
         let path = self.ticket_file(id);
         let input = read(&path)?;
         let (before, _) = parse(&input).map_err(|reason| error(&path, reason))?;
+        let Some((value, expected)) = change(&before) else {
+            return Ok(());
+        };
         let (front, _) = split(&input).map_err(|reason| error(&path, reason))?;
 
         let mut offset = front.start;
-        let mut stage_lines = Vec::new();
-        for line in input[front].split_inclusive('\n') {
+        let mut key_lines = Vec::new();
+        for line in input[front.clone()].split_inclusive('\n') {
             let rest = line.trim_start();
             if rest
-                .strip_prefix("stage")
+                .strip_prefix(key)
                 .is_some_and(|r| r.trim_start().starts_with('='))
             {
-                stage_lines.push((offset, line));
+                key_lines.push((offset, line));
             }
             offset += line.len();
         }
-        let [(start, line)] = stage_lines[..] else {
-            return Err(error(
-                &path,
+        let output = match key_lines[..] {
+            [(start, line)] => {
+                let ending = &line[line.trim_end_matches(['\r', '\n']).len()..];
                 format!(
-                    "expected one `stage = …` line in the front matter, found {}",
-                    stage_lines.len()
-                ),
-            ));
+                    "{}{key} = {value}{ending}{}",
+                    &input[..start],
+                    &input[start + line.len()..]
+                )
+            }
+            [] if insert => {
+                let opening = &input[..front.start];
+                let ending = &opening[opening.trim_end_matches(['\r', '\n']).len()..];
+                format!(
+                    "{}{key} = {value}{ending}{}",
+                    &input[..front.end],
+                    &input[front.end..]
+                )
+            }
+            _ => {
+                return Err(error(
+                    &path,
+                    format!(
+                        "expected one `{key} = …` line in the front matter, found {}",
+                        key_lines.len()
+                    ),
+                ));
+            }
         };
-        let ending = &line[line.trim_end_matches(['\r', '\n']).len()..];
-        let output = format!(
-            "{}stage = {}{ending}{}",
-            &input[..start],
-            toml::Value::String(stage.to_owned()),
-            &input[start + line.len()..]
-        );
 
         let (after, _) = parse(&output).map_err(|reason| error(&path, reason))?;
-        let expected = FrontMatter {
-            stage: stage.to_owned(),
-            ..before
-        };
         if after != expected {
             return Err(error(
                 &path,
-                "the stage line cannot be rewritten on its own",
+                format!("the {key} line cannot be rewritten on its own"),
             ));
         }
         fs::write(&path, output).map_err(|e| error(&path, e))
@@ -346,22 +410,7 @@ impl shared::Tracker for MarkdownTracker {
             if ticket.stage != column.ready || label.is_some_and(|l| !ticket.labels.contains(l)) {
                 continue;
             }
-            let mut blockers: Vec<shared::Blocker> = Vec::new();
-            for blocker in &ticket.blocked_by {
-                if blockers.iter().any(|known| &known.id == blocker) {
-                    continue;
-                }
-                let state = if self.ticket_file(blocker).is_file() {
-                    let stage = MarkdownTracker::ticket(self, blocker).map_err(other)?.stage;
-                    (stage == Self::DONE).then_some(shared::StateType::Completed)
-                } else {
-                    None
-                };
-                blockers.push(shared::Blocker {
-                    id: blocker.clone(),
-                    state,
-                });
-            }
+            let blockers = self.blockers(&ticket)?;
             listed.push(shared::Listed {
                 ticket: shared_ticket(ticket),
                 created_at: None,
@@ -369,6 +418,14 @@ impl shared::Tracker for MarkdownTracker {
             });
         }
         Ok(listed)
+    }
+
+    /// `Completed` at the stage `Done`, no type at any other; a ticket the
+    /// folder lacks is not found (OWL-250).
+    fn state_type(&self, id: &TicketId) -> Result<Option<shared::StateType>, shared::Error> {
+        self.require_ticket(id)?;
+        let stage = MarkdownTracker::ticket(self, id).map_err(other)?.stage;
+        Ok((stage == Self::DONE).then_some(shared::StateType::Completed))
     }
 
     /// The ticket's `author`: its files keep no history, so whoever wrote
@@ -384,6 +441,29 @@ impl shared::Tracker for MarkdownTracker {
             account: account(ticket.author),
             at: None,
         })
+    }
+
+    /// The ticket's stage `Done` as completed, any other stage without a
+    /// type, its description and its `blocked_by`, read as the listing
+    /// reads them. Only a ticket file that is not there is
+    /// [`ErrorKind::NotFound`]: one that cannot be looked at, or a path
+    /// that is not a file, is another error, never an unknown ticket.
+    fn relations(&self, id: &TicketId) -> Result<shared::Relations, shared::Error> {
+        self.require_ticket_file(id)?;
+        let ticket = MarkdownTracker::ticket(self, id).map_err(other)?;
+        Ok(shared::Relations {
+            id: id.clone(),
+            state: (ticket.stage == Self::DONE).then_some(shared::StateType::Completed),
+            blockers: self.blockers(&ticket)?,
+            description: ticket.description,
+        })
+    }
+
+    /// Adds `blocker` to `blocked`'s `blocked_by`
+    /// ([`MarkdownTracker::add_blocked_by`]).
+    fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), shared::Error> {
+        self.require_ticket_file(blocked)?;
+        MarkdownTracker::add_blocked_by(self, blocked, blocker).map_err(other)
     }
 }
 
@@ -430,6 +510,44 @@ impl MarkdownTracker {
         }
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(ids)
+    }
+
+    /// The tickets `blocked_by` names, each once: one at the stage `Done` is
+    /// completed; any other stage has no type, and neither has a ticket the
+    /// folder lacks, so both keep the ticket waiting.
+    fn blockers(&self, ticket: &Ticket) -> Result<Vec<shared::Blocker>, shared::Error> {
+        let mut blockers: Vec<shared::Blocker> = Vec::new();
+        for blocker in &ticket.blocked_by {
+            if blockers.iter().any(|known| &known.id == blocker) {
+                continue;
+            }
+            let state = if self.ticket_file(blocker).is_file() {
+                let stage = MarkdownTracker::ticket(self, blocker).map_err(other)?.stage;
+                (stage == Self::DONE).then_some(shared::StateType::Completed)
+            } else {
+                None
+            };
+            blockers.push(shared::Blocker {
+                id: blocker.clone(),
+                state,
+            });
+        }
+        Ok(blockers)
+    }
+
+    /// As [`Self::require_ticket`], but [`ErrorKind::NotFound`] only when
+    /// the file system answers that the ticket file is not there.
+    fn require_ticket_file(&self, id: &TicketId) -> Result<(), shared::Error> {
+        let path = self.ticket_file(id);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => Err(other(error(&path, "not a ticket file"))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(shared::Error::new(
+                ErrorKind::NotFound,
+                format!("{}: no such ticket", path.display()),
+            )),
+            Err(e) => Err(other(error(&path, e))),
+        }
     }
 
     fn require_ticket(&self, id: &TicketId) -> Result<(), shared::Error> {
@@ -498,7 +616,7 @@ const AUTHOR_PATTERN: &str = "1 to 64 ASCII letters, digits, `_` or `-`";
 const MAX_PER_SECOND: u32 = 1_000_000;
 
 /// The front matter of `ticket.md`.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FrontMatter {
     title: String,
@@ -977,6 +1095,25 @@ mod tests {
         assert!(tracker.gesture(&id(), &Admit::Delegation).is_err());
     }
 
+    /// A blocker of the text convention (OWL-250): `Done` is completed, any
+    /// other stage has no type, a missing folder is not found.
+    #[test]
+    fn a_state_type_is_completed_at_done_and_a_missing_ticket_not_found() {
+        use shared::{StateType, Tracker as _};
+        let (root, tracker, _) = repository(&ticket_md("a", "Todo", &[], &[]));
+        assert_eq!(tracker.state_type(&id()), Ok(None));
+        let done = root.path().join("tickets").join("DEMO-3");
+        fs::create_dir_all(&done).unwrap();
+        fs::write(done.join("ticket.md"), ticket_md("a", "Done", &[], &[])).unwrap();
+        let done = TicketId::new("DEMO-3").unwrap();
+        assert_eq!(tracker.state_type(&done), Ok(Some(StateType::Completed)));
+        let missing = TicketId::new("UTF-8").unwrap();
+        assert_eq!(
+            tracker.state_type(&missing).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+    }
+
     #[test]
     fn setting_the_stage_changes_one_line_only() {
         let (_root, tracker, file) = repository(TICKET);
@@ -1003,5 +1140,75 @@ mod tests {
         let (_root, tracker, file) = repository(ambiguous);
         assert!(tracker.set_stage(&id(), "Done").is_err());
         assert_eq!(fs::read_to_string(&file).unwrap(), ambiguous);
+    }
+
+    /// A relation (OWL-249) is one more `blocked_by` entry: that line alone
+    /// changes, line ending kept, or a line is added before the closing
+    /// `+++`; an entry already there changes nothing; a key written over
+    /// several lines, and the ticket itself, are refused, the file left as
+    /// it was.
+    #[test]
+    fn a_blocker_is_added_to_blocked_by_and_nothing_else() {
+        let (_root, tracker, file) = repository(TICKET);
+        let demo = |n: u32| TicketId::new(format!("DEMO-{n}")).unwrap();
+        tracker.add_blocked_by(&id(), &demo(2)).unwrap();
+        let after = fs::read_to_string(&file).unwrap();
+        let changed: Vec<_> = TICKET
+            .split_inclusive('\n')
+            .zip(after.split_inclusive('\n'))
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(
+            changed,
+            [(
+                "blocked_by = [\"DEMO-0\"]\r\n",
+                "blocked_by = [\"DEMO-0\", \"DEMO-2\"]\r\n"
+            )]
+        );
+        tracker.add_blocked_by(&id(), &demo(2)).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), after);
+        assert!(tracker.add_blocked_by(&id(), &id()).is_err());
+
+        let none = "+++\ntitle = \"t\"\nauthor = \"a\"\nstage = \"Todo\"\n+++\n\nText.\n";
+        let (_root, tracker, file) = repository(none);
+        tracker.add_blocked_by(&id(), &demo(2)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "+++\ntitle = \"t\"\nauthor = \"a\"\nstage = \"Todo\"\nblocked_by = [\"DEMO-2\"]\n\
+             +++\n\nText.\n"
+        );
+
+        let multiline = "+++\ntitle = \"t\"\nauthor = \"a\"\nstage = \"Todo\"\n\
+                         blocked_by = [\n  \"DEMO-0\",\n]\n+++\n";
+        let (_root, tracker, file) = repository(multiline);
+        assert!(tracker.add_blocked_by(&id(), &demo(2)).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), multiline);
+    }
+
+    /// The dependency check's read (OWL-249): `Done` alone is completed,
+    /// the blockers come with their states; only a missing ticket file is
+    /// not found, a path that is not a file is another error.
+    #[test]
+    fn a_tickets_relations_tell_a_missing_ticket_from_an_unreadable_one() {
+        use crate::tracker::{StateType, Tracker as _};
+
+        let (root, tracker, _file) = repository(&ticket_md("a", "Done", &[], &["DEMO-2"]));
+        let relations = tracker.relations(&id()).unwrap();
+        assert_eq!(relations.state, Some(StateType::Completed));
+        assert_eq!(relations.blockers.len(), 1);
+        assert_eq!(relations.blockers[0].state, None);
+
+        let missing = TicketId::new("DEMO-9").unwrap();
+        assert_eq!(
+            tracker.relations(&missing).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        let odd = TicketId::new("DEMO-8").unwrap();
+        fs::create_dir_all(root.path().join("tickets/DEMO-8/ticket.md")).unwrap();
+        assert_eq!(tracker.relations(&odd).unwrap_err().kind, ErrorKind::Other);
+        assert_eq!(
+            tracker.block(&id(), &missing).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
     }
 }

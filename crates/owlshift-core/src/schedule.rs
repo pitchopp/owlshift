@@ -71,6 +71,38 @@ pub enum Wait<K> {
     RunCap,
 }
 
+impl<K> Wait<K> {
+    /// The reason's name in the drain's `decision` events (`drain` =
+    /// `waits`), which `owlshift why` reads (architecture, section 5, "Why a
+    /// ticket waits").
+    pub const fn key(&self) -> &'static str {
+        match self {
+            Wait::Duplicate => "duplicate",
+            Wait::NotAdmitted => "not_admitted",
+            Wait::Excluded => "excluded",
+            Wait::NoDecider => "no_decider",
+            Wait::NoIntake => "no_intake",
+            Wait::StaleIntake => "stale_intake",
+            Wait::NotReady => "not_ready",
+            Wait::BlockerCanceled(_) => "blocker_canceled",
+            Wait::BlockerUnknown(_) => "blocker_unknown",
+            Wait::BlockedBy(_) => "blocked_by",
+            Wait::PrCap => "pr_cap",
+            Wait::Slot => "slot",
+            Wait::RunCap => "run_cap",
+        }
+    }
+
+    /// The tickets the reason names: the blockers that hold the ticket, none
+    /// for any other reason.
+    pub fn tickets(&self) -> &[K] {
+        match self {
+            Wait::BlockerCanceled(ids) | Wait::BlockerUnknown(ids) | Wait::BlockedBy(ids) => ids,
+            _ => &[],
+        }
+    }
+}
+
 /// The scheduler's answer: the ticket to dispatch now, and why each other
 /// ticket waits.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -637,6 +669,22 @@ mod tests {
             ..IDLE
         };
         assert_eq!(ready_set(&tickets, caps, below).dispatch, Some("A"));
+    }
+
+    #[test]
+    fn a_reason_names_its_key_and_only_blockers_name_tickets() {
+        assert_eq!(Wait::<&str>::NotReady.key(), "not_ready");
+        assert!(Wait::<&str>::Slot.tickets().is_empty());
+        let held = Wait::BlockerUnknown(vec!["UTF-8"]);
+        assert_eq!(
+            (held.key(), held.tickets()),
+            ("blocker_unknown", &["UTF-8"][..])
+        );
+        let open = Wait::BlockedBy(vec!["X-1", "X-2"]);
+        assert_eq!(
+            (open.key(), open.tickets()),
+            ("blocked_by", &["X-1", "X-2"][..])
+        );
     }
 
     #[test]

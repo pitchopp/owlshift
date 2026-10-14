@@ -1038,6 +1038,34 @@ fn init_writes_a_commented_project_file_once() {
     );
 }
 
+/// OWL-250: `watch --drain` on a project whose file lists no admitters is
+/// refused before any credential, `watch` alone is not refused for it.
+#[test]
+fn watch_drain_refuses_a_project_without_admitters_before_any_credential() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let init = ["init", "--tracker", "markdown", "--skip-secrets"];
+    assert!(
+        owlshift(repo.path(), config_dir.path(), &init)
+            .status
+            .success()
+    );
+    let output = owlshift(repo.path(), config_dir.path(), &["watch", "--drain"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("`owlshift watch --drain` needs `[tracker].admitters`"),
+        "{}",
+        stderr(&output)
+    );
+    let output = owlshift(repo.path(), config_dir.path(), &["watch"]);
+    assert!(
+        !stderr(&output).contains("admitters"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// What `do` refuses before it opens the keychain.
 #[test]
 fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
