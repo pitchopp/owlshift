@@ -28,6 +28,9 @@ pub enum Action {
     /// Change infrastructure: environment variables, feature flags, DNS, CI
     /// settings.
     ChangeInfrastructure,
+    /// Write a `blocks` relation between two tickets: a dependency intake
+    /// found (architecture section 5, "Dependencies to relations").
+    Relate,
 }
 
 /// Whether a human approval of the action is recorded on the ticket.
@@ -54,6 +57,7 @@ pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), Floor
         | Action::PushBranch
         | Action::PushRef
         | Action::OpenPullRequest => Ok(()),
+        Action::Relate => Ok(()),
     }
 }
 

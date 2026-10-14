@@ -2122,6 +2122,15 @@ impl<'a> Writer<'a> {
         Ok(state)
     }
 
+    /// Writes that `blocker` blocks `blocked`: a dependency intake found
+    /// (OWL-249, architecture section 5, "Dependencies to relations").
+    pub fn relate(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), WriteError> {
+        floor::check_action(Action::Relate, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.tracker
+            .block(blocker, blocked)
+            .map_err(WriteError::Tracker)
+    }
+
     fn post(&self, ticket: &TicketId, body: &str) -> Result<Comment, WriteError> {
         floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
         self.tracker
