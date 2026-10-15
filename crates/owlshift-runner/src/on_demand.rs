@@ -854,7 +854,7 @@ impl Command {
             Command::Do | Command::Continue | Command::Drain => &[Role::Build, Role::Resolver],
             Command::Fix | Command::Correct => &[Role::Build],
             Command::Rebase => &[],
-            Command::Intake => &[Role::Intake],
+            Command::Intake => &[Role::Intake, Role::Resolver],
         }
     }
 }

@@ -8764,3 +8764,62 @@ fn a_bad_role_table_does_not_refuse_a_rebase() {
     );
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
 }
+
+/// OWL-312: the resolver an intake pass runs for the questions intake raises
+/// gets `[roles.resolver]` rules, read for that pass beside intake's own.
+#[test]
+fn an_intake_pass_gives_its_resolver_the_resolver_rules() {
+    let bench = Bench::drained();
+    let checkout = &bench.remote.checkout;
+    let config_path = checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{original}[roles.resolver]\nrules = [\"docs/resolver.md\"]\n\
+             [roles.intake]\nrules = [\"docs/intake.md\"]\n"
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(checkout.join("docs")).unwrap();
+    fs::write(
+        checkout.join("docs/resolver.md"),
+        "Settle from the ticket.\n",
+    )
+    .unwrap();
+    fs::write(checkout.join("docs/intake.md"), "Name dependencies.\n").unwrap();
+    bench
+        .env
+        .run(checkout, &["add", "docs/resolver.md", "docs/intake.md"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["commit", "--quiet", "-am", "Add role rules"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+                "text":"Which file should hold the greeting?"}]"#,
+        )),
+    );
+    let done = bench.reply(None, Some(&intake_result("done", None, "[]")));
+    let _ = bench.intake(
+        vec![asks, bench.reply(None, Some(DECIDED_Q1)), done],
+        gesture("maintainer"),
+    );
+    let briefs = bench.briefs();
+    let roles: Vec<Role> = briefs.iter().map(|b| b.role).collect();
+    assert_eq!(roles[..2], [Role::Intake, Role::Resolver], "{roles:?}");
+    let sources = |brief: &Brief| -> Vec<String> {
+        brief.rules.iter().map(|rule| rule.source.clone()).collect()
+    };
+    assert_eq!(sources(&briefs[0]), ["AGENTS.md", "docs/intake.md"]);
+    assert_eq!(sources(&briefs[1]), ["AGENTS.md", "docs/resolver.md"]);
+}

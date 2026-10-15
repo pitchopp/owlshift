@@ -287,7 +287,7 @@ impl OnDemand<'_> {
             &p.checkout,
             &p.base,
             self.config,
-            &[Role::Intake],
+            &[Role::Intake, Role::Resolver],
         )
         .map_err(|e| refused("the project's rules", e))?;
         // The text the briefs hold, read once: an edit made while intake
