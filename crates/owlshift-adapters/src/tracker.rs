@@ -212,7 +212,9 @@ pub struct Proposal<'a> {
     /// Markdown, the `[owlshift] PROPOSAL` footer included.
     pub description: &'a str,
     /// Whether the follow-up needs the parent's code: the parent then
-    /// blocks it.
+    /// blocks it. On Linear that relation is the proposal's only one, in
+    /// place of `related`, since Linear keeps one relation between two
+    /// issues (OWL-292).
     pub blocked_by_parent: bool,
     /// The ready state's name, `[tracker].states.ready`. A proposal filed
     /// there would enter the queue without a person (principle 6), so the
