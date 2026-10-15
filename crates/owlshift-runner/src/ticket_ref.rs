@@ -376,6 +376,36 @@ pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
         .collect())
 }
 
+/// A ticket ref as the drain's slot weighs it (OWL-291).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefState {
+    /// Its record reads: its state, `None` when the core accepts none from
+    /// it.
+    Read(Option<TicketState>),
+    /// It cannot be read, for this reason: [`forget`] starts it over.
+    Unread(String),
+}
+
+/// Every ticket ref of `checkout` with its state, in [`list`]'s order. A ref
+/// that cannot be read is kept, with why; one gone since the listing is
+/// left out. The error says why the refs could not be listed.
+pub fn states(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, RefState)>, String> {
+    let tickets = list(git, checkout)?;
+    Ok(tickets
+        .into_iter()
+        .filter_map(|ticket| {
+            let state = match read(git, checkout, &ticket) {
+                Ok(Some(stored)) => {
+                    RefState::Read(TicketState::try_from(&stored.record.state).ok())
+                }
+                Ok(None) => return None,
+                Err(why) => RefState::Unread(why),
+            };
+            Some((ticket, state))
+        })
+        .collect())
+}
+
 /// Writes `record` as the ticket ref of `ticket` in `checkout` and returns
 /// the new commit. `previous` is the commit the ref was read at, `None` when
 /// it did not exist: the ref moves only from there, and the new commit has

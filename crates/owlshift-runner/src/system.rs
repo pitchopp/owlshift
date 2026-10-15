@@ -4,12 +4,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use owlshift_contracts::ids::TicketId;
 pub use owlshift_platform::paths::DataDirSource;
 pub use owlshift_platform::process::{Captured, RunError};
 #[cfg(unix)]
 pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
+use crate::ticket_ref::{self, RefState};
 pub use crate::tracker::{AppError, StatesError};
 pub use owlshift_adapters::tracker::linear::{AccountFact, AdmissionFacts, AppUser};
 
@@ -86,6 +88,27 @@ pub trait System {
             .map_err(|error| AppError::Keychain(error.to_string()))
             .and_then(|keychain| crate::tracker::linear_app_user(&keychain, team))
     }
+    /// The ticket refs of the project whose repository is at `root`, each
+    /// with its state ([`ticket_ref::states`]), read in its dedicated
+    /// checkout as `owlshift forget` finds it, without the project's lock:
+    /// `None` when the project has no dedicated checkout yet. The error says
+    /// why they could not be read, in Owlshift's words only (OWL-291). Only
+    /// `owlshift doctor` asks.
+    fn ticket_refs(&self, root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
+        let git = crate::project::runner_git();
+        let repo = crate::on_demand::check_origin(&crate::project::origin_url(&git, root)?)?;
+        let (data_dir, _) = self
+            .data_dir()
+            .ok_or_else(|| "this system has no data directory".to_owned())?;
+        let checkout = crate::project::ProjectDirs::new(&data_dir, &repo).checkout();
+        if !checkout_exists(&checkout)? {
+            return Ok(None);
+        }
+        // git's own words stay out of the report (live check C8).
+        ticket_ref::states(&git, &checkout)
+            .map(Some)
+            .map_err(|_| "git could not list them in the dedicated checkout".to_owned())
+    }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
     #[cfg(unix)]
@@ -97,6 +120,17 @@ pub trait System {
     #[cfg(unix)]
     fn sentinel_probe(&self) -> SentinelProbe {
         owlshift_platform::process::probe_sentinel(SENTINEL_PROBE_TIMEOUT)
+    }
+}
+
+/// Whether the dedicated checkout at `checkout` exists: only its absence is
+/// `false`; any other failure to look is an error, so a ref that holds the
+/// slot is never hidden as no checkout (OWL-291).
+fn checkout_exists(checkout: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(checkout) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("the dedicated checkout could not be inspected".to_owned()),
     }
 }
 
@@ -207,6 +241,9 @@ pub(crate) mod fake {
         /// What checking the Linear app gives, both of its entries being
         /// stored; `None`: no app is stored.
         linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
+        /// What reading the project's ticket refs gives; `None`: no
+        /// dedicated checkout.
+        ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
@@ -283,6 +320,15 @@ pub(crate) mod fake {
             self
         }
 
+        /// Reading the project's ticket refs gives these, or this error.
+        pub(crate) fn ticket_refs_are(
+            mut self,
+            answer: Result<Vec<(TicketId, RefState)>, String>,
+        ) -> Self {
+            self.ticket_refs = Some(answer);
+            self
+        }
+
         /// Puts a program on the fake `PATH`.
         pub(crate) fn install(mut self, program: &str) -> Self {
             self.located.insert(
@@ -341,6 +387,12 @@ pub(crate) mod fake {
 
         fn sandbox(&self) -> Result<(), SandboxError> {
             self.sandbox.clone().map_or(Ok(()), Err)
+        }
+
+        /// No dedicated checkout unless [`Self::ticket_refs_are`] gave an
+        /// answer; never git.
+        fn ticket_refs(&self, _root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
+            self.ticket_refs.clone().transpose()
         }
 
         fn secret_stored(&self, account: &str) -> Result<bool, String> {
@@ -440,6 +492,32 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-291: only an absent checkout is no checkout; a folder that cannot
+    /// be looked into is an error, in Owlshift's words.
+    #[test]
+    fn only_an_absent_checkout_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(checkout_exists(dir.path()), Ok(true));
+        assert_eq!(checkout_exists(&dir.path().join("checkout")), Ok(false));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let looked = checkout_exists(&locked.join("checkout"));
+            // A superuser looks through any folder: nothing to check then.
+            let superuser = std::fs::read_dir(&locked).is_ok();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !superuser {
+                assert_eq!(
+                    looked,
+                    Err("the dedicated checkout could not be inspected".to_owned())
+                );
+            }
+        }
+    }
 
     #[test]
     fn versions_are_rebuilt_from_digits() {

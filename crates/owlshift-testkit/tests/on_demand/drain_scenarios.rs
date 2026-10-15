@@ -600,7 +600,7 @@ fn scenario_s6_the_human_is_the_bottleneck() {
     let passes = by_pass(&events, 0, &ends.borrow());
     assert_eq!(
         waits(&passes[2]),
-        [("DEMO-2".to_owned(), json!("slot"), Value::Null)],
+        [("DEMO-2".to_owned(), json!("slot"), json!(["DEMO-1"]))],
         "{lines}"
     );
     assert!(passes[2..].iter().all(|pass| dispatched(pass).is_empty()));

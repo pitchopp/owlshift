@@ -30,6 +30,9 @@ use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
 use owlshift_contracts::Harness;
 use owlshift_contracts::config::{Admit, States, Tracker, TrackerKind};
+use owlshift_contracts::ids::TicketId;
+use owlshift_core::schedule::{holds_slot, natural_cmp};
+use owlshift_core::vocab::Stage;
 use owlshift_platform::keychain::SERVICE;
 use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
 use serde_json::Value;
@@ -45,6 +48,7 @@ use crate::system::{
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
+use crate::ticket_ref::RefState;
 use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,6 +272,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     let facts = admission_facts(system, config);
     checks.extend(drain_admission_check(config, facts.as_ref()));
     checks.extend(proposals_inbox_check(config, facts.as_ref()));
+    checks.extend(drain_slot_check(system, config));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
@@ -1370,6 +1375,84 @@ fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Che
             },
         ),
     })
+}
+
+/// Whether a ticket ref holds the drain's one slot (OWL-291): one between
+/// Ready and Watch, one whose state does not read, or one that cannot be
+/// read, each of which stops every dispatch of `owlshift watch --drain`.
+/// A warning naming each and the command that clears it, since none blocks
+/// `do`; one a command is working now frees the slot when its work ends.
+/// Read from the dedicated checkout without the project's lock. Only the
+/// identifiers and stages reach the report, never why a ref did not read.
+fn drain_slot_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "drain slot";
+    let FileState::Loaded { path, .. } = &config.project else {
+        return None;
+    };
+    let root = path.parent()?;
+    let refs = match system.ticket_refs(root) {
+        Ok(Some(refs)) => refs,
+        Ok(None) => return Some(Check::ok(Section::Project, SUBJECT, "no ticket ref yet")),
+        Err(why) => {
+            return Some(Check::info(
+                Section::Project,
+                SUBJECT,
+                format!("the ticket refs were not read: {why}"),
+            ));
+        }
+    };
+    let mut held: Vec<(TicketId, String, String)> = refs
+        .into_iter()
+        .filter_map(|(ticket, state)| {
+            let (what, clear) = match state {
+                RefState::Read(Some(state)) if holds_slot(&state) => {
+                    let stage = state.stage();
+                    let again = if stage == Stage::Build {
+                        format!("`owlshift continue {ticket}` to finish its Build")
+                    } else {
+                        format!("`owlshift do {ticket}` to run it again")
+                    };
+                    (
+                        format!("{ticket} at {stage:?}"),
+                        format!("{again} or `owlshift forget {ticket}` to start it over"),
+                    )
+                }
+                RefState::Read(Some(_)) => return None,
+                RefState::Read(None) => (
+                    format!("{ticket}, whose state does not read"),
+                    format!("`owlshift forget {ticket}` to start it over"),
+                ),
+                RefState::Unread(_) => (
+                    format!("{ticket}, whose ticket ref cannot be read"),
+                    format!("`owlshift forget {ticket}` to start it over"),
+                ),
+            };
+            Some((ticket, what, clear))
+        })
+        .collect();
+    if held.is_empty() {
+        return Some(Check::ok(
+            Section::Project,
+            SUBJECT,
+            "no ticket ref holds it",
+        ));
+    }
+    held.sort_by(|a, b| natural_cmp(a.0.as_str(), b.0.as_str()));
+    let (what, clear): (Vec<String>, Vec<String>) = held
+        .into_iter()
+        .map(|(_, what, clear)| (what, clear))
+        .unzip();
+    Some(Check::warn(
+        Section::Project,
+        SUBJECT,
+        format!("held by {}", what.join("; ")),
+        format!(
+            "{DOES_NOT_BLOCK} `owlshift watch --drain` dispatches nothing while a ticket ref is \
+             between Ready and Watch or cannot be read. Unless a command is working on it now, \
+             run {}.",
+            clear.join("; ")
+        ),
+    ))
 }
 
 fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
@@ -2738,5 +2821,87 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         // line's, a missing key the states line's.
         let report = run(&ready(), &config);
         assert!(report.checks.iter().all(|c| c.subject != "proposals inbox"));
+    }
+
+    fn at(ticket: &str, stage: Stage) -> (TicketId, RefState) {
+        use owlshift_core::state::{Status, TicketState};
+        let round = u32::from(stage != Stage::Intake);
+        let state = TicketState::restore(Status::Active(stage), round, 0, 0, 0, 0).unwrap();
+        (TicketId::new(ticket).unwrap(), RefState::Read(Some(state)))
+    }
+
+    fn markdown_project() -> (tempfile::TempDir, Effective) {
+        project_tracked_by(
+            r#"kind = "markdown"
+admit = { label = "agent" }
+admitters = ["ann"]
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#,
+        )
+    }
+
+    /// OWL-291: a ticket ref between Ready and Watch, one whose state does
+    /// not read and one that cannot be read hold the drain's slot: one
+    /// warning names each, in identifier order, with the command that
+    /// clears it; the refs at Ready and Watch are not named.
+    #[test]
+    fn a_ticket_ref_holding_the_drain_slot_is_named_with_its_fix() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = markdown_project();
+        let id = |ticket| TicketId::new(ticket).unwrap();
+        let refs = vec![
+            at("OWL-175", Stage::Verify),
+            at("OWL-12", Stage::Ready),
+            (id("OWL-9"), RefState::Unread("not a commit".to_owned())),
+            at("OWL-30", Stage::Watch),
+            (id("OWL-80"), RefState::Read(None)),
+            at("OWL-173", Stage::Build),
+        ];
+        let report = run(&ready().ticket_refs_are(Ok(refs)), &config);
+        assert!(report.ready(), "{report}");
+        let warned = line(&report, "drain slot");
+        assert_well_formed(warned);
+        assert_eq!(warned.status, Status::Warn);
+        assert_eq!(
+            warned.detail,
+            "held by OWL-9, whose ticket ref cannot be read; OWL-80, whose state does not read; \
+             OWL-173 at Build; OWL-175 at Verify"
+        );
+        let why = warned.why.as_deref().unwrap();
+        for fix in [
+            "`owlshift forget OWL-9` to start it over",
+            "`owlshift forget OWL-80` to start it over",
+            "`owlshift continue OWL-173` to finish its Build or `owlshift forget OWL-173`",
+            "`owlshift do OWL-175` to run it again or `owlshift forget OWL-175`",
+        ] {
+            assert!(why.contains(fix), "{fix}: {why}");
+        }
+        assert!(!why.contains("not a commit"), "{why}");
+    }
+
+    /// OWL-291: no holder, no dedicated checkout and refs that cannot be
+    /// listed are no warning.
+    #[test]
+    fn a_free_slot_is_ok_and_unread_refs_are_information() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = markdown_project();
+        for (system, status, detail) in [
+            (
+                ready().ticket_refs_are(Ok(vec![at("OWL-1", Stage::Ready)])),
+                Status::Ok,
+                "no ticket ref holds it",
+            ),
+            (ready(), Status::Ok, "no ticket ref yet"),
+            (
+                ready().ticket_refs_are(Err("no remote".to_owned())),
+                Status::Info,
+                "the ticket refs were not read: no remote",
+            ),
+        ] {
+            let report = run(&system, &config);
+            let found = line(&report, "drain slot");
+            assert_eq!((found.status, found.detail.as_str()), (status, detail));
+        }
+        let report = run(&ready(), &no_config());
+        assert!(report.checks.iter().all(|c| c.subject != "drain slot"));
     }
 }

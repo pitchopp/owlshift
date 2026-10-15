@@ -235,7 +235,10 @@ fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
         ),
         Wait::BlockedBy(ids) => format!("blocked by {}", list(ids)),
         Wait::PrCap => "the open pull requests reached their cap".to_owned(),
-        Wait::Slot => "another ticket of the project is being built".to_owned(),
+        Wait::Slot(ids) => format!(
+            "the project's slot is held by {} (`owlshift doctor` says how to clear a stale one)",
+            list(ids)
+        ),
         Wait::RunCap => "every run of this machine is taken".to_owned(),
     }
 }
@@ -358,9 +361,19 @@ impl Watch<'_> {
             .filter(|row| Some(row.id()) != taken.as_ref() && row.state.is_some())
             .map(|row| self.core_ticket(memory, row, &refs, exclude, &mut reads))
             .collect();
-        let slot_taken = refs.values().any(|stored| {
-            TicketState::try_from(&stored.record.state).map_or(true, |s| schedule::holds_slot(&s))
-        });
+        // The slot's holders, named in the reasons (OWL-291): every ref read
+        // that holds it, and every ref that could not be read, which stops
+        // every dispatch below.
+        let slot_held_by: Vec<String> = refs
+            .iter()
+            .filter(|(_, stored)| {
+                let state = TicketState::try_from(&stored.record.state).ok();
+                schedule::holds_slot_or_unknown(state.as_ref())
+            })
+            .map(|(ticket, _)| ticket)
+            .chain(&unread)
+            .map(|ticket| ticket.as_str().to_owned())
+            .collect();
         // The pull requests still followed, from the refs read this pass
         // (an unread ref stops every dispatch below). One project, one run
         // at a time.
@@ -380,7 +393,7 @@ impl Watch<'_> {
             Load {
                 runs: 0,
                 open_prs,
-                slot_taken,
+                slot_held_by,
             },
         );
         // A pass with an unread ref counts short: it neither re-arms nor

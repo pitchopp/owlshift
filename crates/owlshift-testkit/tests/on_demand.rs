@@ -8112,9 +8112,19 @@ fn an_unknown_blocker_holds_the_drained_ticket() {
     assert!(lines.contains("which the tracker does not know"), "{lines}");
 }
 
-/// A ticket ref another command left at Build after the snapshot holds the
+/// The `tickets` of the last `waits` event.
+fn last_wait_tickets(bench: &Bench) -> Value {
+    bench
+        .events()
+        .into_iter()
+        .rfind(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("waits")))
+        .and_then(|e| e.data.get("tickets").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// A ticket ref another command left at Verify after the snapshot holds the
 /// slot under the dispatch's lock (OWL-250): nothing is dispatched, and the
-/// next pass says why the ticket waits.
+/// next pass says why the ticket waits, naming the holder (OWL-291).
 #[test]
 fn a_slot_taken_since_the_snapshot_holds_the_dispatch() {
     let bench = Bench::draining("maintainer");
@@ -8125,10 +8135,10 @@ fn a_slot_taken_since_the_snapshot_holds_the_dispatch() {
             let record = bench.record();
             *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
                 let git = Git::with_setup("git", move |command| env.apply(command));
-                let building =
-                    TicketState::restore(Status::Active(Stage::Build), 1, 0, 0, 0, 0).unwrap();
+                let verifying =
+                    TicketState::restore(Status::Active(Stage::Verify), 1, 0, 0, 0, 0).unwrap();
                 let other = TicketRecord {
-                    state: PersistedState::from(&building),
+                    state: PersistedState::from(&verifying),
                     ..record
                 };
                 let demo_9 = TicketId::new("DEMO-9").unwrap();
@@ -8141,6 +8151,44 @@ fn a_slot_taken_since_the_snapshot_holds_the_dispatch() {
     assert_eq!(
         bench.drain_decisions().last(),
         Some(&("waits".to_owned(), json!("slot"))),
+        "{lines}"
+    );
+    assert_eq!(last_wait_tickets(&bench), json!(["DEMO-9"]), "{lines}");
+    assert!(
+        lines.contains("DEMO-1 waits: the project's slot is held by DEMO-9"),
+        "{lines}"
+    );
+}
+
+/// A ticket ref that cannot be read stops every dispatch (OWL-250), and
+/// the waiting ticket names it as the slot's holder (OWL-291).
+#[test]
+fn an_unread_ticket_ref_holds_the_slot_and_is_named() {
+    let bench = Bench::draining("maintainer");
+    let intake = bench.reply(None, Some(&intake_result("done", None, "")));
+    let (outcomes, lines, _) = bench.drain(vec![intake], 2, |pass| {
+        if pass == 1 {
+            // A ticket ref that points to a tree, not a commit.
+            let checkout = bench.dirs().checkout();
+            let tree = bench
+                .env
+                .run(&checkout, &["rev-parse", "HEAD^{tree}"])
+                .unwrap();
+            let tree = String::from_utf8(tree).unwrap();
+            bench
+                .env
+                .run(
+                    &checkout,
+                    &["update-ref", "refs/owlshift/tickets/DEMO-9", tree.trim()],
+                )
+                .unwrap();
+        }
+    });
+    assert_eq!(outcomes.len(), 1, "the intake alone: {outcomes:?}");
+    assert!(!kinds(&bench.events()).contains(&EventKind::Dispatch));
+    assert_eq!(last_wait_tickets(&bench), json!(["DEMO-9"]), "{lines}");
+    assert!(
+        lines.contains("nothing is dispatched while the ticket refs of DEMO-9 cannot be read"),
         "{lines}"
     );
 }
