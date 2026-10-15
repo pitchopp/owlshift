@@ -9,15 +9,50 @@
 //! output is never echoed, since Codex prints part of an API key and Claude
 //! Code prints the account's e-mail address and organisation.
 //!
-//! Running a role is each harness's own module: [`claude`] for Claude Code.
-//! The versions each harness was tested with are in [`tested`].
+//! Running a role is each harness's own module: [`claude`] for Claude Code,
+//! [`codex`] for Codex, both driving their child through a shared stream
+//! reader. The versions each harness was tested with are in [`tested`].
 
 pub mod claude;
+pub mod codex;
+mod stream;
 pub mod tested;
+
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
 use owlshift_contracts::Harness;
+
+/// Tokens and cost of one run, as its harness reported them.
+///
+/// Claude Code's final record fills every field. Codex reports tokens only
+/// (`turn.completed`), which the Codex adapter maps onto these fields.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Usage {
+    /// Input tokens read neither from nor into the cache.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    /// The CLI's cost estimate at list price. On a subscription it measures
+    /// consumption, not a bill.
+    pub cost_usd: Option<f64>,
+    pub duration_ms: Option<u64>,
+    pub num_turns: Option<u32>,
+    /// The same counts per model, subagents included.
+    pub models: BTreeMap<String, ModelUsage>,
+}
+
+/// One model's share of a run.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
 
 /// The program name of a harness CLI.
 pub fn program(harness: Harness) -> &'static str {

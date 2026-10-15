@@ -6,9 +6,9 @@
 //! outside these lists; it never refuses one.
 //!
 //! A version enters a list once the harness's contract tests pass on output
-//! recorded with it. `tests/claude_contract.rs` fails when a recorded Claude
-//! fixture carries a version missing here, so re-recording the fixtures with
-//! a new release forces this list to follow. `tests/claude_live.rs` fails the
+//! recorded with it. `tests/claude_contract.rs` and `tests/codex_fixtures.rs`
+//! fail when a recorded fixture carries a version missing here, so
+//! re-recording the fixtures with a new release forces this list to follow. `tests/claude_live.rs` fails the
 //! same way on the version the real CLI reports, so a silent self-update
 //! does not pass quietly either. The lists only grow: a version tested once
 //! stays tested after newer fixtures replace its recordings.
@@ -21,9 +21,9 @@ use owlshift_contracts::Harness;
 /// Claude Code releases the contract fixtures were recorded with.
 const CLAUDE: &[&str] = &["2.1.283", "2.1.284"];
 
-/// Codex has no contract tests yet, so no version is tested. C8 ran its login
-/// status command on 0.154.0, which says nothing about how it runs a role.
-const CODEX: &[&str] = &[];
+/// Codex releases the recordings of checks C2 and C7 were made with, which
+/// the adapter's contract tests replay (OWL-299).
+const CODEX: &[&str] = &["0.154.0"];
 
 /// The tested versions of a harness, oldest first.
 pub fn tested_versions(harness: Harness) -> &'static [&'static str] {
@@ -49,6 +49,7 @@ mod tests {
         for other in ["2.1.285", "2.1", "2.1.2830", "2.1.283-beta.1", ""] {
             assert!(!is_tested(Harness::Claude, other), "{other}");
         }
-        assert!(!is_tested(Harness::Codex, "0.154.0"));
+        assert!(is_tested(Harness::Codex, "0.154.0"));
+        assert!(!is_tested(Harness::Codex, "0.154.1"));
     }
 }

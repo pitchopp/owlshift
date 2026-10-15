@@ -5,8 +5,9 @@
 //! executor gives the command its directory, its environment and its
 //! streams, spawns it in a process tree of its own, logs it, stops it and
 //! judges the result. [`ClaudeHarness`] drives Claude Code through
-//! `owlshift_adapters::harness::claude`; a harness with no driver of its own
-//! can use [`drive_plain`].
+//! `owlshift_adapters::harness::claude`, and `CodexHarness` (in
+//! `executor::codex`) drives Codex; a harness with no driver of its own can
+//! use [`drive_plain`].
 
 use std::error::Error;
 use std::fmt;
@@ -79,6 +80,22 @@ pub trait Harness {
         let _ = agent;
         Ok(SandboxNeeds::default())
     }
+
+    /// The secrets a copy of the user's login holds ([`SandboxNeeds::home`]),
+    /// given its bytes: hidden in the run's logs and refused in its result,
+    /// as a login token is. None by default.
+    fn login_secrets(&self, login: &[u8]) -> Vec<Secret> {
+        let _ = login;
+        Vec::new()
+    }
+
+    /// Whether the run's copy of the user's login, which it changed, may
+    /// replace the user's file ([`SandboxNeeds::home`]): `Err` says why not.
+    /// Never, by default.
+    fn login_kept(&self, original: &[u8], updated: &[u8]) -> Result<(), String> {
+        let _ = (original, updated);
+        Err("this harness writes no login back".to_owned())
+    }
 }
 
 /// What a harness needs inside the sandbox.
@@ -107,6 +124,29 @@ pub struct SandboxNeeds {
     /// (`SSL_CERT_FILE`): the sandbox closes the Keychain server, which some
     /// certificate checks ask.
     pub read_only: bool,
+    /// A home folder of the harness's own for this run, holding only a copy
+    /// of the user's login file (architecture section 5, "The Codex
+    /// harness"). The executor makes it in the run's own files, bound read
+    /// and written, copies the login in, and sets the variable on the
+    /// harness command alone; once the run's processes are stopped, it brings
+    /// a changed copy back under [`Harness::login_kept`]. Read-only runs
+    /// only. Not [`HarnessLogin::config_variable`]'s folder, which is empty
+    /// and serves a token handed over on a descriptor.
+    pub home: Option<HarnessHome>,
+    /// The harness cannot write the result: the run's last message is the
+    /// result ([`HarnessEnd::message`]), which the executor writes as the
+    /// result file once the run's processes are stopped, over whatever the
+    /// run left there. Read-only runs only.
+    pub result_in_message: bool,
+}
+
+/// A harness's home folder of one run ([`SandboxNeeds::home`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessHome {
+    /// The variable naming it, such as `CODEX_HOME`.
+    pub variable: &'static str,
+    /// The user's login file, copied into it under the same name.
+    pub login: PathBuf,
 }
 
 /// A harness's login for agent runs (OWL-94). The executor gives it to the
@@ -197,6 +237,9 @@ pub struct HarnessEnd {
     pub usage: Option<Usage>,
     pub model: Option<String>,
     pub harness_version: Option<String>,
+    /// The run's last message, when the harness gives its result that way
+    /// ([`SandboxNeeds::result_in_message`]).
+    pub message: Option<String>,
 }
 
 impl HarnessEnd {
@@ -209,6 +252,7 @@ impl HarnessEnd {
             usage: None,
             model: None,
             harness_version: None,
+            message: None,
         }
     }
 }
@@ -368,22 +412,7 @@ impl Harness for ClaudeHarness {
         if agent.is_confined() {
             needs.temp_variable = Some(claude::TMPDIR_ENV);
         }
-        let program = if self.program.is_absolute() {
-            Some(self.program.clone())
-        } else {
-            find_executable_in(
-                &self.program.to_string_lossy(),
-                agent.var("PATH").unwrap_or_default(),
-            )
-        };
-        if let Some(program) = program {
-            needs
-                .readable
-                .extend(program.parent().map(Path::to_path_buf));
-            if let Ok(real) = fs::canonicalize(&program) {
-                needs.readable.extend(real.parent().map(Path::to_path_buf));
-            }
-        }
+        needs.readable = program_folders(&self.program, agent);
         match &self.login {
             Some(token) if !token.is_one_word() => return Err(NoAgentLogin::Malformed.into()),
             Some(token) => {
@@ -398,6 +427,27 @@ impl Harness for ClaudeHarness {
         }
         Ok(needs)
     }
+}
+
+/// The folders a harness program is installed in, read: the one on the
+/// agent's `PATH` (or of its absolute path) and the one its link leads to.
+pub(super) fn program_folders(program: &Path, agent: &AgentEnv) -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    let found = if program.is_absolute() {
+        Some(program.to_owned())
+    } else {
+        find_executable_in(
+            &program.to_string_lossy(),
+            agent.var("PATH").unwrap_or_default(),
+        )
+    };
+    if let Some(found) = found {
+        folders.extend(found.parent().map(Path::to_path_buf));
+        if let Ok(real) = fs::canonicalize(&found) {
+            folders.extend(real.parent().map(Path::to_path_buf));
+        }
+    }
+    folders
 }
 
 /// The role's prompt, then where its brief is.
@@ -428,6 +478,7 @@ fn claude_end(run: claude::Run) -> HarnessEnd {
         usage: run.usage,
         model: run.model,
         harness_version: run.harness_version,
+        message: None,
     }
 }
 

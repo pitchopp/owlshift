@@ -149,7 +149,7 @@ impl Bench {
     fn run_brief(
         &self,
         agent: AgentEnv,
-        harness: &Script,
+        harness: &dyn Harness,
         brief: &Brief,
     ) -> Result<RunReport, ExecutorError> {
         let runner = self.env.clone();
@@ -718,6 +718,160 @@ fn a_run_on_native_windows_is_refused() {
     let error = bench.run(bench.agent(), "echo hi").unwrap_err();
     assert!(
         matches!(&error, ExecutorError::Spawn(e) if e.to_string().contains("WSL2")),
+        "{error:?}"
+    );
+    assert!(!bench.worktree.exists(), "the worktree was created");
+}
+
+/// A Codex login of `account`, shaped as codex-cli 0.154.0's `auth.json`
+/// (key names read on 2026-10-15), its tokens made up.
+#[cfg(unix)]
+fn codex_login(account: &str, access: &str) -> String {
+    serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": "id-SENTINEL_owl299",
+            "access_token": access,
+            "refresh_token": "refresh-SENTINEL_owl299",
+            "account_id": account,
+        },
+        "last_refresh": "2026-10-15T12:00:00Z",
+    })
+    .to_string()
+}
+
+/// The critic's answer, as Codex's last message.
+#[cfg(unix)]
+const CRITIC_MESSAGE: &str = r#"{"format":9,"status":"done","summary":"no finding","findings":[]}"#;
+
+/// A stand-in for `codex exec`, run by `CodexHarness` through the executor:
+/// it reads its prompt, reports what its `CODEX_HOME` holds on standard
+/// error, prints the login it was given (which the log must hide), runs
+/// `script` with `$out` naming `-o`'s file, plants a result of its own
+/// beside it, and ends its stream with `CRITIC_MESSAGE`.
+#[cfg(unix)]
+fn fake_codex(bench: &Bench, script: &str) -> owlshift_runner::executor::CodexHarness {
+    use std::os::unix::fs::PermissionsExt;
+    let message = CRITIC_MESSAGE.replace('"', "\\\"");
+    let body = format!(
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done
+cat > /dev/null
+echo "home=$(ls -A "$CODEX_HOME" | tr '\n' ' ')" >&2
+case "$CODEX_HOME" in "$HOME"/*) echo "home=the user's" >&2;; esac
+cat "$CODEX_HOME/auth.json"; echo
+printf '%s' '{{"format":9,"status":"failed","summary":"planted"}}' > "$(dirname "$out")/result.json"
+{script}
+echo '{{"type":"thread.started","thread_id":"t"}}'
+echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"{message}"}}}}'
+echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"cached_input_tokens":4,"output_tokens":2}}}}'
+"#
+    );
+    let bin = bench.tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let program = bin.join("codex");
+    fs::write(&program, body).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let agent = bench.agent();
+    let login = owlshift_runner::executor::codex::user_login(&agent).unwrap();
+    fs::create_dir_all(login.parent().unwrap()).unwrap();
+    fs::write(&login, codex_login("acct-1", "access-SENTINEL_owl299")).unwrap();
+    owlshift_runner::executor::CodexHarness {
+        program,
+        prompt: "# Verify".into(),
+        model: None,
+        effort: None,
+        login,
+    }
+}
+
+/// OWL-299, confined: Codex runs with a `CODEX_HOME` of the run's own that
+/// holds only a copy of the user's login, whose tokens never reach the logs;
+/// its result comes from its last message, never from a file its shell
+/// wrote; and a login it refreshed for the same account is written back.
+#[cfg(unix)]
+#[test]
+fn a_codex_run_gets_its_own_home_and_its_result_from_its_last_message() {
+    use owlshift_runner::executor::Outcome;
+    let bench = Bench::new();
+    let agent = bench.agent();
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let refreshed = codex_login("acct-1", "access-NEW_owl299");
+    let script = format!(
+        "printf '%s' '{refreshed}' > \"$CODEX_HOME/auth.json\"\nprintf '%s' '{CRITIC_MESSAGE}' > \"$out\""
+    );
+    let harness = fake_codex(&bench, &script);
+    let report = bench.run_brief(agent, &harness, &review_brief()).unwrap();
+    let Outcome::Finished { result, .. } = &report.outcome else {
+        panic!("{:?}", report.outcome);
+    };
+    assert_eq!(result.summary, "no finding", "the planted result stood");
+    assert_eq!(report.warnings, Vec::<String>::new());
+    assert_eq!(report.usage.as_ref().map(|u| u.input_tokens), Some(6));
+    let stderr = fs::read_to_string(&report.stderr_log).unwrap();
+    assert!(stderr.contains("home=auth.json \n"), "{stderr}");
+    assert!(!stderr.contains("the user's"), "{stderr}");
+    let stdout = fs::read_to_string(&report.stdout_log).unwrap();
+    assert!(!stdout.contains("SENTINEL"), "{stdout}");
+    assert!(stdout.contains("<redacted>"), "{stdout}");
+    assert_eq!(fs::read_to_string(&harness.login).unwrap(), refreshed);
+}
+
+/// OWL-299, confined: a login the run turned into another account's is
+/// dropped with a warning, the user's file kept; a last message `-o` does
+/// not hold fails the run, the planted result notwithstanding.
+#[cfg(unix)]
+#[test]
+fn a_codex_run_cannot_swap_the_login_or_plant_its_result() {
+    use owlshift_runner::executor::{Failure, Outcome};
+    let bench = Bench::new();
+    let agent = bench.agent();
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let swapped = codex_login("acct-2", "access-OTHER_owl299");
+    let script = format!("printf '%s' '{swapped}' > \"$CODEX_HOME/auth.json\"");
+    let harness = fake_codex(&bench, &script);
+    let report = bench.run_brief(agent, &harness, &review_brief()).unwrap();
+    assert!(
+        matches!(&report.outcome, Outcome::Failed(Failure::Harness(reason)) if reason.contains("-o")),
+        "{:?}",
+        report.outcome
+    );
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("same account"),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(
+        fs::read_to_string(&harness.login).unwrap(),
+        codex_login("acct-1", "access-SENTINEL_owl299")
+    );
+}
+
+/// OWL-299: with its own sandbox off, Codex runs only confined; refused
+/// before anything is written, on every platform.
+#[test]
+fn an_unconfined_codex_run_is_refused() {
+    let bench = Bench::new();
+    let agent = bench.agent().without_confinement();
+    let harness = owlshift_runner::executor::CodexHarness {
+        program: "codex".into(),
+        prompt: String::new(),
+        model: None,
+        effort: None,
+        login: bench.tmp.path().join("auth.json"),
+    };
+    let mut brief = brief();
+    brief.role = Role::Verify;
+    brief.permissions.level = PermissionLevel::ReadOnly;
+    let error = bench.run_brief(agent, &harness, &brief).unwrap_err();
+    assert!(
+        matches!(&error, ExecutorError::Command(e) if e.to_string().contains("read-only confinement")),
         "{error:?}"
     );
     assert!(!bench.worktree.exists(), "the worktree was created");

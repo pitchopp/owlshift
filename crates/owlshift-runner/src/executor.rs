@@ -44,11 +44,17 @@
 //! OWL-298) gets the worktree and the repository's git folder read, never
 //! written, and nothing is written in the worktree: the brief and the result
 //! go to [`RUN_FILES_DIR`] in the run's own temporary folder, which the run
-//! reads and writes and which is removed with it.
+//! reads and writes and which is removed with it. A harness may also ask
+//! there for a home folder of its own holding a copy of the user's login
+//! ([`SandboxNeeds::home`]), and give its result as its last message
+//! ([`SandboxNeeds::result_in_message`]): Codex does both
+//! ([`CodexHarness`], OWL-299).
 
+pub mod codex;
 pub mod gate;
 mod git;
 pub mod harness;
+mod home;
 pub mod isolation;
 mod watch;
 mod worktree;
@@ -74,11 +80,13 @@ use owlshift_platform::sandbox;
 use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
 
+pub use codex::CodexHarness;
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
 pub use git::{Git, GitError, MINIMUM_GIT_VERSION};
 pub(crate) use git::{git_floor_reason, git_install_advice, git_recheck_note};
 pub use harness::{
-    Harness, HarnessEnd, HarnessError, HarnessLogin, HarnessRun, HarnessStatus, SandboxNeeds,
+    Harness, HarnessEnd, HarnessError, HarnessHome, HarnessLogin, HarnessRun, HarnessStatus,
+    SandboxNeeds,
 };
 pub use isolation::{Violation, check_worktree_link};
 
@@ -114,6 +122,10 @@ pub const HARNESS_CONFIG_DIR: &str = "harness-config";
 /// The harness's temporary folder of one run, in the run's own temporary
 /// folder, when the harness names one (OWL-100). The harness makes it.
 pub const HARNESS_TEMP_DIR: &str = "harness-tmp";
+
+/// The harness's home folder of one run, in the run's own files, when the
+/// harness asks for one ([`SandboxNeeds::home`]).
+pub const HARNESS_HOME_DIR: &str = "harness-home";
 
 /// Runs roles. One value serves every run of a runner.
 #[derive(Clone, Debug)]
@@ -197,6 +209,10 @@ pub struct RunReport {
     /// rebase `done` that broke no isolation. Its commands and commit fill the delivery
     /// report's gate when it passed.
     pub gate: Option<GateReport>,
+    /// What the run's harness home left to say: a changed login that was
+    /// not written back, or a result that could not be written from the
+    /// last message.
+    pub warnings: Vec<String>,
 }
 
 /// How a run ended.
@@ -395,6 +411,13 @@ impl Executor {
                 spec.brief.role.as_str()
             )));
         }
+        if (needs.home.is_some() || needs.result_in_message) && !needs.read_only {
+            return Err(ExecutorError::Spec(
+                "the harness asks for a home of its own or gives its result as its last \
+                 message, which only the read-only profile provides"
+                    .to_owned(),
+            ));
+        }
         worktree::prepare(&self.git, spec)?;
         let mut paths = self.run_paths(spec)?;
         if needs.read_only {
@@ -466,10 +489,28 @@ impl Executor {
             result_file: &result_file,
         };
         let login = needs.login;
-        if let Some(login) = &login {
-            log.hide(&login.token);
-        }
         let inner = harness.command(&context).map_err(ExecutorError::Command)?;
+        // The user's login is copied in as late as can be: an early refusal
+        // leaves no copy behind.
+        let seeded = match (&needs.home, &run_files) {
+            (Some(home), Some(files)) => {
+                let dir = files.join(HARNESS_HOME_DIR);
+                let seeded =
+                    home::seed(&dir, &home.login).map_err(|source| ExecutorError::RunDir {
+                        path: home.login.clone(),
+                        source,
+                    })?;
+                Some((home.variable, dir, seeded))
+            }
+            _ => None,
+        };
+        let mut hidden: Vec<Secret> = login.iter().map(|login| login.token.clone()).collect();
+        if let Some((_, _, seeded)) = &seeded {
+            hidden.extend(harness.login_secrets(seeded.original()));
+        }
+        for secret in &hidden {
+            log.hide(secret);
+        }
         paths.readable = needs.readable;
         paths.writable = needs.writable;
         paths.writable.extend(run_files.iter().cloned());
@@ -505,6 +546,9 @@ impl Executor {
                 .apply(&mut command, config)
                 .map_err(ExecutorError::Spawn)?;
         }
+        if let Some((variable, dir, _)) = &seeded {
+            command.env(variable, dir);
+        }
         if let Some(variable) = needs.temp_variable {
             // Clear of the temporary folders the user's own processes share,
             // which the sandbox closes (OWL-100). The harness makes the folder
@@ -532,13 +576,33 @@ impl Executor {
         let _ = child.wait();
         log.finish();
 
+        // Once nothing of the run is left running: the result from the last
+        // message, over whatever the run wrote there, and the login back.
+        let mut warnings = Vec::new();
+        let mut result_written = Ok(());
+        if needs.result_in_message {
+            let message = driven.as_ref().ok().and_then(|end| end.message.as_deref());
+            result_written = home::result_from_message(&result_file, message).map_err(|error| {
+                format!("it could not be written from the run's last message: {error}")
+            });
+        }
+        if let Some((_, _, seeded)) = &seeded {
+            warnings.extend(home::write_back(seeded, |original, updated| {
+                harness.login_kept(original, updated)
+            }));
+        }
+
         let violations = before.check(&self.git, spec.main, spec.worktree, spec.branch);
-        let hidden = login.as_ref().map(|login| &login.token);
         let result = match &run_files {
             Some(run_files) => (run_files.as_path(), RUN_FILES_RESULT),
             None => (spec.worktree, RESULT_PATH),
         };
-        let (mut outcome, end) = decide(violations, timed_out, driven, spec, result, hidden);
+        let (mut outcome, end) = decide(violations, timed_out, driven, spec, result, &hidden);
+        if let Err(reason) = result_written
+            && matches!(outcome, Outcome::Finished { .. })
+        {
+            outcome = Outcome::Failed(Failure::InvalidResult(reason));
+        }
         let mut gate = None;
         if matches!(brief.role, Role::Build | Role::Rebase) && is_done(&outcome) {
             // The gate runs the code the run wrote, confined as the run was,
@@ -576,6 +640,7 @@ impl Executor {
             stderr_log: log.stderr_path,
             log_error: log.error,
             gate,
+            warnings,
         })
     }
 }
@@ -674,14 +739,14 @@ fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Op
 /// The outcome, in order of precedence: a violation, the deadline, a
 /// credential the harness loaded, a usage limit, a harness failure, then
 /// the result itself, read as `result` (a folder and a name in it), refused
-/// when it holds `hidden`, the harness's login.
+/// when it holds one of `hidden`, the harness's login secrets.
 fn decide(
     violations: Vec<Violation>,
     timed_out: bool,
     driven: io::Result<HarnessEnd>,
     spec: &RunSpec<'_>,
     result: (&Path, &str),
-    hidden: Option<&Secret>,
+    hidden: &[Secret],
 ) -> (Outcome, Option<HarnessEnd>) {
     let (driven, end) = match driven {
         Ok(end) => (Ok(()), Some(end)),
@@ -715,17 +780,18 @@ fn decide(
 /// Reads and validates the role's `result.json`, the file `name` in the
 /// folder `root` (the worktree, or the run's files folder under the
 /// read-only profile), then its artifacts, in the worktree. A result or an
-/// artifact that holds `hidden`, the harness's login, fails the run: what it
-/// says would reach the tracker, the pull request and the events (OWL-94).
+/// artifact that holds one of `hidden`, the harness's login secrets, fails
+/// the run: what it says would reach the tracker, the pull request and the
+/// events (OWL-94).
 fn read_result(
     (root, name): (&Path, &str),
     worktree: &Path,
     branch: &str,
     brief: &Brief,
-    hidden: Option<&Secret>,
+    hidden: &[Secret],
 ) -> Outcome {
     let copied = |into: &str, bytes: &[u8]| {
-        hidden.is_some_and(|token| holds(bytes, token)).then(|| {
+        hidden.iter().any(|token| holds(bytes, token)).then(|| {
             Outcome::Failed(Failure::Credentials(vec![CredentialFinding::LoginCopied {
                 into: into.to_owned(),
             }]))
@@ -801,18 +867,19 @@ pub const REDACTED: &str = "<redacted>";
 /// written as they come. A write error does not stop the run; the first one
 /// is kept for the report.
 ///
-/// Once told of the harness's login token (`RunLog::hide`), each file gets
-/// [`REDACTED`] wherever the harness printed the token, even split across two
+/// Once told of the harness's login secrets (`RunLog::hide`), each file gets
+/// [`REDACTED`] wherever the harness printed one, even split across two
 /// writes: the bytes that could start one are held back until the next
-/// write, or `RunLog::finish`. The agent's shell inherits the token, so a
-/// command such as `env` would otherwise log it (OWL-94).
+/// write, or `RunLog::finish`. The agent's shell inherits the token, or can
+/// read a login copied into the run's home, so a command such as `env` or
+/// `cat` would otherwise log it (OWL-94, OWL-299).
 pub struct RunLog {
     stdout: File,
     stderr: File,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     error: Option<String>,
-    hidden: Option<Secret>,
+    hidden: Vec<Secret>,
     stdout_held: Vec<u8>,
     stderr_held: Vec<u8>,
 }
@@ -844,7 +911,7 @@ impl RunLog {
             stdout_path,
             stderr_path,
             error: None,
-            hidden: None,
+            hidden: Vec::new(),
             stdout_held: Vec::new(),
             stderr_held: Vec::new(),
         })
@@ -853,29 +920,19 @@ impl RunLog {
     /// Replaces `token` with [`REDACTED`] in everything logged from now on.
     fn hide(&mut self, token: &Secret) {
         if !token.expose().is_empty() {
-            self.hidden = Some(token.clone());
+            self.hidden.push(token.clone());
         }
     }
 
     /// Appends bytes of standard output.
     pub fn stdout(&mut self, bytes: &[u8]) {
-        let written = redacted_write(
-            &mut self.stdout,
-            &mut self.stdout_held,
-            self.hidden.as_ref(),
-            bytes,
-        );
+        let written = redacted_write(&mut self.stdout, &mut self.stdout_held, &self.hidden, bytes);
         self.keep(written, "stdout.log");
     }
 
     /// Appends bytes of standard error.
     pub fn stderr(&mut self, bytes: &[u8]) {
-        let written = redacted_write(
-            &mut self.stderr,
-            &mut self.stderr_held,
-            self.hidden.as_ref(),
-            bytes,
-        );
+        let written = redacted_write(&mut self.stderr, &mut self.stderr_held, &self.hidden, bytes);
         self.keep(written, "stderr.log");
     }
 
@@ -900,21 +957,25 @@ impl RunLog {
     }
 }
 
-/// Writes `bytes` to `file`, `hidden`'s value replaced with [`REDACTED`].
-/// `held` carries the last bytes of the previous write, which could start
-/// the token, and keeps this write's, fewer than the token's length.
+/// Writes `bytes` to `file`, each of `hidden`'s values replaced with
+/// [`REDACTED`]. `held` carries the last bytes of the previous write, which
+/// could start a secret, and keeps this write's, fewer than the longest
+/// secret's length.
 fn redacted_write(
     file: &mut File,
     held: &mut Vec<u8>,
-    hidden: Option<&Secret>,
+    hidden: &[Secret],
     bytes: &[u8],
 ) -> io::Result<()> {
-    let Some(token) = hidden.map(|secret| secret.expose().as_bytes()) else {
+    let Some(longest) = hidden.iter().map(|secret| secret.expose().len()).max() else {
         return file.write_all(bytes);
     };
     held.extend_from_slice(bytes);
-    let text = replace_all(held, token, REDACTED.as_bytes());
-    let split = text.len().saturating_sub(token.len() - 1);
+    let mut text = std::mem::take(held);
+    for secret in hidden {
+        text = replace_all(&text, secret.expose().as_bytes(), REDACTED.as_bytes());
+    }
+    let split = text.len().saturating_sub(longest - 1);
     *held = text[split..].to_vec();
     file.write_all(&text[..split])
 }
@@ -1088,6 +1149,11 @@ mod tests {
             log.stdout(chunk.as_bytes());
         }
         log.stderr(TOKEN.as_bytes());
+        // A second secret, such as a login copied into the run's home
+        // (OWL-299), is hidden too, with its own length.
+        log.hide(&Secret::new("refresh-OWL299"));
+        log.stderr(b" cat: refresh-OW");
+        log.stderr(b"L299.");
         log.finish();
         assert!(!format!("{log:?}").contains("sk-an"));
         let read = |name| std::fs::read_to_string(dir.path().join(name)).unwrap();
@@ -1095,7 +1161,7 @@ mod tests {
             read("stdout.log"),
             "env: A=1 T=<redacted>\nagain <redacted><redacted> end sk-an"
         );
-        assert_eq!(read("stderr.log"), "<redacted>");
+        assert_eq!(read("stderr.log"), "<redacted> cat: <redacted>.");
         assert_eq!(log.error, None);
     }
 
