@@ -1,0 +1,38 @@
+{
+  "recorded": "2026-10-15",
+  "codex_version": "0.154.0",
+  "platform": "macos",
+  "confinement": "none: env -i with HOME, PATH, TERM, LANG, CODEX_HOME and HTTPS_PROXY on a dead port, NO_PROXY for the stand-in; a scratch HOME and CODEX_HOME, no login",
+  "setup": "a linked worktree of a scratch repository whose committed .codex/config.toml declares the stdio MCP server `probe`; CODEX_HOME's config.toml trusts the checkout and the worktree and declares the stdio MCP server `userprobe`. Each server leaves a mark when it starts and when its tool is called. The model is a local stand-in for the Responses API, reached through standin_overrides (inserted before the final `-`), which calls the tool `ping` of namespace `mcp__probe` and then gives the final message",
+  "argv": [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--json",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "-c",
+    "skills.include_instructions=false",
+    "-c",
+    "project_doc_max_bytes=0",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--output-schema",
+    "<run-files>/schema.json",
+    "-o",
+    "<run-files>/last-message.json",
+    "-"
+  ],
+  "standin_overrides": [
+    "-c",
+    "model_provider=probe",
+    "-c",
+    "model_providers.probe={name=\"probe\",base_url=\"http://127.0.0.1:<port>/v1\",wire_api=\"responses\"}"
+  ],
+  "prompt": "Review the change.",
+  "exit_status": 0,
+  "stderr": [
+    "2026-10-15T12:00:00.000000Z ERROR codex_core::tools::router: error=unsupported call: mcp__probeping"
+  ],
+  "output_last_message": "{\"format\":9,\"status\":\"done\",\"summary\":\"No finding.\",\"findings\":[]}",
+  "marks": []
+}

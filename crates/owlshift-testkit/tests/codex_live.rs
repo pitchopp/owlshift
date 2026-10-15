@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use owlshift_adapters::harness::codex::Effort;
+use owlshift_adapters::harness::codex::{self, Effort};
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::{
     Author, Brief, GivenDiff, PermissionLevel, Permissions, Relation, ReviewBrief, TicketBrief,
@@ -287,17 +287,35 @@ fn record(report: &RunReport, scratch: &Path) {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|event| event["item"]["type"] == "agent_message")
         .find_map(|event| event["item"]["text"].as_str().map(str::to_owned));
+    // The adapter's command line for this run, with the run's files named
+    // by placeholders, so a recording carries the flags of its day.
+    let request = codex::Request {
+        workdir: PathBuf::from("<worktree>"),
+        model: None,
+        effort: Some(Effort::Low),
+        role: Role::Verify,
+        permissions: Permissions {
+            level: PermissionLevel::ReadOnly,
+            network: false,
+            browser: false,
+        },
+        schema_file: PathBuf::from("<run-files>/schema.json"),
+        last_message_file: PathBuf::from("<run-files>/last-message.json"),
+    };
+    let command = codex::command(Path::new("codex"), &request).unwrap();
+    let argv: Vec<String> = std::iter::once("codex".to_owned())
+        .chain(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        )
+        .collect();
     let meta = serde_json::json!({
         "recorded": jiff::Zoned::now().date().to_string(),
         "codex_version": version,
         "platform": std::env::consts::OS,
         "confinement": "the executor's read-only profile, through Executor::run (OWL-299)",
-        "argv": [
-            "codex", "exec", "--ephemeral", "--json", "--ignore-user-config", "--ignore-rules",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--output-schema", "<run-files>/schema.json", "-o", "<run-files>/last-message.json",
-            "-c", "model_reasoning_effort=low", "-"
-        ],
+        "argv": argv,
         "prompt": "the verify role (roles/verify.md) and the brief's path, on standard input",
         "exit_status": report.exit_code,
         "stderr": stderr,

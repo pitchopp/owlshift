@@ -10,17 +10,22 @@
 //! confinement, the exit status, standard error and the `-o` file. Thread
 //! ids, request ids, Cloudflare ray ids, timestamps and local paths were
 //! replaced before they were committed; the checks below keep it so.
+//!
+//! `trusted_repo_mcp` and its control were recorded for OWL-131 against a
+//! local stand-in for the model, with the adapter's own command line; their
+//! records say how (build plan, OWL-130's entry).
 
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use owlshift_adapters::harness::codex::{Failure, Outcome, Run, Transcript};
+use owlshift_adapters::harness::codex::{self, Failure, Outcome, Run, Transcript};
 use owlshift_adapters::harness::tested;
-use owlshift_contracts::Harness;
+use owlshift_contracts::brief::{PermissionLevel, Permissions};
+use owlshift_contracts::{Harness, Role};
 
 /// Every recording, so that one added without its checks fails here.
-const FIXTURES: [&str; 13] = [
+const FIXTURES: [&str; 15] = [
     "success",
     "write_refused",
     "nested_sandbox",
@@ -34,6 +39,8 @@ const FIXTURES: [&str; 13] = [
     "logged_out",
     "codex_home_read_only",
     "critic",
+    "trusted_repo_mcp",
+    "trusted_repo_mcp_control",
 ];
 
 /// The one id left in the recordings, where each thread id was.
@@ -198,17 +205,21 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
     assert_eq!(replay("usage_limit").outcome, Outcome::UsageLimit);
 
     // The live critic run of `owlshift-testkit/tests/codex_live.rs` (OWL-299):
-    // the adapter's own command line, confined; its last message is the
-    // result the runner validated.
-    let critic = replay("critic");
-    let Outcome::Completed { text } = &critic.outcome else {
-        panic!("{:?}", critic.outcome);
-    };
-    assert_eq!(
-        text,
-        meta("critic")["output_last_message"].as_str().unwrap()
-    );
-    assert!(critic.usage.is_some());
+    // the adapter's command line of then, before OWL-131's two `-c`,
+    // confined; its last message is the result the runner validated. The
+    // stand-in runs of OWL-131 end the same way, with the MCP call or not.
+    for name in ["critic", "trusted_repo_mcp", "trusted_repo_mcp_control"] {
+        let run = replay(name);
+        let Outcome::Completed { text } = &run.outcome else {
+            panic!("{name}: {:?}", run.outcome);
+        };
+        assert_eq!(
+            text,
+            meta(name)["output_last_message"].as_str().unwrap(),
+            "{name}"
+        );
+        assert!(run.usage.is_some(), "{name}");
+    }
     assert_eq!(
         replay("codex_home_read_only").outcome,
         Outcome::Failed(Failure::NoThread)
@@ -216,6 +227,93 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
     for name in FIXTURES {
         assert_eq!(replay(name).malformed_lines, 0, "{name}");
     }
+}
+
+/// OWL-131 (decision D1 of OWL-130): a repository the user's Codex trusts
+/// starts no MCP server in a critic run, and neither does the user's own
+/// configuration. Both recordings ran in a linked worktree of a repository
+/// whose `.codex/config.toml` declares the server `probe`, with a
+/// `CODEX_HOME` whose `config.toml` trusts it and declares `userprobe`; a
+/// local stand-in for the model called `probe`'s tool `ping` in both.
+/// Without `--ignore-user-config` both servers started and the call reached
+/// `probe`; on the adapter's command line neither started and Codex refused
+/// the call, so no MCP item reached the stream.
+///
+/// The recorded command line is `command()`'s, so a change to the adapter's
+/// flags fails here until the pair is recorded again; the unit test in
+/// `harness/codex.rs` is where the flags are read.
+#[test]
+fn a_trusted_repository_starts_no_mcp_server_in_a_critic_run() {
+    let request = codex::Request {
+        workdir: PathBuf::from("<worktree>"),
+        model: None,
+        effort: None,
+        role: Role::Verify,
+        permissions: Permissions {
+            level: PermissionLevel::ReadOnly,
+            network: false,
+            browser: false,
+        },
+        schema_file: PathBuf::from("<run-files>/schema.json"),
+        last_message_file: PathBuf::from("<run-files>/last-message.json"),
+    };
+    let command = codex::command(Path::new("codex"), &request).unwrap();
+    let mut adapter = vec!["codex".to_owned()];
+    adapter.extend(
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    );
+    let argv = |name: &str| -> Vec<String> {
+        meta(name)["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(argv("trusted_repo_mcp"), adapter);
+    assert!(adapter.iter().any(|arg| arg == "--ignore-user-config"));
+    // The control differs by that flag alone.
+    let without: Vec<String> = adapter
+        .iter()
+        .filter(|arg| *arg != "--ignore-user-config")
+        .cloned()
+        .collect();
+    assert_eq!(argv("trusted_repo_mcp_control"), without);
+
+    let mcp_items = |name: &str| -> Vec<Value> {
+        events(name)
+            .into_iter()
+            .map(|event| event["item"].clone())
+            .filter(|item| item["type"] == "mcp_tool_call")
+            .collect()
+    };
+    let called: Vec<Value> = mcp_items("trusted_repo_mcp_control")
+        .into_iter()
+        .filter(|item| item["status"] == "completed")
+        .collect();
+    assert_eq!(called.len(), 1, "{called:?}");
+    assert_eq!(called[0]["server"], "probe");
+    assert_eq!(called[0]["tool"], "ping");
+    assert_eq!(called[0]["result"]["content"][0]["text"], "PONG-repo");
+    assert_eq!(
+        meta("trusted_repo_mcp_control")["marks"],
+        json!([
+            "mcp.codexhome.started",
+            "mcp.repo.called",
+            "mcp.repo.started"
+        ])
+    );
+
+    let guarded = "trusted_repo_mcp";
+    assert_eq!(mcp_items(guarded), Vec::<Value>::new());
+    assert_eq!(meta(guarded)["marks"], json!([]));
+    let stderr = meta(guarded)["stderr"].to_string();
+    assert!(
+        stderr.contains("unsupported call: mcp__probeping"),
+        "{stderr}"
+    );
 }
 
 /// The values left where request ids, Cloudflare ray ids, timestamps and
