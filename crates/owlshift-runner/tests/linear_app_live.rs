@@ -46,8 +46,9 @@ use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::ids::{QuestionId, TicketId};
 use owlshift_contracts::result::{MAX_QUESTIONS, Question, RefusedChoice};
 use owlshift_platform::keychain::{Keychain, Secret};
+use owlshift_runner::secrets::TrackerAccounts;
 use owlshift_runner::tracker::{
-    LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, linear,
+    LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, linear, read,
 };
 use owlshift_runner::writer::{MAX_COMMENT_CHARS, QuestionsComment, ReopenedChoice, Writer};
 
@@ -196,7 +197,8 @@ fn a_question_round_through_the_app_reaches_its_decider() {
             .store(account, &Secret::new(value.as_str()))
             .unwrap();
     }
-    let tracker = linear(&keychain, TEAM).unwrap_or_else(|e| panic!("{e}"));
+    let stored = read(&keychain, &TrackerAccounts::shared()).unwrap();
+    let tracker = linear(&stored, TEAM).unwrap_or_else(|e| panic!("{e}"));
     println!("tracker opened with the app: ok");
 
     // 3. A QUESTIONS round through the Writer, read back.
@@ -428,7 +430,8 @@ fn a_maximal_question_round_reaches_linear_in_parts() {
             .store(account, &Secret::new(value.as_str()))
             .unwrap();
     }
-    let tracker = linear(&keychain, TEAM).unwrap_or_else(|e| panic!("{e}"));
+    let stored = read(&keychain, &TrackerAccounts::shared()).unwrap();
+    let tracker = linear(&stored, TEAM).unwrap_or_else(|e| panic!("{e}"));
     let round = maximal_round(ticket.clone());
     let whole = round.render().chars().count();
     let posted = Writer::new(&tracker)

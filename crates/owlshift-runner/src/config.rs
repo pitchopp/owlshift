@@ -203,7 +203,7 @@ fn repository_key(repo: &Repo) -> String {
 /// read as `owlshift do` reads it ([`project::origin_text`],
 /// [`on_demand::check_origin`]). The remote lives in the checkout's git
 /// configuration, which the committed project file cannot set.
-fn origin_repo(system: &dyn System, root: &Path) -> Result<Repo, String> {
+pub(crate) fn origin_repo<S: System + ?Sized>(system: &S, root: &Path) -> Result<Repo, String> {
     let git = system
         .locate("git")
         .ok_or_else(|| "git is not on the PATH".to_owned())?;

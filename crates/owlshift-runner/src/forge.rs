@@ -7,10 +7,14 @@
 
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github::{GitHubForge, Token};
-use owlshift_platform::keychain::{Keychain, SERVICE};
+use owlshift_platform::keychain::{SERVICE, Secret};
 
-/// The keychain account, under [`SERVICE`], that holds the GitHub token: one
-/// token per machine for now. [`GITHUB_TOKEN_HELP`] says what it needs.
+use crate::secrets::ForgeSecret;
+
+/// The keychain account, under [`SERVICE`], that every project of a machine
+/// shared for the GitHub token before OWL-308, still read for a project with
+/// no token of its own; a project's own account ends with this name
+/// ([`crate::secrets`]). [`GITHUB_TOKEN_HELP`] says what the token needs.
 pub const GITHUB_ACCOUNT: &str = "github";
 
 /// What the GitHub token must allow, as `owlshift init` tells its user.
@@ -21,40 +25,41 @@ pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (wr
      commit statuses, actions and metadata (read) on the project's repository; the output of \
      `gh auth token` also works";
 
-/// The GitHub adapter for `repo`, with its token read from `keychain`:
-/// `owlshift do` opens the pull request and reads the check set the
+/// The GitHub adapter for `repo`, with the token `found`: `owlshift do`
+/// opens the pull request and reads the check set the
 /// [writer](crate::writer) reports with it; `owlshift init` stores the
 /// token.
-pub fn github(keychain: &Keychain, repo: Repo) -> Result<GitHubForge, String> {
-    match keychain.read(GITHUB_ACCOUNT) {
-        Ok(Some(token)) => Ok(GitHubForge::new(Token::new(token.expose()), repo)),
-        Ok(None) => Err(format!(
+pub fn github(found: &ForgeSecret<Secret>, repo: Repo) -> Result<GitHubForge, String> {
+    match &found.token {
+        Some(token) => Ok(GitHubForge::new(Token::new(token.expose()), repo)),
+        None => Err(format!(
             "no GitHub token in the system keychain: run `owlshift init` in a terminal, or \
-             store one under service `{SERVICE}`, account `{GITHUB_ACCOUNT}`"
+             store one under service `{SERVICE}`, account `{}`",
+            found.account.token
         )),
-        Err(error) => Err(error.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use owlshift_platform::keychain::Secret;
+    use crate::secrets::ForgeAccount;
 
     use super::*;
 
     #[test]
-    fn the_github_token_comes_from_the_keychain() {
-        let keychain = Keychain::in_memory();
+    fn the_github_token_is_the_one_found() {
         let repo = Repo::parse("pitchopp/owlshift").unwrap();
-        let missing = github(&keychain, repo.clone()).unwrap_err();
+        let mut found = ForgeSecret {
+            account: ForgeAccount::project(&repo),
+            token: None,
+        };
+        let missing = github(&found, repo.clone()).unwrap_err();
         assert!(
-            missing.contains("service `owlshift`, account `github`"),
+            missing.contains("service `owlshift`, account `github.com/pitchopp/owlshift/github`"),
             "{missing}"
         );
 
-        keychain
-            .store(GITHUB_ACCOUNT, &Secret::new("ghp_test"))
-            .unwrap();
-        assert_eq!(github(&keychain, repo.clone()).unwrap().repo(), &repo);
+        found.token = Some(Secret::new("ghp_test"));
+        assert_eq!(github(&found, repo.clone()).unwrap().repo(), &repo);
     }
 }

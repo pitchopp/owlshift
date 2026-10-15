@@ -11,6 +11,9 @@ pub use owlshift_platform::process::{Captured, RunError};
 pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
+use owlshift_adapters::forge::Repo;
+
+use crate::secrets::TrackerAccounts;
 use crate::ticket_ref::{self, RefState};
 pub use crate::tracker::{AppError, StatesError};
 pub use owlshift_adapters::tracker::linear::{AccountFact, AdmissionFacts, AppUser};
@@ -51,42 +54,57 @@ pub trait System {
             .and_then(|keychain| keychain.contains(account))
             .map_err(|error| error.to_string())
     }
+    /// The GitHub repository of the `origin` remote of the checkout at
+    /// `root`, read as `owlshift do` reads it: what names a project's
+    /// secrets (OWL-308).
+    fn origin_repo(&self, root: &Path) -> Result<Repo, String> {
+        crate::config::origin_repo(self, root)
+    }
     /// The names of the workflow states of the Linear team `team`, read
-    /// over the network with the Linear API key in the system keychain
+    /// over the network with the Linear API key stored under `accounts`
     /// (OWL-147). Only `owlshift doctor` asks, and only for a Linear project.
-    fn linear_states(&self, team: &str) -> Result<Vec<String>, StatesError> {
+    fn linear_states(
+        &self,
+        accounts: &TrackerAccounts,
+        team: &str,
+    ) -> Result<Vec<String>, StatesError> {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| StatesError::Keychain(error.to_string()))
-            .and_then(|keychain| crate::tracker::linear_team_states(&keychain, team))
+            .and_then(|keychain| crate::tracker::linear_team_states(&keychain, accounts, team))
     }
     /// What the admission and proposals setup of the Linear team `team`
     /// looks like (OWL-155): which of `labels` the team can carry, which of
-    /// `accounts` the workspace knows, and where a proposal would be filed,
-    /// given the ready state `ready`. Read over the network with the key in
-    /// the system keychain. Only `owlshift doctor` asks, and only for a
+    /// `people` the workspace knows, and where a proposal would be filed,
+    /// given the ready state `ready`. Read over the network with the key
+    /// stored under `accounts`. Only `owlshift doctor` asks, and only for a
     /// Linear project.
     fn linear_admission(
         &self,
+        accounts: &TrackerAccounts,
         team: &str,
         ready: &str,
         labels: &[&str],
-        accounts: &[&str],
+        people: &[&str],
     ) -> Result<AdmissionFacts, StatesError> {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| StatesError::Keychain(error.to_string()))
             .and_then(|keychain| {
-                crate::tracker::linear_admission(&keychain, team, ready, labels, accounts)
+                crate::tracker::linear_admission(&keychain, accounts, team, ready, labels, people)
             })
     }
-    /// The Linear app user Owlshift writes as, with the credentials in the
-    /// system keychain, checked over the network as `owlshift do` checks it
+    /// The Linear app user Owlshift writes as, with the credentials stored
+    /// under `accounts`, checked over the network as `owlshift do` checks it
     /// for team `team`, its token revoked after: `None` when no app is
     /// stored (OWL-157). Only `owlshift doctor` asks, and only for a Linear
     /// project.
-    fn linear_app(&self, team: &str) -> Result<Option<AppUser>, AppError> {
+    fn linear_app(
+        &self,
+        accounts: &TrackerAccounts,
+        team: &str,
+    ) -> Result<Option<AppUser>, AppError> {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| AppError::Keychain(error.to_string()))
-            .and_then(|keychain| crate::tracker::linear_app_user(&keychain, team))
+            .and_then(|keychain| crate::tracker::linear_app_user(&keychain, accounts, team))
     }
     /// The ticket refs of the project whose repository is at `root`, each
     /// with its state ([`ticket_ref::states`]), read in its dedicated
@@ -241,6 +259,8 @@ pub(crate) mod fake {
         /// What checking the Linear app gives, both of its entries being
         /// stored; `None`: no app is stored.
         linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
+        /// The repository `origin` names; `None`: `pitchopp/owlshift`.
+        origin: Option<Result<Repo, String>>,
         /// What reading the project's ticket refs gives; `None`: no
         /// dedicated checkout.
         ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
@@ -283,6 +303,30 @@ pub(crate) mod fake {
         /// No secret is stored for this keychain account.
         pub(crate) fn unstored(mut self, account: &str) -> Self {
             self.unstored.push(account.to_owned());
+            self
+        }
+
+        /// The project's own tracker and forge accounts hold nothing, so
+        /// its secrets come from the shared accounts (OWL-308).
+        pub(crate) fn only_shared(mut self) -> Self {
+            let repo = Repo::parse("pitchopp/owlshift").unwrap();
+            let own = crate::secrets::TrackerAccounts::project(&repo);
+            self.unstored.extend([
+                own.key,
+                own.app_id,
+                own.app_secret,
+                crate::secrets::ForgeAccount::project(&repo).token,
+            ]);
+            self
+        }
+
+        /// The repository `origin` names, or why it names none.
+        pub(crate) fn origin_is(mut self, origin: Result<&str, &str>) -> Self {
+            self.origin = Some(
+                origin
+                    .map(|repo| Repo::parse(repo).unwrap())
+                    .map_err(str::to_owned),
+            );
             self
         }
 
@@ -402,11 +446,21 @@ pub(crate) mod fake {
             }
         }
 
+        fn origin_repo(&self, _root: &Path) -> Result<Repo, String> {
+            self.origin
+                .clone()
+                .unwrap_or_else(|| Ok(Repo::parse("pitchopp/owlshift").unwrap()))
+        }
+
         /// The key's presence follows [`Self::unstored`] and
         /// [`Self::keychain_fails`]; never the network.
-        fn linear_states(&self, _team: &str) -> Result<Vec<String>, StatesError> {
+        fn linear_states(
+            &self,
+            accounts: &TrackerAccounts,
+            _team: &str,
+        ) -> Result<Vec<String>, StatesError> {
             use owlshift_adapters::tracker::{Error, ErrorKind};
-            match self.secret_stored(crate::tracker::LINEAR_ACCOUNT) {
+            match self.secret_stored(&accounts.key) {
                 Err(reason) => Err(StatesError::Keychain(reason)),
                 Ok(false) => Err(StatesError::NoKey),
                 Ok(true) => self
@@ -423,13 +477,14 @@ pub(crate) mod fake {
         /// Only the labels and accounts the answer holds come back.
         fn linear_admission(
             &self,
+            accounts: &TrackerAccounts,
             _team: &str,
             _ready: &str,
             labels: &[&str],
-            accounts: &[&str],
+            people: &[&str],
         ) -> Result<AdmissionFacts, StatesError> {
             use owlshift_adapters::tracker::{Error, ErrorKind};
-            match self.secret_stored(crate::tracker::LINEAR_ACCOUNT) {
+            match self.secret_stored(&accounts.key) {
                 Err(reason) => Err(StatesError::Keychain(reason)),
                 Ok(false) => Err(StatesError::NoKey),
                 Ok(true) => self
@@ -440,7 +495,7 @@ pub(crate) mod fake {
                     })
                     .map(|mut facts| {
                         facts.labels.retain(|l| labels.contains(&l.as_str()));
-                        facts.accounts.retain(|a| accounts.contains(&a.id.as_str()));
+                        facts.accounts.retain(|a| people.contains(&a.id.as_str()));
                         facts
                     })
                     .map_err(StatesError::Tracker),
@@ -450,26 +505,31 @@ pub(crate) mod fake {
         /// No app unless [`Self::linear_app_is`] gave one; then its entries
         /// follow [`Self::unstored`] and [`Self::keychain_fails`]. Never the
         /// network.
-        fn linear_app(&self, _team: &str) -> Result<Option<AppUser>, AppError> {
-            use crate::tracker::{LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
+        fn linear_app(
+            &self,
+            accounts: &TrackerAccounts,
+            _team: &str,
+        ) -> Result<Option<AppUser>, AppError> {
             let Some(answer) = self.linear_app.clone() else {
                 return Ok(None);
             };
             let stored = |account| self.secret_stored(account).map_err(AppError::Keychain);
-            match (
-                stored(LINEAR_APP_ID_ACCOUNT)?,
-                stored(LINEAR_APP_SECRET_ACCOUNT)?,
-            ) {
+            let incomplete = |missing: &str| AppError::Incomplete {
+                missing: missing.to_owned(),
+                source: accounts.source,
+            };
+            match (stored(&accounts.app_id)?, stored(&accounts.app_secret)?) {
                 (false, false) => Ok(None),
-                (true, false) => Err(AppError::Incomplete {
-                    missing: LINEAR_APP_SECRET_ACCOUNT,
-                }),
-                (false, true) => Err(AppError::Incomplete {
-                    missing: LINEAR_APP_ID_ACCOUNT,
-                }),
-                (true, true) => answer
-                    .map(|name| Some(AppUser { name }))
-                    .map_err(AppError::Tracker),
+                (true, false) => Err(incomplete(&accounts.app_secret)),
+                (false, true) => Err(incomplete(&accounts.app_id)),
+                (true, true) => {
+                    answer
+                        .map(|name| Some(AppUser { name }))
+                        .map_err(|error| AppError::Tracker {
+                            error,
+                            accounts: accounts.clone(),
+                        })
+                }
             }
         }
 

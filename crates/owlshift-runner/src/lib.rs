@@ -24,6 +24,7 @@ pub mod resolver;
 pub mod reversal;
 pub mod roles;
 pub mod rules;
+pub mod secrets;
 pub mod system;
 pub mod ticket_ref;
 pub mod tracker;

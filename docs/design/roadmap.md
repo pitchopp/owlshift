@@ -118,7 +118,7 @@ PR quality at least on par with the current `/parallel` workflow.
 - S8 stops on a premise the repository or its documents contradict. Intake stays without network: a premise only the outside world can check is a question. Recording the dated finding where the project keeps external facts waits for a key that names that place.
 - S17's rule that a reviewer runs on another family is held by one reviewer per review, the Codex critic; the others add mandates on Claude Code.
 - S17's routing part: the routing verdict's tier and effort are followed; the authoring roles stay on Claude Code (D4), so a verdict naming Codex for them is shown and not followed. Its fallback part, a harness at its usage limit switching to another, is P6's, as that step says.
-- Locary is in a Linear workspace of its own, while a machine keeps one Linear key and one GitHub token for every project (keychain accounts `linear` and `github`): its first tickets need secrets per project.
+- Locary is in a Linear workspace of its own, while a machine keeps one Linear key and one GitHub token for every project (keychain accounts `linear` and `github`): its first tickets need secrets per project, named by the project's GitHub repository since OWL-308 ([build plan](build-plan.md), "P5 · Quality pipeline", part K).
 
 **Exit gate.** Five PRs judged at least as good as `/parallel` output by the maintainer; first Locary tickets delivered.
 

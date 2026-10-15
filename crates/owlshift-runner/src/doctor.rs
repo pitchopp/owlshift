@@ -22,6 +22,7 @@ pub mod render;
 
 use std::path::{MAIN_SEPARATOR, Path};
 
+use owlshift_adapters::forge::Repo;
 use owlshift_adapters::harness::{self, Login, tested};
 use owlshift_adapters::tracker::linear::{
     AdmissionFacts, LinearTracker, StateMismatch, find_state,
@@ -42,6 +43,7 @@ use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
 };
+use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::{
     AppError, DataDirSource, RunError, StatesError, System, exact_version_of, older_than,
     version_of,
@@ -49,7 +51,6 @@ use crate::system::{
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 use crate::ticket_ref::RefState;
-use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -267,9 +268,15 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(file_check("project config", &config.project, home));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
-    checks.extend(tracker_states_check(system, config));
-    checks.extend(tracker_identity_check(system, config));
-    let facts = admission_facts(system, config);
+    let stored = project_secrets(system, config);
+    checks.extend(stored.as_ref().map(secrets_check));
+    let accounts = match &stored {
+        Some(Ok(found)) => found.tracker.as_ref().map(|tracker| &tracker.accounts),
+        _ => None,
+    };
+    checks.extend(tracker_states_check(system, config, accounts));
+    checks.extend(tracker_identity_check(system, config, accounts));
+    let facts = admission_facts(system, config, accounts);
     checks.extend(drain_admission_check(config, facts.as_ref()));
     checks.extend(proposals_inbox_check(config, facts.as_ref()));
     checks.extend(drain_slot_check(system, config));
@@ -925,7 +932,11 @@ fn tracker_check(config: &Effective) -> Check {
 /// keychain it cannot read, a team Linear does not know) is a failure. None
 /// for a Markdown project or none loaded: only a Linear project opens the
 /// keychain and the network here, once each.
-fn tracker_states_check(system: &dyn System, config: &Effective) -> Option<Check> {
+fn tracker_states_check(
+    system: &dyn System,
+    config: &Effective,
+    accounts: Option<&TrackerAccounts>,
+) -> Option<Check> {
     const SUBJECT: &str = "tracker states";
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
@@ -933,11 +944,16 @@ fn tracker_states_check(system: &dyn System, config: &Effective) -> Option<Check
     let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
         return None;
     };
-    let place = format!("in the system keychain (service `{SERVICE}`, account `{LINEAR_ACCOUNT}`)");
+    // Unresolved, the `secrets` line says why.
+    let accounts = accounts?;
+    let place = format!(
+        "in the system keychain (service `{SERVICE}`, account `{}`)",
+        accounts.key
+    );
     let fail = |detail: String, why: &str, fix: Vec<Step>| {
         Some(Check::fail(Section::Project, SUBJECT, detail, why, fix))
     };
-    let names = match system.linear_states(team) {
+    let names = match system.linear_states(accounts, team) {
         Ok(names) => names,
         Err(StatesError::NoKey) => {
             return fail(
@@ -1042,6 +1058,7 @@ fn tracker_states_check(system: &dyn System, config: &Effective) -> Option<Check
 fn admission_facts(
     system: &dyn System,
     config: &Effective,
+    secrets: Option<&TrackerAccounts>,
 ) -> Option<Result<AdmissionFacts, StatesError>> {
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
@@ -1049,6 +1066,7 @@ fn admission_facts(
     let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
         return None;
     };
+    let secrets = secrets?;
     let tracker = &config.tracker;
     let mut labels = vec![PROPOSED_LABEL];
     if let Admit::Label(label) = &tracker.admit {
@@ -1061,7 +1079,7 @@ fn admission_facts(
         .flatten()
         .map(String::as_str)
         .collect();
-    Some(system.linear_admission(team, &tracker.states.ready, &labels, &accounts))
+    Some(system.linear_admission(secrets, team, &tracker.states.ready, &labels, &accounts))
 }
 
 /// Whether the project is set up to admit tickets to the drain (OWL-155,
@@ -1307,7 +1325,11 @@ fn state_entries(states: Value) -> Vec<(String, String)> {
 /// as before. An app `do` would refuse fails: half of it stored, Linear
 /// refusing it or not answering, since `do` never falls back to the key.
 /// None for a Markdown project or none loaded.
-fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Check> {
+fn tracker_identity_check(
+    system: &dyn System,
+    config: &Effective,
+    accounts: Option<&TrackerAccounts>,
+) -> Option<Check> {
     const SUBJECT: &str = "tracker identity";
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
@@ -1315,21 +1337,29 @@ fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Che
     let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
         return None;
     };
+    // Unresolved, the `secrets` line says why.
+    let accounts = accounts?;
     let place = format!(
-        "in the system keychain (service `{SERVICE}`, accounts `{LINEAR_APP_ID_ACCOUNT}` and \
-         `{LINEAR_APP_SECRET_ACCOUNT}`)"
+        "in the system keychain (service `{SERVICE}`, accounts `{}` and `{}`)",
+        accounts.app_id, accounts.app_secret
     );
     let why = "With the Linear app stored, `owlshift do` writes as its app user, checked before \
                any work, and refuses rather than write through the API key.";
+    let shared = accounts.source == Source::Shared;
     let store_both = || {
         vec![Step::run_noting(
             "owlshift init --replace-secrets",
-            "give the Linear app's client ID and secret when asked",
+            if shared {
+                "give this project a Linear key of its own, then its Linear app's client ID and \
+                 secret, when asked"
+            } else {
+                "give the Linear app's client ID and secret when asked"
+            },
         )]
     };
     let fail =
         |detail: String, fix: Vec<Step>| Check::fail(Section::Project, SUBJECT, detail, why, fix);
-    Some(match system.linear_app(team) {
+    Some(match system.linear_app(accounts, team) {
         Ok(Some(user)) => Check::ok(
             Section::Project,
             SUBJECT,
@@ -1347,7 +1377,7 @@ fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Che
                  stores its client ID and secret."
             ),
         ),
-        Err(AppError::NoKey) => Check::info(
+        Err(AppError::NoKey { .. }) => Check::info(
             Section::Project,
             SUBJECT,
             "not checked: no Linear API key, which the Linear app's check needs",
@@ -1356,16 +1386,22 @@ fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Che
             format!("not checked: could not read the Linear app's credentials {place}: {reason}"),
             vec![Step::act(KEYCHAIN_FIX)],
         ),
-        Err(AppError::Incomplete { missing }) => fail(
+        Err(AppError::Incomplete { missing, .. }) => fail(
             format!(
                 "half of the Linear app is stored: nothing under service `{SERVICE}`, account \
                  `{missing}`"
             ),
             store_both(),
         ),
-        Err(AppError::Tracker(error)) => fail(
+        Err(AppError::Tracker { error, .. }) => fail(
             format!("the Linear app stored {place} cannot be used: {error}"),
             match error.kind {
+                // The shared entries may serve another project: never
+                // advise deleting them (OWL-308).
+                ErrorKind::Other if shared => vec![Step::act(
+                    "Check that Linear is reachable from this machine, then run `owlshift \
+                     doctor` again",
+                )],
                 ErrorKind::Other => vec![Step::act(
                     "Check that Linear is reachable from this machine, then run `owlshift \
                      doctor` again; or delete both of the app's keychain entries to write \
@@ -1375,6 +1411,171 @@ fn tracker_identity_check(system: &dyn System, config: &Effective) -> Option<Che
             },
         ),
     })
+}
+
+/// The project's tracker and forge secrets as doctor finds them (OWL-308):
+/// the repository that names them and what is stored, presence only.
+struct ProjectSecrets {
+    repo: Repo,
+    /// For a Linear project.
+    tracker: Option<TrackerSecrets<()>>,
+    forge: ForgeSecret<()>,
+}
+
+/// Why doctor could not tell which accounts hold the project's secrets.
+enum Unresolved {
+    /// `origin` names no GitHub repository, for this reason.
+    Origin(String),
+    /// The keychain could not be read, for this reason.
+    Keychain(String),
+}
+
+/// The secrets of the loaded project, resolved as `owlshift do` resolves
+/// them ([`secrets`]), each account's presence asked once: never a value.
+/// None when no project is loaded.
+fn project_secrets(
+    system: &dyn System,
+    config: &Effective,
+) -> Option<Result<ProjectSecrets, Unresolved>> {
+    let FileState::Loaded { path, config, .. } = &config.project else {
+        return None;
+    };
+    let root = path.parent()?;
+    let repo = match system.origin_repo(root) {
+        Ok(repo) => repo,
+        Err(reason) => return Some(Err(Unresolved::Origin(reason))),
+    };
+    let mut look = |account: &str| {
+        system
+            .secret_stored(account)
+            .map(|found| found.then_some(()))
+    };
+    let found = (|| {
+        let tracker = match config.tracker.kind {
+            TrackerKind::Linear => Some(secrets::tracker(&repo, &mut look)?),
+            TrackerKind::Markdown => None,
+        };
+        let forge = secrets::forge(&repo, &mut look)?;
+        Ok((tracker, forge))
+    })();
+    Some(match found {
+        Ok((tracker, forge)) => Ok(ProjectSecrets {
+            repo,
+            tracker,
+            forge,
+        }),
+        Err(reason) => Err(Unresolved::Keychain(reason)),
+    })
+}
+
+/// Which keychain account each tracker and forge secret of the project is
+/// read from (OWL-308). A secret read from an account every project of the
+/// machine shares is a warning: the project works, on a key or token that
+/// may be another project's. No GitHub token fails, as `owlshift do`
+/// refuses then; a missing Linear key is the `tracker states` line's.
+fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
+    const SUBJECT: &str = "secrets";
+    let found = match found {
+        Ok(found) => found,
+        Err(Unresolved::Origin(reason)) => {
+            return Check::fail(
+                Section::Project,
+                SUBJECT,
+                format!("not checked: {reason}"),
+                "Owlshift keeps a project's tracker and forge secrets under keychain accounts \
+                 named by its GitHub repository, the one `origin` names, and `owlshift do` \
+                 delivers to that repository.",
+                vec![Step::act(
+                    "Set the remote `origin` to the project's github.com repository, over SSH or \
+                     with a git credential helper",
+                )],
+            );
+        }
+        Err(Unresolved::Keychain(reason)) => {
+            return Check::fail(
+                Section::Project,
+                SUBJECT,
+                format!("not checked: could not read the system keychain: {reason}"),
+                "`owlshift do` reads the project's tracker and forge secrets in the system \
+                 keychain before each run.",
+                vec![Step::act(KEYCHAIN_FIX)],
+            );
+        }
+    };
+    let under = |account: &str, source: Source| match source {
+        Source::Project => format!("`{account}`"),
+        Source::Shared => format!("the shared `{account}`"),
+    };
+    let mut parts = Vec::new();
+    let mut shared = false;
+    if let Some(tracker) = &found.tracker {
+        let accounts = &tracker.accounts;
+        shared |= accounts.source == Source::Shared;
+        parts.push(match tracker.key {
+            Some(()) => format!(
+                "Linear API key under {}",
+                under(&accounts.key, accounts.source)
+            ),
+            None => format!("no Linear API key under `{}`", accounts.key),
+        });
+        parts.push(match (tracker.app_id, tracker.app_secret) {
+            (None, None) => "no Linear app".to_owned(),
+            (Some(()), Some(())) => format!(
+                "Linear app under {} and `{}`",
+                under(&accounts.app_id, accounts.source),
+                accounts.app_secret
+            ),
+            _ => format!(
+                "half of the Linear app under {} and `{}`",
+                under(&accounts.app_id, accounts.source),
+                accounts.app_secret
+            ),
+        });
+    }
+    let forge = &found.forge;
+    parts.push(match forge.token {
+        Some(()) => {
+            shared |= forge.account.source == Source::Shared;
+            format!(
+                "GitHub token under {}",
+                under(&forge.account.token, forge.account.source)
+            )
+        }
+        None => format!("no GitHub token under `{}`", forge.account.token),
+    });
+    let detail = format!(
+        "github.com/{} (service `{SERVICE}`): {}",
+        found.repo,
+        parts.join("; ")
+    );
+    if forge.token.is_none() {
+        return Check::fail(
+            Section::Project,
+            SUBJECT,
+            detail,
+            "`owlshift do` opens the pull request with the project's GitHub token, kept in the \
+             system keychain, and refuses to start without it.",
+            vec![Step::run_noting(
+                "owlshift init",
+                "paste the token when asked",
+            )],
+        );
+    }
+    if shared {
+        return Check::warn(
+            Section::Project,
+            SUBJECT,
+            detail,
+            format!(
+                "{DOES_NOT_BLOCK} a shared account is the one every project of this machine \
+                 used before secrets were kept per project, so another project's key or token \
+                 may serve this one. Run `owlshift init --replace-secrets` in this repository to \
+                 store its own; Owlshift keeps the shared accounts for the projects that still \
+                 read them."
+            ),
+        );
+    }
+    Check::ok(Section::Project, SUBJECT, detail)
 }
 
 /// Whether a ticket ref holds the drain's one slot (OWL-291): one between
@@ -1480,6 +1681,11 @@ mod tests {
 
     use super::*;
     use crate::system::fake::{Answer, FakeSystem};
+
+    /// The tracker accounts of the fake's repository, `pitchopp/owlshift`.
+    fn own() -> TrackerAccounts {
+        TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap())
+    }
 
     const CLAUDE_STATUS: &str = "claude auth status --json";
     const CODEX_STATUS: &str = "codex login status";
@@ -2461,9 +2667,8 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
             "Linear has no team with the key \"OWL\"",
         );
         let refused = Error::new(ErrorKind::Unauthorized, "Linear: AUTHENTICATION_ERROR: no");
-        let failures: [(FakeSystem, &[&str]); 4] = [
-            (ready().unstored(LINEAR_ACCOUNT), &["owlshift init"]),
-            (ready().keychain_fails("locked"), &[]),
+        let failures: [(FakeSystem, &[&str]); 3] = [
+            (ready().unstored(&own().key), &["owlshift init"]),
             (
                 ready().linear_states_are(Err(refused)),
                 &["owlshift init --replace-secrets"],
@@ -2521,7 +2726,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
             (
                 ready()
                     .linear_app_is(Ok("owlshiftbot"))
-                    .unstored(LINEAR_APP_SECRET_ACCOUNT),
+                    .unstored(&own().app_secret),
                 &["owlshift init --replace-secrets"],
             ),
             (
@@ -2709,7 +2914,7 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
             refused.detail.contains("not checked: Linear: AUTH"),
             "{refused:?}"
         );
-        let report = run(&ready().unstored(LINEAR_ACCOUNT), &config);
+        let report = run(&ready().unstored(&own().key), &config);
         assert_eq!(line(&report, "drain admission").status, Status::Ok);
     }
 
@@ -2903,5 +3108,112 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         }
         let report = run(&ready(), &no_config());
         assert!(report.checks.iter().all(|c| c.subject != "drain slot"));
+    }
+
+    /// OWL-308: the `secrets` line names the account each tracker and forge
+    /// secret is read from, warns when one is shared, and fails when `do`
+    /// would refuse. The tracker lines read the accounts it resolved.
+    #[test]
+    fn the_secrets_line_names_each_account() {
+        use owlshift_adapters::tracker::Error;
+
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, owl) = linear_project();
+        let secrets_line = |system: &FakeSystem| {
+            let report = run(system, &owl);
+            (line(&report, "secrets").clone(), report)
+        };
+
+        let (own_line, report) = secrets_line(&ready());
+        assert_eq!(own_line.status, Status::Ok, "{own_line:?}");
+        assert_eq!(
+            own_line.detail,
+            "github.com/pitchopp/owlshift (service `owlshift`): Linear API key under \
+             `github.com/pitchopp/owlshift/linear`; Linear app under \
+             `github.com/pitchopp/owlshift/linear-app-client-id` and \
+             `github.com/pitchopp/owlshift/linear-app-client-secret`; GitHub token under \
+             `github.com/pitchopp/owlshift/github`"
+        );
+        assert!(report.ready(), "{report}");
+        let no_app = ready().unstored(&own().app_id).unstored(&own().app_secret);
+        assert!(
+            secrets_line(&no_app).0.detail.contains("; no Linear app; "),
+            "the app's pair is reported missing"
+        );
+
+        let refused = Error::new(ErrorKind::Unauthorized, "refused");
+        let shared = ready().only_shared().linear_app_is(Err(refused));
+        let (shared_line, report) = secrets_line(&shared);
+        assert_eq!(shared_line.status, Status::Warn, "{shared_line:?}");
+        assert_eq!(
+            shared_line.detail,
+            "github.com/pitchopp/owlshift (service `owlshift`): Linear API key under the shared \
+             `linear`; Linear app under the shared `linear-app-client-id` and \
+             `linear-app-client-secret`; GitHub token under the shared `github`"
+        );
+        let why = shared_line.why.as_deref().unwrap();
+        assert!(
+            why.contains("`owlshift init --replace-secrets` in this repository"),
+            "{why}"
+        );
+        // The tracker lines read the shared accounts too, and never advise
+        // deleting them.
+        let identity = line(&report, "tracker identity");
+        assert!(
+            identity
+                .detail
+                .contains("accounts `linear-app-client-id` and `linear-app-client-secret`"),
+            "{identity:?}"
+        );
+        assert!(!format!("{identity:?}").contains("delete"), "{identity:?}");
+
+        let no_token = ready()
+            .unstored("github.com/pitchopp/owlshift/github")
+            .unstored("github");
+        let (failed, report) = secrets_line(&no_token);
+        assert_eq!(failed.status, Status::Fail, "{failed:?}");
+        assert!(
+            failed
+                .detail
+                .ends_with("no GitHub token under `github.com/pitchopp/owlshift/github`"),
+            "{failed:?}"
+        );
+        assert_eq!(commands(&failed.fix), ["owlshift init"]);
+        assert!(!report.ready());
+
+        // What keeps doctor from naming the accounts fails here alone: the
+        // tracker lines are left out.
+        for (system, fix) in [
+            (ready().keychain_fails("locked"), &[] as &[&str]),
+            (
+                ready().origin_is(Err("the repository has no remote `origin`")),
+                &[],
+            ),
+        ] {
+            let (failed, report) = secrets_line(&system);
+            assert_eq!(failed.status, Status::Fail, "{failed:?}");
+            assert!(failed.detail.starts_with("not checked: "), "{failed:?}");
+            assert_eq!(commands(&failed.fix), fix, "{failed:?}");
+            assert!(
+                !report
+                    .checks
+                    .iter()
+                    .any(|check| check.subject.starts_with("tracker ")),
+                "{report}"
+            );
+        }
+    }
+
+    /// A Markdown project has the GitHub token alone.
+    #[test]
+    fn a_markdown_projects_secrets_are_its_github_token() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, markdown) = markdown_project();
+        let report = run(&ready(), &markdown);
+        assert_eq!(
+            line(&report, "secrets").detail,
+            "github.com/pitchopp/owlshift (service `owlshift`): GitHub token under \
+             `github.com/pitchopp/owlshift/github`"
+        );
     }
 }

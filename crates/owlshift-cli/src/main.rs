@@ -41,7 +41,7 @@ enum Command {
     /// Read the configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
-    /// Write a commented owlshift.toml for this repository, then store the
+    /// Write a commented owlshift.toml for this repository, then store its
     /// tracker and forge secrets and the agent runs' Claude Code token
     /// `owlshift do` needs in the system keychain.
     Init(init_cmd::Args),
