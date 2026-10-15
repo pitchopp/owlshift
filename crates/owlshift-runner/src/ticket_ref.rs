@@ -185,13 +185,33 @@ fn read_listed(
         return Err(broken(format!("points to a {}, not a commit", listed.kind)));
     }
     let entries = tree_entries(git, checkout, &listed.oid).map_err(ReadError::Git)?;
-    let state = PersistedState::parse(&read_file(git, checkout, name, &entries, STATE_FILE)?)
+    let has = |file: &str| entries.iter().any(|entry| entry.name == file);
+    let optional: Vec<&str> = [DELIVERY_FILE, INTAKE_FILE, PROPOSALS_FILE]
+        .into_iter()
+        .filter(|file| has(file))
+        .collect();
+    let wanted: Vec<&str> = [STATE_FILE, QUESTIONS_FILE]
+        .into_iter()
+        .chain(optional)
+        .collect();
+    // The files are shown in one call, then judged in this order: the first
+    // that is refused or does not parse is the error, as with one call each.
+    let mut texts = read_files(git, checkout, &entries, &wanted, false)
+        .map_err(ReadError::Git)?
+        .into_iter();
+    let mut next = |file: &str| match texts.next() {
+        Some(Ok(text)) => Ok(text),
+        Some(Err(why)) => Err(broken(why)),
+        None => Err(broken(format!("has no {file}"))),
+    };
+    let text = next(STATE_FILE)?;
+    let state = PersistedState::parse(&text)
         .map_err(|e| broken(format!("holds an invalid {STATE_FILE}: {e}")))?;
-    let questions =
-        TicketQuestions::parse(&read_file(git, checkout, name, &entries, QUESTIONS_FILE)?)
-            .map_err(|e| broken(format!("holds an invalid {QUESTIONS_FILE}: {e}")))?;
-    let delivery = if entries.iter().any(|entry| entry.name == DELIVERY_FILE) {
-        let text = read_file(git, checkout, name, &entries, DELIVERY_FILE)?;
+    let text = next(QUESTIONS_FILE)?;
+    let questions = TicketQuestions::parse(&text)
+        .map_err(|e| broken(format!("holds an invalid {QUESTIONS_FILE}: {e}")))?;
+    let delivery = if has(DELIVERY_FILE) {
+        let text = next(DELIVERY_FILE)?;
         Some(
             TicketDelivery::parse(&text)
                 .map_err(|e| broken(format!("holds an invalid {DELIVERY_FILE}: {e}")))?,
@@ -199,8 +219,8 @@ fn read_listed(
     } else {
         None
     };
-    let intake = if entries.iter().any(|entry| entry.name == INTAKE_FILE) {
-        let text = read_file(git, checkout, name, &entries, INTAKE_FILE)?;
+    let intake = if has(INTAKE_FILE) {
+        let text = next(INTAKE_FILE)?;
         Some(
             TicketIntake::parse(&text)
                 .map_err(|e| broken(format!("holds an invalid {INTAKE_FILE}: {e}")))?,
@@ -208,8 +228,8 @@ fn read_listed(
     } else {
         None
     };
-    let proposals = if entries.iter().any(|entry| entry.name == PROPOSALS_FILE) {
-        let text = read_file(git, checkout, name, &entries, PROPOSALS_FILE)?;
+    let proposals = if has(PROPOSALS_FILE) {
+        let text = next(PROPOSALS_FILE)?;
         Some(
             TicketProposals::parse(&text)
                 .map_err(|e| broken(format!("holds an invalid {PROPOSALS_FILE}: {e}")))?,
@@ -230,33 +250,113 @@ fn read_listed(
     })
 }
 
-/// The text of `file` among `entries`: a regular blob of at most
-/// [`MAX_FILE`] bytes, in UTF-8.
-fn read_file(
+/// The text of each of `files` among `entries`, in order: a regular blob of
+/// at most [`MAX_FILE`] bytes, in UTF-8, or why the ref is broken for that
+/// file. The blobs that pass those checks are read by one `git cat-file
+/// --batch`; none when no file passes. Unless `past_invalid`, the files after
+/// the first that is refused are not read: [`read_listed`] stops there, and a
+/// git failure on a later blob must not come before that refusal.
+fn read_files(
     git: &Git,
     checkout: &Path,
-    name: &str,
     entries: &[Entry],
-    file: &str,
-) -> Result<String, ReadError> {
-    let broken = |why: String| ReadError::Invalid(format!("the ticket ref {name} {why}"));
-    let entry = entries
+    files: &[&str],
+    past_invalid: bool,
+) -> Result<Vec<Result<String, String>>, String> {
+    let checked: Vec<Result<&str, String>> = files
         .iter()
-        .find(|entry| entry.name == file)
-        .ok_or_else(|| broken(format!("has no {file}")))?;
-    if entry.mode != "100644" || entry.kind != "blob" {
-        return Err(broken(format!(
-            "holds {file} as {} {}, not a regular file",
-            entry.mode, entry.kind
-        )));
+        .map(|&file| {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.name == file)
+                .ok_or_else(|| format!("has no {file}"))?;
+            if entry.mode != "100644" || entry.kind != "blob" {
+                return Err(format!(
+                    "holds {file} as {} {}, not a regular file",
+                    entry.mode, entry.kind
+                ));
+            }
+            if entry.size.is_none_or(|size| size > MAX_FILE) {
+                return Err(format!("holds {file} past {MAX_FILE} bytes"));
+            }
+            Ok(entry.oid.as_str())
+        })
+        .collect();
+    let stop = if past_invalid {
+        checked.len()
+    } else {
+        checked
+            .iter()
+            .position(Result::is_err)
+            .unwrap_or(checked.len())
+    };
+    let oids: Vec<&str> = checked[..stop]
+        .iter()
+        .filter_map(|checked| checked.as_ref().ok().copied())
+        .collect();
+    let mut blobs = if oids.is_empty() {
+        Vec::new().into_iter()
+    } else {
+        let input: String = oids.iter().map(|oid| format!("{oid}\n")).collect();
+        let out = git
+            .run_with_input(checkout, &["cat-file", "--batch"], input.as_bytes())
+            .map_err(|e| e.to_string())?;
+        parse_batch(&out, &oids)
+            .map_err(|e| format!("git cat-file --batch: {e}"))?
+            .into_iter()
+    };
+    Ok(checked
+        .into_iter()
+        .zip(files)
+        .take(if past_invalid { files.len() } else { stop + 1 })
+        .map(|(checked, file)| {
+            checked.and_then(|_| {
+                let bytes = blobs.next().expect("one blob per checked file");
+                String::from_utf8(bytes).map_err(|_| format!("holds {file} not in UTF-8"))
+            })
+        })
+        .collect())
+}
+
+/// The contents `git cat-file --batch` printed for `oids`, one per id, in
+/// order. Each answer is `<oid> <type> <size>\n`, the content and a `\n`, or
+/// `<oid> missing\n` (checked 2026-10-15, git 2.43.0, which also answers
+/// `<name> missing` for a name that is no object and exits 0): a missing
+/// object, or any other type than a blob, is an error here, as a failing
+/// `cat-file blob` is. A blob may hold newlines; its size says where it ends.
+fn parse_batch(out: &[u8], oids: &[&str]) -> Result<Vec<Vec<u8>>, String> {
+    let mut rest = out;
+    let mut blobs = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let end = rest
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .ok_or_else(|| format!("no answer for {oid}"))?;
+        let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+        rest = &rest[end + 1..];
+        let mut fields = header.split(' ');
+        let (Some(answered), Some(kind), size, None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(format!("unexpected answer {header:?} for {oid}"));
+        };
+        if answered != *oid {
+            return Err(format!("answered {answered} where {oid} was asked"));
+        }
+        if kind == "missing" && size.is_none() {
+            return Err(format!("{oid} is missing"));
+        }
+        let size = size.and_then(|size| size.parse::<usize>().ok());
+        let (true, Some(size)) = (kind == "blob", size) else {
+            return Err(format!("unexpected answer {header:?} for {oid}"));
+        };
+        if rest.len() <= size || rest[size] != b'\n' {
+            return Err(format!("the content of {oid} is cut short"));
+        }
+        blobs.push(rest[..size].to_vec());
+        rest = &rest[size + 1..];
     }
-    if entry.size.is_none_or(|size| size > MAX_FILE) {
-        return Err(broken(format!("holds {file} past {MAX_FILE} bytes")));
-    }
-    let bytes = git
-        .run(checkout, &["cat-file", "blob", &entry.oid])
-        .map_err(|e| ReadError::Git(e.to_string()))?;
-    String::from_utf8(bytes).map_err(|_| broken(format!("holds {file} not in UTF-8")))
+    Ok(blobs)
 }
 
 /// The tickets that have a ticket ref in `checkout`, in the order git lists
@@ -480,7 +580,7 @@ pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Fo
         }
         Err(ReadError::Invalid(why)) => (
             Previous::Unreadable(why),
-            salvage(git, checkout, &name, &listed.oid)?,
+            salvage(git, checkout, &listed.oid)?,
         ),
     };
     let (kept, proposals) = kept;
@@ -523,21 +623,29 @@ fn kept(round: u32, questions: Option<&TicketQuestions>) -> Result<TicketRecord,
 fn salvage(
     git: &Git,
     checkout: &Path,
-    name: &str,
     commit: &str,
 ) -> Result<(TicketRecord, ProposalsFile<'static>), String> {
     let entries = tree_entries(git, checkout, commit)?;
-    let text = |file: &str| match read_file(git, checkout, name, &entries, file) {
-        Ok(text) => Ok(Some(text)),
-        Err(ReadError::Invalid(_)) => Ok(None),
-        Err(ReadError::Git(error)) => Err(error),
+    let has = |file: &str| entries.iter().any(|entry| entry.name == file);
+    let wanted: Vec<&str> = [STATE_FILE, QUESTIONS_FILE, PROPOSALS_FILE]
+        .into_iter()
+        .filter(|file| has(file) || *file != PROPOSALS_FILE)
+        .collect();
+    // Each file stands alone: one that is refused only loses its own part.
+    let mut texts = read_files(git, checkout, &entries, &wanted, true)?;
+    let proposals_text = if has(PROPOSALS_FILE) {
+        texts.pop()
+    } else {
+        None
     };
-    let round = text(STATE_FILE)?
+    let questions_text = texts.pop().and_then(Result::ok);
+    let state_text = texts.pop().and_then(Result::ok);
+    let round = state_text
         .and_then(|text| PersistedState::parse(&text).ok())
         .map_or(0, |state| state.round);
-    let questions = text(QUESTIONS_FILE)?.and_then(|text| TicketQuestions::parse(&text).ok());
-    let proposals = if !entries.iter().any(|entry| entry.name == PROPOSALS_FILE)
-        || text(PROPOSALS_FILE)?.is_some_and(|text| TicketProposals::parse(&text).is_ok())
+    let questions = questions_text.and_then(|text| TicketQuestions::parse(&text).ok());
+    let proposals = if proposals_text
+        .is_none_or(|text| text.is_ok_and(|text| TicketProposals::parse(&text).is_ok()))
     {
         ProposalsFile::Keep
     } else {
@@ -637,4 +745,47 @@ fn with_input(git: &Git, checkout: &Path, args: &[&str], input: &[u8]) -> Result
 
 fn text(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_batch;
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn several_blobs_come_out_whole_whatever_they_hold() {
+        // As printed by git 2.43.0 (2026-10-15): a blob with newlines, an
+        // empty one, and the same id asked twice.
+        let out = format!("{A} blob 5\na\nb\n\n\n{B} blob 0\n\n{A} blob 5\na\nb\n\n\n");
+        let blobs = parse_batch(out.as_bytes(), &[A, B, A]).unwrap();
+        assert_eq!(
+            blobs,
+            [b"a\nb\n\n".to_vec(), Vec::new(), b"a\nb\n\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_missing_object_is_an_error() {
+        let out = format!("{A} blob 1\nx\n{B} missing\n");
+        assert_eq!(
+            parse_batch(out.as_bytes(), &[A, B]),
+            Err(format!("{B} is missing"))
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_whole_blob_is_an_error() {
+        for out in [
+            String::new(),
+            format!("{A} tree 3\nabc\n"),
+            format!("{B} blob 1\nx\n"),
+            format!("{A} blob 4\nx\n"),
+            format!("{A} blob 1\nxy\n"),
+            format!("{A} blob\n"),
+        ] {
+            assert!(parse_batch(out.as_bytes(), &[A]).is_err(), "{out:?}");
+        }
+    }
 }
