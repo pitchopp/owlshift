@@ -113,30 +113,72 @@ fn a_run_fails_exactly_when_its_stream_ends_in_turn_failed_or_is_empty() {
     }
 }
 
+/// The values left where request ids, Cloudflare ray ids, timestamps and
+/// home folders were.
+const PLACEHOLDER_REQUEST: &str = "req_00000000000000000000000000000000";
+const PLACEHOLDER_RAY: &str = "0000000000000000-XXX";
+const PLACEHOLDER_TIMESTAMP: &str = "2026-10-15T12:00:00";
+const PLACEHOLDER_HOME: &str = "user";
+
 /// What was scrubbed stays scrubbed: no local path naming a user or the
-/// recording machine's folders, no e-mail address, no token shape, no id
-/// but the placeholder.
+/// recording machine's folders, no e-mail address, no token shape, and no
+/// thread id, request id, ray id, timestamp or home folder but its
+/// placeholder.
 #[test]
 fn the_recordings_carry_nothing_personal() {
     for name in FIXTURES {
         for file in [format!("{name}.jsonl"), format!("{name}.meta.json")] {
             let text = read(&file);
-            for needle in [
-                "/Users/",
-                "/private/",
-                "claude-501",
-                "/home/owl",
-                "eyJ",
-                "sk-",
-            ] {
+            for needle in ["/Users/", "/private/", "claude-501", "eyJ", "sk-"] {
                 assert!(!text.contains(needle), "{file} contains {needle:?}");
             }
             assert!(!has_email(&text), "{file} contains an e-mail address");
             for id in uuids(&text) {
                 assert_eq!(id, PLACEHOLDER_UUID, "{file}");
             }
+            for id in following(&text, "req_", |c| c.is_ascii_alphanumeric()) {
+                assert_eq!(format!("req_{id}"), PLACEHOLDER_REQUEST, "{file}");
+            }
+            for ray in following(&text, "cf-ray: ", |c| c.is_ascii_alphanumeric() || c == '-') {
+                assert_eq!(ray, PLACEHOLDER_RAY, "{file}");
+            }
+            for stamp in timestamps(&text) {
+                assert_eq!(stamp, PLACEHOLDER_TIMESTAMP, "{file}");
+            }
+            for user in following(&text, "/home/", |c| c != '/' && c != '"' && c != ' ') {
+                assert_eq!(user, PLACEHOLDER_HOME, "{file}");
+            }
         }
     }
+}
+
+/// What follows each occurrence of `prefix`, as long as `keep` holds.
+fn following<'a>(text: &'a str, prefix: &str, keep: impl Fn(char) -> bool) -> Vec<&'a str> {
+    text.match_indices(prefix)
+        .map(|(i, _)| {
+            let rest = &text[i + prefix.len()..];
+            let end = rest.find(|c: char| !keep(c)).unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .collect()
+}
+
+/// Every substring shaped like an ISO 8601 date and time to the second:
+/// `YYYY-MM-DDTHH:MM:SS`.
+fn timestamps(text: &str) -> Vec<&str> {
+    let shape = |s: &str| {
+        s.char_indices().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            10 => c == 'T',
+            13 | 16 => c == ':',
+            _ => c.is_ascii_digit(),
+        })
+    };
+    (0..text.len().saturating_sub(18))
+        .filter(|&i| text.is_char_boundary(i) && text.is_char_boundary(i + 19))
+        .map(|i| &text[i..i + 19])
+        .filter(|s| shape(s))
+        .collect()
 }
 
 fn has_email(text: &str) -> bool {
@@ -177,4 +219,21 @@ fn the_scrub_checks_catch_what_they_look_for() {
         ["01a13f6e-17c3-7ed0-90ab-9d2a59c4f4c6"]
     );
     assert!(uuids("no id here").is_empty());
+    assert_eq!(
+        following(
+            "request id: req_a7c3ddf654a8444fa4d251ed67f7a475, x",
+            "req_",
+            |c| c.is_ascii_alphanumeric()
+        ),
+        ["a7c3ddf654a8444fa4d251ed67f7a475"]
+    );
+    assert_eq!(
+        timestamps("at 2026-10-15T11:31:45.447598Z ERROR"),
+        ["2026-10-15T11:31:45"]
+    );
+    assert_eq!(
+        following("/home/owl/lab and /home/user", "/home/", |c| c != '/'
+            && c != ' '),
+        ["owl", "user"]
+    );
 }
