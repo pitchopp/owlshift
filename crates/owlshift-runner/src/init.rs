@@ -9,6 +9,9 @@
 //! writes as, OWL-157), the forge's (a GitHub token) and the token agent runs
 //! log in to Claude Code with (OWL-94). The command line asks for them on a terminal
 //! only; this module decides which are missing and stores what it is given.
+//! The tracker's and the forge's are the project's, under accounts named by
+//! its GitHub repository; the Claude Code token is one per machine (OWL-308,
+//! [`crate::secrets`]).
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -17,12 +20,14 @@ use std::path::Path;
 
 use semver::Version;
 
+use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::forge::{GITHUB_ACCOUNT, GITHUB_TOKEN_HELP};
+use crate::secrets::{self, Source, TrackerAccounts};
 use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 
 /// The values of a new project file.
@@ -170,27 +175,22 @@ pub fn write_project_file(root: &Path, text: &str) -> io::Result<Written> {
 /// A secret `owlshift do` reads from the keychain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecretSpec {
-    /// The keychain account, under service [`SERVICE`].
+    /// The keychain account, under service [`SERVICE`], of a secret kept one
+    /// per machine; for a project's secret, the shared account its own
+    /// account's name ends with ([`secrets::project_account`]).
     pub account: &'static str,
+    /// Whether each project keeps its own (OWL-308).
+    pub per_project: bool,
     /// What to call it when asking for it.
     pub label: &'static str,
     /// Where it comes from and what it must allow.
     pub help: &'static str,
 }
 
-impl fmt::Display for SecretSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} (keychain service `{SERVICE}`, account `{}`)",
-            self.label, self.account
-        )
-    }
-}
-
 /// The Linear API key.
 pub const LINEAR_KEY: SecretSpec = SecretSpec {
     account: LINEAR_ACCOUNT,
+    per_project: true,
     label: "Linear API key",
     help: "a personal API key, created in Linear's settings under Security & access",
 };
@@ -198,14 +198,17 @@ pub const LINEAR_KEY: SecretSpec = SecretSpec {
 /// The GitHub token.
 pub const GITHUB_TOKEN: SecretSpec = SecretSpec {
     account: GITHUB_ACCOUNT,
+    per_project: true,
     label: "GitHub token",
     help: GITHUB_TOKEN_HELP,
 };
 
 /// The Claude Code token agent runs log in with (OWL-94): confined, they
-/// cannot reach the Keychain, where the operator's own login lives.
+/// cannot reach the Keychain, where the operator's own login lives. One
+/// per machine: a model login, not a project's secret.
 pub const CLAUDE_TOKEN: SecretSpec = SecretSpec {
     account: CLAUDE_AGENT_ACCOUNT,
+    per_project: false,
     label: "Claude Code token for agent runs",
     help: "a long-lived token of your Claude subscription, which agent runs log in with: run \
            `claude setup-token` and paste the token it prints",
@@ -216,6 +219,7 @@ pub const CLAUDE_TOKEN: SecretSpec = SecretSpec {
 /// [`store_app_credentials`].
 pub const LINEAR_APP_ID: SecretSpec = SecretSpec {
     account: LINEAR_APP_ID_ACCOUNT,
+    per_project: true,
     label: "Linear app client ID",
     help: "optional: the client ID of the OAuth application a workspace admin creates in \
            Linear's API settings, with client credentials on, so that Owlshift comments as its \
@@ -226,6 +230,7 @@ pub const LINEAR_APP_ID: SecretSpec = SecretSpec {
 /// That app's client secret.
 pub const LINEAR_APP_SECRET: SecretSpec = SecretSpec {
     account: LINEAR_APP_SECRET_ACCOUNT,
+    per_project: true,
     label: "Linear app client secret",
     help: "the client secret of that OAuth application",
 };
@@ -240,50 +245,144 @@ pub fn required_secrets(tracker: TrackerKind) -> Vec<SecretSpec> {
     }
 }
 
+/// A secret `init` makes sure of, with the account it is stored under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wanted {
+    pub spec: SecretSpec,
+    /// Where `init` stores it: the project's own account, or the machine's.
+    pub account: String,
+    /// The shared account the project reads it from today, having none of
+    /// its own: an empty answer keeps using it.
+    pub shared: Option<String>,
+}
+
+impl Wanted {
+    /// `spec`, under the project's own account when it is a project's.
+    pub fn new(spec: SecretSpec, repo: &Repo) -> Self {
+        let account = if spec.per_project {
+            secrets::project_account(repo, spec.account)
+        } else {
+            spec.account.to_owned()
+        };
+        Self {
+            spec,
+            account,
+            shared: None,
+        }
+    }
+}
+
+impl fmt::Display for Wanted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (keychain service `{SERVICE}`, account `{}`)",
+            self.spec.label, self.account
+        )
+    }
+}
+
+/// What `init` makes sure of for `specs` in the project of `repo`, each
+/// under the account it is stored under, with the shared account a project
+/// secret is read from today when the project has none of its own, resolved
+/// as `owlshift do` resolves it ([`secrets`]). Without a repository, the
+/// project's secrets cannot be named: they come back apart, and only the
+/// machine's are wanted.
+pub fn wanted_secrets(
+    keychain: &Keychain,
+    specs: &[SecretSpec],
+    repo: Option<&Repo>,
+) -> Result<(Vec<Wanted>, Vec<SecretSpec>), String> {
+    let mut wanted = Vec::new();
+    let mut unnamed = Vec::new();
+    for spec in specs {
+        if !spec.per_project {
+            wanted.push(Wanted {
+                spec: *spec,
+                account: spec.account.to_owned(),
+                shared: None,
+            });
+            continue;
+        }
+        let Some(repo) = repo else {
+            unnamed.push(*spec);
+            continue;
+        };
+        let mut look = |account: &str| {
+            keychain
+                .contains(account)
+                .map(|found| found.then_some(()))
+                .map_err(|error| error.to_string())
+        };
+        let shared = if spec.account == LINEAR_ACCOUNT {
+            let found = secrets::tracker(repo, &mut look)?;
+            (found.accounts.source == Source::Shared && found.key.is_some())
+                .then_some(found.accounts.key)
+        } else if spec.account == GITHUB_ACCOUNT {
+            let found = secrets::forge(repo, &mut look)?;
+            (found.account.source == Source::Shared && found.token.is_some())
+                .then_some(found.account.token)
+        } else {
+            None
+        };
+        wanted.push(Wanted {
+            shared,
+            ..Wanted::new(*spec, repo)
+        });
+    }
+    Ok((wanted, unnamed))
+}
+
 /// What [`store_secrets`] did with each secret.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecretsReport {
     /// Given and stored.
-    pub stored: Vec<SecretSpec>,
+    pub stored: Vec<Wanted>,
     /// Already in the keychain, and left there.
-    pub kept: Vec<SecretSpec>,
+    pub kept: Vec<Wanted>,
+    /// Not given, the project reading the shared account it names in
+    /// [`Wanted::shared`]: nothing written, and that account still read.
+    pub kept_shared: Vec<Wanted>,
     /// Neither in the keychain nor given.
-    pub missing: Vec<SecretSpec>,
+    pub missing: Vec<Wanted>,
     /// Given, but not one word: holding a space or a control character, as
     /// a secret pasted wrong does. Not stored; one already there is kept.
-    pub refused: Vec<SecretSpec>,
+    pub refused: Vec<Wanted>,
 }
 
-/// Makes sure each of `specs` is in `keychain`. One already there is kept,
-/// unless `replace`; for any other, `ask` is called and what it gives is
-/// stored, trimmed, when it is one word ([`Secret::is_one_word`]), and
-/// refused otherwise. `ask` answers `None` when it cannot ask, or was given
-/// nothing: the secret is then kept when it exists, missing otherwise. A
-/// secret is never part of the report or of an error.
+/// Makes sure each of `wanted` is in `keychain`, under its account. One
+/// already there is kept, unless `replace`; for any other, `ask` is called
+/// and what it gives is stored, trimmed, when it is one word
+/// ([`Secret::is_one_word`]), and refused otherwise. `ask` answers `None`
+/// when it cannot ask, or was given nothing: the secret is then kept when
+/// it exists, kept in its shared account when the project reads one,
+/// missing otherwise. A shared account is never written. A secret is never
+/// part of the report or of an error.
 pub fn store_secrets(
     keychain: &Keychain,
-    specs: &[SecretSpec],
+    wanted: &[Wanted],
     replace: bool,
-    ask: &mut dyn FnMut(&SecretSpec) -> Option<Secret>,
+    ask: &mut dyn FnMut(&Wanted) -> Option<Secret>,
 ) -> Result<SecretsReport, KeychainError> {
     let mut report = SecretsReport::default();
-    for spec in specs {
-        let present = keychain.read(spec.account)?.is_some();
+    for one in wanted {
+        let present = keychain.contains(&one.account)?;
         if present && !replace {
-            report.kept.push(*spec);
+            report.kept.push(one.clone());
             continue;
         }
-        let given = ask(spec)
+        let given = ask(one)
             .map(|secret| Secret::new(secret.expose().trim()))
             .filter(|secret| !secret.expose().is_empty());
         match given {
-            Some(secret) if !secret.is_one_word() => report.refused.push(*spec),
+            Some(secret) if !secret.is_one_word() => report.refused.push(one.clone()),
             Some(secret) => {
-                keychain.store(spec.account, &secret)?;
-                report.stored.push(*spec);
+                keychain.store(&one.account, &secret)?;
+                report.stored.push(one.clone());
             }
-            None if present => report.kept.push(*spec),
-            None => report.missing.push(*spec),
+            None if present => report.kept.push(one.clone()),
+            None if one.shared.is_some() => report.kept_shared.push(one.clone()),
+            None => report.missing.push(one.clone()),
         }
     }
     Ok(report)
@@ -305,13 +404,13 @@ pub enum AppStored {
     Refused,
 }
 
-/// Stores the Linear app's client ID and secret together or not at all
-/// (OWL-157). A stored pair is kept unless `replace`. Otherwise `ask` gives
-/// the client ID, then, when one was given, the secret; both, each one word,
-/// are stored, and anything less stores nothing, keeping what the keychain
-/// holds. Whether it then holds a usable pair is
-/// [`crate::tracker::app_credentials`]'s to say. Neither value is ever part
-/// of the answer or of an error.
+/// Stores the Linear app's client ID and secret under `accounts`, the
+/// project's own, together or not at all (OWL-157). A stored pair is kept
+/// unless `replace`. Otherwise `ask` gives the client ID, then, when one
+/// was given, the secret; both, each one word, are stored, and anything less
+/// stores nothing, keeping what the keychain holds. Whether it then holds a
+/// usable pair is [`crate::tracker::app_credentials`]'s to say. Neither
+/// value is ever part of the answer or of an error.
 ///
 /// The client ID is written first: when writing the secret then fails, the
 /// client ID the keychain held before is put back, or the new one removed
@@ -320,33 +419,39 @@ pub enum AppStored {
 /// again.
 pub fn store_app_credentials(
     keychain: &Keychain,
+    accounts: &TrackerAccounts,
     replace: bool,
-    ask: &mut dyn FnMut(&SecretSpec) -> Option<Secret>,
+    ask: &mut dyn FnMut(&Wanted) -> Option<Secret>,
 ) -> Result<AppStored, String> {
-    let contains = |account| keychain.contains(account).map_err(|e| e.to_string());
-    let paired = contains(LINEAR_APP_ID.account)? && contains(LINEAR_APP_SECRET.account)?;
+    let contains = |account: &str| keychain.contains(account).map_err(|e| e.to_string());
+    let paired = contains(&accounts.app_id)? && contains(&accounts.app_secret)?;
     if paired && !replace {
         return Ok(AppStored::Kept);
     }
-    let mut given = |spec: &SecretSpec| {
-        ask(spec)
+    let wanted = |spec: SecretSpec, account: &str| Wanted {
+        spec,
+        account: account.to_owned(),
+        shared: None,
+    };
+    let mut given = |one: Wanted| {
+        ask(&one)
             .map(|secret| Secret::new(secret.expose().trim()))
             .filter(|secret| !secret.expose().is_empty())
     };
-    let Some(id) = given(&LINEAR_APP_ID) else {
+    let Some(id) = given(wanted(LINEAR_APP_ID, &accounts.app_id)) else {
         return Ok(if paired {
             AppStored::Kept
         } else {
             AppStored::Skipped
         });
     };
-    let Some(secret) = given(&LINEAR_APP_SECRET) else {
+    let Some(secret) = given(wanted(LINEAR_APP_SECRET, &accounts.app_secret)) else {
         return Ok(AppStored::Incomplete);
     };
     if !(id.is_one_word() && secret.is_one_word()) {
         return Ok(AppStored::Refused);
     }
-    store_pair(keychain, &id, &secret)?;
+    store_pair(keychain, accounts, &id, &secret)?;
     Ok(AppStored::Stored)
 }
 
@@ -374,10 +479,16 @@ impl Entries for Keychain {
     }
 }
 
-/// Writes the client ID, then the secret; when the secret's write fails,
-/// puts back the client ID found before, or removes the new one.
-fn store_pair(keychain: &dyn Entries, id: &Secret, secret: &Secret) -> Result<(), String> {
-    let (id_account, secret_account) = (LINEAR_APP_ID.account, LINEAR_APP_SECRET.account);
+/// Writes the client ID, then the secret, under `accounts`; when the
+/// secret's write fails, puts back the client ID found before, or removes
+/// the new one.
+fn store_pair(
+    keychain: &dyn Entries,
+    accounts: &TrackerAccounts,
+    id: &Secret,
+    secret: &Secret,
+) -> Result<(), String> {
+    let (id_account, secret_account) = (&accounts.app_id, &accounts.app_secret);
     let before = keychain.read(id_account)?;
     keychain.store(id_account, id)?;
     let Err(stored) = keychain.store(secret_account, secret) else {
@@ -451,33 +562,43 @@ mod tests {
         assert_eq!(text, "a = 1\n");
     }
 
+    fn repo() -> Repo {
+        Repo::parse("pitchopp/owlshift").unwrap()
+    }
+
+    fn wanted(keychain: &Keychain, specs: &[SecretSpec]) -> Vec<Wanted> {
+        wanted_secrets(keychain, specs, Some(&repo())).unwrap().0
+    }
+
+    fn specs(wanted: &[Wanted]) -> Vec<SecretSpec> {
+        wanted.iter().map(|one| one.spec).collect()
+    }
+
     #[test]
     fn secrets_are_asked_only_when_missing_and_never_reported() {
         const SENTINEL: &str = "lin_api_SENTINEL_never_shown";
         let keychain = Keychain::in_memory();
+        let own = TrackerAccounts::project(&repo());
+        let token = secrets::ForgeAccount::project(&repo()).token;
         keychain
-            .store(GITHUB_ACCOUNT, &Secret::new("ghp_SENTINEL_never_shown"))
+            .store(&token, &Secret::new("ghp_SENTINEL_never_shown"))
             .unwrap();
         let mut asked = Vec::new();
-        let report = store_secrets(
-            &keychain,
-            &required_secrets(TrackerKind::Linear),
-            false,
-            &mut |spec| {
-                asked.push(spec.account);
-                Some(Secret::new(format!("  {SENTINEL}\n")))
-            },
-        )
+        let all = wanted(&keychain, &required_secrets(TrackerKind::Linear));
+        let report = store_secrets(&keychain, &all, false, &mut |one| {
+            asked.push(one.account.clone());
+            Some(Secret::new(format!("  {SENTINEL}\n")))
+        })
         .unwrap();
-        assert_eq!(asked, [LINEAR_ACCOUNT, CLAUDE_AGENT_ACCOUNT]);
-        assert_eq!(report.stored, [LINEAR_KEY, CLAUDE_TOKEN]);
-        assert_eq!(report.kept, [GITHUB_TOKEN]);
+        // The project's secrets under its own accounts, the Claude Code
+        // token under the machine's.
+        assert_eq!(asked, [own.key.as_str(), CLAUDE_AGENT_ACCOUNT]);
+        assert_eq!(specs(&report.stored), [LINEAR_KEY, CLAUDE_TOKEN]);
+        assert_eq!(specs(&report.kept), [GITHUB_TOKEN]);
         assert!(report.missing.is_empty());
         // Stored trimmed, and absent from everything a person is shown.
-        assert_eq!(
-            keychain.read(LINEAR_ACCOUNT).unwrap().unwrap().expose(),
-            SENTINEL
-        );
+        assert_eq!(keychain.read(&own.key).unwrap().unwrap().expose(), SENTINEL);
+        assert_eq!(keychain.read(LINEAR_ACCOUNT).unwrap(), None);
         assert_eq!(
             keychain
                 .read(CLAUDE_AGENT_ACCOUNT)
@@ -486,8 +607,18 @@ mod tests {
                 .expose(),
             SENTINEL
         );
-        let shown = format!("{report:?} {LINEAR_KEY} {GITHUB_TOKEN} {CLAUDE_TOKEN}");
+        let shown = format!(
+            "{report:?} {}",
+            all.iter().map(ToString::to_string).collect::<String>()
+        );
         assert!(!shown.contains("SENTINEL"), "{shown}");
+        assert!(
+            shown.contains(
+                "Linear API key (keychain service `owlshift`, account \
+                 `github.com/pitchopp/owlshift/linear`)"
+            ),
+            "{shown}"
+        );
         assert!(CLAUDE_TOKEN.help.contains("`claude setup-token`"));
         assert_eq!(
             required_secrets(TrackerKind::Markdown),
@@ -496,22 +627,22 @@ mod tests {
 
         // Replacing asks again; an empty answer keeps what is there, and a
         // secret nobody gives is missing.
-        let report = store_secrets(&keychain, &[LINEAR_KEY], true, &mut |_| {
-            Some(Secret::new(""))
-        })
-        .unwrap();
-        assert_eq!(report.kept, [LINEAR_KEY]);
-        keychain.delete(GITHUB_ACCOUNT).unwrap();
-        let report = store_secrets(&keychain, &[GITHUB_TOKEN], false, &mut |_| None).unwrap();
-        assert_eq!(report.missing, [GITHUB_TOKEN]);
+        let key = wanted(&keychain, &[LINEAR_KEY]);
+        let report = store_secrets(&keychain, &key, true, &mut |_| Some(Secret::new(""))).unwrap();
+        assert_eq!(specs(&report.kept), [LINEAR_KEY]);
+        keychain.delete(&token).unwrap();
+        let github = wanted(&keychain, &[GITHUB_TOKEN]);
+        let report = store_secrets(&keychain, &github, false, &mut |_| None).unwrap();
+        assert_eq!(specs(&report.missing), [GITHUB_TOKEN]);
 
         // A secret pasted across two lines is refused, and the one stored
         // is kept.
-        let report = store_secrets(&keychain, &[CLAUDE_TOKEN], true, &mut |_| {
+        let claude = wanted(&keychain, &[CLAUDE_TOKEN]);
+        let report = store_secrets(&keychain, &claude, true, &mut |_| {
             Some(Secret::new("sk-ant-oat01-SENTINEL\nrest"))
         })
         .unwrap();
-        assert_eq!(report.refused, [CLAUDE_TOKEN]);
+        assert_eq!(specs(&report.refused), [CLAUDE_TOKEN]);
         assert!(report.stored.is_empty());
         assert_eq!(
             keychain
@@ -523,51 +654,103 @@ mod tests {
         );
     }
 
-    /// The Linear app's pair is stored whole or not at all: a client ID
-    /// alone, or one pasted across lines, stores nothing; no answer skips
-    /// the app; a stored pair is kept unless replaced.
+    /// A project reading a shared secret is asked for its own; an empty
+    /// answer keeps reading the shared one, and a shared account is never
+    /// written, even when replacing.
+    #[test]
+    fn a_shared_secret_is_kept_in_use_and_never_written() {
+        let keychain = Keychain::in_memory();
+        keychain
+            .store(LINEAR_ACCOUNT, &Secret::new("shared-key"))
+            .unwrap();
+        keychain
+            .store(GITHUB_ACCOUNT, &Secret::new("shared-token"))
+            .unwrap();
+        let both = wanted(&keychain, &[LINEAR_KEY, GITHUB_TOKEN]);
+        assert_eq!(both[0].shared.as_deref(), Some(LINEAR_ACCOUNT));
+        assert_eq!(both[1].shared.as_deref(), Some(GITHUB_ACCOUNT));
+        for replace in [false, true] {
+            let mut asked = 0;
+            let report = store_secrets(&keychain, &both, replace, &mut |_| {
+                asked += 1;
+                None
+            })
+            .unwrap();
+            assert_eq!(asked, 2);
+            assert_eq!(specs(&report.kept_shared), [LINEAR_KEY, GITHUB_TOKEN]);
+            assert!(report.missing.is_empty() && report.stored.is_empty());
+        }
+        let report = store_secrets(&keychain, &both[..1], true, &mut |_| {
+            Some(Secret::new("own-key"))
+        })
+        .unwrap();
+        assert_eq!(specs(&report.stored), [LINEAR_KEY]);
+        let own = TrackerAccounts::project(&repo());
+        assert_eq!(
+            keychain.read(&own.key).unwrap().unwrap().expose(),
+            "own-key"
+        );
+        assert_eq!(
+            keychain.read(LINEAR_ACCOUNT).unwrap().unwrap().expose(),
+            "shared-key"
+        );
+        // With a key of its own, the project reads no shared one.
+        assert_eq!(wanted(&keychain, &[LINEAR_KEY])[0].shared, None);
+    }
+
+    /// Without a GitHub repository, only the machine's secret is wanted:
+    /// the project's cannot be named.
+    #[test]
+    fn without_a_repository_only_the_machines_secret_is_wanted() {
+        let keychain = Keychain::in_memory();
+        let (wanted, unnamed) =
+            wanted_secrets(&keychain, &required_secrets(TrackerKind::Linear), None).unwrap();
+        assert_eq!(specs(&wanted), [CLAUDE_TOKEN]);
+        assert_eq!(wanted[0].account, CLAUDE_AGENT_ACCOUNT);
+        assert_eq!(unnamed, [LINEAR_KEY, GITHUB_TOKEN]);
+    }
+
+    /// The Linear app's pair is stored whole or not at all, under the
+    /// project's accounts: a client ID alone, or one pasted across lines,
+    /// stores nothing; no answer skips the app; a stored pair is kept
+    /// unless replaced.
     #[test]
     fn the_linear_apps_pair_is_stored_whole_or_not_at_all() {
         let keychain = Keychain::in_memory();
+        let own = TrackerAccounts::project(&repo());
         let store = |replace, answers: [Option<&str>; 2]| {
             let mut answers = answers.into_iter();
             let mut asked = Vec::new();
-            let stored = store_app_credentials(&keychain, replace, &mut |spec| {
-                asked.push(spec.account);
+            let stored = store_app_credentials(&keychain, &own, replace, &mut |one| {
+                asked.push(one.account.clone());
                 answers.next().flatten().map(Secret::new)
             })
             .unwrap();
             (stored, asked)
         };
-        let is_stored = |account| keychain.contains(account).unwrap();
+        let is_stored = |account: &str| keychain.contains(account).unwrap();
 
         assert_eq!(
             store(false, [None, None]),
-            (AppStored::Skipped, vec![LINEAR_APP_ID_ACCOUNT])
+            (AppStored::Skipped, vec![own.app_id.clone()])
         );
         assert_eq!(store(false, [Some("id"), None]).0, AppStored::Incomplete);
         assert_eq!(
             store(false, [Some("id"), Some("two\nlines")]).0,
             AppStored::Refused
         );
-        assert!(!is_stored(LINEAR_APP_ID_ACCOUNT));
-        assert!(!is_stored(LINEAR_APP_SECRET_ACCOUNT));
+        assert!(!is_stored(&own.app_id));
+        assert!(!is_stored(&own.app_secret));
 
         assert_eq!(
             store(false, [Some(" id "), Some("secret")]),
             (
                 AppStored::Stored,
-                vec![LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT]
+                vec![own.app_id.clone(), own.app_secret.clone()]
             )
         );
-        assert_eq!(
-            keychain
-                .read(LINEAR_APP_ID_ACCOUNT)
-                .unwrap()
-                .unwrap()
-                .expose(),
-            "id"
-        );
+        assert_eq!(keychain.read(&own.app_id).unwrap().unwrap().expose(), "id");
+        assert!(!is_stored(LINEAR_APP_ID_ACCOUNT));
         assert_eq!(
             store(false, [Some("x"), Some("y")]),
             (AppStored::Kept, vec![])
@@ -575,11 +758,7 @@ mod tests {
         assert_eq!(store(true, [None, None]).0, AppStored::Kept);
         assert_eq!(store(true, [Some("id"), None]).0, AppStored::Incomplete);
         assert_eq!(
-            keychain
-                .read(LINEAR_APP_SECRET_ACCOUNT)
-                .unwrap()
-                .unwrap()
-                .expose(),
+            keychain.read(&own.app_secret).unwrap().unwrap().expose(),
             "secret"
         );
     }
@@ -598,7 +777,7 @@ mod tests {
         }
 
         fn store(&self, account: &str, secret: &Secret) -> Result<(), String> {
-            if account == LINEAR_APP_SECRET_ACCOUNT {
+            if account == TrackerAccounts::project(&repo()).app_secret {
                 return Err("keychain: the secret's write failed".to_owned());
             }
             self.id_writes.set(self.id_writes.get() + 1);
@@ -627,25 +806,26 @@ mod tests {
             id_writes: std::cell::Cell::new(0),
         };
         let (id, secret) = (Secret::new("new-id"), Secret::new("new-secret"));
+        let own = TrackerAccounts::project(&repo());
         let id_of = |k: &SecretFails| {
-            Entries::read(&k.inner, LINEAR_APP_ID_ACCOUNT)
+            Entries::read(&k.inner, &own.app_id)
                 .unwrap()
                 .map(|s| s.expose().to_owned())
         };
 
         let none = keychain(false);
-        let error = store_pair(&none, &id, &secret).unwrap_err();
+        let error = store_pair(&none, &own, &id, &secret).unwrap_err();
         assert_eq!(error, "keychain: the secret's write failed");
         assert_eq!(id_of(&none), None);
 
         let pair = keychain(false);
         pair.inner
-            .store(LINEAR_APP_ID_ACCOUNT, &Secret::new("old-id"))
+            .store(&own.app_id, &Secret::new("old-id"))
             .unwrap();
         pair.inner
-            .store(LINEAR_APP_SECRET_ACCOUNT, &Secret::new("old-secret"))
+            .store(&own.app_secret, &Secret::new("old-secret"))
             .unwrap();
-        let error = store_pair(&pair, &id, &secret).unwrap_err();
+        let error = store_pair(&pair, &own, &id, &secret).unwrap_err();
         assert_eq!(error, "keychain: the secret's write failed");
         assert_eq!(id_of(&pair).as_deref(), Some("old-id"));
 
@@ -654,10 +834,10 @@ mod tests {
             if let Some(before) = before {
                 stuck
                     .inner
-                    .store(LINEAR_APP_ID_ACCOUNT, &Secret::new(before))
+                    .store(&own.app_id, &Secret::new(before))
                     .unwrap();
             }
-            let error = store_pair(&stuck, &id, &secret).unwrap_err();
+            let error = store_pair(&stuck, &own, &id, &secret).unwrap_err();
             assert!(
                 error.contains("the secret's write failed")
                     && error.contains("the rollback failed")

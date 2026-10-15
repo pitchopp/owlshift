@@ -31,7 +31,7 @@ use owlshift_runner::roles::{
 };
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
-use owlshift_runner::{forge, tracker};
+use owlshift_runner::{forge, secrets, tracker};
 
 use crate::fail;
 
@@ -130,25 +130,40 @@ fn run_with(
 
     // From here on, the credentials: the runner's own, never an agent's.
     let keychain = open_keychain().map_err(|error| error.to_string())?;
+    // The project's own secrets, or the shared ones it has none of its own
+    // for, each entry read once (OWL-308).
+    let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
+    let tracker_secrets = match project.tracker.kind {
+        TrackerKind::Linear => Some(secrets::tracker(&repo, &mut read)?),
+        TrackerKind::Markdown => None,
+    };
+    let forge_secret = secrets::forge(&repo, &mut read)?;
+    if let Some(notice) = secrets::shared_notice(
+        &repo,
+        tracker_secrets.as_ref().map(|found| &found.accounts),
+        &forge_secret.account,
+    ) {
+        eprintln!("owlshift: {notice}");
+    }
     // With the Linear app stored, its token is requested here, before any
     // work, and revoked when the tracker is dropped (OWL-157).
-    let tracker: Box<dyn Tracker> = match project.tracker.kind {
-        TrackerKind::Linear => {
+    let tracker: Box<dyn Tracker> = match &tracker_secrets {
+        Some(found) => {
             let team = project
                 .tracker
                 .team
                 .as_deref()
                 .ok_or("a Linear project names its team in `tracker.team`")?;
-            Box::new(tracker::linear(&keychain, team)?)
+            Box::new(tracker::linear(found, team)?)
         }
-        TrackerKind::Markdown => Box::new(MarkdownTracker::new(root)),
+        None => Box::new(MarkdownTracker::new(root)),
     };
     if mode == Mode::Drain && !tracker.capabilities().contains(&Capability::ListAdmitted) {
         return Err(
             "`owlshift watch --drain` needs a tracker that lists admitted tickets".to_owned(),
         );
     }
-    let forge = forge::github(&keychain, repo.clone())?;
+    let forge = forge::github(&forge_secret, repo.clone())?;
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
     // run, with the fix, before anything is cloned.

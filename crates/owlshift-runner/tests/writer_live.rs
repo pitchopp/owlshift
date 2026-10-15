@@ -26,6 +26,7 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::result::Decision;
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::forge::{GITHUB_ACCOUNT, github};
+use owlshift_runner::secrets;
 use owlshift_runner::tracker::{LINEAR_ACCOUNT, linear};
 use owlshift_runner::writer::{DeliveryReport, Gate, Writer};
 
@@ -70,8 +71,10 @@ fn posts_the_delivery_report_on_a_real_ticket() {
     keychain.store(GITHUB_ACCOUNT, &github_token()).unwrap();
     // No Linear app is stored here: the report goes through the key.
     let team = ticket.as_str().rsplit_once('-').unwrap().0;
-    let tracker = linear(&keychain, team).unwrap();
-    let forge = github(&keychain, repo).unwrap();
+    // Resolved as `owlshift do` resolves them: the shared accounts here.
+    let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
+    let tracker = linear(&secrets::tracker(&repo, &mut look).unwrap(), team).unwrap();
+    let forge = github(&secrets::forge(&repo, &mut look).unwrap(), repo).unwrap();
 
     assert_eq!(tracker.ticket(&ticket).unwrap().id, ticket);
     let pull_request = forge

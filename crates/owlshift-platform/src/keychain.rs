@@ -3,7 +3,9 @@
 //! Owlshift never writes such a secret to a file.
 //!
 //! Every Owlshift entry is filed under the service [`SERVICE`] and named by
-//! its account, such as `linear`. Access goes through `keyring-core` with one
+//! its account, such as `github.com/pitchopp/owlshift/linear` for a
+//! project's Linear key (OWL-308) or `claude-agent` for one kept per
+//! machine. Access goes through `keyring-core` with one
 //! store crate per platform, as the `keyring` project advises applications
 //! to do (OWL-13, 2026-09-28). Tests use [`Keychain::in_memory`], so no test
 //! needs a keychain entry, or a keychain at all.
@@ -204,7 +206,11 @@ mod tests {
     #[ignore = "touches the system keychain"]
     fn system_keychain_round_trip() {
         let keychain = Keychain::system().unwrap();
-        let account = format!("live-check-{}", std::process::id());
+        // Shaped as a project's account (OWL-308): `/` and `.` in the name.
+        let account = format!(
+            "github.com/owlshift-live-check/repo-{}/linear",
+            std::process::id()
+        );
         keychain.delete(&account).unwrap();
         assert!(!keychain.contains(&account).unwrap());
         keychain.store(&account, &Secret::new("dummy")).unwrap();
