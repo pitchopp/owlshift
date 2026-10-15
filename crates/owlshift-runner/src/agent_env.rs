@@ -18,6 +18,9 @@
 //! git folder (not its hooks or configuration) and the run's own temporary
 //! folder, which holds the harness's configuration, closes the temporary folders
 //! the user's other processes share, and closes the system credential store.
+//! Under the read-only profile ([`RunPaths::read_only`], OWL-298) the
+//! worktree and the git folder are read only, and the run writes nowhere but
+//! its own temporary folder and the folders its harness needs.
 //! An agent environment is always confined: the only way out is
 //! `without_confinement`, compiled for the test bench alone.
 //!
@@ -73,6 +76,10 @@ pub struct RunPaths {
     /// `TMP` and `TEMP` name, and where the harness keeps its configuration
     /// for the run. `None`: no temporary folder is written.
     pub temp: Option<PathBuf>,
+    /// The read-only profile (OWL-298): the worktree and the git folder are
+    /// read, never written. The folders of `writable` and `temp` stay
+    /// written; the executor keeps them clear of both.
+    pub read_only: bool,
 }
 
 /// The variables that name a temporary folder.
@@ -246,15 +253,22 @@ impl AgentEnv {
         readable.extend(run.readable.iter().cloned());
         hidden.extend(run.hidden.iter().cloned());
 
-        let mut writable = vec![run.workdir.clone()];
+        let mut writable = Vec::new();
         let mut protected = Vec::new();
-        if let Some(git_dir) = &run.git_dir {
-            writable.push(git_dir.clone());
-            protected.extend(
-                ["hooks", "config", "config.worktree", "info"]
-                    .iter()
-                    .map(|name| git_dir.join(name)),
-            );
+        if run.read_only {
+            // Read, never written: nothing in them needs protecting.
+            readable.push(run.workdir.clone());
+            readable.extend(run.git_dir.iter().cloned());
+        } else {
+            writable.push(run.workdir.clone());
+            if let Some(git_dir) = &run.git_dir {
+                writable.push(git_dir.clone());
+                protected.extend(
+                    ["hooks", "config", "config.worktree", "info"]
+                        .iter()
+                        .map(|name| git_dir.join(name)),
+                );
+            }
         }
         writable.extend(run.writable.iter().cloned());
 
@@ -903,6 +917,7 @@ mod tests {
             writable: vec!["/home/op/login".into()],
             hidden: vec!["/srv/run".into()],
             temp: Some("/srv/run-temp".into()),
+            read_only: false,
         };
         let policy = agent.policy(&run);
         let has = |list: &[PathBuf], path: &str| list.iter().any(|p| p == Path::new(path));
@@ -948,6 +963,36 @@ mod tests {
         assert!(has(&policy.closed, &std::env::temp_dir().to_string_lossy()));
         assert_eq!(policy.temp, [PathBuf::from("/srv/run-temp")]);
         assert!(!has(&policy.writable, "/tmp/op"));
+        assert_eq!(policy.workdir, Path::new("/srv/wt"));
+    }
+
+    /// OWL-298: under the read-only profile the worktree and the git folder
+    /// are read, never written, and the run's other folders are as before.
+    #[cfg(unix)]
+    #[test]
+    fn the_read_only_policy_reads_the_worktree_and_the_git_folder_and_writes_neither() {
+        let agent = env(&[("HOME", "/home/op"), ("PATH", "/usr/bin")]);
+        let run = RunPaths {
+            workdir: "/srv/wt".into(),
+            git_dir: Some("/srv/repo/.git".into()),
+            writable: vec!["/srv/run-temp/run-files".into()],
+            hidden: vec!["/srv/run".into()],
+            temp: Some("/srv/run-temp".into()),
+            read_only: true,
+            ..RunPaths::default()
+        };
+        let policy = agent.policy(&run);
+        assert_eq!(policy.writable, [PathBuf::from("/srv/run-temp/run-files")]);
+        for path in ["/srv/wt", "/srv/repo/.git"] {
+            assert!(
+                policy.readable.iter().any(|p| p == Path::new(path)),
+                "{path}: {:?}",
+                policy.readable
+            );
+        }
+        assert!(policy.protected.is_empty(), "{:?}", policy.protected);
+        assert_eq!(policy.temp, [PathBuf::from("/srv/run-temp")]);
+        assert!(policy.hidden.iter().any(|p| p == Path::new("/srv/run")));
         assert_eq!(policy.workdir, Path::new("/srv/wt"));
     }
 

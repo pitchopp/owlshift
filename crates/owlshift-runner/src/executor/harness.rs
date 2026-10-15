@@ -39,8 +39,18 @@ pub struct HarnessRun<'a> {
     pub worktree: &'a Path,
     /// The brief as written, its `result_path` set by the executor.
     pub brief: &'a Brief,
-    /// The brief's file, inside the worktree.
+    /// The brief's file: inside the worktree, or, under the read-only
+    /// profile ([`SandboxNeeds::read_only`]), in the run's files folder.
     pub brief_file: &'a Path,
+    /// The file the role's result is read from once the run ends: the
+    /// brief's `result_path` in the worktree, or, under the read-only
+    /// profile, `result.json` in the run's files folder
+    /// ([`RUN_FILES_DIR`](super::RUN_FILES_DIR)), where the brief's
+    /// `result_path` does not apply. That folder, in the run's own temporary
+    /// folder, is read and written by the run and removed with it: a
+    /// read-only harness keeps there the files of its own the run needs,
+    /// made by [`Harness::command`].
+    pub result_file: &'a Path,
 }
 
 /// A harness CLI, or a stand-in for one.
@@ -86,6 +96,17 @@ pub struct SandboxNeeds {
     /// temporary folder, which the harness makes itself: nothing more is
     /// opened in the sandbox (OWL-100).
     pub temp_variable: Option<&'static str>,
+    /// Whether the run gets the read-only profile (OWL-298, architecture
+    /// section 5, "The Codex harness"): the worktree and the repository's
+    /// git folder are read, never written, and the brief and the result
+    /// live in the run's own temporary folder ([`HarnessRun::result_file`]).
+    /// Only a brief whose permissions are read-only runs so, and no folder
+    /// of [`SandboxNeeds::writable`] may hold, or lie in, the worktree or
+    /// the git folder. On macOS the harness command also gets the system's
+    /// certificate bundle when the agent environment names none
+    /// (`SSL_CERT_FILE`): the sandbox closes the Keychain server, which some
+    /// certificate checks ask.
+    pub read_only: bool,
 }
 
 /// A harness's login for agent runs (OWL-94). The executor gives it to the

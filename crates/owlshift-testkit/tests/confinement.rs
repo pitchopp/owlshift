@@ -41,12 +41,20 @@ struct Script {
     line: String,
     login: Option<Secret>,
     temp_variable: Option<&'static str>,
+    /// Asks for the read-only profile (OWL-298).
+    read_only: bool,
 }
 
 impl Harness for Script {
-    fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+    /// The script gets the result file as `$1` and the brief's file as `$2`.
+    fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         let mut command = Command::new("sh");
-        command.arg("-c").arg(&self.line);
+        command
+            .arg("-c")
+            .arg(&self.line)
+            .arg("sh")
+            .arg(run.result_file)
+            .arg(run.brief_file);
         Ok(command)
     }
 
@@ -58,6 +66,7 @@ impl Harness for Script {
                 config_variable: claude::CONFIG_DIR_ENV,
             }),
             temp_variable: self.temp_variable,
+            read_only: self.read_only,
             ..SandboxNeeds::default()
         })
     }
@@ -128,11 +137,21 @@ impl Bench {
             line: script.to_owned(),
             login,
             temp_variable: None,
+            read_only: false,
         };
         self.run_harness(agent, &harness)
     }
 
     fn run_harness(&self, agent: AgentEnv, harness: &Script) -> Result<RunReport, ExecutorError> {
+        self.run_brief(agent, harness, &brief())
+    }
+
+    fn run_brief(
+        &self,
+        agent: AgentEnv,
+        harness: &Script,
+        brief: &Brief,
+    ) -> Result<RunReport, ExecutorError> {
         let runner = self.env.clone();
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner.apply(command)),
@@ -147,7 +166,7 @@ impl Bench {
             branch: BRANCH,
             base: "origin/main",
             run_dir: &self.run_dir(),
-            brief: &brief(),
+            brief,
         };
         executor.run(&spec, harness)
     }
@@ -506,6 +525,7 @@ fn a_confined_harness_keeps_its_temporary_files_clear_of_the_operators_folder() 
         line: TEMP_FILES.to_owned(),
         login: None,
         temp_variable: Some(claude::TMPDIR_ENV),
+        read_only: false,
     };
     let report = bench.run_harness(agent, &harness).unwrap();
     assert!(
@@ -525,6 +545,168 @@ fn a_confined_harness_keeps_its_temporary_files_clear_of_the_operators_folder() 
     assert_eq!(probe[..3], ["own=ok", "tmpdir=run", operator], "{probe:?}");
     let path = probe[3].strip_prefix("path=").unwrap();
     assert!(!PathBuf::from(path).exists(), "{path} outlived the run");
+}
+
+/// A review brief, read-only, as a Codex critic gets (OWL-298).
+#[cfg(unix)]
+fn review_brief() -> Brief {
+    let mut brief = brief();
+    brief.role = Role::DesignReview;
+    brief.permissions.level = PermissionLevel::ReadOnly;
+    brief
+}
+
+/// A read-only harness for `line`.
+fn read_only(line: &str) -> Script {
+    Script {
+        line: line.to_owned(),
+        login: None,
+        temp_variable: None,
+        read_only: true,
+    }
+}
+
+/// A review run's result, valid against [`review_brief`].
+#[cfg(unix)]
+const REVIEW_RESULT: &str = r#"{"format":9,"status":"done","summary":"no finding"}"#;
+
+/// OWL-298: the read-only profile is refused for a brief that lets its role
+/// write the worktree, before anything is written, on every platform.
+#[test]
+fn the_read_only_profile_is_refused_to_a_brief_that_writes() {
+    let bench = Bench::new();
+    let agent = bench.agent().without_confinement();
+    let error = bench.run_harness(agent, &read_only("exit 0")).unwrap_err();
+    assert!(
+        matches!(&error, ExecutorError::Spec(reason) if reason.contains("read-only")),
+        "{error:?}"
+    );
+    assert!(!bench.worktree.exists(), "the worktree was created");
+}
+
+/// OWL-298: a read-only run's result is read from its own files folder
+/// alone, never from a result an earlier run left in the worktree, and
+/// nothing of the run is written in the worktree. Unconfined: what is
+/// checked here is where the executor puts and reads the run's files.
+#[cfg(unix)]
+#[test]
+fn a_read_only_run_reads_its_result_from_its_own_files_alone() {
+    use owlshift_runner::executor::{Failure, Outcome};
+    let bench = Bench::new();
+    let agent = bench.agent().without_confinement();
+    // An earlier run, with the write profile, leaves a valid result.
+    let earlier = format!(
+        "mkdir -p .owlshift/run && printf '%s' '{REVIEW_RESULT}' > .owlshift/run/result.json"
+    );
+    let harness = Script {
+        read_only: false,
+        ..read_only(&earlier)
+    };
+    let report = bench
+        .run_brief(agent.clone(), &harness, &review_brief())
+        .unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Finished { .. }),
+        "{:?}",
+        report.outcome
+    );
+
+    let report = bench
+        .run_brief(agent.clone(), &read_only("exit 0"), &review_brief())
+        .unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Failed(Failure::NoResult)),
+        "{:?}",
+        report.outcome
+    );
+
+    fs::remove_dir_all(bench.worktree.join(".owlshift")).unwrap();
+    let writes = format!(
+        "test -r \"$2\" || exit 3; case \"$1\" in \"$PWD\"/*) exit 4;; esac; \
+         printf '%s' '{REVIEW_RESULT}' > \"$1\""
+    );
+    let report = bench
+        .run_brief(agent, &read_only(&writes), &review_brief())
+        .unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Finished { .. }),
+        "{:?}",
+        report.outcome
+    );
+    assert!(
+        !bench.worktree.join(".owlshift").exists(),
+        "a read-only run wrote its files in the worktree"
+    );
+}
+
+/// What a read-only run tries, one `name=status` line each on its standard
+/// output: read the worktree, change a file there, create one, write in the
+/// repository's git folder, ask `git status`, read its brief, write in its
+/// own files folder; then it writes its result.
+#[cfg(unix)]
+const READ_ONLY_PROBE: &str = r#"
+cat README.md > /dev/null 2>&1; echo "read=$?"
+(echo changed >> README.md) 2> /dev/null; echo "edit=$?"
+(echo new > new.txt) 2> /dev/null; echo "create=$?"
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+(echo planted > "$common/objects/owl298") 2> /dev/null; echo "git=$?"
+git --no-optional-locks status --porcelain > /dev/null 2>&1; echo "status=$?"
+test -r "$2"; echo "brief=$?"
+(echo own > "$(dirname "$1")/own") 2> /dev/null; echo "own=$?"
+"#;
+
+/// OWL-298's acceptance through the executor, with the real sandbox
+/// (Seatbelt, or bwrap on the Linux CI job): under the read-only profile the
+/// run reads the worktree and git answers, but every write to the worktree
+/// and to the repository's git folder is refused; it reads its brief and
+/// writes its own files folder, where its result is read from.
+#[cfg(unix)]
+#[test]
+fn a_read_only_run_reads_the_worktree_and_writes_only_its_own_files() {
+    use owlshift_runner::executor::Outcome;
+    let bench = Bench::new();
+    let agent = bench.agent();
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let line = format!("{READ_ONLY_PROBE}printf '%s' '{REVIEW_RESULT}' > \"$1\"\n");
+    let report = bench
+        .run_brief(agent, &read_only(&line), &review_brief())
+        .unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Finished { .. }),
+        "{:?}",
+        report.outcome
+    );
+    let stdout = fs::read_to_string(&report.stdout_log).unwrap();
+    let probe: Vec<&str> = stdout.lines().collect();
+    let refused = |name: &str| {
+        probe.iter().any(|line| {
+            line.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('=') && rest != "=0")
+        })
+    };
+    for name in ["read", "status", "brief", "own"] {
+        assert!(
+            probe.contains(&format!("{name}=0").as_str()),
+            "{name}: {probe:?}"
+        );
+    }
+    for name in ["edit", "create", "git"] {
+        assert!(refused(name), "{name} was not refused: {probe:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(bench.worktree.join("README.md")).unwrap(),
+        "hello\n"
+    );
+    assert!(!bench.worktree.join("new.txt").exists());
+    let common = fs::read_to_string(bench.worktree.join(".git")).unwrap();
+    let common = PathBuf::from(common.trim().strip_prefix("gitdir: ").unwrap());
+    let objects = common.parent().unwrap().parent().unwrap().join("objects");
+    assert!(
+        !objects.join("owl298").exists(),
+        "the git folder was written"
+    );
 }
 
 /// Native Windows has no sandbox: the run is refused before anything is

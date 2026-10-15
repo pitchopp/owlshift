@@ -39,6 +39,12 @@
 //! ([`RESULT_PATH`]) and, for the build role, its plan and ledger. The
 //! executor never writes there through a symbolic link. The log files and a
 //! copy of the brief go to the caller's run directory, outside the worktree.
+//!
+//! A harness that asks for the read-only profile ([`SandboxNeeds::read_only`],
+//! OWL-298) gets the worktree and the repository's git folder read, never
+//! written, and nothing is written in the worktree: the brief and the result
+//! go to [`RUN_FILES_DIR`] in the run's own temporary folder, which the run
+//! reads and writes and which is removed with it.
 
 pub mod gate;
 mod git;
@@ -58,11 +64,12 @@ use jiff::Timestamp;
 
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_contracts::Role;
-use owlshift_contracts::brief::{Brief, GateFailure};
+use owlshift_contracts::brief::{Brief, GateFailure, PermissionLevel};
 use owlshift_contracts::ids::RelativePath;
 use owlshift_contracts::result::{self, DecisionsRefusal, RunResult};
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 use owlshift_platform::keychain::Secret;
+use owlshift_platform::sandbox;
 
 use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
@@ -84,6 +91,18 @@ pub const BRIEF_PATH: &str = ".owlshift/run/brief.json";
 /// Where the role writes `result.json`, relative to the worktree: the
 /// brief's `result_path`.
 pub const RESULT_PATH: &str = ".owlshift/run/result.json";
+
+/// The folder of the run's own files under the read-only profile (OWL-298),
+/// in the run's own temporary folder: the brief, the result
+/// ([`RUN_FILES_RESULT`]) and the harness's own files of the run.
+pub const RUN_FILES_DIR: &str = "run-files";
+
+/// The result's name in [`RUN_FILES_DIR`].
+pub const RUN_FILES_RESULT: &str = "result.json";
+
+/// The system's certificate bundle on macOS, given to a read-only harness
+/// command as `SSL_CERT_FILE` (OWL-298).
+pub const MACOS_CERT_BUNDLE: &str = "/etc/ssl/cert.pem";
 
 /// The most bytes `result.json` may hold, as for an artifact.
 pub const MAX_RESULT_BYTES: u64 = MAX_ARTIFACT_BYTES;
@@ -366,11 +385,55 @@ impl Executor {
         self.agent
             .sandbox_ready()
             .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
+        let needs = harness
+            .sandbox_needs(&self.agent)
+            .map_err(ExecutorError::Command)?;
+        if needs.read_only && spec.brief.permissions.level != PermissionLevel::ReadOnly {
+            return Err(ExecutorError::Spec(format!(
+                "the {} role's brief lets it write the worktree, which the read-only \
+                 profile its harness asks for does not",
+                spec.brief.role.as_str()
+            )));
+        }
         worktree::prepare(&self.git, spec)?;
+        let mut paths = self.run_paths(spec)?;
+        if needs.read_only {
+            read_only_clear(&needs.writable, &paths)?;
+        }
+        // The run's own temporary folder: private to the user, removed when
+        // `run` returns, after every process of the run is stopped.
+        let temp = tempfile::Builder::new()
+            .prefix("owlshift-run-")
+            .tempdir()
+            .map_err(|source| ExecutorError::RunDir {
+                path: std::env::temp_dir(),
+                source,
+            })?;
         let mut brief = spec.brief.clone();
         brief.result_path =
             RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a plain relative path");
-        let brief_file = worktree::write_run_files(spec.worktree, &brief)?;
+        // Where the run's own files go: the worktree, or, under the read-only
+        // profile, a folder of the run's temporary folder, bound read and
+        // written (as the configuration folder below), and nothing is written
+        // in the worktree.
+        let (brief_file, result_file, run_files) = if needs.read_only {
+            let run_files = temp.path().join(RUN_FILES_DIR);
+            let layout = |source| ExecutorError::RunDir {
+                path: run_files.clone(),
+                source,
+            };
+            fs::create_dir(&run_files).map_err(layout)?;
+            let brief_file = run_files.join("brief.json");
+            fs::write(&brief_file, brief.render()).map_err(layout)?;
+            (
+                brief_file,
+                run_files.join(RUN_FILES_RESULT),
+                Some(run_files),
+            )
+        } else {
+            let brief_file = worktree::write_run_files(spec.worktree, &brief)?;
+            (brief_file, spec.worktree.join(RESULT_PATH), None)
+        };
         let run_dir = |source| ExecutorError::RunDir {
             path: spec.run_dir.to_owned(),
             source,
@@ -400,28 +463,18 @@ impl Executor {
             worktree: spec.worktree,
             brief: &brief,
             brief_file: &brief_file,
+            result_file: &result_file,
         };
-        let needs = harness
-            .sandbox_needs(&self.agent)
-            .map_err(ExecutorError::Command)?;
         let login = needs.login;
         if let Some(login) = &login {
             log.hide(&login.token);
         }
-        // The run's own temporary folder: private to the user, removed when
-        // `run` returns, after every process of the run is stopped.
-        let temp = tempfile::Builder::new()
-            .prefix("owlshift-run-")
-            .tempdir()
-            .map_err(|source| ExecutorError::RunDir {
-                path: std::env::temp_dir(),
-                source,
-            })?;
-        let mut paths = self.run_paths(spec)?;
         let inner = harness.command(&context).map_err(ExecutorError::Command)?;
         paths.readable = needs.readable;
         paths.writable = needs.writable;
+        paths.writable.extend(run_files.iter().cloned());
         paths.temp = Some(temp.path().to_owned());
+        paths.read_only = needs.read_only;
         // An empty configuration folder of the run's own, in its temporary
         // folder: no other login is found there, and nothing the harness
         // writes outlives the run (OWL-94). It is bound read and written:
@@ -459,6 +512,9 @@ impl Executor {
             // opened.
             command.env(variable, temp.path().join(HARNESS_TEMP_DIR));
         }
+        if let Some(bundle) = certificate_bundle(&self.agent, needs.read_only) {
+            command.env("SSL_CERT_FILE", bundle);
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -478,7 +534,11 @@ impl Executor {
 
         let violations = before.check(&self.git, spec.main, spec.worktree, spec.branch);
         let hidden = login.as_ref().map(|login| &login.token);
-        let (mut outcome, end) = decide(violations, timed_out, driven, spec, hidden);
+        let result = match &run_files {
+            Some(run_files) => (run_files.as_path(), RUN_FILES_RESULT),
+            None => (spec.worktree, RESULT_PATH),
+        };
+        let (mut outcome, end) = decide(violations, timed_out, driven, spec, result, hidden);
         let mut gate = None;
         if matches!(brief.role, Role::Build | Role::Rebase) && is_done(&outcome) {
             // The gate runs the code the run wrote, confined as the run was,
@@ -489,6 +549,7 @@ impl Executor {
                 &RunPaths {
                     readable: Vec::new(),
                     writable: Vec::new(),
+                    read_only: false,
                     ..paths
                 },
                 &brief.gate,
@@ -539,8 +600,50 @@ impl Executor {
             writable: Vec::new(),
             hidden: vec![spec.run_dir.to_owned()],
             temp: None,
+            read_only: false,
         })
     }
+}
+
+/// Refuses a read-only run whose harness would write a folder that holds,
+/// or lies in, the worktree or the git folder, compared by real path: the
+/// profile would no longer keep them unwritten.
+fn read_only_clear(writable: &[PathBuf], run: &RunPaths) -> Result<(), ExecutorError> {
+    let kept: Vec<PathBuf> = [&run.workdir]
+        .into_iter()
+        .chain(&run.git_dir)
+        .map(|path| sandbox::real(path))
+        .collect();
+    for path in writable {
+        let real = sandbox::real(path);
+        if let Some(kept) = kept
+            .iter()
+            .find(|kept| real.starts_with(kept) || kept.starts_with(&real))
+        {
+            return Err(ExecutorError::Spec(format!(
+                "the harness asks to write {}, which would open {} to a read-only run",
+                path.display(),
+                kept.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The certificate bundle a harness command gets as `SSL_CERT_FILE`: on
+/// macOS only, for a read-only run only, when the agent environment names
+/// none and the bundle is there. The sandbox closes the Keychain server
+/// (`com.apple.SecurityServer`), which Codex's certificate check asks: it
+/// then fails with `UnknownIssuer` and retries without end, and with the
+/// system's bundle it connects (checked live on 2026-10-15, build plan,
+/// "C2"). Elsewhere the environment is left as it is.
+fn certificate_bundle(agent: &AgentEnv, read_only: bool) -> Option<&'static Path> {
+    let bundle = Path::new(MACOS_CERT_BUNDLE);
+    (cfg!(target_os = "macos")
+        && read_only
+        && agent.var("SSL_CERT_FILE").is_none()
+        && bundle.is_file())
+    .then_some(bundle)
 }
 
 /// Whether the role finished with `done`.
@@ -570,12 +673,14 @@ fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Op
 
 /// The outcome, in order of precedence: a violation, the deadline, a
 /// credential the harness loaded, a usage limit, a harness failure, then
-/// the result itself, refused when it holds `hidden`, the harness's login.
+/// the result itself, read as `result` (a folder and a name in it), refused
+/// when it holds `hidden`, the harness's login.
 fn decide(
     violations: Vec<Violation>,
     timed_out: bool,
     driven: io::Result<HarnessEnd>,
     spec: &RunSpec<'_>,
+    result: (&Path, &str),
     hidden: Option<&Secret>,
 ) -> (Outcome, Option<HarnessEnd>) {
     let (driven, end) = match driven {
@@ -599,7 +704,7 @@ fn decide(
                 },
                 HarnessStatus::Failed(reason) => Outcome::Failed(Failure::Harness(reason.clone())),
                 HarnessStatus::Completed => {
-                    read_result(spec.worktree, spec.branch, spec.brief, hidden)
+                    read_result(result, spec.worktree, spec.branch, spec.brief, hidden)
                 }
             }
         }
@@ -607,11 +712,18 @@ fn decide(
     (outcome, end)
 }
 
-/// Reads and validates the role's `result.json`, then its artifacts. A
-/// result or an artifact that holds `hidden`, the harness's login, fails the
-/// run: what it says would reach the tracker, the pull request and the
-/// events (OWL-94).
-fn read_result(worktree: &Path, branch: &str, brief: &Brief, hidden: Option<&Secret>) -> Outcome {
+/// Reads and validates the role's `result.json`, the file `name` in the
+/// folder `root` (the worktree, or the run's files folder under the
+/// read-only profile), then its artifacts, in the worktree. A result or an
+/// artifact that holds `hidden`, the harness's login, fails the run: what it
+/// says would reach the tracker, the pull request and the events (OWL-94).
+fn read_result(
+    (root, name): (&Path, &str),
+    worktree: &Path,
+    branch: &str,
+    brief: &Brief,
+    hidden: Option<&Secret>,
+) -> Outcome {
     let copied = |into: &str, bytes: &[u8]| {
         hidden.is_some_and(|token| holds(bytes, token)).then(|| {
             Outcome::Failed(Failure::Credentials(vec![CredentialFinding::LoginCopied {
@@ -619,7 +731,7 @@ fn read_result(worktree: &Path, branch: &str, brief: &Brief, hidden: Option<&Sec
             }]))
         })
     };
-    let bytes = match read_confined(worktree, RESULT_PATH, MAX_RESULT_BYTES) {
+    let bytes = match read_confined(root, name, MAX_RESULT_BYTES) {
         Ok(bytes) => bytes,
         Err(ConfinedError::Refused {
             reason: Refusal::NotFound,
@@ -627,7 +739,7 @@ fn read_result(worktree: &Path, branch: &str, brief: &Brief, hidden: Option<&Sec
         }) => return Outcome::Failed(Failure::NoResult),
         Err(error) => return Outcome::Failed(Failure::InvalidResult(error.to_string())),
     };
-    if let Some(refused) = copied(RESULT_PATH, &bytes) {
+    if let Some(refused) = copied(name, &bytes) {
         return refused;
     }
     let result = match validate_result(&bytes, branch, brief) {
@@ -842,6 +954,51 @@ fn holds(haystack: &[u8], token: &Secret) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-298: the system's bundle reaches a read-only harness command on
+    /// macOS alone, when the agent environment names no bundle.
+    #[test]
+    fn a_read_only_run_on_macos_gets_the_systems_certificate_bundle() {
+        let bare = AgentEnv::new([("PATH".into(), "/usr/bin".into())]).unwrap();
+        let own = AgentEnv::new([
+            ("PATH".into(), "/usr/bin".into()),
+            ("SSL_CERT_FILE".into(), "/opt/corp/ca.pem".into()),
+        ])
+        .unwrap();
+        let expected = (cfg!(target_os = "macos") && Path::new(MACOS_CERT_BUNDLE).is_file())
+            .then_some(Path::new(MACOS_CERT_BUNDLE));
+        assert_eq!(certificate_bundle(&bare, true), expected);
+        assert_eq!(certificate_bundle(&bare, false), None);
+        assert_eq!(certificate_bundle(&own, true), None);
+    }
+
+    /// OWL-298: a harness's writable folder may not hold, nor lie in, the
+    /// worktree or the git folder of a read-only run.
+    #[test]
+    fn a_read_only_run_writes_nothing_that_overlaps_its_worktree() {
+        let base = tempfile::tempdir().unwrap();
+        let run = RunPaths {
+            workdir: base.path().join("wt"),
+            git_dir: Some(base.path().join("repo/.git")),
+            ..RunPaths::default()
+        };
+        for path in [
+            base.path().to_owned(),
+            base.path().join("wt"),
+            base.path().join("wt/cache"),
+            base.path().join("repo"),
+            base.path().join("repo/.git/hooks"),
+        ] {
+            let refused = read_only_clear(std::slice::from_ref(&path), &run);
+            assert!(
+                matches!(refused, Err(ExecutorError::Spec(_))),
+                "{}: {refused:?}",
+                path.display()
+            );
+        }
+        let beside = [base.path().join("temp/run-files"), base.path().join("wt2")];
+        assert!(read_only_clear(&beside, &run).is_ok());
+    }
 
     #[test]
     fn the_wall_span_is_none_when_the_clock_was_set_back() {
