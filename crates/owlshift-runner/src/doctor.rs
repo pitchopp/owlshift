@@ -2434,11 +2434,18 @@ mod tests {
         let report = run(&system, &no_config());
         let codex = line(&report, "codex");
         assert_eq!(codex.status, Status::Warn, "{report}");
+        // Shown as every path under the home is: `~/…` where `/home/ada` is
+        // absolute, as is on Windows.
+        let file = shown(
+            Path::new("/home/ada/.codex/auth.json"),
+            Some(Path::new("/home/ada")),
+        );
         assert_eq!(
             codex.detail,
-            "0.154.0 (/fake/bin/codex), logged in (API key), but no login file at \
-             ~/.codex/auth.json"
+            format!("0.154.0 (/fake/bin/codex), logged in (API key), but no login file at {file}")
         );
+        #[cfg(unix)]
+        assert_eq!(file, "~/.codex/auth.json");
         let why = codex.why.as_deref().unwrap();
         assert!(
             why.contains("the critic of the review roles runs on Claude Code"),
