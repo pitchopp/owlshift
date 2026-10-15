@@ -10,8 +10,9 @@
 //! its own and writes `result.json` from the run's last message.
 //!
 //! Every CLI behaviour relied on here was checked live and is recorded in
-//! `docs/design/build-plan.md`, under checks C2 and C7 (Codex), with
-//! codex-cli 0.154.0: the flags, the stream's events, the rule that a run
+//! `docs/design/build-plan.md`, under checks C2 and C7 (Codex) and OWL-130's
+//! entry (OWL-131), with codex-cli 0.154.0: the flags, the stream's events,
+//! the rule that a run
 //! failed exactly when its stream ends in `turn.failed` or is empty, the
 //! usage-limit message, and the effort levels. The recordings are replayed
 //! by `tests/codex_fixtures.rs`.
@@ -44,16 +45,28 @@ pub use owlshift_contracts::result::Effort;
 ///   routing paths").
 /// - `--ignore-rules` drops execpolicy `.rules` files: the runner injects the
 ///   project's rules in the brief (C2, "Rules").
+/// - `skills.include_instructions=false` lists no skill to the model, the
+///   worktree's `.agents/skills` and `.codex/skills` included, which load
+///   whatever the flags above say (OWL-131).
+/// - `project_doc_max_bytes=0` drops the worktree's `AGENTS.md`: the brief
+///   carries the project's rules, read at the base commit, never from the
+///   ticket's branch (OWL-131).
 /// - `--dangerously-bypass-approvals-and-sandbox` turns Codex's own sandbox
 ///   off: Seatbelt does not nest, and a nested one fails silently (C2,
 ///   `nested_sandbox`). The executor's read-only profile confines the run
-///   instead; the runner refuses a Codex run it cannot confine.
+///   instead; the runner refuses a Codex run it cannot confine. It does not
+///   bypass hook trust; `--dangerously-bypass-hook-trust` would, and would
+///   run the hooks of the run's own `CODEX_HOME` (OWL-131).
 const LAUNCH_ARGS: &[&str] = &[
     "exec",
     "--ephemeral",
     "--json",
     "--ignore-user-config",
     "--ignore-rules",
+    "-c",
+    "skills.include_instructions=false",
+    "-c",
+    "project_doc_max_bytes=0",
     "--dangerously-bypass-approvals-and-sandbox",
 ];
 
@@ -457,6 +470,7 @@ mod tests {
         assert_eq!(
             joined(&request),
             "exec --ephemeral --json --ignore-user-config --ignore-rules \
+             -c skills.include_instructions=false -c project_doc_max_bytes=0 \
              --dangerously-bypass-approvals-and-sandbox \
              --output-schema /run/schema.json -o /run/last-message.json -"
         );
