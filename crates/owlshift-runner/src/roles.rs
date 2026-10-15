@@ -141,13 +141,15 @@ mod tests {
         let prompt = format::strip_role_front_matter(Role::Intake, INTAKE_ROLE).expect("strips");
         assert!(prompt.trim_start().starts_with("# Intake"), "{prompt}");
         for (role, text, title) in [
-            (Role::Design, DESIGN_ROLE, "# Design\n"),
-            (Role::DesignReview, DESIGN_REVIEW_ROLE, "# Design review\n"),
-            (Role::Verify, VERIFY_ROLE, "# Verify\n"),
-            (Role::Arbiter, ARBITER_ROLE, "# Arbiter\n"),
+            (Role::Design, DESIGN_ROLE, "# Design"),
+            (Role::DesignReview, DESIGN_REVIEW_ROLE, "# Design review"),
+            (Role::Verify, VERIFY_ROLE, "# Verify"),
+            (Role::Arbiter, ARBITER_ROLE, "# Arbiter"),
         ] {
             let prompt = format::strip_role_front_matter(role, text).expect("strips");
-            assert!(prompt.trim_start().starts_with(title), "{prompt}");
+            // The whole first line, whatever line endings the checkout
+            // gave the file: `# Design` is a prefix of `# Design review`.
+            assert_eq!(prompt.trim_start().lines().next(), Some(title), "{prompt}");
         }
     }
 
