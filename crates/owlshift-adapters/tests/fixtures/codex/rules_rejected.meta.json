@@ -1,0 +1,23 @@
+{
+  "recorded": "2026-10-15",
+  "codex_version": "0.154.0",
+  "platform": "macos",
+  "confinement": "none",
+  "argv": [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--json",
+    "--ignore-user-config",
+    "-c",
+    "model_reasoning_effort=low",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "<prompt>"
+  ],
+  "prompt": "run `touch rules-probe.txt`, forbidden by a prefix_rule in $CODEX_HOME/rules/default.rules",
+  "exit_status": 0,
+  "stderr": [
+    "Reading additional input from stdin...",
+    "2026-10-15T12:00:00.000000Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"`/bin/zsh -lc 'touch rules-probe.txt'` rejected: OWL-297 probe rule\\\")\" }"
+  ]
+}
