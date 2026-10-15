@@ -135,7 +135,8 @@ mod correction;
 mod drain;
 mod intake;
 
-pub use drain::{Taken, still_ready};
+pub(crate) use drain::delivery_followed;
+pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
 
 /// The pipeline of this version: the build stage alone, in the core machine.

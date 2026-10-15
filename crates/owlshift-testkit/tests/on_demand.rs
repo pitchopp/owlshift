@@ -8224,7 +8224,18 @@ fn the_open_pr_cap_holds_the_next_build_and_is_told_once() {
     assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}");
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
     assert_eq!(roles, [Role::Intake, Role::Intake, Role::Build], "{lines}");
-    let capped: Vec<Value> = bench
+    assert_eq!(pr_caps(&bench), [json!(["DEMO-2", 1, 1])], "{lines}");
+    assert_eq!(
+        lines.matches("reached their cap (1 of 1)").count(),
+        1,
+        "{lines}"
+    );
+    assert!(!lines.contains("DEMO-2 waits: the open"), "{lines}");
+}
+
+/// The `pr_cap` decision events, each as its ticket, count and cap.
+fn pr_caps(bench: &Bench) -> Vec<Value> {
+    bench
         .events()
         .into_iter()
         .filter(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("pr_cap")))
@@ -8235,14 +8246,91 @@ fn the_open_pr_cap_holds_the_next_build_and_is_told_once() {
                 e.data["max_open_prs"]
             ])
         })
-        .collect();
-    assert_eq!(capped, [json!(["DEMO-2", 1, 1])], "{lines}");
+        .collect()
+}
+
+/// A pull request delivered by another command after the snapshot counts
+/// under the dispatch's lock (OWL-313): with `max_open_prs = 1`, DEMO-9's
+/// delivery written between the pass's snapshot and DEMO-1's dispatch holds
+/// that dispatch, and the held dispatch tells the cap in its own pass. Once
+/// DEMO-9's pull request ends, the next pass builds DEMO-1: the held
+/// dispatch kept no hold.
+#[test]
+fn a_delivery_since_the_snapshot_holds_the_dispatch() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\npriority = \"high\"\n",
+        "max_open_prs = 1\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    bench.other_ticket("DEMO-9", "In Review");
+    let demo_9 = TicketId::new("DEMO-9").unwrap();
+    let git = {
+        let env = bench.env.clone();
+        Git::with_setup("git", move |command| env.apply(command))
+    };
+    let checkout = bench.dirs().checkout();
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let (outcomes, lines, _) = bench.drain(replies, 3, |pass| match pass {
+        1 => {
+            // A `do` on DEMO-9 delivered meanwhile: its ticket at Watch,
+            // which holds no slot, its pull request followed.
+            let (env, checkout) = (bench.env.clone(), checkout.clone());
+            let record = bench.record();
+            let base = bench.remote_main();
+            *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
+                let git = Git::with_setup("git", move |command| env.apply(command));
+                let watching =
+                    TicketState::restore(Status::Active(Stage::Watch), 1, 0, 0, 0, 0).unwrap();
+                let mut delivery =
+                    owlshift_contracts::refs::TicketDelivery::new("owlshift/demo-9", "main");
+                delivery.pull_request = Some(owlshift_contracts::refs::DeliveredPullRequest {
+                    number: 9,
+                    url: "https://github.com/demo/project/pull/9".to_owned(),
+                });
+                delivery.pushed = Some(base.clone());
+                delivery.base_at_push = Some(base);
+                let other = TicketRecord {
+                    state: PersistedState::from(&watching),
+                    delivery: Some(delivery),
+                    ..record
+                };
+                let demo_9 = TicketId::new("DEMO-9").unwrap();
+                ticket_ref::write(&git, &checkout, &demo_9, &other, None).unwrap();
+            }));
+        }
+        2 => {
+            // The held dispatch told the cap in its own pass, and built
+            // nothing.
+            assert_eq!(pr_caps(&bench), [json!(["DEMO-1", 1, 1])]);
+            let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+            assert_eq!(roles, [Role::Intake]);
+            assert!(!kinds(&bench.events()).contains(&EventKind::Dispatch));
+            // Then DEMO-9's pull request is closed.
+            let stored = ticket_ref::read(&git, &checkout, &demo_9).unwrap().unwrap();
+            let mut record = stored.record;
+            record.delivery.as_mut().unwrap().ended = Some(owlshift_contracts::refs::Ended {
+                why: owlshift_contracts::refs::EndedWhy::Closed,
+                at: Timestamp::from_second(1_790_000_000).unwrap(),
+                head: None,
+            });
+            ticket_ref::write(&git, &checkout, &demo_9, &record, Some(&stored.commit)).unwrap();
+        }
+        _ => {}
+    });
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}");
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Intake, Role::Build], "{lines}");
+    assert_eq!(pr_caps(&bench), [json!(["DEMO-1", 1, 1])], "{lines}");
     assert_eq!(
         lines.matches("reached their cap (1 of 1)").count(),
         1,
         "{lines}"
     );
-    assert!(!lines.contains("DEMO-2 waits: the open"), "{lines}");
 }
 
 /// A first intake refused before any ticket ref is made is held as a
