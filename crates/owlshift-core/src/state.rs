@@ -39,6 +39,31 @@ pub const MAX_FIX_PASSES: u32 = 2;
 /// ([`Event::FixDue`], [`Event::RebaseDue`]).
 pub const MAX_REPAIRS: u32 = 6;
 
+/// Review passes at Design review or at Verify before what they leave goes
+/// to the decider: S9's bound (architecture, section 5, "The quality
+/// pipeline"). A confirmed finding of a pass before the last sends the
+/// ticket back to its author; the last pass's residue is asked, listed or
+/// proposed ([`crate::review::settle`]).
+pub const MAX_REVIEW_PASSES: u32 = 2;
+
+/// Whether review pass number `pass` (from 1, as `review.json` numbers
+/// them) is a last one: the [`MAX_REVIEW_PASSES`]th, and every pass after
+/// it, each of which follows an answered round. No [`Event::LoopBack`]
+/// follows a last pass.
+pub const fn is_last_review_pass(pass: u32) -> bool {
+    pass >= MAX_REVIEW_PASSES
+}
+
+/// The review stage of the loop `stage` belongs to: Design review for
+/// Design and Design review, Verify for Build and Verify; `None` elsewhere.
+const fn review_loop(stage: Stage) -> Option<Stage> {
+    match stage {
+        Stage::Design | Stage::DesignReview => Some(Stage::DesignReview),
+        Stage::Build | Stage::Verify => Some(Stage::Verify),
+        Stage::Intake | Stage::Ready | Stage::Deliver | Stage::Watch => None,
+    }
+}
+
 /// Where a ticket stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Status {
@@ -46,9 +71,13 @@ pub enum Status {
     /// for the scheduler to dispatch it.
     Active(Stage),
     /// Questions wait for the decider. Once they are answered the ticket
-    /// resumes at `return_to`, the stage that asked: at Intake, intake runs
-    /// again with the answers (OWL-269). A round asked at Intake before
-    /// OWL-269 returned to Ready, which refs written then still keep.
+    /// resumes at `return_to`, the round's return stage
+    /// ([`Pipeline::round_return`]): the stage that asked, but Design for a
+    /// round asked at Design review and Build for one asked at Verify, and
+    /// Design for a Build's round carrying a `replan` ([`Pipeline::replan`],
+    /// OWL-301). At Intake, intake runs again with the answers (OWL-269). A
+    /// round asked at Intake before OWL-269 returned to Ready, which refs
+    /// written then still keep.
     NeedsInput { return_to: Stage },
     /// Parked by a circuit breaker, a blocked run or an isolation breach; a
     /// human restarts it. `awaiting_input` is set when it was parked while
@@ -99,8 +128,10 @@ impl Status {
 /// | --- | --- |
 /// | The scheduler claimed a ready ticket | `Dispatched` |
 /// | A stage run returned `done`, and the stage passed | `Completed` |
-/// | A stage run returned `done` asking for a revision or a fix; at Watch, review comments on the pull request (from P5) | `LoopBack` |
-/// | A stage run returned `questions` or `premise_false` (after the resolver) | `Questions` |
+/// | A stage run returned `done` asking for a revision or a fix; a review pass before the last left confirmed findings ([`crate::review::settle`]); at Watch, review comments on the pull request (from P5) | `LoopBack` |
+/// | A stage run returned `questions` or `premise_false` (after the resolver); the last review pass left findings for the decider | `Questions` |
+/// | A Build run asked a `replan`, and a round opens for its questions, the `replan` asked or decided (after the resolver) | `ReplanRound` |
+/// | A Build run asked a `replan`, and the resolver decided every question of the run | `ReplanDecided` |
 /// | A stage run returned `blocked` | `Blocked` |
 /// | The answer check found every question answered | `Answered` |
 /// | The answer check found questions left open (they are re-asked) | `Incomplete` |
@@ -128,8 +159,22 @@ impl Status {
 pub enum Event {
     Dispatched,
     Completed,
+    /// A stage loops back ([`Pipeline::loop_back`]). From Design review or
+    /// Verify it ends a review pass, counted, and is refused after a last
+    /// pass ([`is_last_review_pass`]).
     LoopBack,
+    /// A question round opens; it returns to [`Pipeline::round_return`].
+    /// At Design review or Verify it ends a review pass, counted.
     Questions,
+    /// A round opens for a Build run that asked a `replan` (OWL-301): it
+    /// returns to [`Pipeline::replan`], Design, whose new plan is reviewed
+    /// again, or Build on `trivial`. Valid only at Build: a fix run's
+    /// `replan` at Watch is a plain question.
+    ReplanRound,
+    /// The resolver settled a Build run's `replan` with the run's other
+    /// questions, so no round opens: the ticket goes to
+    /// [`Pipeline::replan`] at once. Valid only at Build.
+    ReplanDecided,
     Blocked,
     Answered,
     Incomplete,
@@ -189,11 +234,13 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
         Self::Questions,
+        Self::ReplanRound,
+        Self::ReplanDecided,
         Self::Blocked,
         Self::Answered,
         Self::Incomplete,
@@ -340,6 +387,9 @@ impl TicketState {
     ///   waiting for input;
     /// - at most [`MAX_FIX_PASSES`] fix passes and [`MAX_REPAIRS`] repairs,
     ///   and either only at Watch.
+    ///
+    /// The state has no review pass; [`TicketState::with_review_passes`]
+    /// gives it those a ticket ref keeps, with their own rule.
     pub fn restore(
         status: Status,
         round: u32,
@@ -422,23 +472,43 @@ impl TicketState {
         self.repairs
     }
 
-    /// The review passes of the current stage (`state.json` format 4,
-    /// OWL-300): 0 until the quality pipeline's core counts them. Every
-    /// transition carries the count unchanged; when it is reset and how
-    /// far it may go are the pipeline's rules (OWL-301).
+    /// The review passes ended in the current review loop (`state.json`
+    /// format 4, OWL-300, OWL-301): Design and Design review, or Build and
+    /// Verify. A [`Event::LoopBack`] or [`Event::Questions`] from Design
+    /// review or Verify ends one; moving within the loop, a round, a park
+    /// and a restart keep the count; entering a stage of another loop or
+    /// of none resets it (Design review to Build, Verify to Deliver, a
+    /// `replan` from Build to Design). Rounds being unlimited, so is the
+    /// count: each answered round at a last pass buys one more pass.
     pub const fn review_passes(&self) -> u32 {
         self.review_passes
     }
 
+    /// The number of the review pass due at the current review loop, from
+    /// 1, as `review.json` numbers them: [`TicketState::review_passes`]
+    /// plus one, saturating. [`is_last_review_pass`] tells whether it is a
+    /// last one.
+    pub const fn review_pass_due(&self) -> u32 {
+        self.review_passes.saturating_add(1)
+    }
+
     /// This state with `review_passes` review passes, as a ticket ref keeps
-    /// them; [`TicketState::restore`] rebuilds the other parts. The count
-    /// carries no rule of its own yet (OWL-301 adds them).
-    #[must_use]
-    pub const fn with_review_passes(self, review_passes: u32) -> Self {
-        Self {
+    /// them; [`TicketState::restore`] rebuilds the other parts. Refused
+    /// above 0 outside a review loop's stages (Design, Design review, Build
+    /// and Verify, working, waiting or parked there), since leaving the
+    /// loop resets the count.
+    pub fn with_review_passes(self, review_passes: u32) -> Result<Self, InvalidState> {
+        let state = Self {
             review_passes,
             ..self
+        };
+        if review_passes > 0 && review_loop(self.stage()).is_none() {
+            return Err(InvalidState {
+                state,
+                reason: "review passes outside design, design review, build and verify",
+            });
         }
+        Ok(state)
     }
 
     /// Applies an event to this state, in the ticket's pipeline.
@@ -468,17 +538,39 @@ impl TicketState {
             }
             (Status::Active(stage), Event::LoopBack) => {
                 let target = pipeline.loop_back(stage).ok_or(invalid)?;
-                Transition::To(self.enter(Status::Active(target)))
+                if review_loop(stage) == Some(stage) && is_last_review_pass(self.review_pass_due())
+                {
+                    return Err(invalid);
+                }
+                let entered = self.enter(Status::Active(target));
+                Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
             }
-            // Every stage's round returns to it, Intake's included: intake
-            // runs again with the answers (OWL-269).
+            // A round returns to the stage that asked, Intake's included:
+            // intake runs again with the answers (OWL-269); a review stage's
+            // returns to its author.
             (Status::Active(stage), Event::Questions) if stage != Stage::Ready => {
+                let round = self.round.checked_add(1).ok_or(invalid)?;
+                let entered = Self {
+                    round,
+                    reasks: 0,
+                    ..self.enter(Status::NeedsInput {
+                        return_to: pipeline.round_return(stage),
+                    })
+                };
+                Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
+            }
+            (Status::Active(Stage::Build), Event::ReplanRound) => {
                 let round = self.round.checked_add(1).ok_or(invalid)?;
                 Transition::To(Self {
                     round,
                     reasks: 0,
-                    ..self.enter(Status::NeedsInput { return_to: stage })
+                    ..self.enter(Status::NeedsInput {
+                        return_to: pipeline.replan(),
+                    })
                 })
+            }
+            (Status::Active(Stage::Build), Event::ReplanDecided) => {
+                Transition::To(self.enter(Status::Active(pipeline.replan())))
             }
             (Status::Active(stage), Event::Blocked) if stage != Stage::Ready => {
                 self.park(ParkReason::Blocked, self.failed_runs)
@@ -624,19 +716,40 @@ impl TicketState {
     /// This state moved to `status`. The failed-run count restarts when the
     /// stage changes, and so do the fix passes and repairs, which count
     /// only at Watch: leaving it, which only review comments do (P5), ends
-    /// the delivery they counted.
+    /// the delivery they counted. The review passes are kept within a
+    /// review loop and restart when entering a stage of another loop or of
+    /// none.
     fn enter(&self, status: Status) -> Self {
         if status.stage() == self.stage() {
-            Self { status, ..*self }
-        } else {
-            Self {
-                status,
-                failed_runs: 0,
-                fix_passes: 0,
-                repairs: 0,
-                ..*self
-            }
+            return Self { status, ..*self };
         }
+        let to = review_loop(status.stage());
+        let review_passes = if to.is_some() && to == review_loop(self.stage()) {
+            self.review_passes
+        } else {
+            0
+        };
+        Self {
+            status,
+            failed_runs: 0,
+            fix_passes: 0,
+            repairs: 0,
+            review_passes,
+            ..*self
+        }
+    }
+
+    /// `entered`, the state an event leaving `stage` moved to, with the
+    /// review pass that event ended counted when `stage` is Design review or
+    /// Verify; `None` past `u32::MAX`.
+    fn end_review_pass(&self, stage: Stage, entered: Self) -> Option<Self> {
+        if review_loop(stage) != Some(stage) {
+            return Some(entered);
+        }
+        Some(Self {
+            review_passes: self.review_passes.checked_add(1)?,
+            ..entered
+        })
     }
 
     /// Parks the ticket at its current stage, remembering whether it was
@@ -790,9 +903,19 @@ mod tests {
             (Status::Active(Verify), Event::LoopBack) => Expect::To(Status::Active(Build)),
             (Status::Active(Watch), Event::LoopBack) => Expect::To(Status::Active(Build)),
 
+            (Status::Active(DesignReview), Event::Questions) => {
+                Expect::To(Status::NeedsInput { return_to: Design })
+            }
+            (Status::Active(Verify), Event::Questions) => {
+                Expect::To(Status::NeedsInput { return_to: Build })
+            }
             (Status::Active(stage), Event::Questions) if stage != Ready => {
                 Expect::To(Status::NeedsInput { return_to: stage })
             }
+            (Status::Active(Build), Event::ReplanRound) => {
+                Expect::To(Status::NeedsInput { return_to: Design })
+            }
+            (Status::Active(Build), Event::ReplanDecided) => Expect::To(Status::Active(Design)),
             (Status::Active(stage), Event::Blocked) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::Blocked)
             }
@@ -1360,17 +1483,23 @@ mod tests {
                 }
             }
         }
+        // The round cap bounds the review passes too: past the last pass
+        // only a round, which counts, ends another.
+        //
         // Every status the table test uses is reachable but the two of a
         // round that returned to Ready, asked at Intake before OWL-269, and
-        // so is each bound: the fix passes', and the repairs' below it, green
-        // having cleared the passes and not the repairs.
+        // the four of a round waiting at Design review or Verify, which
+        // returns to Design or Build since OWL-301; and so is each bound:
+        // the fix passes', the repairs' below it, green having cleared the
+        // passes and not the repairs, and a review pass past the last.
         let statuses: HashSet<_> = seen.iter().map(TicketState::status).collect();
-        assert_eq!(statuses.len(), 29);
+        assert_eq!(statuses.len(), 25);
         assert!(seen.iter().any(|s| s.fix_passes() == MAX_FIX_PASSES));
         assert!(
             seen.iter()
                 .any(|s| s.repairs() == MAX_REPAIRS && s.fix_passes() < MAX_FIX_PASSES)
         );
+        assert!(seen.iter().any(|s| s.review_passes() > MAX_REVIEW_PASSES));
         for reached in seen {
             let restored = TicketState::restore(
                 reached.status(),
@@ -1379,7 +1508,8 @@ mod tests {
                 reached.failed_runs(),
                 reached.fix_passes(),
                 reached.repairs(),
-            );
+            )
+            .and_then(|state| state.with_review_passes(reached.review_passes()));
             assert_eq!(restored, Ok(reached));
         }
     }
@@ -1456,24 +1586,180 @@ mod tests {
         );
     }
 
+    /// Applies `events` in order, each one the state must accept.
+    fn walk(from: TicketState, pipeline: Pipeline, events: &[Event]) -> TicketState {
+        events.iter().fold(from, |current, &event| {
+            match current.apply(pipeline, event) {
+                Ok(Transition::To(next) | Transition::Parked { state: next, .. }) => next,
+                other => panic!("{:?} + {event:?}: {other:?}", current.status()),
+            }
+        })
+    }
+
+    /// (status, review passes) of a state, for compact expectations.
+    fn at(state: TicketState) -> (Status, u32) {
+        (state.status(), state.review_passes())
+    }
+
+    /// Two passes, the first sending the plan back; the second's residue
+    /// asked; the answer buys one more pass, itself last; passing leaves the
+    /// loop and resets the count.
     #[test]
-    fn review_passes_are_restored_and_carried_through_every_transition() {
-        let build = state(Status::Active(Stage::Build), 1, 0, 0).with_review_passes(2);
-        assert_eq!(build.review_passes(), 2);
-        let waiting = to(build.apply(STANDARD, Event::Questions));
-        assert_eq!(waiting.review_passes(), 2);
-        let parked = match waiting.apply(STANDARD, Event::Quarantined) {
-            Ok(Transition::Parked { state, .. }) => state,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(parked.review_passes(), 2);
+    fn design_review_counts_passes_to_the_bound_and_each_answered_round_buys_one() {
+        use Event::{Answered, Completed, LoopBack, Questions};
+        let design = state(Status::Active(Stage::Design), 1, 0, 0);
+        let second = walk(design, STANDARD, &[Completed, LoopBack, Completed]);
+        assert_eq!(at(second), (Status::Active(Stage::DesignReview), 1));
+        assert_eq!(second.review_pass_due(), 2);
+        assert!(is_last_review_pass(second.review_pass_due()));
+        assert!(second.apply(STANDARD, LoopBack).is_err());
+
+        let asked = walk(second, STANDARD, &[Questions]);
         assert_eq!(
-            to(parked.apply(STANDARD, Event::Restarted)).review_passes(),
-            2
+            at(asked),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Design
+                },
+                2
+            )
+        );
+        assert_eq!(asked.round(), 2);
+        let third = walk(asked, STANDARD, &[Answered, Completed]);
+        assert_eq!(at(third), (Status::Active(Stage::DesignReview), 2));
+        assert!(third.apply(STANDARD, LoopBack).is_err());
+        assert_eq!(
+            at(walk(third, STANDARD, &[Questions])),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Design
+                },
+                3
+            )
         );
         assert_eq!(
-            to(build.apply(STANDARD, Event::Completed)).review_passes(),
-            2
+            at(walk(third, STANDARD, &[Completed])),
+            (Status::Active(Stage::Build), 0)
         );
+    }
+
+    /// Verify's loop is Build's: a fix run's own round, a park and a restart
+    /// keep the count; Verify's residue round returns to Build; passing
+    /// leaves the loop.
+    #[test]
+    fn verify_counts_passes_across_the_fix_runs_and_their_rounds() {
+        use Event::{Answered, Completed, LoopBack, Quarantined, Questions, Restarted};
+        let build = state(Status::Active(Stage::Build), 1, 0, 0);
+        let fixing = walk(build, STANDARD, &[Completed, LoopBack]);
+        assert_eq!(at(fixing), (Status::Active(Stage::Build), 1));
+        let second = walk(
+            fixing,
+            STANDARD,
+            &[Questions, Answered, Quarantined, Restarted, Completed],
+        );
+        assert_eq!(at(second), (Status::Active(Stage::Verify), 1));
+        assert!(second.apply(STANDARD, LoopBack).is_err());
+        let asked = walk(second, STANDARD, &[Questions]);
+        assert_eq!(
+            at(asked),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Build
+                },
+                2
+            )
+        );
+        let third = walk(asked, STANDARD, &[Answered, Completed]);
+        assert_eq!(at(third), (Status::Active(Stage::Verify), 2));
+        assert_eq!(
+            at(walk(third, STANDARD, &[Completed])),
+            (Status::Active(Stage::Deliver), 0)
+        );
+    }
+
+    /// A settled `replan` takes a Build back to Design, a new plan with its
+    /// review passes from zero; on `trivial` the Build runs again, its
+    /// count kept.
+    #[test]
+    fn a_settled_replan_goes_back_to_design_or_on_trivial_to_build() {
+        let trivial = Pipeline::new(Variant::Trivial);
+        let fixing = state(Status::Active(Stage::Build), 1, 0, 1)
+            .with_review_passes(1)
+            .expect("passes at Build");
+
+        let decided = to(fixing.apply(STANDARD, Event::ReplanDecided));
+        assert_eq!(at(decided), (Status::Active(Stage::Design), 0));
+        assert_eq!(decided.failed_runs(), 0);
+        let round = to(fixing.apply(STANDARD, Event::ReplanRound));
+        assert_eq!(
+            at(round),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Design
+                },
+                0
+            )
+        );
+        assert_eq!(round.round(), 2);
+
+        assert_eq!(to(fixing.apply(trivial, Event::ReplanDecided)), fixing);
+        let round = to(fixing.apply(trivial, Event::ReplanRound));
+        assert_eq!(
+            at(round),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Build
+                },
+                1
+            )
+        );
+        assert_eq!(round.failed_runs(), 1, "same stage: the failure counts");
+    }
+
+    #[test]
+    fn a_review_pass_past_u32_max_is_refused() {
+        let verify = state(Status::Active(Stage::Verify), 1, 0, 0)
+            .with_review_passes(u32::MAX)
+            .expect("passes at Verify");
+        assert_eq!(verify.review_pass_due(), u32::MAX);
+        assert!(verify.apply(STANDARD, Event::Questions).is_err());
+    }
+
+    #[test]
+    fn review_passes_are_kept_only_in_a_review_loop() {
+        let parked = |at, awaiting_input| Status::Parked { at, awaiting_input };
+        for status in [
+            Status::Active(Stage::Design),
+            Status::Active(Stage::DesignReview),
+            Status::NeedsInput {
+                return_to: Stage::Build,
+            },
+            parked(Stage::Verify, true),
+        ] {
+            let base = baseline(status).expect("a valid status");
+            assert_eq!(
+                base.with_review_passes(3).map(|s| s.review_passes()),
+                Ok(3),
+                "{status:?}"
+            );
+        }
+        for status in [
+            Status::Active(Stage::Intake),
+            Status::Active(Stage::Ready),
+            parked(Stage::Deliver, false),
+            Status::NeedsInput {
+                return_to: Stage::Watch,
+            },
+        ] {
+            let base = baseline(status).expect("a valid status");
+            assert_eq!(base.with_review_passes(0), Ok(base));
+            let error = base.with_review_passes(1).expect_err("outside a loop");
+            assert!(
+                error
+                    .to_string()
+                    .ends_with("review passes outside design, design review, build and verify"),
+                "{error}"
+            );
+        }
     }
 }

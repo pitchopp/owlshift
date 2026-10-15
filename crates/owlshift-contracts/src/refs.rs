@@ -251,7 +251,7 @@ impl TryFrom<&PersistedState> for TicketState {
             persisted.fix_passes,
             persisted.repairs,
         )
-        .map(|state| state.with_review_passes(persisted.review_passes))
+        .and_then(|state| state.with_review_passes(persisted.review_passes))
         .map_err(|error| ContractError::invalid(PersistedState::CONTRACT, error.to_string()))
     }
 }

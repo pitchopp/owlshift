@@ -14,11 +14,14 @@ use crate::review::{
     Finding, FindingResponse, FindingsMode, MAX_FINDINGS, Plan, Ruling, check_answers,
     check_findings,
 };
-use crate::{Harness, Role, Tier, Variant};
+use crate::{Role, Variant};
 
 /// The answer check's classes live in the core, which folds them into one
 /// state-machine event.
 pub use owlshift_core::vocab::AnswerClass;
+/// The routing verdict and its effort levels live in the core, which
+/// resolves each run's routing from them (OWL-301).
+pub use owlshift_core::vocab::{Effort, Routing};
 
 pub(crate) const CONTRACT: &str = "result.json";
 
@@ -185,43 +188,6 @@ pub struct IntakeVerdict {
     #[serde(default)]
     #[schemars(length(max = MAX_DEPENDENCIES))]
     pub dependencies: Vec<IntakeDependency>,
-}
-
-/// The routing verdict: the harness, tier and effort of the ticket's runs
-/// (section 9, "One routing verdict per ticket").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Routing {
-    pub harness: Harness,
-    pub tier: Tier,
-    pub effort: Effort,
-}
-
-/// How hard a model thinks, as `claude --effort` names its levels (checked
-/// on 2026-10-13 with Claude Code 2.1.296: `claude --help` lists `low`,
-/// `medium`, `high`, `xhigh` and `max`). A harness with other levels maps
-/// from these when routing follows the verdict (P5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl Effort {
-    /// The value `claude --effort` takes.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
 }
 
 /// A ticket the intake role found this one depends on: its identifier and

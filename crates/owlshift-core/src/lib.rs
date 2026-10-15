@@ -20,6 +20,9 @@
 //! | Scheduler | [`schedule`]; dependencies to relations, [`dependency`] |
 //! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
 //! | A follow-up proposal's title, for its fingerprint | [`proposal`] |
+//! | A review pass settled: each finding's fate, where the ticket goes | [`review`] |
+//! | Who reviews, per variant, and the critic's stand-in | [`roster`] |
+//! | Per-ticket routing: harness, tier and effort of each run | [`routing`] |
 
 pub mod agent_env;
 pub mod decider;
@@ -31,6 +34,9 @@ pub mod pipeline;
 pub mod proposal;
 pub mod reply;
 pub mod resource;
+pub mod review;
+pub mod roster;
+pub mod routing;
 pub mod schedule;
 pub mod state;
 pub mod ticket;

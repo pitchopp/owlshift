@@ -132,6 +132,68 @@ pub enum PlanApproval {
     Never,
 }
 
+/// The routing verdict: the harness, tier and effort of the ticket's runs
+/// (section 9, "One routing verdict per ticket").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Routing {
+    pub harness: Harness,
+    pub tier: Tier,
+    pub effort: Effort,
+}
+
+/// How hard a model thinks, as `claude --effort` names its levels (checked
+/// on 2026-10-13 with Claude Code 2.1.296: `claude --help` lists `low`,
+/// `medium`, `high`, `xhigh` and `max`). A harness with other levels maps
+/// from these when routing follows the verdict (P5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    /// The value `claude --effort` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// How much a finding weighs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Blocker,
+    Major,
+    Minor,
+}
+
+/// A review mandate (architecture section 5, "The roster").
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Mandate {
+    /// What breaks the work: a premise that does not hold, a case left out,
+    /// a simpler way.
+    Critic,
+    /// The plan or the diff against the ticket's criteria, the decider's
+    /// answers and the project's rules.
+    Conformance,
+    /// What the change does to the code around it.
+    Debt,
+}
+
 /// How the decider's answers left one question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

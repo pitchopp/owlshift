@@ -59,14 +59,18 @@ fn written_and_read(state: &TicketState, schema: &jsonschema::Validator) -> Tick
 #[test]
 fn every_reachable_state_survives_a_write_and_a_read_back() {
     let schema = schema_validator();
-    for variant in [Variant::Standard, Variant::Trivial] {
+    for variant in [Variant::Standard, Variant::Trivial, Variant::Risky] {
         let states = reachable(Pipeline::new(variant));
         for state in &states {
             assert_eq!(written_and_read(state, &schema), *state, "{variant:?}");
         }
         if variant == Variant::Standard {
             let statuses: HashSet<_> = states.iter().map(TicketState::status).collect();
-            assert_eq!(statuses.len(), 29, "every status the machine has");
+            assert_eq!(statuses.len(), 25, "every status the machine has");
+            assert!(
+                states.iter().any(|state| state.review_passes() > 0),
+                "review passes are written and read back"
+            );
         }
     }
 }
