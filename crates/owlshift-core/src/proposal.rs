@@ -7,6 +7,16 @@
 /// spaces at either end dropped (OWL-253), so that "Add X." and "add x"
 /// are one proposal. Every other character is such a run: "Résumé" reads
 /// `r sum`.
+///
+/// # Examples
+///
+/// ```
+/// use owlshift_core::proposal::normalize_title;
+///
+/// assert_eq!(normalize_title("Add X."), normalize_title("add x"));
+/// assert_eq!(normalize_title("Add X."), "add x");
+/// assert_eq!(normalize_title("Résumé"), "r sum");
+/// ```
 pub fn normalize_title(title: &str) -> String {
     title
         .split(|c: char| !c.is_ascii_alphanumeric())
