@@ -6,6 +6,7 @@
 pub mod agent_env;
 pub mod answer_check;
 pub mod artifact;
+pub mod codex_machine;
 pub mod config;
 pub mod doctor;
 pub mod events;

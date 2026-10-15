@@ -38,6 +38,7 @@ use owlshift_platform::keychain::SERVICE;
 use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
 use serde_json::Value;
 
+use crate::codex_machine::{self, Declared, FULL_ACCESS};
 use crate::config::{Effective, FileState, exit_text};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::executor::{
@@ -264,6 +265,10 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     // A missing `claude` fails its own line: its agent login is not asked.
     if harnesses.contains(&Harness::Claude) && system.locate("claude").is_some() {
         checks.push(agent_login_check(system));
+    }
+    if harnesses.contains(&Harness::Codex) && system.locate("codex").is_some() {
+        checks.push(codex_machine_config_check(system));
+        checks.extend(codex_requirements_check(system));
     }
     checks.push(file_check("project config", &config.project, home));
     checks.push(file_check("personal config", &config.personal, home));
@@ -630,6 +635,165 @@ fn agent_login_check(system: &dyn System) -> Check {
     }
 }
 
+/// The MCP servers and hooks the machine's Codex configuration declares
+/// (OWL-314). They are its administrator's, accepted as Claude Code's
+/// managed settings are (`docs/design/runtime-and-operations.md`, "Codex
+/// routing"), so only a warning: they reach every Codex agent run whatever
+/// the adapter's flags. Each file is read on its own, and every finding and
+/// every unreadable file is named.
+fn codex_machine_config_check(system: &dyn System) -> Check {
+    const SUBJECT: &str = "codex machine config";
+    let mut declared = Vec::new();
+    let mut unreadable = Vec::new();
+    for path in [codex_machine::CONFIG, codex_machine::MANAGED_CONFIG] {
+        match system.read_text_file(Path::new(path)) {
+            Ok(None) => {}
+            Ok(Some(text)) => match codex_machine::declared(&text) {
+                Ok(found) if found.is_empty() => {}
+                Ok(found) => declared.push(format!("{path} declares {}", declarations(&found))),
+                Err(error) => unreadable.push(format!("{path} {error}")),
+            },
+            Err(error) => unreadable.push(format!("{path} could not be read: {error}")),
+        }
+    }
+    if declared.is_empty() && unreadable.is_empty() {
+        return Check::ok(
+            Section::AgentIsolation,
+            SUBJECT,
+            format!(
+                "no MCP server or hook in {} or {}",
+                codex_machine::CONFIG,
+                codex_machine::MANAGED_CONFIG
+            ),
+        );
+    }
+    let mut why = DOES_NOT_BLOCK.to_owned();
+    if !declared.is_empty() {
+        why.push_str(
+            " the machine's Codex configuration is its administrator's, accepted as Claude \
+             Code's managed settings are: its MCP servers start, and its hooks run with no trust \
+             prompt, in every Codex agent run, whatever Owlshift's flags. Remove them from the \
+             file if agent runs should not have them.",
+        );
+    }
+    if !unreadable.is_empty() {
+        why.push_str(
+            " Codex reads these files in every run, so what an unreadable one declares may \
+             reach every Codex agent run too.",
+        );
+    }
+    Check::warn(
+        Section::AgentIsolation,
+        SUBJECT,
+        [declared, unreadable].concat().join("; "),
+        why,
+    )
+}
+
+/// `found`'s servers and hooks, each name escaped.
+fn declarations(found: &Declared) -> String {
+    let names = |names: &[String]| {
+        names
+            .iter()
+            .map(|name| format!("`{}`", name.escape_debug()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = Vec::new();
+    if !found.mcp_servers.is_empty() {
+        parts.push(format!("MCP servers {}", names(&found.mcp_servers)));
+    }
+    if !found.hooks.is_empty() {
+        parts.push(format!("hooks on {}", names(&found.hooks)));
+    }
+    parts.join(" and ")
+}
+
+/// Whether the machine's Codex requirements let a Codex agent run start
+/// (OWL-314): one that refuses [`FULL_ACCESS`] stops every run, so Codex is
+/// not ready, which [`critic_stands_in_without_codex`] makes its warning.
+/// `None` when the machine has no requirements file.
+fn codex_requirements_check(system: &dyn System) -> Option<Check> {
+    const SUBJECT: &str = "codex requirements";
+    let path = codex_machine::REQUIREMENTS;
+    let unknown = |detail: String| {
+        Check::warn(
+            Section::AgentIsolation,
+            SUBJECT,
+            detail,
+            format!(
+                "{DOES_NOT_BLOCK} Codex reads this file before every run; Owlshift could not \
+                 tell whether it lets Codex agent runs start, which needs `{FULL_ACCESS}` in its \
+                 `allowed_sandbox_modes` if it has one."
+            ),
+        )
+    };
+    let text = match system.read_text_file(Path::new(path)) {
+        Ok(None) => return None,
+        Ok(Some(text)) => text,
+        Err(error) => return Some(unknown(format!("{path} could not be read: {error}"))),
+    };
+    let required = match codex_machine::requirements(&text) {
+        Ok(required) => required,
+        Err(error) => return Some(unknown(format!("{path} {error}"))),
+    };
+    let hooks = required
+        .managed_hooks_dir
+        .as_deref()
+        .map(|dir| format!("; a managed hooks folder, `{}`", dir.escape_debug()))
+        .unwrap_or_default();
+    if required.refuses_full_access() {
+        let allowed = match required
+            .allowed_sandbox_modes
+            .as_deref()
+            .unwrap_or_default()
+        {
+            [] => "no sandbox mode".to_owned(),
+            modes => format!(
+                "only {}",
+                modes
+                    .iter()
+                    .map(|mode| format!("`{mode}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let refused = Check::fail(
+            Section::AgentIsolation,
+            SUBJECT,
+            format!(
+                "{path} allows {allowed}, and a Codex agent run needs `{FULL_ACCESS}`, Owlshift \
+                 confining it in Codex's stead: every Codex agent run stops before it \
+                 starts{hooks}"
+            ),
+            harness_why(Harness::Codex),
+            vec![Step::act(format!(
+                "Have the machine's administrator add \"{FULL_ACCESS}\" to \
+                 `allowed_sandbox_modes` in {path}"
+            ))],
+        );
+        return Some(critic_stands_in_without_codex(refused, Harness::Codex));
+    }
+    let allows = match required.allowed_sandbox_modes {
+        Some(_) => format!("{path} allows `{FULL_ACCESS}`"),
+        None => format!("{path} sets no `allowed_sandbox_modes`"),
+    };
+    Some(if hooks.is_empty() {
+        Check::ok(Section::AgentIsolation, SUBJECT, allows)
+    } else {
+        Check::warn(
+            Section::AgentIsolation,
+            SUBJECT,
+            format!("{allows}{hooks}"),
+            format!(
+                "{DOES_NOT_BLOCK} the hooks of a managed hooks folder are the machine \
+                 administrator's, as its configuration's are; whether they run in a Codex agent \
+                 run was not tried, so take them to run in every one."
+            ),
+        )
+    })
+}
+
 /// The step that fixes a keychain doctor cannot read.
 const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on macOS; on Linux, \
                             start a Secret Service such as GNOME Keyring";
@@ -700,7 +864,8 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
     critic_stands_in_without_codex(result, harness)
 }
 
-/// Codex that is missing, logged out or unreadable is a warning, never a
+/// Codex that is missing, logged out, unreadable or stopped by the machine's
+/// requirements ([`codex_requirements_check`], OWL-314) is a warning, never a
 /// failure: without it, the critic of the review roles runs on Claude Code
 /// instead (architecture section 5, "Without Codex"), so it is not a problem
 /// to fix before `do` (OWL-102, OWL-299). The decision is made here and only
@@ -1880,6 +2045,7 @@ mod tests {
         }
         expected.extend([
             (Section::AgentIsolation, "claude agent login"),
+            (Section::AgentIsolation, "codex machine config"),
             (Section::Project, "project config"),
             (Section::Project, "personal config"),
             (Section::Project, "tracker"),
@@ -2534,11 +2700,102 @@ mod tests {
                 "claude --version",
                 Answer::Exit(0, "2.1.283 (Claude Code)\n", ""),
             )
-            .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""));
+            .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""))
+            .text_file(
+                codex_machine::REQUIREMENTS,
+                Ok("allowed_sandbox_modes = [\"read-only\"]"),
+            );
         let report = run(&system, &config);
 
         assert!(report.ready(), "{report}");
-        assert!(report.checks.iter().all(|check| check.subject != "codex"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| !check.subject.starts_with("codex")),
+            "{report}"
+        );
+    }
+
+    /// OWL-314: the MCP servers and hooks of `/etc/codex` are named as the
+    /// operator's, each file read on its own; what an unreadable file holds
+    /// never reaches the report, only its line.
+    #[test]
+    fn the_machines_codex_config_is_named_as_the_operators() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+            .text_file(
+                codex_machine::CONFIG,
+                Ok("[mcp_servers.search]\ncommand = \"search-mcp\"\n\n\
+                    [[hooks.SessionStart]]\nhooks = [{ type = \"command\", command = \"mark\" }]\n"),
+            )
+            .text_file(
+                codex_machine::MANAGED_CONFIG,
+                Ok("[mcp_servers.tracker]\nbearer = sk-secret-value\n"),
+            )
+            .text_file(codex_machine::REQUIREMENTS, Err("permission denied"));
+        let report = run(&system, &no_config());
+
+        assert!(report.ready(), "{report}");
+        let config = line(&report, "codex machine config");
+        assert_eq!(config.status, Status::Warn);
+        assert_eq!(
+            config.detail,
+            "/etc/codex/config.toml declares MCP servers `search` and hooks on \
+             `SessionStart`; /etc/codex/managed_config.toml is not valid TOML (line 2)"
+        );
+        assert!(config.why.as_deref().unwrap().contains("administrator's"));
+        let requirements = line(&report, "codex requirements");
+        assert_eq!(requirements.status, Status::Warn);
+        assert_eq!(
+            requirements.detail,
+            "/etc/codex/requirements.toml could not be read: permission denied"
+        );
+        for shown in [report.to_string(), report.to_json().to_string()] {
+            assert!(!shown.contains("sk-secret"), "{shown}");
+        }
+    }
+
+    /// OWL-314: requirements refusing `danger-full-access` stop every Codex
+    /// agent run, so Codex is not ready, which is the critic's stand-in
+    /// warning; a managed hooks folder is named either way.
+    #[test]
+    fn requirements_refusing_full_access_make_codex_not_ready() {
+        let hooks = "\n[hooks]\nmanaged_dir = \"/etc/codex/hooks\"\n";
+        let refusing = format!("allowed_sandbox_modes = [\"read-only\"]\n{hooks}");
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+            .text_file(codex_machine::REQUIREMENTS, Ok(refusing.as_str()));
+        let report = run(&system, &no_config());
+
+        assert!(report.ready(), "{report}");
+        assert_eq!(line(&report, "codex machine config").status, Status::Ok);
+        let refused = line(&report, "codex requirements");
+        assert_eq!(refused.status, Status::Warn);
+        assert_eq!(
+            refused.detail,
+            "/etc/codex/requirements.toml allows only `read-only`, and a Codex agent run needs \
+             `danger-full-access`, Owlshift confining it in Codex's stead: every Codex agent run \
+             stops before it starts; a managed hooks folder, `/etc/codex/hooks`"
+        );
+        assert_eq!(
+            refused.why.as_deref(),
+            Some(
+                "Does not block `owlshift do`: without Codex, the critic of the review roles runs \
+                 on Claude Code instead, a model of the same family as the author's. To get it \
+                 ready: Have the machine's administrator add \"danger-full-access\" to \
+                 `allowed_sandbox_modes` in /etc/codex/requirements.toml."
+            )
+        );
+
+        let allowing = format!("allowed_sandbox_modes = [\"danger-full-access\"]\n{hooks}");
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+            .text_file(codex_machine::REQUIREMENTS, Ok(allowing.as_str()));
+        let allowed = run(&system, &no_config());
+        let allowed = line(&allowed, "codex requirements");
+        assert_eq!(allowed.status, Status::Warn);
+        assert!(
+            allowed.detail.ends_with("`/etc/codex/hooks`"),
+            "{allowed:?}"
+        );
     }
 
     /// The next command follows the project file: `owlshift do` with one,

@@ -55,6 +55,17 @@ pub trait System {
     fn is_file(&self, path: &Path) -> bool {
         path.is_file()
     }
+    /// The text of the file at `path`, `None` when there is none. The error
+    /// says why it could not be read in Owlshift's words, never what the
+    /// file holds. Only `owlshift doctor` asks, for the machine's Codex
+    /// configuration ([`crate::codex_machine`], OWL-314).
+    fn read_text_file(&self, path: &Path) -> Result<Option<String>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.kind().to_string()),
+        }
+    }
     /// Whether agent runs can be confined here (OWL-41).
     fn sandbox(&self) -> Result<(), SandboxError> {
         owlshift_platform::sandbox::available()
@@ -279,6 +290,10 @@ pub(crate) mod fake {
         ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
         /// Files that are not there; every other one is.
         missing_files: Vec<PathBuf>,
+        /// What reading a text file gives; a file not here has no text,
+        /// whatever [`Self::missing_files`] says, so no test reads the real
+        /// `/etc/codex`.
+        texts: HashMap<PathBuf, Result<String, String>>,
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
@@ -291,6 +306,15 @@ pub(crate) mod fake {
         /// There is no file at `path`.
         pub(crate) fn without_file(mut self, path: &str) -> Self {
             self.missing_files.push(PathBuf::from(path));
+            self
+        }
+
+        /// Reading the text file at `path` gives this text, or this error.
+        pub(crate) fn text_file(mut self, path: &str, answer: Result<&str, &str>) -> Self {
+            self.texts.insert(
+                PathBuf::from(path),
+                answer.map(str::to_owned).map_err(str::to_owned),
+            );
             self
         }
 
@@ -447,6 +471,11 @@ pub(crate) mod fake {
 
         fn is_file(&self, path: &Path) -> bool {
             !self.missing_files.iter().any(|missing| missing == path)
+        }
+
+        /// Only the files [`Self::text_file`] scripted; never the disk.
+        fn read_text_file(&self, path: &Path) -> Result<Option<String>, String> {
+            self.texts.get(path).cloned().transpose()
         }
 
         fn data_dir(&self) -> Option<(PathBuf, DataDirSource)> {
