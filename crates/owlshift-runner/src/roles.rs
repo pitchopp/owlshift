@@ -68,6 +68,25 @@ pub const REBASE_ROLE: &str = include_str!("../../../roles/rebase.md");
 /// take an admitted ticket in (OWL-248).
 pub const INTAKE_ROLE: &str = include_str!("../../../roles/intake.md");
 
+/// The default design role prompt, `roles/design.md`, as this binary was
+/// built with it: the plan a ticket's Build follows (OWL-302, architecture
+/// section 5, "The quality pipeline").
+pub const DESIGN_ROLE: &str = include_str!("../../../roles/design.md");
+
+/// The default design review role prompt, `roles/design_review.md`, as this
+/// binary was built with it: one reviewer of the plan, its mandates in the
+/// brief (OWL-302).
+pub const DESIGN_REVIEW_ROLE: &str = include_str!("../../../roles/design_review.md");
+
+/// The default verify role prompt, `roles/verify.md`, as this binary was
+/// built with it: one reviewer of the Build's diff before the push
+/// (OWL-302).
+pub const VERIFY_ROLE: &str = include_str!("../../../roles/verify.md");
+
+/// The default arbiter role prompt, `roles/arbiter.md`, as this binary was
+/// built with it: the ruling on a review pass's findings (OWL-302).
+pub const ARBITER_ROLE: &str = include_str!("../../../roles/arbiter.md");
+
 /// Reads `<roles_dir>/<role>.md` and strips its front matter, per
 /// [`owlshift_contracts::format::strip_role_front_matter`].
 pub fn load_role_prompt(roles_dir: &Path, role: Role) -> Result<String, RoleLoadError> {
@@ -121,6 +140,15 @@ mod tests {
         assert!(prompt.trim_start().starts_with("# Rebase"), "{prompt}");
         let prompt = format::strip_role_front_matter(Role::Intake, INTAKE_ROLE).expect("strips");
         assert!(prompt.trim_start().starts_with("# Intake"), "{prompt}");
+        for (role, text, title) in [
+            (Role::Design, DESIGN_ROLE, "# Design\n"),
+            (Role::DesignReview, DESIGN_REVIEW_ROLE, "# Design review\n"),
+            (Role::Verify, VERIFY_ROLE, "# Verify\n"),
+            (Role::Arbiter, ARBITER_ROLE, "# Arbiter\n"),
+        ] {
+            let prompt = format::strip_role_front_matter(role, text).expect("strips");
+            assert!(prompt.trim_start().starts_with(title), "{prompt}");
+        }
     }
 
     #[test]

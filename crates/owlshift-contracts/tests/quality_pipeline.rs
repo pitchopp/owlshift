@@ -365,9 +365,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
             json!({ "mandates": ["critic"], "pass": 1, "diff": diff }),
         )
     };
-    let findings_with = |mode: &str, diff: &Value| {
-        json!({ "mode": mode, "findings": [finding("F1")], "diff": diff })
-    };
+    let findings_with = |mode: &str, diff: &Value| json!({ "mode": mode, "findings": [finding("F1")], "diff": diff });
     parse(&review_with("verify", &diff)).unwrap();
     parse(&with(
         brief("arbiter"),

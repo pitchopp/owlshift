@@ -12,11 +12,12 @@ use owlshift_contracts::format::{RESULT_FORMAT, strip_role_front_matter};
 use owlshift_contracts::result::{
     AnswerClass, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES, Resolution, RunResult,
 };
+use owlshift_contracts::review::{MAX_FINDING_BYTES, MAX_FINDINGS, MAX_PLAN_BYTES, RulingOutcome};
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
 use owlshift_core::gate::{GatePolicy, Route};
 use owlshift_core::vocab::PlanApproval;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The line budget of the build prompt, which the harness re-reads every run.
 const BUILD_MAX_LINES: usize = 120;
@@ -72,11 +73,10 @@ const INTAKE_ONLY: &[&str] = &[
 ];
 
 /// `result.json` fields and values of the quality pipeline (OWL-300) that
-/// roles/build.md does not name yet: the design role's plan and approval,
-/// the review roles' findings and the arbiter's rulings, which a build
-/// result carrying them is refused for, and Build's own `replan` and
-/// `finding_responses`, which OWL-302 teaches it and then takes out of
-/// this list.
+/// only other roles write: the design role's plan and approval, the review
+/// roles' findings and the arbiter's rulings, which a build result carrying
+/// them is refused for. Build's own `replan` and `finding_responses` are
+/// in its prompt since OWL-302.
 const QUALITY_PIPELINE: &[&str] = &[
     "plan",
     "goal",
@@ -105,11 +105,6 @@ const QUALITY_PIPELINE: &[&str] = &[
     "settle",
     "rulings",
     "confirmed",
-    "rejected",
-    "finding",
-    "finding_responses",
-    "fixed",
-    "replan",
 ];
 
 /// Brief fields the build prompt relies on, as dotted paths from the brief's
@@ -141,6 +136,9 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "decisions_refused",
     "refused_choices.question",
     "refused_choices.recorded",
+    "plan.plan",
+    "plan.base",
+    "findings.mode",
     "result_path",
 ];
 
@@ -432,6 +430,7 @@ fn build_brief_fields_exist() {
             &["decider", "owlshift", "other"][..],
         ),
         ("permissions.level", &["write_worktree"][..]),
+        ("findings.mode", &["answer", "fix"][..]),
     ] {
         let path: Vec<&str> = field.split('.').collect();
         let allowed: BTreeSet<String> = resolve(&brief, &brief, &path)
@@ -756,4 +755,312 @@ fn intake_example_result_parses() {
             .all(|d| d.quote.contains(d.ticket.as_str())),
         "each example dependency's quote names its ticket"
     );
+}
+
+/// The JSON example of `roles/<file>`, which holds exactly one.
+fn the_example(file: &str) -> Value {
+    let text = prompt(file);
+    let blocks = json_examples(&text);
+    assert_eq!(blocks.len(), 1, "roles/{file} holds one json example");
+    serde_json::from_str(blocks[0])
+        .unwrap_or_else(|e| panic!("the example in roles/{file} is not JSON: {e}"))
+}
+
+/// A brief of the quality pipeline's `role` (OWL-302): the fixture's, made
+/// a brief of that role, with what the role is given at its stage. The plan
+/// is design.md's example and the findings design_review.md's, so the
+/// prompts' examples read as one ticket's.
+fn quality_pipeline_brief(role: Role) -> Brief {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/brief.json");
+    let mut brief: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    brief["role"] = role.as_str().into();
+    let object = brief.as_object_mut().unwrap();
+    for build_only in ["checkpoint", "gate_failure", "result_refusal"] {
+        object.remove(build_only);
+    }
+    brief["permissions"]["level"] = "read_only".into();
+    let plan = json!({ "base": "a".repeat(40), "plan": the_example("design.md")["plan"] });
+    let diff = json!({ "base": "b".repeat(40), "path": ".owlshift/diff.patch" });
+    let review = |diff: Option<&Value>| {
+        let mut review = json!({ "mandates": ["critic", "conformance"], "pass": 1 });
+        if let Some(diff) = diff {
+            review["diff"] = diff.clone();
+        }
+        review
+    };
+    match role {
+        Role::Design => {}
+        Role::DesignReview => {
+            brief["plan"] = plan;
+            brief["review"] = review(None);
+        }
+        Role::Verify => {
+            brief["plan"] = plan;
+            brief["review"] = review(Some(&diff));
+        }
+        Role::Arbiter => {
+            let mut findings = the_example("design_review.md")["findings"].clone();
+            let mut again = findings[0].clone();
+            again["id"] = "F3".into();
+            findings.as_array_mut().unwrap().push(again);
+            brief["plan"] = plan;
+            brief["findings"] = json!({ "mode": "rule", "findings": findings, "diff": diff });
+        }
+        other => panic!("{} is not a quality pipeline role", other.as_str()),
+    }
+    Brief::parse(&brief.to_string()).unwrap_or_else(|e| panic!("{}: {e}", role.as_str()))
+}
+
+/// The checks every prompt of the quality pipeline passes (OWL-302): its
+/// front matter, the format sentence, the result fields and values it
+/// writes, the brief fields it reads, its dotted fields, and its one
+/// example, a result its role may give. Returns the prompt and the example.
+fn quality_pipeline_prompt(role: Role, writes: &[&str], reads: &[&str]) -> (String, RunResult) {
+    let file = format!("{}.md", role.as_str());
+    let text = prompt(&file);
+    strip_role_front_matter(role, &text).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        text.contains(&format!("JSON with `format` {RESULT_FORMAT},")),
+        "roles/{file} does not say result.json has `format` {RESULT_FORMAT}"
+    );
+    let mut result_words = BTreeSet::new();
+    names_and_values(&generated("result"), &mut result_words);
+    for word in writes {
+        assert!(result_words.contains(*word), "the result takes no {word:?}");
+        assert!(names(&text, word), "roles/{file} does not name {word}");
+    }
+    brief_fields_exist(&file, &text, reads);
+    dotted_fields_exist(&file, &text);
+    let example = the_example(&file).to_string();
+    let result = RunResult::parse_against(&example, &quality_pipeline_brief(role)).unwrap_or_else(
+        |refused| {
+            panic!(
+                "the example in roles/{file} is refused from its role: {}",
+                refused.error
+            )
+        },
+    );
+    (text, result)
+}
+
+/// The words of a review run's result.
+const REVIEW_WRITES: &[&str] = &[
+    "format",
+    "status",
+    "summary",
+    "findings",
+    "id",
+    "severity",
+    "blocker",
+    "major",
+    "minor",
+    "claim",
+    "evidence",
+    "criterion",
+    "settle",
+    "done",
+    "blocked",
+    "failed",
+];
+
+/// A review prompt states the bounds on findings and names every mandate.
+fn review_prompt_names_bounds_and_mandates(file: &str, text: &str) {
+    let bounds = format!(
+        "At most {MAX_FINDINGS} findings, each at most {MAX_FINDING_BYTES} bytes rendered as JSON"
+    );
+    assert!(
+        text.contains(&bounds),
+        "roles/{file} does not state: {bounds}"
+    );
+    let brief = generated("brief");
+    let mut mandates = BTreeSet::new();
+    names_and_values(&brief["$defs"]["Mandate"], &mut mandates);
+    assert_eq!(mandates.len(), 3, "the mandates changed: {mandates:?}");
+    for mandate in &mandates {
+        assert!(names(text, mandate), "roles/{file} does not name {mandate}");
+    }
+}
+
+#[test]
+fn design_prompt_matches_the_contracts() {
+    let (text, result) = quality_pipeline_prompt(
+        Role::Design,
+        &[
+            "format",
+            "status",
+            "summary",
+            "plan",
+            "goal",
+            "criteria",
+            "approach",
+            "alternatives",
+            "reason",
+            "files",
+            "steps",
+            "what",
+            "test",
+            "risks",
+            "out_of_scope",
+            "forks",
+            "choice",
+            "options",
+            "approval",
+            "approved",
+            "changed",
+            "finding_responses",
+            "finding",
+            "outcome",
+            "fixed",
+            "rejected",
+            "questions",
+            "id",
+            "category",
+            "context",
+            "text",
+            "recommendation",
+            "decisions",
+            "done",
+            "blocked",
+            "premise_false",
+            "failed",
+        ],
+        &[
+            "ticket.description",
+            "ticket.author.relation",
+            "decider",
+            "thread.author.relation",
+            "thread.type",
+            "thread.decision",
+            "thread.question",
+            "thread.reversed",
+            "rules.text",
+            "rules.source",
+            "rules.applies_to",
+            "zones",
+            "always_human",
+            "plan.plan",
+            "plan.base",
+            "approval",
+            "findings.mode",
+            "result_path",
+        ],
+    );
+    let bounds = format!(
+        "at most {MAX_QUESTIONS} questions, each at most {MAX_QUESTION_BYTES} bytes, \
+         all together at most {MAX_QUESTIONS_BYTES} bytes."
+    );
+    assert!(
+        text.contains(&bounds),
+        "roles/design.md does not state: {bounds}"
+    );
+    let plan_bound = format!("at most {MAX_PLAN_BYTES} bytes rendered as JSON");
+    assert!(
+        text.contains(&plan_bound),
+        "roles/design.md does not state: {plan_bound}"
+    );
+    let missing: Vec<_> = FloorCategory::ALL
+        .iter()
+        .map(|c| c.token())
+        .filter(|token| !text.contains(&format!("`{token}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "roles/design.md does not name: {missing:?}"
+    );
+    for mode in ["fix", "answer"] {
+        assert!(names(&text, mode), "roles/design.md does not name {mode}");
+    }
+    let plan = result.plan.expect("the example gives a plan");
+    assert!(!plan.forks.is_empty(), "the example names a fork");
+}
+
+#[test]
+fn design_review_prompt_matches_the_contracts() {
+    let (text, result) = quality_pipeline_prompt(
+        Role::DesignReview,
+        REVIEW_WRITES,
+        &[
+            "ticket.description",
+            "ticket.author.relation",
+            "decider",
+            "thread.author.relation",
+            "thread.decision",
+            "rules.text",
+            "rules.source",
+            "plan.plan",
+            "plan.base",
+            "review.mandates",
+            "review.pass",
+            "result_path",
+        ],
+    );
+    review_prompt_names_bounds_and_mandates("design_review.md", &text);
+    assert!(!result.findings.is_empty(), "the example gives findings");
+}
+
+#[test]
+fn verify_prompt_matches_the_contracts() {
+    let (text, result) = quality_pipeline_prompt(
+        Role::Verify,
+        REVIEW_WRITES,
+        &[
+            "ticket.description",
+            "ticket.author.relation",
+            "decider",
+            "thread.author.relation",
+            "thread.decision",
+            "rules.text",
+            "rules.source",
+            "plan.plan",
+            "plan.base",
+            "review.mandates",
+            "review.pass",
+            "review.diff.base",
+            "review.diff.path",
+            "result_path",
+        ],
+    );
+    review_prompt_names_bounds_and_mandates("verify.md", &text);
+    assert!(!result.findings.is_empty(), "the example gives findings");
+}
+
+#[test]
+fn arbiter_prompt_matches_the_contracts() {
+    let (_, result) = quality_pipeline_prompt(
+        Role::Arbiter,
+        &[
+            "format",
+            "status",
+            "summary",
+            "rulings",
+            "finding",
+            "outcome",
+            "reason",
+            "confirmed",
+            "rejected",
+            "done",
+            "failed",
+        ],
+        &[
+            "ticket.description",
+            "ticket.author.relation",
+            "decider",
+            "thread.author.relation",
+            "thread.decision",
+            "rules.text",
+            "rules.source",
+            "findings.findings",
+            "findings.diff.base",
+            "findings.diff.path",
+            "plan.plan",
+            "plan.base",
+            "result_path",
+        ],
+    );
+    for outcome in [RulingOutcome::Confirmed, RulingOutcome::Rejected] {
+        assert!(
+            result.rulings.iter().any(|r| r.outcome == outcome),
+            "the example gives no {outcome:?} ruling"
+        );
+    }
 }
