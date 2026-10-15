@@ -214,6 +214,7 @@ fn a_question_round_through_the_app_reaches_its_decider() {
             text: "Did Linear notify you of this comment?".to_owned(),
             options: Vec::new(),
             recommendation: None,
+            replan: false,
         }],
         premise_false: false,
         decided: 0,
@@ -330,6 +331,7 @@ fn maximal_round(ticket: TicketId) -> QuestionsComment {
                 text: format!("Which {n}? {}", "t".repeat(900)),
                 options: vec!["o".repeat(20), "p".repeat(20)],
                 recommendation: Some("r".repeat(20)),
+                replan: false,
             })
             .collect(),
         premise_false: false,

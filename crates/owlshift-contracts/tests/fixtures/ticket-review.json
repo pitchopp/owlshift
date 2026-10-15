@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "passes": [
+    {
+      "stage": "design_review",
+      "pass": 1,
+      "findings": [
+        {
+          "finding": {
+            "id": "F1",
+            "severity": "major",
+            "claim": "The plan reads the whole log into memory.",
+            "evidence": "Step 1 of the plan.",
+            "criterion": "`owlshift logs OWL-42` prints each event of OWL-42, oldest first.",
+            "settle": "Stream the log line by line."
+          },
+          "reviewer": {
+            "role": "design_review",
+            "mandates": [
+              "critic"
+            ],
+            "harness": "codex",
+            "model": "gpt-5.5"
+          },
+          "ruling": {
+            "outcome": "confirmed",
+            "reason": "crates/owlshift-runner/src/events.rs reads the log whole."
+          },
+          "outcome": "fixed"
+        },
+        {
+          "finding": {
+            "id": "F2",
+            "severity": "minor",
+            "claim": "No test covers an empty log.",
+            "evidence": "The plan's steps.",
+            "settle": "Add the case to step 1's test."
+          },
+          "reviewer": {
+            "role": "design_review",
+            "mandates": [
+              "conformance"
+            ],
+            "harness": "claude",
+            "model": "claude-sonnet-5-5"
+          },
+          "ruling": {
+            "outcome": "rejected",
+            "reason": "The store's own tests cover an empty log: crates/owlshift-runner/src/events.rs."
+          },
+          "outcome": "rejected"
+        }
+      ]
+    }
+  ],
+  "answered_reviews": [
+    3141592653
+  ]
+}

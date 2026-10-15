@@ -103,6 +103,14 @@ fn a_real_role_runs_through_the_executor() {
         correction: None,
         rebase: None,
         result_path: RelativePath::new("result.json").unwrap(),
+        plan: None,
+        approval: false,
+        findings: None,
+        review: Some(owlshift_contracts::brief::ReviewBrief {
+            mandates: vec![owlshift_contracts::review::Mandate::Critic],
+            pass: std::num::NonZeroU32::MIN,
+        }),
+        pull_request_reviews: Vec::new(),
     };
     let spec = RunSpec {
         main: &remote.checkout,

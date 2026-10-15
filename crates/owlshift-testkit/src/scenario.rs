@@ -113,13 +113,15 @@ use tempfile::TempDir;
 use owlshift_adapters::tracker::markdown::{self, MarkdownTracker};
 use owlshift_adapters::tracker::{Person, Tracker};
 use owlshift_contracts::brief::{
-    Brief, GateFailure, PermissionLevel, Permissions, Relation, ThreadEntry, TicketBrief,
+    Brief, GateFailure, PermissionLevel, Permissions, Relation, ReviewBrief, ThreadEntry,
+    TicketBrief,
 };
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::refs::{Ask, AskDecider, AskKind, KeptDecision, TicketQuestions};
 use owlshift_contracts::result::{Question, RunResult, Status as ResultStatus, Verdict};
+use owlshift_contracts::review::Mandate;
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::decider::{DeciderRule, brief_zones};
 use owlshift_core::gate::GatePolicy;
@@ -1240,6 +1242,17 @@ impl Driver {
             correction: None,
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
+            plan: None,
+            approval: false,
+            findings: None,
+            // A review run's brief always says what it reviews for
+            // (OWL-300); the bench's review runs hold the critic's mandate
+            // until the quality pipeline's scenarios give them theirs.
+            review: matches!(role, Role::DesignReview | Role::Verify).then(|| ReviewBrief {
+                mandates: vec![Mandate::Critic],
+                pass: NonZeroU32::MIN,
+            }),
+            pull_request_reviews: Vec::new(),
         };
         if role == Role::Build {
             tell_build(&mut brief, &self.questions);

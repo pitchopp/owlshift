@@ -15,6 +15,7 @@ pub mod format;
 pub mod ids;
 pub mod refs;
 pub mod result;
+pub mod review;
 pub mod schema;
 
 pub use format::ContractError;

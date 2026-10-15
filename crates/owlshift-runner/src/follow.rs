@@ -704,7 +704,9 @@ pub fn changed(
                     PushKind::Fix => Some(Event::FixPushed),
                     PushKind::Rebase => Some(Event::RebasePushed),
                     PushKind::Correction => Some(Event::Corrected),
-                    PushKind::Delivery => None,
+                    // No run pushes a review loop's commit yet; how its
+                    // push is adopted comes with the loop (OWL-301, OWL-307).
+                    PushKind::Delivery | PushKind::Review => None,
                 };
                 match event {
                     None => landed(&mut delivery, pushing),
@@ -729,7 +731,9 @@ pub fn changed(
                                 .report
                                 .as_ref()
                                 .map_or(1, |kept| kept.questions.len() as u32),
-                            PushKind::Fix | PushKind::Delivery => state.fix_passes(),
+                            PushKind::Fix | PushKind::Delivery | PushKind::Review => {
+                                state.fix_passes()
+                            }
                         };
                         replaced = landed_owing(&mut delivery, pushing, count);
                     }
@@ -1131,6 +1135,7 @@ mod tests {
             questions: vec![],
             notes: vec![],
             followups: vec![],
+            reviews: Vec::new(),
         };
         assert_eq!(
             next.owed,

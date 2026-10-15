@@ -9,6 +9,7 @@ use crate::drain::{TicketIntake, TicketProposals};
 use crate::event::Event;
 use crate::refs::{Claim, PersistedState, TicketDelivery, TicketQuestions};
 use crate::result::RunResult;
+use crate::review::{TicketPlan, TicketReview};
 
 /// Every published schema, by file stem: `schemas/<stem>.schema.json`.
 pub fn all() -> Vec<(&'static str, Schema)> {
@@ -24,6 +25,8 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("ticket-delivery", schema::<TicketDelivery>()),
         ("ticket-intake", schema::<TicketIntake>()),
         ("ticket-proposals", schema::<TicketProposals>()),
+        ("ticket-plan", schema::<TicketPlan>()),
+        ("ticket-review", schema::<TicketReview>()),
         ("comment-footer", schema::<Footer>()),
     ]
 }

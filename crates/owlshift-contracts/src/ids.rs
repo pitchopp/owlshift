@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub const TICKET_ID_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$";
 /// The JSON Schema pattern of a [`QuestionId`].
 pub const QUESTION_ID_PATTERN: &str = "^Q[1-9][0-9]*$";
+/// The JSON Schema pattern of a [`FindingId`].
+pub const FINDING_ID_PATTERN: &str = "^F[1-9][0-9]*$";
 /// The JSON Schema pattern of a [`RelativePath`]: `/`-separated segments,
 /// none empty or `..`, and no backslash or colon anywhere.
 pub const RELATIVE_PATH_PATTERN: &str = r"^(?:[^/\\:.][^/\\:]*|\.(?:[^/\\:.][^/\\:]*)?|\.\.[^/\\:]+)(?:/(?:[^/\\:.][^/\\:]*|\.(?:[^/\\:.][^/\\:]*)?|\.\.[^/\\:]+))*$";
@@ -81,6 +83,45 @@ impl QuestionId {
     }
 }
 
+/// A review finding's identifier within a result or a brief: `F1`, `F2`,
+/// and so on (OWL-300).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FindingId(String);
+
+impl FindingId {
+    pub fn new(id: impl Into<String>) -> Result<Self, IdError> {
+        let id = id.into();
+        let valid = id.strip_prefix('F').is_some_and(|n| {
+            n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0') && n.parse::<u32>().is_ok()
+        });
+        if valid {
+            Ok(Self(id))
+        } else {
+            Err(IdError {
+                kind: "finding id",
+                value: id,
+                pattern: FINDING_ID_PATTERN,
+            })
+        }
+    }
+
+    /// The finding for position `n` (1-based).
+    pub fn nth(n: u32) -> Self {
+        assert!(n > 0, "finding numbers start at 1");
+        Self(format!("F{n}"))
+    }
+
+    /// The finding's number: 1 for `F1`.
+    pub fn number(&self) -> u32 {
+        self.0[1..].parse().expect("validated at construction")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A path relative to the worktree, from untrusted input, that cannot leave
 /// it: `/`-separated segments, none empty or `..`. A backslash or a colon is
 /// refused anywhere, which also rules out absolute, drive-prefixed and UNC
@@ -128,6 +169,11 @@ pub fn is_repository_part(part: &str) -> bool {
 /// id, a SHA-256 or a fingerprint is written.
 pub(crate) fn is_lower_hex(text: &str, len: usize) -> bool {
     text.len() == len && text.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// A full commit id: 40 or 64 lowercase hexadecimal digits.
+pub(crate) fn is_commit_id(id: &str) -> bool {
+    is_lower_hex(id, 40) || is_lower_hex(id, 64)
 }
 
 /// Checks a name a person writes and Owlshift compares exactly, such as a
@@ -211,6 +257,11 @@ string_id!(
     QuestionId,
     QUESTION_ID_PATTERN,
     "A question's identifier within a round: Q1, Q2, and so on."
+);
+string_id!(
+    FindingId,
+    FINDING_ID_PATTERN,
+    "A review finding's identifier: F1, F2, and so on."
 );
 string_id!(
     RelativePath,

@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket review",
+  "description": "A ticket's review record, in [`REVIEW_FILE`](crate::refs::REVIEW_FILE):\neach review pass with its findings and what became of them, and the pull\nrequest reviews answered.",
+  "type": "object",
+  "properties": {
+    "answered_reviews": {
+      "description": "The ids of the pull request reviews answered, each once.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      },
+      "uniqueItems": true
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "passes": {
+      "description": "Every review pass, oldest first.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ReviewPass"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ],
+  "$defs": {
+    "Finding": {
+      "description": "A finding of a review run (architecture section 5, \"Design review\").\nEvery text is not blank.",
+      "type": "object",
+      "properties": {
+        "claim": {
+          "description": "What is wrong.",
+          "type": "string"
+        },
+        "criterion": {
+          "description": "The success criterion it bears on, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "description": "What shows it: a `file:line`, a step of the plan, a line of the\nticket.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/FindingId"
+        },
+        "settle": {
+          "description": "What would settle it.",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "severity",
+        "claim",
+        "evidence",
+        "settle"
+      ]
+    },
+    "FindingId": {
+      "description": "A review finding's identifier: F1, F2, and so on.",
+      "type": "string",
+      "pattern": "^F[1-9][0-9]*$"
+    },
+    "FindingOutcome": {
+      "description": "What became of a finding.",
+      "oneOf": [
+        {
+          "description": "A later run fixed it.",
+          "type": "string",
+          "const": "fixed"
+        },
+        {
+          "description": "The arbiter or the author rejected it.",
+          "type": "string",
+          "const": "rejected"
+        },
+        {
+          "description": "It went to the decider in a question round.",
+          "type": "string",
+          "const": "asked"
+        },
+        {
+          "description": "It became a proposed follow-up.",
+          "type": "string",
+          "const": "proposed"
+        }
+      ]
+    },
+    "Harness": {
+      "description": "A harness: a vendor CLI that runs one role headless.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex"
+      ]
+    },
+    "KeptFinding": {
+      "description": "A finding as the ticket ref keeps it.",
+      "type": "object",
+      "properties": {
+        "finding": {
+          "$ref": "#/$defs/Finding"
+        },
+        "outcome": {
+          "description": "What became of it, once settled.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FindingOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "response": {
+          "description": "The author's response (`pipeline.findings = \"author\"`); never with a\nruling.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeptResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewer": {
+          "$ref": "#/$defs/Reviewer"
+        },
+        "ruling": {
+          "description": "The arbiter's ruling (`pipeline.findings = \"arbiter\"`); never with a\nresponse.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeptRuling"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "finding",
+        "reviewer"
+      ]
+    },
+    "KeptResponse": {
+      "description": "The author's response, as kept with its finding.",
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/ResponseOutcome"
+        },
+        "reason": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "reason"
+      ]
+    },
+    "KeptRuling": {
+      "description": "The arbiter's ruling, as kept with its finding.",
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/RulingOutcome"
+        },
+        "reason": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "reason"
+      ]
+    },
+    "Mandate": {
+      "description": "A review mandate (architecture section 5, \"The roster\").",
+      "oneOf": [
+        {
+          "description": "What breaks the work: a premise that does not hold, a case left out,\na simpler way.",
+          "type": "string",
+          "const": "critic"
+        },
+        {
+          "description": "The plan or the diff against the ticket's criteria, the decider's\nanswers and the project's rules.",
+          "type": "string",
+          "const": "conformance"
+        },
+        {
+          "description": "What the change does to the code around it.",
+          "type": "string",
+          "const": "debt"
+        }
+      ]
+    },
+    "ResponseOutcome": {
+      "description": "What the author did with a finding.",
+      "type": "string",
+      "enum": [
+        "fixed",
+        "rejected"
+      ]
+    },
+    "ReviewPass": {
+      "description": "One review pass: the roster's findings on the plan or the diff.",
+      "type": "object",
+      "properties": {
+        "findings": {
+          "description": "The findings of every reviewer of the pass, ids increasing, at most\n[`MAX_PASS_FINDINGS`].",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/KeptFinding"
+          },
+          "maxItems": 192
+        },
+        "pass": {
+          "description": "The pass at its stage, from 1.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "stage": {
+          "description": "`design_review` or `verify`.",
+          "$ref": "#/$defs/Stage"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "pass"
+      ]
+    },
+    "Reviewer": {
+      "description": "The reviewer that raised a finding.",
+      "type": "object",
+      "properties": {
+        "harness": {
+          "$ref": "#/$defs/Harness"
+        },
+        "mandates": {
+          "description": "Its mandates, at least one, each once.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Mandate"
+          },
+          "minItems": 1
+        },
+        "model": {
+          "description": "The model it ran on, as the harness was given it.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "role": {
+          "description": "The reviewer's role: `design_review` or `verify`, the pass's stage.",
+          "$ref": "#/$defs/Role"
+        },
+        "stand_in": {
+          "description": "It stood in for a reviewer of another harness, such as the critic on\nClaude Code without Codex.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "mandates",
+        "harness",
+        "model"
+      ]
+    },
+    "Role": {
+      "description": "What a run executes: a stage's role, or one of the runner's helper roles.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "resolver",
+        "answer_check",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "rebase",
+        "arbiter"
+      ]
+    },
+    "RulingOutcome": {
+      "description": "What the arbiter ruled.",
+      "type": "string",
+      "enum": [
+        "confirmed",
+        "rejected"
+      ]
+    },
+    "Severity": {
+      "description": "How much a finding weighs.",
+      "type": "string",
+      "enum": [
+        "blocker",
+        "major",
+        "minor"
+      ]
+    },
+    "Stage": {
+      "description": "A stage of the pipeline, or `ready` for an admitted ticket not yet started.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "ready",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "deliver",
+        "watch"
+      ]
+    }
+  }
+}

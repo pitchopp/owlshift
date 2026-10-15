@@ -219,6 +219,7 @@ mod tests {
                 text: "Which file?".into(),
                 options: Vec::new(),
                 recommendation: None,
+                replan: false,
             },
             decision: "GREETING.md".into(),
             basis: "the ticket".into(),

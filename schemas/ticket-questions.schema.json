@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 10
+      "const": 11
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -303,6 +303,10 @@
             "string",
             "null"
           ]
+        },
+        "replan": {
+          "description": "The Build cannot follow its plan, and asks how (format 9, OWL-300):\nonce answered or decided, the ticket goes back to Design. Only on a\nbuild run's question.",
+          "type": "boolean"
         },
         "text": {
           "type": "string"

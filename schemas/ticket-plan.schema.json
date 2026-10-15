@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket plan",
+  "description": "A ticket's plan, in [`PLAN_FILE`](crate::refs::PLAN_FILE): the latest\nplan of its design runs, the text and the base commit it was written on,\nand the decider's approval once given.",
+  "type": "object",
+  "properties": {
+    "approval": {
+      "description": "The decider's approval, once given.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KeptApproval"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "base": {
+      "description": "The base commit the plan was written on, a full commit id.",
+      "type": "string"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "plan": {
+      "$ref": "#/$defs/Plan"
+    },
+    "text_sha256": {
+      "description": "The SHA-256 of the ticket's title, a NUL byte and its description,\nas 64 lowercase hexadecimal digits, as `intake.json` keeps it.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "plan",
+    "text_sha256",
+    "base"
+  ],
+  "$defs": {
+    "Alternative": {
+      "description": "An approach the plan set aside.",
+      "type": "object",
+      "properties": {
+        "approach": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was set aside.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "approach",
+        "reason"
+      ]
+    },
+    "Fork": {
+      "description": "A fork of the plan: its choice, the options it chose among, and why.",
+      "type": "object",
+      "properties": {
+        "choice": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "choice",
+        "options",
+        "reason"
+      ]
+    },
+    "KeptApproval": {
+      "description": "The decider's approval of a plan.",
+      "type": "object",
+      "properties": {
+        "comment": {
+          "description": "The tracker's identifier of the decider's comment that approved it.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "plan_sha256": {
+          "description": "The SHA-256 of the approved plan's [`Plan::canonical`] text, as 64\nlowercase hexadecimal digits: a Build runs only on a plan with this\nhash when approval is required (OWL-32).",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "comment",
+        "plan_sha256"
+      ]
+    },
+    "Plan": {
+      "description": "The plan a design run returns (architecture section 5, \"Design\"): what\nthe Build follows and the reviewers read. Every text is not blank.",
+      "type": "object",
+      "properties": {
+        "alternatives": {
+          "description": "The approaches set aside, each with why.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Alternative"
+          }
+        },
+        "approach": {
+          "description": "The approach chosen.",
+          "type": "string"
+        },
+        "criteria": {
+          "description": "The success criteria, taken from the ticket.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "files": {
+          "description": "The files the work touches, from the repository's root.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "forks": {
+          "description": "The choices of how the design made between approaches that would\neach deliver the ticket; `on-fork` plan approval reads them.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Fork"
+          }
+        },
+        "goal": {
+          "description": "What the ticket's work achieves.",
+          "type": "string"
+        },
+        "out_of_scope": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "steps": {
+          "description": "The ordered steps, each with its test.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlanStep"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "goal",
+        "criteria",
+        "approach",
+        "steps"
+      ]
+    },
+    "PlanStep": {
+      "description": "One step of a plan.",
+      "type": "object",
+      "properties": {
+        "test": {
+          "description": "The test that shows the step done.",
+          "type": "string"
+        },
+        "what": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "what",
+        "test"
+      ]
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "format": 9,
+  "status": "done",
+  "summary": "Planned the logs command.",
+  "plan": {
+    "goal": "Add the logs command.",
+    "criteria": [
+      "`owlshift logs OWL-42` prints each event of OWL-42, oldest first."
+    ],
+    "approach": "Filter the event store by ticket.",
+    "steps": [
+      {
+        "what": "Filter the store's events by ticket.",
+        "test": "A unit test with events of two tickets."
+      }
+    ]
+  }
+}

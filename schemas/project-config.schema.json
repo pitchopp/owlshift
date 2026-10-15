@@ -4,6 +4,17 @@
   "description": "The project file, `owlshift.toml`, committed in the repository.",
   "type": "object",
   "properties": {
+    "forge": {
+      "description": "The forge's settings (OWL-300); optional. Without it, no review on a\npull request is read. A file using it requires an Owlshift that reads\nit.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Forge"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "models": {
       "$ref": "#/$defs/Models"
     },
@@ -77,6 +88,38 @@
         }
       ]
     },
+    "FindingsConfirmation": {
+      "description": "Who confirms a review finding.",
+      "oneOf": [
+        {
+          "description": "One arbiter run per review pass rules on all its findings.",
+          "type": "string",
+          "const": "arbiter"
+        },
+        {
+          "description": "The next design or fix run answers each finding, fixed or rejected.",
+          "type": "string",
+          "const": "author"
+        }
+      ]
+    },
+    "Forge": {
+      "description": "The forge and how Owlshift reads it (OWL-300).",
+      "type": "object",
+      "properties": {
+        "reviewers": {
+          "description": "The forge logins whose reviews on Owlshift's pull requests are read,\neach written exactly and mapped to its tracker account's identifier,\nwritten as a zone's owner is. A review is an instruction when that\naccount is the ticket's decider, and context otherwise; anyone\nelse's review is ignored. At least one, no login listed twice, even\nin another case.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "reviewers"
+      ]
+    },
     "Models": {
       "description": "The model for each tier, per harness.",
       "type": "object",
@@ -119,6 +162,17 @@
       "properties": {
         "default": {
           "$ref": "#/$defs/Variant"
+        },
+        "findings": {
+          "description": "Who confirms a review finding before it is acted on (OWL-300,\narchitecture section 5, \"Confirming a finding\"): `arbiter`, the\ndefault when absent, or `author`. A file using it requires an\nOwlshift that reads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FindingsConfirmation"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "plan_approval": {
           "$ref": "#/$defs/PlanApproval"

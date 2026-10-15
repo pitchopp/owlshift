@@ -4,8 +4,9 @@
 //! [`CLAIM_FILE`]; `refs/owlshift/tickets/<ticket>` points to a commit whose
 //! tree holds [`STATE_FILE`], [`QUESTIONS_FILE`], once a delivery was made
 //! [`DELIVERY_FILE`] (OWL-209), once the drain took it in or a run proposed a
-//! follow-up [`INTAKE_FILE`] and [`PROPOSALS_FILE`] (OWL-245), and, later, the
-//! ticket's artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
+//! follow-up [`INTAKE_FILE`] and [`PROPOSALS_FILE`] (OWL-245), once a design
+//! or a review ran [`PLAN_FILE`] and [`REVIEW_FILE`] (OWL-300), and, later,
+//! the ticket's artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
 //! checkout only; pushing it to the remote comes with claims (P7).
 
 use std::num::NonZeroU32;
@@ -24,7 +25,7 @@ use crate::format::{
     self, CLAIM_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
     TICKET_STATE_FORMAT,
 };
-use crate::ids::{TicketId, is_lower_hex};
+use crate::ids::{TicketId, check_name, is_commit_id};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
@@ -40,8 +41,9 @@ pub const TICKETS_PREFIX: &str = "refs/owlshift/tickets/";
 pub const CLAIM_FILE: &str = "claim.json";
 /// The ticket's state, in a ticket ref's tree.
 pub const STATE_FILE: &str = "state.json";
-/// The plan, in a ticket ref's tree.
-pub const PLAN_FILE: &str = "plan.md";
+/// The plan, in a ticket ref's tree once a design run returned one
+/// (OWL-300, [`crate::review::TicketPlan`]).
+pub const PLAN_FILE: &str = "plan.json";
 /// The step ledger, in a ticket ref's tree.
 pub const LEDGER_FILE: &str = "ledger.json";
 /// The questions the runner asked on the ticket, in a ticket ref's tree; the
@@ -56,8 +58,10 @@ pub const INTAKE_FILE: &str = "intake.json";
 /// The follow-ups proposed by the ticket's runs, in a ticket ref's tree once
 /// one was (OWL-245, [`crate::drain::TicketProposals`]).
 pub const PROPOSALS_FILE: &str = "proposals.json";
-/// The review findings, in a ticket ref's tree.
-pub const FINDINGS_FILE: &str = "findings.json";
+/// The review passes, their findings and the pull request reviews answered,
+/// in a ticket ref's tree once a review ran (OWL-300,
+/// [`crate::review::TicketReview`]).
+pub const REVIEW_FILE: &str = "review.json";
 
 /// The claim ref of a ticket: `refs/owlshift/claims/<ticket>`.
 pub fn claim_ref(ticket: &TicketId) -> String {
@@ -121,6 +125,8 @@ pub struct PersistedState {
     /// Fix and rebase runs pushed since the delivery; only at Watch (format
     /// 3).
     pub repairs: u32,
+    /// Review passes of the current stage (format 4, OWL-300).
+    pub review_passes: u32,
 }
 
 /// Why a ticket waits.
@@ -139,8 +145,9 @@ impl PersistedState {
     const CONTRACT: &str = "ticket state";
 
     /// Parses a `state.json`. A format-2 one, written before the fix passes
-    /// and repairs were kept (OWL-55), is read with both at 0, and the next
-    /// write gives it the current format.
+    /// and repairs were kept (OWL-55), is read with both at 0, a format-2 or
+    /// 3 one, written before the review passes were kept (OWL-300), with
+    /// them at 0, and the next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let state: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -150,23 +157,27 @@ impl PersistedState {
         Ok(state)
     }
 
-    /// A format-2 document read as the current format, or `None` for any
-    /// other. Format 2 is format 3 without the two counts, so either field
-    /// is refused in it, whatever its value.
+    /// A format-2 or 3 document read as the current format, or `None` for
+    /// any other. Format 2 is format 3 without the fix passes and repairs,
+    /// and format 3 is format 4 without the review passes, so a field a
+    /// later format added is refused in it, whatever its value.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
-        if fields.get("format").and_then(serde_json::Value::as_u64) != Some(2) {
-            return None;
-        }
-        for field in ["fix_passes", "repairs"] {
-            if fields.contains_key(field) {
+        let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
+        let lacks: &[&str] = match format {
+            2 => &["fix_passes", "repairs", "review_passes"],
+            3 => &["review_passes"],
+            _ => return None,
+        };
+        for field in lacks {
+            if fields.contains_key(*field) {
                 return Some(Err(ContractError::invalid(
                     Self::CONTRACT,
-                    format!("format 2 keeps no {field}"),
+                    format!("format {format} keeps no {field}"),
                 )));
             }
-            fields.insert(field.to_owned(), 0.into());
+            fields.insert((*field).to_owned(), 0.into());
         }
         fields.insert("format".to_owned(), TICKET_STATE_FORMAT.into());
         Some(
@@ -210,6 +221,7 @@ impl From<&TicketState> for PersistedState {
             failed_runs: state.failed_runs(),
             fix_passes: state.fix_passes(),
             repairs: state.repairs(),
+            review_passes: state.review_passes(),
         }
     }
 }
@@ -239,6 +251,7 @@ impl TryFrom<&PersistedState> for TicketState {
             persisted.fix_passes,
             persisted.repairs,
         )
+        .map(|state| state.with_review_passes(persisted.review_passes))
         .map_err(|error| ContractError::invalid(PersistedState::CONTRACT, error.to_string()))
     }
 }
@@ -676,8 +689,10 @@ impl TicketQuestions {
     /// written before the resolver's refusal was kept (OWL-191), and a
     /// format-7 one, written before every refused list was kept (OWL-195),
     /// and a format-8 one, written before the refused choices were typed
-    /// (OWL-198), and a format-9 one, written before a decision kept its
-    /// reversal (OWL-146), are read as the current format with what they lack
+    /// (OWL-198), a format-9 one, written before a decision kept its
+    /// reversal (OWL-146), and a format-10 one, written before a question
+    /// kept its `replan` (OWL-300), are read as the current format with what
+    /// they lack
     /// empty, a format-6 or 7 Build refusal upgraded
     /// (`LegacyBuildRefusal::upgrade`) and a format-8 one's lists kept as
     /// text, and the next write gives them the current format.
@@ -690,18 +705,31 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 9 document read as the current format, or `None` for
+    /// A format-2 to 10 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
-    /// in their own shape, format 9 adds the typed choices to it, and format
-    /// 10 a decision's reversal.
+    /// in their own shape, format 9 adds the typed choices to it, format 10
+    /// a decision's reversal, and format 11 a question's `replan`.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=9).contains(&format) {
+        if !(2..=10).contains(&format) {
             return None;
         }
+        let asked = document["asks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|ask| ask["questions"].as_array().into_iter().flatten());
+        let decided = document["decisions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|decision| &decision["question"]);
+        let replan = asked
+            .chain(decided)
+            .any(|question| question.get("replan").is_some());
         let typed = format <= 8
             && document["build_refusal"]
                 .as_object()
@@ -716,7 +744,9 @@ impl TicketQuestions {
                 .as_array()
                 .is_some_and(|asks| asks.iter().any(|ask| ask.get(field).is_some()))
         };
-        let refused = if format == 2 && in_an_ask("verdicts") {
+        let refused = if replan {
+            Some("replan")
+        } else if format == 2 && in_an_ask("verdicts") {
             Some("verdicts")
         } else if format <= 3 && document.get("decisions").is_some() {
             Some("decisions")
@@ -728,7 +758,7 @@ impl TicketQuestions {
             Some("resolver refusal")
         } else if typed {
             Some("typed refused choices")
-        } else if reversed {
+        } else if format <= 9 && reversed {
             Some("reversed decision")
         } else {
             None
@@ -1071,6 +1101,21 @@ pub struct KeptReport {
     /// The follow-ups the run proposed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub followups: Vec<Followup>,
+    /// For a review loop's run, the pull request reviews it answers, what
+    /// its report's lead line names (format 5, OWL-300).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<AnsweredReview>,
+}
+
+/// A pull request review a review loop's run answers (OWL-300).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnsweredReview {
+    /// The forge's id of the review.
+    pub id: u64,
+    /// The forge login of its author.
+    #[schemars(regex(pattern = r"\S"))]
+    pub author: String,
 }
 
 /// A DELIVERY report still to be posted for the delivery's `pushed`
@@ -1084,8 +1129,8 @@ pub struct OwedReport {
     /// `delivery`, `fix`, `rebase` or `correction`.
     pub kind: PushKind,
     /// The fix pass or the repair the push was, from 1; for a correction,
-    /// how many decisions it follows the replies to; 1 for the first
-    /// delivery.
+    /// how many decisions it follows the replies to; for a review loop's
+    /// run, how many reviews it answers; 1 for the first delivery.
     pub count: u32,
     /// What the run gave its report; absent for a push adopted from a ref
     /// that kept none.
@@ -1107,6 +1152,9 @@ pub enum PushKind {
     /// A correction run's, after the decider reversed a decision (format 3,
     /// OWL-146).
     Correction,
+    /// A review loop's run, after reviews on the pull request (format 5,
+    /// OWL-300).
+    Review,
 }
 
 /// Why and when watch stopped following a pull request.
@@ -1155,8 +1203,9 @@ impl TicketDelivery {
     /// report and the kept report were kept (OWL-218), is read without
     /// them, a format-2 one, written before a correction run's push
     /// (OWL-146), without one, and a format-3 one, written before the first
-    /// delivery's report was owed (OWL-236), without that; the next write
-    /// gives it the current format.
+    /// delivery's report was owed (OWL-236), without that, and a format-4
+    /// one, written before a review loop's push (OWL-300), without one; the
+    /// next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -1166,17 +1215,18 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1, -2 or -3 document read as the current format, or `None`
-    /// for any other. Format 1 is format 2 without `owed` and
-    /// `pushing.report`, format 2 is format 3 without a correction's push or
-    /// report, and format 3 is format 4 without an owed delivery report, a
-    /// report's `notes` or an owed report's `unchanged`, so each is refused
-    /// in an older format.
+    /// A format-1 to 4 document read as the current format, or `None` for
+    /// any other. Format 1 is format 2 without `owed` and `pushing.report`,
+    /// format 2 is format 3 without a correction's push or report, format 3
+    /// is format 4 without an owed delivery report, a report's `notes` or an
+    /// owed report's `unchanged`, and format 4 is format 5 without a review
+    /// loop's push or a report's `reviews`, so each is refused in an older
+    /// format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=3).contains(&format) {
+        if !(1..=4).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
@@ -1197,6 +1247,14 @@ impl TicketDelivery {
         .into_iter()
         .flatten()
         .any(|kind| kind == "correction");
+        let review = [
+            pushing.and_then(|p| p.get("kind")),
+            owed.and_then(|owed| owed.get("kind")),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|kind| kind == "review");
+        let reviews = reports().any(|report| report.get("reviews").is_some());
         let questions = reports().any(|report| report.get("questions").is_some());
         let notes = reports().any(|report| report.get("notes").is_some());
         let owed_delivery = owed
@@ -1208,9 +1266,11 @@ impl TicketDelivery {
             ("pushing.report", format == 1 && report),
             ("correction's push", format <= 2 && correction),
             ("correction's report", format <= 2 && questions),
-            ("owed delivery report", owed_delivery),
-            ("report's notes", notes),
-            ("unchanged correction", unchanged),
+            ("owed delivery report", format <= 3 && owed_delivery),
+            ("report's notes", format <= 3 && notes),
+            ("unchanged correction", format <= 3 && unchanged),
+            ("review loop's push", review),
+            ("report's reviews", reviews),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -1330,6 +1390,25 @@ impl TicketDelivery {
         {
             return invalid("a report keeps notes only if it is a delivery's".to_owned());
         }
+        // A review loop's report names the reviews it answers, each once,
+        // and no other report does (OWL-300).
+        for (kind, report) in reports.into_iter().flatten() {
+            if (kind == PushKind::Review) == report.reviews.is_empty() {
+                return invalid(
+                    "a report names reviews if and only if it is a review loop's".to_owned(),
+                );
+            }
+            if let Some(review) = report.reviews.iter().enumerate().find_map(|(n, r)| {
+                (check_name(&r.author).is_err()
+                    || report.reviews[..n].iter().any(|seen| seen.id == r.id))
+                .then_some(r)
+            }) {
+                return invalid(format!(
+                    "a report names review {} twice, or without its author",
+                    review.id
+                ));
+            }
+        }
         if let Some(owed) = &self.owed {
             if owed.unchanged && owed.kind != PushKind::Correction {
                 return invalid(
@@ -1366,11 +1445,6 @@ impl TicketDelivery {
         }
         Ok(())
     }
-}
-
-/// A full commit id: 40 or 64 lowercase hexadecimal digits.
-fn is_commit_id(id: &str) -> bool {
-    is_lower_hex(id, 40) || is_lower_hex(id, 64)
 }
 
 /// Git's rules for a branch name (`git check-ref-format --branch`), the

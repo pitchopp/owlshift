@@ -255,7 +255,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(9);
+            v["format"] = json!(10);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -304,20 +304,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 9, "status""#),
+        RunResult::parse(r#"{"format": 10, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 8, "status""#),
+        RunResult::parse(r#"{"format": 9, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(9));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(10));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 9,
-            supported: 8,
+            found: 10,
+            supported: 9,
             ..
         })
     ));
@@ -1182,8 +1182,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(15)),
+        parse(|v| v["format"] = json!(16)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 14, before the quality pipeline's fields",
+        parse(|v| v["format"] = json!(14)),
+        "unknown format 14",
     );
     rejects(
         "format 10, before Build's brief listed the refused choices",
@@ -1548,18 +1553,35 @@ fn event_claim_and_state_rejections() {
         "format 2 keeps no fix_passes",
     );
     rejects(
-        "a format-3 state without repairs",
+        "a format-3 state with review passes",
+        state(|v| v["format"] = json!(3)),
+        "format 3 keeps no review_passes",
+    );
+    rejects(
+        "a format-4 state without repairs",
         state(|v| {
             v.as_object_mut().unwrap().remove("repairs");
         }),
         "missing field `repairs`",
     );
+    rejects(
+        "a newer state",
+        state(|v| v["format"] = json!(5)),
+        "upgrade Owlshift",
+    );
+    let older = PersistedState::parse(&edited("ticket-state.json", |v| {
+        v["format"] = json!(3);
+        v.as_object_mut().unwrap().remove("review_passes");
+    }))
+    .unwrap();
+    assert_eq!(older.review_passes, 0);
+    assert!(older.render().contains("\"format\": 4"));
 
     let asked =
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(11)),
+        asked(|v| v["format"] = json!(12)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1655,7 +1677,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 10,"));
+    assert!(read.render().starts_with("{\n  \"format\": 11,"));
     // A format-3 document, written before the resolver's decisions were
     // kept, is read with none, its verdicts kept.
     let format_3 = edited("ticket-questions.json", |v| {
@@ -1671,7 +1693,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_3).unwrap();
     assert!(read.decisions.is_empty());
     assert_eq!(read.asks[0].verdicts.len(), 2);
-    assert!(read.render().starts_with("{\n  \"format\": 10,"));
+    assert!(read.render().starts_with("{\n  \"format\": 11,"));
     // A format-4 document, written before an ask kept its check's refusal,
     // is read with none, its decisions kept.
     let format_4 = edited("ticket-questions.json", |v| {
@@ -1686,7 +1708,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_4).unwrap();
     assert!(read.asks.iter().all(|ask| ask.result_refusal.is_none()));
     assert_eq!(read.decisions.len(), 1);
-    assert!(read.render().starts_with("{\n  \"format\": 10,"));
+    assert!(read.render().starts_with("{\n  \"format\": 11,"));
     // A format-5 document, written before Build's refusal was kept
     // (OWL-192), is read with none, its asks' refusals kept.
     let format_5 = edited("ticket-questions.json", |v| {
@@ -1697,7 +1719,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_5).unwrap();
     assert_eq!(read.build_refusal, None);
     assert!(read.asks[1].result_refusal.is_some());
-    assert!(read.render().starts_with("{\n  \"format\": 10,"));
+    assert!(read.render().starts_with("{\n  \"format\": 11,"));
     // Formats 6 and 7 kept Build's refusal in their own shape (OWL-192,
     // OWL-194): the hold's first list in `decisions_reason`, the latest
     // reason, of a kind they did not keep, in `reason`. Each is read as
@@ -1716,7 +1738,7 @@ fn event_claim_and_state_rejections() {
     };
     let upgraded = |format: u64, refusal: Value| {
         let read = TicketQuestions::parse(&legacy(format, refusal)).unwrap();
-        assert!(read.render().starts_with("{\n  \"format\": 10,"));
+        assert!(read.render().starts_with("{\n  \"format\": 11,"));
         read.build_refusal.unwrap()
     };
     for format in [6, 7] {
@@ -1795,7 +1817,7 @@ fn event_claim_and_state_rejections() {
     };
     let read =
         TicketQuestions::parse(&format_8(json!({"reason": latest, "lists": [held]}))).unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 10,"));
+    assert!(read.render().starts_with("{\n  \"format\": 11,"));
     let kept = read.build_refusal.unwrap();
     assert!(kept.holds() && kept.choices.is_empty() && kept.lists == [held]);
     assert_eq!(
@@ -1817,7 +1839,7 @@ fn event_claim_and_state_rejections() {
     // reversal is refused in it. Format 10 keeps one, naming its reply.
     let read = TicketQuestions::parse(&edited("ticket-questions.json", |v| v["format"] = json!(9)))
         .unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 10,"));
+    assert!(read.render().starts_with("{\n  \"format\": 11,"));
     assert!(read.decisions[0].reversed.is_none());
     let reversal = || json!({"through": "2026-09-28T12:00:00Z", "comment": "c-reply-1"});
     rejects(
@@ -2524,7 +2546,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
     assert!(
-        older.render().contains("\"format\": 4"),
+        older.render().contains("\"format\": 5"),
         "{}",
         older.render()
     );
@@ -2556,7 +2578,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     // in format 1. Format 3 keeps one, whose report names its questions,
     // and only a correction's report does.
     let older = parse(|v| v["format"] = json!(2)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 4,"));
+    assert!(older.render().starts_with("{\n  \"format\": 5,"));
     let refused: [(&str, Edit); 3] = [
         ("correction's push", |v| {
             v["format"] = json!(2);

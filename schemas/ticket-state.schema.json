@@ -19,7 +19,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 3
+      "const": 4
     },
     "reasks": {
       "description": "Re-asks in the current round.",
@@ -29,6 +29,12 @@
     },
     "repairs": {
       "description": "Fix and rebase runs pushed since the delivery; only at Watch (format\n3).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "review_passes": {
+      "description": "Review passes of the current stage (format 4, OWL-300).",
       "type": "integer",
       "format": "uint32",
       "minimum": 0
@@ -63,7 +69,8 @@
     "reasks",
     "failed_runs",
     "fix_passes",
-    "repairs"
+    "repairs",
+    "review_passes"
   ],
   "$defs": {
     "Stage": {

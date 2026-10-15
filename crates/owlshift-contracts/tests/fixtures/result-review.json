@@ -1,0 +1,15 @@
+{
+  "format": 9,
+  "status": "done",
+  "summary": "One finding on the plan.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "claim": "The plan names no test for the oldest-first order.",
+      "evidence": "Step 1 of the plan.",
+      "criterion": "`owlshift logs OWL-42` prints each event of OWL-42, oldest first.",
+      "settle": "A test with events written out of order."
+    }
+  ]
+}

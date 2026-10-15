@@ -1,0 +1,46 @@
+{
+  "format": 1,
+  "plan": {
+    "goal": "Add the logs command, printing one ticket's events oldest first.",
+    "criteria": [
+      "`owlshift logs OWL-42` prints each event of OWL-42, oldest first."
+    ],
+    "approach": "Read the event log through the existing store and filter by ticket.",
+    "alternatives": [
+      {
+        "approach": "A separate index file per ticket.",
+        "reason": "A second write path for data the log already holds."
+      }
+    ],
+    "files": [
+      "crates/owlshift-cli/src/logs_cmd.rs"
+    ],
+    "steps": [
+      {
+        "what": "Filter the store's events by ticket.",
+        "test": "A unit test with events of two tickets."
+      }
+    ],
+    "risks": [
+      "A large log read whole."
+    ],
+    "out_of_scope": [
+      "Run logs."
+    ],
+    "forks": [
+      {
+        "choice": "Times in UTC.",
+        "options": [
+          "Local times."
+        ],
+        "reason": "The event log stores UTC, and a grep finds them."
+      }
+    ]
+  },
+  "text_sha256": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
+  "base": "0123456789abcdef0123456789abcdef01234567",
+  "approval": {
+    "comment": "c-approval-1",
+    "plan_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

@@ -205,6 +205,11 @@ fn brief() -> Brief {
         correction: None,
         rebase: None,
         result_path: RelativePath::new("result.json").unwrap(),
+        plan: None,
+        approval: false,
+        findings: None,
+        review: None,
+        pull_request_reviews: Vec::new(),
     }
 }
 
@@ -331,7 +336,7 @@ echo written > "$CLAUDE_CONFIG_DIR/session"
 env
 printf 'token: %s\n' "$tok" >&2
 mkdir -p .owlshift/run
-printf '{"format":8,"status":"blocked","summary":"%s"}' "${LEAK:+$tok}" > .owlshift/run/result.json
+printf '{"format":9,"status":"blocked","summary":"%s"}' "${LEAK:+$tok}" > .owlshift/run/result.json
 "#;
 
 /// OWL-94's acceptance through the executor: a confined harness logs in
@@ -446,7 +451,7 @@ case "$out" in
 esac >> probe.txt
 echo "path=$d" >> probe.txt
 mkdir -p .owlshift/run
-printf '{"format":8,"status":"blocked","summary":"probed"}' > .owlshift/run/result.json
+printf '{"format":9,"status":"blocked","summary":"probed"}' > .owlshift/run/result.json
 "#;
 
 /// The user's own `/tmp/claude-<uid>`, made for the test when it is absent

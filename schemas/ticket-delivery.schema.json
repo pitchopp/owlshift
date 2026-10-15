@@ -33,7 +33,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 4
+      "const": 5
     },
     "owed": {
       "description": "The DELIVERY report of `pushed`, a fix, rebase or correction run's\npush that landed, while it is not on the ticket yet (OWL-218): the\nnext pass posts it, once. Since format 2; since format 4 also the\nfirst delivery's report, and a correction's that pushed nothing\n(OWL-236).",
@@ -90,6 +90,28 @@
     "base_branch"
   ],
   "$defs": {
+    "AnsweredReview": {
+      "description": "A pull request review a review loop's run answers (OWL-300).",
+      "type": "object",
+      "properties": {
+        "author": {
+          "description": "The forge login of its author.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "id": {
+          "description": "The forge's id of the review.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "author"
+      ]
+    },
     "Decision": {
       "description": "A decision the role took on its own.",
       "type": "object",
@@ -265,6 +287,13 @@
             "type": "string"
           }
         },
+        "reviews": {
+          "description": "For a review loop's run, the pull request reviews it answers, what\nits report's lead line names (format 5, OWL-300).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AnsweredReview"
+          }
+        },
         "summary": {
           "description": "The run's `summary`.",
           "type": "string"
@@ -280,7 +309,7 @@
       "type": "object",
       "properties": {
         "count": {
-          "description": "The fix pass or the repair the push was, from 1; for a correction,\nhow many decisions it follows the replies to; 1 for the first\ndelivery.",
+          "description": "The fix pass or the repair the push was, from 1; for a correction,\nhow many decisions it follows the replies to; for a review loop's\nrun, how many reviews it answers; 1 for the first delivery.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -326,6 +355,11 @@
           "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146).",
           "type": "string",
           "const": "correction"
+        },
+        {
+          "description": "A review loop's run, after reviews on the pull request (format 5,\nOWL-300).",
+          "type": "string",
+          "const": "review"
         }
       ]
     },

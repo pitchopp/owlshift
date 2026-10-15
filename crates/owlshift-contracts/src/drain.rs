@@ -172,8 +172,8 @@ pub struct KeptProposal {
 }
 
 /// The run that proposed a follow-up: the delivering Build, or a fix,
-/// rebase or correction run whose push landed, counted as its push is in
-/// `delivery.json`.
+/// rebase, correction or, since format 2, review loop run whose push
+/// landed, counted as its push is in `delivery.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProposingRun {
@@ -203,11 +203,44 @@ pub enum ProposalOutcome {
 impl TicketProposals {
     const CONTRACT: &str = "ticket proposals";
 
-    /// Parses and validates a `proposals.json`.
+    /// Parses and validates a `proposals.json`. A format-1 one, written
+    /// before a review loop's run could propose (OWL-300), is read as the
+    /// current format, and the next write gives it that format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let proposals: Self = format::parse_json(Self::CONTRACT, PROPOSALS_FORMAT, input)?;
+        let proposals: Self = match Self::from_older_format(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, PROPOSALS_FORMAT, input)?,
+        };
         proposals.validate()?;
         Ok(proposals)
+    }
+
+    /// A format-1 document read as the current format, or `None` for any
+    /// other. Format 1 is format 2 without a review loop's run, which is
+    /// refused in it.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        let review = document["proposals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|proposal| proposal["run"]["kind"] == "review");
+        if review {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "format 1 keeps no review loop's run",
+            )));
+        }
+        document["format"] = PROPOSALS_FORMAT.into();
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {
