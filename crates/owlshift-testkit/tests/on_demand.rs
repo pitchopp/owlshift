@@ -8642,3 +8642,184 @@ fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
 /// (OWL-254, build plan part K).
 #[path = "on_demand/drain_scenarios.rs"]
 mod drain_scenarios;
+
+/// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
+/// `stack.rules`, and not the resolver's; the `dispatch` event names every
+/// source; a named file the base commit lacks refuses the run.
+#[test]
+fn a_roles_rules_reach_its_brief_and_not_the_resolvers() {
+    let skill = "---\nname: frontend\n---\nUse tabs.\n";
+    let bench = Bench::new(true);
+    let checkout = &bench.remote.checkout;
+    let config_path = checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    let with = |named: &str| format!("{original}[roles.build]\nrules = [\"{named}\"]\n");
+
+    // A file the base commit lacks refuses the run, naming it.
+    fs::write(&config_path, with("docs/skills/frontend/SKILL.md")).unwrap();
+    bench
+        .env
+        .run(checkout, &["commit", "--quiet", "-am", "Name a skill"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let (outcome, printed) = bench.run(Vec::new(), None);
+    let stop = outcome.expect_err("the skill is not in the base commit");
+    assert!(
+        matches!(&stop, Stop::Refused(reason)
+            if reason.contains("docs/skills/frontend/SKILL.md on origin/main does not exist")
+                && reason.contains("roles.build.rules")),
+        "{stop:?}\n{printed}"
+    );
+
+    // Once the base holds it, Build gets it after AGENTS.md and the resolver
+    // does not.
+    let folder = checkout.join("docs/skills/frontend");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("SKILL.md"), skill).unwrap();
+    bench
+        .env
+        .run(checkout, &["add", "docs/skills/frontend/SKILL.md"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["commit", "--quiet", "-m", "Add the skill"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(NAMING)),
+            bench.reply(None, Some(DECIDED_Q1)),
+            limited,
+        ],
+        None,
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let briefs = bench.briefs();
+    let roles: Vec<Role> = briefs.iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::Resolver, Role::Build]);
+    for build in [&briefs[0], &briefs[2]] {
+        let sources: Vec<&str> = build.rules.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(sources, ["AGENTS.md", "docs/skills/frontend/SKILL.md"]);
+        assert_eq!(build.rules[1].text, skill);
+    }
+    let sources: Vec<&str> = briefs[1].rules.iter().map(|r| r.source.as_str()).collect();
+    assert_eq!(sources, ["AGENTS.md"]);
+    let dispatch = bench
+        .events()
+        .into_iter()
+        .find(|e| e.kind == EventKind::Dispatch)
+        .expect("a dispatch");
+    assert_eq!(
+        dispatch.data["rules"],
+        serde_json::json!(["AGENTS.md", "docs/skills/frontend/SKILL.md"])
+    );
+}
+
+/// OWL-312: a command reads only the `[roles]` tables of the roles it may
+/// brief. A rebase run's brief takes `stack.rules` alone, so a table of the
+/// build role naming a file the base lacks does not refuse it, where the
+/// same table refuses the Build loop of `do`.
+#[test]
+fn a_bad_role_table_does_not_refuse_a_rebase() {
+    let bench = delivered_with_rules();
+    let checkout = &bench.remote.checkout;
+    let config_path = checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!("{original}[roles.build]\nrules = [\"docs/missing.md\"]\n"),
+    )
+    .unwrap();
+    bench
+        .env
+        .run(
+            checkout,
+            &["commit", "--quiet", "-am", "Name a missing skill"],
+        )
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (outcome, printed) = bench.continue_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![rebase_in(
+            &bench,
+            main,
+            vec![("AGENTS.md", AGENTS_RESOLVED)],
+        )],
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+}
+
+/// OWL-312: the resolver an intake pass runs for the questions intake raises
+/// gets `[roles.resolver]` rules, read for that pass beside intake's own.
+#[test]
+fn an_intake_pass_gives_its_resolver_the_resolver_rules() {
+    let bench = Bench::drained();
+    let checkout = &bench.remote.checkout;
+    let config_path = checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{original}[roles.resolver]\nrules = [\"docs/resolver.md\"]\n\
+             [roles.intake]\nrules = [\"docs/intake.md\"]\n"
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(checkout.join("docs")).unwrap();
+    fs::write(
+        checkout.join("docs/resolver.md"),
+        "Settle from the ticket.\n",
+    )
+    .unwrap();
+    fs::write(checkout.join("docs/intake.md"), "Name dependencies.\n").unwrap();
+    bench
+        .env
+        .run(checkout, &["add", "docs/resolver.md", "docs/intake.md"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["commit", "--quiet", "-am", "Add role rules"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+                "text":"Which file should hold the greeting?"}]"#,
+        )),
+    );
+    let done = bench.reply(None, Some(&intake_result("done", None, "[]")));
+    let _ = bench.intake(
+        vec![asks, bench.reply(None, Some(DECIDED_Q1)), done],
+        gesture("maintainer"),
+    );
+    let briefs = bench.briefs();
+    let roles: Vec<Role> = briefs.iter().map(|b| b.role).collect();
+    assert_eq!(roles[..2], [Role::Intake, Role::Resolver], "{roles:?}");
+    let sources = |brief: &Brief| -> Vec<String> {
+        brief.rules.iter().map(|rule| rule.source.clone()).collect()
+    };
+    assert_eq!(sources(&briefs[0]), ["AGENTS.md", "docs/intake.md"]);
+    assert_eq!(sources(&briefs[1]), ["AGENTS.md", "docs/resolver.md"]);
+}

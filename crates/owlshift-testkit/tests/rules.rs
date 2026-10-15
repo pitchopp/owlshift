@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 
 use owlshift_contracts::brief::Rule;
 use owlshift_contracts::config::ProjectConfig;
+use owlshift_core::vocab::Role;
 use owlshift_runner::executor::Git;
 use owlshift_runner::project::Base;
-use owlshift_runner::rules::project_rules;
+use owlshift_runner::rules::{ProjectRules, project_rules};
 use owlshift_testkit::git::GitEnv;
 
 /// A repository whose `origin/main` is moved to a commit built per case.
@@ -78,6 +79,36 @@ impl Repo {
     }
 
     fn rules_at(&self, commit: &str, stack: &str) -> Result<Vec<Rule>, String> {
+        self.project_at(commit, stack, "")
+            .map(|rules| rules.common().to_vec())
+    }
+
+    /// The project's rules at `origin/main`'s tip, `[stack]` holding `stack`
+    /// and `tail` added after the last table (`[roles.build]` and the like).
+    fn project_tip(&self, stack: &str, tail: &str) -> Result<ProjectRules, String> {
+        let tip = self.git(&["rev-parse", "refs/remotes/origin/main"]);
+        self.project_at(&tip, stack, tail)
+    }
+
+    fn project_at(&self, commit: &str, stack: &str, tail: &str) -> Result<ProjectRules, String> {
+        let all = [Role::Build, Role::Resolver, Role::Intake];
+        self.project_in(commit, stack, tail, &all)
+    }
+
+    /// The rules at `origin/main`'s tip, as a command that briefs `roles`
+    /// reads them, `tail` added after the last table.
+    fn project_for(&self, tail: &str, roles: &[Role]) -> Result<ProjectRules, String> {
+        let tip = self.git(&["rev-parse", "refs/remotes/origin/main"]);
+        self.project_in(&tip, "", tail, roles)
+    }
+
+    fn project_in(
+        &self,
+        commit: &str,
+        stack: &str,
+        tail: &str,
+        roles: &[Role],
+    ) -> Result<ProjectRules, String> {
         let base = Base {
             remote_ref: "origin/main".to_owned(),
             branch: "main".to_owned(),
@@ -99,10 +130,11 @@ impl Repo {
             [models]
             [policy]
             always_human = []
+            {tail}
             "#
         ))
         .unwrap();
-        project_rules(&self.git, self.root(), &base, &config.stack)
+        project_rules(&self.git, self.root(), &base, &config, roles)
     }
 }
 
@@ -305,4 +337,146 @@ fn the_rules_take_64_kib_together() {
         ),
         "{error}"
     );
+}
+
+/// A repository whose base holds a root `AGENTS.md`, a frontend skill (front
+/// matter and a supporting file it points to) and a database convention.
+fn skilled_repo() -> Repo {
+    let repo = Repo::new();
+    let agents = repo.blob(b"Sign off every commit.\n");
+    let skill = repo.blob(b"---\nname: frontend\ndescription: Style.\n---\nSee style.md.\n");
+    let style = repo.blob(b"Tabs.\n");
+    let migrations = repo.blob(b"Write migrations forward only.\n");
+    repo.base(&[
+        ("100644", &agents, "AGENTS.md"),
+        ("100644", &skill, "docs/skills/frontend/SKILL.md"),
+        ("100644", &style, "docs/skills/frontend/style.md"),
+        ("100644", &migrations, "docs/db.md"),
+    ]);
+    repo
+}
+
+#[test]
+fn a_roles_rules_follow_the_stack_rules_in_its_brief_alone() {
+    let repo = skilled_repo();
+    let rules = repo
+        .project_tip(
+            "",
+            "[roles.build]\nrules = [\"docs/skills/frontend/SKILL.md\", \"docs/db.md\"]\n\
+             [roles.intake]\nrules = [\"docs/db.md\"]",
+        )
+        .unwrap();
+    let agents = rule("AGENTS.md", "Sign off every commit.\n");
+    // The skill is taken whole, front matter included, its supporting file
+    // not followed.
+    let skill = rule(
+        "docs/skills/frontend/SKILL.md",
+        "---\nname: frontend\ndescription: Style.\n---\nSee style.md.\n",
+    );
+    let db = rule("docs/db.md", "Write migrations forward only.\n");
+    assert_eq!(
+        rules.for_role(Role::Build),
+        vec![agents.clone(), skill.clone(), db.clone()]
+    );
+    assert_eq!(
+        rules.for_role(Role::Intake),
+        vec![agents.clone(), db.clone()]
+    );
+    // The resolver, which has no table, and every other role keep the
+    // stack's rules alone.
+    assert_eq!(rules.for_role(Role::Resolver), vec![agents.clone()]);
+    assert_eq!(rules.for_role(Role::Rebase), vec![agents.clone()]);
+    // The dispatch event names every source once.
+    assert_eq!(
+        rules.sources(),
+        vec!["AGENTS.md", "docs/db.md", "docs/skills/frontend/SKILL.md"]
+    );
+
+    // The files are those of the base commit, not of a branch.
+    repo.git(&[
+        "checkout",
+        "--quiet",
+        "-b",
+        "owlshift/demo-1",
+        "origin/main",
+    ]);
+    fs::write(repo.root().join("AGENTS.md"), "Push to main.\n").unwrap();
+    repo.git(&["commit", "--quiet", "-am", "Change the rules"]);
+    assert_eq!(
+        repo.project_tip("", "[roles.intake]\nrules = [\"docs/db.md\"]")
+            .unwrap()
+            .for_role(Role::Intake),
+        vec![agents, db]
+    );
+
+    // A role's blank file gives no rule.
+    let blank = repo.blob(b"\n");
+    repo.base(&[
+        ("100644", &blank, "blank.md"),
+        ("100644", &blank, "other.md"),
+    ]);
+    let rules = repo
+        .project_tip(
+            "rules = [\"other.md\"]",
+            "[roles.build]\nrules = [\"blank.md\"]",
+        )
+        .unwrap();
+    assert!(rules.for_role(Role::Build).is_empty());
+}
+
+#[test]
+fn a_roles_rule_file_is_required_and_the_limits_count_both_lists() {
+    let repo = skilled_repo();
+    let error = repo
+        .project_tip("", "[roles.resolver]\nrules = [\"docs/missing.md\"]")
+        .unwrap_err();
+    assert!(
+        error.starts_with("docs/missing.md on origin/main does not exist")
+            && error.contains("`roles.resolver.rules`"),
+        "{error}"
+    );
+
+    let half = repo.blob(&vec![b'a'; 32 * 1024]);
+    let byte = repo.blob(b"b");
+    repo.base(&[
+        ("100644", &half, "AGENTS.md"),
+        ("100644", &half, "role.md"),
+        ("100644", &byte, "byte.md"),
+    ]);
+    // 64 KiB for the default rule and the role's together is the limit...
+    let rules = repo
+        .project_tip("", "[roles.build]\nrules = [\"role.md\"]")
+        .unwrap();
+    let held: usize = rules
+        .for_role(Role::Build)
+        .iter()
+        .map(|rule| rule.text.len())
+        .sum();
+    assert_eq!(held, 64 * 1024);
+    // ...one byte more refuses the role's brief, naming each file and its
+    // size.
+    let error = repo
+        .project_tip("", "[roles.build]\nrules = [\"role.md\", \"byte.md\"]")
+        .unwrap_err();
+    assert!(
+        error.starts_with(
+            "the rule files of the `build` brief on origin/main hold 65537 bytes together \
+             (AGENTS.md 32768, role.md 32768, byte.md 1)"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn only_the_roles_a_command_briefs_are_read() {
+    let repo = skilled_repo();
+    let tail = "[roles.build]\nrules = [\"docs/missing.md\"]";
+    // Intake alone never reads Build's table...
+    let mut config_ok = repo.project_for(tail, &[Role::Intake]).unwrap();
+    assert_eq!(config_ok.sources(), vec!["AGENTS.md"]);
+    config_ok = repo.project_for(tail, &[Role::Resolver]).unwrap();
+    assert_eq!(config_ok.sources(), vec!["AGENTS.md"]);
+    // ...while a command that briefs Build refuses the missing file.
+    let error = repo.project_for(tail, &[Role::Build]).unwrap_err();
+    assert!(error.contains("docs/missing.md"), "{error}");
 }

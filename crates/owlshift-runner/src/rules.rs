@@ -1,99 +1,213 @@
-//! The project's rules, injected into the brief (OWL-61, OWL-67, build plan
-//! "The project's rules").
+//! The project's rules, injected into the brief (OWL-61, OWL-67, OWL-312,
+//! build plan "The project's rules" and "Rules per role").
 //!
 //! The rules are the files the project names in `stack.rules`, by default
-//! the `AGENTS.md` at the root of the repository, read at the base commit in
-//! the dedicated checkout, never in a worktree: the ticket's branch is
-//! written by agents, and the build role takes `rules` as instructions. A
-//! rule is never cut: a file the runner cannot take whole refuses the run.
+//! the `AGENTS.md` at the root of the repository, which every brief takes,
+//! and the files `[roles.<role>]` names, which that role's brief takes after
+//! them. All are read at the base commit in the dedicated checkout, never in
+//! a worktree: the ticket's branch is written by agents, and the build role
+//! takes `rules` as instructions. A rule is never cut: a file the runner
+//! cannot take whole refuses the run.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use owlshift_contracts::brief::Rule;
-use owlshift_contracts::config::Stack;
+use owlshift_contracts::config::{ProjectConfig, RULE_ROLES};
+use owlshift_core::vocab::Role;
 
 use crate::executor::Git;
 use crate::project::Base;
 
-/// The file the rules come from when the project names none.
-const DEFAULT_RULE_FILE: &str = "AGENTS.md";
-
-/// The most bytes the rules take, all files together.
+/// The most bytes the rules of one brief take, all its files together.
 const MAX_RULE_BYTES: u64 = 64 * 1024;
 
 /// What the rules are, in a refusal.
 const RULES: &str = "the project's rules";
 
+/// The rules a project gives its briefs: those of every brief, and those of
+/// one role's alone (OWL-312).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectRules {
+    /// The rules of `stack.rules`, in order.
+    common: Vec<Rule>,
+    /// The rules of `[roles.<role>]`, in order, for each role that has any.
+    roles: BTreeMap<Role, Vec<Rule>>,
+}
+
+impl ProjectRules {
+    /// The rules of `stack.rules`, which every brief holds.
+    pub fn common(&self) -> &[Rule] {
+        &self.common
+    }
+
+    /// The rules of the brief of `role`: those of `stack.rules`, then the
+    /// role's own.
+    pub fn for_role(&self, role: Role) -> Vec<Rule> {
+        let mut rules = self.common.clone();
+        if let Some(own) = self.roles.get(&role) {
+            rules.extend(own.iter().cloned());
+        }
+        rules
+    }
+
+    /// Every source read, each once: `stack.rules` first, then each role's, in
+    /// the order of the roles.
+    pub fn sources(&self) -> Vec<&str> {
+        let mut sources: Vec<&str> = Vec::new();
+        for rule in self.common.iter().chain(self.roles.values().flatten()) {
+            if !sources.contains(&rule.source.as_str()) {
+                sources.push(&rule.source);
+            }
+        }
+        sources
+    }
+}
+
+/// A rule file listed at the base commit, not yet read.
+struct Listed<'a> {
+    file: &'a str,
+    entry: Entry,
+}
+
 /// The project's rules at `base`, as the dedicated `checkout` knows it after
 /// a fetch: one rule for the whole repository (`applies_to` empty) per file
 /// `stack.rules` names, in order, or, when it names none, per root
-/// `AGENTS.md` the base commit has.
+/// `AGENTS.md` the base commit has; and, for each role of
+/// [`RULE_ROLES`], one per file `[roles.<role>]` names. Only the roles in `briefed` are read, so that a bad table of another role refuses nothing.
 ///
 /// The rules are read at `base.commit`, which
 /// [`sync_checkout`](crate::project::sync_checkout) resolved once through
 /// the base's full name, so a local branch named like it
 /// (`refs/heads/origin/main`) cannot stand in for it. A blank file gives no
 /// rule. A named file the base commit lacks, an entry that is not a regular
-/// file, files over 64 KiB together, a file not in UTF-8, and any git failure
-/// are errors: a reason that names the file.
+/// file, files over 64 KiB together in one brief (`stack.rules` and the
+/// role's), a file not in UTF-8, and any git failure are errors: a reason
+/// that names the file. Every file is listed and measured before any is
+/// read.
 pub fn project_rules(
     git: &Git,
     checkout: &Path,
     base: &Base,
-    stack: &Stack,
-) -> Result<Vec<Rule>, String> {
-    let (files, required) = match &stack.rules {
-        Some(named) => (named.iter().map(String::as_str).collect(), true),
-        None => (vec![DEFAULT_RULE_FILE], false),
+    config: &ProjectConfig,
+    briefed: &[Role],
+) -> Result<ProjectRules, String> {
+    let files = config.stack.rule_files();
+    let required = config.stack.rules.is_some();
+    let common = list(git, checkout, base, files, "`stack.rules`", required)?;
+    check_total(base, &common, &[], None)?;
+    let mut own = Vec::new();
+    for role in RULE_ROLES.into_iter().filter(|role| briefed.contains(role)) {
+        let named: Vec<&str> = config
+            .role_rule_files(role)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if named.is_empty() {
+            continue;
+        }
+        let key = format!("`roles.{}.rules`", role.as_str());
+        let listed = list(git, checkout, base, named, &key, true)?;
+        check_total(base, &common, &listed, Some(role))?;
+        own.push((role, listed));
+    }
+    let mut rules = ProjectRules {
+        common: read_all(git, checkout, base, &common)?,
+        roles: BTreeMap::new(),
     };
-    // Every entry is listed and checked before any is read, so the limit
-    // bounds what is read, not only what is kept.
-    let mut entries = Vec::with_capacity(files.len());
+    for (role, listed) in own {
+        let read = read_all(git, checkout, base, &listed)?;
+        if !read.is_empty() {
+            rules.roles.insert(role, read);
+        }
+    }
+    Ok(rules)
+}
+
+/// The entries of `files` at the base commit. `key` names the list in a
+/// refusal; a file the commit lacks is one only when the list `required`
+/// them (a default file is optional).
+fn list<'a>(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+    files: Vec<&'a str>,
+    key: &str,
+    required: bool,
+) -> Result<Vec<Listed<'a>>, String> {
+    let mut listed = Vec::with_capacity(files.len());
     for file in files {
         let at = format!("{file} on {}", base.remote_ref);
         match entry(git, checkout, base, file, &at, RULES)? {
-            Some(entry) => entries.push((file, entry)),
+            Some(entry) => listed.push(Listed { file, entry }),
             None if required => {
                 return Err(format!(
-                    "{at} does not exist: `stack.rules` in owlshift.toml names it, and a named \
-                     rule file is never skipped"
+                    "{at} does not exist: {key} in owlshift.toml names it, and a named rule \
+                     file is never skipped"
                 ));
             }
             None => {}
         }
     }
-    let total: u64 = entries.iter().map(|(_, entry)| entry.size).sum();
-    if total > MAX_RULE_BYTES {
-        let at = &base.remote_ref;
-        return Err(match &entries[..] {
-            [(file, _)] => format!(
-                "{file} on {at} holds {total} bytes, over the {MAX_RULE_BYTES} Owlshift passes \
-                 to an agent as rules; a rule is never cut, so shorten the file"
-            ),
-            _ => {
-                let sizes: Vec<String> = entries
-                    .iter()
-                    .map(|(file, entry)| format!("{file} {}", entry.size))
-                    .collect();
-                format!(
-                    "the rule files on {at} hold {total} bytes together ({}), over the \
-                     {MAX_RULE_BYTES} Owlshift passes to an agent as rules; a rule is never \
-                     cut, so name fewer files or shorten them",
-                    sizes.join(", ")
-                )
-            }
-        });
+    Ok(listed)
+}
+
+/// Refuses the files of one brief (`common` then `own`, for `role`'s brief,
+/// or `common` alone) when together they hold over 64 KiB, naming each file
+/// and its size.
+fn check_total(
+    base: &Base,
+    common: &[Listed<'_>],
+    own: &[Listed<'_>],
+    role: Option<Role>,
+) -> Result<(), String> {
+    let all: Vec<&Listed<'_>> = common.iter().chain(own).collect();
+    let total: u64 = all.iter().map(|listed| listed.entry.size).sum();
+    if total <= MAX_RULE_BYTES {
+        return Ok(());
     }
-    let mut rules = Vec::with_capacity(entries.len());
-    for (file, entry) in entries {
+    let at = &base.remote_ref;
+    Err(match (&all[..], role) {
+        ([one], None) => format!(
+            "{} on {at} holds {total} bytes, over the {MAX_RULE_BYTES} Owlshift passes to an \
+             agent as rules; a rule is never cut, so shorten the file",
+            one.file
+        ),
+        _ => {
+            let sizes: Vec<String> = all
+                .iter()
+                .map(|listed| format!("{} {}", listed.file, listed.entry.size))
+                .collect();
+            let brief = role.map_or(String::new(), |role| {
+                format!(" of the `{}` brief", role.as_str())
+            });
+            format!(
+                "the rule files{brief} on {at} hold {total} bytes together ({}), over the \
+                 {MAX_RULE_BYTES} Owlshift passes to an agent as rules; a rule is never cut, so \
+                 name fewer files or shorten them",
+                sizes.join(", ")
+            )
+        }
+    })
+}
+
+/// The rules of `listed`, read in order; a blank file gives none.
+fn read_all(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+    listed: &[Listed<'_>],
+) -> Result<Vec<Rule>, String> {
+    let mut rules = Vec::with_capacity(listed.len());
+    for Listed { file, entry } in listed {
         let at = format!("{file} on {}", base.remote_ref);
-        let text = read_blob(git, checkout, &entry, &at, RULES)?;
+        let text = read_blob(git, checkout, entry, &at, RULES)?;
         if text.trim().is_empty() {
             continue;
         }
         rules.push(Rule {
             applies_to: Vec::new(),
-            source: file.to_owned(),
+            source: (*file).to_owned(),
             text,
         });
     }

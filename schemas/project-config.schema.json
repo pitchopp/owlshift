@@ -28,6 +28,13 @@
       "description": "The Owlshift versions that can read this file: a semantic version\nrequirement such as `>=0.4`.",
       "type": "string"
     },
+    "roles": {
+      "description": "Settings per role (OWL-312), keyed by the role's name as its prompt\nfile is (`build`, `resolver`, `intake`): rules added to that role's\nbrief alone. Only a role whose brief carries rules is accepted\n([`RULE_ROLES`]). A file using it requires an Owlshift that reads it.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RoleSettings"
+      }
+    },
     "stack": {
       "$ref": "#/$defs/Stack"
     },
@@ -227,6 +234,23 @@
       "additionalProperties": false,
       "required": [
         "always_human"
+      ]
+    },
+    "RoleSettings": {
+      "description": "The settings of one role (OWL-312).",
+      "type": "object",
+      "properties": {
+        "rules": {
+          "description": "The files whose text reaches this role's brief alone, after\n`stack.rules`: paths from the repository's root with `/` between\nfolders, in order, each read at the base commit, taken whole (a\n`SKILL.md` included, its front matter too) and required to exist\nthere. Files only, none also in `stack.rules` (the default counting as\n`[\"AGENTS.md\"]`), and at most 32 and 64 KiB together with it.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rules"
       ]
     },
     "Stack": {
