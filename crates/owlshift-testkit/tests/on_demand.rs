@@ -8725,3 +8725,42 @@ fn a_roles_rules_reach_its_brief_and_not_the_resolvers() {
         serde_json::json!(["AGENTS.md", "docs/skills/frontend/SKILL.md"])
     );
 }
+
+/// OWL-312: a command reads only the `[roles]` tables of the roles it may
+/// brief. A rebase run's brief takes `stack.rules` alone, so a table of the
+/// build role naming a file the base lacks does not refuse it, where the
+/// same table refuses the Build loop of `do`.
+#[test]
+fn a_bad_role_table_does_not_refuse_a_rebase() {
+    let bench = delivered_with_rules();
+    let checkout = &bench.remote.checkout;
+    let config_path = checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!("{original}[roles.build]\nrules = [\"docs/missing.md\"]\n"),
+    )
+    .unwrap();
+    bench
+        .env
+        .run(
+            checkout,
+            &["commit", "--quiet", "-am", "Name a missing skill"],
+        )
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (outcome, printed) = bench.continue_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![rebase_in(
+            &bench,
+            main,
+            vec![("AGENTS.md", AGENTS_RESOLVED)],
+        )],
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+}

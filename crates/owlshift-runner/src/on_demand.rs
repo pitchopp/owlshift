@@ -844,6 +844,19 @@ impl Command {
             Command::Drain => "drain",
         }
     }
+
+    /// The roles whose briefs the command may build, and so the `[roles]`
+    /// tables it reads (OWL-312): Build and the resolver in the Build loop,
+    /// Build alone in a fix or a correction (no resolver runs there), none in
+    /// a rebase, whose brief takes `stack.rules` only.
+    fn briefed_roles(self) -> &'static [Role] {
+        match self {
+            Command::Do | Command::Continue | Command::Drain => &[Role::Build, Role::Resolver],
+            Command::Fix | Command::Correct => &[Role::Build],
+            Command::Rebase => &[],
+            Command::Intake => &[Role::Intake],
+        }
+    }
 }
 
 /// What a command holds once the project is its own and the ticket read.
@@ -1395,7 +1408,7 @@ impl OnDemand<'_> {
             &p.checkout,
             &p.base,
             self.config,
-            &[Role::Build, Role::Resolver],
+            command.briefed_roles(),
         )
         .map_err(|e| refused("the project's rules", e))?;
         sink.emit(
