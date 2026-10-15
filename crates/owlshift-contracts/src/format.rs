@@ -23,14 +23,19 @@ use crate::Role;
 /// gives `result_refusal` to the resolver too (OWL-191); format 11 adds
 /// Build's `refused_choices` (OWL-198); format 12 adds Build's `check_failure`
 /// (OWL-112); format 13 the rebase role's `rebase` (OWL-210); format 14
-/// Build's `correction` and a thread decision's `reversed` (OWL-146).
-pub const BRIEF_FORMAT: u32 = 14;
+/// Build's `correction` and a thread decision's `reversed` (OWL-146); format
+/// 15 the quality pipeline's `plan`, `approval`, `findings`, `review` and
+/// `pull_request_reviews`, and a question's `replan` (OWL-300).
+pub const BRIEF_FORMAT: u32 = 15;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
 /// (OWL-176); format 7 adds Build's `refused_choices_asked` (OWL-193);
-/// format 8 the intake role's `intake` (OWL-245).
-pub const RESULT_FORMAT: u32 = 8;
+/// format 8 the intake role's `intake` (OWL-245); format 9 the quality
+/// pipeline's `plan`, `approval`, `findings`, `rulings` and
+/// `finding_responses`, a question's `replan`, and `premise_false` from the
+/// intake, design and build roles only (OWL-300).
+pub const RESULT_FORMAT: u32 = 9;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -38,30 +43,40 @@ pub const EVENT_FORMAT: u32 = 2;
 /// The format version of a claim (`claim.json` on a claim ref).
 pub const CLAIM_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).
-/// Format 3 adds the fix passes and repairs at Watch (OWL-55); format 2 is
-/// still read, with both at 0.
-pub const TICKET_STATE_FORMAT: u32 = 3;
+/// Format 3 adds the fix passes and repairs at Watch (OWL-55); format 4 the
+/// review passes of the current stage (OWL-300); formats 2 and 3 are still
+/// read, with what they lack at 0.
+pub const TICKET_STATE_FORMAT: u32 = 4;
 /// The format version of a ticket's asks (`questions.json` on a ticket ref).
 /// Format 4 added the resolver's kept `decisions` (OWL-138); format 5 an
 /// ask's `result_refusal` (OWL-184); format 6 Build's kept `build_refusal`
 /// (OWL-192); format 7 the resolver's kept `resolver_refusal` (OWL-191);
 /// format 8 every refused list of choices in `build_refusal` (OWL-195);
 /// format 9 the refused choices typed in it (OWL-198); format 10 a
-/// decision's `reversed` (OWL-146); formats 2 to 9 are still read.
-pub const QUESTIONS_FORMAT: u32 = 10;
+/// decision's `reversed` (OWL-146); format 11 a question's `replan`
+/// (OWL-300); formats 2 to 10 are still read.
+pub const QUESTIONS_FORMAT: u32 = 11;
 /// The format version of a ticket's delivery (`delivery.json` on a ticket
 /// ref, OWL-209). Format 2 adds the `owed` report and the push's kept
 /// `report` (OWL-218); format 3 a correction run's push (OWL-146); format 4
 /// the first delivery's owed report, with its kept `notes`, and a
-/// correction's owed report that pushed nothing (OWL-236); formats 1 to 3
+/// correction's owed report that pushed nothing (OWL-236); format 5 a review
+/// loop's push and its report's answered `reviews` (OWL-300); formats 1 to 4
 /// are still read.
-pub const DELIVERY_FORMAT: u32 = 4;
+pub const DELIVERY_FORMAT: u32 = 5;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
 /// ref, OWL-245).
 pub const INTAKE_FORMAT: u32 = 1;
 /// The format version of a ticket's proposed follow-ups (`proposals.json` on
-/// a ticket ref, OWL-245).
-pub const PROPOSALS_FORMAT: u32 = 1;
+/// a ticket ref, OWL-245). Format 2 lets a review loop's run propose
+/// (OWL-300); format 1 is still read.
+pub const PROPOSALS_FORMAT: u32 = 2;
+/// The format version of a ticket's plan (`plan.json` on a ticket ref,
+/// OWL-300).
+pub const PLAN_FORMAT: u32 = 1;
+/// The format version of a ticket's review record (`review.json` on a ticket
+/// ref, OWL-300).
+pub const REVIEW_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

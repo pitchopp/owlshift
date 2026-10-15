@@ -306,6 +306,7 @@ pub struct TicketState {
     failed_runs: u32,
     fix_passes: u32,
     repairs: u32,
+    review_passes: u32,
 }
 
 impl TicketState {
@@ -318,6 +319,7 @@ impl TicketState {
             failed_runs: 0,
             fix_passes: 0,
             repairs: 0,
+            review_passes: 0,
         }
     }
 
@@ -378,6 +380,7 @@ impl TicketState {
             failed_runs,
             fix_passes,
             repairs,
+            review_passes: 0,
         };
         match problem {
             None => Ok(state),
@@ -417,6 +420,25 @@ impl TicketState {
     /// Repairs of the current delivery; only at Watch.
     pub const fn repairs(&self) -> u32 {
         self.repairs
+    }
+
+    /// The review passes of the current stage (`state.json` format 4,
+    /// OWL-300): 0 until the quality pipeline's core counts them. Every
+    /// transition carries the count unchanged; when it is reset and how
+    /// far it may go are the pipeline's rules (OWL-301).
+    pub const fn review_passes(&self) -> u32 {
+        self.review_passes
+    }
+
+    /// This state with `review_passes` review passes, as a ticket ref keeps
+    /// them; [`TicketState::restore`] rebuilds the other parts. The count
+    /// carries no rule of its own yet (OWL-301 adds them).
+    #[must_use]
+    pub const fn with_review_passes(self, review_passes: u32) -> Self {
+        Self {
+            review_passes,
+            ..self
+        }
     }
 
     /// Applies an event to this state, in the ticket's pipeline.
@@ -590,6 +612,7 @@ impl TicketState {
                     failed_runs: 0,
                     fix_passes: 0,
                     repairs: 0,
+                    review_passes: self.review_passes,
                 })
             }
 
@@ -669,11 +692,13 @@ impl fmt::Display for InvalidState {
             failed_runs,
             fix_passes,
             repairs,
+            review_passes,
         } = self.state;
         write!(
             f,
             "invalid ticket state {status:?} (round {round}, re-asks {reasks}, failed runs \
-             {failed_runs}, fix passes {fix_passes}, repairs {repairs}): {}",
+             {failed_runs}, fix passes {fix_passes}, repairs {repairs}, review passes \
+             {review_passes}): {}",
             self.reason
         )
     }
@@ -1427,7 +1452,28 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid ticket state Active(Verify) (round 1, re-asks 0, failed runs 0, fix passes \
-             1, repairs 2): fix passes or repairs outside watch"
+             1, repairs 2, review passes 0): fix passes or repairs outside watch"
+        );
+    }
+
+    #[test]
+    fn review_passes_are_restored_and_carried_through_every_transition() {
+        let build = state(Status::Active(Stage::Build), 1, 0, 0).with_review_passes(2);
+        assert_eq!(build.review_passes(), 2);
+        let waiting = to(build.apply(STANDARD, Event::Questions));
+        assert_eq!(waiting.review_passes(), 2);
+        let parked = match waiting.apply(STANDARD, Event::Quarantined) {
+            Ok(Transition::Parked { state, .. }) => state,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parked.review_passes(), 2);
+        assert_eq!(
+            to(parked.apply(STANDARD, Event::Restarted)).review_passes(),
+            2
+        );
+        assert_eq!(
+            to(build.apply(STANDARD, Event::Completed)).review_passes(),
+            2
         );
     }
 }

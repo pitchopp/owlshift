@@ -112,6 +112,11 @@ impl Bench {
             correction: None,
             rebase: None,
             result_path: RelativePath::new("result.json").unwrap(),
+            plan: None,
+            approval: false,
+            findings: None,
+            review: None,
+            pull_request_reviews: Vec::new(),
         };
         Self {
             worktree: tmp.path().join("worktree"),
@@ -475,7 +480,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
             }),
             ..bench.executor.clone()
         };
-        let done = r#"{"format":8,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+        let done = r#"{"format":9,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
         let write_result = format!("printf '%s' '{done}' > .owlshift/run/result.json");
         let mut brief = bench.brief.clone();
         let script = if case == "the harness" {

@@ -2951,6 +2951,11 @@ impl OnDemand<'_> {
             rebase: None,
             correction: None,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
+            plan: None,
+            approval: false,
+            findings: None,
+            review: None,
+            pull_request_reviews: Vec::new(),
         }
     }
 
@@ -3070,6 +3075,7 @@ impl OnDemand<'_> {
                 questions: Vec::new(),
                 notes: gathered.decisions,
                 followups: gathered.followups,
+                reviews: Vec::new(),
             }),
             unchanged: false,
         });
@@ -3236,6 +3242,7 @@ impl Repaired {
             },
             notes: Vec::new(),
             followups: followups.to_vec(),
+            reviews: Vec::new(),
         }
     }
 }
@@ -4378,6 +4385,9 @@ impl OnDemand<'_> {
             // The first delivery's report has no lead line, and counts
             // nothing (OWL-236).
             PushKind::Delivery => (None, None, None, None),
+            // No run pushes a review loop's commit yet: its lead line, which
+            // names the reviews answered, comes with the loop (OWL-307).
+            PushKind::Review => (None, None, None, None),
             PushKind::Correction => {
                 let corrected = Corrected {
                     questions: owed
@@ -4781,6 +4791,7 @@ fn push_what(kind: PushKind) -> &'static str {
         PushKind::Fix => "fix",
         PushKind::Correction => "correction",
         PushKind::Delivery => "delivery",
+        PushKind::Review => "review",
     }
 }
 
@@ -5185,6 +5196,7 @@ fn late_round(late: &[Comment]) -> Round {
             "No: deliver the work as it stands".to_owned(),
         ],
         recommendation: Some("Yes: revise the work for them, then deliver".to_owned()),
+        replan: false,
     };
     Round {
         questions: vec![(question.id.clone(), question)],
@@ -5466,6 +5478,7 @@ mod tests {
                 text: "t".into(),
                 options: Vec::new(),
                 recommendation: None,
+                replan: false,
             }],
             decider: AskDecider {
                 account: "u1".into(),
@@ -5484,6 +5497,7 @@ mod tests {
                 text: "t".into(),
                 options: Vec::new(),
                 recommendation: None,
+                replan: false,
             },
             decision: decided.into(),
             basis: "the ticket".into(),
@@ -5576,6 +5590,7 @@ mod tests {
                 text: "t".into(),
                 options: Vec::new(),
                 recommendation: None,
+                replan: false,
             }],
             decider: AskDecider {
                 account: by.into(),
@@ -5829,12 +5844,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":8,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":9,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t"}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":8,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":9,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -5918,7 +5933,7 @@ mod tests {
         // A `premise_false` with no question asks nothing either (OWL-193).
         let unasked_premise = Outcome::Finished {
             result: Box::new(
-                RunResult::parse(r#"{"format":8,"status":"premise_false","summary":"s"}"#).unwrap(),
+                RunResult::parse(r#"{"format":9,"status":"premise_false","summary":"s"}"#).unwrap(),
             ),
             artifacts: crate::artifact::ArtifactContents::default(),
         };
@@ -6017,7 +6032,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":8,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":9,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -6054,7 +6069,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":8,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":9,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());
@@ -6120,7 +6135,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 10,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 11,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),
@@ -6141,7 +6156,7 @@ mod tests {
         };
         let asking = |named: &str| {
             format!(
-                r#"{{"format":8,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":9,"status":"questions","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"Which file, and every key?"}}]{named}}}"#
             )
         };
@@ -6157,7 +6172,7 @@ mod tests {
             (true, 0, Some(held))
         );
         // Its `done` is refused, and the hold kept with the latest reason.
-        let done = validated(r#"{"format":8,"status":"done","summary":"s"}"#, &text_only);
+        let done = validated(r#"{"format":9,"status":"done","summary":"s"}"#, &text_only);
         let refused = done.unwrap_err();
         assert!(
             matches!(
@@ -6178,7 +6193,7 @@ mod tests {
 
         // Mixed with typed choices, a later refusal's: only those have a
         // place, and an ask naming them all clears the text lists too.
-        let listing = r#"{"format":8,"status":"done","summary":"s","decisions":[
+        let listing = r#"{"format":9,"status":"done","summary":"s","decisions":[
             {"question":"Where the README lists it","decision":"d","basis":"b"},
             {"question":"Which default","decision":"d","basis":"b"}]}"#;
         let refused = validated(listing, &text_only).unwrap_err();

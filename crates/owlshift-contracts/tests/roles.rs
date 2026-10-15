@@ -71,6 +71,47 @@ const INTAKE_ONLY: &[&str] = &[
     "quote",
 ];
 
+/// `result.json` fields and values of the quality pipeline (OWL-300) that
+/// roles/build.md does not name yet: the design role's plan and approval,
+/// the review roles' findings and the arbiter's rulings, which a build
+/// result carrying them is refused for, and Build's own `replan` and
+/// `finding_responses`, which OWL-302 teaches it and then takes out of
+/// this list.
+const QUALITY_PIPELINE: &[&str] = &[
+    "plan",
+    "goal",
+    "criteria",
+    "approach",
+    "alternatives",
+    "files",
+    "steps",
+    "what",
+    "test",
+    "risks",
+    "out_of_scope",
+    "forks",
+    "choice",
+    "approval",
+    "approved",
+    "changed",
+    "findings",
+    "severity",
+    "blocker",
+    "major",
+    "minor",
+    "claim",
+    "evidence",
+    "criterion",
+    "settle",
+    "rulings",
+    "confirmed",
+    "rejected",
+    "finding",
+    "finding_responses",
+    "fixed",
+    "replan",
+];
+
 /// Brief fields the build prompt relies on, as dotted paths from the brief's
 /// root; arrays and alternatives are crossed on the way.
 const BUILD_BRIEF_FIELDS: &[&str] = &[
@@ -314,6 +355,7 @@ fn build_prompt_names_every_result_field_and_value() {
         .chain(RESOLVER_ONLY)
         .chain(NOT_BUILD)
         .chain(INTAKE_ONLY)
+        .chain(QUALITY_PIPELINE)
     {
         assert!(
             expected.remove(*word),

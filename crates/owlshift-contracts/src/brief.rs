@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::Role;
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
-use crate::ids::{QuestionId, RelativePath, TicketId};
+use crate::ids::{QuestionId, RelativePath, TicketId, is_commit_id};
 use crate::result::{Question, RefusedChoice, check_question_order, first_not_ascending};
+use crate::review::{
+    Finding, FindingsMode, MAX_PASS_FINDINGS, Mandate, Plan, check_findings, check_mandates,
+};
 
 const CONTRACT: &str = "brief";
 
@@ -137,8 +140,102 @@ pub struct Brief {
     /// Build's brief only, at Watch; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correction: Option<Correction>,
+    /// The ticket's plan and the base commit it was written on (format 15,
+    /// OWL-300): what Build follows, the review roles and the arbiter read,
+    /// and a design run revises or puts to the decider. Required in the
+    /// design review role's brief; given to the design, design review,
+    /// build, verify and arbiter roles only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<GivenPlan>,
+    /// The plan was put to the decider for approval, and the thread holds
+    /// their reply (format 15): this design run answers it, approved or
+    /// changed. In a design run's brief only, with its `plan`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approval: bool,
+    /// Findings this run rules on, answers or fixes (format 15): to rule on
+    /// in the arbiter's brief, always; to answer or to fix in a design or
+    /// build run's brief only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<GivenFindings>,
+    /// What this review run reviews for, and its pass (format 15): in the
+    /// design review and verify roles' briefs, always, and only there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewBrief>,
+    /// Reviews submitted on the delivered pull request (format 15): what a
+    /// review loop's Build run follows when its author is the decider, and
+    /// quoted data otherwise. In Build's brief only, at most
+    /// [`MAX_PULL_REQUEST_REVIEW_BYTES`] each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pull_request_reviews: Vec<PullRequestReview>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
+}
+
+/// The plan a brief gives (OWL-300).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GivenPlan {
+    /// The base commit the plan was written on, a full commit id.
+    pub base: String,
+    pub plan: Plan,
+}
+
+/// The findings a brief gives, and what the run does with them (OWL-300).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GivenFindings {
+    pub mode: FindingsMode,
+    /// At least one, ids increasing, at most [`MAX_PASS_FINDINGS`]; text of
+    /// the reviewers, data.
+    #[schemars(length(min = 1, max = MAX_PASS_FINDINGS))]
+    pub findings: Vec<Finding>,
+}
+
+/// What a review run reviews for (OWL-300).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewBrief {
+    /// The run's mandates, at least one, each once: a critic alone in its
+    /// pass holds conformance too.
+    #[schemars(length(min = 1))]
+    pub mandates: Vec<Mandate>,
+    /// The review pass at its stage, from 1.
+    pub pass: NonZeroU32,
+}
+
+/// The most bytes one pull request review weighs in a brief, rendered as
+/// JSON.
+pub const MAX_PULL_REQUEST_REVIEW_BYTES: usize = 64 * 1024;
+
+/// A review submitted on the delivered pull request (OWL-300, architecture
+/// section 5, "Review comments on the pull request").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestReview {
+    /// The forge's id of the review.
+    pub id: u64,
+    /// Its author: `decider` when that forge login maps to the ticket's
+    /// decider, whose review is an instruction; `other` for another listed
+    /// reviewer, whose review is quoted data.
+    pub author: Author,
+    /// The review's body; empty when it has inline comments only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// Its inline comments, in the forge's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<ReviewComment>,
+}
+
+/// An inline comment of a pull request review.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewComment {
+    /// The file, from the repository's root.
+    pub path: String,
+    /// The line of the file, when the forge gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<NonZeroU32>,
+    pub body: String,
 }
 
 /// A question the resolver settles, as the raising run asked it but without
@@ -661,6 +758,7 @@ impl Brief {
                 ));
             }
         }
+        self.check_quality_pipeline()?;
         match (self.role == Role::Resolver, self.resolve.is_empty()) {
             (true, true) => Err(ContractError::invalid(
                 CONTRACT,
@@ -682,6 +780,112 @@ impl Brief {
                 None => Ok(()),
             },
         }
+    }
+}
+
+impl Brief {
+    /// The rules of format 15's fields (OWL-300): the plan only for the
+    /// design, design review, build, verify and arbiter roles, always for
+    /// design review, its base a full commit id and the plan keeping its own
+    /// rules; `approval` only for design, with a plan; findings to rule on
+    /// for the arbiter, always, and to answer or fix for design or build
+    /// only, ids increasing and each keeping a result's rules; `review` for
+    /// design review and verify, always, and only them, with distinct
+    /// mandates; pull request reviews for build only, each with a body or a
+    /// comment, every comment naming a path and saying something, and at
+    /// most [`MAX_PULL_REQUEST_REVIEW_BYTES`].
+    fn check_quality_pipeline(&self) -> Result<(), ContractError> {
+        let role = self.role;
+        let mismatch = |field: &str, roles: &str| {
+            Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "{field}: the role is {}, and {field} goes to {roles}",
+                    role.as_str()
+                ),
+            ))
+        };
+        match &self.plan {
+            Some(given) => {
+                if !matches!(
+                    role,
+                    Role::Design | Role::DesignReview | Role::Build | Role::Verify | Role::Arbiter
+                ) {
+                    return mismatch(
+                        "a plan",
+                        "the design, design review, build, verify and arbiter roles only",
+                    );
+                }
+                if !is_commit_id(&given.base) {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        format!("the plan's base {:?} is not a full commit id", given.base),
+                    ));
+                }
+                given.plan.check(CONTRACT)?;
+            }
+            None if role == Role::DesignReview => {
+                return mismatch("a plan", "the design review role always");
+            }
+            None => {}
+        }
+        if self.approval && (role != Role::Design || self.plan.is_none()) {
+            return mismatch("an approval round", "the design role only, with its plan");
+        }
+        match &self.findings {
+            Some(given) => {
+                let allowed = match given.mode {
+                    FindingsMode::Rule => role == Role::Arbiter,
+                    FindingsMode::Answer | FindingsMode::Fix => {
+                        matches!(role, Role::Design | Role::Build)
+                    }
+                };
+                if !allowed {
+                    return mismatch(
+                        "findings",
+                        "the arbiter to rule on, and design or build to answer or fix",
+                    );
+                }
+                if given.findings.is_empty() {
+                    return Err(ContractError::invalid(CONTRACT, "no finding is given"));
+                }
+                check_findings(CONTRACT, &given.findings, MAX_PASS_FINDINGS, false)?;
+            }
+            None if role == Role::Arbiter => {
+                return mismatch("findings", "the arbiter always");
+            }
+            None => {}
+        }
+        let reviews = matches!(role, Role::DesignReview | Role::Verify);
+        match &self.review {
+            Some(review) if reviews => check_mandates(CONTRACT, &review.mandates)?,
+            None if !reviews => {}
+            _ => return mismatch("a review", "the design review and verify roles, always"),
+        }
+        if !self.pull_request_reviews.is_empty() && role != Role::Build {
+            return mismatch("pull request reviews", "build only");
+        }
+        for review in &self.pull_request_reviews {
+            let id = review.id;
+            let broken = if review.body.trim().is_empty() && review.comments.is_empty() {
+                "has neither a body nor a comment"
+            } else if review
+                .comments
+                .iter()
+                .any(|c| c.path.trim().is_empty() || c.body.trim().is_empty())
+            {
+                "has a comment without a path or a body"
+            } else if format::render_json(review).len() > MAX_PULL_REQUEST_REVIEW_BYTES {
+                "is over the bytes a review may weigh"
+            } else {
+                continue;
+            };
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!("pull request review {id} {broken}"),
+            ));
+        }
+        Ok(())
     }
 }
 

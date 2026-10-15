@@ -7,7 +7,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "proposals": {
       "description": "At least one: a ref keeps no `proposals.json` without a proposal.",
@@ -175,7 +175,7 @@
       ]
     },
     "ProposingRun": {
-      "description": "The run that proposed a follow-up: the delivering Build, or a fix,\nrebase or correction run whose push landed, counted as its push is in\n`delivery.json`.",
+      "description": "The run that proposed a follow-up: the delivering Build, or a fix,\nrebase, correction or, since format 2, review loop run whose push\nlanded, counted as its push is in `delivery.json`.",
       "type": "object",
       "properties": {
         "count": {
@@ -209,6 +209,11 @@
           "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146).",
           "type": "string",
           "const": "correction"
+        },
+        {
+          "description": "A review loop's run, after reviews on the pull request (format 5,\nOWL-300).",
+          "type": "string",
+          "const": "review"
         }
       ]
     },

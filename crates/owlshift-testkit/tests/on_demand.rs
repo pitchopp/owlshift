@@ -582,7 +582,7 @@ struct Bench {
     inbox: RefCell<FakeInbox>,
 }
 
-const DONE: &str = r#"{"format":8,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const DONE: &str = r#"{"format":9,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
 /// The project's rules, which every brief carries (OWL-61).
@@ -1349,7 +1349,7 @@ fn a_reopened_choice_goes_to_the_decider() {
 "refused_choices_asked":[{{"choice":1,"question":"Q1"}},{{"choice":2,"question":"Q2"}}]}}"#,
         MIXED.strip_suffix("]}").unwrap()
     );
-    let decided_q3 = r#"{"format":8,"status":"done","summary":"The ticket names the heading.",
+    let decided_q3 = r#"{"format":9,"status":"done","summary":"The ticket names the heading.",
 "resolutions":[{"question":"Q3","outcome":"decided","category":"naming","decision":"Hello.",
 "basis":"The ticket's description."}]}"#;
     let (stopped, printed) = bench.run(
@@ -1760,7 +1760,7 @@ type Check = fn(&Stop) -> bool;
 /// itself went through.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
-    let blocked = r#"{"format":8,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":9,"status":"blocked","summary":"The gate needs network."}"#;
     let reset: jiff::Timestamp = "2026-09-29T15:00:00Z".parse().unwrap();
 
     let cases: Vec<(&str, Setup, Check, Option<EventKind>)> = vec![
@@ -2100,7 +2100,7 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         ]);
         *planted.borrow_mut() = commit;
     });
-    let blocked = r#"{"format":8,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":9,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], Some(agent));
     assert!(
         matches!(
@@ -2282,7 +2282,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
 }
 
 /// The Build run's first question round.
-const ROUND_1: &str = r#"{"format":8,"status":"questions",
+const ROUND_1: &str = r#"{"format":9,"status":"questions",
 "summary":"The greeting's language and words are not given.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The ticket names no language.",
@@ -2304,7 +2304,7 @@ fn check(verdicts: &[(&str, &str, &str)]) -> String {
             verdict
         })
         .collect();
-    json!({ "format": 8, "status": "done", "summary": "Checked.", "verdicts": verdicts })
+    json!({ "format": 9, "status": "done", "summary": "Checked.", "verdicts": verdicts })
         .to_string()
 }
 
@@ -3052,7 +3052,7 @@ fn a_late_comment_the_build_cannot_follow_stops_in_needs_input() {
     let check = answered_round(&bench);
     // Not an always-human category: only the integration sends it to the
     // decider without a resolver run, which would need a reply of its own.
-    let asks = r#"{"format":8,"status":"questions",
+    let asks = r#"{"format":9,"status":"questions",
         "summary":"The greeting cannot say both Hello and Goodbye.",
         "questions":[{"id":"Q1","category":"wording","context":"Q2 was answered Hello; a later comment says Goodbye.",
           "text":"Hello or Goodbye?","options":["Hello","Goodbye"]}]}"#;
@@ -3324,7 +3324,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
 
-    let failed = r#"{"format":8,"status":"failed","summary":"The thread holds no ask."}"#;
+    let failed = r#"{"format":9,"status":"failed","summary":"The thread holds no ask."}"#;
     let (outcome, _) = bench.continue_ticket(vec![bench.reply(None, Some(failed))]);
     assert!(
         matches!(&outcome, Err(Stop::CheckFailed { .. })),
@@ -3697,7 +3697,7 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
     let bench = Bench::new(true);
     bench.refuse.set(Some("[owlshift] PARKED"));
     bench.refuse_stage.set(true);
-    let blocked = r#"{"format":8,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":9,"status":"blocked","summary":"The gate needs network."}"#;
     let (outcome, _) = bench.run(vec![bench.reply(None, Some(blocked))], None);
     let Err(
         stop @ Stop::Parked {
@@ -3735,7 +3735,7 @@ fn a_restart_at_build_shows_the_ticket_working_again() {
         ("Q1", "answered", "English."),
         ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
     ]);
-    let blocked = r#"{"format":8,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":9,"status":"blocked","summary":"The gate needs network."}"#;
     let (parked, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(None, Some(blocked)),
@@ -3872,7 +3872,7 @@ fn a_zone_owner_named_only_in_the_persons_checkout_decides_nothing() {
 
 /// A Build run's questions: Q1 discoverable (naming), Q2 always human
 /// (scope).
-const MIXED: &str = r#"{"format":8,"status":"questions",
+const MIXED: &str = r#"{"format":9,"status":"questions",
 "summary":"The greeting's file and words are not given.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
@@ -3881,7 +3881,7 @@ const MIXED: &str = r#"{"format":8,"status":"questions",
    "text":"What should the greeting say?"}]}"#;
 
 /// A Build run's one discoverable question.
-const NAMING: &str = r#"{"format":8,"status":"questions",
+const NAMING: &str = r#"{"format":9,"status":"questions",
 "summary":"The greeting's file is not named.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
@@ -3901,7 +3901,7 @@ fn asking_refused(result: &str, choices: u32) -> String {
 }
 
 /// The resolver decides Q1.
-const DECIDED_Q1: &str = r#"{"format":8,"status":"done","summary":"The ticket names the file.",
+const DECIDED_Q1: &str = r#"{"format":9,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
 "basis":"The ticket's description."}]}"#;
 
@@ -4138,7 +4138,7 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
 
 /// The resolver resolves Q2, which a brief giving Q1 alone did not give: its
 /// result is refused.
-const RESOLVED_Q2: &str = r#"{"format":8,"status":"done","summary":"The ticket names the file.",
+const RESOLVED_Q2: &str = r#"{"format":9,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q2","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
 "basis":"The ticket's description."}]}"#;
 
@@ -4293,14 +4293,14 @@ fn a_refused_resolver_result_is_told_when_its_round_was_posted_but_not_kept() {
 /// decider and the resolver is never run.
 #[test]
 fn the_added_always_human_categories_reach_build_and_the_resolver() {
-    let raised = r#"{"format":8,"status":"questions",
+    let raised = r#"{"format":9,"status":"questions",
 "summary":"The tone and the file are open.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
    "text":"Which file should hold the greeting?"},
   {"id":"Q2","category":"Brand Voice","context":"The ticket does not say how formal it is.",
    "text":"How formal should the greeting be?"}]}"#;
-    let resolved = r#"{"format":8,"status":"done","summary":"The file is named.",
+    let resolved = r#"{"format":9,"status":"done","summary":"The file is named.",
 "resolutions":[
   {"question":"Q1","outcome":"decided","category":"naming",
    "decision":"GREETING.md, at the root.","basis":"The ticket's description."}]}"#;
@@ -4349,7 +4349,7 @@ fn the_added_always_human_categories_reach_build_and_the_resolver() {
 /// one passed on, while the other decision of the same result stands.
 #[test]
 fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
-    let raised = r#"{"format":8,"status":"questions",
+    let raised = r#"{"format":9,"status":"questions",
 "summary":"The greeting's file, the old greetings and the tone are open.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
@@ -4358,7 +4358,7 @@ fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
    "text":"May the old greetings file be deleted?"},
   {"id":"Q3","category":"tone","context":"The ticket does not say how formal it is.",
    "text":"How formal should the greeting be?"}]}"#;
-    let resolved = r#"{"format":8,"status":"done","summary":"The file is named; the rest is not mine.",
+    let resolved = r#"{"format":9,"status":"done","summary":"The file is named; the rest is not mine.",
 "resolutions":[
   {"question":"Q1","outcome":"decided","category":"naming",
    "decision":"GREETING.md, at the root.","basis":"The ticket's description."},
@@ -5097,7 +5097,7 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
 }
 
 /// A fix run's `done`: the greeting committed again.
-const FIXED: &str = r#"{"format":8,"status":"done","summary":"Kept the greeting on every platform.",
+const FIXED: &str = r#"{"format":9,"status":"done","summary":"Kept the greeting on every platform.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Fixed."}}"#;
 
 /// A delivered ticket, its pull request followed.
@@ -5524,7 +5524,7 @@ fn a_refused_move_from_a_stage_left_at_working_is_warned_of_once() {
 
 /// A repair run's question about something only a person holds (scenario
 /// S9).
-const ASKS_FOR_A_VARIABLE: &str = r#"{"format":8,"status":"questions",
+const ASKS_FOR_A_VARIABLE: &str = r#"{"format":9,"status":"questions",
 "summary":"The red is a missing environment variable.",
 "questions":[{"id":"Q1","category":"secrets","context":"CI lacks the GREETING_LOCALE variable the check reads.",
 "text":"Can someone set GREETING_LOCALE in CI and re-run the check?"}]}"#;
@@ -5694,7 +5694,7 @@ fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
 fn a_false_premise_without_a_question_parks_the_fix() {
     let bench = delivered();
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
-    let premise = r#"{"format":8,"status":"premise_false","summary":"The check tests a file this branch never had.","questions":[]}"#;
+    let premise = r#"{"format":9,"status":"premise_false","summary":"The check tests a file this branch never had.","questions":[]}"#;
     let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(premise))]);
     assert!(
         matches!(
@@ -6300,6 +6300,7 @@ fn a_crashed_fix_push(bench: &Bench, owed: Option<owlshift_contracts::refs::Owed
             questions: Vec::new(),
             notes: Vec::new(),
             followups: Vec::new(),
+            reviews: Vec::new(),
         }),
     });
     bench.write_record(&record);
@@ -6576,7 +6577,7 @@ fn an_owed_report_whose_checks_cannot_be_read_is_posted() {
 }
 
 /// A Build `done` proposing a follow-up.
-const DONE_WITH_FOLLOWUP: &str = r#"{"format":8,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const DONE_WITH_FOLLOWUP: &str = r#"{"format":9,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."},
 "followups":[{"title":"Greet in French","why":"Readers asked.","source":"agent","done_when":"It says Bonjour."}]}"#;
 
@@ -6680,10 +6681,10 @@ const AGENTS_RESOLVED: &str =
     "Sign off every commit (`git commit -s`), always, and keep it short.\n";
 
 /// A rebase run's `done`.
-const REBASED: &str = r#"{"format":8,"status":"done","summary":"Rebased onto the base; the conflict kept both sides."}"#;
+const REBASED: &str = r#"{"format":9,"status":"done","summary":"Rebased onto the base; the conflict kept both sides."}"#;
 
 /// A rebase run that could not resolve its conflict.
-const NOT_REBASED: &str = r#"{"format":8,"status":"failed","summary":"Could not resolve AGENTS.md; the rebase was aborted."}"#;
+const NOT_REBASED: &str = r#"{"format":9,"status":"failed","summary":"Could not resolve AGENTS.md; the rebase was aborted."}"#;
 
 /// A delivered ticket whose delivery also changed the project's rules, its
 /// pull request followed.
@@ -6983,7 +6984,7 @@ fn delivered_with_a_decision(bench: &Bench) -> String {
 }
 
 /// A correction run's `done`, the greeting moved as the reply asks.
-const CORRECTED: &str = r#"{"format":8,"status":"done","summary":"Moved the greeting as the reply asks.",
+const CORRECTED: &str = r#"{"format":9,"status":"done","summary":"Moved the greeting as the reply asks.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Corrected."}}"#;
 
 /// Scenario S7's reversal (OWL-146): once the ticket is delivered, the
@@ -7173,7 +7174,7 @@ fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_r
     bench.refuse.set(Some("[owlshift] DELIVERY"));
     let (unchanged, printed) = bench.continue_ticket(vec![bench.reply(
         None,
-        Some(r#"{"format":8,"status":"done","summary":"HELLO.md already holds the greeting."}"#),
+        Some(r#"{"format":9,"status":"done","summary":"HELLO.md already holds the greeting."}"#),
     )]);
     assert!(
         matches!(&unchanged, Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
@@ -7240,7 +7241,7 @@ fn a_correction_that_fails_then_asks_goes_to_the_decider_then_corrects() {
     let bench = Bench::new(true);
     let decision = delivered_with_a_decision(&bench);
     bench.reply_as("maintainer", &decision, "Use the README instead. go");
-    let asks = r#"{"format":8,"status":"questions","summary":"The README has no greeting section.",
+    let asks = r#"{"format":9,"status":"questions","summary":"The README has no greeting section.",
 "questions":[{"id":"Q1","category":"scope","context":"The README holds the install steps only.",
 "text":"Where in the README should the greeting go?"}]}"#;
     let (outcome, printed) =
@@ -7295,7 +7296,7 @@ fn intake_result(status: &str, dependency: Option<&str>, questions: &str) -> Str
         .into_iter()
         .collect();
     let mut result = json!({
-        "format": 8,
+        "format": 9,
         "status": status,
         "summary": "A small greeting.",
         "intake": {
@@ -7552,7 +7553,7 @@ fn a_parked_intake_is_restarted_by_continue_and_returns_to_ready() {
     let failed = || {
         bench.reply(
             None,
-            Some(r#"{"format":8,"status":"failed","summary":"Lost."}"#),
+            Some(r#"{"format":9,"status":"failed","summary":"Lost."}"#),
         )
     };
     let stop = bench
@@ -7592,7 +7593,7 @@ fn continue_runs_intake_on_a_ticket_at_intake() {
     let failed = || {
         bench.reply(
             None,
-            Some(r#"{"format":8,"status":"failed","summary":"Lost."}"#),
+            Some(r#"{"format":9,"status":"failed","summary":"Lost."}"#),
         )
     };
     bench
@@ -7610,7 +7611,7 @@ fn continue_runs_intake_on_a_ticket_at_intake() {
 }
 
 /// A Build run's `done` with two follow-ups (OWL-253).
-const PROPOSING: &str = r#"{"format":8,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const PROPOSING: &str = r#"{"format":9,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."},
 "followups":[
  {"title":"Translate the greeting","why":"Readers abroad.","evidence":["GREETING.md:1"],"source":"agent","done_when":"A French greeting exists."},
@@ -8581,7 +8582,7 @@ fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
     let failed = || {
         bench.reply(
             None,
-            Some(r#"{"format":8,"status":"failed","summary":"Lost."}"#),
+            Some(r#"{"format":9,"status":"failed","summary":"Lost."}"#),
         )
     };
     let asks = bench.reply(

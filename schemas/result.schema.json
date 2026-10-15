@@ -1,9 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift result.json",
-  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, resolutions from the resolver only, covering\nexactly the questions it was given, no decisions from the build role,\nno `done` from a Build run told that its predecessor's decisions were\nrefused, from such a run when it asks, every refused choice of its\nbrief named in `refused_choices_asked` (OWL-193), and `intake` from the\nintake role only, which gives it whenever it ends `done` or `questions`\n(OWL-245).",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, resolutions from the resolver only, covering\nexactly the questions it was given, no decisions from the build role,\nno `done` from a Build run told that its predecessor's decisions were\nrefused, from such a run when it asks, every refused choice of its\nbrief named in `refused_choices_asked` (OWL-193), `intake` from the\nintake role only, which gives it whenever it ends `done` or `questions`\n(OWL-245), and the quality pipeline's fields from their roles only\n(OWL-300, [`RunResult::validate_against`]).",
   "type": "object",
   "properties": {
+    "approval": {
+      "description": "A design run's answer to an approval round (format 9): `approved`\nleaves the plan as it was, `changed` gives the revised `plan`\nbeside it. Required with `done` from a design run whose brief has\n`approval`, refused otherwise.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ApprovalOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "artifacts": {
       "description": "Paths, relative to the worktree, of the artifacts the run left.",
       "$ref": "#/$defs/Artifacts",
@@ -17,6 +28,21 @@
         "$ref": "#/$defs/Decision"
       }
     },
+    "finding_responses": {
+      "description": "The author's answer to each finding of its brief, in finding order\n(format 9): only from a design or build run whose brief gives\nfindings to answer, and only with `done`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/FindingResponse"
+      }
+    },
+    "findings": {
+      "description": "A review run's findings, F1..Fn in order, at most\n[`crate::review::MAX_FINDINGS`] (format 9): only from the design\nreview and verify roles, and only with `done`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "maxItems": 64
+    },
     "followups": {
       "description": "Follow-up tickets proposed to a human; never admitted automatically.",
       "type": "array",
@@ -28,13 +54,24 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 8
+      "const": 9
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
       "anyOf": [
         {
           "$ref": "#/$defs/IntakeVerdict"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "plan": {
+      "description": "The design role's plan (format 9, OWL-300): with `done`, from a\ndesign run not answering an approval round, or beside `approval:\nchanged`; refused from any other role and with any other status.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Plan"
         },
         {
           "type": "null"
@@ -74,6 +111,13 @@
       "default": [],
       "items": {
         "$ref": "#/$defs/Resolution"
+      }
+    },
+    "rulings": {
+      "description": "The arbiter's ruling on each finding of its brief, in finding order\n(format 9): only from the arbiter, and only with `done`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Ruling"
       }
     },
     "status": {
@@ -222,6 +266,105 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "plan": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "plan"
+            ]
+          },
+          {
+            "properties": {
+              "approval": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "approval"
+            ]
+          },
+          {
+            "properties": {
+              "findings": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "findings"
+            ]
+          },
+          {
+            "properties": {
+              "rulings": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "rulings"
+            ]
+          },
+          {
+            "properties": {
+              "finding_responses": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "finding_responses"
+            ]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "done"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "approval": {
+            "const": "changed"
+          }
+        },
+        "required": [
+          "approval"
+        ]
+      },
+      "then": {
+        "required": [
+          "plan"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "approval": {
+            "const": "approved"
+          }
+        },
+        "required": [
+          "approval"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "plan"
+          ]
+        }
+      }
     }
   ],
   "required": [
@@ -230,6 +373,24 @@
     "summary"
   ],
   "$defs": {
+    "Alternative": {
+      "description": "An approach the plan set aside.",
+      "type": "object",
+      "properties": {
+        "approach": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was set aside.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "approach",
+        "reason"
+      ]
+    },
     "AnswerClass": {
       "description": "How the decider's answers left one question.",
       "oneOf": [
@@ -252,6 +413,21 @@
           "description": "The decider answered with a question of their own.",
           "type": "string",
           "const": "counter_question"
+        }
+      ]
+    },
+    "ApprovalOutcome": {
+      "description": "A design run's answer to an approval round (format 9, OWL-300).",
+      "oneOf": [
+        {
+          "description": "The decider approved the plan as it was.",
+          "type": "string",
+          "const": "approved"
+        },
+        {
+          "description": "The decider's answer changes the plan: the result's `plan` is the\nrevised one.",
+          "type": "string",
+          "const": "changed"
         }
       ]
     },
@@ -335,6 +511,72 @@
         "max"
       ]
     },
+    "Finding": {
+      "description": "A finding of a review run (architecture section 5, \"Design review\").\nEvery text is not blank.",
+      "type": "object",
+      "properties": {
+        "claim": {
+          "description": "What is wrong.",
+          "type": "string"
+        },
+        "criterion": {
+          "description": "The success criterion it bears on, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "description": "What shows it: a `file:line`, a step of the plan, a line of the\nticket.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/FindingId"
+        },
+        "settle": {
+          "description": "What would settle it.",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "severity",
+        "claim",
+        "evidence",
+        "settle"
+      ]
+    },
+    "FindingId": {
+      "description": "A review finding's identifier: F1, F2, and so on.",
+      "type": "string",
+      "pattern": "^F[1-9][0-9]*$"
+    },
+    "FindingResponse": {
+      "description": "The author's answer to one finding it was given, in author mode\n(`pipeline.findings = \"author\"`).",
+      "type": "object",
+      "properties": {
+        "finding": {
+          "$ref": "#/$defs/FindingId"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ResponseOutcome"
+        },
+        "reason": {
+          "description": "Why; not blank.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "finding",
+        "outcome",
+        "reason"
+      ]
+    },
     "Followup": {
       "description": "A follow-up ticket proposed to a human.",
       "type": "object",
@@ -380,6 +622,31 @@
         "agent",
         "reviewer",
         "ci"
+      ]
+    },
+    "Fork": {
+      "description": "A fork of the plan: its choice, the options it chose among, and why.",
+      "type": "object",
+      "properties": {
+        "choice": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "choice",
+        "options",
+        "reason"
       ]
     },
     "Harness": {
@@ -434,6 +701,99 @@
         "routing"
       ]
     },
+    "Plan": {
+      "description": "The plan a design run returns (architecture section 5, \"Design\"): what\nthe Build follows and the reviewers read. Every text is not blank.",
+      "type": "object",
+      "properties": {
+        "alternatives": {
+          "description": "The approaches set aside, each with why.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Alternative"
+          }
+        },
+        "approach": {
+          "description": "The approach chosen.",
+          "type": "string"
+        },
+        "criteria": {
+          "description": "The success criteria, taken from the ticket.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "files": {
+          "description": "The files the work touches, from the repository's root.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "forks": {
+          "description": "The choices of how the design made between approaches that would\neach deliver the ticket; `on-fork` plan approval reads them.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Fork"
+          }
+        },
+        "goal": {
+          "description": "What the ticket's work achieves.",
+          "type": "string"
+        },
+        "out_of_scope": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "steps": {
+          "description": "The ordered steps, each with its test.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlanStep"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "goal",
+        "criteria",
+        "approach",
+        "steps"
+      ]
+    },
+    "PlanStep": {
+      "description": "One step of a plan.",
+      "type": "object",
+      "properties": {
+        "test": {
+          "description": "The test that shows the step done.",
+          "type": "string"
+        },
+        "what": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "what",
+        "test"
+      ]
+    },
     "PullRequest": {
       "description": "The pull request the runner opens for a finished ticket.",
       "type": "object",
@@ -482,6 +842,10 @@
             "string",
             "null"
           ]
+        },
+        "replan": {
+          "description": "The Build cannot follow its plan, and asks how (format 9, OWL-300):\nonce answered or decided, the ticket goes back to Design. Only on a\nbuild run's question.",
+          "type": "boolean"
         },
         "text": {
           "type": "string"
@@ -586,6 +950,14 @@
         }
       ]
     },
+    "ResponseOutcome": {
+      "description": "What the author did with a finding.",
+      "type": "string",
+      "enum": [
+        "fixed",
+        "rejected"
+      ]
+    },
     "Routing": {
       "description": "The routing verdict: the harness, tier and effort of the ticket's runs\n(section 9, \"One routing verdict per ticket\").",
       "type": "object",
@@ -605,6 +977,45 @@
         "harness",
         "tier",
         "effort"
+      ]
+    },
+    "Ruling": {
+      "description": "The arbiter's ruling on one finding it was given.",
+      "type": "object",
+      "properties": {
+        "finding": {
+          "$ref": "#/$defs/FindingId"
+        },
+        "outcome": {
+          "$ref": "#/$defs/RulingOutcome"
+        },
+        "reason": {
+          "description": "Why, resting on what the arbiter checked in the repository; not\nblank.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "finding",
+        "outcome",
+        "reason"
+      ]
+    },
+    "RulingOutcome": {
+      "description": "What the arbiter ruled.",
+      "type": "string",
+      "enum": [
+        "confirmed",
+        "rejected"
+      ]
+    },
+    "Severity": {
+      "description": "How much a finding weighs.",
+      "type": "string",
+      "enum": [
+        "blocker",
+        "major",
+        "minor"
       ]
     },
     "Status": {

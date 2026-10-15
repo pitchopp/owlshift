@@ -74,12 +74,14 @@ fn committed_schemas_match_the_types() {
 
 #[test]
 fn fixtures_validate_against_the_committed_schemas() {
-    let cases: [(&str, &str); 16] = [
+    let cases: [(&str, &str); 20] = [
         ("result", "result-sample.json"),
         ("result", "result-answer-check.json"),
         ("result", "result-counter-question.json"),
         ("result", "result-resolver.json"),
         ("result", "result-intake.json"),
+        ("result", "result-design.json"),
+        ("result", "result-review.json"),
         ("brief", "brief.json"),
         ("event", "event.json"),
         ("claim", "claim.json"),
@@ -88,6 +90,8 @@ fn fixtures_validate_against_the_committed_schemas() {
         ("ticket-delivery", "ticket-delivery.json"),
         ("ticket-intake", "ticket-intake.json"),
         ("ticket-proposals", "ticket-proposals.json"),
+        ("ticket-plan", "ticket-plan.json"),
+        ("ticket-review", "ticket-review.json"),
         ("comment-footer", "footer.json"),
         ("project-config", "owlshift.toml"),
         ("personal-config", "personal.toml"),
@@ -111,7 +115,7 @@ fn fixtures_validate_against_the_committed_schemas() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
-    let base = |status: &str| json!({ "format": 8, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 9, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -142,10 +146,92 @@ fn result_schema_carries_the_expressible_rules() {
     named["refused_choices_asked"][0]["choice"] = json!(0);
     assert!(!validator.is_valid(&named));
 
-    for format in [1, 2, 3, 4, 5, 6, 7, 9] {
+    for format in [1, 2, 3, 4, 5, 6, 7, 8, 10] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
+    }
+
+    // The quality pipeline's fields go with `done` only, and an approval
+    // `changed` with its plan, `approved` without one (OWL-300); schema and
+    // type agree on each case.
+    let design: Value = serde_json::from_str(&fixture("result-design.json")).unwrap();
+    let review: Value = serde_json::from_str(&fixture("result-review.json")).unwrap();
+    let ruling = json!([{ "finding": "F1", "outcome": "confirmed", "reason": "r" }]);
+    let response = json!([{ "finding": "F1", "outcome": "fixed", "reason": "r" }]);
+    let with = |mut document: Value, field: &str, value: Value| {
+        if value.is_null() {
+            document.as_object_mut().unwrap().remove(field);
+        } else {
+            document[field] = value;
+        }
+        document
+    };
+    for (case, document, valid) in [
+        ("plan", design.clone(), true),
+        (
+            "plan, failed",
+            with(design.clone(), "status", json!("failed")),
+            false,
+        ),
+        (
+            "changed",
+            with(design.clone(), "approval", json!("changed")),
+            true,
+        ),
+        (
+            "changed without a plan",
+            with(
+                with(design.clone(), "approval", json!("changed")),
+                "plan",
+                Value::Null,
+            ),
+            false,
+        ),
+        (
+            "approved with a plan",
+            with(design.clone(), "approval", json!("approved")),
+            false,
+        ),
+        (
+            "approved",
+            with(
+                with(design.clone(), "approval", json!("approved")),
+                "plan",
+                Value::Null,
+            ),
+            true,
+        ),
+        ("findings", review.clone(), true),
+        (
+            "findings, blocked",
+            with(review.clone(), "status", json!("blocked")),
+            false,
+        ),
+        (
+            "rulings",
+            with(base("done"), "rulings", ruling.clone()),
+            true,
+        ),
+        (
+            "rulings, failed",
+            with(base("failed"), "rulings", ruling),
+            false,
+        ),
+        (
+            "responses",
+            with(base("done"), "finding_responses", response.clone()),
+            true,
+        ),
+        (
+            "responses, failed",
+            with(base("failed"), "finding_responses", response),
+            false,
+        ),
+    ] {
+        assert_eq!(validator.is_valid(&document), valid, "schema: {case}");
+        let parses = owlshift_contracts::result::RunResult::parse(&document.to_string()).is_ok();
+        assert_eq!(parses, valid, "type: {case}");
     }
 
     // The intake record goes with `done` or `questions` only (OWL-245).

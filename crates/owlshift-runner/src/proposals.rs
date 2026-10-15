@@ -390,6 +390,7 @@ mod tests {
                 questions: vec![],
                 notes: vec![],
                 followups: titles.iter().map(|t| followup(t)).collect(),
+                reviews: Vec::new(),
             }),
             unchanged: false,
         }

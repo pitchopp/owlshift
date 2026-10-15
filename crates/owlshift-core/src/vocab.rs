@@ -68,6 +68,7 @@ pub enum Role {
     Build,
     Verify,
     Rebase,
+    Arbiter,
 }
 
 impl Role {
@@ -83,6 +84,7 @@ impl Role {
             Self::Build => "build",
             Self::Verify => "verify",
             Self::Rebase => "rebase",
+            Self::Arbiter => "arbiter",
         }
     }
 }
@@ -181,6 +183,7 @@ mod tests {
             Role::Build,
             Role::Verify,
             Role::Rebase,
+            Role::Arbiter,
         ] {
             let serialized = serde_json::to_value(role).expect("Role always serializes");
             assert_eq!(

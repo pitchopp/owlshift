@@ -219,6 +219,7 @@ impl ProposalDescription {
             PushKind::Fix => "fix",
             PushKind::Rebase => "rebase",
             PushKind::Correction => "correction",
+            PushKind::Review => "review",
         };
         let pull_request = self
             .pull_request
@@ -2904,6 +2905,7 @@ Merge state reported by the forge: `CLEAN`.
             text: format!("Which {id}?"),
             options: vec!["One".to_owned(), "Two\n- injected".to_owned()],
             recommendation: Some("One".to_owned()),
+            replan: false,
         };
         let verdict = |id: &str, class, reason: &str| AnswerVerdict {
             question: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
@@ -3004,6 +3006,7 @@ Merge state reported by the forge: `CLEAN`.
             text: text.to_owned(),
             options: vec!["One".to_owned()],
             recommendation: None,
+            replan: false,
         }
     }
 
@@ -3191,6 +3194,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 text: "Which file?".to_owned(),
                 options: vec!["GREETING.md".to_owned(), "HELLO.md".to_owned()],
                 recommendation: Some("GREETING.md".to_owned()),
+                replan: false,
             },
             decision: format!("GREETING.md\n\n{forged}"),
             basis: "The ticket's description.".to_owned(),
@@ -3280,6 +3284,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             text: format!("Which {id}?"),
             options: Vec::new(),
             recommendation: None,
+            replan: false,
         };
         let reopened = |place: u32, id: &str, asked: &str, recorded: &str| ReopenedChoice {
             place: NonZeroU32::new(place).unwrap(),
@@ -3326,6 +3331,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             text: format!("Which {id}?"),
             options: Vec::new(),
             recommendation: None,
+            replan: false,
         };
         let comment = QuestionsComment {
             ticket: ticket(),
@@ -3473,6 +3479,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             text: "Which?".to_owned(),
             options: Vec::new(),
             recommendation: None,
+            replan: false,
         };
         let round = NonZeroU32::new(1).unwrap();
         let questions = QuestionsComment {
@@ -3583,6 +3590,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 text: format!("Which {n}? {}", "t".repeat(900)),
                 options: vec!["o".repeat(20), "p".repeat(20)],
                 recommendation: Some("r".repeat(20)),
+                replan: false,
             })
             .collect();
         let weights: Vec<usize> = questions
@@ -4141,6 +4149,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 text: format!("Which?{}", "t".repeat(1 << 20)),
                 options: vec!["o".repeat(1 << 20), "p".repeat(1 << 20)],
                 recommendation: None,
+                replan: false,
             },
             decision: "d".repeat(1 << 20),
             basis: "b".repeat(1 << 20),

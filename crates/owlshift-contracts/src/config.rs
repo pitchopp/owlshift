@@ -37,6 +37,11 @@ pub struct ProjectConfig {
     pub pipeline: Pipeline,
     pub models: Models,
     pub policy: Policy,
+    /// The forge's settings (OWL-300); optional. Without it, no review on a
+    /// pull request is read. A file using it requires an Owlshift that reads
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<Forge>,
     /// Code zones, keyed by their folder from the repository's root, such as
     /// `backend/billing`: who owns each.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -192,6 +197,77 @@ impl Stack {
 pub struct Pipeline {
     pub default: Variant,
     pub plan_approval: PlanApproval,
+    /// Who confirms a review finding before it is acted on (OWL-300,
+    /// architecture section 5, "Confirming a finding"): `arbiter`, the
+    /// default when absent, or `author`. A file using it requires an
+    /// Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<FindingsConfirmation>,
+}
+
+/// Who confirms a review finding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingsConfirmation {
+    /// One arbiter run per review pass rules on all its findings.
+    #[default]
+    Arbiter,
+    /// The next design or fix run answers each finding, fixed or rejected.
+    Author,
+}
+
+impl Pipeline {
+    /// Who confirms a finding: the project's choice, or the arbiter.
+    pub fn findings(&self) -> FindingsConfirmation {
+        self.findings.unwrap_or_default()
+    }
+}
+
+/// The forge and how Owlshift reads it (OWL-300).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Forge {
+    /// The forge logins whose reviews on Owlshift's pull requests are read,
+    /// each written exactly and mapped to its tracker account's identifier,
+    /// written as a zone's owner is. A review is an instruction when that
+    /// account is the ticket's decider, and context otherwise; anyone
+    /// else's review is ignored. At least one, no login listed twice, even
+    /// in another case.
+    #[schemars(length(min = 1))]
+    pub reviewers: BTreeMap<String, String>,
+}
+
+impl Forge {
+    /// Checks the reviewers: at least one, each login and account a name
+    /// written exactly, no login twice ignoring case (forge logins are
+    /// compared without case).
+    fn check_reviewers(&self) -> Result<(), String> {
+        if self.reviewers.is_empty() {
+            return Err(
+                "forge.reviewers lists no reviewer: list at least one, or leave [forge] out"
+                    .to_owned(),
+            );
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for (login, account) in &self.reviewers {
+            if let Err(broken) = check_name(login) {
+                return Err(format!("forge.reviewers: the login {login:?} {broken}"));
+            }
+            if let Err(broken) = check_name(account) {
+                return Err(format!(
+                    "forge.reviewers: the account of {login:?}, {account:?}, {broken}"
+                ));
+            }
+            let lower = login.to_lowercase();
+            if seen.contains(&lower) {
+                return Err(format!(
+                    "forge.reviewers: {login:?} is listed twice, logins being compared without case"
+                ));
+            }
+            seen.push(lower);
+        }
+        Ok(())
+    }
 }
 
 /// The model for each tier, per harness.
@@ -375,6 +451,11 @@ impl ProjectConfig {
                 PROJECT,
                 "policy.max_open_prs must be a whole number from 1 to 20",
             ));
+        }
+        if let Some(forge) = &self.forge {
+            forge
+                .check_reviewers()
+                .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         }
         self.zone_owners()?;
         check_names(&self.stack.gate_env_names()).map_err(gate_env_error)

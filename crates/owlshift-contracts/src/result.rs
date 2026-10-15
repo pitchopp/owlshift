@@ -10,6 +10,10 @@ use crate::brief::{Brief, MAX_CHOICE_BYTES};
 use crate::format::{self, ContractError, Format, RESULT_FORMAT};
 use crate::ids::{QuestionId, RelativePath, TicketId};
 use crate::refs::cut_to;
+use crate::review::{
+    Finding, FindingResponse, FindingsMode, MAX_FINDINGS, Plan, Ruling, check_answers,
+    check_findings,
+};
 use crate::{Harness, Role, Tier, Variant};
 
 /// The answer check's classes live in the core, which folds them into one
@@ -66,9 +70,10 @@ pub const MAX_QUESTIONS: usize = 64;
 /// exactly the questions it was given, no decisions from the build role,
 /// no `done` from a Build run told that its predecessor's decisions were
 /// refused, from such a run when it asks, every refused choice of its
-/// brief named in `refused_choices_asked` (OWL-193), and `intake` from the
+/// brief named in `refused_choices_asked` (OWL-193), `intake` from the
 /// intake role only, which gives it whenever it ends `done` or `questions`
-/// (OWL-245).
+/// (OWL-245), and the quality pipeline's fields from their roles only
+/// (OWL-300, [`RunResult::validate_against`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift result.json", transform = result_invariants)]
@@ -118,6 +123,43 @@ pub struct RunResult {
     /// any other role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intake: Option<IntakeVerdict>,
+    /// The design role's plan (format 9, OWL-300): with `done`, from a
+    /// design run not answering an approval round, or beside `approval:
+    /// changed`; refused from any other role and with any other status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Plan>,
+    /// A design run's answer to an approval round (format 9): `approved`
+    /// leaves the plan as it was, `changed` gives the revised `plan`
+    /// beside it. Required with `done` from a design run whose brief has
+    /// `approval`, refused otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalOutcome>,
+    /// A review run's findings, F1..Fn in order, at most
+    /// [`crate::review::MAX_FINDINGS`] (format 9): only from the design
+    /// review and verify roles, and only with `done`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = crate::review::MAX_FINDINGS))]
+    pub findings: Vec<Finding>,
+    /// The arbiter's ruling on each finding of its brief, in finding order
+    /// (format 9): only from the arbiter, and only with `done`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rulings: Vec<Ruling>,
+    /// The author's answer to each finding of its brief, in finding order
+    /// (format 9): only from a design or build run whose brief gives
+    /// findings to answer, and only with `done`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_responses: Vec<FindingResponse>,
+}
+
+/// A design run's answer to an approval round (format 9, OWL-300).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOutcome {
+    /// The decider approved the plan as it was.
+    Approved,
+    /// The decider's answer changes the plan: the result's `plan` is the
+    /// revised one.
+    Changed,
 }
 
 /// The most dependencies one intake record names (OWL-245): the record is
@@ -267,6 +309,11 @@ pub struct Question {
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommendation: Option<String>,
+    /// The Build cannot follow its plan, and asks how (format 9, OWL-300):
+    /// once answered or decided, the ticket goes back to Design. Only on a
+    /// build run's question.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replan: bool,
 }
 
 /// The answer check's verdict on one question: how the decider's answers
@@ -502,8 +549,63 @@ impl RunResult {
                     .map(|d| (&d.ticket, d.quote.as_str())),
             )?;
         }
+        self.check_quality_pipeline()?;
         check_verdicts(CONTRACT, &self.verdicts)?;
         check_resolutions(&self.resolutions)
+    }
+
+    /// The rules of the quality pipeline's fields (format 9) that need no
+    /// brief: each only with `done`; `approval: changed` with a plan beside
+    /// it and `approved` without one; the plan's own rules; findings F1..Fn
+    /// within their bounds; rulings and responses in finding order, each
+    /// with a reason.
+    fn check_quality_pipeline(&self) -> Result<(), ContractError> {
+        let given = [
+            ("plan", self.plan.is_some()),
+            ("approval", self.approval.is_some()),
+            ("findings", !self.findings.is_empty()),
+            ("rulings", !self.rulings.is_empty()),
+            ("finding_responses", !self.finding_responses.is_empty()),
+        ];
+        if self.status != Status::Done
+            && let Some((field, _)) = given.iter().find(|(_, given)| *given)
+        {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!("{field} is given but status is not done"),
+            ));
+        }
+        match (self.approval, &self.plan) {
+            (Some(ApprovalOutcome::Changed), None) => {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "approval is changed but no revised plan is given",
+                ));
+            }
+            (Some(ApprovalOutcome::Approved), Some(_)) => {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "approval is approved but a plan is given: an approved plan stays as it was",
+                ));
+            }
+            _ => {}
+        }
+        if let Some(plan) = &self.plan {
+            plan.check(CONTRACT)?;
+        }
+        check_findings(CONTRACT, &self.findings, MAX_FINDINGS, true)?;
+        check_answers(
+            CONTRACT,
+            "ruling",
+            self.rulings.iter().map(|r| (&r.finding, r.reason.as_str())),
+        )?;
+        check_answers(
+            CONTRACT,
+            "response",
+            self.finding_responses
+                .iter()
+                .map(|r| (&r.finding, r.reason.as_str())),
+        )
     }
 
     /// Whether the result asks: `questions`, or `premise_false` with at
@@ -531,6 +633,7 @@ impl RunResult {
         self.refused_choices_against(brief)?;
         self.resolutions_against(brief)?;
         self.intake_against(brief)?;
+        self.quality_pipeline_against(brief)?;
         if brief.role != Role::AnswerCheck {
             if !self.verdicts.is_empty() {
                 return Err(ContractError::invalid(
@@ -738,6 +841,122 @@ impl RunResult {
         }
     }
 
+    /// The rules of format 9 that need the brief (OWL-300): `premise_false`
+    /// from the intake, design and build roles only; a question's `replan`
+    /// from the build role only; the plan and the approval from the design
+    /// role only, a `done` design run giving `approval` exactly when its
+    /// brief has `approval` and a plan otherwise; findings from the design
+    /// review and verify roles only; rulings from the arbiter only, one for
+    /// each finding of its brief when `done`; responses from a design or
+    /// build run whose brief gives findings to answer only, one for each
+    /// when `done`.
+    fn quality_pipeline_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        let role = brief.role;
+        let refused = |field: &str, roles: &str| {
+            Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "{field} is given but the run's role is {}, not {roles}",
+                    role.as_str()
+                ),
+            ))
+        };
+        if self.status == Status::PremiseFalse
+            && !matches!(role, Role::Intake | Role::Design | Role::Build)
+        {
+            return refused("premise_false", "intake, design or build");
+        }
+        if role != Role::Build
+            && let Some(question) = self.questions.iter().find(|q| q.replan)
+        {
+            return refused(&format!("replan on {}", question.id), "build");
+        }
+        if role != Role::Design {
+            if self.plan.is_some() {
+                return refused("plan", "design");
+            }
+            if self.approval.is_some() {
+                return refused("approval", "design");
+            }
+        } else if self.status == Status::Done {
+            match (brief.approval, self.approval, &self.plan) {
+                (true, None, _) => {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        "status is done but no approval is given: a design run after an \
+                         approval round answers it, approved or changed",
+                    ));
+                }
+                (false, Some(_), _) => {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        "approval is given but the brief asks for no approval",
+                    ));
+                }
+                (false, None, None) => {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        "status is done but no plan is given: the design role returns its plan",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !self.findings.is_empty() && !matches!(role, Role::DesignReview | Role::Verify) {
+            return refused("findings", "design_review or verify");
+        }
+        let given: Vec<_> = brief
+            .findings
+            .iter()
+            .flat_map(|given| given.findings.iter().map(|f| &f.id))
+            .collect();
+        let covers = |answered: Vec<&crate::ids::FindingId>, what: &str| {
+            if answered == given {
+                Ok(())
+            } else {
+                Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "the {what} name {} but the brief gives {}: give one for each finding, \
+                         in order",
+                        ids(&answered),
+                        ids(&given)
+                    ),
+                ))
+            }
+        };
+        if role != Role::Arbiter {
+            if !self.rulings.is_empty() {
+                return refused("rulings", "arbiter");
+            }
+        } else if self.status == Status::Done {
+            covers(self.rulings.iter().map(|r| &r.finding).collect(), "rulings")?;
+        }
+        let answers = matches!(role, Role::Design | Role::Build)
+            && brief
+                .findings
+                .as_ref()
+                .is_some_and(|given| given.mode == FindingsMode::Answer);
+        if !answers {
+            if !self.finding_responses.is_empty() {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "finding_responses are given but the run's brief gives no finding to \
+                         answer (role {})",
+                        role.as_str()
+                    ),
+                ));
+            }
+        } else if self.status == Status::Done {
+            covers(
+                self.finding_responses.iter().map(|r| &r.finding).collect(),
+                "finding_responses",
+            )?;
+        }
+        Ok(())
+    }
+
     /// Resolutions come from the resolver only, and a `done` resolver gives
     /// one for each question of its brief's `resolve`, no more: a decision on
     /// a question it was not given, such as one of an always-human category,
@@ -864,6 +1083,17 @@ fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
     Ok(())
 }
 
+/// Finding ids as a refusal names them: `F1, F2`, or `none`.
+fn ids(ids: &[&crate::ids::FindingId]) -> String {
+    if ids.is_empty() {
+        return "none".to_owned();
+    }
+    ids.iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The first id not greater than the one before it: repeated or out of
 /// order.
 pub(crate) fn first_not_ascending<'a>(
@@ -980,7 +1210,7 @@ pub(crate) fn check_question_order(
     Ok(())
 }
 
-/// Adds to the schema the six rules of [`RunResult::validate`] that JSON
+/// Adds to the schema the nine rules of [`RunResult::validate`] that JSON
 /// Schema can express.
 fn result_invariants(schema: &mut Schema) {
     let rules = json!([
@@ -1013,6 +1243,26 @@ fn result_invariants(schema: &mut Schema) {
         {
             "if": { "properties": { "intake": { "type": "object" } }, "required": ["intake"] },
             "then": { "properties": { "status": { "enum": ["done", "questions"] } } }
+        },
+        {
+            "if": {
+                "anyOf": [
+                    { "properties": { "plan": { "type": "object" } }, "required": ["plan"] },
+                    { "properties": { "approval": { "type": "string" } }, "required": ["approval"] },
+                    { "properties": { "findings": { "minItems": 1 } }, "required": ["findings"] },
+                    { "properties": { "rulings": { "minItems": 1 } }, "required": ["rulings"] },
+                    { "properties": { "finding_responses": { "minItems": 1 } }, "required": ["finding_responses"] }
+                ]
+            },
+            "then": { "properties": { "status": { "const": "done" } } }
+        },
+        {
+            "if": { "properties": { "approval": { "const": "changed" } }, "required": ["approval"] },
+            "then": { "required": ["plan"] }
+        },
+        {
+            "if": { "properties": { "approval": { "const": "approved" } }, "required": ["approval"] },
+            "then": { "not": { "required": ["plan"] } }
         }
     ]);
     schema.insert("allOf".to_owned(), rules);

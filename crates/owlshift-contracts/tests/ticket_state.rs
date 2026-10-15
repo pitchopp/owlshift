@@ -234,6 +234,6 @@ fn a_format_2_state_reads_with_no_fix_pass_or_repair() {
             &rendered["fix_passes"],
             &rendered["repairs"]
         ),
-        (&json!(3), &json!(0), &json!(0))
+        (&json!(4), &json!(0), &json!(0))
     );
 }
