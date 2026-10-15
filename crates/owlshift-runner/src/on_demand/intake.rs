@@ -282,9 +282,8 @@ impl OnDemand<'_> {
             )));
         }
         let current = person(p.current()?, &p.found);
-        let rules =
-            rules::project_rules(&self.executor.git, &p.checkout, &p.base, &self.config.stack)
-                .map_err(|e| refused("the project's rules", e))?;
+        let rules = rules::project_rules(&self.executor.git, &p.checkout, &p.base, self.config)
+            .map_err(|e| refused("the project's rules", e))?;
         // The text the briefs hold, read once: an edit made while intake
         // runs is a text intake did not read, which the next pass takes in.
         let text = text_sha256(&p.found.title, &p.found.description);

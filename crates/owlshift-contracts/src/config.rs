@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::ContractError;
 use crate::ids::{check_name, is_repository_part};
-use crate::{Harness, PlanApproval, Variant};
+use crate::{Harness, PlanApproval, Role, Variant};
 
 const PROJECT: &str = "owlshift.toml";
 const PERSONAL: &str = "personal configuration";
@@ -46,7 +46,35 @@ pub struct ProjectConfig {
     /// `backend/billing`: who owns each.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub zones: BTreeMap<String, ZoneSettings>,
+    /// Settings per role (OWL-312), keyed by the role's name as its prompt
+    /// file is (`build`, `resolver`, `intake`): rules added to that role's
+    /// brief alone. Only a role whose brief carries rules is accepted
+    /// ([`RULE_ROLES`]). A file using it requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, RoleSettings>,
 }
+
+/// The settings of one role (OWL-312).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSettings {
+    /// The files whose text reaches this role's brief alone, after
+    /// `stack.rules`: paths from the repository's root with `/` between
+    /// folders, in order, each read at the base commit, taken whole (a
+    /// `SKILL.md` included, its front matter too) and required to exist
+    /// there. Files only, none also in `stack.rules` (the default counting as
+    /// `["AGENTS.md"]`), and at most 32 and 64 KiB together with it.
+    pub rules: Vec<String>,
+}
+
+/// The roles whose brief carries rules, and so accept `[roles.<role>]`.
+/// Each role the quality pipeline adds joins this list as it is built
+/// (OWL-302, OWL-303, OWL-304); `answer_check` never does, since it judges
+/// the decider's answers from the brief alone.
+pub const RULE_ROLES: [Role; 3] = [Role::Build, Role::Resolver, Role::Intake];
+
+/// The rule file read when `stack.rules` is left out.
+pub const DEFAULT_RULE_FILE: &str = "AGENTS.md";
 
 /// The tracker and how Owlshift maps onto it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -159,34 +187,94 @@ impl Stack {
         let Some(paths) = &self.rules else {
             return Ok(());
         };
-        if paths.len() > MAX_RULE_FILES {
+        check_rule_paths(&paths.iter().map(String::as_str).collect::<Vec<_>>(), &[])
+    }
+
+    /// The files `stack.rules` stands for: the ones it names, or the root
+    /// `AGENTS.md` when it is left out.
+    pub fn rule_files(&self) -> Vec<&str> {
+        match &self.rules {
+            Some(named) => named.iter().map(String::as_str).collect(),
+            None => vec![DEFAULT_RULE_FILE],
+        }
+    }
+}
+
+/// Checks `paths`, rule files of one brief: at most [`MAX_RULE_FILES`]
+/// together with `already`, the files of the same brief named in another
+/// list; each a path from the repository's root, `/` between its parts, none
+/// empty, `.` or `..`, no `\` or control character, none named twice, none in
+/// `already` (compared as written).
+fn check_rule_paths(paths: &[&str], already: &[&str]) -> Result<(), String> {
+    let total = paths.len() + already.len();
+    if total > MAX_RULE_FILES {
+        return Err(format!(
+            "{total} files named, over the {MAX_RULE_FILES} Owlshift takes as rules"
+        ));
+    }
+    for (i, path) in paths.iter().enumerate() {
+        if path.chars().any(char::is_control) {
             return Err(format!(
-                "{} files named, over the {MAX_RULE_FILES} Owlshift takes as rules",
-                paths.len()
+                "{path:?} holds a control character: name a file by its path"
             ));
         }
-        for (i, path) in paths.iter().enumerate() {
-            if path.chars().any(char::is_control) {
-                return Err(format!(
-                    "{path:?} holds a control character: name a file by its path"
-                ));
+        if path.contains('\\') {
+            return Err(format!("{path:?} holds `\\`: separate folders with `/`"));
+        }
+        if path.starts_with('/') {
+            return Err(format!(
+                "{path:?} starts with `/`: name a file from the repository's root"
+            ));
+        }
+        if path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+            return Err(format!(
+                "{path:?} is not a file's path: no part of it may be empty, `.` or `..`"
+            ));
+        }
+        if paths[..i].contains(path) {
+            return Err(format!("{path:?} is named twice"));
+        }
+        if already.contains(path) {
+            return Err(format!(
+                "{path:?} is also a rule of `stack.rules`, which the brief already holds: \
+                 name it in one list"
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl ProjectConfig {
+    /// The files `[roles.<role>]` names for `role`, none when it has no
+    /// table.
+    pub fn role_rule_files(&self, role: Role) -> &[String] {
+        self.roles
+            .get(role.as_str())
+            .map_or(&[], |settings| settings.rules.as_slice())
+    }
+
+    /// Checks `[roles]`: each key a role whose brief carries rules, and its
+    /// files by the rules of `stack.rules`, counted with it for the brief.
+    fn check_roles(&self) -> Result<(), ContractError> {
+        let stack_files = self.stack.rule_files();
+        for (name, settings) in &self.roles {
+            let refuse = |reason: String| {
+                ContractError::invalid(PROJECT, format!("roles.{name}.rules: {reason}"))
+            };
+            if !RULE_ROLES.iter().any(|role| role.as_str() == name) {
+                return Err(refuse(if name == Role::AnswerCheck.as_str() {
+                    "the answer check classifies the decider's answers from its brief alone, \
+                     and an instruction there could only sway a verdict: it takes no rules"
+                        .to_owned()
+                } else {
+                    format!(
+                        "`{name}` is not a role whose brief carries rules; the roles that do: {}",
+                        RULE_ROLES.map(Role::as_str).join(", ")
+                    )
+                }));
             }
-            if path.contains('\\') {
-                return Err(format!("{path:?} holds `\\`: separate folders with `/`"));
-            }
-            if path.starts_with('/') {
-                return Err(format!(
-                    "{path:?} starts with `/`: name a file from the repository's root"
-                ));
-            }
-            if path.split('/').any(|part| matches!(part, "" | "." | "..")) {
-                return Err(format!(
-                    "{path:?} is not a file's path: no part of it may be empty, `.` or `..`"
-                ));
-            }
-            if paths[..i].contains(path) {
-                return Err(format!("{path:?} is named twice"));
-            }
+            let paths: Vec<&str> = settings.rules.iter().map(String::as_str).collect();
+            check_rule_paths(&paths, &stack_files).map_err(refuse)?;
         }
         Ok(())
     }
@@ -436,6 +524,7 @@ impl ProjectConfig {
         self.stack
             .check_rules()
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.rules: {reason}")))?;
+        self.check_roles()?;
         if let Some(minutes) = self.policy.quiet_window_minutes
             && !QUIET_WINDOW_MINUTES.contains(&minutes)
         {
@@ -1137,6 +1226,96 @@ mod tests {
                 error.starts_with("invalid owlshift.toml: stack.rules: ") && error.contains(reason),
                 "{paths}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn roles_add_rules_to_the_briefs_that_carry_them() {
+        let absent = project_with_stack("").unwrap();
+        assert!(absent.roles.is_empty());
+        assert!(!absent.render().contains("roles"));
+        assert!(absent.role_rule_files(Role::Build).is_empty());
+
+        let tail = "[roles.build]\nrules = [\"docs/skills/frontend/SKILL.md\"]\n\
+                    [roles.resolver]\nrules = []\n\
+                    [roles.intake]\nrules = [\"docs/zones.md\"]";
+        let named = project("", tail).unwrap();
+        assert_eq!(
+            named.role_rule_files(Role::Build),
+            ["docs/skills/frontend/SKILL.md"]
+        );
+        assert!(named.role_rule_files(Role::Resolver).is_empty());
+        assert_eq!(named.role_rule_files(Role::Intake), ["docs/zones.md"]);
+        assert!(named.role_rule_files(Role::Design).is_empty());
+        assert_eq!(ProjectConfig::parse(&named.render()).unwrap(), named);
+
+        // 32 files for the role alone fit only beside an empty `stack.rules`.
+        let many: Vec<String> = (0..32).map(|i| format!("\"r{i}.md\"")).collect();
+        let many = format!("[roles.build]\nrules = [{}]", many.join(", "));
+        assert!(project("rules = []", &many).is_ok());
+        let over = project("", &many).unwrap_err().to_string();
+        assert!(
+            over.contains("roles.build.rules: 33 files named, over the 32"),
+            "{over}"
+        );
+
+        for (case, stack, tail, reason) in [
+            (
+                "answer_check",
+                "",
+                "[roles.answer_check]\nrules = [\"a.md\"]",
+                "roles.answer_check.rules: the answer check classifies",
+            ),
+            (
+                "an unknown role",
+                "",
+                "[roles.bulid]\nrules = [\"a.md\"]",
+                "roles.bulid.rules: `bulid` is not a role whose brief carries rules; \
+                 the roles that do: build, resolver, intake",
+            ),
+            (
+                "a role not built yet",
+                "",
+                "[roles.verify]\nrules = [\"a.md\"]",
+                "roles.verify.rules: `verify` is not a role whose brief carries rules",
+            ),
+            (
+                "a path that climbs",
+                "",
+                "[roles.build]\nrules = [\"../a.md\"]",
+                "roles.build.rules: \"../a.md\" is not a file's path",
+            ),
+            (
+                "a path twice",
+                "",
+                "[roles.build]\nrules = [\"a.md\", \"a.md\"]",
+                "roles.build.rules: \"a.md\" is named twice",
+            ),
+            (
+                "a path of stack.rules",
+                r#"rules = ["docs/x.md"]"#,
+                "[roles.build]\nrules = [\"docs/x.md\"]",
+                "roles.build.rules: \"docs/x.md\" is also a rule of `stack.rules`",
+            ),
+            (
+                "the default path",
+                "",
+                "[roles.intake]\nrules = [\"AGENTS.md\"]",
+                "roles.intake.rules: \"AGENTS.md\" is also a rule of `stack.rules`",
+            ),
+        ] {
+            let error = project(stack, tail).unwrap_err().to_string();
+            assert!(
+                error.starts_with("invalid owlshift.toml: ") && error.contains(reason),
+                "{case}: {error}"
+            );
+        }
+        // `stack.rules = []` drops the default, so a role may name it.
+        assert!(project("rules = []", "[roles.intake]\nrules = [\"AGENTS.md\"]").is_ok());
+
+        // A table with no `rules`, or with another key, is refused.
+        for tail in ["[roles.build]", "[roles.build]\nrules = []\nmodel = \"x\""] {
+            assert!(project("", tail).is_err(), "{tail}");
         }
     }
 

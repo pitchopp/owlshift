@@ -69,7 +69,7 @@ use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
     Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, RebaseBrief, Relation,
-    Rule, ThreadEntry, TicketBrief,
+    ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
@@ -108,7 +108,7 @@ use crate::proposals::{self, Filing};
 use crate::rebase;
 use crate::resolver::{self, Fallback, Resolved};
 use crate::reversal;
-use crate::rules;
+use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
     Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment,
@@ -919,7 +919,7 @@ impl Prepared {
 struct Dispatched {
     head: Branch,
     base_branch: Branch,
-    rules: Vec<Rule>,
+    rules: ProjectRules,
 }
 
 /// One run through the executor: its id, its report, and the isolation
@@ -1390,9 +1390,8 @@ impl OnDemand<'_> {
             .forge
             .find_open_pull_request(&head, &base_branch)
             .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
-        let rules =
-            rules::project_rules(&self.executor.git, &p.checkout, &p.base, &self.config.stack)
-                .map_err(|e| refused("the project's rules", e))?;
+        let rules = rules::project_rules(&self.executor.git, &p.checkout, &p.base, self.config)
+            .map_err(|e| refused("the project's rules", e))?;
         sink.emit(
             &p.ticket,
             None,
@@ -1406,10 +1405,7 @@ impl OnDemand<'_> {
                 ("worktree", path(&p.worktree)),
                 ("checkout", path(&p.checkout)),
                 ("pull_request", json!(open.map(|pr| pr.number))),
-                (
-                    "rules",
-                    json!(rules.iter().map(|rule| &rule.source).collect::<Vec<_>>()),
-                ),
+                ("rules", json!(rules.sources())),
             ]),
         );
         Ok(Dispatched {
@@ -1822,7 +1818,7 @@ impl OnDemand<'_> {
         state: &TicketState,
         result: &RunResult,
         asked: &[ReopenedChoice],
-        rules: &[Rule],
+        rules: &ProjectRules,
         current: &Person,
         settled: u32,
         raised_by: &str,
@@ -2032,7 +2028,14 @@ impl OnDemand<'_> {
             .decider
             .as_ref()
             .map_or(asked_of, |decider| person(decider, &p.found));
-        let mut brief = self.brief(p, Role::AnswerCheck, &comments, &[], None, &current);
+        let mut brief = self.brief(
+            p,
+            Role::AnswerCheck,
+            &comments,
+            &ProjectRules::default(),
+            None,
+            &current,
+        );
         // Why the last check on this ask had its result refused, kept in
         // the ticket ref whatever command ran it (OWL-184).
         brief.result_refusal = questions
@@ -2897,7 +2900,7 @@ impl OnDemand<'_> {
         p: &Prepared,
         role: Role,
         comments: &[Comment],
-        rules: &[Rule],
+        rules: &ProjectRules,
         gate_failure: Option<GateFailure>,
         current: &Person,
     ) -> Brief {
@@ -2927,7 +2930,7 @@ impl OnDemand<'_> {
             checkpoint: if build { checkpoint(&p.worktree) } else { None },
             zones: brief_zones(p.found.labels.iter().map(String::as_str)).zones,
             resources: Vec::new(),
-            rules: rules.to_vec(),
+            rules: rules.for_role(role),
             permissions: Permissions {
                 level: if build || role == Role::Rebase {
                     PermissionLevel::WriteWorktree
@@ -3291,7 +3294,7 @@ struct RepairRun<'r> {
     /// `fix`, `rebase` or `correction`, for what the runner tells.
     what: &'static str,
     pull_request: u64,
-    rules: &'r [Rule],
+    rules: &'r ProjectRules,
     /// The harness of each attempt, from 1.
     harness: &'r dyn Fn(u32) -> &'r dyn Harness,
     /// Done before each attempt, from 1, before its brief is built.
