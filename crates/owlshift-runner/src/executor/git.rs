@@ -233,6 +233,25 @@ impl Git {
         timeout: Duration,
     ) -> Result<Vec<u8>, GitError> {
         let output = self.output_within(dir, args, None, timeout)?;
+        Self::stdout_of(dir, args, output)
+    }
+
+    /// [`Git::run`] with `input` on git's standard input.
+    pub(crate) fn run_with_input<S: AsRef<OsStr>>(
+        &self,
+        dir: &Path,
+        args: &[S],
+        input: &[u8],
+    ) -> Result<Vec<u8>, GitError> {
+        let output = self.output(dir, args, Some(input))?;
+        Self::stdout_of(dir, args, output)
+    }
+
+    fn stdout_of<S: AsRef<OsStr>>(
+        dir: &Path,
+        args: &[S],
+        output: Captured,
+    ) -> Result<Vec<u8>, GitError> {
         if output.success() {
             Ok(output.stdout)
         } else {

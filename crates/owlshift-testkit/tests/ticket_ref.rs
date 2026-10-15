@@ -52,6 +52,10 @@ impl Repo {
 
     /// A blob holding `content`.
     fn blob(&self, content: &str) -> String {
+        self.blob_bytes(content.as_bytes())
+    }
+
+    fn blob_bytes(&self, content: &[u8]) -> String {
         let file = self.root.join(".git").join("blob");
         fs::write(&file, content).unwrap();
         self.git(&["hash-object", "-w", file.to_str().unwrap()])
@@ -580,6 +584,8 @@ fn a_broken_ticket_ref_is_refused() {
     let state = repo.blob(WAITING);
     let asked = repo.blob(&questions(1));
     let later = repo.blob(&questions(2));
+    let unparsable = repo.blob("{}");
+    let not_utf8 = repo.blob_bytes(b"\xff");
     let cases: Vec<(Vec<Entry>, &str)> = vec![
         (
             vec![("100644", &state, "state.json")],
@@ -605,6 +611,21 @@ fn a_broken_ticket_ref_is_refused() {
                 ("100644", &later, "questions.json"),
             ],
             "waits for the answers of round 1, but its latest ask is of round 2",
+        ),
+        // The first broken file is the error, whatever a later one holds.
+        (
+            vec![
+                ("100644", &unparsable, "state.json"),
+                ("120000", &asked, "questions.json"),
+            ],
+            "holds an invalid state.json",
+        ),
+        (
+            vec![
+                ("100644", &not_utf8, "state.json"),
+                ("100644", &asked, "questions.json"),
+            ],
+            "holds state.json not in UTF-8",
         ),
     ];
     for (entries, needle) in cases {
