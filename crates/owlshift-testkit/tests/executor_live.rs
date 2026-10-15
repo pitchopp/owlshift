@@ -109,6 +109,7 @@ fn a_real_role_runs_through_the_executor() {
         review: Some(owlshift_contracts::brief::ReviewBrief {
             mandates: vec![owlshift_contracts::review::Mandate::Critic],
             pass: std::num::NonZeroU32::MIN,
+            diff: None,
         }),
         pull_request_reviews: Vec::new(),
     };

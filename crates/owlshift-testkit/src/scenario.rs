@@ -1251,6 +1251,7 @@ impl Driver {
             review: matches!(role, Role::DesignReview | Role::Verify).then(|| ReviewBrief {
                 mandates: vec![Mandate::Critic],
                 pass: NonZeroU32::MIN,
+                diff: None,
             }),
             pull_request_reviews: Vec::new(),
         };

@@ -597,10 +597,40 @@
         "truncated"
       ]
     },
+    "GivenDiff": {
+      "description": "The diff a Verify pass reviews (OWL-302, architecture section 5,\n\"Verify\"): a read-only run cannot always run git, so the runner writes\nthe diff to a file beside the brief.",
+      "type": "object",
+      "properties": {
+        "base": {
+          "description": "The commit the Build started from, a full commit id.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The file holding `git diff <base>..HEAD`, given as `result_path` is.",
+          "$ref": "#/$defs/RelativePath"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "base",
+        "path"
+      ]
+    },
     "GivenFindings": {
       "description": "The findings a brief gives, and what the run does with them (OWL-300).",
       "type": "object",
       "properties": {
+        "diff": {
+          "description": "The diff the findings were raised on, when they come from a Verify\npass (OWL-302): with findings to rule on only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GivenDiff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "findings": {
           "description": "At least one, ids increasing, at most [`MAX_PASS_FINDINGS`]; text of\nthe reviewers, data.",
           "type": "array",
@@ -972,6 +1002,17 @@
       "description": "What a review run reviews for (OWL-300).",
       "type": "object",
       "properties": {
+        "diff": {
+          "description": "The diff under review (OWL-302): in the verify role's brief only,\nwhere the runner gives it at every pass.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GivenDiff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mandates": {
           "description": "The run's mandates, at least one, each once: a critic alone in its\npass holds conformance too.",
           "type": "array",

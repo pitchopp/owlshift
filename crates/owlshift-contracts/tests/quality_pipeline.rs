@@ -355,8 +355,43 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         json!([review.clone()]),
     ))
     .unwrap();
+    // The diff of a Verify pass (OWL-302): in verify's review, and with the
+    // arbiter's findings to rule on.
+    let diff = json!({ "base": "b".repeat(40), "path": ".owlshift/run/diff.patch" });
+    let review_with = |role: &str, diff: &Value| {
+        with(
+            brief(role),
+            "review",
+            json!({ "mandates": ["critic"], "pass": 1, "diff": diff }),
+        )
+    };
+    let findings_with = |mode: &str, diff: &Value| {
+        json!({ "mode": mode, "findings": [finding("F1")], "diff": diff })
+    };
+    parse(&review_with("verify", &diff)).unwrap();
+    parse(&with(
+        brief("arbiter"),
+        "findings",
+        findings_with("rule", &diff),
+    ))
+    .unwrap();
 
     for (case, document, reason) in [
+        (
+            "a diff for design review",
+            review_with("design_review", &diff),
+            "a diff to review: the role is design_review",
+        ),
+        (
+            "a diff with findings to answer",
+            with(brief("build"), "findings", findings_with("answer", &diff)),
+            "a diff with findings: the role is build",
+        ),
+        (
+            "a diff on a branch name",
+            review_with("verify", &json!({ "base": "main", "path": "diff.patch" })),
+            "the diff's base \"main\" is not a full commit id",
+        ),
         (
             "a plan for intake",
             with(brief("intake"), "plan", given_plan.clone()),

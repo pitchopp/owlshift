@@ -189,6 +189,10 @@ pub struct GivenFindings {
     /// the reviewers, data.
     #[schemars(length(min = 1, max = MAX_PASS_FINDINGS))]
     pub findings: Vec<Finding>,
+    /// The diff the findings were raised on, when they come from a Verify
+    /// pass (OWL-302): with findings to rule on only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<GivenDiff>,
 }
 
 /// What a review run reviews for (OWL-300).
@@ -201,6 +205,22 @@ pub struct ReviewBrief {
     pub mandates: Vec<Mandate>,
     /// The review pass at its stage, from 1.
     pub pass: NonZeroU32,
+    /// The diff under review (OWL-302): in the verify role's brief only,
+    /// where the runner gives it at every pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<GivenDiff>,
+}
+
+/// The diff a Verify pass reviews (OWL-302, architecture section 5,
+/// "Verify"): a read-only run cannot always run git, so the runner writes
+/// the diff to a file beside the brief.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GivenDiff {
+    /// The commit the Build started from, a full commit id.
+    pub base: String,
+    /// The file holding `git diff <base>..HEAD`, given as `result_path` is.
+    pub path: RelativePath,
 }
 
 /// The most bytes one pull request review weighs in a brief, rendered as
@@ -791,9 +811,11 @@ impl Brief {
     /// for the arbiter, always, and to answer or fix for design or build
     /// only, ids increasing and each keeping a result's rules; `review` for
     /// design review and verify, always, and only them, with distinct
-    /// mandates; pull request reviews for build only, each with a body or a
-    /// comment, every comment naming a path and saying something, and at
-    /// most [`MAX_PULL_REQUEST_REVIEW_BYTES`].
+    /// mandates; a diff (OWL-302) only in a verify run's review and with
+    /// findings to rule on, its base a full commit id; pull request reviews
+    /// for build only, each with a body or a comment, every comment naming
+    /// a path and saying something, and at most
+    /// [`MAX_PULL_REQUEST_REVIEW_BYTES`].
     fn check_quality_pipeline(&self) -> Result<(), ContractError> {
         let role = self.role;
         let mismatch = |field: &str, roles: &str| {
@@ -850,6 +872,15 @@ impl Brief {
                     return Err(ContractError::invalid(CONTRACT, "no finding is given"));
                 }
                 check_findings(CONTRACT, &given.findings, MAX_PASS_FINDINGS, false)?;
+                if let Some(diff) = &given.diff {
+                    if given.mode != FindingsMode::Rule {
+                        return mismatch(
+                            "a diff with findings",
+                            "the arbiter's findings to rule on only",
+                        );
+                    }
+                    check_diff(diff)?;
+                }
             }
             None if role == Role::Arbiter => {
                 return mismatch("findings", "the arbiter always");
@@ -858,7 +889,15 @@ impl Brief {
         }
         let reviews = matches!(role, Role::DesignReview | Role::Verify);
         match &self.review {
-            Some(review) if reviews => check_mandates(CONTRACT, &review.mandates)?,
+            Some(review) if reviews => {
+                check_mandates(CONTRACT, &review.mandates)?;
+                if let Some(diff) = &review.diff {
+                    if role != Role::Verify {
+                        return mismatch("a diff to review", "the verify role only");
+                    }
+                    check_diff(diff)?;
+                }
+            }
             None if !reviews => {}
             _ => return mismatch("a review", "the design review and verify roles, always"),
         }
@@ -886,6 +925,18 @@ impl Brief {
             ));
         }
         Ok(())
+    }
+}
+
+/// A diff's base is a full commit id (OWL-302).
+fn check_diff(diff: &GivenDiff) -> Result<(), ContractError> {
+    if is_commit_id(&diff.base) {
+        Ok(())
+    } else {
+        Err(ContractError::invalid(
+            CONTRACT,
+            format!("the diff's base {:?} is not a full commit id", diff.base),
+        ))
     }
 }
 
