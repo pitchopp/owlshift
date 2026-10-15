@@ -151,7 +151,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 *I adopt Owlshift on a repository in minutes, without reading the code of Owlshift.*
 
 - `owlshift init` detects the stack, connects the tracker, stores tracker and forge secrets in the system keychain and writes a commented project file. It never asks for a model API key.
-- `owlshift doctor` checks every capability the config relies on, including that each configured harness CLI is installed, that Codex is logged in (a warning until the review roles exist in P5, since `owlshift do` does not run Codex before), that agent runs have their Claude Code token (made with `claude setup-token`, stored by `owlshift init`), and names what is missing and how to fix it.
+- `owlshift doctor` checks every capability the config relies on, including that each configured harness CLI is installed, that Codex is logged in (a warning: without it the review roles run on Claude Code, and the ticket says so), that agent runs have their Claude Code token (made with `claude setup-token`, stored by `owlshift init`), and names what is missing and how to fix it.
 - A missing required capability stops `init`, never a run.
 
 ### S16. Several projects on one machine
@@ -166,5 +166,5 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 *I choose Claude Code, Codex or both, per project, per role or per ticket, and a subscription reaching its limit does not stop the flow.*
 
 - The effective harness is resolved in order: project default, role, ticket verdict, what the machine has.
-- A reviewer runs on another model family than the author whenever one is available.
+- Every review has a reviewer of another model family than the author whenever one is available.
 - A harness at its usage limit switches the role to its declared fallback and logs it on the ticket; the original harness is used again after its reset.
