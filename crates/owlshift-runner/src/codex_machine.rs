@@ -59,7 +59,7 @@ impl fmt::Display for Unreadable {
 pub struct Declared {
     /// The MCP servers, but those set `enabled = false`.
     pub mcp_servers: Vec<String>,
-    /// The keys of `[hooks]`: the events with hooks.
+    /// The events of `[hooks]` that hold at least one hook.
     pub hooks: Vec<String>,
 }
 
@@ -95,7 +95,24 @@ pub fn declared(text: &str) -> Result<Declared, Unreadable> {
     }
     match table.get("hooks") {
         None => {}
-        Some(Value::Table(hooks)) => found.hooks = hooks.keys().cloned().collect(),
+        Some(Value::Table(hooks)) => {
+            for (event, handlers) in hooks {
+                // An event's hooks are an array of tables, as the 2026-10-15
+                // probe's `[[hooks.SessionStart]]`; an empty one runs none.
+                match handlers {
+                    Value::Array(handlers) if handlers.iter().all(Value::is_table) => {
+                        if !handlers.is_empty() {
+                            found.hooks.push(event.clone());
+                        }
+                    }
+                    _ => {
+                        return Err(Unreadable::Shape(
+                            "a hook event that is not a list of tables",
+                        ));
+                    }
+                }
+            }
+        }
         Some(_) => return Err(Unreadable::Shape("a `hooks` that is not a table")),
     }
     Ok(found)
@@ -241,6 +258,24 @@ hooks = [{ type = "command", command = "true" }]
                 "{text}"
             );
         }
+    }
+
+    /// A hook event is named only when it holds hooks of Codex's shape.
+    #[test]
+    fn a_hook_event_must_be_a_list_of_tables() {
+        for text in [
+            "[hooks]\nSessionStart = false",
+            "[hooks]\nSessionStart = [\"touch /tmp/mark\"]",
+        ] {
+            assert_eq!(
+                declared(text),
+                Err(Unreadable::Shape(
+                    "a hook event that is not a list of tables"
+                )),
+                "{text}"
+            );
+        }
+        assert!(declared("[hooks]\nSessionStart = []").unwrap().is_empty());
     }
 
     #[test]
