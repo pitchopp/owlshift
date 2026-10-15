@@ -101,7 +101,7 @@ pub trait System {
             .data_dir()
             .ok_or_else(|| "this system has no data directory".to_owned())?;
         let checkout = crate::project::ProjectDirs::new(&data_dir, &repo).checkout();
-        if std::fs::symlink_metadata(&checkout).is_err() {
+        if !checkout_exists(&checkout)? {
             return Ok(None);
         }
         // git's own words stay out of the report (live check C8).
@@ -120,6 +120,17 @@ pub trait System {
     #[cfg(unix)]
     fn sentinel_probe(&self) -> SentinelProbe {
         owlshift_platform::process::probe_sentinel(SENTINEL_PROBE_TIMEOUT)
+    }
+}
+
+/// Whether the dedicated checkout at `checkout` exists: only its absence is
+/// `false`; any other failure to look is an error, so a ref that holds the
+/// slot is never hidden as no checkout (OWL-291).
+fn checkout_exists(checkout: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(checkout) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("the dedicated checkout could not be inspected".to_owned()),
     }
 }
 
@@ -481,6 +492,32 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-291: only an absent checkout is no checkout; a folder that cannot
+    /// be looked into is an error, in Owlshift's words.
+    #[test]
+    fn only_an_absent_checkout_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(checkout_exists(dir.path()), Ok(true));
+        assert_eq!(checkout_exists(&dir.path().join("checkout")), Ok(false));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let looked = checkout_exists(&locked.join("checkout"));
+            // A superuser looks through any folder: nothing to check then.
+            let superuser = std::fs::read_dir(&locked).is_ok();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !superuser {
+                assert_eq!(
+                    looked,
+                    Err("the dedicated checkout could not be inspected".to_owned())
+                );
+            }
+        }
+    }
 
     #[test]
     fn versions_are_rebuilt_from_digits() {
