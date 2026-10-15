@@ -1924,7 +1924,7 @@ impl VisibleStage {
     pub fn after(event: Event) -> Option<Self> {
         match event {
             Event::Dispatched | Event::Answered => Some(Self::Working),
-            Event::Questions | Event::Incomplete => Some(Self::NeedsInput),
+            Event::Questions | Event::ReplanRound | Event::Incomplete => Some(Self::NeedsInput),
             _ => None,
         }
     }
@@ -3088,6 +3088,17 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             Some(VisibleStage::Working)
         );
         assert_eq!(VisibleStage::of(Status::Active(Stage::Ready)), None);
+    }
+
+    /// A `replan`'s round waits for the decider as any round; settled
+    /// without one, the ticket keeps working, at Design (OWL-301).
+    #[test]
+    fn a_replan_round_waits_for_the_decider() {
+        assert_eq!(
+            VisibleStage::after(Event::ReplanRound),
+            Some(VisibleStage::NeedsInput)
+        );
+        assert_eq!(VisibleStage::after(Event::ReplanDecided), None);
     }
 
     #[test]

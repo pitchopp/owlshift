@@ -4,10 +4,12 @@
 use owlshift_core::floor::{Action, HumanApproval, check_action};
 use owlshift_core::gate::{GatePolicy, Route};
 use owlshift_core::resource::Resource;
+use owlshift_core::review::{Standing, settle};
+use owlshift_core::roster::roster;
 use owlshift_core::schedule::{Caps, Load, Wait, ready_set};
 use owlshift_core::state::{Event, Finish, ParkReason, Status, TicketState, Transition};
 use owlshift_core::ticket::{Admission, Blocker, BlockerState, Ticket};
-use owlshift_core::vocab::{PlanApproval, Priority, Stage, Variant};
+use owlshift_core::vocab::{PlanApproval, Priority, Severity, Stage, Variant};
 
 /// Applies an event the ticket must accept, and returns its new state.
 fn step(ticket: &mut Ticket<String>, event: Event) -> Transition {
@@ -79,16 +81,55 @@ fn a_standard_ticket_from_admission_to_merge() {
     step(&mut ticket, Event::Dispatched);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
 
-    // Design, a revision asked by the review, then approval of a forked plan.
+    // Design, then its review: the critic on Codex and conformance on
+    // Claude Code. The first pass's confirmed finding sends the plan back;
+    // the second, last, pass leaves a major for the decider, whose answer
+    // the design takes in before one more pass, which only notes a minor.
     step(&mut ticket, Event::Completed);
-    step(&mut ticket, Event::LoopBack);
+    assert_eq!(
+        roster(ticket.variant, Stage::DesignReview, true).len(),
+        2,
+        "two reviewers"
+    );
+    let pass = |ticket: &Ticket<String>, findings: &[Standing]| {
+        settle(
+            ticket.state.stage(),
+            ticket.state.review_pass_due(),
+            findings,
+        )
+        .expect("a review stage")
+        .outcome
+        .event()
+    };
+    let major = Standing {
+        severity: Severity::Major,
+        on_criterion: true,
+    };
+    let minor = Standing {
+        severity: Severity::Minor,
+        on_criterion: false,
+    };
+    let event = pass(&ticket, &[minor]);
+    step(&mut ticket, event);
+    assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
     step(&mut ticket, Event::Completed);
-    assert!(policy.plan_approval_required(ticket.pipeline(), true));
-    step(&mut ticket, Event::Questions);
+    let event = pass(&ticket, &[major]);
+    step(&mut ticket, event);
+    assert_eq!(
+        ticket.state.status(),
+        Status::NeedsInput {
+            return_to: Stage::Design
+        }
+    );
     step(&mut ticket, Event::Answered);
     step(&mut ticket, Event::Completed);
+    let event = pass(&ticket, &[minor]);
+    // The plan approval of a forked plan comes on top (OWL-32).
+    assert!(policy.plan_approval_required(ticket.pipeline(), true));
+    step(&mut ticket, event);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Build));
     assert_eq!(ticket.state.round(), 2);
+    assert_eq!(ticket.state.review_passes(), 0);
 
     // A failed run and a usage-limit interruption, then Build passes.
     step(&mut ticket, Event::RunFailed);

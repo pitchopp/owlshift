@@ -70,6 +70,32 @@ impl Pipeline {
         };
         self.contains(target).then_some(target)
     }
+
+    /// The stage a question round asked at `stage` returns to once it is
+    /// answered (architecture, section 5, "The quality pipeline"): Design for
+    /// one asked at Design review, since the design role runs with the
+    /// answers and its plan is reviewed again; Build for one asked at
+    /// Verify, a Verify fix run with the answers. Every other stage's round
+    /// returns to it. A round at a stage whose loop-back target this
+    /// pipeline skips returns to the stage itself.
+    pub fn round_return(self, stage: Stage) -> Stage {
+        match stage {
+            Stage::DesignReview | Stage::Verify => self.loop_back(stage).unwrap_or(stage),
+            _ => stage,
+        }
+    }
+
+    /// Where a Build goes once its `replan` question is settled, answered
+    /// or decided, whatever the answer: Design, whose new plan is reviewed
+    /// again. `trivial` has no Design, so its `replan` is a plain question
+    /// and the Build runs again.
+    pub fn replan(self) -> Stage {
+        if self.contains(Stage::Design) {
+            Stage::Design
+        } else {
+            Stage::Build
+        }
+    }
 }
 
 impl Stage {
@@ -152,6 +178,32 @@ mod tests {
         for stage in Stage::ALL.into_iter().filter(|s| !looping.contains(s)) {
             assert_eq!(STANDARD.loop_back(stage), None, "{stage:?}");
         }
+    }
+
+    #[test]
+    fn a_dispatch_from_ready_starts_design_or_for_trivial_build() {
+        assert_eq!(STANDARD.next(Stage::Ready), Some(Stage::Design));
+        assert_eq!(RISKY.next(Stage::Ready), Some(Stage::Design));
+        assert_eq!(TRIVIAL_PIPELINE.next(Stage::Ready), Some(Stage::Build));
+    }
+
+    #[test]
+    fn rounds_at_a_review_stage_return_to_its_author_and_others_to_themselves() {
+        for pipeline in [STANDARD, RISKY] {
+            assert_eq!(pipeline.round_return(Stage::DesignReview), Stage::Design);
+            assert_eq!(pipeline.round_return(Stage::Verify), Stage::Build);
+            for stage in [Stage::Intake, Stage::Design, Stage::Build, Stage::Watch] {
+                assert_eq!(pipeline.round_return(stage), stage, "{stage:?}");
+            }
+            assert_eq!(pipeline.replan(), Stage::Design);
+        }
+        assert_eq!(TRIVIAL_PIPELINE.round_return(Stage::Verify), Stage::Build);
+        // A stage trivial skips: no Design to return to.
+        assert_eq!(
+            TRIVIAL_PIPELINE.round_return(Stage::DesignReview),
+            Stage::DesignReview
+        );
+        assert_eq!(TRIVIAL_PIPELINE.replan(), Stage::Build);
     }
 
     #[test]

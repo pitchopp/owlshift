@@ -179,30 +179,9 @@ pub struct Finding {
     pub settle: String,
 }
 
-/// How much a finding weighs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    Blocker,
-    Major,
-    Minor,
-}
-
-/// A review mandate (architecture section 5, "The roster").
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Mandate {
-    /// What breaks the work: a premise that does not hold, a case left out,
-    /// a simpler way.
-    Critic,
-    /// The plan or the diff against the ticket's criteria, the decider's
-    /// answers and the project's rules.
-    Conformance,
-    /// What the change does to the code around it.
-    Debt,
-}
+/// A finding's severity and a reviewer's mandates live in the core, which
+/// settles a review pass and draws its roster from them (OWL-301).
+pub use owlshift_core::vocab::{Mandate, Severity};
 
 /// What a run does with the findings its brief gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
