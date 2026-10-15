@@ -1,0 +1,22 @@
+{
+  "recorded": "2026-10-15",
+  "codex_version": "0.154.0",
+  "platform": "macos",
+  "confinement": "none",
+  "argv": [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--json",
+    "--ignore-user-config",
+    "-c",
+    "model_reasoning_effort=low",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "<prompt>"
+  ],
+  "prompt": "reply OK, with the subscription at its limit",
+  "exit_status": 1,
+  "stderr": [
+    "Reading additional input from stdin..."
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "recorded": "2026-10-15",
+  "codex_version": "0.154.0",
+  "platform": "macos",
+  "confinement": "sandbox-exec: the executor profile, worktree and git folder read-only, CODEX_HOME writable",
+  "argv": [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--json",
+    "--ignore-user-config",
+    "-c",
+    "model_reasoning_effort=low",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "<prompt>"
+  ],
+  "prompt": "run five fixed commands: a write to the worktree, to the git folder, to $TMPDIR, git status, test -r of ~/.codex/auth.json",
+  "exit_status": 0,
+  "stderr": [
+    "Reading additional input from stdin...",
+    "2026-10-15T12:00:00.000000Z ERROR codex_skills_extension::loader::host: failed to scan skill path file:///home/user/.agents/skills: Operation not permitted (os error 1)"
+  ]
+}
