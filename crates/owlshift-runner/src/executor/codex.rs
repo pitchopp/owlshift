@@ -11,6 +11,7 @@
 //! `result.json`: the run's last message is the result, which the executor
 //! writes once the run is over ([`SandboxNeeds::result_in_message`]).
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -61,11 +62,18 @@ pub struct CodexHarness {
 /// The user's Codex login file: `auth.json` in the agent environment's
 /// `CODEX_HOME`, or in `$HOME/.codex`. `None` without either variable.
 pub fn user_login(agent: &AgentEnv) -> Option<PathBuf> {
-    let home = match agent.var(CODEX_HOME_ENV) {
-        Some(home) if !home.is_empty() => PathBuf::from(home),
-        _ => Path::new(agent.var("HOME")?).join(".codex"),
+    login_file(agent.var(CODEX_HOME_ENV), agent.var("HOME").map(Path::new))
+}
+
+/// Codex's login file given its `CODEX_HOME` and the user's home folder, as
+/// Codex resolves them: `auth.json` in `CODEX_HOME`, or in `<home>/.codex`.
+/// `owlshift doctor` looks for the same file (OWL-299).
+pub fn login_file(codex_home: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    let folder = match codex_home {
+        Some(folder) if !folder.is_empty() => PathBuf::from(folder),
+        _ => home?.join(".codex"),
     };
-    Some(home.join(LOGIN_FILE))
+    Some(folder.join(LOGIN_FILE))
 }
 
 /// Why a Codex run cannot start.

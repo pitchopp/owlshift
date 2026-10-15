@@ -20,7 +20,7 @@ use owlshift_adapters::harness::tested;
 use owlshift_contracts::Harness;
 
 /// Every recording, so that one added without its checks fails here.
-const FIXTURES: [&str; 12] = [
+const FIXTURES: [&str; 13] = [
     "success",
     "write_refused",
     "nested_sandbox",
@@ -33,6 +33,7 @@ const FIXTURES: [&str; 12] = [
     "usage_limit",
     "logged_out",
     "codex_home_read_only",
+    "critic",
 ];
 
 /// The one id left in the recordings, where each thread id was.
@@ -195,6 +196,19 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
         assert_eq!(run.usage, None, "{name}");
     }
     assert_eq!(replay("usage_limit").outcome, Outcome::UsageLimit);
+
+    // The live critic run of `owlshift-testkit/tests/codex_live.rs` (OWL-299):
+    // the adapter's own command line, confined; its last message is the
+    // result the runner validated.
+    let critic = replay("critic");
+    let Outcome::Completed { text } = &critic.outcome else {
+        panic!("{:?}", critic.outcome);
+    };
+    assert_eq!(
+        text,
+        meta("critic")["output_last_message"].as_str().unwrap()
+    );
+    assert!(critic.usage.is_some());
     assert_eq!(
         replay("codex_home_read_only").outcome,
         Outcome::Failed(Failure::NoThread)

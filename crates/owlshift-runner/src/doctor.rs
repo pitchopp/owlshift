@@ -693,6 +693,9 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
         shown(&path, home)
     );
     let mut result = login_check(system, harness, &path, &found);
+    if harness == Harness::Codex && result.status == Status::Ok {
+        result = codex_login_file_check(system, result, home);
+    }
     flag_untested(&mut result, harness, exact.as_deref());
     critic_stands_in_without_codex(result, harness)
 }
@@ -729,6 +732,32 @@ fn critic_stands_in_without_codex(mut check: Check, harness: Harness) -> Check {
     ));
     check.fix = Vec::new();
     check
+}
+
+/// A Codex logged in, but not through the file a Codex agent run copies its
+/// login from (OWL-299), such as a login kept in the system keyring: `codex
+/// login status` says logged in, yet the run is refused. Not ready, so
+/// [`critic_stands_in_without_codex`] makes it its warning.
+fn codex_login_file_check(system: &dyn System, logged_in: Check, home: Option<&Path>) -> Check {
+    let file = system.codex_login_file();
+    if file.as_deref().is_some_and(|file| system.is_file(file)) {
+        return logged_in;
+    }
+    let where_ = file.map_or_else(
+        || "no login file (neither CODEX_HOME nor a home folder is set)".to_owned(),
+        |file| format!("no login file at {}", shown(&file, home)),
+    );
+    Check::fail(
+        Section::Tools,
+        "codex",
+        format!("{}, but {where_}", logged_in.detail),
+        harness_why(Harness::Codex),
+        vec![Step::run_noting(
+            harness::login_command(Harness::Codex),
+            "with Codex set to keep its login in auth.json, which Owlshift copies into each \
+             Codex run",
+        )],
+    )
 }
 
 fn harness_name(harness: Harness) -> &'static str {
@@ -2393,6 +2422,33 @@ mod tests {
             "0.154.0 (/fake/bin/codex), logged in (API key)"
         );
         assert_eq!(codex.why, None);
+    }
+
+    /// OWL-299: a Codex logged in without the login file a Codex run copies,
+    /// such as a login kept in the keyring, is not ready: its warning says
+    /// where the file was looked for and how to get it written.
+    #[test]
+    fn a_codex_login_without_its_file_is_the_warning() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+            .without_file("/home/ada/.codex/auth.json");
+        let report = run(&system, &no_config());
+        let codex = line(&report, "codex");
+        assert_eq!(codex.status, Status::Warn, "{report}");
+        assert_eq!(
+            codex.detail,
+            "0.154.0 (/fake/bin/codex), logged in (API key), but no login file at \
+             ~/.codex/auth.json"
+        );
+        let why = codex.why.as_deref().unwrap();
+        assert!(
+            why.contains("the critic of the review roles runs on Claude Code"),
+            "{why}"
+        );
+        assert!(
+            why.contains("`codex login`") && why.contains("auth.json"),
+            "{why}"
+        );
+        assert!(report.ready(), "{report}");
     }
 
     /// A Codex that is not ready at an untested version is still the warning

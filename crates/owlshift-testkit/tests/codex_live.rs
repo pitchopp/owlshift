@@ -227,9 +227,15 @@ fn brief(base: String) -> Brief {
 /// placeholders `codex_fixtures.rs` checks for.
 fn record(report: &RunReport, scratch: &Path) {
     let home = std::env::var("HOME").unwrap_or_default();
+    // The longest first: the scratch folder lies in the temporary one.
     let mut replaced: Vec<(String, String)> = Vec::new();
-    for path in [scratch.to_path_buf(), fs::canonicalize(scratch).unwrap()] {
+    for path in [fs::canonicalize(scratch).unwrap(), scratch.to_path_buf()] {
         replaced.push((path.display().to_string(), "/tmp/owlshift-live".into()));
+    }
+    let temp = std::env::temp_dir();
+    for path in [fs::canonicalize(&temp).unwrap(), temp] {
+        let path = path.display().to_string();
+        replaced.push((path.trim_end_matches('/').to_owned(), "/tmp".into()));
     }
     if !home.is_empty() {
         replaced.push((home, "/home/user".into()));
@@ -274,10 +280,13 @@ fn record(report: &RunReport, scratch: &Path) {
         .trim()
         .trim_start_matches("codex-cli ")
         .to_owned();
-    let message = match &report.outcome {
-        Outcome::Finished { result, .. } => serde_json::to_value(result.as_ref()).unwrap(),
-        _ => serde_json::Value::Null,
-    };
+    // The last agent message, as `-o` wrote it.
+    let message = stream
+        .iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["item"]["type"] == "agent_message")
+        .find_map(|event| event["item"]["text"].as_str().map(str::to_owned));
     let meta = serde_json::json!({
         "recorded": jiff::Zoned::now().date().to_string(),
         "codex_version": version,
@@ -292,7 +301,7 @@ fn record(report: &RunReport, scratch: &Path) {
         "prompt": "the verify role (roles/verify.md) and the brief's path, on standard input",
         "exit_status": report.exit_code,
         "stderr": stderr,
-        "result": message,
+        "output_last_message": message,
     });
     let dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../owlshift-adapters/tests/fixtures/codex");
