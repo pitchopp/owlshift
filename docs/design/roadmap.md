@@ -108,6 +108,17 @@ PR quality at least on par with the current `/parallel` workflow.
 
 - Stages design, design review, build, verify; variants `trivial`, `standard`, `risky`; plan approval policy.
 - Codex harness for review roles; the cross-family rule; per-ticket routing (harness, tier, effort); false-premise stop. Scenarios S8 and S17 (routing part).
+- The rules are [architecture](architecture.md) section 5, "The quality pipeline" (OWL-296), and the [build plan](build-plan.md), "P5 · Quality pipeline", says who builds what and how the exit gate is run.
+
+**Readings and deviations** (OWL-296, 2026-10-15).
+
+- Verify reviews the diff before the pull request opens; the complete CI result stays Watch's, through P3's fix runs. Browser QA, "when declared", waits for P6, where the browser becomes a resource.
+- S9's confirmed finding and its two review passes are P5's; a finding is confirmed by an arbiter run by default, or triaged by the author's own fix run when the project sets `pipeline.findings = "author"`.
+- Human review comments on the pull request, deferred by P3, are read from P5, from the forge accounts `[forge].reviewers` lists; P10's identity map replaces that list.
+- S8 stops on a premise the repository or its documents contradict. Intake stays without network: a premise only the outside world can check is a question. Recording the dated finding where the project keeps external facts waits for a key that names that place.
+- S17's rule that a reviewer runs on another family is held by one reviewer per review, the Codex critic; the others add mandates on Claude Code.
+- S17's routing part: the routing verdict's tier and effort are followed; the authoring roles stay on Claude Code (D4), so a verdict naming Codex for them is shown and not followed. Its fallback part, a harness at its usage limit switching to another, is P6's, as that step says.
+- Locary is in a Linear workspace of its own, while a machine keeps one Linear key and one GitHub token for every project (keychain accounts `linear` and `github`): its first tickets need secrets per project.
 
 **Exit gate.** Five PRs judged at least as good as `/parallel` output by the maintainer; first Locary tickets delivered.
 
