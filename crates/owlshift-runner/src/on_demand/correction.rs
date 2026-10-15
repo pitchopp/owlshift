@@ -154,7 +154,8 @@ impl OnDemand<'_> {
         }
         let correction = reversal::correction(&reversed, &questions, pr.number, &pr.url, &pushed);
         let dispatched = self.dispatch(p, Command::Correct, sink)?;
-        let build = |_: u32| self.build;
+        let harness = self.build.harness(dispatched.build);
+        let build = |_: u32| &*harness;
         let decorate = |brief: &mut Brief, questions: &TicketQuestions| {
             brief.correction = Some(correction.clone());
             tell_build(brief, questions);

@@ -132,7 +132,8 @@ plan_approval = \"on-fork\"
 
 [models]
 # The model of each tier, per harness; left out, a harness runs its own
-# default model. `owlshift do` builds on the standard tier. For example:
+# default model, but `fast` falls back to `standard`. A ticket's Build runs
+# on the tier of its routing verdict, or of its `tier:` label. For example:
 # deep = {{ claude = \"claude-opus-5-5\" }}
 # standard = {{ claude = \"claude-sonnet-5\" }}
 # fast = {{ claude = \"claude-haiku-4-5\" }}

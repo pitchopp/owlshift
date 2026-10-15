@@ -1368,7 +1368,7 @@ impl IntakeComment {
         let mut sections = vec![
             header.render(),
             format!(
-                "**Variant:** {}\n**Routing:** {} on the {} tier, effort {}",
+                "**Variant:** {}\n**Routing:** {} on the {} tier, effort {}{}",
                 match self.variant {
                     Variant::Trivial => "trivial",
                     Variant::Standard => "standard",
@@ -1383,7 +1383,14 @@ impl IntakeComment {
                     Tier::Standard => "standard",
                     Tier::Fast => "fast",
                 },
-                routing.effort.as_str()
+                routing.effort.as_str(),
+                // The authoring runs stay on Claude Code in P5 (D4, OWL-305).
+                match routing.harness {
+                    Harness::Claude => "",
+                    Harness::Codex =>
+                        "\n**Harness not followed:** Design and Build run on Claude Code, the \
+                         tier and effort apply there.",
+                }
             ),
         ];
         if self.dependencies.is_empty() {
@@ -2886,6 +2893,24 @@ Merge state reported by the forge: `CLEAN`.
         }
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
         assert_eq!(footers.count(), 1, "{body}");
+        assert!(!body.contains("not followed"), "{body}");
+
+        // A verdict naming Codex is shown, and shown not followed (OWL-305).
+        let codex = IntakeComment {
+            routing: Routing {
+                harness: Harness::Codex,
+                ..comment.routing
+            },
+            ..comment.clone()
+        }
+        .render();
+        assert!(
+            codex.contains(
+                "**Routing:** codex on the standard tier, effort high\n**Harness not followed:** \
+                 Design and Build run on Claude Code"
+            ),
+            "{codex}"
+        );
 
         let none = IntakeComment {
             dependencies: Vec::new(),

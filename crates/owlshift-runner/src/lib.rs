@@ -23,6 +23,7 @@ pub mod rebase;
 pub mod resolver;
 pub mod reversal;
 pub mod roles;
+pub mod routing;
 pub mod rules;
 pub mod secrets;
 pub mod system;
