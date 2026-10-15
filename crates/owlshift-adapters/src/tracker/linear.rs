@@ -121,8 +121,10 @@
 //!   created by the app user. `IssueCreateInput` has `labelIds` and no
 //!   relation field, so the relations are writes of their own.
 //! - `issueRelationCreate(input: { type, issueId, relatedIssueId })` wrote a
-//!   `related` relation, and a `blocks` relation with the parent as
-//!   `issueId`, which the proposal then listed in its `inverseRelations`.
+//!   `related` relation, and, by a script of its own once that one was
+//!   deleted, a `blocks` relation with the parent as `issueId`, which the
+//!   proposal then listed in its `inverseRelations`. The two never stand
+//!   together (OWL-292, below).
 //! - `issues(filter: …, includeArchived: true)` with the team's key and
 //!   `title: { eqIgnoreCase }`, or `description: { contains: "fingerprint
 //!   <hex>" }`, found the issue, the latter again once it was canceled.
@@ -138,10 +140,21 @@
 //!   issue then lists the relation in its `inverseRelations`.
 //! - The same write again answers `success: true` with the same relation:
 //!   it is idempotent.
-//! - The reverse write answers a new relation: Linear does not refuse a
-//!   cycle, so the runner's walk is the only guard.
+//! - The reverse write answers a new relation, which replaces the first
+//!   (OWL-292, below): Linear refuses neither write, and the runner's walk
+//!   refuses the reverse one before it is made.
 //! - An unknown `issueId` answers `issue not found`, code `INPUT_ERROR`,
 //!   which the adapter reads as [`ErrorKind::NotFound`].
+//!
+//! Checked live on 2026-10-15 (OWL-292; build plan, "P4 · The drain", part
+//! I) through the API key, on two throwaway issues then canceled: Linear
+//! keeps one relation between two issues. `related` then `blocks`, `blocks`
+//! then `related`, and `blocks` one way then the other: each write answered
+//! `success: true` and a relation of its own, and read back 5 s later the
+//! pair held the later relation only, the earlier one's id answering
+//! `Entity not found: IssueRelation`. The proposals the app filed on the P4
+//! exit gate kept their `blocks` relation alone in the same way. So a
+//! proposal is given one relation.
 //!
 //! Read only, for `owlshift doctor` (OWL-155, checked 2026-10-14):
 //!
@@ -822,10 +835,12 @@ impl Tracker for LinearTracker {
     /// position, when the team has triage on; else its first `backlog`
     /// state by position with [`PROPOSED_LABEL`], the team's label before a
     /// workspace one. The label is never created: doctor warns of a missing
-    /// one (build plan, "P4 · The drain", part D). The relations are written
-    /// by the issues' ids: `related` from the proposal to the parent, and
-    /// `blocks` from the parent to the proposal, `issue` blocking
-    /// `relatedIssue`.
+    /// one (build plan, "P4 · The drain", part D). One relation is written,
+    /// by the issues' ids, since Linear keeps one between two issues, a
+    /// later write replacing the earlier without a word (checked 2026-10-15,
+    /// OWL-292, above): `blocks` from the parent to the proposal, `issue`
+    /// blocking `relatedIssue`, when the proposal needs the parent's code;
+    /// else `related` from the proposal to the parent.
     fn propose(&self, proposal: &Proposal<'_>) -> Result<Filed, Error> {
         let parent = proposal.parent;
         let data: TargetData = self.call(TARGET_QUERY, json!({ "id": parent.as_str() }))?;
@@ -872,20 +887,19 @@ impl Tracker for LinearTracker {
                 created.state.name, state.name
             )));
         }
-        let mut relate = |kind: &str, issue: &str, related: &str| {
-            let input = json!({ "type": kind, "issueId": issue, "relatedIssueId": related });
-            let what = format!("the `{kind}` relation between {parent} and {id}");
-            match self.write::<RelateData>(RELATE_MUTATION, json!({ "input": input })) {
-                Ok(RelateData {
-                    issue_relation_create: Success { success: true },
-                }) => {}
-                Ok(_) => problems.push(invalid(format!("Linear did not write {what}"))),
-                Err(e) => problems.push(Error::new(e.kind, format!("{what} was not written: {e}"))),
-            }
+        let (kind, issue, related) = if proposal.blocked_by_parent {
+            ("blocks", &target.id, &created.id)
+        } else {
+            ("related", &created.id, &target.id)
         };
-        relate("related", &created.id, &target.id);
-        if proposal.blocked_by_parent {
-            relate("blocks", &target.id, &created.id);
+        let input = json!({ "type": kind, "issueId": issue, "relatedIssueId": related });
+        let what = format!("the `{kind}` relation between {parent} and {id}");
+        match self.write::<RelateData>(RELATE_MUTATION, json!({ "input": input })) {
+            Ok(RelateData {
+                issue_relation_create: Success { success: true },
+            }) => {}
+            Ok(_) => problems.push(invalid(format!("Linear did not write {what}"))),
+            Err(e) => problems.push(Error::new(e.kind, format!("{what} was not written: {e}"))),
         }
         Ok(Filed {
             id,
@@ -961,7 +975,8 @@ impl Tracker for LinearTracker {
     /// `issueRelationCreate` of type `blocks`, `blocker` as `issueId` and
     /// `blocked` as `relatedIssueId`, by their identifiers, through the app
     /// when one is set (check (d), 2026-10-14, above): a relation already
-    /// there is answered again, not doubled.
+    /// there is answered again, not doubled, and a `related` or reverse
+    /// `blocks` relation of the pair is replaced (OWL-292, above).
     fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), Error> {
         let input = json!({ "type": "blocks", "issueId": blocker.as_str(),
             "relatedIssueId": blocked.as_str() });
@@ -2160,10 +2175,11 @@ mod tests {
     }
 
     /// Filing into Triage, as check (e) did: the parent's team and project
-    /// read through the key, the issue and its relations written through
-    /// the app, by ids, with no label, priority or estimate.
+    /// read through the key, the issue and its one relation, the parent's
+    /// `blocks` (OWL-292), written through the app, by ids, with no label,
+    /// priority or estimate.
     #[test]
-    fn a_proposal_goes_to_triage_in_the_parents_project_related_and_blocked() {
+    fn a_proposal_goes_to_triage_in_the_parents_project_blocked_by_it() {
         let key = Scripted::new(vec![
             ("Workspace", json!({ "organization": { "id": "org-1" } })),
             ("ProposalTarget", target(true, OWL_TYPED)),
@@ -2188,10 +2204,7 @@ mod tests {
             }
         );
         assert_eq!(*by_key.lock().unwrap(), ["Workspace", "ProposalTarget"]);
-        assert_eq!(
-            *by_app.lock().unwrap(),
-            ["App", "Propose", "Relate", "Relate"]
-        );
+        assert_eq!(*by_app.lock().unwrap(), ["App", "Propose", "Relate"]);
         let sent = sent.lock().unwrap();
         let p = proposal(&parent, true);
         assert_eq!(
@@ -2201,10 +2214,6 @@ mod tests {
         );
         assert_eq!(
             sent[2]["input"],
-            json!({ "type": "related", "issueId": "new-id", "relatedIssueId": "parent-id" })
-        );
-        assert_eq!(
-            sent[3]["input"],
             json!({ "type": "blocks", "issueId": "parent-id", "relatedIssueId": "new-id" })
         );
     }
@@ -2259,6 +2268,10 @@ mod tests {
             assert_eq!(sent[2]["input"]["stateId"], "s-Backlog");
             assert_eq!(sent[2]["input"]["labelIds"], json!([chosen]));
             assert_eq!(sent.len(), 4, "one relation only: {sent:?}");
+            assert_eq!(
+                sent[3]["input"],
+                json!({ "type": "related", "issueId": "new-id", "relatedIssueId": "parent-id" })
+            );
         }
     }
 
@@ -2310,32 +2323,45 @@ mod tests {
         }
     }
 
-    /// Once the issue exists, a relation not written or another state than
-    /// the one asked is a problem of the filed proposal, never an error:
-    /// the other relation is still written.
+    /// Once the issue exists, its relation refused or failed, or another
+    /// state than the one asked, is a problem of the filed proposal, never
+    /// an error, and no other relation is written in its place.
     #[test]
     fn what_goes_wrong_after_the_creation_is_kept_with_the_filed_proposal() {
         let parent = TicketId::new("OWL-252").unwrap();
-        let key = Scripted::new(vec![
-            ("ProposalTarget", target(true, OWL_TYPED)),
-            ("Propose", created("Backlog")),
-            ("Relate", related(false)),
-            ("Relate", related(true)),
-        ]);
-        let asked = key.asked.clone();
-        let filed = LinearTracker::with_transport(key)
-            .propose(&proposal(&parent, true))
-            .unwrap();
-        assert_eq!(filed.state, "Backlog");
-        let problems: Vec<&str> = filed.problems.iter().map(|e| e.message.as_str()).collect();
-        assert_eq!(
-            problems,
-            [
-                "Linear filed OWL-266 in \"Backlog\", not in \"Triage\"",
-                "Linear did not write the `related` relation between OWL-252 and OWL-266",
-            ]
-        );
-        assert_eq!(asked.lock().unwrap().len(), 4);
+        for (relate, says) in [
+            (
+                related(false),
+                "Linear did not write the `blocks` relation between OWL-252 and OWL-266",
+            ),
+            (
+                Value::Null,
+                "the `blocks` relation between OWL-252 and OWL-266 was not written: ",
+            ),
+        ] {
+            let key = Scripted::new(vec![
+                ("ProposalTarget", target(true, OWL_TYPED)),
+                ("Propose", created("Backlog")),
+                ("Relate", relate),
+            ]);
+            let asked = key.asked.clone();
+            let filed = LinearTracker::with_transport(key)
+                .propose(&proposal(&parent, true))
+                .unwrap();
+            assert_eq!(filed.id.as_str(), "OWL-266");
+            assert_eq!(filed.state, "Backlog");
+            let problems: Vec<&str> = filed.problems.iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(problems.len(), 2, "{problems:?}");
+            assert_eq!(
+                problems[0],
+                "Linear filed OWL-266 in \"Backlog\", not in \"Triage\""
+            );
+            assert!(problems[1].starts_with(says), "{problems:?}");
+            assert_eq!(
+                *asked.lock().unwrap(),
+                ["ProposalTarget", "Propose", "Relate"]
+            );
+        }
     }
 
     /// The two exact searches: the team's key, the title in any case, the
