@@ -547,11 +547,35 @@ impl TicketReview {
     /// Checks each pass is at Design review or Verify, its findings keep a
     /// result's rules with ids increasing, each raised by a reviewer of the
     /// pass's role with its mandates distinct and a model named, and none
-    /// both ruled on and responded to; and each answered review is named
-    /// once.
+    /// both ruled on and responded to, nor given an outcome its ruling or
+    /// response contradicts (a rejected ruling or response gives
+    /// `rejected` only, a confirmed ruling anything but `rejected`, a fixed
+    /// response `fixed` only); and each answered review is named once.
+    ///
+    /// Passes are numbered from 1 in each run of consecutive passes at one
+    /// stage, each pass the one before it plus 1, or 1 again: a review loop
+    /// on the pull request starts its Verify passes over after the
+    /// delivery's (architecture section 5, "Review comments on the pull
+    /// request"). No order holds between stages: a settled `replan` sends a
+    /// ticket from Verify back to Design, and its design review follows.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
-        for pass in &self.passes {
+        for (n, pass) in self.passes.iter().enumerate() {
+            let follows = n
+                .checked_sub(1)
+                .map(|before| &self.passes[before])
+                .filter(|before| before.stage == pass.stage)
+                .map(|before| before.pass.get());
+            let numbered =
+                pass.pass.get() == 1 || follows.is_some_and(|p| pass.pass.get() == p + 1);
+            if !numbered {
+                return invalid(format!(
+                    "{:?} pass {} follows {}: a run of passes at a stage counts from 1, by 1",
+                    pass.stage,
+                    pass.pass,
+                    follows.map_or("another stage's pass".to_owned(), |p| format!("pass {p}"))
+                ));
+            }
             let role = match pass.stage {
                 Stage::DesignReview => Role::DesignReview,
                 Stage::Verify => Role::Verify,
@@ -589,6 +613,27 @@ impl TicketReview {
                     .or(kept.response.as_ref().map(|r| &r.reason));
                 if reason.is_some_and(|r| r.trim().is_empty()) {
                     return invalid(format!("finding {id} of {at} keeps a blank reason"));
+                }
+                use FindingOutcome::{Asked, Fixed, Proposed, Rejected};
+                let (judgment, allowed): (&str, &[FindingOutcome]) =
+                    match (&kept.ruling, &kept.response) {
+                        (Some(ruling), _) if ruling.outcome == RulingOutcome::Rejected => {
+                            ("rejected ruling", &[Rejected])
+                        }
+                        (Some(_), _) => ("confirmed ruling", &[Fixed, Asked, Proposed]),
+                        (_, Some(response)) if response.outcome == ResponseOutcome::Rejected => {
+                            ("rejected response", &[Rejected])
+                        }
+                        (_, Some(_)) => ("fixed response", &[Fixed]),
+                        (None, None) => ("", &[Fixed, Rejected, Asked, Proposed]),
+                    };
+                if let Some(outcome) = kept.outcome
+                    && !allowed.contains(&outcome)
+                {
+                    return invalid(format!(
+                        "finding {id} of {at} keeps the outcome {outcome:?}, which its {judgment} \
+                         contradicts"
+                    ));
                 }
             }
         }
@@ -782,6 +827,113 @@ mod tests {
                 (&|d| d["format"] = 2.into(), "upgrade Owlshift"),
             ],
         );
+    }
+
+    /// The fixture's finding with `judgment` (`ruling` or `response`) of
+    /// `outcome`, kept with the outcome `kept`, parsed.
+    fn settled(judgment: &str, outcome: &str, kept: &str) -> Result<TicketReview, String> {
+        let mut document = ticket_review();
+        let finding = &mut document["passes"][0]["findings"][0];
+        finding.as_object_mut().unwrap().remove("ruling");
+        finding[judgment] = json!({ "outcome": outcome, "reason": "r" });
+        finding["outcome"] = kept.into();
+        TicketReview::parse(&document.to_string()).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_rejected_ruling_gives_only_rejected() {
+        settled("ruling", "rejected", "rejected").unwrap();
+        for kept in ["fixed", "asked", "proposed"] {
+            let error = settled("ruling", "rejected", kept).unwrap_err();
+            assert!(
+                error.contains("its rejected ruling contradicts"),
+                "{kept}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmed_ruling_never_gives_rejected() {
+        for kept in ["fixed", "asked", "proposed"] {
+            settled("ruling", "confirmed", kept).unwrap_or_else(|e| panic!("{kept}: {e}"));
+        }
+        let error = settled("ruling", "confirmed", "rejected").unwrap_err();
+        assert!(
+            error.contains("its confirmed ruling contradicts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_response_gives_only_fixed() {
+        settled("response", "fixed", "fixed").unwrap();
+        for kept in ["rejected", "asked", "proposed"] {
+            let error = settled("response", "fixed", kept).unwrap_err();
+            assert!(
+                error.contains("its fixed response contradicts"),
+                "{kept}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_response_gives_only_rejected() {
+        settled("response", "rejected", "rejected").unwrap();
+        for kept in ["fixed", "asked", "proposed"] {
+            let error = settled("response", "rejected", kept).unwrap_err();
+            assert!(
+                error.contains("its rejected response contradicts"),
+                "{kept}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_count_from_1_by_1_within_a_run_at_one_stage() {
+        let review = |passes: &[(&str, u32)]| {
+            let mut document = ticket_review();
+            let pass = document["passes"][0].clone();
+            document["passes"] = passes
+                .iter()
+                .map(|&(stage, n)| {
+                    let mut pass = pass.clone();
+                    pass["stage"] = stage.into();
+                    pass["pass"] = n.into();
+                    for kept in pass["findings"].as_array_mut().unwrap() {
+                        kept["reviewer"]["role"] = stage.into();
+                    }
+                    pass
+                })
+                .collect();
+            TicketReview::parse(&document.to_string()).map_err(|e| e.to_string())
+        };
+        // Passes rise by 1; a review loop starts Verify over at 1; Design
+        // review may follow Verify after a `replan`.
+        review(&[
+            ("design_review", 1),
+            ("design_review", 2),
+            ("design_review", 3),
+            ("verify", 1),
+            ("verify", 2),
+            ("verify", 1),
+            ("design_review", 1),
+        ])
+        .unwrap();
+        for (passes, reason) in [
+            (&[("design_review", 2)][..], "follows another stage's pass"),
+            (
+                &[("design_review", 1), ("verify", 2)][..],
+                "follows another stage's pass",
+            ),
+            (&[("verify", 1), ("verify", 3)][..], "follows pass 1"),
+            (
+                &[("verify", 2), ("verify", 2)][..],
+                "follows another stage's pass",
+            ),
+        ] {
+            let error = review(passes).unwrap_err();
+            assert!(error.contains(reason), "{passes:?}: {error}");
+        }
     }
 
     #[test]
