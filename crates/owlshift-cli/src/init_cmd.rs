@@ -251,7 +251,9 @@ fn linear_app(
             "The Linear app goes with the Linear API key: this project has no key of its own, so \
              it is not asked for."
         );
-        return true;
+        // The shared pair it may read is still checked: half of it would
+        // refuse the next `owlshift do`.
+        return usable_app(keychain, &shared);
     }
     if !own_app && shared_app {
         println!(
@@ -291,7 +293,13 @@ fn linear_app(
             return false;
         }
     }
-    match tracker::read(keychain, own)
+    usable_app(keychain, own)
+}
+
+/// Whether the Linear app's pair under `accounts` is whole or absent, as
+/// `owlshift do` needs it; half a pair is said and fails `init`.
+fn usable_app(keychain: &Keychain, accounts: &TrackerAccounts) -> bool {
+    match tracker::read(keychain, accounts)
         .map_err(|error| error.to_string())
         .and_then(|found| app_credentials(&found).map_err(|error| error.to_string()))
     {
@@ -309,4 +317,32 @@ fn next_steps() -> ExitCode {
          a ticket."
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use owlshift_adapters::forge::Repo;
+    use owlshift_runner::tracker::{
+        LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT,
+    };
+
+    use super::*;
+
+    /// A project reading the shared key is asked for no app, but half a
+    /// shared pair still fails `init`, as it would refuse `owlshift do`.
+    #[test]
+    fn a_half_shared_app_fails_a_project_without_its_own_key() {
+        let keychain = Keychain::in_memory();
+        let own = TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap());
+        for account in [LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT] {
+            keychain.store(account, &Secret::new("x")).unwrap();
+        }
+        let mut ask = |_: &Wanted| -> Option<Secret> { panic!("no app is asked for") };
+        assert!(!linear_app(&keychain, &own, false, &mut ask));
+
+        keychain
+            .store(LINEAR_APP_SECRET_ACCOUNT, &Secret::new("y"))
+            .unwrap();
+        assert!(linear_app(&keychain, &own, false, &mut ask));
+    }
 }
