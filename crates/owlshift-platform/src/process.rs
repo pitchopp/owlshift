@@ -22,6 +22,7 @@ pub use sentinel::{SentinelProbe, SentinelStatus, probe_sentinel};
 pub use signals::stop_trees_on_signal;
 #[cfg(unix)]
 pub use signals::{sentinel_status, stop_trees_when_killed};
+use tree::ExitWatch;
 pub use tree::ProcessTree;
 
 use std::ffi::OsStr;
@@ -37,6 +38,8 @@ use std::time::{Duration, Instant};
 /// dropped.
 pub const OUTPUT_CAP: usize = 64 * 1024;
 
+/// How often the sentinel's waits check on a process.
+#[cfg(unix)]
 const POLL: Duration = Duration::from_millis(10);
 
 /// What a finished program returned.
@@ -101,8 +104,8 @@ pub fn find_executable_in(name: &str, search_path: impl AsRef<OsStr>) -> Option<
 /// passes, whether the program itself is still running or a process it
 /// started still holds its output open, the whole tree is stopped and the
 /// output readers are left behind rather than waited on, so the call never
-/// outlives `timeout` by more than a poll interval. A run that finishes in
-/// time stops nothing: what it leaves running is left alone.
+/// outlives `timeout` by more than the time it takes to stop the tree. A run
+/// that finishes in time stops nothing: what it leaves running is left alone.
 pub fn run(
     program: &Path,
     args: &[&str],
@@ -127,6 +130,10 @@ pub fn run(
 /// Each output stream is read to its end and its first `output_cap` bytes
 /// are kept: [`OUTPUT_CAP`] for a probe, `usize::MAX` for output that must be
 /// read whole, such as a large repository's `git status`.
+///
+/// The call never outlives `timeout` by more than the time it takes to stop
+/// the tree: it blocks until the command exits or the deadline passes,
+/// without polling.
 pub fn run_command(
     command: &mut Command,
     input: Option<&[u8]>,
@@ -154,20 +161,21 @@ pub fn run_command(
         });
     }
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                stop(&mut child, &tree);
-                return Err(RunError::TimedOut);
-            }
-            Ok(None) => thread::sleep(POLL),
-            Err(error) => {
-                stop(&mut child, &tree);
-                return Err(RunError::Io(error));
-            }
+    // The root is reaped only once its tree is withdrawn, through
+    // `ProcessTree::reap`, here or in `stop`: until then its pid, the tree's
+    // group id on Unix, cannot be reused, so stopping the tree never signals
+    // another process.
+    match ExitWatch::start(&child).and_then(|watch| watch.exited_by(&child, deadline)) {
+        Ok(true) => {}
+        Ok(false) => {
+            stop(child, tree);
+            return Err(RunError::TimedOut);
         }
-    };
+        Err(error) => {
+            stop(child, tree);
+            return Err(RunError::Io(error));
+        }
+    }
     let receive = |stream: Receiver<io::Result<Vec<u8>>>| {
         stream
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -176,31 +184,34 @@ pub fn run_command(
     };
     let output = receive(stdout).and_then(|stdout| Ok((stdout, receive(stderr)?)));
     match output {
-        Ok((stdout, stderr)) => Ok(Captured {
-            code: status.code(),
-            stdout,
-            stderr,
-        }),
+        Ok((stdout, stderr)) => {
+            let status = tree.reap(&mut child).map_err(RunError::Io)?;
+            Ok(Captured {
+                code: status.code(),
+                stdout,
+                stderr,
+            })
+        }
         Err(error) => {
             // The program is gone, but a process it started holds the output,
             // or the output could not be read whole: never a partial result.
-            stop(&mut child, &tree);
+            stop(child, tree);
             Err(error)
         }
     }
 }
 
-/// Stops the tree, then reaps its root.
+/// Stops the tree, then withdraws it and reaps its root.
 ///
 /// Best effort: the error the run reports is the timeout or failure that led
 /// here. The root is also killed on its own, in case it left its process
 /// group; it is waited on only if one of the two succeeded, so a root that
 /// could not be stopped never blocks the call.
-fn stop(child: &mut Child, tree: &ProcessTree) {
+fn stop(mut child: Child, tree: ProcessTree) {
     let tree_stopped = tree.kill().is_ok();
     let root_stopped = child.kill().is_ok();
     if tree_stopped || root_stopped {
-        let _ = child.wait();
+        let _ = tree.reap(&mut child);
     }
 }
 
@@ -407,6 +418,20 @@ mod tests {
             WAIT_OBJECT_0 => false,
             other => panic!("wait returned {other}: {}", io::Error::last_os_error()),
         }
+    }
+
+    /// What keeps a reaped pid from being signalled: the watch reports the
+    /// root's exit and leaves it unreaped, its pid still its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_watch_leaves_the_root_unreaped() {
+        let (mut child, tree) = ProcessTree::spawn(&mut Command::new("true")).unwrap();
+        let watch = ExitWatch::start(&child).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(watch.exited_by(&child, deadline).unwrap());
+        let pid = child.id();
+        assert!(state(pid).starts_with('Z'), "{}", state(pid));
+        assert!(tree.reap(&mut child).unwrap().success());
     }
 
     #[test]

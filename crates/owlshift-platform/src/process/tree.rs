@@ -6,7 +6,7 @@
 //! (`setsid`, `setpgid`); a Windows job gives no such way out.
 
 use std::io;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 
 /// The handle that stops a process tree started by [`ProcessTree::spawn`].
 ///
@@ -53,6 +53,18 @@ impl ProcessTree {
         imp::kill(self)
     }
 
+    /// Withdraws the tree from the live ones, then reaps its root.
+    ///
+    /// The order is what keeps a reaped pid from being signalled on Unix: the
+    /// group id is the root's pid, reserved while the root is unreaped, and
+    /// once the tree is withdrawn neither the signal handler nor the sentinel
+    /// stops it any more. Dropping the handle can block for good when the
+    /// process is being stopped by a signal, by design.
+    pub(super) fn reap(self, child: &mut Child) -> io::Result<ExitStatus> {
+        drop(self);
+        child.wait()
+    }
+
     /// The tree's entry among the live ones.
     #[cfg(test)]
     pub(super) fn registration(&self) -> &super::signals::Registration {
@@ -60,6 +72,7 @@ impl ProcessTree {
     }
 }
 
+pub(super) use imp::ExitWatch;
 #[cfg(unix)]
 pub(super) use imp::kill_group;
 #[cfg(windows)]
@@ -70,10 +83,13 @@ mod imp {
     use super::super::signals;
     use super::ProcessTree;
     use rustix::io::Errno;
-    use rustix::process::{Pid, Signal, kill_process_group};
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::thread;
+    use std::time::Instant;
 
     pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, ProcessTree)> {
         // A group id of 0 makes the child the leader of a new group whose id
@@ -88,13 +104,72 @@ mod imp {
         kill_group(tree.group)
     }
 
+    /// Tells when the root of a tree exits, without reaping it.
+    ///
+    /// A thread blocks in `waitid` with `WNOWAIT`, which leaves the root a
+    /// zombie: its pid, the tree's group id, stays reserved until the caller
+    /// reaps it through its [`Child`], so stopping the tree after the root
+    /// exited never signals a reused pid. `waitid` with `WEXITED | WNOWAIT`
+    /// was checked on 2026-10-15 on Linux 6.18; macOS by the CI leg running
+    /// the tests of `process`.
+    pub(in crate::process) struct ExitWatch(Receiver<io::Result<()>>);
+
+    impl ExitWatch {
+        /// Starts watching `child`, a root not reaped yet.
+        pub(in crate::process) fn start(child: &Child) -> io::Result<Self> {
+            let pid = Pid::from_child(child);
+            let (sender, receiver) = mpsc::channel();
+            thread::Builder::new()
+                .name("owlshift-exit-watch".into())
+                .spawn(move || {
+                    let exit = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+                    let outcome = loop {
+                        match waitid(WaitId::Pid(pid), exit) {
+                            // Without `WNOHANG`, it returns only once the
+                            // child has exited.
+                            Ok(_) => break Ok(()),
+                            Err(Errno::INTR) => {}
+                            Err(error) => break Err(error.into()),
+                        }
+                    };
+                    // The receiver is gone when the run timed out.
+                    let _ = sender.send(outcome);
+                })?;
+            Ok(Self(receiver))
+        }
+
+        /// Waits until the root exits, `true`, or the deadline passes,
+        /// `false`. Asked once: the answer is consumed.
+        pub(in crate::process) fn exited_by(
+            &self,
+            _child: &Child,
+            deadline: Instant,
+        ) -> io::Result<bool> {
+            match self
+                .0
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(outcome) => outcome.map(|()| true),
+                Err(RecvTimeoutError::Timeout) => Ok(false),
+                // Only if the thread panicked.
+                Err(RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                    "the thread watching the program ended without an answer",
+                )),
+            }
+        }
+    }
+
     /// Sends `SIGKILL` to the group.
     ///
     /// The group id stays reserved while the root is unreaped or any member
-    /// is alive. Once the root is reaped and the group is empty, the number
-    /// could in theory be reused by an unrelated group after the pid space
-    /// wraps around; callers stop a tree while its run is still theirs, and
-    /// the signal thread only while its handle is.
+    /// is alive: [`run_command`] reaps the root only after the tree is
+    /// withdrawn ([`ProcessTree::reap`]), and [`ExitWatch`] never reaps.
+    /// Once the root is reaped and the group is empty, the number could in
+    /// theory be reused by an unrelated group after the pid space wraps
+    /// around; callers stop a tree while its run is still theirs, and the
+    /// signal thread only while its handle is.
+    ///
+    /// [`run_command`]: crate::process::run_command
     pub(in crate::process) fn kill_group(group: Pid) -> io::Result<()> {
         match kill_process_group(group, Signal::KILL) {
             // No process left in the group.
@@ -128,7 +203,10 @@ mod imp {
     use std::process::{Child, Command};
     use std::ptr;
     use std::sync::Arc;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::{
+        INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
@@ -136,7 +214,8 @@ mod imp {
         AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        CREATE_SUSPENDED, INFINITE, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        WaitForSingleObject,
     };
 
     /// The exit code the processes of a stopped tree get, as with
@@ -228,6 +307,45 @@ mod imp {
 
     pub(super) fn kill(tree: &ProcessTree) -> io::Result<()> {
         terminate_job(&tree.job)
+    }
+
+    /// Tells when the root of a tree exits, without reaping it: a wait with a
+    /// timeout on the root's process handle, so no thread is needed. Nothing
+    /// here signals a pid: the tree is stopped through its job handle, the
+    /// root through its process handle, which keeps the process object.
+    pub(in crate::process) struct ExitWatch;
+
+    impl ExitWatch {
+        /// Starts watching `child`, a root not reaped yet.
+        pub(in crate::process) fn start(_child: &Child) -> io::Result<Self> {
+            Ok(Self)
+        }
+
+        /// Waits until the root exits, `true`, or the deadline passes,
+        /// `false`.
+        pub(in crate::process) fn exited_by(
+            &self,
+            child: &Child,
+            deadline: Instant,
+        ) -> io::Result<bool> {
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                // Whole milliseconds, rounded up, short of `INFINITE`.
+                let millis = u32::try_from(left.as_nanos().div_ceil(1_000_000))
+                    .unwrap_or(u32::MAX)
+                    .min(INFINITE - 1);
+                // SAFETY: the child's handle is open while it is borrowed.
+                match unsafe { WaitForSingleObject(child.as_raw_handle(), millis) } {
+                    WAIT_OBJECT_0 => return Ok(true),
+                    // The timer may fire a tick early, or the deadline was
+                    // too far for one wait: check it again.
+                    WAIT_TIMEOUT if Instant::now() >= deadline => return Ok(false),
+                    WAIT_TIMEOUT => {}
+                    WAIT_FAILED => return Err(io::Error::last_os_error()),
+                    other => return Err(io::Error::other(format!("wait returned {other}"))),
+                }
+            }
+        }
     }
 
     /// Stops every process in the job.
