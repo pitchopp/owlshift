@@ -33,6 +33,19 @@ jobs:
         run: rustup toolchain install
       - name: Show the toolchain
         run: cargo --version --verbose
+      # OWL-289: the legs recompiled the workspace's dependencies on every
+      # run. Swatinem/rust-cache keeps ~/.cargo's registry and the
+      # dependencies' build artifacts, one cache per OS, keyed by the
+      # toolchain and the Cargo files, so it comes after the toolchain
+      # install and before the first cargo build. Default settings: a run
+      # whose key is not cached saves it, and a pull request whose Cargo
+      # files match main's restores main's cache and saves nothing. The
+      # action sets CARGO_INCREMENTAL=0 for the job. Pinned to its full
+      # commit; the workflow's permissions are unchanged. Approved on
+      # OWL-289 on 2026-10-15, with the action as a dependency, as the
+      # CI-settings floor of architecture section 8 requires.
+      - name: Cache the build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # OWL-41: agent runs are confined with bwrap on Linux. The image keeps
       # unprivileged programs from creating user namespaces (AppArmor), so
       # bwrap alone is allowed them with a scoped profile, as on a user's
