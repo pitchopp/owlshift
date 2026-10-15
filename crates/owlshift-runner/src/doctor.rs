@@ -635,8 +635,8 @@ const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on mac
                             start a Secret Service such as GNOME Keyring";
 
 /// The harnesses declared in the personal file, or both when it declares
-/// none (scenario S15). Codex that is not ready is only a warning until P5: see
-/// [`not_needed_before_review_roles`].
+/// none (scenario S15). Codex that is not ready is only a warning: see
+/// [`critic_stands_in_without_codex`].
 fn required_harnesses(config: &Effective) -> Vec<Harness> {
     if let FileState::Loaded { config, .. } = &config.personal {
         let declared: Vec<Harness> = config.harnesses.iter().map(|(h, _)| h).collect();
@@ -654,7 +654,10 @@ fn harness_why(harness: Harness) -> &'static str {
             "`owlshift do` runs every agent in Claude Code, so it must be installed. \
              Agent runs log in with the token the `claude agent login` line checks."
         }
-        Harness::Codex => "Codex runs the review roles from P5; `owlshift do` does not use it yet.",
+        Harness::Codex => {
+            "Codex runs the critic of the review roles, a model of another family than the \
+             author's; without it the critic runs on Claude Code."
+        }
     }
 }
 
@@ -678,7 +681,7 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
             harness_why(harness),
             fix,
         );
-        return not_needed_before_review_roles(missing, harness);
+        return critic_stands_in_without_codex(missing, harness);
     };
     let (version, exact) = match system.run(&path, &["--version"], None) {
         Ok(out) if out.code == Some(0) => (version_of(&out.stdout), exact_version_of(&out.stdout)),
@@ -690,19 +693,19 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
         shown(&path, home)
     );
     let mut result = login_check(system, harness, &path, &found);
+    if harness == Harness::Codex && result.status == Status::Ok {
+        result = codex_login_file_check(system, result, home);
+    }
     flag_untested(&mut result, harness, exact.as_deref());
-    not_needed_before_review_roles(result, harness)
+    critic_stands_in_without_codex(result, harness)
 }
 
-/// Codex that is missing, logged out or unreadable is a warning, not a
-/// failure: `owlshift do` does not run it before the review roles (P5), so
-/// it is not a problem to fix before `do` (OWL-102). The decision is made
-/// here and only here.
-///
-/// P5 must replace the unconditional downgrade with a condition: Codex stays
-/// a failure once a configured role uses it. No configuration maps roles to
-/// harnesses yet, so there is nothing to read today.
-fn not_needed_before_review_roles(mut check: Check, harness: Harness) -> Check {
+/// Codex that is missing, logged out or unreadable is a warning, never a
+/// failure: without it, the critic of the review roles runs on Claude Code
+/// instead (architecture section 5, "Without Codex"), so it is not a problem
+/// to fix before `do` (OWL-102, OWL-299). The decision is made here and only
+/// here.
+fn critic_stands_in_without_codex(mut check: Check, harness: Harness) -> Check {
     if harness != Harness::Codex || check.status != Status::Fail {
         return check;
     }
@@ -723,12 +726,38 @@ fn not_needed_before_review_roles(mut check: Check, harness: Harness) -> Check {
         .collect();
     check.status = Status::Warn;
     check.why = Some(format!(
-        "{DOES_NOT_BLOCK} it does not use Codex yet; the review roles will, from P5, and \
-         then Codex must be ready. To get it ready: {}.",
+        "{DOES_NOT_BLOCK} without Codex, the critic of the review roles runs on Claude Code \
+         instead, a model of the same family as the author's. To get it ready: {}.",
         steps.join(", then ")
     ));
     check.fix = Vec::new();
     check
+}
+
+/// A Codex logged in, but not through the file a Codex agent run copies its
+/// login from (OWL-299), such as a login kept in the system keyring: `codex
+/// login status` says logged in, yet the run is refused. Not ready, so
+/// [`critic_stands_in_without_codex`] makes it its warning.
+fn codex_login_file_check(system: &dyn System, logged_in: Check, home: Option<&Path>) -> Check {
+    let file = system.codex_login_file();
+    if file.as_deref().is_some_and(|file| system.is_file(file)) {
+        return logged_in;
+    }
+    let where_ = file.map_or_else(
+        || "no login file (neither CODEX_HOME nor a home folder is set)".to_owned(),
+        |file| format!("no login file at {}", shown(&file, home)),
+    );
+    Check::fail(
+        Section::Tools,
+        "codex",
+        format!("{}, but {where_}", logged_in.detail),
+        harness_why(Harness::Codex),
+        vec![Step::run_noting(
+            harness::login_command(Harness::Codex),
+            "with Codex set to keep its login in auth.json, which Owlshift copies into each \
+             Codex run",
+        )],
+    )
 }
 
 fn harness_name(harness: Harness) -> &'static str {
@@ -826,12 +855,7 @@ fn flag_untested(check: &mut Check, harness: Harness, version: Option<&str>) {
     }
     if matches!(check.status, Status::Ok | Status::Info) {
         check.status = Status::Warn;
-        let mut why = match harness {
-            Harness::Codex => format!(
-                "{DOES_NOT_BLOCK} it does not use Codex yet; the review roles will, from P5."
-            ),
-            Harness::Claude => format!("{DOES_NOT_BLOCK} an untested version usually works."),
-        };
+        let mut why = format!("{DOES_NOT_BLOCK} an untested version usually works.");
         if !tested.is_empty() {
             why.push_str(&format!(
                 " If a run misbehaves, install a tested version: {} {}.",
@@ -2264,7 +2288,10 @@ mod tests {
             assert_eq!(codex.fix, []);
             let why = codex.why.as_deref().unwrap();
             assert!(why.starts_with(DOES_NOT_BLOCK), "{why}");
-            assert!(why.contains("from P5"), "{why}");
+            assert!(
+                why.contains("the critic of the review roles runs on Claude Code"),
+                "{why}"
+            );
             assert!(why.contains(step), "{why}");
             assert!(report.ready(), "{report}");
             assert_eq!(report.failures(), 0, "{report}");
@@ -2378,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tested_version_is_quiet_and_codex_has_none_yet() {
+    fn a_tested_version_is_quiet() {
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
         let report = run(&system, &no_config());
         let claude = line(&report, "claude");
@@ -2386,27 +2413,54 @@ mod tests {
         assert!(!claude.detail.contains("tested"), "{report}");
         assert_eq!(claude.why, None);
 
-        // Codex has no contract tests, so no version of it is tested.
+        // Codex 0.154.0 is tested since its contract tests (OWL-299).
         let codex = line(&report, "codex");
         assert!(report.ready(), "{report}");
-        assert_eq!(codex.status, Status::Warn);
+        assert_eq!(codex.status, Status::Ok, "{report}");
         assert_eq!(
             codex.detail,
-            "0.154.0 (/fake/bin/codex), logged in (API key); no version tested with Owlshift yet"
+            "0.154.0 (/fake/bin/codex), logged in (API key)"
         );
-        assert_eq!(
-            codex.why.as_deref(),
-            Some(
-                "Does not block `owlshift do`: it does not use Codex yet; the review roles \
-                 will, from P5."
-            )
-        );
-        assert_eq!(codex.fix, []);
+        assert_eq!(codex.why, None);
     }
 
-    /// A Codex that is not ready at an untested version (every Codex version
-    /// is untested) is still the warning of OWL-102, and its detail says the
-    /// version is untested; an informational line becomes a warning.
+    /// OWL-299: a Codex logged in without the login file a Codex run copies,
+    /// such as a login kept in the keyring, is not ready: its warning says
+    /// where the file was looked for and how to get it written.
+    #[test]
+    fn a_codex_login_without_its_file_is_the_warning() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
+            .without_file("/home/ada/.codex/auth.json");
+        let report = run(&system, &no_config());
+        let codex = line(&report, "codex");
+        assert_eq!(codex.status, Status::Warn, "{report}");
+        // Shown as every path under the home is: `~/…` where `/home/ada` is
+        // absolute, as is on Windows.
+        let file = shown(
+            Path::new("/home/ada/.codex/auth.json"),
+            Some(Path::new("/home/ada")),
+        );
+        assert_eq!(
+            codex.detail,
+            format!("0.154.0 (/fake/bin/codex), logged in (API key), but no login file at {file}")
+        );
+        #[cfg(unix)]
+        assert_eq!(file, "~/.codex/auth.json");
+        let why = codex.why.as_deref().unwrap();
+        assert!(
+            why.contains("the critic of the review roles runs on Claude Code"),
+            "{why}"
+        );
+        assert!(
+            why.contains("`codex login`") && why.contains("auth.json"),
+            "{why}"
+        );
+        assert!(report.ready(), "{report}");
+    }
+
+    /// A Codex that is not ready at an untested version is still the warning
+    /// of OWL-102, and its detail says the version is untested; an
+    /// informational line becomes a warning.
     #[test]
     fn a_codex_not_ready_at_an_untested_version_is_one_warning() {
         let system = with_harnesses(with_git(FakeSystem::default()))
@@ -2418,13 +2472,17 @@ mod tests {
                 CLAUDE_STATUS,
                 Answer::Exit(1, r#"{"loggedIn": false, "authMethod": "none"}"#, ""),
             )
+            .answer(
+                "codex --version",
+                Answer::Exit(0, "codex-cli 0.155.0\n", ""),
+            )
             .answer(CODEX_STATUS, Answer::Exit(1, "", "Not logged in\n"));
         let report = run(&system, &no_config());
         let codex = line(&report, "codex");
         assert_eq!(codex.status, Status::Warn);
         assert_eq!(
             codex.detail,
-            "0.154.0 (/fake/bin/codex), not logged in; no version tested with Owlshift yet"
+            "0.155.0 (/fake/bin/codex), not logged in; version not tested with Owlshift"
         );
         assert_eq!(codex.fix, []);
 

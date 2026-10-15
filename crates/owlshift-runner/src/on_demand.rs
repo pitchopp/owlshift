@@ -5463,6 +5463,7 @@ mod tests {
             stderr_log: PathBuf::from("stderr.log"),
             log_error: None,
             gate: None,
+            warnings: Vec::new(),
         }
     }
 

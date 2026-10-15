@@ -42,6 +42,19 @@ pub trait System {
     fn data_dir(&self) -> Option<(PathBuf, DataDirSource)> {
         owlshift_platform::paths::data_dir_and_source()
     }
+    /// The file a Codex agent run copies its login from (OWL-299), as
+    /// `executor::codex::user_login` resolves it: `auth.json` in
+    /// `CODEX_HOME`, or in `~/.codex`.
+    fn codex_login_file(&self) -> Option<PathBuf> {
+        crate::executor::codex::login_file(
+            std::env::var_os("CODEX_HOME").as_deref(),
+            self.home().as_deref(),
+        )
+    }
+    /// Whether `path` is a regular file, links followed.
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
     /// Whether agent runs can be confined here (OWL-41).
     fn sandbox(&self) -> Result<(), SandboxError> {
         owlshift_platform::sandbox::available()
@@ -264,6 +277,8 @@ pub(crate) mod fake {
         /// What reading the project's ticket refs gives; `None`: no
         /// dedicated checkout.
         ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
+        /// Files that are not there; every other one is.
+        missing_files: Vec<PathBuf>,
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
@@ -273,6 +288,12 @@ pub(crate) mod fake {
     }
 
     impl FakeSystem {
+        /// There is no file at `path`.
+        pub(crate) fn without_file(mut self, path: &str) -> Self {
+            self.missing_files.push(PathBuf::from(path));
+            self
+        }
+
         /// Agent runs cannot be confined, for this reason.
         pub(crate) fn no_sandbox(mut self, error: SandboxError) -> Self {
             self.sandbox = Some(error);
@@ -418,6 +439,14 @@ pub(crate) mod fake {
 
         fn home(&self) -> Option<PathBuf> {
             Some(PathBuf::from("/home/ada"))
+        }
+
+        fn codex_login_file(&self) -> Option<PathBuf> {
+            Some(PathBuf::from("/home/ada/.codex/auth.json"))
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            !self.missing_files.iter().any(|missing| missing == path)
         }
 
         fn data_dir(&self) -> Option<(PathBuf, DataDirSource)> {

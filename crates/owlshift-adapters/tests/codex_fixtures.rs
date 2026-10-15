@@ -1,6 +1,6 @@
-//! Checks on the Codex recordings in `fixtures/codex/`, which the Codex
-//! harness adapter's contract tests (OWL-299) replay. There is no Codex
-//! adapter yet: these tests read the recordings, never a harness.
+//! Checks on the Codex recordings in `fixtures/codex/`, and the Codex
+//! harness adapter's contract tests (OWL-299), which replay them through
+//! `harness::codex::Transcript`.
 //!
 //! The recordings were made on 2026-10-15 with codex-cli 0.154.0 for checks
 //! C2 and C7 (Codex), by a throwaway script whose runs and results are in
@@ -15,8 +15,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use owlshift_adapters::harness::codex::{Failure, Outcome, Run, Transcript};
+use owlshift_adapters::harness::tested;
+use owlshift_contracts::Harness;
+
 /// Every recording, so that one added without its checks fails here.
-const FIXTURES: [&str; 12] = [
+const FIXTURES: [&str; 13] = [
     "success",
     "write_refused",
     "nested_sandbox",
@@ -29,6 +33,7 @@ const FIXTURES: [&str; 12] = [
     "usage_limit",
     "logged_out",
     "codex_home_read_only",
+    "critic",
 ];
 
 /// The one id left in the recordings, where each thread id was.
@@ -82,7 +87,13 @@ fn every_recording_is_a_stream_of_typed_events_with_its_record() {
     for name in FIXTURES {
         events(name);
         let meta = meta(name);
-        assert_eq!(meta["codex_version"], "0.154.0", "{name}");
+        // A recording's version is a tested one: re-recording with a new
+        // release makes `tested.rs` follow.
+        let version = meta["codex_version"].as_str().unwrap();
+        assert!(
+            tested::is_tested(Harness::Codex, version),
+            "{name}: Codex {version} is missing from harness/tested.rs"
+        );
         assert!(meta["exit_status"].is_i64(), "{name}");
         assert!(
             meta["platform"] == "macos" || meta["platform"] == "linux",
@@ -110,6 +121,100 @@ fn a_run_fails_exactly_when_its_stream_ends_in_turn_failed_or_is_empty() {
         if !failed {
             assert_eq!(last, Some("turn.completed"), "{name}");
         }
+    }
+}
+
+/// Replays a recording through the adapter's transcript, with its recorded
+/// exit status.
+fn replay(name: &str) -> Run {
+    let mut transcript = Transcript::default();
+    for line in read(&format!("{name}.jsonl")).lines() {
+        transcript.feed(line.as_bytes());
+    }
+    let exit = meta(name)["exit_status"].as_i64().unwrap();
+    transcript.finish(Some(i32::try_from(exit).unwrap()), Vec::new())
+}
+
+/// How the adapter classifies each recording. That the exit status agrees
+/// with the stream is pinned above; this is what the runner is told.
+#[test]
+fn the_adapter_reads_each_recording_as_the_checks_found_it() {
+    for name in ["success", "nested_sandbox"] {
+        assert_eq!(
+            replay(name).outcome,
+            Outcome::Completed { text: "OK".into() },
+            "{name}"
+        );
+    }
+    for name in ["write_refused", "rules_rejected"] {
+        assert!(
+            matches!(replay(name).outcome, Outcome::Completed { .. }),
+            "{name}"
+        );
+    }
+    // The last agent message is what `-o` wrote.
+    let schema = replay("output_schema");
+    assert_eq!(
+        schema.outcome,
+        Outcome::Completed {
+            text: meta("output_schema")["output_last_message"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    );
+    let usage = replay("success").usage.unwrap();
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cache_read_input_tokens,
+            usage.output_tokens
+        ),
+        (13725 - 11520, 11520, 21)
+    );
+
+    for (name, status) in [
+        ("invalid_schema", 400),
+        ("unsupported_effort", 400),
+        ("unknown_effort", 400),
+        ("unknown_model", 400),
+        ("logged_out", 401),
+    ] {
+        let run = replay(name);
+        assert!(
+            matches!(
+                &run.outcome,
+                Outcome::Failed(Failure::Error {
+                    exit_code: Some(1),
+                    api_status: Some(found),
+                    message: Some(_),
+                }) if *found == status
+            ),
+            "{name}: {:?}",
+            run.outcome
+        );
+        assert_eq!(run.usage, None, "{name}");
+    }
+    assert_eq!(replay("usage_limit").outcome, Outcome::UsageLimit);
+
+    // The live critic run of `owlshift-testkit/tests/codex_live.rs` (OWL-299):
+    // the adapter's own command line, confined; its last message is the
+    // result the runner validated.
+    let critic = replay("critic");
+    let Outcome::Completed { text } = &critic.outcome else {
+        panic!("{:?}", critic.outcome);
+    };
+    assert_eq!(
+        text,
+        meta("critic")["output_last_message"].as_str().unwrap()
+    );
+    assert!(critic.usage.is_some());
+    assert_eq!(
+        replay("codex_home_read_only").outcome,
+        Outcome::Failed(Failure::NoThread)
+    );
+    for name in FIXTURES {
+        assert_eq!(replay(name).malformed_lines, 0, "{name}");
     }
 }
 
