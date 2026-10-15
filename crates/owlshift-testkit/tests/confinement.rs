@@ -790,6 +790,10 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"cached_input_tokens
 /// holds only a copy of the user's login, whose tokens never reach the logs;
 /// its result comes from its last message, never from a file its shell
 /// wrote; and a login it refreshed for the same account is written back.
+/// OWL-132: the user's `CODEX_HOME` and its `.env`, which Codex reads
+/// whatever its flags and which can name the proxy a run uses, are out of
+/// the run's reach, read or written, and the `.env` the run writes in its
+/// own home goes with it.
 #[cfg(unix)]
 #[test]
 fn a_codex_run_gets_its_own_home_and_its_result_from_its_last_message() {
@@ -800,10 +804,16 @@ fn a_codex_run_gets_its_own_home_and_its_result_from_its_last_message() {
         return;
     }
     let refreshed = codex_login("acct-1", "access-NEW_owl299");
+    let proxy = "HTTPS_PROXY=http://127.0.0.1:9";
     let script = format!(
-        "printf '%s' '{refreshed}' > \"$CODEX_HOME/auth.json\"\nprintf '%s' '{CRITIC_MESSAGE}' > \"$out\""
+        "printf '%s' '{refreshed}' > \"$CODEX_HOME/auth.json\"\nprintf '%s' '{CRITIC_MESSAGE}' > \"$out\"
+cat \"$HOME/.codex/.env\" > /dev/null 2>&1; echo \"user_env_read=$?\" >&2
+echo '{proxy}' > \"$HOME/.codex/.env\" 2> /dev/null; echo \"user_env_write=$?\" >&2
+echo '{proxy}' > \"$CODEX_HOME/.env\"; echo \"own_env_write=$?\" >&2"
     );
     let harness = fake_codex(&bench, &script);
+    let user_env = harness.login.with_file_name(".env");
+    fs::write(&user_env, "OWL132=user\n").unwrap();
     let report = bench.run_brief(agent, &harness, &review_brief()).unwrap();
     let Outcome::Finished { result, .. } = &report.outcome else {
         panic!("{:?}", report.outcome);
@@ -814,6 +824,10 @@ fn a_codex_run_gets_its_own_home_and_its_result_from_its_last_message() {
     let stderr = fs::read_to_string(&report.stderr_log).unwrap();
     assert!(stderr.contains("home=auth.json \n"), "{stderr}");
     assert!(!stderr.contains("the user's"), "{stderr}");
+    assert!(!stderr.contains("user_env_read=0"), "{stderr}");
+    assert!(!stderr.contains("user_env_write=0"), "{stderr}");
+    assert!(stderr.contains("own_env_write=0"), "{stderr}");
+    assert_eq!(fs::read_to_string(&user_env).unwrap(), "OWL132=user\n");
     let stdout = fs::read_to_string(&report.stdout_log).unwrap();
     assert!(!stdout.contains("SENTINEL"), "{stdout}");
     assert!(stdout.contains("<redacted>"), "{stdout}");

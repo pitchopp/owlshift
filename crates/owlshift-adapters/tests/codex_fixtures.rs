@@ -13,7 +13,9 @@
 //!
 //! `trusted_repo_mcp` and its control were recorded for OWL-131 against a
 //! local stand-in for the model, with the adapter's own command line; their
-//! records say how (build plan, OWL-130's entry).
+//! records say how (build plan, OWL-130's entry). `apps_disabled` and its
+//! control were recorded for OWL-132 on 2026-10-16 by
+//! `owlshift-testkit/tests/codex_live.rs`, on a ChatGPT login.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +27,7 @@ use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::{Harness, Role};
 
 /// Every recording, so that one added without its checks fails here.
-const FIXTURES: [&str; 15] = [
+const FIXTURES: [&str; 17] = [
     "success",
     "write_refused",
     "nested_sandbox",
@@ -41,6 +43,8 @@ const FIXTURES: [&str; 15] = [
     "critic",
     "trusted_repo_mcp",
     "trusted_repo_mcp_control",
+    "apps_disabled",
+    "apps_disabled_control",
 ];
 
 /// The one id left in the recordings, where each thread id was.
@@ -205,10 +209,17 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
     assert_eq!(replay("usage_limit").outcome, Outcome::UsageLimit);
 
     // The live critic run of `owlshift-testkit/tests/codex_live.rs` (OWL-299):
-    // the adapter's command line of then, before OWL-131's two `-c`,
-    // confined; its last message is the result the runner validated. The
-    // stand-in runs of OWL-131 end the same way, with the MCP call or not.
-    for name in ["critic", "trusted_repo_mcp", "trusted_repo_mcp_control"] {
+    // the adapter's command line of then, before OWL-131's two `-c` and
+    // OWL-132's `--disable apps`, confined; its last message is the result
+    // the runner validated. The stand-in runs of OWL-131 and the live
+    // apps-server runs of OWL-132 end the same way.
+    for name in [
+        "critic",
+        "trusted_repo_mcp",
+        "trusted_repo_mcp_control",
+        "apps_disabled",
+        "apps_disabled_control",
+    ] {
         let run = replay(name);
         let Outcome::Completed { text } = &run.outcome else {
             panic!("{name}: {:?}", run.outcome);
@@ -229,25 +240,13 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
     }
 }
 
-/// OWL-131 (decision D1 of OWL-130): a repository the user's Codex trusts
-/// starts no MCP server in a critic run, and neither does the user's own
-/// configuration. Both recordings ran in a linked worktree of a repository
-/// whose `.codex/config.toml` declares the server `probe`, with a
-/// `CODEX_HOME` whose `config.toml` trusts it and declares `userprobe`; a
-/// local stand-in for the model called `probe`'s tool `ping` in both.
-/// Without `--ignore-user-config` both servers started and the call reached
-/// `probe`; on the adapter's command line neither started and Codex refused
-/// the call, so no MCP item reached the stream.
-///
-/// The recorded command line is `command()`'s, so a change to the adapter's
-/// flags fails here until the pair is recorded again; the unit test in
-/// `harness/codex.rs` is where the flags are read.
-#[test]
-fn a_trusted_repository_starts_no_mcp_server_in_a_critic_run() {
+/// The adapter's command line for a critic run at `effort`, with the run's
+/// files named by the placeholders the recordings use.
+fn adapter_argv(effort: Option<codex::Effort>) -> Vec<String> {
     let request = codex::Request {
         workdir: PathBuf::from("<worktree>"),
         model: None,
-        effort: None,
+        effort,
         role: Role::Verify,
         permissions: Permissions {
             level: PermissionLevel::ReadOnly,
@@ -258,29 +257,111 @@ fn a_trusted_repository_starts_no_mcp_server_in_a_critic_run() {
         last_message_file: PathBuf::from("<run-files>/last-message.json"),
     };
     let command = codex::command(Path::new("codex"), &request).unwrap();
-    let mut adapter = vec!["codex".to_owned()];
-    adapter.extend(
-        command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned()),
-    );
-    let argv = |name: &str| -> Vec<String> {
-        meta(name)["argv"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|arg| arg.as_str().unwrap().to_owned())
-            .collect()
-    };
-    assert_eq!(argv("trusted_repo_mcp"), adapter);
-    assert!(adapter.iter().any(|arg| arg == "--ignore-user-config"));
-    // The control differs by that flag alone.
-    let without: Vec<String> = adapter
+    std::iter::once("codex".to_owned())
+        .chain(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        )
+        .collect()
+}
+
+/// `argv` without the one run of arguments `cut`, which it must hold.
+fn without(argv: &[String], cut: &[&str]) -> Vec<String> {
+    let at = argv
+        .windows(cut.len())
+        .position(|run| run == cut)
+        .unwrap_or_else(|| panic!("{argv:?} lacks {cut:?}"));
+    let mut kept = argv.to_vec();
+    kept.drain(at..at + cut.len());
+    kept
+}
+
+fn recorded_argv(name: &str) -> Vec<String> {
+    meta(name)["argv"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|arg| *arg != "--ignore-user-config")
-        .cloned()
-        .collect();
-    assert_eq!(argv("trusted_repo_mcp_control"), without);
+        .map(|arg| arg.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// OWL-132: on a ChatGPT login, the ChatGPT apps server offers the model
+/// MCP resource tools and `request_plugin_install`; on the adapter's command
+/// line, which passes `--disable apps`, it offers none of them. Both runs
+/// asked the model to give, as its result's summary, the names of the tools
+/// it can call; the control's command line differs by that flag alone, and
+/// the adapter's is `command()`'s, so a change to its flags fails here until
+/// the pair is recorded again.
+#[test]
+fn the_apps_server_offers_a_critic_run_no_tool() {
+    let adapter = adapter_argv(Some(codex::Effort::Low));
+    assert_eq!(recorded_argv("apps_disabled"), adapter);
+    assert_eq!(
+        recorded_argv("apps_disabled_control"),
+        without(&adapter, &["--disable", "apps"])
+    );
+    let tools = |name: &str| -> Vec<String> {
+        let message = meta(name)["output_last_message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let result: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(result["status"], "done", "{name}");
+        let names: Vec<String> = serde_json::from_str(result["summary"].as_str().unwrap())
+            .unwrap_or_else(|e| panic!("{name}: the summary lists no names: {e}"));
+        // The run's own shell tool, so an empty or unrelated list fails.
+        assert!(
+            names.iter().any(|tool| tool.ends_with("exec_command")),
+            "{name}: {names:?}"
+        );
+        names
+    };
+    let offered = |names: &[String], tool: &str| {
+        names
+            .iter()
+            .any(|name| name.rsplit('.').next() == Some(tool))
+    };
+    let (adapter, control) = (tools("apps_disabled"), tools("apps_disabled_control"));
+    for tool in [
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "read_mcp_resource",
+        "request_plugin_install",
+    ] {
+        assert!(
+            offered(&control, tool),
+            "the control lacks {tool}: {control:?}"
+        );
+        assert!(
+            !offered(&adapter, tool),
+            "the adapter offers {tool}: {adapter:?}"
+        );
+    }
+}
+
+/// OWL-131 (decision D1 of OWL-130): a repository the user's Codex trusts
+/// starts no MCP server in a critic run, and neither does the user's own
+/// configuration. Both recordings ran in a linked worktree of a repository
+/// whose `.codex/config.toml` declares the server `probe`, with a
+/// `CODEX_HOME` whose `config.toml` trusts it and declares `userprobe`; a
+/// local stand-in for the model called `probe`'s tool `ping` in both.
+/// Without `--ignore-user-config` both servers started and the call reached
+/// `probe`; on the adapter's command line neither started and Codex refused
+/// the call, so no MCP item reached the stream.
+///
+/// The recorded command line is `command()`'s but for `--disable apps`,
+/// which OWL-132 added after it: the pair ran logged out, where Codex opens
+/// no apps server. A change to the adapter's other flags fails here until
+/// the pair is recorded again; the unit test in `harness/codex.rs` is where
+/// the flags are read.
+#[test]
+fn a_trusted_repository_starts_no_mcp_server_in_a_critic_run() {
+    let adapter = without(&adapter_argv(None), &["--disable", "apps"]);
+    assert_eq!(recorded_argv("trusted_repo_mcp"), adapter);
+    // The control differs by `--ignore-user-config` alone.
+    let control = without(&adapter, &["--ignore-user-config"]);
+    assert_eq!(recorded_argv("trusted_repo_mcp_control"), control);
 
     let mcp_items = |name: &str| -> Vec<Value> {
         events(name)
