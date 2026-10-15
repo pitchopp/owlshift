@@ -2,7 +2,7 @@
 //! runner and the test harness use it.
 
 use owlshift_core::floor::{Action, HumanApproval, check_action};
-use owlshift_core::gate::{GatePolicy, Route};
+use owlshift_core::gate::{GatePolicy, PlanGate, Route};
 use owlshift_core::resource::Resource;
 use owlshift_core::review::{Standing, settle};
 use owlshift_core::roster::roster;
@@ -13,10 +13,16 @@ use owlshift_core::vocab::{PlanApproval, Priority, Severity, Stage, Variant};
 
 /// Applies an event the ticket must accept, and returns its new state.
 fn step(ticket: &mut Ticket<String>, event: Event) -> Transition {
-    let transition = ticket
-        .state
-        .apply(ticket.pipeline(), event)
-        .unwrap_or_else(|error| panic!("{error}"));
+    step_with(ticket, event, None)
+}
+
+/// As [`step`], with the plan gate of the ticket's current plan.
+fn step_with(ticket: &mut Ticket<String>, event: Event, gate: Option<PlanGate>) -> Transition {
+    let transition = match gate {
+        None => ticket.state.apply(ticket.pipeline(), event),
+        Some(gate) => ticket.state.apply_gated(ticket.pipeline(), event, gate),
+    }
+    .unwrap_or_else(|error| panic!("{error}"));
     match transition {
         Transition::To(state) | Transition::Parked { state, .. } => ticket.state = state,
         Transition::Finished(_) => {}
@@ -99,7 +105,6 @@ fn a_standard_ticket_from_admission_to_merge() {
         )
         .expect("a review stage")
         .outcome
-        .event()
     };
     let major = Standing {
         severity: Severity::Major,
@@ -109,11 +114,11 @@ fn a_standard_ticket_from_admission_to_merge() {
         severity: Severity::Minor,
         on_criterion: false,
     };
-    let event = pass(&ticket, &[minor]);
+    let event = pass(&ticket, &[minor]).event();
     step(&mut ticket, event);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
     step(&mut ticket, Event::Completed);
-    let event = pass(&ticket, &[major]);
+    let event = pass(&ticket, &[major]).event();
     step(&mut ticket, event);
     assert_eq!(
         ticket.state.status(),
@@ -123,12 +128,30 @@ fn a_standard_ticket_from_admission_to_merge() {
     );
     step(&mut ticket, Event::Answered);
     step(&mut ticket, Event::Completed);
-    let event = pass(&ticket, &[minor]);
-    // The plan approval of a forked plan comes on top (OWL-32).
-    assert!(policy.plan_approval_required(ticket.pipeline(), true));
+    // The plan names a fork, so under `on-fork` the decider approves it
+    // before Build (OWL-32): the passed pass opens the approval round, and
+    // the design run that answers it `approved` takes the plan to Build.
+    let plan = "the plan's hash";
+    let unapproved = policy.plan_gate(ticket.pipeline(), true, plan, None);
+    assert!(
+        ticket
+            .state
+            .apply(ticket.pipeline(), Event::Completed)
+            .is_err()
+    );
+    let event = pass(&ticket, &[minor]).design_review_event(unapproved);
     step(&mut ticket, event);
+    assert_eq!(
+        ticket.state.status(),
+        Status::NeedsInput {
+            return_to: Stage::Design
+        }
+    );
+    step(&mut ticket, Event::Answered);
+    let approved = policy.plan_gate(ticket.pipeline(), true, plan, Some(plan));
+    step_with(&mut ticket, Event::PlanApproved, Some(approved));
     assert_eq!(ticket.state.status(), Status::Active(Stage::Build));
-    assert_eq!(ticket.state.round(), 2);
+    assert_eq!(ticket.state.round(), 3);
     assert_eq!(ticket.state.review_passes(), 0);
 
     // A failed run and a usage-limit interruption, then Build passes.

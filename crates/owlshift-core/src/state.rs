@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use crate::gate::PlanGate;
 use crate::pipeline::Pipeline;
 use crate::vocab::{AnswerClass, Stage};
 
@@ -127,11 +128,12 @@ impl Status {
 /// | Observed | Event |
 /// | --- | --- |
 /// | The scheduler claimed a ready ticket | `Dispatched` |
-/// | A stage run returned `done`, and the stage passed | `Completed` |
+/// | A stage run returned `done`, and the stage passed; at Design review, with the plan gate open ([`TicketState::apply_gated`]) | `Completed` |
 /// | A stage run returned `done` asking for a revision or a fix; a review pass before the last left confirmed findings ([`crate::review::settle`]); at Watch, review comments on the pull request (from P5) | `LoopBack` |
-/// | A stage run returned `questions` or `premise_false` (after the resolver); the last review pass left findings for the decider | `Questions` |
+/// | A stage run returned `questions` or `premise_false` (after the resolver); the last review pass left findings for the decider; a Design review pass passed with the plan gate shut, the approval round (OWL-32) | `Questions` |
 /// | A Build run asked a `replan`, and a round opens for its questions, the `replan` asked or decided (after the resolver) | `ReplanRound` |
 /// | A Build run asked a `replan`, and the resolver decided every question of the run | `ReplanDecided` |
+/// | A design run answered an approval round `approved`, and the runner kept the approval | `PlanApproved` |
 /// | A stage run returned `blocked` | `Blocked` |
 /// | The answer check found every question answered | `Answered` |
 /// | The answer check found questions left open (they are re-asked) | `Incomplete` |
@@ -175,6 +177,14 @@ pub enum Event {
     /// questions, so no round opens: the ticket goes to
     /// [`Pipeline::replan`] at once. Valid only at Build.
     ReplanDecided,
+    /// A design run answered an approval round `approved` (OWL-32): the
+    /// plan stays as it was and the ticket goes to Build. Valid only at
+    /// Design after a review pass of the loop, which the approval round's
+    /// [`Event::Questions`] at Design review always ends, and only with a
+    /// plan gate that required the approval and holds it
+    /// ([`TicketState::apply_gated`]); so a Design back from a `replan`, or
+    /// one revising its plan, never skips the review.
+    PlanApproved,
     Blocked,
     Answered,
     Incomplete,
@@ -234,13 +244,14 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
         Self::Questions,
         Self::ReplanRound,
         Self::ReplanDecided,
+        Self::PlanApproved,
         Self::Blocked,
         Self::Answered,
         Self::Incomplete,
@@ -516,11 +527,75 @@ impl TicketState {
     /// A human merge or withdrawal ends the ticket from any state. Every other
     /// event is valid only in some states (see [`Event`]); elsewhere, and for a
     /// question round past `u32::MAX`, it is an [`InvalidTransition`].
+    ///
+    /// Entering Build from Design or Design review takes the plan gate, in
+    /// a pipeline with Design review: there it is refused here and made by
+    /// [`TicketState::apply_gated`]. A `trivial` pipeline has no plan to
+    /// approve, so a ticket whose variant changed while it was at Design
+    /// moves on without one; [`Event::PlanApproved`] always takes it.
     pub fn apply(&self, pipeline: Pipeline, event: Event) -> Result<Transition, InvalidTransition> {
+        self.step(pipeline, event, None)
+    }
+
+    /// Applies an event as [`TicketState::apply`] does, with the plan gate
+    /// of the ticket's current plan ([`crate::gate::GatePolicy::plan_gate`],
+    /// OWL-32). The gate bears only on entering Build from Design or Design
+    /// review: [`Event::Completed`] at Design review needs it open, and
+    /// [`Event::PlanApproved`] needs it to require the approval and hold
+    /// it. So when approval is required, Build is never entered on a plan
+    /// whose hash is not the approved one. Every other move is
+    /// [`TicketState::apply`]'s.
+    pub fn apply_gated(
+        &self,
+        pipeline: Pipeline,
+        event: Event,
+        gate: PlanGate,
+    ) -> Result<Transition, InvalidTransition> {
+        self.step(pipeline, event, Some(gate))
+    }
+
+    fn step(
+        &self,
+        pipeline: Pipeline,
+        event: Event,
+        gate: Option<PlanGate>,
+    ) -> Result<Transition, InvalidTransition> {
         let invalid = InvalidTransition {
             from: self.status,
             event,
         };
+        let transition = self.transition(pipeline, event, invalid)?;
+        let from_design = matches!(
+            self.status,
+            Status::Active(Stage::Design | Stage::DesignReview)
+        );
+        let to_build = matches!(
+            transition,
+            Transition::To(Self {
+                status: Status::Active(Stage::Build),
+                ..
+            })
+        );
+        if from_design && to_build {
+            let passes = match (event, gate) {
+                (Event::PlanApproved, gate) => gate.is_some_and(|g| g.required() && g.approved()),
+                (_, Some(gate)) => gate.is_open(),
+                (_, None) => !pipeline.contains(Stage::DesignReview),
+            };
+            if !passes {
+                return Err(invalid);
+            }
+        }
+        Ok(transition)
+    }
+
+    /// The transition table, before the plan gate.
+    fn transition(
+        &self,
+        pipeline: Pipeline,
+        event: Event,
+        invalid: InvalidTransition,
+    ) -> Result<Transition, InvalidTransition> {
         let transition = match (self.status, event) {
             (_, Event::Merged) => Transition::Finished(Finish::Merged),
             (_, Event::Withdrawn) => Transition::Finished(Finish::Withdrawn),
@@ -571,6 +646,10 @@ impl TicketState {
             }
             (Status::Active(Stage::Build), Event::ReplanDecided) => {
                 Transition::To(self.enter(Status::Active(pipeline.replan())))
+            }
+            // The plan gate is checked on top ([`TicketState::step`]).
+            (Status::Active(Stage::Design), Event::PlanApproved) if self.review_passes > 0 => {
+                Transition::To(self.enter(Status::Active(Stage::Build)))
             }
             (Status::Active(stage), Event::Blocked) if stage != Stage::Ready => {
                 self.park(ParkReason::Blocked, self.failed_runs)
@@ -824,9 +903,52 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
 
     use super::*;
-    use crate::vocab::Variant;
+    use crate::gate::GatePolicy;
+    use crate::vocab::{PlanApproval, Variant};
 
     const STANDARD: Pipeline = Pipeline::new(Variant::Standard);
+    const RISKY: Pipeline = Pipeline::new(Variant::Risky);
+
+    /// A plan's hash, and another's.
+    const PLAN: &str = "plan";
+    const OTHER_PLAN: &str = "other plan";
+
+    /// A gate requiring no approval: a standard plan under `never`.
+    fn not_required() -> PlanGate {
+        GatePolicy::new(Vec::<String>::new(), PlanApproval::Never)
+            .plan_gate(STANDARD, true, PLAN, None)
+    }
+
+    /// A risky plan's gate, with the approval of `kept`, if any.
+    fn risky_gate(kept: Option<&str>) -> PlanGate {
+        GatePolicy::new(Vec::<String>::new(), PlanApproval::Never)
+            .plan_gate(RISKY, false, PLAN, kept)
+    }
+
+    /// Every state reachable from admission in `pipeline`, each event
+    /// applied without a gate and with each of `gates`, with question rounds
+    /// bounded at three: past that, only the round counter grows.
+    fn reachable(pipeline: Pipeline, gates: &[PlanGate]) -> HashSet<TicketState> {
+        let mut seen = HashSet::from([TicketState::admitted()]);
+        let mut queue = VecDeque::from([TicketState::admitted()]);
+        while let Some(current) = queue.pop_front() {
+            for event in Event::ALL {
+                let gated = gates
+                    .iter()
+                    .map(|&gate| current.apply_gated(pipeline, event, gate));
+                for transition in std::iter::once(current.apply(pipeline, event)).chain(gated) {
+                    let next = match transition {
+                        Ok(Transition::To(next) | Transition::Parked { state: next, .. }) => next,
+                        Ok(Transition::Finished(_)) | Err(_) => continue,
+                    };
+                    if next.round() <= 3 && seen.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        seen
+    }
 
     /// Every status, valid or not.
     fn all_statuses() -> Vec<Status> {
@@ -894,7 +1016,8 @@ mod tests {
             (Status::Active(Ready), Event::Dispatched) => Expect::To(Status::Active(Design)),
             (Status::Active(Intake), Event::Completed) => Expect::To(Status::Active(Ready)),
             (Status::Active(Design), Event::Completed) => Expect::To(Status::Active(DesignReview)),
-            (Status::Active(DesignReview), Event::Completed) => Expect::To(Status::Active(Build)),
+            // Design review to Build takes the plan gate (OWL-32), which
+            // `apply` has not: see `the_design_loop_enters_build_only_through_the_plan_gate`.
             (Status::Active(Build), Event::Completed) => Expect::To(Status::Active(Verify)),
             (Status::Active(Verify), Event::Completed) => Expect::To(Status::Active(Deliver)),
             (Status::Active(Deliver), Event::Completed) => Expect::To(Status::Active(Watch)),
@@ -1470,19 +1593,7 @@ mod tests {
 
     #[test]
     fn every_reachable_state_can_be_restored() {
-        let mut seen = HashSet::from([TicketState::admitted()]);
-        let mut queue = VecDeque::from([TicketState::admitted()]);
-        while let Some(current) = queue.pop_front() {
-            for event in Event::ALL {
-                let next = match current.apply(STANDARD, event) {
-                    Ok(Transition::To(next) | Transition::Parked { state: next, .. }) => next,
-                    Ok(Transition::Finished(_)) | Err(_) => continue,
-                };
-                if next.round() <= 3 && seen.insert(next) {
-                    queue.push_back(next);
-                }
-            }
-        }
+        let seen = reachable(STANDARD, &[risky_gate(Some(PLAN))]);
         // The round cap bounds the review passes too: past the last pass
         // only a round, which counts, ends another.
         //
@@ -1637,8 +1748,9 @@ mod tests {
                 3
             )
         );
+        assert!(third.apply(STANDARD, Completed).is_err(), "no plan gate");
         assert_eq!(
-            at(walk(third, STANDARD, &[Completed])),
+            at(to(third.apply_gated(STANDARD, Completed, not_required()))),
             (Status::Active(Stage::Build), 0)
         );
     }
@@ -1761,5 +1873,216 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// The (state, event) table of the design loop's states, with each
+    /// review pass count a ticket has there and each plan gate (OWL-32):
+    /// none, approval not required, required and not given, required and
+    /// given. Completing Design review needs the gate open; `PlanApproved`
+    /// needs a review pass of the loop behind it and a gate that required
+    /// the approval and holds it; every other move is the table's.
+    #[test]
+    fn the_design_loop_enters_build_only_through_the_plan_gate() {
+        use Stage::{Design, DesignReview};
+        let gates = [
+            None,
+            Some(not_required()),
+            Some(risky_gate(None)),
+            Some(risky_gate(Some(OTHER_PLAN))),
+            Some(risky_gate(Some(PLAN))),
+        ];
+        let expect = |status: Status, passes: u32, event: Event, gate: Option<PlanGate>| {
+            let to_build = Expect::To(Status::Active(Stage::Build));
+            match (status, event) {
+                (Status::Active(DesignReview), Event::Completed) => {
+                    if gate.is_some_and(PlanGate::is_open) {
+                        to_build
+                    } else {
+                        Expect::Invalid
+                    }
+                }
+                (Status::Active(Design), Event::PlanApproved) => {
+                    if passes > 0 && gate.is_some_and(|g| g.required() && g.approved()) {
+                        to_build
+                    } else {
+                        Expect::Invalid
+                    }
+                }
+                // A last pass is never sent back.
+                (Status::Active(DesignReview), Event::LoopBack)
+                    if is_last_review_pass(passes + 1) =>
+                {
+                    Expect::Invalid
+                }
+                _ => expected(status, event),
+            }
+        };
+        for status in [Status::Active(Design), Status::Active(DesignReview)] {
+            for passes in 0..=MAX_REVIEW_PASSES {
+                let state = baseline(status)
+                    .and_then(|s| s.with_review_passes(passes).ok())
+                    .expect("a valid state");
+                for event in Event::ALL {
+                    for gate in gates {
+                        let applied = match gate {
+                            None => state.apply(STANDARD, event),
+                            Some(gate) => state.apply_gated(STANDARD, event, gate),
+                        };
+                        let actual = match applied {
+                            Err(_) => Expect::Invalid,
+                            Ok(Transition::To(next)) => Expect::To(next.status()),
+                            Ok(Transition::Parked { state, reason }) => {
+                                Expect::Parked(state.status(), reason)
+                            }
+                            Ok(Transition::Finished(finish)) => Expect::Finished(finish),
+                        };
+                        assert_eq!(
+                            actual,
+                            expect(status, passes, event, gate),
+                            "{status:?} with {passes} passes + {event:?}, gate {gate:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Outside the design loop the gate changes nothing.
+        let states: Vec<_> = all_statuses().into_iter().filter_map(baseline).collect();
+        for state in states.iter().filter(|s| {
+            !matches!(
+                s.status(),
+                Status::Active(Stage::Design | Stage::DesignReview)
+            )
+        }) {
+            for event in Event::ALL {
+                for gate in gates.into_iter().flatten() {
+                    assert_eq!(
+                        state.apply_gated(STANDARD, event, gate),
+                        state.apply(STANDARD, event),
+                        "{:?} + {event:?}",
+                        state.status()
+                    );
+                }
+            }
+        }
+
+        // `trivial` has no plan to approve: a ticket whose variant changed
+        // at Design moves on to Build without a gate, but never by an
+        // approval.
+        let trivial = Pipeline::new(Variant::Trivial);
+        let design = state(Status::Active(Design), 1, 0, 0)
+            .with_review_passes(1)
+            .expect("passes at Design");
+        assert_eq!(
+            to(design.apply(trivial, Event::Completed)).status(),
+            Status::Active(Stage::Build)
+        );
+        assert!(design.apply(trivial, Event::PlanApproved).is_err());
+    }
+
+    /// A risky ticket never reaches Build, nor any stage after it, without
+    /// its plan approved: not with every event applied without a gate, nor
+    /// with a gate whose approval is missing or of another plan.
+    #[test]
+    fn a_risky_ticket_cannot_reach_build_without_an_approval() {
+        let past_design = |seen: &HashSet<TicketState>| {
+            seen.iter()
+                .filter(|s| s.stage() >= Stage::Build)
+                .map(TicketState::status)
+                .collect::<Vec<_>>()
+        };
+        let shut = reachable(RISKY, &[risky_gate(None), risky_gate(Some(OTHER_PLAN))]);
+        assert!(
+            shut.iter()
+                .any(|s| s.status() == Status::Active(Stage::DesignReview))
+        );
+        assert_eq!(past_design(&shut), Vec::new());
+        let approved = reachable(RISKY, &[risky_gate(Some(PLAN))]);
+        assert!(
+            approved
+                .iter()
+                .any(|s| s.status() == Status::Active(Stage::Build))
+        );
+    }
+
+    /// The approval round is a `Questions` at Design review on top of a
+    /// passed pass: it counts the pass and returns to Design. An approval
+    /// takes the plan to Build; a changed plan gets one more pass, a last
+    /// one, and is asked again; an approval kept for another plan opens
+    /// nothing.
+    #[test]
+    fn an_approval_round_takes_an_approved_plan_to_build_and_a_changed_one_to_review() {
+        use crate::review::PassOutcome;
+        use Event::{Answered, Completed, PlanApproved};
+        let design = state(Status::Active(Stage::Design), 1, 0, 0);
+        let reviewed = walk(design, RISKY, &[Completed]);
+        let shut = risky_gate(None);
+        assert!(reviewed.apply(RISKY, Completed).is_err());
+        assert!(reviewed.apply_gated(RISKY, Completed, shut).is_err());
+        let round = PassOutcome::Passed.design_review_event(shut);
+        let asked = walk(reviewed, RISKY, &[round]);
+        assert_eq!(
+            at(asked),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Design
+                },
+                1
+            )
+        );
+        let answering = walk(asked, RISKY, &[Answered]);
+        assert_eq!(at(answering), (Status::Active(Stage::Design), 1));
+        for gate in [shut, risky_gate(Some(OTHER_PLAN))] {
+            assert!(answering.apply_gated(RISKY, PlanApproved, gate).is_err());
+        }
+        assert!(answering.apply(RISKY, PlanApproved).is_err());
+        let approved = risky_gate(Some(PLAN));
+        assert_eq!(
+            at(to(answering.apply_gated(RISKY, PlanApproved, approved))),
+            (Status::Active(Stage::Build), 0)
+        );
+
+        // Changed: the revised plan's last pass, then the round again.
+        let last = walk(answering, RISKY, &[Completed]);
+        assert_eq!(at(last), (Status::Active(Stage::DesignReview), 1));
+        assert!(is_last_review_pass(last.review_pass_due()));
+        assert!(last.apply(RISKY, Event::LoopBack).is_err());
+        let changed = risky_gate(Some(OTHER_PLAN));
+        assert!(last.apply_gated(RISKY, Completed, changed).is_err());
+        let again = walk(
+            last,
+            RISKY,
+            &[PassOutcome::Passed.design_review_event(changed), Answered],
+        );
+        assert_eq!(at(again), (Status::Active(Stage::Design), 2));
+        assert_eq!(again.round(), 3);
+        assert_eq!(
+            at(to(again.apply_gated(RISKY, PlanApproved, approved))),
+            (Status::Active(Stage::Build), 0)
+        );
+    }
+
+    /// A plan invalidated during Build goes back to Design with no review
+    /// pass behind it: no approval takes it to Build before its new plan is
+    /// reviewed, and that plan goes through the gate as the first did.
+    #[test]
+    fn a_replanned_ticket_reaches_build_again_only_through_review_and_the_gate() {
+        use Event::{Answered, Completed, PlanApproved, ReplanRound};
+        let build = state(Status::Active(Stage::Build), 2, 0, 0);
+        let design = walk(build, RISKY, &[ReplanRound, Answered]);
+        assert_eq!(at(design), (Status::Active(Stage::Design), 0));
+        let approved = risky_gate(Some(PLAN));
+        assert!(design.apply_gated(RISKY, PlanApproved, approved).is_err());
+        let reviewed = walk(design, RISKY, &[Completed]);
+        assert!(reviewed.apply(RISKY, Completed).is_err());
+        assert!(
+            reviewed
+                .apply_gated(RISKY, Completed, risky_gate(None))
+                .is_err()
+        );
+        assert_eq!(
+            to(reviewed.apply_gated(RISKY, Completed, approved)).status(),
+            Status::Active(Stage::Build)
+        );
     }
 }

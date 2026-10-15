@@ -7,6 +7,7 @@
 //! the author did not reject it. Which findings stand is the runner's to
 //! read; what follows from them is decided here.
 
+use crate::gate::PlanGate;
 use crate::state::{Event, is_last_review_pass};
 use crate::vocab::{Severity, Stage};
 
@@ -51,13 +52,27 @@ pub enum PassOutcome {
 }
 
 impl PassOutcome {
-    /// The state machine's event for this outcome. The plan-approval gate
-    /// (OWL-32) comes on top of a passed Design review.
+    /// The state machine's event for this outcome. At Design review, the
+    /// plan-approval gate comes on top of a passed pass:
+    /// [`PassOutcome::design_review_event`].
     pub const fn event(self) -> Event {
         match self {
             Self::Passed => Event::Completed,
             Self::Revise => Event::LoopBack,
             Self::Ask => Event::Questions,
+        }
+    }
+
+    /// The event for this outcome of a Design review pass, given the plan
+    /// gate of the plan it reviewed (OWL-32): a passed pass whose gate is
+    /// shut opens the approval round, a [`Event::Questions`] straight to
+    /// the decider, which counts the pass and returns to Design; with the
+    /// gate open it completes, to Build
+    /// ([`crate::state::TicketState::apply_gated`]).
+    pub const fn design_review_event(self, gate: PlanGate) -> Event {
+        match self {
+            Self::Passed if !gate.is_open() => Event::Questions,
+            _ => self.event(),
         }
     }
 }
@@ -197,5 +212,33 @@ mod tests {
         assert_eq!(PassOutcome::Passed.event(), Event::Completed);
         assert_eq!(PassOutcome::Revise.event(), Event::LoopBack);
         assert_eq!(PassOutcome::Ask.event(), Event::Questions);
+    }
+
+    /// A passed Design review pass whose plan gate is shut opens the
+    /// approval round; the gate changes no other outcome.
+    #[test]
+    fn a_passed_design_review_with_its_gate_shut_asks_for_approval() {
+        use crate::gate::GatePolicy;
+        use crate::pipeline::Pipeline;
+        use crate::vocab::{PlanApproval, Variant};
+        let policy = GatePolicy::new(Vec::<String>::new(), PlanApproval::Never);
+        let plan = "a".repeat(64);
+        let shut = policy.plan_gate(Pipeline::new(Variant::Risky), false, &plan, None);
+        let open = policy.plan_gate(Pipeline::new(Variant::Risky), false, &plan, Some(&plan));
+        assert_eq!(
+            PassOutcome::Passed.design_review_event(shut),
+            Event::Questions
+        );
+        assert_eq!(
+            PassOutcome::Passed.design_review_event(open),
+            Event::Completed
+        );
+        for gate in [shut, open] {
+            assert_eq!(
+                PassOutcome::Revise.design_review_event(gate),
+                Event::LoopBack
+            );
+            assert_eq!(PassOutcome::Ask.design_review_event(gate), Event::Questions);
+        }
     }
 }
