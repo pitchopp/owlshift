@@ -12,7 +12,7 @@
 
 use owlshift_contracts::config::{Admit, Tracker as TrackerConfig};
 use owlshift_contracts::drain::Gesture;
-use owlshift_core::schedule::holds_slot;
+use owlshift_core::schedule::holds_slot_or_unknown;
 
 use super::*;
 use crate::ticket_ref::text_sha256;
@@ -171,8 +171,9 @@ impl OnDemand<'_> {
             .iter()
             .filter(|other| **other != p.ticket)
             .any(|other| match ticket_ref::read(git, &p.checkout, other) {
-                Ok(Some(stored)) => TicketState::try_from(&stored.record.state)
-                    .map_or(true, |state| holds_slot(&state)),
+                Ok(Some(stored)) => {
+                    holds_slot_or_unknown(TicketState::try_from(&stored.record.state).ok().as_ref())
+                }
                 Ok(None) => false,
                 Err(_) => true,
             })

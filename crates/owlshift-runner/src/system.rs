@@ -4,12 +4,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use owlshift_contracts::ids::TicketId;
 pub use owlshift_platform::paths::DataDirSource;
 pub use owlshift_platform::process::{Captured, RunError};
 #[cfg(unix)]
 pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
+use crate::ticket_ref::{self, RefState};
 pub use crate::tracker::{AppError, StatesError};
 pub use owlshift_adapters::tracker::linear::{AccountFact, AdmissionFacts, AppUser};
 
@@ -85,6 +87,27 @@ pub trait System {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| AppError::Keychain(error.to_string()))
             .and_then(|keychain| crate::tracker::linear_app_user(&keychain, team))
+    }
+    /// The ticket refs of the project whose repository is at `root`, each
+    /// with its state ([`ticket_ref::states`]), read in its dedicated
+    /// checkout as `owlshift forget` finds it, without the project's lock:
+    /// `None` when the project has no dedicated checkout yet. The error says
+    /// why they could not be read, in Owlshift's words only (OWL-291). Only
+    /// `owlshift doctor` asks.
+    fn ticket_refs(&self, root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
+        let git = crate::project::runner_git();
+        let repo = crate::on_demand::check_origin(&crate::project::origin_url(&git, root)?)?;
+        let (data_dir, _) = self
+            .data_dir()
+            .ok_or_else(|| "this system has no data directory".to_owned())?;
+        let checkout = crate::project::ProjectDirs::new(&data_dir, &repo).checkout();
+        if std::fs::symlink_metadata(&checkout).is_err() {
+            return Ok(None);
+        }
+        // git's own words stay out of the report (live check C8).
+        ticket_ref::states(&git, &checkout)
+            .map(Some)
+            .map_err(|_| "git could not list them in the dedicated checkout".to_owned())
     }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
@@ -207,6 +230,9 @@ pub(crate) mod fake {
         /// What checking the Linear app gives, both of its entries being
         /// stored; `None`: no app is stored.
         linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
+        /// What reading the project's ticket refs gives; `None`: no
+        /// dedicated checkout.
+        ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
         /// How the sentinel is; `None`: it runs.
         #[cfg(unix)]
         sentinel: Option<SentinelStatus>,
@@ -283,6 +309,15 @@ pub(crate) mod fake {
             self
         }
 
+        /// Reading the project's ticket refs gives these, or this error.
+        pub(crate) fn ticket_refs_are(
+            mut self,
+            answer: Result<Vec<(TicketId, RefState)>, String>,
+        ) -> Self {
+            self.ticket_refs = Some(answer);
+            self
+        }
+
         /// Puts a program on the fake `PATH`.
         pub(crate) fn install(mut self, program: &str) -> Self {
             self.located.insert(
@@ -341,6 +376,12 @@ pub(crate) mod fake {
 
         fn sandbox(&self) -> Result<(), SandboxError> {
             self.sandbox.clone().map_or(Ok(()), Err)
+        }
+
+        /// No dedicated checkout unless [`Self::ticket_refs_are`] gave an
+        /// answer; never git.
+        fn ticket_refs(&self, _root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
+            self.ticket_refs.clone().transpose()
         }
 
         fn secret_stored(&self, account: &str) -> Result<bool, String> {

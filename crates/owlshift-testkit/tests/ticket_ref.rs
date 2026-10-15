@@ -702,3 +702,35 @@ fn the_proposals_outlive_every_write_and_forget() {
     ticket_ref::forget(&repo.git, &repo.root, &ticket()).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().proposals, None);
 }
+
+/// OWL-291: what doctor weighs the drain's slot from, each ref with its
+/// state; one that cannot be read is kept with why, not an error of all.
+#[test]
+fn every_ticket_ref_comes_with_its_state_or_why_it_cannot_be_read() {
+    use owlshift_core::state::{Status, TicketState};
+    use owlshift_core::vocab::Stage;
+    use owlshift_runner::ticket_ref::RefState;
+
+    let repo = Repo::new();
+    assert_eq!(ticket_ref::states(&repo.git, &repo.root).unwrap(), []);
+    let verify = r#"{"format":2,"stage":"verify","round":1,"reasks":0,"failed_runs":0}"#;
+    let demo_9 = TicketId::new("DEMO-9").unwrap();
+    ticket_ref::write(&repo.git, &repo.root, &demo_9, &record(verify, 1), None).unwrap();
+    // DEMO-1's ref points to a tree, not a commit.
+    let tree = repo.git(&["write-tree"]);
+    repo.git(&["update-ref", REF, &tree]);
+
+    let states = ticket_ref::states(&repo.git, &repo.root).unwrap();
+    assert_eq!(states.len(), 2, "{states:?}");
+    let at_verify = TicketState::restore(Status::Active(Stage::Verify), 1, 0, 0, 0, 0).unwrap();
+    assert!(
+        states.contains(&(demo_9, RefState::Read(Some(at_verify)))),
+        "{states:?}"
+    );
+    assert!(
+        states
+            .iter()
+            .any(|(id, state)| *id == ticket() && matches!(state, RefState::Unread(_))),
+        "{states:?}"
+    );
+}

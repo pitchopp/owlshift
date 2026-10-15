@@ -21,15 +21,26 @@ pub struct Caps {
 }
 
 /// What is in flight now.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Load {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Load<K> {
     /// Runs in flight on this machine.
     pub runs: u32,
     /// Open pull requests awaiting review.
     pub open_prs: u32,
-    /// Whether a ticket ref of the project holds the slot ([`slot_taken`]).
-    /// The tickets given to [`ready_set`] are counted as well.
-    pub slot_taken: bool,
+    /// The tickets whose ref holds the project's slot
+    /// ([`holds_slot_or_unknown`]), in any order. [`ready_set`] adds those
+    /// of the tickets it is given whose state holds it, once each.
+    pub slot_held_by: Vec<K>,
+}
+
+impl<K> Default for Load<K> {
+    fn default() -> Self {
+        Load {
+            runs: 0,
+            open_prs: 0,
+            slot_held_by: Vec::new(),
+        }
+    }
 }
 
 /// Why an admitted ticket of the ready column is not dispatched. The variants
@@ -64,9 +75,9 @@ pub enum Wait<K> {
     BlockedBy(Vec<K>),
     /// Open pull requests awaiting review reached their cap.
     PrCap,
-    /// Another ticket of the project holds the one slot, or takes it in this
-    /// pass.
-    Slot,
+    /// These tickets of the project hold the one slot, in identifier order,
+    /// or this one takes it in this pass (OWL-291).
+    Slot(Vec<K>),
     /// Every run slot of this machine is taken.
     RunCap,
 }
@@ -88,16 +99,19 @@ impl<K> Wait<K> {
             Wait::BlockerUnknown(_) => "blocker_unknown",
             Wait::BlockedBy(_) => "blocked_by",
             Wait::PrCap => "pr_cap",
-            Wait::Slot => "slot",
+            Wait::Slot(_) => "slot",
             Wait::RunCap => "run_cap",
         }
     }
 
-    /// The tickets the reason names: the blockers that hold the ticket, none
-    /// for any other reason.
+    /// The tickets the reason names: the blockers that hold the ticket, or
+    /// the tickets that hold the slot; none for any other reason.
     pub fn tickets(&self) -> &[K] {
         match self {
-            Wait::BlockerCanceled(ids) | Wait::BlockerUnknown(ids) | Wait::BlockedBy(ids) => ids,
+            Wait::BlockerCanceled(ids)
+            | Wait::BlockerUnknown(ids)
+            | Wait::BlockedBy(ids)
+            | Wait::Slot(ids) => ids,
             _ => &[],
         }
     }
@@ -123,9 +137,11 @@ pub fn holds_slot(state: &TicketState) -> bool {
     matches!(state.status(), Status::Active(stage) if stage > Stage::Ready && stage < Stage::Watch)
 }
 
-/// Whether any of these ticket states holds the project's slot.
-pub fn slot_taken<'a>(states: impl IntoIterator<Item = &'a TicketState>) -> bool {
-    states.into_iter().any(holds_slot)
+/// Whether a ticket ref whose state reads as `state` holds the slot: one
+/// whose state does not read (`None`) counts as holding it, since nothing
+/// tells it does not.
+pub fn holds_slot_or_unknown(state: Option<&TicketState>) -> bool {
+    state.is_none_or(holds_slot)
 }
 
 /// Orders identifiers naturally: runs of digits compare as numbers, so
@@ -232,7 +248,7 @@ fn dispatchable<K>(ticket: &Ticket<K>) -> bool {
 pub fn ready_set<K: Clone + Ord + AsRef<str>>(
     tickets: &[Ticket<K>],
     caps: Caps,
-    load: Load,
+    load: Load<K>,
 ) -> ReadySet<K> {
     let mut candidates: Vec<&Ticket<K>> = tickets.iter().collect();
     candidates.sort_by(|a, b| {
@@ -245,8 +261,19 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
     let pr_cap_reached = caps.open_prs.is_some_and(|cap| load.open_prs >= cap);
     // What holds back a ticket that passed every other check: the slot, then
     // this machine's runs. Once one ticket is dispatched, the slot is taken.
-    let mut capacity = if load.slot_taken || slot_taken(tickets.iter().map(|t| &t.state)) {
-        Some(Wait::Slot)
+    // The holders the load names and those of the tickets given, which a
+    // caller may name in both.
+    let mut holders = load.slot_held_by;
+    holders.extend(
+        tickets
+            .iter()
+            .filter(|t| holds_slot(&t.state))
+            .map(|t| t.id.clone()),
+    );
+    holders.sort_by(|a, b| natural_cmp(a.as_ref(), b.as_ref()).then_with(|| a.cmp(b)));
+    holders.dedup();
+    let mut capacity = if !holders.is_empty() {
+        Some(Wait::Slot(holders))
     } else if load.runs >= caps.concurrent_runs {
         Some(Wait::RunCap)
     } else {
@@ -290,7 +317,7 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
         match wait {
             Some(wait) => ready.waiting.push((ticket.id.clone(), wait)),
             None => {
-                capacity = Some(Wait::Slot);
+                capacity = Some(Wait::Slot(vec![ticket.id.clone()]));
                 ready.dispatch = Some(ticket.id.clone());
             }
         }
@@ -307,10 +334,10 @@ mod tests {
         concurrent_runs: 10,
         open_prs: None,
     };
-    const IDLE: Load = Load {
+    const IDLE: Load<&'static str> = Load {
         runs: 0,
         open_prs: 0,
-        slot_taken: false,
+        slot_held_by: Vec::new(),
     };
 
     fn restore(status: Status, round: u32) -> TicketState {
@@ -360,7 +387,12 @@ mod tests {
         assert_eq!(ready.dispatch, Some("OWL-3"));
         let order: Vec<_> = ready.waiting.iter().map(|(id, _)| *id).collect();
         assert_eq!(order, ["OWL-11", "OWL-9", "OWL-10", "OWL-2", "OWL-1"]);
-        assert!(ready.waiting.iter().all(|(_, w)| *w == Wait::Slot));
+        assert!(
+            ready
+                .waiting
+                .iter()
+                .all(|(_, w)| *w == Wait::Slot(vec!["OWL-3"]))
+        );
     }
 
     #[test]
@@ -441,7 +473,7 @@ mod tests {
             Load {
                 runs: 1,
                 open_prs: 2,
-                slot_taken: true,
+                slot_held_by: vec!["Z-1"],
             },
         );
         assert_eq!(ready.dispatch, None);
@@ -617,22 +649,51 @@ mod tests {
         let tickets = [ticket("A", Priority::High), ticket("B", Priority::Low)];
         let ready = ready_set(&tickets, ROOMY, IDLE);
         assert_eq!(ready.dispatch, Some("A"));
-        assert_eq!(ready.waiting, [("B", Wait::Slot)]);
+        assert_eq!(ready.waiting, [("B", Wait::Slot(vec!["A"]))]);
 
         let held = Load {
-            slot_taken: true,
+            slot_held_by: vec!["X-9"],
             ..IDLE
         };
         let ready = ready_set(&tickets, ROOMY, held);
         assert_eq!(ready.dispatch, None);
-        assert_eq!(ready.waiting, [("A", Wait::Slot), ("B", Wait::Slot)]);
+        let by_x9 = || Wait::Slot(vec!["X-9"]);
+        assert_eq!(ready.waiting, [("A", by_x9()), ("B", by_x9())]);
 
         // A ticket of the column at Build holds it, whatever the load says.
         let mut building = ticket("C", Priority::Urgent);
         building.state = restore(Status::Active(Stage::Build), 1);
         let ready = ready_set(&[building, tickets[1].clone()], ROOMY, IDLE);
         assert_eq!(ready.dispatch, None);
-        assert_eq!(ready.waiting, [("C", Wait::NotReady), ("B", Wait::Slot)]);
+        assert_eq!(
+            ready.waiting,
+            [("C", Wait::NotReady), ("B", Wait::Slot(vec!["C"]))]
+        );
+    }
+
+    /// OWL-291: the holders the load names and those of the column, once
+    /// each, in identifier order.
+    #[test]
+    fn a_held_slot_names_its_holders_once_in_identifier_order() {
+        let mut verifying = ticket("X-9", Priority::Urgent);
+        verifying.state = restore(Status::Active(Stage::Verify), 1);
+        let load = Load {
+            slot_held_by: vec!["X-10", "X-9", "X-10"],
+            ..IDLE
+        };
+        let ready = ready_set(&[verifying, ticket("A", Priority::Low)], ROOMY, load);
+        assert_eq!(ready.dispatch, None);
+        assert_eq!(ready.waiting[1], ("A", Wait::Slot(vec!["X-9", "X-10"])));
+        assert_eq!(ready.waiting[1].1.tickets(), ["X-9", "X-10"]);
+    }
+
+    #[test]
+    fn a_state_that_does_not_read_holds_the_slot() {
+        assert!(holds_slot_or_unknown(None));
+        let verify = restore(Status::Active(Stage::Verify), 1);
+        assert!(holds_slot_or_unknown(Some(&verify)));
+        let ready = restore(Status::Active(Stage::Ready), 0);
+        assert!(!holds_slot_or_unknown(Some(&ready)));
     }
 
     #[test]
@@ -657,7 +718,7 @@ mod tests {
         };
         let at_cap = Load {
             open_prs: 2,
-            slot_taken: true,
+            slot_held_by: vec!["X-1"],
             ..IDLE
         };
         assert_eq!(
@@ -672,9 +733,11 @@ mod tests {
     }
 
     #[test]
-    fn a_reason_names_its_key_and_only_blockers_name_tickets() {
+    fn a_reason_names_its_key_and_only_blockers_and_the_slot_name_tickets() {
         assert_eq!(Wait::<&str>::NotReady.key(), "not_ready");
-        assert!(Wait::<&str>::Slot.tickets().is_empty());
+        assert!(Wait::<&str>::RunCap.tickets().is_empty());
+        let slot = Wait::Slot(vec!["X-9"]);
+        assert_eq!((slot.key(), slot.tickets()), ("slot", &["X-9"][..]));
         let held = Wait::BlockerUnknown(vec!["UTF-8"]);
         assert_eq!(
             (held.key(), held.tickets()),
