@@ -47,6 +47,13 @@ pub use owlshift_contracts::result::Effort;
 ///   otherwise opens it with its access token, and it offers the model MCP
 ///   resource tools and `request_plugin_install`, checked live on
 ///   2026-10-16 (OWL-132, recordings `apps_disabled` and its control).
+/// - `--disable image_generation`, `--disable multi_agent` and
+///   `web_search="disabled"` take image generation, the collaboration tools
+///   (`spawn_agent` and the rest) and web search away from the critic: it
+///   returns JSON, sub-agents multiply a run's cost, and web search searches
+///   on the operator's account, against the design's "without network where
+///   the harness allows it" (OWL-316, recordings `critic_tools` and its
+///   control).
 /// - `--ignore-rules` drops execpolicy `.rules` files: the runner injects the
 ///   project's rules in the brief (C2, "Rules").
 /// - `skills.include_instructions=false` lists no skill to the model, the
@@ -68,6 +75,12 @@ const LAUNCH_ARGS: &[&str] = &[
     "--ignore-user-config",
     "--disable",
     "apps",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "multi_agent",
+    "-c",
+    "web_search=\"disabled\"",
     "--ignore-rules",
     "-c",
     "skills.include_instructions=false",
@@ -475,7 +488,9 @@ mod tests {
         let mut request = request(Role::Verify, PermissionLevel::ReadOnly);
         assert_eq!(
             joined(&request),
-            "exec --ephemeral --json --ignore-user-config --disable apps --ignore-rules \
+            "exec --ephemeral --json --ignore-user-config --disable apps \
+             --disable image_generation --disable multi_agent -c web_search=\"disabled\" \
+             --ignore-rules \
              -c skills.include_instructions=false -c project_doc_max_bytes=0 \
              --dangerously-bypass-approvals-and-sandbox \
              --output-schema /run/schema.json -o /run/last-message.json -"

@@ -15,7 +15,8 @@
 //! local stand-in for the model, with the adapter's own command line; their
 //! records say how (build plan, OWL-130's entry). `apps_disabled` and its
 //! control were recorded for OWL-132 on 2026-10-16 by
-//! `owlshift-testkit/tests/codex_live.rs`, on a ChatGPT login.
+//! `owlshift-testkit/tests/codex_live.rs`, on a ChatGPT login, and
+//! `critic_tools` and its control by the same file for OWL-316.
 
 use std::path::{Path, PathBuf};
 
@@ -27,7 +28,7 @@ use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::{Harness, Role};
 
 /// Every recording, so that one added without its checks fails here.
-const FIXTURES: [&str; 17] = [
+const FIXTURES: [&str; 19] = [
     "success",
     "write_refused",
     "nested_sandbox",
@@ -45,6 +46,8 @@ const FIXTURES: [&str; 17] = [
     "trusted_repo_mcp_control",
     "apps_disabled",
     "apps_disabled_control",
+    "critic_tools",
+    "critic_tools_control",
 ];
 
 /// The one id left in the recordings, where each thread id was.
@@ -212,13 +215,16 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
     // the adapter's command line of then, before OWL-131's two `-c` and
     // OWL-132's `--disable apps`, confined; its last message is the result
     // the runner validated. The stand-in runs of OWL-131 and the live
-    // apps-server runs of OWL-132 end the same way.
+    // apps-server runs of OWL-132 and the tool-list runs of OWL-316 end the
+    // same way.
     for name in [
         "critic",
         "trusted_repo_mcp",
         "trusted_repo_mcp_control",
         "apps_disabled",
         "apps_disabled_control",
+        "critic_tools",
+        "critic_tools_control",
     ] {
         let run = replay(name);
         let Outcome::Completed { text } = &run.outcome else {
@@ -286,42 +292,102 @@ fn recorded_argv(name: &str) -> Vec<String> {
         .collect()
 }
 
+/// The flags OWL-316 added to take image generation, the collaboration tools
+/// and web search away from a critic run.
+const TOOLS_OFF: [&[&str]; 3] = [
+    &["--disable", "image_generation"],
+    &["--disable", "multi_agent"],
+    &["-c", "web_search=\"disabled\""],
+];
+
+/// `argv` without the flags of [`TOOLS_OFF`]: the adapter's command line
+/// before OWL-316.
+fn before_tools_off(argv: &[String]) -> Vec<String> {
+    TOOLS_OFF
+        .iter()
+        .fold(argv.to_vec(), |kept, flags| without(&kept, flags))
+}
+
+/// The tool names a tool-list recording's result gives as its summary.
+fn tools(name: &str) -> Vec<String> {
+    let message = meta(name)["output_last_message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let result: Value = serde_json::from_str(&message).unwrap();
+    assert_eq!(result["status"], "done", "{name}");
+    let names: Vec<String> = serde_json::from_str(result["summary"].as_str().unwrap())
+        .unwrap_or_else(|e| panic!("{name}: the summary lists no names: {e}"));
+    // The run's own shell tool, so an empty or unrelated list fails.
+    assert!(
+        names.iter().any(|tool| tool.ends_with("exec_command")),
+        "{name}: {names:?}"
+    );
+    names
+}
+
+/// Whether `names` holds `tool`, whatever namespace prefix the model gave it.
+fn offered(names: &[String], tool: &str) -> bool {
+    names
+        .iter()
+        .any(|name| name.rsplit('.').next() == Some(tool))
+}
+
+/// OWL-316: a critic run is offered neither web search, nor image
+/// generation, nor the collaboration tools, which the same run without the
+/// flags of [`TOOLS_OFF`] is offered. Both runs asked the model to give, as
+/// its result's summary, the names of the tools it can call; the control's
+/// command line differs by those flags alone, and the adapter's is
+/// `command()`'s, so a change to its flags fails here until the pair is
+/// recorded again. The tools kept, and why, are in the build plan
+/// (OWL-132's entry).
+#[test]
+fn a_critic_run_is_offered_only_the_tools_it_keeps() {
+    let adapter = adapter_argv(Some(codex::Effort::Low));
+    assert_eq!(recorded_argv("critic_tools"), adapter);
+    assert_eq!(
+        recorded_argv("critic_tools_control"),
+        before_tools_off(&adapter)
+    );
+    let (adapter, control) = (tools("critic_tools"), tools("critic_tools_control"));
+    for tool in [
+        "web__run",
+        "image_gen__imagegen",
+        "spawn_agent",
+        "send_message",
+        "wait_agent",
+        "list_agents",
+        "interrupt_agent",
+        "followup_task",
+    ] {
+        assert!(
+            offered(&control, tool),
+            "the control lacks {tool}: {control:?}"
+        );
+        assert!(
+            !offered(&adapter, tool),
+            "the adapter offers {tool}: {adapter:?}"
+        );
+    }
+}
+
 /// OWL-132: on a ChatGPT login, the ChatGPT apps server offers the model
 /// MCP resource tools and `request_plugin_install`; on the adapter's command
 /// line, which passes `--disable apps`, it offers none of them. Both runs
 /// asked the model to give, as its result's summary, the names of the tools
-/// it can call; the control's command line differs by that flag alone, and
-/// the adapter's is `command()`'s, so a change to its flags fails here until
-/// the pair is recorded again.
+/// it can call; the control's command line differs by that flag alone.
+///
+/// The adapter's recorded command line is `command()`'s but for the flags
+/// of [`TOOLS_OFF`], which OWL-316 added after it. A change to the adapter's
+/// other flags fails here until the pair is recorded again.
 #[test]
 fn the_apps_server_offers_a_critic_run_no_tool() {
-    let adapter = adapter_argv(Some(codex::Effort::Low));
+    let adapter = before_tools_off(&adapter_argv(Some(codex::Effort::Low)));
     assert_eq!(recorded_argv("apps_disabled"), adapter);
     assert_eq!(
         recorded_argv("apps_disabled_control"),
         without(&adapter, &["--disable", "apps"])
     );
-    let tools = |name: &str| -> Vec<String> {
-        let message = meta(name)["output_last_message"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let result: Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(result["status"], "done", "{name}");
-        let names: Vec<String> = serde_json::from_str(result["summary"].as_str().unwrap())
-            .unwrap_or_else(|e| panic!("{name}: the summary lists no names: {e}"));
-        // The run's own shell tool, so an empty or unrelated list fails.
-        assert!(
-            names.iter().any(|tool| tool.ends_with("exec_command")),
-            "{name}: {names:?}"
-        );
-        names
-    };
-    let offered = |names: &[String], tool: &str| {
-        names
-            .iter()
-            .any(|name| name.rsplit('.').next() == Some(tool))
-    };
     let (adapter, control) = (tools("apps_disabled"), tools("apps_disabled_control"));
     for tool in [
         "list_mcp_resources",
@@ -351,13 +417,17 @@ fn the_apps_server_offers_a_critic_run_no_tool() {
 /// the call, so no MCP item reached the stream.
 ///
 /// The recorded command line is `command()`'s but for `--disable apps`,
-/// which OWL-132 added after it: the pair ran logged out, where Codex opens
-/// no apps server. A change to the adapter's other flags fails here until
-/// the pair is recorded again; the unit test in `harness/codex.rs` is where
-/// the flags are read.
+/// which OWL-132 added after it (the pair ran logged out, where Codex opens
+/// no apps server), and the flags of [`TOOLS_OFF`], which OWL-316 added. A
+/// change to the adapter's other flags fails here until the pair is
+/// recorded again; the unit test in `harness/codex.rs` is where the flags
+/// are read.
 #[test]
 fn a_trusted_repository_starts_no_mcp_server_in_a_critic_run() {
-    let adapter = without(&adapter_argv(None), &["--disable", "apps"]);
+    let adapter = without(
+        &before_tools_off(&adapter_argv(None)),
+        &["--disable", "apps"],
+    );
     assert_eq!(recorded_argv("trusted_repo_mcp"), adapter);
     // The control differs by `--ignore-user-config` alone.
     let control = without(&adapter, &["--ignore-user-config"]);
