@@ -26,7 +26,9 @@
 //! ticket is dispatched, and intake goes on. Reaching the cap is one
 //! `decision` event (`drain` = `pr_cap`, with the count and the cap) and one
 //! line, not one per pass; the tickets it holds back are not told one by
-//! one.
+//! one. The dispatch counts again from the refs read under its lock
+//! (OWL-313), so a pull request another command delivered since the
+//! snapshot holds it too, told the same way.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -47,7 +49,7 @@ use owlshift_core::vocab::Stage;
 
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Watch};
 use crate::events::{EventSink, data};
-use crate::on_demand::{self, Delivered, Stop, Taken};
+use crate::on_demand::{self, Delivered, DispatchSeen, Stop, Taken, delivery_followed};
 use crate::ticket_ref::{self, Stored, text_sha256};
 
 /// Why `owlshift watch --drain` refuses to start on a project configured
@@ -138,10 +140,7 @@ impl Row {
     }
 
     fn followed(&self) -> bool {
-        self.stored
-            .as_ref()
-            .and_then(|stored| stored.record.delivery.as_ref())
-            .is_some_and(|delivery| delivery.followed())
+        self.stored.as_ref().is_some_and(delivery_followed)
     }
 
     fn excluded(&self, exclude: Option<&str>) -> bool {
@@ -241,15 +240,6 @@ fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
         ),
         Wait::RunCap => "every run of this machine is taken".to_owned(),
     }
-}
-
-/// Whether a ticket ref's delivery is a pull request still followed.
-fn delivery_followed(stored: &Stored) -> bool {
-    stored
-        .record
-        .delivery
-        .as_ref()
-        .is_some_and(|delivery| delivery.followed())
 }
 
 /// How an intake's outcome is reported, as a continue's: a record kept is
@@ -401,30 +391,10 @@ impl Watch<'_> {
         if !unread.is_empty() {
         } else if open_prs < cap {
             memory.drain.capped = false;
-        } else if !memory.drain.capped
-            && let Some((held, _)) = ready.waiting.iter().find(|(_, wait)| *wait == Wait::PrCap)
+        } else if let Some((held, _)) = ready.waiting.iter().find(|(_, wait)| *wait == Wait::PrCap)
             && let Ok(held) = TicketId::new(held)
         {
-            // Told when a ticket is first held by it, once for each time
-            // the count reaches the cap.
-            sink.emit(
-                &held,
-                None,
-                EventKind::Decision,
-                data([
-                    ("drain", json!("pr_cap")),
-                    ("open_prs", json!(open_prs)),
-                    ("max_open_prs", json!(cap)),
-                ]),
-            );
-            self.line(
-                out,
-                &format!(
-                    "the open pull requests reached their cap ({open_prs} of {cap}): no new Build \
-                     starts until one is merged or closed; intake goes on"
-                ),
-            );
-            memory.drain.capped = true;
+            self.tell_cap(memory, &held, open_prs, cap, sink, out);
         }
         for (id, wait) in &ready.waiting {
             if *wait == Wait::PrCap {
@@ -537,14 +507,57 @@ impl Watch<'_> {
         }
         match on_demand.dispatch_seen(ticket, commit, sink) {
             None => {}
-            Some(Taken::NotAdmitted { account, reason }) => {
+            // A pull request delivered since the snapshot (OWL-313): nothing
+            // ran, so nothing is held; the next pass counts again.
+            Some(DispatchSeen::Capped {
+                open_prs,
+                max_open_prs,
+            }) => self.tell_cap(memory, ticket, open_prs, max_open_prs, sink, out),
+            Some(DispatchSeen::Taken(Taken::NotAdmitted { account, reason })) => {
                 self.not_admitted(memory, ticket, account, &reason, sink, out);
             }
-            Some(Taken::Ran(outcome)) => {
+            Some(DispatchSeen::Taken(Taken::Ran(outcome))) => {
                 memory.drain.warned.remove(ticket);
                 self.ran(memory, ticket, seen, &outcome, sink, continued);
             }
         }
+    }
+
+    /// The cap reached, `open_prs` of `cap`, holding `held` back: one
+    /// `decision` event (`drain` = `pr_cap`) carried by `held` and one line,
+    /// unless already told since the count last fell below the cap. `held`
+    /// is the pass's first ticket the cap holds, or the dispatch the refs
+    /// read under its lock held (OWL-313).
+    fn tell_cap(
+        &self,
+        memory: &mut WatchMemory,
+        held: &TicketId,
+        open_prs: u32,
+        cap: u32,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+    ) {
+        if memory.drain.capped {
+            return;
+        }
+        sink.emit(
+            held,
+            None,
+            EventKind::Decision,
+            data([
+                ("drain", json!("pr_cap")),
+                ("open_prs", json!(open_prs)),
+                ("max_open_prs", json!(cap)),
+            ]),
+        );
+        self.line(
+            out,
+            &format!(
+                "the open pull requests reached their cap ({open_prs} of {cap}): no new Build \
+                 starts until one is merged or closed; intake goes on"
+            ),
+        );
+        memory.drain.capped = true;
     }
 
     /// An intake's or a dispatch's outcome reported as a continue's, then

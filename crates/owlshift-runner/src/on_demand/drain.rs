@@ -8,7 +8,9 @@
 //! check the admission gesture against `[tracker].admitters` at the base
 //! commit ([`OnDemand::gesture_for`]): a ticket whose admitter was dropped
 //! from the list is taken no further until its gesture, read again, admits it
-//! (section 8).
+//! (section 8). The dispatch also reads every ticket ref of the project
+//! again under the lock, for the slot and for the open pull request cap
+//! (OWL-313): a pull request delivered since the snapshot holds it.
 
 use owlshift_contracts::config::{Admit, Tracker as TrackerConfig};
 use owlshift_contracts::drain::Gesture;
@@ -25,6 +27,35 @@ pub enum Taken<T> {
     /// The gesture the tracker shows was made by `account`, which does not
     /// admit; nothing ran.
     NotAdmitted { account: String, reason: String },
+}
+
+/// What the drain's dispatch did, once it ran at all.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DispatchSeen {
+    /// It ran, or its gesture did not admit.
+    Taken(Taken<Delivered>),
+    /// The ticket refs read under the lock show `open_prs` pull requests
+    /// followed, at least `policy.max_open_prs`: no Build started.
+    Capped { open_prs: u32, max_open_prs: u32 },
+}
+
+/// What the project's ticket refs show, read under the lock.
+enum Locked {
+    /// Another ticket ref holds the slot, or a ref cannot be read.
+    Held,
+    /// The slot is free; `open_prs` refs, the dispatched ticket's own
+    /// included, have a followed delivery.
+    Free { open_prs: u32 },
+}
+
+/// Whether watch still follows the delivery of `stored`: what the open pull
+/// request cap counts, in watch's snapshot and under the dispatch's lock.
+pub(crate) fn delivery_followed(stored: &Stored) -> bool {
+    stored
+        .record
+        .delivery
+        .as_ref()
+        .is_some_and(|delivery| delivery.followed())
 }
 
 /// Why `found`, whose tracker shows the state `shown`, is no longer one the
@@ -96,17 +127,18 @@ impl OnDemand<'_> {
     /// nothing run or recorded, when the ticket ref is no longer `seen`, the
     /// intake record no longer holds the ticket's current text, the ticket
     /// left the column, or another ticket ref of the project, read under the
-    /// lock, holds the slot (or cannot be read). Its `dispatch` event names
-    /// `command` = `drain`.
+    /// lock, holds the slot (or cannot be read); [`DispatchSeen::Capped`] when
+    /// those refs show the open pull request cap reached (OWL-313). Its
+    /// `dispatch` event names `command` = `drain`.
     pub fn dispatch_seen(
         &self,
         ticket: &TicketId,
         seen: &str,
         sink: &mut EventSink<'_>,
-    ) -> Option<Taken<Delivered>> {
+    ) -> Option<DispatchSeen> {
         let mut p = match self.prepare(ticket, Command::Drain) {
             Ok(p) => p,
-            Err(stop) => return Some(Taken::Ran(Err(stop))),
+            Err(stop) => return Some(DispatchSeen::Taken(Taken::Ran(Err(stop)))),
         };
         if p.stored.as_ref().map(|stored| stored.commit.as_str()) != Some(seen) {
             return None;
@@ -117,15 +149,24 @@ impl OnDemand<'_> {
         }
         match self.drain_checks(&p) {
             Some(Ok(_)) => {}
-            Some(Err(taken)) => return Some(taken),
+            Some(Err(taken)) => return Some(DispatchSeen::Taken(taken)),
             None => return None,
         }
-        // The slot as the refs show it under this lock: a command typed
-        // since the snapshot may have left another ticket at Build.
-        if self.slot_held_by_another(&p) {
+        // The slot and the cap as the refs show them under this lock: a
+        // command typed since the snapshot may have left another ticket at
+        // Build, or delivered its pull request.
+        let Locked::Free { open_prs } = self.under_lock(&p) else {
             return None;
+        };
+        let max_open_prs = u32::from(self.config.policy.max_open_prs());
+        if open_prs >= max_open_prs {
+            return Some(DispatchSeen::Capped {
+                open_prs,
+                max_open_prs,
+            });
         }
-        Some(Taken::Ran(self.run_prepared(&mut p, Command::Drain, sink)))
+        let outcome = self.run_prepared(&mut p, Command::Drain, sink);
+        Some(DispatchSeen::Taken(Taken::Ran(outcome)))
     }
 
     /// What both commands check once the ref is the one seen: the ticket
@@ -159,24 +200,40 @@ impl OnDemand<'_> {
         )
     }
 
-    /// Whether a ticket ref of the project other than `p`'s holds the slot,
-    /// read under the lock `p` holds; one that cannot be read counts as
-    /// holding it, since nothing tells it does not.
-    fn slot_held_by_another(&self, p: &Prepared) -> bool {
+    /// The project's ticket refs read under the lock `p` holds: the slot is
+    /// held when a ref other than `p`'s holds it, or when one cannot be
+    /// read, since nothing tells it does not; otherwise the followed
+    /// deliveries of every ref, `p`'s own included, as watch's snapshot
+    /// counts them. A ref gone since the listing neither holds nor counts.
+    fn under_lock(&self, p: &Prepared) -> Locked {
         let git = &self.executor.git;
         let Ok(tickets) = ticket_ref::list(git, &p.checkout) else {
-            return true;
+            return Locked::Held;
         };
-        tickets
-            .iter()
-            .filter(|other| **other != p.ticket)
-            .any(|other| match ticket_ref::read(git, &p.checkout, other) {
-                Ok(Some(stored)) => {
-                    holds_slot_or_unknown(TicketState::try_from(&stored.record.state).ok().as_ref())
+        let mut open_prs: u32 = 0;
+        for ticket in &tickets {
+            let own = *ticket == p.ticket;
+            let read = if own {
+                p.stored.clone()
+            } else {
+                match ticket_ref::read(git, &p.checkout, ticket) {
+                    Ok(read) => read,
+                    Err(_) => return Locked::Held,
                 }
-                Ok(None) => false,
-                Err(_) => true,
-            })
+            };
+            let Some(stored) = read else {
+                continue;
+            };
+            if !own
+                && holds_slot_or_unknown(TicketState::try_from(&stored.record.state).ok().as_ref())
+            {
+                return Locked::Held;
+            }
+            if delivery_followed(&stored) {
+                open_prs = open_prs.saturating_add(1);
+            }
+        }
+        Locked::Free { open_prs }
     }
 }
 
