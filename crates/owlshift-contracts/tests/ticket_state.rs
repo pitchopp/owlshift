@@ -12,24 +12,38 @@ use std::fs;
 use std::path::PathBuf;
 
 use owlshift_contracts::refs::{PersistedState, Waiting};
-use owlshift_contracts::{ContractError, Stage, Variant};
+use owlshift_contracts::{ContractError, PlanApproval, Stage, Variant};
+use owlshift_core::gate::GatePolicy;
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
 use serde_json::{Value, json};
 
-/// Every state reachable from admission in `pipeline`, with question rounds
-/// bounded at three: past that, only the round counter grows.
+/// Every state reachable from admission in `pipeline`, each event applied
+/// without a plan gate and with the gate of an approved plan (OWL-32), with
+/// question rounds bounded at three: past that, only the round counter
+/// grows.
 fn reachable(pipeline: Pipeline) -> HashSet<TicketState> {
+    let gate = GatePolicy::new(Vec::<String>::new(), PlanApproval::Always).plan_gate(
+        pipeline,
+        true,
+        "plan",
+        Some("plan"),
+    );
     let mut seen = HashSet::from([TicketState::admitted()]);
     let mut queue = VecDeque::from([TicketState::admitted()]);
     while let Some(current) = queue.pop_front() {
         for event in Event::ALL {
-            let next = match current.apply(pipeline, event) {
-                Ok(Transition::To(next) | Transition::Parked { state: next, .. }) => next,
-                Ok(Transition::Finished(_)) | Err(_) => continue,
-            };
-            if next.round() <= 3 && seen.insert(next) {
-                queue.push_back(next);
+            for transition in [
+                current.apply(pipeline, event),
+                current.apply_gated(pipeline, event, gate),
+            ] {
+                let next = match transition {
+                    Ok(Transition::To(next) | Transition::Parked { state: next, .. }) => next,
+                    Ok(Transition::Finished(_)) | Err(_) => continue,
+                };
+                if next.round() <= 3 && seen.insert(next) {
+                    queue.push_back(next);
+                }
             }
         }
     }

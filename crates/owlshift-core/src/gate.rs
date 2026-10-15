@@ -126,6 +126,55 @@ impl GatePolicy {
             },
         }
     }
+
+    /// The plan-approval gate of the ticket's current plan (OWL-32): whether
+    /// it must be approved ([`GatePolicy::plan_approval_required`]), and
+    /// whether the approval kept in the ticket ref is of this very plan,
+    /// `approved_sha256` being the hash it keeps and `plan_sha256` the
+    /// current plan's, both the SHA-256 of the plan's canonical text, which
+    /// the runner computes. An empty hash is never approved.
+    pub fn plan_gate(
+        &self,
+        pipeline: Pipeline,
+        design_has_fork: bool,
+        plan_sha256: &str,
+        approved_sha256: Option<&str>,
+    ) -> PlanGate {
+        PlanGate {
+            required: self.plan_approval_required(pipeline, design_has_fork),
+            approved: !plan_sha256.is_empty() && approved_sha256 == Some(plan_sha256),
+        }
+    }
+}
+
+/// The plan-approval gate between the design loop and Build (architecture,
+/// section 5, "Plan approval"): when approval is required, a Build is never
+/// entered on a plan whose hash is not the approved one. Only
+/// [`GatePolicy::plan_gate`] builds one, from the policy and the plan's
+/// facts, and the state machine takes it to enter Build from Design or
+/// Design review ([`crate::state::TicketState::apply_gated`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlanGate {
+    required: bool,
+    approved: bool,
+}
+
+impl PlanGate {
+    /// Whether the plan must be approved before Build.
+    pub const fn required(self) -> bool {
+        self.required
+    }
+
+    /// Whether the kept approval is of the current plan.
+    pub const fn approved(self) -> bool {
+        self.approved
+    }
+
+    /// Whether a Build may start on the current plan: no approval is
+    /// required, or the plan is the approved one.
+    pub const fn is_open(self) -> bool {
+        !self.required || self.approved
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +298,41 @@ mod tests {
                 "{mode:?}, fork {fork}"
             );
         }
+    }
+
+    /// The gate opens on a plan that needs no approval, or on the very plan
+    /// approved: another plan's approval, none, or an empty hash keep it
+    /// shut.
+    #[test]
+    fn the_plan_gate_opens_only_on_the_approved_hash_when_approval_is_required() {
+        let plan = "a".repeat(64);
+        let other = "b".repeat(64);
+        let risky = Pipeline::new(Variant::Risky);
+        for mode in MODES {
+            let policy = GatePolicy::new(Vec::<String>::new(), mode);
+            let cases = [
+                (plan.as_str(), Some(plan.as_str()), true),
+                (plan.as_str(), Some(other.as_str()), false),
+                (plan.as_str(), None, false),
+                ("", Some(""), false),
+            ];
+            for (current, kept, approved) in cases {
+                let gate = policy.plan_gate(risky, false, current, kept);
+                assert!(gate.required(), "{mode:?}");
+                assert_eq!(gate.approved(), approved, "{mode:?} {kept:?}");
+                assert_eq!(gate.is_open(), approved, "{mode:?} {kept:?}");
+            }
+            let trivial = policy.plan_gate(Pipeline::new(Variant::Trivial), true, &plan, None);
+            assert!(!trivial.required() && trivial.is_open(), "{mode:?}");
+        }
+        let on_fork = GatePolicy::new(Vec::<String>::new(), PlanApproval::OnFork);
+        let standard = Pipeline::new(Variant::Standard);
+        assert!(on_fork.plan_gate(standard, false, &plan, None).is_open());
+        assert!(!on_fork.plan_gate(standard, true, &plan, None).is_open());
+        assert!(
+            on_fork
+                .plan_gate(standard, true, &plan, Some(&plan))
+                .is_open()
+        );
     }
 }
