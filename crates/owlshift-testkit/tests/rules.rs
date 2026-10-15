@@ -91,6 +91,24 @@ impl Repo {
     }
 
     fn project_at(&self, commit: &str, stack: &str, tail: &str) -> Result<ProjectRules, String> {
+        let all = [Role::Build, Role::Resolver, Role::Intake];
+        self.project_in(commit, stack, tail, &all)
+    }
+
+    /// The rules at `origin/main`'s tip, as a command that briefs `roles`
+    /// reads them, `tail` added after the last table.
+    fn project_for(&self, tail: &str, roles: &[Role]) -> Result<ProjectRules, String> {
+        let tip = self.git(&["rev-parse", "refs/remotes/origin/main"]);
+        self.project_in(&tip, "", tail, roles)
+    }
+
+    fn project_in(
+        &self,
+        commit: &str,
+        stack: &str,
+        tail: &str,
+        roles: &[Role],
+    ) -> Result<ProjectRules, String> {
         let base = Base {
             remote_ref: "origin/main".to_owned(),
             branch: "main".to_owned(),
@@ -116,7 +134,7 @@ impl Repo {
             "#
         ))
         .unwrap();
-        project_rules(&self.git, self.root(), &base, &config)
+        project_rules(&self.git, self.root(), &base, &config, roles)
     }
 }
 
@@ -447,4 +465,18 @@ fn a_roles_rule_file_is_required_and_the_limits_count_both_lists() {
         ),
         "{error}"
     );
+}
+
+#[test]
+fn only_the_roles_a_command_briefs_are_read() {
+    let repo = skilled_repo();
+    let tail = "[roles.build]\nrules = [\"docs/missing.md\"]";
+    // Intake alone never reads Build's table...
+    let mut config_ok = repo.project_for(tail, &[Role::Intake]).unwrap();
+    assert_eq!(config_ok.sources(), vec!["AGENTS.md"]);
+    config_ok = repo.project_for(tail, &[Role::Resolver]).unwrap();
+    assert_eq!(config_ok.sources(), vec!["AGENTS.md"]);
+    // ...while a command that briefs Build refuses the missing file.
+    let error = repo.project_for(tail, &[Role::Build]).unwrap_err();
+    assert!(error.contains("docs/missing.md"), "{error}");
 }

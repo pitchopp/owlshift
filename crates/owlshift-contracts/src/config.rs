@@ -268,7 +268,7 @@ impl ProjectConfig {
                         .to_owned()
                 } else {
                     format!(
-                        "`{name}` is not a role whose brief carries rules; the roles that do: {}",
+                        "`{name}` is not a role whose brief carries rules (a role joins as it is built); the roles that do: {}",
                         RULE_ROLES.map(Role::as_str).join(", ")
                     )
                 }));
@@ -1270,8 +1270,8 @@ mod tests {
                 "an unknown role",
                 "",
                 "[roles.bulid]\nrules = [\"a.md\"]",
-                "roles.bulid.rules: `bulid` is not a role whose brief carries rules; \
-                 the roles that do: build, resolver, intake",
+                "roles.bulid.rules: `bulid` is not a role whose brief carries rules \
+                 (a role joins as it is built); the roles that do: build, resolver, intake",
             ),
             (
                 "a role not built yet",

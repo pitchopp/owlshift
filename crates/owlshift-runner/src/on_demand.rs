@@ -1390,8 +1390,14 @@ impl OnDemand<'_> {
             .forge
             .find_open_pull_request(&head, &base_branch)
             .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
-        let rules = rules::project_rules(&self.executor.git, &p.checkout, &p.base, self.config)
-            .map_err(|e| refused("the project's rules", e))?;
+        let rules = rules::project_rules(
+            &self.executor.git,
+            &p.checkout,
+            &p.base,
+            self.config,
+            &[Role::Build, Role::Resolver],
+        )
+        .map_err(|e| refused("the project's rules", e))?;
         sink.emit(
             &p.ticket,
             None,

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use owlshift_contracts::brief::Rule;
-use owlshift_contracts::config::{DEFAULT_RULE_FILE, ProjectConfig, RULE_ROLES};
+use owlshift_contracts::config::{ProjectConfig, RULE_ROLES};
 use owlshift_core::vocab::Role;
 
 use crate::executor::Git;
@@ -74,7 +74,7 @@ struct Listed<'a> {
 /// a fetch: one rule for the whole repository (`applies_to` empty) per file
 /// `stack.rules` names, in order, or, when it names none, per root
 /// `AGENTS.md` the base commit has; and, for each role of
-/// [`RULE_ROLES`], one per file `[roles.<role>]` names.
+/// [`RULE_ROLES`], one per file `[roles.<role>]` names. Only the roles in `briefed` are read, so that a bad table of another role refuses nothing.
 ///
 /// The rules are read at `base.commit`, which
 /// [`sync_checkout`](crate::project::sync_checkout) resolved once through
@@ -90,15 +90,14 @@ pub fn project_rules(
     checkout: &Path,
     base: &Base,
     config: &ProjectConfig,
+    briefed: &[Role],
 ) -> Result<ProjectRules, String> {
-    let (files, required) = match &config.stack.rules {
-        Some(named) => (named.iter().map(String::as_str).collect(), true),
-        None => (vec![DEFAULT_RULE_FILE], false),
-    };
+    let files = config.stack.rule_files();
+    let required = config.stack.rules.is_some();
     let common = list(git, checkout, base, files, "`stack.rules`", required)?;
     check_total(base, &common, &[], None)?;
     let mut own = Vec::new();
-    for role in RULE_ROLES {
+    for role in RULE_ROLES.into_iter().filter(|role| briefed.contains(role)) {
         let named: Vec<&str> = config
             .role_rule_files(role)
             .iter()
