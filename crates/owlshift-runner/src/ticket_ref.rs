@@ -202,7 +202,7 @@ fn read_listed(
     let mut next = |file: &str| match texts.next() {
         Some(Ok(text)) => Ok(text),
         Some(Err(why)) => Err(broken(why)),
-        None => Err(broken(format!("has no {file}"))),
+        None => unreachable!("{file} was asked for and no earlier file was refused"),
     };
     let text = next(STATE_FILE)?;
     let state = PersistedState::parse(&text)
@@ -308,7 +308,7 @@ fn read_files(
     Ok(checked
         .into_iter()
         .zip(files)
-        .take(if past_invalid { files.len() } else { stop + 1 })
+        .take(stop + 1)
         .map(|(checked, file)| {
             checked.and_then(|_| {
                 let bytes = blobs.next().expect("one blob per checked file");
