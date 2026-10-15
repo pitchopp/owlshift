@@ -14,10 +14,10 @@ use std::time::Duration;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::Role;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::{Role, Tier};
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::config::{Effective, FileState};
@@ -29,6 +29,7 @@ use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{
     ANSWER_CHECK_ROLE, BUILD_ROLE, INTAKE_ROLE, REBASE_ROLE, RESOLVER_ROLE,
 };
+use owlshift_runner::routing::{ClaudeRouter, claude_model};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
 use owlshift_runner::{forge, secrets, tracker};
@@ -178,17 +179,21 @@ fn run_with(
             .and_then(|claude| claude.budget_usd),
         _ => None,
     };
+    // The standard tier without an effort, as section 9 routes intake, the
+    // resolver and the answer check.
     let harness = ClaudeHarness {
         program: claude,
         prompt,
-        model: project
-            .models
-            .standard
-            .as_ref()
-            .and_then(|tier| tier.claude.clone()),
+        model: claude_model(&project.models, Tier::Standard).map(str::to_owned),
         effort: None,
         max_budget_usd: budget,
         login,
+    };
+    // Build on the ticket's routing (OWL-305): the tier of each run picks
+    // its model from `[models]`.
+    let build = ClaudeRouter {
+        harness: harness.clone(),
+        models: project.models.clone(),
     };
     // The answer check runs on the same harness, model and login, with its
     // own prompt.
@@ -200,26 +205,20 @@ fn run_with(
         prompt: resolver_prompt,
         ..harness.clone()
     };
-    // Intake (OWL-248) on the standard tier, as Build's routing is.
+    // Intake (OWL-248) on the standard tier.
     let intake = ClaudeHarness {
         prompt: intake_prompt,
         ..harness.clone()
     };
-    // A rebase run (OWL-210) on the Build routing, and its fast tier for a
-    // trivial conflict's first run: `[models].fast`, else the standard
-    // tier's model.
-    let rebase = ClaudeHarness {
-        prompt: rebase_prompt,
-        ..harness.clone()
-    };
-    let rebase_fast = ClaudeHarness {
-        model: project
-            .models
-            .fast
-            .as_ref()
-            .and_then(|tier| tier.claude.clone())
-            .or_else(|| rebase.model.clone()),
-        ..rebase.clone()
+    // A rebase run (OWL-210) on the fast tier for a trivial conflict's first
+    // run, `[models].fast` else the standard tier's model, then on the
+    // ticket's tier.
+    let rebase = ClaudeRouter {
+        harness: ClaudeHarness {
+            prompt: rebase_prompt,
+            ..harness.clone()
+        },
+        models: project.models.clone(),
     };
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
@@ -227,12 +226,11 @@ fn run_with(
         executor: &executor,
         tracker: tracker.as_ref(),
         forge: &forge,
-        build: &harness,
+        build: &build,
         intake: &intake,
         answer_check: &check,
         resolver: &resolver,
         rebase: &rebase,
-        rebase_fast: &rebase_fast,
         remote_url: &remote_url,
         config: project,
         dirs: &dirs,

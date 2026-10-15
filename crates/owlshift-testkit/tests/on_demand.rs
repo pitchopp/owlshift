@@ -38,7 +38,9 @@ use owlshift_contracts::refs::{AskDecider, PersistedState, Waiting};
 use owlshift_contracts::result::RefusedChoice;
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::decider::DeciderRule;
+use owlshift_core::routing::RunRouting;
 use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason, Status, TicketState};
+use owlshift_core::vocab::{Effort, Tier};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{Data, EventLog, EventSink};
 use owlshift_runner::executor::harness::ClaudeHarness;
@@ -47,6 +49,7 @@ use owlshift_runner::executor::{
 };
 use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
+use owlshift_runner::routing::{ClaudeRouter, Router};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_testkit::gh;
@@ -292,6 +295,35 @@ struct Replies {
     first: RefCell<Option<Agent>>,
     during: RefCell<Vec<During>>,
     started: Cell<usize>,
+    /// The routing of each routed run, in order.
+    routed: Rc<RefCell<Vec<RunRouting>>>,
+}
+
+/// The routed harnesses are the bench's one harness, which records the
+/// routing of each run it starts.
+impl Router for Replies {
+    fn harness(&self, routing: RunRouting) -> Box<dyn Harness + '_> {
+        Box::new(Routed(self, routing))
+    }
+}
+
+/// [`Replies`] given as a routed harness.
+struct Routed<'a>(&'a Replies, RunRouting);
+
+impl Harness for Routed<'_> {
+    fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        self.0.routed.borrow_mut().push(self.1);
+        self.0.command(run)
+    }
+
+    fn drive(
+        &self,
+        run: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        self.0.drive(run, child, log)
+    }
 }
 
 impl Harness for Replies {
@@ -580,6 +612,8 @@ struct Bench {
     waited: Cell<SignedDuration>,
     /// The tracker's proposals inbox (OWL-253).
     inbox: RefCell<FakeInbox>,
+    /// The routing each routed harness was asked for, in order (OWL-305).
+    routed: Rc<RefCell<Vec<RunRouting>>>,
 }
 
 const DONE: &str = r#"{"format":9,"status":"done","summary":"Added GREETING.md; the gate passes.",
@@ -698,6 +732,7 @@ impl Bench {
             after_stage_read: RefCell::new(None),
             waited: Cell::new(SignedDuration::from_mins(10)),
             inbox: RefCell::default(),
+            routed: Rc::default(),
         }
     }
 
@@ -818,6 +853,19 @@ impl Bench {
             .join("tickets")
             .join(TICKET)
             .join("ticket.md")
+    }
+
+    /// Gives DEMO-1, which has no labels yet, `labels`, as a person would.
+    fn add_labels(&self, labels: &[&str]) {
+        let file = self.ticket_file();
+        let text = fs::read_to_string(&file).unwrap();
+        let line = format!("labels = {labels:?}\n+++\n");
+        fs::write(&file, text.replacen("\n+++\n", &format!("\n{line}"), 1)).unwrap();
+    }
+
+    /// The routing of each routed run so far, in order (OWL-305).
+    fn routed(&self) -> Vec<RunRouting> {
+        self.routed.borrow().clone()
     }
 
     /// The ticket's visible stage on the tracker.
@@ -983,6 +1031,7 @@ impl Bench {
             first: RefCell::new(first),
             during: RefCell::new(during),
             started: Cell::new(0),
+            routed: self.routed.clone(),
         };
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
@@ -1027,7 +1076,6 @@ impl Bench {
             answer_check: &harness,
             resolver: &harness,
             rebase: &harness,
-            rebase_fast: &harness,
             remote_url: &remote_url,
             config: &config,
             dirs: &dirs,
@@ -1133,6 +1181,8 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         kinds(&events),
         [
             Dispatch,
+            // The ticket's routing (OWL-305).
+            Decision,
             TrackerWrite,
             RunStarted,
             RunEnded,
@@ -2165,6 +2215,10 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
     };
     let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let config = ProjectConfig::parse(&config_text).unwrap();
+    let router = ClaudeRouter {
+        harness: harness.clone(),
+        models: config.models.clone(),
+    };
     let tracker = MarkdownTracker::new(&bench.remote.checkout);
     let forge =
         GitHubForge::with_transport(Shared(bench.github.clone()), Repo::parse(REPO).unwrap());
@@ -2174,12 +2228,11 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         executor: &executor,
         tracker: &tracker,
         forge: &forge,
-        build: &harness,
+        build: &router,
         intake: &harness,
         answer_check: &harness,
         resolver: &harness,
-        rebase: &harness,
-        rebase_fast: &harness,
+        rebase: &router,
         remote_url: &remote_url,
         config: &config,
         dirs: &dirs,
@@ -2236,6 +2289,10 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
     };
     let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let config = ProjectConfig::parse(&config_text).unwrap();
+    let router = ClaudeRouter {
+        harness: harness.clone(),
+        models: config.models.clone(),
+    };
     let tracker = MarkdownTracker::new(&bench.tmp.path().join("no-such-tracker"));
     let forge =
         GitHubForge::with_transport(Shared(bench.github.clone()), Repo::parse(REPO).unwrap());
@@ -2245,12 +2302,11 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         executor: &executor,
         tracker: &tracker,
         forge: &forge,
-        build: &harness,
+        build: &router,
         intake: &harness,
         answer_check: &harness,
         resolver: &harness,
-        rebase: &harness,
-        rebase_fast: &harness,
+        rebase: &router,
         remote_url: &remote_url,
         config: &config,
         dirs: &dirs,
@@ -5295,11 +5351,13 @@ fn stage_during(bench: &Bench, run: usize, seen: &Rc<RefCell<Option<String>>>) -
 }
 
 /// OWL-259: a fix run shows its ticket as working while it works the pull
-/// request, and as review again once its push has landed.
+/// request, and as review again once its push has landed. It runs on the
+/// ticket's routing, the labels read at its dispatch (OWL-305).
 #[test]
 fn a_fix_run_shows_working_until_its_push_lands() {
     let bench = delivered();
     assert_eq!(bench.stage(), "In Review");
+    bench.add_labels(&["tier:deep", "effort:max"]);
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
     let from = bench.events().len();
     let seen = Rc::new(RefCell::new(None));
@@ -5311,6 +5369,23 @@ fn a_fix_run_shows_working_until_its_push_lands() {
     assert_eq!(seen.borrow().as_deref(), Some("In Progress"));
     assert_eq!(stage_moves(&bench, from), ["working", "review"]);
     assert_eq!(bench.stage(), "In Review");
+    assert_eq!(
+        bench.routed(),
+        [
+            claude(Tier::Standard, None),
+            claude(Tier::Deep, Some(Effort::Max))
+        ],
+        "the Build, then the fix run"
+    );
+}
+
+/// A routing on Claude Code.
+fn claude(tier: Tier, effort: Option<Effort>) -> RunRouting {
+    RunRouting {
+        harness: owlshift_contracts::Harness::Claude,
+        tier,
+        effort,
+    }
 }
 
 /// OWL-259: a fix run a usage limit stops leaves the ticket at Watch, with
@@ -6761,7 +6836,7 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
 
     // One run, of the rebase role on the fast tier, told what to rebase.
     let events = &bench.events()[delivered_events..];
-    let runs = data_of(events, EventKind::Decision, "tier");
+    let runs = data_of(events, EventKind::Decision, "trivial");
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(
         (
@@ -6871,7 +6946,7 @@ fn a_non_trivial_conflict_goes_to_the_build_routing_at_once() {
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
 
     let events = &bench.events()[delivered_events..];
-    let runs = data_of(events, EventKind::Decision, "tier");
+    let runs = data_of(events, EventKind::Decision, "trivial");
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(
         (&runs[0]["tier"], &runs[0]["trivial"]),
@@ -6898,6 +6973,7 @@ fn a_non_trivial_conflict_goes_to_the_build_routing_at_once() {
 #[test]
 fn a_rebase_that_fails_twice_parks_the_ticket() {
     let bench = delivered_with_rules();
+    bench.add_labels(&["tier:deep", "effort:max"]);
     let delivered_events = bench.events().len();
     let first_push = bench.remote_branch().unwrap();
     bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
@@ -6917,11 +6993,16 @@ fn a_rebase_that_fails_twice_parks_the_ticket() {
         "{outcome:?}\n{printed}"
     );
     let events = &bench.events()[delivered_events..];
-    let tiers: Vec<Value> = data_of(events, EventKind::Decision, "tier")
+    let tiers: Vec<Value> = data_of(events, EventKind::Decision, "trivial")
         .iter()
         .map(|run| run["tier"].clone())
         .collect();
     assert_eq!(tiers, [json!("fast"), json!("build")]);
+    // The fast tier, then the ticket's, neither with an effort (OWL-305).
+    assert_eq!(
+        bench.routed()[1..],
+        [claude(Tier::Fast, None), claude(Tier::Deep, None)]
+    );
     let parked = bench.comments().pop().unwrap();
     assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
     assert!(parked.contains("owlshift continue DEMO-1"), "{parked}");
@@ -8061,6 +8142,75 @@ fn the_drain_takes_a_ticket_in_then_builds_it_once_its_blocker_is_done() {
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
     assert_eq!(roles, [Role::Intake, Role::Build]);
     assert_eq!(bench.record().intake.unwrap().gesture.account, "maintainer");
+}
+
+/// Per-ticket routing (OWL-305, architecture section 5): the Build follows
+/// intake's verdict, an `effort:` label overriding its effort and a `tier:`
+/// label naming no tier left out with a warning; the dispatch's `routing`
+/// event says where each part came from. A verdict naming Codex is not
+/// followed: the Build runs on Claude Code, on the verdict's tier and effort.
+#[test]
+fn the_build_follows_the_routing_verdict_under_the_tickets_labels() {
+    let cases = [
+        (
+            json!({ "harness": "claude", "tier": "deep", "effort": "high" }),
+            "\"effort:low\", \"tier:huge\"",
+            claude(Tier::Deep, Some(Effort::Low)),
+            ("followed", "label"),
+        ),
+        (
+            json!({ "harness": "codex", "tier": "fast", "effort": "high" }),
+            "",
+            claude(Tier::Fast, Some(Effort::High)),
+            ("not_followed", "verdict"),
+        ),
+    ];
+    for (verdict, labels, routed, (followed, effort_from)) in cases {
+        let bench = Bench::build_admitting(
+            "maintainer",
+            &format!("assignee = \"maintainer\"\nlabels = [\"agent\", {labels}]\n"),
+            "",
+            ", parked = \"Parked\"",
+            "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+        );
+        let mut result: Value = serde_json::from_str(&intake_result("done", None, "")).unwrap();
+        result["intake"]["routing"] = verdict;
+        let intake = bench.reply(None, Some(&result.to_string()));
+        let build = bench.reply(Some("Hello"), Some(DONE));
+        let (outcomes, lines, printed) = bench.drain(vec![intake, build], 2, |_| {});
+        assert!(
+            matches!(outcomes[..], [Err(Stop::Ready { .. }), Ok(_)]),
+            "{outcomes:?}\n{lines}\n{printed}"
+        );
+        assert_eq!(bench.routed(), [routed], "the Build alone is routed");
+        let events = bench.events();
+        let routing = data_of(&events, EventKind::Decision, "routing");
+        assert_eq!(routing.len(), 1, "{routing:?}");
+        assert_eq!(
+            (
+                &routing[0]["routing"],
+                &routing[0]["command"],
+                &routing[0]["tier_from"],
+                &routing[0]["effort_from"],
+            ),
+            (
+                &json!(followed),
+                &json!("drain"),
+                &json!("verdict"),
+                &json!(effort_from)
+            )
+        );
+        let ignored: Vec<Value> = data_of(&events, EventKind::Warning, "label")
+            .into_iter()
+            .map(|warning| warning["label"].clone())
+            .collect();
+        let expected: &[&str] = if labels.is_empty() {
+            &[]
+        } else {
+            &["tier:huge"]
+        };
+        assert_eq!(ignored, expected);
+    }
 }
 
 /// A gesture by an account `admitters` does not list (OWL-250): one

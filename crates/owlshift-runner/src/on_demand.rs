@@ -90,6 +90,9 @@ use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, 
 use owlshift_core::gate::GatePolicy;
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::Resource;
+use owlshift_core::routing::{
+    PROJECT_DEFAULT, RunRouting, TicketRouting, role_routing, ticket_routing,
+};
 use owlshift_core::state::{
     Event, MAX_REASKS, MAX_RESOLVED_PASSES, ParkReason, Status, TicketState, Transition,
 };
@@ -108,6 +111,7 @@ use crate::proposals::{self, Filing};
 use crate::rebase;
 use crate::resolver::{self, Fallback, Resolved};
 use crate::reversal;
+use crate::routing::{Router, claude_model, route_labels};
 use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
@@ -377,8 +381,10 @@ pub struct OnDemand<'a> {
     pub executor: &'a Executor,
     pub tracker: &'a dyn Tracker,
     pub forge: &'a GitHubForge,
-    /// Runs the build role.
-    pub build: &'a dyn Harness,
+    /// Runs the build role, Build's runs and Watch's fix and correction
+    /// runs alike, on the ticket's routing (OWL-305): the tier and effort of
+    /// intake's verdict under the ticket's `tier:` and `effort:` labels.
+    pub build: &'a dyn Router,
     /// Runs the intake role (`roles/intake.md`) on the standard tier
     /// (OWL-248).
     pub intake: &'a dyn Harness,
@@ -386,12 +392,11 @@ pub struct OnDemand<'a> {
     pub answer_check: &'a dyn Harness,
     /// Runs the resolver (`roles/resolver.md`).
     pub resolver: &'a dyn Harness,
-    /// Runs the rebase role (`roles/rebase.md`) on the Build routing: a
-    /// non-trivial conflict, or a retry after a failed fast run (OWL-210).
-    pub rebase: &'a dyn Harness,
-    /// Runs the rebase role on the fast tier (`[models].fast`, else the
-    /// standard tier's model): a trivial conflict's first run.
-    pub rebase_fast: &'a dyn Harness,
+    /// Runs the rebase role (`roles/rebase.md`), without an effort: on the
+    /// fast tier for a trivial conflict's first run, on the ticket's tier for
+    /// a non-trivial conflict or a retry after a failed fast run (OWL-210,
+    /// OWL-305).
+    pub rebase: &'a dyn Router,
     /// What the dedicated checkout clones and fetches: the `origin` of the
     /// person's checkout.
     pub remote_url: &'a str,
@@ -933,6 +938,10 @@ struct Dispatched {
     head: Branch,
     base_branch: Branch,
     rules: ProjectRules,
+    /// The ticket's routing, its labels read at this dispatch (OWL-305).
+    routing: TicketRouting,
+    /// The routing of the build role's runs on this ticket.
+    build: RunRouting,
 }
 
 /// One run through the executor: its id, its report, and the isolation
@@ -1216,7 +1225,9 @@ impl OnDemand<'_> {
             .agent
             .sandbox_ready()
             .map_err(|e| Stop::Refused(e.to_string()))?;
-        for harness in [self.build, self.answer_check, self.resolver, self.intake] {
+        // A harness's needs do not depend on its run's tier or effort.
+        let build = self.build.harness(PROJECT_DEFAULT);
+        for harness in [&*build, self.answer_check, self.resolver, self.intake] {
             harness
                 .sandbox_needs(&self.executor.agent)
                 .map_err(|e| Stop::Refused(e.to_string()))?;
@@ -1427,11 +1438,79 @@ impl OnDemand<'_> {
                 ("rules", json!(rules.sources())),
             ]),
         );
+        let (routing, build) = self.route(p, command, sink);
         Ok(Dispatched {
             head,
             base_branch,
             rules,
+            routing,
+            build,
         })
+    }
+
+    /// The ticket's routing at a dispatch (OWL-305, architecture section 5,
+    /// "Per-ticket routing"), and the build role's under it: intake's verdict
+    /// from the ticket's record, none for a ticket intake never ran on, under
+    /// the `tier:` and `effort:` labels the ticket carries now. A label left
+    /// out is a `warning` event; the routing is a `decision` event, `routing`
+    /// saying whether the verdict's harness is followed, with where its tier
+    /// and effort come from. It is the ticket's routing, which Build and
+    /// Watch's fix and correction runs take; a rebase run's own tier is its
+    /// `rebase_run` event's.
+    fn route(
+        &self,
+        p: &Prepared,
+        command: Command,
+        sink: &mut EventSink<'_>,
+    ) -> (TicketRouting, RunRouting) {
+        let labels = route_labels(p.found.labels.iter().map(String::as_str));
+        for left_out in &labels.ignored {
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("label_ignored")),
+                    ("label", json!(left_out.label)),
+                    ("reason", json!(left_out.reason)),
+                ]),
+            );
+        }
+        let verdict = p.intake.as_ref().map(|record| record.routing);
+        let routing = ticket_routing(verdict, labels.tier, labels.effort);
+        let build = role_routing(Role::Build, routing).expect("the build role follows the ticket");
+        let from = |label: bool| match (label, verdict.is_some()) {
+            (true, _) => "label",
+            (false, true) => "verdict",
+            (false, false) => "default",
+        };
+        sink.emit(
+            &p.ticket,
+            None,
+            EventKind::Decision,
+            data([
+                (
+                    "routing",
+                    json!(if routing.harness_followed {
+                        "followed"
+                    } else {
+                        "not_followed"
+                    }),
+                ),
+                ("command", json!(command.name())),
+                ("verdict", json!(verdict)),
+                ("harness", json!(build.harness)),
+                ("tier", json!(build.tier)),
+                ("tier_from", json!(from(labels.tier.is_some()))),
+                ("effort", json!(build.effort)),
+                ("effort_from", json!(from(labels.effort.is_some()))),
+                (
+                    "model",
+                    json!(claude_model(&self.config.models, build.tier)),
+                ),
+            ]),
+        );
+        (routing, build)
     }
 
     /// Runs Build from `state` until it delivers or stops: a failed run gets
@@ -1446,6 +1525,7 @@ impl OnDemand<'_> {
     ) -> Result<Delivered, Stop> {
         let current = person(p.current()?, &p.found);
         self.keep(p, &state)?;
+        let harness = self.build.harness(dispatched.build);
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
         // Runs in a row whose questions the resolver all decided. Neither
@@ -1472,7 +1552,7 @@ impl OnDemand<'_> {
             // whatever command ran it (OWL-192).
             tell_build(&mut brief, &p.questions());
             let (ran, event) =
-                self.run_build_once(p, &state, &brief, attempt, &mut gathered, sink)?;
+                self.run_role_once(p, &*harness, &state, &brief, attempt, &mut gathered, sink)?;
             let result = (event != Event::ResultRefused)
                 .then(|| ran.result())
                 .flatten();
@@ -1619,25 +1699,12 @@ impl OnDemand<'_> {
         self.deliver(p, dispatched, report, gathered, &state, sink)
     }
 
-    /// One run of the build role from `brief`, in `state`, for `build` and
-    /// for a fix run (OWL-112) alike: the run, what it keeps of Build's
-    /// refused results, the gate's failure and the follow-ups it gathers
-    /// for the next brief and the report, and its core event
-    /// ([`stage_event`], a quarantine for a breach).
-    fn run_build_once(
-        &self,
-        p: &mut Prepared,
-        state: &TicketState,
-        brief: &Brief,
-        attempt: u32,
-        gathered: &mut Gathered,
-        sink: &mut EventSink<'_>,
-    ) -> Result<(Ran, Event), Stop> {
-        self.run_role_once(p, self.build, state, brief, attempt, gathered, sink)
-    }
-
-    /// [`Self::run_build_once`] on `harness`, for a rebase run's role too
-    /// (OWL-210); only a Build run keeps a refused result for the next one.
+    /// One run of the build role from `brief` on `harness`, in `state`, for
+    /// `build` and for a fix run (OWL-112) alike, and for a rebase run's role
+    /// too (OWL-210): the run, what it keeps of Build's refused results, the
+    /// gate's failure and the follow-ups it gathers for the next brief and
+    /// the report, and its core event ([`stage_event`], a quarantine for a
+    /// breach). Only a Build run keeps a refused result for the next one.
     #[allow(clippy::too_many_arguments)]
     fn run_role_once(
         &self,
@@ -3584,7 +3651,8 @@ impl OnDemand<'_> {
             })
         })?;
         let dispatched = self.dispatch(p, Command::Fix, sink)?;
-        let build = |_: u32| self.build;
+        let harness = self.build.harness(dispatched.build);
+        let build = |_: u32| &*harness;
         let decorate = |brief: &mut Brief, questions: &TicketQuestions| {
             brief.check_failure = Some(failure.clone());
             tell_build(brief, questions);
@@ -3935,11 +4003,20 @@ impl OnDemand<'_> {
         let classified = rebase::classify(git, &checkout, onto.as_str(), pushed, !refresh);
         let dispatched = self.dispatch(p, Command::Rebase, sink)?;
         let fast = |attempt: u32| classified.trivial && attempt == 1;
+        // The rebase role takes no effort: its own fast tier, then the
+        // ticket's tier (architecture section 5, "Per-ticket routing").
+        let fast_run = self.rebase.harness(
+            role_routing(Role::Rebase, dispatched.routing).expect("the rebase role has a tier"),
+        );
+        let build_run = self.rebase.harness(RunRouting {
+            effort: None,
+            ..dispatched.build
+        });
         let harness = |attempt: u32| {
             if fast(attempt) {
-                self.rebase_fast
+                &*fast_run
             } else {
-                self.rebase
+                &*build_run
             }
         };
         let before = |p: &Prepared, attempt: u32, sink: &mut EventSink<'_>| {
