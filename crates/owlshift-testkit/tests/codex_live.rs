@@ -8,16 +8,24 @@
 //!
 //! ```sh
 //! OWLSHIFT_LIVE_CODEX=1 OWLSHIFT_CODEX_BACKUP=/path/to/new/backup.json \
-//!   cargo test -p owlshift-testkit --test codex_live -- --ignored --nocapture
+//!   cargo test -p owlshift-testkit --test codex_live -- --ignored --nocapture \
+//!   --test-threads=1
 //! ```
 //!
-//! With `OWLSHIFT_RECORD_CODEX=1` it also writes the run's stream as the
-//! recording `fixtures/codex/critic` of `owlshift-adapters`, scrubbed;
-//! `tests/codex_fixtures.rs` then checks it like the others.
+//! One thread, since the tests share the user's login; each makes its own
+//! backup, the apps-server check's with `.apps` appended to the name. A
+//! second test, OWL-132's, runs two short critic runs that list their tools,
+//! with and without `--disable apps`.
+//!
+//! With `OWLSHIFT_RECORD_CODEX=1` they also write their runs' streams as the
+//! recordings `critic`, `apps_disabled` and `apps_disabled_control` of
+//! `owlshift-adapters`' `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs`
+//! then checks them like the others.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use owlshift_adapters::harness::codex::{self, Effort};
@@ -47,81 +55,238 @@ new file mode 100644\n\
 +    done * 100 / total\n\
 +}\n";
 
+/// A scratch project seeded as the runner seeds one, the executor on the
+/// user's own environment, and the user's Codex login, backed up first.
+struct Live {
+    tmp: tempfile::TempDir,
+    main: PathBuf,
+    base: String,
+    executor: Executor,
+    login: PathBuf,
+    original: Vec<u8>,
+}
+
+impl Live {
+    /// Refuses to start without `OWLSHIFT_LIVE_CODEX=1` and a backup path in
+    /// `OWLSHIFT_CODEX_BACKUP`, to which `suffix` is appended so that each
+    /// test makes a backup of its own.
+    fn new(suffix: &str) -> Self {
+        assert_eq!(
+            std::env::var("OWLSHIFT_LIVE_CODEX").as_deref(),
+            Ok("1"),
+            "this test spends Codex usage: set OWLSHIFT_LIVE_CODEX=1 to run it"
+        );
+        let mut backup = std::env::var_os("OWLSHIFT_CODEX_BACKUP")
+            .expect("name a new file for the backup of auth.json in OWLSHIFT_CODEX_BACKUP");
+        backup.push(suffix);
+        let agent = AgentEnv::from_runner(&[], &[]).unwrap();
+        let login = user_login(&agent).expect("no CODEX_HOME or HOME");
+        let original = fs::read(&login).expect("no Codex login: run `codex login`");
+        back_up(Path::new(&backup), &original);
+
+        let tmp = tempfile::Builder::new()
+            .prefix("owlshift-live-codex-")
+            .tempdir()
+            .unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("README.md"), "Progress ratios.\n").unwrap();
+        fs::write(project.join("src/lib.rs"), CHANGE).unwrap();
+        fs::write(project.join("change.diff"), DIFF).unwrap();
+        let env = GitEnv::create(tmp.path().join("home")).unwrap();
+        let remote = seed(&env, tmp.path(), &project).unwrap();
+        let base = String::from_utf8(env.run(&remote.checkout, &["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        let runner = env.clone();
+        let executor = Executor {
+            git: Git::with_setup("git", move |command| runner.apply(command)),
+            agent,
+            forge_hosts: vec!["github.com".into()],
+            timeout: Duration::from_secs(600),
+            gate_timeout: Duration::from_secs(60),
+        };
+        Self {
+            tmp,
+            main: remote.checkout,
+            base,
+            executor,
+            login,
+            original,
+        }
+    }
+
+    /// The critic on Codex, at effort `low`, with `prompt`.
+    fn harness(&self, prompt: String) -> CodexHarness {
+        CodexHarness {
+            // Found on the PATH.
+            program: "codex".into(),
+            prompt,
+            model: None,
+            effort: Some(Effort::Low),
+            login: self.login.clone(),
+        }
+    }
+
+    /// Runs `harness` on the verify brief, on a branch and in a worktree
+    /// named after `id`, then checks the user's login: unchanged, or a
+    /// refresh of the same ChatGPT login.
+    fn run(&self, harness: &CodexHarness, id: &str) -> RunReport {
+        let brief = brief(self.base.clone());
+        let spec = RunSpec {
+            main: &self.main,
+            worktree: &self.tmp.path().join(format!("worktree-{id}")),
+            branch: &format!("owlshift/{id}"),
+            base: "origin/main",
+            run_dir: &self.tmp.path().join(format!("run-{id}")),
+            brief: &brief,
+        };
+        let report = self.executor.run(&spec, harness).unwrap();
+        let after = fs::read(&self.login).unwrap();
+        let login_state = if after == self.original {
+            "unchanged"
+        } else {
+            codex_login_kept(&self.original, &after)
+                .expect("auth.json no longer holds the same ChatGPT login: restore the backup");
+            "refreshed and written back"
+        };
+        eprintln!(
+            "{id} outcome: {}\nusage: {:?}\nwarnings: {:?}\nauth.json: {login_state}",
+            describe(&report),
+            report.usage,
+            report.warnings
+        );
+        report
+    }
+
+    /// Runs `codex exec` on `TOOLS_PROMPT` with the adapter's command line,
+    /// or with `--disable apps` taken off it, outside the executor: through
+    /// it, the run without the flag started its turn and never ended it,
+    /// confined or not (2026-10-16, twice each). The run gets the
+    /// environment of OWL-130's checks (`HOME`, `PATH`, `USER`, `LANG`) and a
+    /// `CODEX_HOME` of its own holding a copy of the user's login, brought
+    /// back under `codex_login_kept`, as the executor does.
+    fn run_direct(&self, id: &str, apps_left_on: bool) -> (codex::Run, Logs) {
+        let files = self.tmp.path().join(format!("run-{id}"));
+        let home = files.join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let copied = fs::read(&self.login).unwrap();
+        fs::write(home.join("auth.json"), &copied).unwrap();
+        let schema = files.join("schema.json");
+        let rendered = serde_json::to_string_pretty(&codex::review_schema()).unwrap();
+        fs::write(&schema, rendered).unwrap();
+        let request = codex::Request {
+            workdir: self.main.clone(),
+            model: None,
+            effort: Some(Effort::Low),
+            role: Role::Verify,
+            permissions: read_only(),
+            schema_file: schema,
+            last_message_file: files.join("last-message.json"),
+        };
+        let adapter = codex::command(Path::new("codex"), &request).unwrap();
+        let mut args: Vec<String> = adapter
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if apps_left_on {
+            args = without_apps_disabled(args);
+        }
+        let mut command = Command::new("codex");
+        command
+            .args(&args)
+            .current_dir(&self.main)
+            .env_clear()
+            .env("CODEX_HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for name in ["HOME", "PATH", "USER", "LANG"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let mut child = command.spawn().unwrap();
+        // Stopped after five minutes, as a hung run would be.
+        let pid = child.id().to_string();
+        let (ended, wait) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if wait.recv_timeout(Duration::from_secs(300)).is_err() {
+                let _ = Command::new("kill").arg(&pid).status();
+            }
+        });
+        let mut stdout = Vec::new();
+        let run = codex::drive(&mut child, TOOLS_PROMPT, |line| {
+            stdout.extend_from_slice(line.strip_suffix(b"\n").unwrap_or(line));
+            stdout.push(b'\n');
+        })
+        .unwrap();
+        let _ = ended.send(());
+        watchdog.join().unwrap();
+        let logs = Logs {
+            stdout: files.join("stdout.log"),
+            stderr: files.join("stderr.log"),
+            exit_code: run.exit_code,
+        };
+        fs::write(&logs.stdout, &stdout).unwrap();
+        fs::write(&logs.stderr, &run.stderr).unwrap();
+        let updated = fs::read(home.join("auth.json")).unwrap_or_default();
+        if updated != copied {
+            let unchanged = fs::read(&self.login).unwrap() == copied;
+            match codex_login_kept(&copied, &updated) {
+                Ok(()) if unchanged => fs::write(&self.login, &updated).unwrap(),
+                Ok(()) => eprintln!("{id}: auth.json changed during the run: copy dropped"),
+                Err(why) => eprintln!("{id}: the run's login was dropped: {why}"),
+            }
+        }
+        eprintln!("{id} outcome: {:?}, usage: {:?}", run.outcome, run.usage);
+        (run, logs)
+    }
+
+    /// The login's tokens, key and account id, before the runs and now:
+    /// what a recording must never hold.
+    fn login_values(&self) -> Vec<String> {
+        let now = fs::read(&self.login).unwrap();
+        [self.original.as_slice(), now.as_slice()]
+            .into_iter()
+            .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .flat_map(|login| {
+                let tokens = &login["tokens"];
+                ["id_token", "access_token", "refresh_token", "account_id"]
+                    .into_iter()
+                    .filter_map(|key| tokens[key].as_str().map(str::to_owned))
+                    .chain(login["OPENAI_API_KEY"].as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+}
+
+fn recording_asked() -> bool {
+    std::env::var("OWLSHIFT_RECORD_CODEX").as_deref() == Ok("1")
+}
+
 #[test]
 #[ignore = "live: runs `codex exec` on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_real_critic_runs_on_codex_through_the_executor() {
-    assert_eq!(
-        std::env::var("OWLSHIFT_LIVE_CODEX").as_deref(),
-        Ok("1"),
-        "this test spends Codex usage: set OWLSHIFT_LIVE_CODEX=1 to run it"
-    );
-    let backup = PathBuf::from(
-        std::env::var_os("OWLSHIFT_CODEX_BACKUP")
-            .expect("name a new file for the backup of auth.json in OWLSHIFT_CODEX_BACKUP"),
-    );
-    let agent = AgentEnv::from_runner(&[], &[]).unwrap();
-    let login = user_login(&agent).expect("no CODEX_HOME or HOME");
-    let original = fs::read(&login).expect("no Codex login: run `codex login`");
-    back_up(&backup, &original);
-
-    let tmp = tempfile::Builder::new()
-        .prefix("owlshift-live-codex-")
-        .tempdir()
-        .unwrap();
-    let project = tmp.path().join("project");
-    fs::create_dir_all(project.join("src")).unwrap();
-    fs::write(project.join("README.md"), "Progress ratios.\n").unwrap();
-    fs::write(project.join("src/lib.rs"), CHANGE).unwrap();
-    fs::write(project.join("change.diff"), DIFF).unwrap();
-    let env = GitEnv::create(tmp.path().join("home")).unwrap();
-    let remote = seed(&env, tmp.path(), &project).unwrap();
-    let base = String::from_utf8(env.run(&remote.checkout, &["rev-parse", "HEAD"]).unwrap())
-        .unwrap()
-        .trim()
-        .to_owned();
-    let runner = env.clone();
-    let executor = Executor {
-        git: Git::with_setup("git", move |command| runner.apply(command)),
-        agent,
-        forge_hosts: vec!["github.com".into()],
-        timeout: Duration::from_secs(600),
-        gate_timeout: Duration::from_secs(60),
-    };
-    let harness = CodexHarness {
-        // Found on the PATH.
-        program: "codex".into(),
-        prompt: strip_role_front_matter(Role::Verify, VERIFY_ROLE).unwrap(),
-        model: None,
-        effort: Some(Effort::Low),
-        login: login.clone(),
-    };
-    let brief = brief(base);
-    let spec = RunSpec {
-        main: &remote.checkout,
-        worktree: &tmp.path().join("worktree"),
-        branch: "owlshift/LIVE-2",
-        base: "origin/main",
-        run_dir: &tmp.path().join("run"),
-        brief: &brief,
-    };
-
-    let report = executor.run(&spec, &harness).unwrap();
-    let after = fs::read(&login).unwrap();
-    let login_state = if after == original {
-        "unchanged"
-    } else {
-        codex_login_kept(&original, &after)
-            .expect("auth.json no longer holds the same ChatGPT login: restore the backup");
-        "refreshed and written back"
-    };
-    eprintln!(
-        "outcome: {}\nusage: {:?}\nwarnings: {:?}\nauth.json: {login_state}",
-        describe(&report),
-        report.usage,
-        report.warnings
-    );
-    if std::env::var("OWLSHIFT_RECORD_CODEX").as_deref() == Ok("1") {
-        record(&report, tmp.path());
+    let live = Live::new("");
+    let harness = live.harness(strip_role_front_matter(Role::Verify, VERIFY_ROLE).unwrap());
+    let report = live.run(&harness, "LIVE-2");
+    if recording_asked() {
+        record(
+            &Logs::from(&report),
+            live.tmp.path(),
+            &Recording {
+                name: "critic",
+                argv: adapter_argv(),
+                prompt: "the verify role (roles/verify.md) and the brief's path, on standard input",
+                confinement: "the executor's read-only profile, through Executor::run (OWL-299)",
+                setup: None,
+            },
+            &live.login_values(),
+        );
     }
     let Outcome::Finished { result, .. } = &report.outcome else {
         panic!(
@@ -136,6 +301,146 @@ fn a_real_critic_runs_on_codex_through_the_executor() {
     );
     assert!(report.usage.is_some(), "{report:?}");
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+/// The prompt of the apps-server check: the model lists its tools.
+const TOOLS_PROMPT: &str = "Do not run any command and do not call any tool. Your last \
+message is the result JSON the output schema describes, with status `done`, no finding, and \
+as `summary` a JSON array of the exact names of every tool or function you can call in this \
+session, each with its namespace or server prefix as you see it, MCP, connector, app and \
+plugin tools included.";
+
+/// The tools the ChatGPT apps server adds to a run, seen on 2026-10-16
+/// (OWL-132).
+const APPS_TOOLS: [&str; 4] = [
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+    "request_plugin_install",
+];
+
+/// OWL-132: on a ChatGPT login, the adapter's command line offers the model
+/// none of the ChatGPT apps server's tools, while the same run without
+/// `--disable apps` offers them all. Two short runs outside the executor
+/// (`Live::run_direct` says why); with `OWLSHIFT_RECORD_CODEX=1` they are
+/// recorded as `apps_disabled` and `apps_disabled_control`.
+#[test]
+#[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
+fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
+    let live = Live::new(".apps");
+    let (adapter, adapter_logs) = live.run_direct("LIVE-APPS", false);
+    let (control, control_logs) = live.run_direct("LIVE-APPS-CONTROL", true);
+    if recording_asked() {
+        let values = live.login_values();
+        let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
+                     command line (the control: without `--disable apps`) and the prompt on \
+                     standard input, and a CODEX_HOME of the run's own holding a copy of the \
+                     user's ChatGPT login";
+        for (logs, name, argv) in [
+            (&adapter_logs, "apps_disabled", adapter_argv()),
+            (
+                &control_logs,
+                "apps_disabled_control",
+                without_apps_disabled(adapter_argv()),
+            ),
+        ] {
+            record(
+                logs,
+                live.tmp.path(),
+                &Recording {
+                    name,
+                    argv,
+                    prompt: TOOLS_PROMPT,
+                    confinement: "none: env -i with HOME, PATH, USER, LANG and CODEX_HOME",
+                    setup: Some(setup),
+                },
+                &values,
+            );
+        }
+    }
+    let tools = |run: &codex::Run| -> Vec<String> {
+        let codex::Outcome::Completed { text } = &run.outcome else {
+            panic!("{:?}", run.outcome);
+        };
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        let names: Vec<String> = serde_json::from_str(result["summary"].as_str().unwrap())
+            .unwrap_or_else(|e| panic!("the summary is not a JSON array of names: {e}"));
+        assert!(
+            names.iter().any(|name| name.ends_with("exec_command")),
+            "{names:?}"
+        );
+        names
+    };
+    let offered = |names: &[String], tool: &str| {
+        names
+            .iter()
+            .any(|name| name.rsplit('.').next() == Some(tool))
+    };
+    let (adapter, control) = (tools(&adapter), tools(&control));
+    for tool in APPS_TOOLS {
+        assert!(offered(&control, tool), "control lacks {tool}: {control:?}");
+        assert!(
+            !offered(&adapter, tool),
+            "adapter offers {tool}: {adapter:?}"
+        );
+    }
+}
+
+/// The files of a run's two streams, and its exit code.
+struct Logs {
+    stdout: PathBuf,
+    stderr: PathBuf,
+    exit_code: Option<i32>,
+}
+
+impl From<&RunReport> for Logs {
+    fn from(report: &RunReport) -> Self {
+        Self {
+            stdout: report.stdout_log.clone(),
+            stderr: report.stderr_log.clone(),
+            exit_code: report.exit_code,
+        }
+    }
+}
+
+fn read_only() -> Permissions {
+    Permissions {
+        level: PermissionLevel::ReadOnly,
+        network: false,
+        browser: false,
+    }
+}
+
+/// `args` without the pair `--disable apps`.
+fn without_apps_disabled(mut args: Vec<String>) -> Vec<String> {
+    let at = args
+        .windows(2)
+        .position(|pair| pair == ["--disable", "apps"])
+        .expect("the adapter passes `--disable apps`");
+    args.drain(at..at + 2);
+    args
+}
+
+/// The adapter's command line for a live run, with the run's files named by
+/// placeholders, so a recording carries the flags of its day.
+fn adapter_argv() -> Vec<String> {
+    let request = codex::Request {
+        workdir: PathBuf::from("<worktree>"),
+        model: None,
+        effort: Some(Effort::Low),
+        role: Role::Verify,
+        permissions: read_only(),
+        schema_file: PathBuf::from("<run-files>/schema.json"),
+        last_message_file: PathBuf::from("<run-files>/last-message.json"),
+    };
+    let command = codex::command(Path::new("codex"), &request).unwrap();
+    std::iter::once("codex".to_owned())
+        .chain(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        )
+        .collect()
 }
 
 /// Copies the login to `backup`, a new file readable by the user alone.
@@ -222,10 +527,20 @@ fn brief(base: String) -> Brief {
     }
 }
 
-/// Writes the run's stream and its record as the `critic` recording, with
-/// the scratch folders, the home folder and the thread id replaced by the
-/// placeholders `codex_fixtures.rs` checks for.
-fn record(report: &RunReport, scratch: &Path) {
+/// What a recording is named and says of its run.
+struct Recording<'a> {
+    name: &'a str,
+    argv: Vec<String>,
+    prompt: &'a str,
+    confinement: &'a str,
+    setup: Option<&'a str>,
+}
+
+/// Writes the run's stream and its record as `recording`, with the scratch
+/// folders, the home folder and the thread id replaced by the placeholders
+/// `codex_fixtures.rs` checks for; refused, before anything is written,
+/// when either holds one of `login_values`.
+fn record(logs: &Logs, scratch: &Path, recording: &Recording<'_>, login_values: &[String]) {
     let home = std::env::var("HOME").unwrap_or_default();
     // The longest first: the scratch folder lies in the temporary one.
     let mut replaced: Vec<(String, String)> = Vec::new();
@@ -247,7 +562,7 @@ fn record(report: &RunReport, scratch: &Path) {
         }
         text
     };
-    let stream: Vec<String> = fs::read_to_string(&report.stdout_log)
+    let stream: Vec<String> = fs::read_to_string(&logs.stdout)
         .unwrap()
         .lines()
         .map(|line| {
@@ -258,7 +573,7 @@ fn record(report: &RunReport, scratch: &Path) {
             scrub(&event.to_string())
         })
         .collect();
-    let stderr: Vec<String> = fs::read_to_string(&report.stderr_log)
+    let stderr: Vec<String> = fs::read_to_string(&logs.stderr)
         .unwrap()
         .lines()
         .map(|line| {
@@ -287,46 +602,32 @@ fn record(report: &RunReport, scratch: &Path) {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|event| event["item"]["type"] == "agent_message")
         .find_map(|event| event["item"]["text"].as_str().map(str::to_owned));
-    // The adapter's command line for this run, with the run's files named
-    // by placeholders, so a recording carries the flags of its day.
-    let request = codex::Request {
-        workdir: PathBuf::from("<worktree>"),
-        model: None,
-        effort: Some(Effort::Low),
-        role: Role::Verify,
-        permissions: Permissions {
-            level: PermissionLevel::ReadOnly,
-            network: false,
-            browser: false,
-        },
-        schema_file: PathBuf::from("<run-files>/schema.json"),
-        last_message_file: PathBuf::from("<run-files>/last-message.json"),
-    };
-    let command = codex::command(Path::new("codex"), &request).unwrap();
-    let argv: Vec<String> = std::iter::once("codex".to_owned())
-        .chain(
-            command
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned()),
-        )
-        .collect();
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "recorded": jiff::Zoned::now().date().to_string(),
         "codex_version": version,
         "platform": std::env::consts::OS,
-        "confinement": "the executor's read-only profile, through Executor::run (OWL-299)",
-        "argv": argv,
-        "prompt": "the verify role (roles/verify.md) and the brief's path, on standard input",
-        "exit_status": report.exit_code,
+        "confinement": recording.confinement,
+        "argv": recording.argv,
+        "prompt": recording.prompt,
+        "exit_status": logs.exit_code,
         "stderr": stderr,
         "output_last_message": message,
     });
+    if let Some(setup) = recording.setup {
+        meta["setup"] = setup.into();
+    }
+    let stream = stream.join("\n") + "\n";
+    let meta = serde_json::to_string_pretty(&meta).unwrap() + "\n";
+    // Checked before anything is written, and without naming the value.
+    for value in login_values {
+        assert!(
+            !stream.contains(value.as_str()) && !meta.contains(value.as_str()),
+            "the {} recording holds a value of the login: nothing was written",
+            recording.name
+        );
+    }
     let dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../owlshift-adapters/tests/fixtures/codex");
-    fs::write(dir.join("critic.jsonl"), stream.join("\n") + "\n").unwrap();
-    fs::write(
-        dir.join("critic.meta.json"),
-        serde_json::to_string_pretty(&meta).unwrap() + "\n",
-    )
-    .unwrap();
+    fs::write(dir.join(format!("{}.jsonl", recording.name)), stream).unwrap();
+    fs::write(dir.join(format!("{}.meta.json", recording.name)), meta).unwrap();
 }

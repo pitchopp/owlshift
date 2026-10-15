@@ -1,0 +1,33 @@
+{
+  "argv": [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--json",
+    "--ignore-user-config",
+    "--disable",
+    "apps",
+    "--ignore-rules",
+    "-c",
+    "skills.include_instructions=false",
+    "-c",
+    "project_doc_max_bytes=0",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--output-schema",
+    "<run-files>/schema.json",
+    "-o",
+    "<run-files>/last-message.json",
+    "-c",
+    "model_reasoning_effort=low",
+    "-"
+  ],
+  "codex_version": "0.154.0",
+  "confinement": "none: env -i with HOME, PATH, USER, LANG and CODEX_HOME",
+  "exit_status": 0,
+  "output_last_message": "{\"findings\":[],\"format\":9,\"status\":\"done\",\"summary\":\"[\\\"functions.wait\\\",\\\"functions.request_user_input\\\",\\\"functions.request_user_input_async\\\",\\\"functions.exec\\\",\\\"tools.apply_patch\\\",\\\"tools.exec_command\\\",\\\"tools.view_image\\\",\\\"tools.write_stdin\\\",\\\"tools.clock__curr_time\\\",\\\"tools.image_gen__imagegen\\\",\\\"tools.web__run\\\",\\\"clock.sleep\\\",\\\"collaboration.followup_task\\\",\\\"collaboration.interrupt_agent\\\",\\\"collaboration.list_agents\\\",\\\"collaboration.send_message\\\",\\\"collaboration.spawn_agent\\\",\\\"collaboration.wait_agent\\\"]\"}",
+  "platform": "macos",
+  "prompt": "Do not run any command and do not call any tool. Your last message is the result JSON the output schema describes, with status `done`, no finding, and as `summary` a JSON array of the exact names of every tool or function you can call in this session, each with its namespace or server prefix as you see it, MCP, connector, app and plugin tools included.",
+  "recorded": "2026-10-16",
+  "setup": "a scratch repository; codex exec spawned by the test with the adapter's command line (the control: without `--disable apps`) and the prompt on standard input, and a CODEX_HOME of the run's own holding a copy of the user's ChatGPT login",
+  "stderr": []
+}

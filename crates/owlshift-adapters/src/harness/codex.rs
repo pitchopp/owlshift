@@ -43,6 +43,10 @@ pub use owlshift_contracts::result::Effort;
 ///   repository's, so no MCP server, provider or exporter of theirs applies;
 ///   the login still does (OWL-130, recorded under "Codex's remaining
 ///   routing paths").
+/// - `--disable apps` keeps the ChatGPT apps server out: a ChatGPT login
+///   otherwise opens it with its access token, and it offers the model MCP
+///   resource tools and `request_plugin_install`, checked live on
+///   2026-10-16 (OWL-132, recordings `apps_disabled` and its control).
 /// - `--ignore-rules` drops execpolicy `.rules` files: the runner injects the
 ///   project's rules in the brief (C2, "Rules").
 /// - `skills.include_instructions=false` lists no skill to the model, the
@@ -62,6 +66,8 @@ const LAUNCH_ARGS: &[&str] = &[
     "--ephemeral",
     "--json",
     "--ignore-user-config",
+    "--disable",
+    "apps",
     "--ignore-rules",
     "-c",
     "skills.include_instructions=false",
@@ -469,7 +475,7 @@ mod tests {
         let mut request = request(Role::Verify, PermissionLevel::ReadOnly);
         assert_eq!(
             joined(&request),
-            "exec --ephemeral --json --ignore-user-config --ignore-rules \
+            "exec --ephemeral --json --ignore-user-config --disable apps --ignore-rules \
              -c skills.include_instructions=false -c project_doc_max_bytes=0 \
              --dangerously-bypass-approvals-and-sandbox \
              --output-schema /run/schema.json -o /run/last-message.json -"
