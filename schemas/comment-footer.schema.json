@@ -81,6 +81,11 @@
           "description": "The intake's verdict and the dependencies it found (OWL-248).",
           "type": "string",
           "const": "INTAKE"
+        },
+        {
+          "description": "The plan of a ticket's design run once its review passes end, with\nthe findings left and the reviewers that ran (OWL-303).",
+          "type": "string",
+          "const": "PLAN"
         }
       ]
     },

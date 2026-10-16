@@ -85,6 +85,7 @@ use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
     Verdict as AnswerVerdict,
 };
+use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::GatePolicy;
@@ -900,6 +901,12 @@ struct Prepared {
     /// The intake record, as the ticket ref keeps it or as intake just made
     /// it: every write of the ref carries it ([`OnDemand::store_delivery`]).
     intake: Option<TicketIntake>,
+    /// The ticket's plan, as the ticket ref keeps it or as a design run just
+    /// made it (OWL-303): every write of the ref carries it, as `intake`.
+    plan: Option<TicketPlan>,
+    /// The ticket's review passes, as the ticket ref keeps them or as a
+    /// review pass just added one (OWL-303): every write carries them.
+    review: Option<TicketReview>,
 }
 
 impl Prepared {
@@ -1301,6 +1308,10 @@ impl OnDemand<'_> {
             intake: stored
                 .as_ref()
                 .and_then(|stored| stored.record.intake.clone()),
+            plan: stored.as_ref().and_then(|stored| stored.record.plan.clone()),
+            review: stored
+                .as_ref()
+                .and_then(|stored| stored.record.review.clone()),
             stored,
             heeded: false,
             repairing: false,
@@ -2602,6 +2613,8 @@ impl OnDemand<'_> {
             questions,
             delivery,
             intake: p.intake.clone(),
+            plan: p.plan.clone(),
+            review: p.review.clone(),
         };
         let kept = p
             .stored

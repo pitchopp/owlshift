@@ -5,9 +5,11 @@
 //! continue` knows the round, its re-asks and failed runs, and which comments
 //! are the runner's asks; once a delivery was made, the pull request
 //! `owlshift watch` follows ([`DELIVERY_FILE`], OWL-209); and once intake
-//! ran, its record ([`INTAKE_FILE`], OWL-248); and once a run proposed a
-//! follow-up, the proposals and what became of them ([`PROPOSALS_FILE`],
-//! OWL-253), which no write drops but [`forget`]'s of an invalid one.
+//! ran, its record ([`INTAKE_FILE`], OWL-248); once a design run wrote a
+//! plan, the plan ([`PLAN_FILE`]) and its review passes ([`REVIEW_FILE`],
+//! OWL-303); and once a run proposed a follow-up, the proposals and what
+//! became of them ([`PROPOSALS_FILE`], OWL-253), which no write drops but
+//! [`forget`]'s of an invalid one.
 //!
 //! The ref lives in the dedicated checkout only (decided 2026-10-02): it is
 //! not pushed, which architecture section 7 plans for once claims exist
@@ -37,9 +39,10 @@ use sha2::{Digest, Sha256};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    DELIVERY_FILE, INTAKE_FILE, PROPOSALS_FILE, PersistedState, QUESTIONS_FILE, STATE_FILE,
-    TICKETS_PREFIX, TicketDelivery, TicketQuestions, ticket_ref,
+    DELIVERY_FILE, INTAKE_FILE, PLAN_FILE, PROPOSALS_FILE, PersistedState, QUESTIONS_FILE,
+    REVIEW_FILE, STATE_FILE, TICKETS_PREFIX, TicketDelivery, TicketQuestions, ticket_ref,
 };
+use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
 
@@ -62,6 +65,12 @@ pub struct TicketRecord {
     /// The intake record, once intake ran: `None` when the tree holds no
     /// [`INTAKE_FILE`] (OWL-248).
     pub intake: Option<TicketIntake>,
+    /// The latest plan of the ticket's design runs, once one wrote it:
+    /// `None` when the tree holds no [`PLAN_FILE`] (OWL-303).
+    pub plan: Option<TicketPlan>,
+    /// The review passes of the ticket, once one ran: `None` when the tree
+    /// holds no [`REVIEW_FILE`] (OWL-303).
+    pub review: Option<TicketReview>,
 }
 
 /// The hash an intake record keeps of a ticket's text (architecture section
@@ -105,8 +114,8 @@ pub enum ProposalsFile<'a> {
 /// point to a commit, a tree without both files as regular blobs, a file
 /// that does not parse, or asks that do not match the state (a ticket
 /// waiting for answers to a round the asks do not end with) is an error.
-/// [`DELIVERY_FILE`], [`INTAKE_FILE`] and [`PROPOSALS_FILE`] are optional,
-/// checked like the two others when present.
+/// [`DELIVERY_FILE`], [`INTAKE_FILE`], [`PLAN_FILE`], [`REVIEW_FILE`] and
+/// [`PROPOSALS_FILE`] are optional, checked like the two others when present.
 /// Other entries of the tree are left alone.
 pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stored>, String> {
     let name = ticket_ref(ticket);
@@ -186,7 +195,13 @@ fn read_listed(
     }
     let entries = tree_entries(git, checkout, &listed.oid).map_err(ReadError::Git)?;
     let has = |file: &str| entries.iter().any(|entry| entry.name == file);
-    let optional: Vec<&str> = [DELIVERY_FILE, INTAKE_FILE, PROPOSALS_FILE]
+    let optional: Vec<&str> = [
+        DELIVERY_FILE,
+        INTAKE_FILE,
+        PLAN_FILE,
+        REVIEW_FILE,
+        PROPOSALS_FILE,
+    ]
         .into_iter()
         .filter(|file| has(file))
         .collect();
@@ -228,6 +243,24 @@ fn read_listed(
     } else {
         None
     };
+    let plan = if has(PLAN_FILE) {
+        let text = next(PLAN_FILE)?;
+        Some(
+            TicketPlan::parse(&text)
+                .map_err(|e| broken(format!("holds an invalid {PLAN_FILE}: {e}")))?,
+        )
+    } else {
+        None
+    };
+    let review = if has(REVIEW_FILE) {
+        let text = next(REVIEW_FILE)?;
+        Some(
+            TicketReview::parse(&text)
+                .map_err(|e| broken(format!("holds an invalid {REVIEW_FILE}: {e}")))?,
+        )
+    } else {
+        None
+    };
     let proposals = if has(PROPOSALS_FILE) {
         let text = next(PROPOSALS_FILE)?;
         Some(
@@ -244,6 +277,8 @@ fn read_listed(
             questions,
             delivery,
             intake,
+            plan,
+            review,
         },
         commit: listed.oid.clone(),
         proposals,
@@ -410,8 +445,9 @@ pub fn states(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, RefState)>, S
 /// the new commit. `previous` is the commit the ref was read at, `None` when
 /// it did not exist: the ref moves only from there, and the new commit has
 /// it as its parent and keeps every other entry of its tree but
-/// [`DELIVERY_FILE`] and [`INTAKE_FILE`], each written when the record has
-/// it and left out when it has none. [`PROPOSALS_FILE`] is kept as it is:
+/// [`DELIVERY_FILE`], [`INTAKE_FILE`], [`PLAN_FILE`] and [`REVIEW_FILE`],
+/// each written when the record has it and left out when it has none.
+/// [`PROPOSALS_FILE`] is kept as it is:
 /// [`write_proposals`] writes it.
 ///
 /// A file that would hold more than [`MAX_FILE`] bytes is refused before
@@ -450,6 +486,12 @@ pub fn write_proposals(
     if let Some(intake) = &record.intake {
         files.push((INTAKE_FILE, intake.render()));
     }
+    if let Some(plan) = &record.plan {
+        files.push((PLAN_FILE, plan.render()));
+    }
+    if let Some(review) = &record.review {
+        files.push((REVIEW_FILE, review.render()));
+    }
     if let ProposalsFile::Write(proposals) = proposals {
         files.push((PROPOSALS_FILE, proposals.render()));
     }
@@ -475,8 +517,15 @@ pub fn write_proposals(
         for entry in tree_entries(git, checkout, previous)? {
             let replaced = entry.name == PROPOSALS_FILE && proposals != ProposalsFile::Keep;
             if !replaced
-                && ![STATE_FILE, QUESTIONS_FILE, DELIVERY_FILE, INTAKE_FILE]
-                    .contains(&entry.name.as_str())
+                && ![
+                    STATE_FILE,
+                    QUESTIONS_FILE,
+                    DELIVERY_FILE,
+                    INTAKE_FILE,
+                    PLAN_FILE,
+                    REVIEW_FILE,
+                ]
+                .contains(&entry.name.as_str())
             {
                 tree.extend_from_slice(
                     format!(
@@ -561,7 +610,8 @@ pub enum Previous {
 /// zero, and of `questions.json` only Build's and the resolver's kept
 /// refusals, which the next runs are told. `delivery.json` goes: nothing is
 /// followed any more, and `owlshift do` delivers again (OWL-209). So does
-/// `intake.json`: the drain runs intake again (OWL-245). The asks, their verdicts, what
+/// `intake.json`: the drain runs intake again (OWL-245). So do `plan.json`
+/// and `review.json`: the next dispatch designs anew (OWL-303). The asks, their verdicts, what
 /// the last answer check read and the decisions go; their comments stay on
 /// the ticket. A record that cannot be read gives what still reads on its
 /// own: the round of a `state.json` that parses, the refusals of a
@@ -643,6 +693,8 @@ fn kept(round: u32, questions: Option<&TicketQuestions>) -> Result<TicketRecord,
         },
         delivery: None,
         intake: None,
+        plan: None,
+        review: None,
     })
 }
 

@@ -46,10 +46,13 @@ pub enum MarkerKind {
     Reply,
     /// The intake's verdict and the dependencies it found (OWL-248).
     Intake,
+    /// The plan of a ticket's design run once its review passes end, with
+    /// the findings left and the reviewers that ran (OWL-303).
+    Plan,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -58,6 +61,7 @@ impl MarkerKind {
         Self::Delivery,
         Self::Reply,
         Self::Intake,
+        Self::Plan,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -70,6 +74,7 @@ impl MarkerKind {
             Self::Delivery => "DELIVERY",
             Self::Reply => "REPLY",
             Self::Intake => "INTAKE",
+            Self::Plan => "PLAN",
         }
     }
 

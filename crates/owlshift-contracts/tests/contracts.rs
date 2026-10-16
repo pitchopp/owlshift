@@ -2111,11 +2111,18 @@ fn comment_headers() {
     };
     assert_eq!(intake.render(), "[owlshift] INTAKE");
     assert_eq!(Header::parse(&intake.render()).unwrap(), intake);
+    let plan = Header {
+        kind: MarkerKind::Plan,
+        round: None,
+    };
+    assert_eq!(plan.render(), "[owlshift] PLAN");
+    assert_eq!(Header::parse(&plan.render()).unwrap(), plan);
 
     for (line, needle) in [
         ("[owlshift] QUESTIONS", "needs a round"),
         ("[owlshift] DELIVERY · round 1", "takes no round"),
         ("[owlshift] INTAKE · round 1", "takes no round"),
+        ("[owlshift] PLAN · round 1", "takes no round"),
         ("[owlshift] QUESTIONS · round 0", "invalid round"),
         ("[owlshift] QUESTIONS · round 02", "invalid round"),
         ("[owlshift] QUESTIONS · round two", "invalid round"),
