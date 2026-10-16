@@ -303,6 +303,46 @@ pub struct BaseChecks {
     pub rate: Option<RateLimit>,
 }
 
+/// A review submitted on a pull request (OWL-307, architecture section 5,
+/// "Review comments on the pull request"): never a pending one, which only
+/// its author sees and has not sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Review {
+    /// GitHub's id of the review, the one its REST API gives; past 2^32.
+    pub id: u64,
+    /// Its author's login; `None` for an account GitHub no longer knows.
+    pub author: Option<String>,
+    /// `COMMENTED`, `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`, as
+    /// GitHub writes it: the state plays no part in what Owlshift does.
+    pub state: String,
+    pub submitted_at: Timestamp,
+    /// Empty when the review has inline comments only.
+    pub body: String,
+    /// The commit the review was made on, when GitHub still has it.
+    pub commit: Option<CommitId>,
+    /// Its inline comments, in GitHub's order: the first 100.
+    pub comments: Vec<InlineComment>,
+}
+
+/// An inline comment of a review.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineComment {
+    /// The file, from the repository's root.
+    pub path: String,
+    /// Its line in the pull request's head; `None` once a later push made
+    /// the comment outdated.
+    pub line: Option<u32>,
+    pub body: String,
+}
+
+/// The reviews of a pull request, oldest first: the newest 100 submitted
+/// ones, and the read's cost when GitHub reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewsRead {
+    pub reviews: Vec<Review>,
+    pub rate: Option<RateLimit>,
+}
+
 /// What a check set says about the pull request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {

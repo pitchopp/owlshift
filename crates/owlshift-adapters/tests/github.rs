@@ -13,6 +13,12 @@
 //! `rate-limited.json` alone is made up in the shape GitHub documents, and
 //! says so and why in its `recorded` line and on each exchange.
 //!
+//! The reviews' read (OWL-307) was recorded live on 2026-10-16 by
+//! `record_review_fixtures`, read-only, on throwaway pull request #2 of the
+//! private repository `pitchopp/owlshift-live-sandbox`, whose reviews were
+//! made for it: a review with a body and an inline comment a later push made
+//! outdated, one with an inline comment alone, and a reply in a thread.
+//!
 //! To record again, with a token that can read the repository in
 //! `OWLSHIFT_GITHUB_TOKEN`, or logged in with `gh` (`record_fixtures` for
 //! delivery's fixtures, `record_watch_fixtures` for watch's):
@@ -45,6 +51,12 @@ const FOLLOW_CONFLICTING: &str = "follow-conflicting.json";
 const FOLLOW_MERGED: &str = "follow-merged.json";
 const BASE_CHECKS: &str = "base-checks.json";
 const RATE_LIMITED: &str = "rate-limited.json";
+const REVIEWS: &str = "reviews.json";
+
+/// The throwaway pull request whose reviews were recorded (OWL-307), and
+/// its repository.
+const REVIEWED: u64 = 2;
+const SANDBOX: &str = "pitchopp/owlshift-live-sandbox";
 
 /// The pull request of the made-up rate-limited fixture.
 const FOLLOWED: u64 = 42;
@@ -451,4 +463,86 @@ fn record_watch_fixtures() {
         rate.remaining
     );
     r.write(BASE_CHECKS, &recorded);
+}
+
+/// The reviews of a pull request in one query (OWL-307): ids past 2^32,
+/// the author's login, a body or none, an outdated inline comment without
+/// its line, and a reply in a thread read as a review of its own.
+#[test]
+fn reads_the_reviews_of_a_pull_request_with_their_inline_comments() {
+    let replay = Replay::of(&dir(), REVIEWS);
+    let read = GitHubForge::with_transport(replay.clone(), Repo::parse(SANDBOX).unwrap())
+        .reviews(REVIEWED)
+        .unwrap();
+    replay.assert_done();
+    let rate = read.rate.expect("rateLimit in the reviews' query");
+    assert_eq!(rate.cost, 1);
+    let [first, inline, reply] = &read.reviews[..] else {
+        panic!("{:?}", read.reviews);
+    };
+    for review in &read.reviews {
+        assert!(review.id > u64::from(u32::MAX), "{review:?}");
+        assert_eq!(review.author.as_deref(), Some("pitchopp"));
+        assert_eq!(review.state, "COMMENTED");
+    }
+    assert_eq!(first.body, "Please rename the file.");
+    assert_eq!(first.comments.len(), 1);
+    assert_eq!(first.comments[0].path, "owl-307-review.txt");
+    assert_eq!(first.comments[0].line, None, "outdated by a later push");
+    assert_eq!(first.comments[0].body, "Say two in digits.");
+    assert_eq!(inline.body, "");
+    assert_eq!(inline.comments[0].line, Some(3));
+    assert_eq!(reply.comments[0].body, "A reply in the thread.");
+    assert!(first.submitted_at < inline.submitted_at && inline.submitted_at < reply.submitted_at);
+    assert!(first.commit.is_some());
+}
+
+/// The reviews' query names every submitted state, so a pending review,
+/// which GitHub shows its own author, is never read (checked live on
+/// 2026-10-16), and an answer without a submission time is dropped.
+#[test]
+fn a_pending_review_is_never_read() {
+    let replay = Replay::of(&dir(), REVIEWS);
+    GitHubForge::with_transport(replay.clone(), Repo::parse(SANDBOX).unwrap())
+        .reviews(REVIEWED)
+        .unwrap();
+    let fixture = support::load(&dir(), REVIEWS);
+    let query = fixture.exchanges[0].request["query"].as_str().unwrap();
+    assert!(
+        query.contains("states: [COMMENTED, APPROVED, CHANGES_REQUESTED, DISMISSED]"),
+        "{query}"
+    );
+    let mut answer = fixture.exchanges[0].response.clone();
+    let nodes = &mut answer["data"]["repository"]["pullRequest"]["reviews"]["nodes"];
+    nodes[0]["submittedAt"] = Value::Null;
+    nodes[0]["state"] = json!("PENDING");
+    let mut exchange = fixture.exchanges[0].clone();
+    exchange.response = answer;
+    let pending = support::Replay::from_exchanges("pending", vec![exchange]);
+    let read = GitHubForge::with_transport(pending.clone(), Repo::parse(SANDBOX).unwrap())
+        .reviews(REVIEWED)
+        .unwrap();
+    pending.assert_done();
+    assert_eq!(read.reviews.len(), 2);
+    assert!(read.reviews.iter().all(|review| review.state != "PENDING"));
+}
+
+/// Records the reviews' read on the sandbox's throwaway pull request #2
+/// (OWL-307), read-only: its reviews were made for the check (c) of the
+/// build plan, and the pull request is closed.
+///
+/// ```sh
+/// cargo test -p owlshift-adapters --test github -- --ignored --nocapture record_review_fixtures
+/// ```
+#[test]
+#[ignore = "records against the live GitHub API"]
+fn record_review_fixtures() {
+    let token = support::github_token();
+    let recorded = format!("{} on {SANDBOX}, recorded live", jiff::Zoned::now().date());
+    let r = Recorder::over(HttpTransport::new(token), dir());
+    let read = GitHubForge::with_transport(r.clone(), Repo::parse(SANDBOX).unwrap())
+        .reviews(REVIEWED)
+        .unwrap();
+    assert_eq!(read.reviews.len(), 3, "{:?}", read.reviews);
+    r.write(REVIEWS, &recorded);
 }

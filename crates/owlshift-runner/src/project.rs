@@ -31,6 +31,7 @@
 //! crash or a Ctrl-C in the middle of a run leaves it too. While it exists,
 //! `owlshift do` refuses the project until a person looks.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
@@ -474,6 +475,21 @@ pub fn admitters_at(
     base: &Base,
 ) -> Result<Option<Vec<String>>, String> {
     Ok(config_at(git, checkout, base)?.and_then(|config| config.tracker.admitters))
+}
+
+/// The `[forge].reviewers` of the project file as the base commit holds it
+/// (OWL-307, architecture section 5, "Review comments on the pull
+/// request"), read as [`admitters_at`] reads the admitters, for the same
+/// reason: a run cannot choose whose review instructs it. `None` when the
+/// file, or its `[forge]` table, is absent: no review is read.
+pub fn forge_reviewers_at(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+) -> Result<Option<BTreeMap<String, String>>, String> {
+    Ok(config_at(git, checkout, base)?
+        .and_then(|config| config.forge)
+        .map(|forge| forge.reviewers))
 }
 
 /// The project file at the base commit, parsed; `None` when there is none.

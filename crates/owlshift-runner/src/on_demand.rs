@@ -53,7 +53,10 @@
 //! project's `pipeline.default`, read at each command. Every variant's Build,
 //! once its gate passed, goes through Verify before the push (OWL-304): its
 //! roster reviews the diff, and what it finds is fixed, rejected, asked or
-//! proposed; see the `verify` module.
+//! proposed; see the `verify` module. A review of the decider's on a
+//! delivered pull request sends its ticket back to Build on the delivered
+//! branch, then through Verify to a push to the same pull request (OWL-307);
+//! see the `review_loop` module.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -71,13 +74,13 @@ use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::push::{PushError, Pushed};
 use owlshift_adapters::forge::{
     self as forge, Branch, Check, CheckSet, CheckState, CommitId, ErrorKind, PrState, PullRequest,
-    Repo, Verdict,
+    Repo, ReviewsRead, Verdict,
 };
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, RebaseBrief, Relation,
-    ThreadEntry, TicketBrief,
+    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, PullRequestReview,
+    RebaseBrief, Relation, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
@@ -86,14 +89,15 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
-    Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision, KeptReport,
-    OwedReport, PersistedState, PushKind, Pushing, TicketDelivery, TicketQuestions, cut_reason,
+    AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision,
+    KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketDelivery, TicketQuestions,
+    cut_reason,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
     Verdict as AnswerVerdict,
 };
-use owlshift_contracts::review::{TicketPlan, TicketReview};
+use owlshift_contracts::review::{KeptBuild, TicketPlan, TicketReview};
 use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::GatePolicy;
@@ -126,7 +130,7 @@ use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
     Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment,
     Posted, QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart,
-    ResumeComment, VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
+    ResumeComment, Reviewed, VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 
@@ -148,9 +152,11 @@ mod correction;
 mod design;
 mod drain;
 mod intake;
+mod review_loop;
 mod verify;
 
 use design::Built;
+use review_loop::{in_review_loop, loop_base, loop_reviews};
 use verify::Verified;
 
 pub(crate) use drain::delivery_followed;
@@ -1193,11 +1199,26 @@ impl OnDemand<'_> {
             return Err(nothing_to_continue(ticket));
         };
         let mut state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
+        // A review loop's pull request first (OWL-307): one merged, closed
+        // or pushed to by someone else ends the loop, and a push of its own
+        // a crash cut short is adopted, before anything runs or restarts.
+        if in_review_loop(&p)
+            && let Some(look) = self.loop_outlived(&mut p, sink)?
+        {
+            return Err(look);
+        }
         // At Verify, parked or cut short, the pass runs again on the Build
         // the ref keeps (OWL-304): refused, before a park is restarted or
         // anything kept, when that Build is no longer what would be pushed.
-        if state.stage() == Stage::Verify {
-            self.verify_resumable(&p)?;
+        // A review loop's Build runs again instead (OWL-307): `do` is
+        // refused while its pull request is followed.
+        if state.stage() == Stage::Verify
+            && let Err(why) = self.verify_resumable(&p)
+        {
+            if !in_review_loop(&p) {
+                return Err(why);
+            }
+            state = self.rebuild_loop(&mut p, state, why, sink)?;
         }
         // A person typing `continue` on a parked ticket is the restart the
         // core waits for.
@@ -1520,7 +1541,26 @@ impl OnDemand<'_> {
         // The decider's replies to a DECISION, which the correction reads
         // again under this command's lock (OWL-146).
         if !p.questions().decisions.is_empty() {
-            return self.correct(p, &mut following, sink);
+            match self.correct(p, &mut following, sink) {
+                // Nothing to correct: the reviews may start a loop.
+                Err(Stop::Watched { .. }) => {}
+                outcome => return outcome,
+            }
+        }
+        // The reviews on the pull request, which may loop back to Build
+        // (OWL-307), when the read asks for no repair.
+        if self.config.forge.is_some()
+            && matches!(
+                seen.decision,
+                FollowDecision::Follow {
+                    adopt: false,
+                    action: FollowAction::Green
+                        | FollowAction::WaitChecks
+                        | FollowAction::WaitBaseRed,
+                }
+            )
+        {
+            return self.review_loop(p, None, sink);
         }
         Err(Stop::Watched {
             ticket,
@@ -1692,6 +1732,8 @@ impl OnDemand<'_> {
             tell_build(&mut brief, &p.questions());
             // The plan the Build follows, with its base (OWL-303).
             brief.plan = design::given_plan(p);
+            // In a review loop, the reviews it answers (OWL-307).
+            brief.pull_request_reviews = loop_reviews(p);
             // The findings of the latest Verify pass, to fix or answer
             // (OWL-304).
             brief.findings = verify::verify_input(&state, p.review.as_ref(), confirmation)
@@ -1714,8 +1756,10 @@ impl OnDemand<'_> {
                 .unwrap_or_default();
             // A Build that cannot follow its plan asks a `replan` (OWL-303):
             // once settled, the ticket goes back to Design. On `trivial`,
-            // which has no Design, it is a plain question.
+            // which has no Design, it is a plain question, and so it is in
+            // a review loop, whose questions return to Build (OWL-307).
             let replan = p.pipeline.contains(Stage::Design)
+                && !in_review_loop(p)
                 && result.is_some_and(|result| result.questions.iter().any(|q| q.replan));
             // Questions go through the resolver before any reaches the
             // decider: the core's `Questions` comes after it, for what is
@@ -1734,7 +1778,7 @@ impl OnDemand<'_> {
             {
                 // On an approved plan a `replan` goes to the decider, never
                 // to the resolver (architecture section 5, "Plan approval").
-                let forced = if design::plan_approved(p) {
+                let forced = if replan && design::plan_approved(p) {
                     result
                         .questions
                         .iter()
@@ -1867,10 +1911,18 @@ impl OnDemand<'_> {
                     );
                     reversal::followed(&mut questions, &reversed);
                     let built = self.kept_build(p, &ran.report, &gathered, &comments)?;
+                    // A review loop's Build that committed nothing ends the
+                    // loop, with no Verify pass and no push (OWL-307).
+                    if loop_base(p).is_some_and(|pushed| pushed.as_str() == built.commit) {
+                        return self
+                            .review_unchanged(p, state, questions, built, sink)
+                            .map(Built::Delivered);
+                    }
                     let review = p.review.get_or_insert_with(|| TicketReview {
                         format: Format,
                         passes: Vec::new(),
                         answered_reviews: Vec::new(),
+                        answering: Vec::new(),
                         build: None,
                     });
                     if let (Some(given), Some(result)) = (&brief.findings, ran.result()) {
@@ -1894,8 +1946,25 @@ impl OnDemand<'_> {
                 }
             }
         }
-        self.deliver(p, dispatched, &state, sink)
+        self.deliver_verified(p, dispatched, &state, sink)
             .map(Built::Delivered)
+    }
+
+    /// Delivers the Build Verify passed: to the followed pull request in a
+    /// review loop ([`Self::deliver_review`], OWL-307), else as a first
+    /// delivery ([`Self::deliver`]).
+    fn deliver_verified(
+        &self,
+        p: &mut Prepared,
+        dispatched: &Dispatched,
+        state: &TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        if in_review_loop(p) {
+            self.deliver_review(p, state, sink)
+        } else {
+            self.deliver(p, dispatched, state, sink)
+        }
     }
 
     /// One run of the build role from `brief` on `harness`, in `state`, for
@@ -3336,6 +3405,16 @@ impl OnDemand<'_> {
         // what CI merges the head with.
         let base_at_push = self.base_head(p, base, ticket, sink);
         let mut kept = TicketDelivery::new(head.as_str(), base.as_str());
+        // Dated before the pull request can be reviewed, and kept by a
+        // retry of this same delivery, one that never reached its pull
+        // request: a review before it is not this delivery's (OWL-307).
+        kept.delivered_at = p
+            .stored
+            .as_ref()
+            .and_then(|stored| stored.record.delivery.as_ref())
+            .filter(|earlier| earlier.ended.is_none() && earlier.pull_request.is_none())
+            .and_then(|earlier| earlier.delivered_at)
+            .or_else(|| Some((self.clock)()));
         kept.pushing = Some(Pushing {
             commit: commit.to_string(),
             kind: PushKind::Delivery,
@@ -3580,15 +3659,29 @@ impl Repaired {
             },
             checks: match kind {
                 RepairKind::Fix { checks } => checks.clone(),
-                RepairKind::Rebase { .. } | RepairKind::Correction { .. } => Vec::new(),
+                RepairKind::Rebase { .. }
+                | RepairKind::Correction { .. }
+                | RepairKind::Review { .. } => Vec::new(),
             },
             questions: match kind {
                 RepairKind::Correction { questions } => questions.clone(),
-                RepairKind::Fix { .. } | RepairKind::Rebase { .. } => Vec::new(),
+                RepairKind::Fix { .. } | RepairKind::Rebase { .. } | RepairKind::Review { .. } => {
+                    Vec::new()
+                }
             },
-            notes: Vec::new(),
+            notes: match kind {
+                RepairKind::Review { notes, .. } => notes.clone(),
+                RepairKind::Fix { .. }
+                | RepairKind::Rebase { .. }
+                | RepairKind::Correction { .. } => Vec::new(),
+            },
             followups: followups.to_vec(),
-            reviews: Vec::new(),
+            reviews: match kind {
+                RepairKind::Review { reviews, .. } => reviews.clone(),
+                RepairKind::Fix { .. }
+                | RepairKind::Rebase { .. }
+                | RepairKind::Correction { .. } => Vec::new(),
+            },
         }
     }
 }
@@ -3619,6 +3712,13 @@ enum RepairKind {
     /// A correction run's, following the decider's replies to the DECISION
     /// comments of these questions (OWL-146): a fast-forward.
     Correction { questions: Vec<String> },
+    /// A review loop's Build, answering these reviews of the pull request,
+    /// with the runner's notes of its runs (OWL-307): a fast-forward, from
+    /// Verify, which leaves the loop at Watch once it lands.
+    Review {
+        reviews: Vec<AnsweredReview>,
+        notes: Vec<Decision>,
+    },
 }
 
 impl RepairKind {
@@ -3627,6 +3727,7 @@ impl RepairKind {
             Self::Fix { .. } => "fix",
             Self::Rebase { .. } => "rebase",
             Self::Correction { .. } => "correction",
+            Self::Review { .. } => "review",
         }
     }
 }
@@ -3674,7 +3775,27 @@ impl OnDemand<'_> {
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        let mut p = match self.prepare(ticket, Command::Fix) {
+        let mut p = match self.prepare_at_watch(ticket, seen, Command::Fix)? {
+            Ok(p) => p,
+            Err(stop) => return Some(Err(stop)),
+        };
+        Some(self.repair(&mut p, failing_for, following, sink))
+    }
+
+    /// What a run watch decides at Watch starts from (a repair, a
+    /// correction, a review loop): `command`'s preparation, only while the
+    /// ticket ref, read under the project's lock, is still `seen`, the
+    /// commit watch read it at, and keeps a ticket at Watch. `None`, with
+    /// nothing run, kept or recorded, when the project is busy, or the ref
+    /// moved or no longer keeps a ticket at Watch: the next pass reads it
+    /// again.
+    fn prepare_at_watch(
+        &self,
+        ticket: &TicketId,
+        seen: &str,
+        command: Command,
+    ) -> Option<Result<Prepared, Stop>> {
+        let p = match self.prepare(ticket, command) {
             Ok(p) => p,
             Err(Stop::Busy(_)) => return None,
             Err(stop) => return Some(Err(stop)),
@@ -3686,7 +3807,7 @@ impl OnDemand<'_> {
         {
             return None;
         }
-        Some(self.repair(&mut p, failing_for, following, sink))
+        Some(Ok(p))
     }
 
     /// Repairs the followed pull request of a ticket at Watch (OWL-112,
@@ -4429,7 +4550,10 @@ impl OnDemand<'_> {
     /// Owlshift's own push, which parks the ticket; one rejected because the
     /// branch moved is someone's push, which ends the following at the next
     /// read. A push with no verdict is a failed run, its commit pushed again
-    /// next time.
+    /// next time. A review loop's commit (OWL-307) is pushed as a fix's,
+    /// from Verify: once it lands the ticket is back at Watch, with the
+    /// reviews answered in the same write; a push the forge refuses leaves
+    /// it at Verify for `continue`, as a first delivery's does.
     #[allow(clippy::too_many_arguments)]
     fn push_repair(
         &self,
@@ -4457,10 +4581,13 @@ impl OnDemand<'_> {
                 RepairKind::Fix { .. } => PushKind::Fix,
                 RepairKind::Rebase { .. } => PushKind::Rebase,
                 RepairKind::Correction { .. } => PushKind::Correction,
+                RepairKind::Review { .. } => PushKind::Review,
             },
             base: base_at_push.clone(),
             onto: match &kind {
-                RepairKind::Fix { .. } | RepairKind::Correction { .. } => None,
+                RepairKind::Fix { .. }
+                | RepairKind::Correction { .. }
+                | RepairKind::Review { .. } => None,
                 RepairKind::Rebase { onto } => Some(onto.to_string()),
             },
             report: Some(report),
@@ -4471,7 +4598,7 @@ impl OnDemand<'_> {
         let writer = Writer::new(self.tracker);
         let git = &self.executor.git;
         let landed = match &kind {
-            RepairKind::Fix { .. } | RepairKind::Correction { .. } => {
+            RepairKind::Fix { .. } | RepairKind::Correction { .. } | RepairKind::Review { .. } => {
                 writer.push_leased(git, &p.checkout, "origin", &commit, &head, pushed)
             }
             RepairKind::Rebase { onto } => {
@@ -4500,6 +4627,17 @@ impl OnDemand<'_> {
                 self.store_delivery(p, &state, questions, Some(kept))
                     .map_err(|e| refused("keeping the refused push in the ticket's ref", e))?;
                 let remote = self.remote_head(p, &head);
+                // A review loop's push the forge refuses leaves the ticket at
+                // Verify, as a first delivery's does: the park at a refusal
+                // is Watch's (OWL-307).
+                if remote.as_deref() == Ok(pushed.as_str())
+                    && matches!(kind, RepairKind::Review { .. })
+                {
+                    return Err(Stop::Delivery(format!(
+                        "the forge refused Owlshift's push of {commit} to {head}: {reason}; the \
+                         ticket stays at verify, and `owlshift continue {ticket}` pushes it again"
+                    )));
+                }
                 if remote.as_deref() == Ok(pushed.as_str()) {
                     let parked = match state.apply(PIPELINE, Event::ForgeBlocked) {
                         Ok(Transition::Parked { state, .. }) => state,
@@ -4570,15 +4708,20 @@ impl OnDemand<'_> {
                 )));
             }
         };
-        let event = match kind {
-            RepairKind::Fix { .. } => Event::FixPushed,
-            RepairKind::Rebase { .. } => Event::RebasePushed,
-            RepairKind::Correction { .. } => Event::Corrected,
+        // A review loop's push ends it: from Verify, through Deliver, to
+        // Watch (OWL-307).
+        let events: &[Event] = match kind {
+            RepairKind::Fix { .. } => &[Event::FixPushed],
+            RepairKind::Rebase { .. } => &[Event::RebasePushed],
+            RepairKind::Correction { .. } => &[Event::Corrected],
+            RepairKind::Review { .. } => &[Event::Completed, Event::Completed],
         };
-        state = match state.apply(PIPELINE, event) {
-            Ok(Transition::To(next)) => next,
-            other => return Err(core_error(other)),
-        };
+        for event in events {
+            state = match state.apply(PIPELINE, *event) {
+                Ok(Transition::To(next)) => next,
+                other => return Err(core_error(other)),
+            };
+        }
         // The report is owed from the write that keeps the push, so a
         // tracker that refuses it, or a crash, leaves it for the next pass
         // (OWL-218).
@@ -4590,8 +4733,14 @@ impl OnDemand<'_> {
                 // A correction counts no fix pass: its report counts the
                 // decisions it follows the replies to (OWL-146).
                 RepairKind::Correction { questions } => questions.len() as u32,
+                // A review loop's report counts 1, as a delivery's.
+                RepairKind::Review { .. } => 1,
             };
             replaced = follow::landed_owing(&mut kept, pushing, count);
+        }
+        // The reviews answered, in the write that keeps the push landed.
+        if matches!(kind, RepairKind::Review { .. }) {
+            review_loop::answer_reviews(p);
         }
         // Its follow-ups are owed in the same write, and those of the report
         // it replaces, which is never posted (OWL-253).
@@ -4729,8 +4878,8 @@ impl OnDemand<'_> {
             // The first delivery's report has no lead line, and counts
             // nothing (OWL-236).
             PushKind::Delivery => (None, None, None, None),
-            // No run pushes a review loop's commit yet: its lead line, which
-            // names the reviews answered, comes with the loop (OWL-307).
+            // A review loop's lead names the reviews it answers (OWL-307),
+            // below.
             PushKind::Review => (None, None, None, None),
             PushKind::Correction => {
                 let corrected = Corrected {
@@ -4799,9 +4948,23 @@ impl OnDemand<'_> {
             fix_pass,
             rebase,
             correction,
+            // A delivery's Verify passes, or a review loop's when its Build
+            // changed something: one that changed nothing ran none.
             review: review
-                .filter(|_| owed.kind == PushKind::Delivery)
+                .filter(|_| match owed.kind {
+                    PushKind::Delivery => true,
+                    PushKind::Review => !owed.unchanged,
+                    PushKind::Fix | PushKind::Rebase | PushKind::Correction => false,
+                })
                 .and_then(verify::reported_review),
+            reviewed: (owed.kind == PushKind::Review).then(|| Reviewed {
+                reviews: owed
+                    .report
+                    .as_ref()
+                    .map(|kept| kept.reviews.clone())
+                    .unwrap_or_default(),
+                pushed: !owed.unchanged,
+            }),
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
             Ok(comment) => {

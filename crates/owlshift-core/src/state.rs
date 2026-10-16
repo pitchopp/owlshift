@@ -149,7 +149,7 @@ impl Status {
 /// | At Watch, a read calls for a fix run, before it runs | `FixDue` |
 /// | At Watch, a read calls for a rebase run, before it runs | `RebaseDue` |
 /// | At Watch, a red no run fixes, or a push the forge refused | `ForgeBlocked` |
-/// | While a round waits at Watch, or the ticket is parked there, its pull request was merged, closed, or pushed to by someone else | `FollowingEnded` |
+/// | While a round waits at Watch, or the ticket is parked there, its pull request was merged, closed, or pushed to by someone else; likewise while a review loop's ticket is at Build or Verify, working, waiting or parked there (OWL-307) | `FollowingEnded` |
 /// | A human restarted a parked ticket | `Restarted` |
 /// | A human merged the pull request | `Merged` |
 /// | A human canceled, closed or excluded the ticket | `Withdrawn` |
@@ -234,8 +234,15 @@ pub enum Event {
     /// counts kept. Since OWL-243 it also ends a park at Watch, the park
     /// a person was to look at: back at Watch with the round, the fix passes
     /// and the repairs kept, its re-asks and failed runs cleared. Nothing
-    /// runs after it, and no bound is reset. Valid only while waiting with
-    /// Watch as the return stage, or parked at Watch.
+    /// runs after it, and no bound is reset. Since OWL-307 it also ends a
+    /// review loop, which took a delivered ticket back to Build on reviews of
+    /// its pull request: from Build or Verify, working, waiting for input
+    /// (whose round returns to Build) or parked there, the ticket is back at
+    /// Watch as above, its review passes reset by leaving their loop. The
+    /// state does not know whether a delivery is followed: the runner gives
+    /// it there only for a ticket whose delivery watch follows. Valid only
+    /// while waiting with Watch or Build as the return stage, parked at
+    /// Watch, Build or Verify, or working at Build or Verify.
     FollowingEnded,
     Restarted,
     Merged,
@@ -692,6 +699,23 @@ impl TicketState {
                 failed_runs: 0,
                 ..self.enter(Status::Active(Stage::Watch))
             }),
+            // A review loop the pull request outlived (OWL-307): back at
+            // Watch, its round closed or its park ended as there.
+            (
+                Status::Active(Stage::Build | Stage::Verify)
+                | Status::NeedsInput {
+                    return_to: Stage::Build,
+                }
+                | Status::Parked {
+                    at: Stage::Build | Stage::Verify,
+                    ..
+                },
+                Event::FollowingEnded,
+            ) => Transition::To(Self {
+                reasks: 0,
+                failed_runs: 0,
+                ..self.enter(Status::Active(Stage::Watch))
+            }),
 
             (status, Event::RunFailed) if status.runs() => {
                 let failed_runs = self.failed_runs + 1;
@@ -1079,6 +1103,15 @@ mod tests {
             }
             (
                 Status::NeedsInput { return_to: Watch } | Status::Parked { at: Watch, .. },
+                Event::FollowingEnded,
+            ) => Expect::To(Status::Active(Watch)),
+            // A review loop's ticket (OWL-307).
+            (
+                Status::Active(Build | Verify)
+                | Status::NeedsInput { return_to: Build }
+                | Status::Parked {
+                    at: Build | Verify, ..
+                },
                 Event::FollowingEnded,
             ) => Expect::To(Status::Active(Watch)),
 
@@ -2084,5 +2117,59 @@ mod tests {
             to(reviewed.apply_gated(RISKY, Completed, approved)).status(),
             Status::Active(Stage::Build)
         );
+    }
+
+    /// A review loop (OWL-307): reviews take a delivered ticket from Watch
+    /// back to Build, its repairs no longer counted and its Verify passes
+    /// counted from the first; its end with the pull request brings it back
+    /// to Watch from wherever it waits, and a second loop counts its passes
+    /// afresh.
+    #[test]
+    fn a_review_loop_counts_its_own_passes_and_ends_with_its_pull_request() {
+        use Event::{Completed, FollowingEnded, LoopBack, Questions, RunFailed};
+        let watching = watch(1, 2, 5);
+        let building = to(watching.apply(STANDARD, LoopBack));
+        assert_eq!(building.status(), Status::Active(Stage::Build));
+        assert_eq!(
+            (
+                building.fix_passes(),
+                building.repairs(),
+                building.failed_runs()
+            ),
+            (0, 0, 0)
+        );
+        // Its Build holds the drain's one slot as any Build does.
+        assert!(crate::schedule::holds_slot(&building));
+        assert!(!crate::schedule::holds_slot(&watching));
+        let revised = walk(building, STANDARD, &[Completed, LoopBack, Completed]);
+        assert_eq!(at(revised), (Status::Active(Stage::Verify), 1));
+        // Waiting on the residue's round, then parked on two failed runs of
+        // its answer check: each ends with the pull request.
+        let waiting = to(revised.apply(STANDARD, Questions));
+        assert_eq!(
+            waiting.status(),
+            Status::NeedsInput {
+                return_to: Stage::Build
+            }
+        );
+        let parked = match walk(waiting, STANDARD, &[RunFailed]).apply(STANDARD, RunFailed) {
+            Ok(Transition::Parked { state, .. }) => state,
+            other => panic!("{other:?}"),
+        };
+        for loop_state in [building, revised, waiting, parked] {
+            let ended = to(loop_state.apply(STANDARD, FollowingEnded));
+            assert_eq!(at(ended), (Status::Active(Stage::Watch), 0));
+            assert_eq!((ended.reasks(), ended.failed_runs()), (0, 0));
+            let again = walk(ended, STANDARD, &[LoopBack, Completed]);
+            assert_eq!(at(again), (Status::Active(Stage::Verify), 0));
+        }
+        // Delivered: back at Watch, the loop's passes no longer counted.
+        let delivered = walk(revised, STANDARD, &[Completed, Completed]);
+        assert_eq!(at(delivered), (Status::Active(Stage::Watch), 0));
+        // Elsewhere the end of the following is no event.
+        for stage in [Stage::Design, Stage::DesignReview, Stage::Deliver] {
+            let other = state(Status::Active(stage), 1, 0, 0);
+            assert!(other.apply(STANDARD, FollowingEnded).is_err(), "{stage:?}");
+        }
     }
 }

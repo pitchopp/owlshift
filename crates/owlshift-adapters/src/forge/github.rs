@@ -39,7 +39,8 @@ use owlshift_contracts::brief::MAX_EXCERPT_BYTES;
 
 use crate::forge::{
     BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId, Error,
-    ErrorKind, Mergeable, PrState, PullRequest, PullRequestRead, RateLimit, Repo,
+    ErrorKind, InlineComment, Mergeable, PrState, PullRequest, PullRequestRead, RateLimit, Repo,
+    Review, ReviewsRead,
 };
 pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
@@ -270,6 +271,7 @@ impl GitHubForge {
     pub const CAPABILITIES: &'static [Capability] = &[
         Capability::OpenPullRequest,
         Capability::ReadChecks,
+        Capability::ReadReviewComments,
         Capability::PushBranch,
         Capability::ReadMergeState,
     ];
@@ -381,6 +383,63 @@ impl GitHubForge {
     pub fn follow(&self, number: u64) -> Result<PullRequestRead, Error> {
         let (checks, rate) = self.read_checks(FOLLOW_QUERY, number, None)?;
         Ok(PullRequestRead { checks, rate })
+    }
+
+    /// The reviews submitted on pull request `number` (OWL-307), in one
+    /// query: the newest 100, oldest first, each with its first 100 inline
+    /// comments, and the query's cost. A pending review, which only its
+    /// author sees, is never asked for (checked live on 2026-10-16: GitHub
+    /// shows the token's owner their own pending review unless the states
+    /// are named); one without a submission time is dropped likewise.
+    pub fn reviews(&self, number: u64) -> Result<ReviewsRead, Error> {
+        let variables = json!({
+            "owner": self.repo.owner(), "name": self.repo.name(), "number": number,
+        });
+        let data: ReviewsData = self.call(REVIEWS_QUERY, variables)?;
+        let mut rate = Rates::default();
+        rate.add(data.rate_limit);
+        let pr = data.repository.pull_request.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no pull request #{number} in {}", self.repo),
+            )
+        })?;
+        let mut reviews = Vec::with_capacity(pr.reviews.nodes.len());
+        for node in pr.reviews.nodes {
+            let Some(submitted_at) = node.submitted_at else {
+                continue;
+            };
+            let id = node.full_database_id.parse::<u64>().map_err(|_| {
+                invalid(format!(
+                    "unexpected review id {:?} from GitHub",
+                    node.full_database_id
+                ))
+            })?;
+            reviews.push(Review {
+                id,
+                author: node.author.map(|author| author.login),
+                state: node.state,
+                submitted_at,
+                body: node.body,
+                commit: node
+                    .commit
+                    .and_then(|commit| CommitId::new(commit.oid).ok()),
+                comments: node
+                    .comments
+                    .nodes
+                    .into_iter()
+                    .map(|comment| InlineComment {
+                        path: comment.path,
+                        line: comment.line,
+                        body: comment.body,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(ReviewsRead {
+            reviews,
+            rate: rate.get(),
+        })
     }
 
     /// The checks of `base`'s head and, when given, of `at_push`, each read
@@ -732,6 +791,17 @@ const FOLLOW_QUERY: &str = "query Follow($owner: String!, $name: String!, $numbe
     ... on StatusContext { context state description isRequired(pullRequestNumber: $number) \
     targetUrl } \
     } } } } } } } } }";
+
+/// The reviews of a pull request (OWL-307): every submitted state named, so
+/// no pending review is read; the newest 100, each with its first 100
+/// inline comments. `fullDatabaseId` is the REST id as a string: the ids
+/// are past 2^31, the most GraphQL's `Int` holds.
+const REVIEWS_QUERY: &str = "query Reviews($owner: String!, $name: String!, $number: Int!) { \
+    rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { \
+    pullRequest(number: $number) { \
+    reviews(last: 100, states: [COMMENTED, APPROVED, CHANGES_REQUESTED, DISMISSED]) { \
+    nodes { fullDatabaseId author { login } state submittedAt body commit { oid } \
+    comments(first: 100) { nodes { path line body } } } } } } }";
 
 /// The checks of the base head and of `base_at_push` (OWL-209).
 const BASE_CHECKS_QUERY: &str = "query BaseChecks($owner: String!, $name: String!, \
@@ -1092,6 +1162,60 @@ struct ChecksData {
     repository: ChecksRepository,
     #[serde(default)]
     rate_limit: Option<GhRateLimit>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewsData {
+    repository: ReviewsRepository,
+    #[serde(default)]
+    rate_limit: Option<GhRateLimit>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewsRepository {
+    pull_request: Option<ReviewsPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct ReviewsPullRequest {
+    reviews: Nodes<GhReview>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReview {
+    full_database_id: String,
+    #[serde(default)]
+    author: Option<GhActor>,
+    state: String,
+    #[serde(default)]
+    submitted_at: Option<Timestamp>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    commit: Option<GhOid>,
+    comments: Nodes<GhReviewComment>,
+}
+
+#[derive(Deserialize)]
+struct GhActor {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct GhOid {
+    oid: String,
+}
+
+#[derive(Deserialize)]
+struct GhReviewComment {
+    path: String,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    body: String,
 }
 
 #[derive(Deserialize)]

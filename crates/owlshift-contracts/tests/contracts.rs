@@ -2661,7 +2661,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
                 v["owed"]["unchanged"] = json!(true);
                 v["owed"].as_object_mut().unwrap().remove("report");
             },
-            "an unchanged correction's owed report keeps its questions",
+            "an unchanged owed report keeps its run's report",
         ),
         (
             "a delivery's owed report counting 2",
@@ -2669,7 +2669,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
                 v["owed"]["kind"] = json!("delivery");
                 v["owed"]["count"] = json!(2);
             },
-            "a delivery's owed report counts 1",
+            "a delivery's or a review loop's owed report counts 1",
         ),
     ];
     for (case, edit, reason) in refused {

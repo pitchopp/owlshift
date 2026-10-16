@@ -10,6 +10,7 @@ use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::brief::{PullRequestReview, pull_request_review_problem};
 use crate::format::{self, ContractError, Format, PLAN_FORMAT, REVIEW_FORMAT};
 use crate::ids::{FindingId, check_name, is_commit_id, is_lower_hex};
 use crate::result::{Decision, Followup, PullRequest};
@@ -424,6 +425,14 @@ pub struct TicketReview {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("uniqueItems" = true))]
     pub answered_reviews: Vec<u64>,
+    /// The pull request reviews the review loop under way answers
+    /// (OWL-307), as read when it started: each one an instruction of the
+    /// decider or quoted data, as the loop's Build runs are given them.
+    /// Present from the loop's start to its push landing, or its report
+    /// owed, when their ids move to `answered_reviews`; dropped when watch
+    /// stops following the pull request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answering: Vec<PullRequestReview>,
     /// What the Build that Verify reviews gave for its delivery (OWL-304):
     /// kept once a Build is done and its gate passed, so that `continue`
     /// runs a Verify pass cut short again and delivers. Dropped when the
@@ -557,8 +566,25 @@ pub enum FindingOutcome {
     Proposed,
 }
 
+impl Default for TicketReview {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TicketReview {
     const CONTRACT: &str = "ticket review";
+
+    /// A record with nothing in it yet.
+    pub fn new() -> Self {
+        Self {
+            format: Format,
+            passes: Vec::new(),
+            answered_reviews: Vec::new(),
+            answering: Vec::new(),
+            build: None,
+        }
+    }
 
     /// Parses and validates a `review.json`.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
@@ -579,7 +605,9 @@ impl TicketReview {
     /// `rejected` only, a confirmed ruling anything but `rejected`, a fixed
     /// response `fixed` only); each reviewer a pass names is of its role,
     /// with its mandates distinct and a model named; each answered review is
-    /// named once; and the kept build's commit is a full commit id.
+    /// named once; each review under way once, not answered, with a body or
+    /// a comment, each comment with a path and a body, within the bytes a
+    /// brief gives it; and the kept build's commit is a full commit id.
     ///
     /// Passes are numbered from 1 in each run of consecutive passes at one
     /// stage, each pass the one before it plus 1, or 1 again: a review loop
@@ -685,6 +713,20 @@ impl TicketReview {
                 "pull request review {} is answered twice",
                 self.answered_reviews[n]
             ));
+        }
+        // The loop under way answers each review once, none already
+        // answered, each as a Build brief would carry it (OWL-307).
+        for (n, review) in self.answering.iter().enumerate() {
+            let broken = if self.answering[..n].iter().any(|seen| seen.id == review.id) {
+                Some("is answered twice by the loop under way")
+            } else if self.answered_reviews.contains(&review.id) {
+                Some("is under way although answered")
+            } else {
+                pull_request_review_problem(review)
+            };
+            if let Some(broken) = broken {
+                return invalid(format!("pull request review {} {broken}", review.id));
+            }
         }
         if let Some(build) = &self.build
             && !is_commit_id(&build.commit)

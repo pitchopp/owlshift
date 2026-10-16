@@ -86,6 +86,10 @@ struct FakeGitHub {
     log: Mutex<(u16, u32)>,
     /// What happens at the next read of a head's checks, once (OWL-238).
     at_checks: Mutex<Option<AtChecks>>,
+    /// The reviews submitted on the pull request, as GitHub's GraphQL nodes
+    /// give them (OWL-307), and the reads of them so far.
+    reviews: Mutex<Vec<Value>>,
+    reviews_reads: Mutex<u32>,
 }
 
 /// What happens at the next read of a head's checks.
@@ -189,6 +193,10 @@ impl FakeGitHub {
                     },
                 } } }] },
             } } })
+        } else if query.starts_with("query Reviews") {
+            *self.reviews_reads.lock().unwrap() += 1;
+            let nodes = self.reviews.lock().unwrap().clone();
+            json!({ "repository": { "pullRequest": { "reviews": { "nodes": nodes } } } })
         } else if query.starts_with("query BaseChecks") {
             *self.base_reads.lock().unwrap() += 1;
             let followed = self.followed.lock().unwrap().clone();
@@ -739,6 +747,8 @@ impl Bench {
             base_reads: Mutex::new(0),
             log: Mutex::new((200, 0)),
             at_checks: Mutex::new(None),
+            reviews: Mutex::new(Vec::new()),
+            reviews_reads: Mutex::new(0),
         });
         Self {
             data: tmp.path().join("data"),
@@ -9298,3 +9308,7 @@ fn an_intake_pass_gives_its_resolver_the_resolver_rules() {
     assert_eq!(sources(&briefs[0]), ["AGENTS.md", "docs/intake.md"]);
     assert_eq!(sources(&briefs[1]), ["AGENTS.md", "docs/resolver.md"]);
 }
+
+/// The review loop on a delivered pull request (OWL-307, build plan part J).
+#[path = "on_demand/review_scenarios.rs"]
+mod review_scenarios;

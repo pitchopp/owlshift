@@ -28,6 +28,15 @@
 //! holds the project's lock is moved to the stage its ref shows (OWL-265,
 //! architecture section 5, "The stage while a repair runs").
 //!
+//! Since OWL-307, a read that asks for no repair and ran no correction
+//! leaves room for the reviews on the pull request: one read of them, and a
+//! review of the decider's that `[forge].reviewers` lists starts a review
+//! loop ([`OnDemand::review_seen`]), held as a continue is. A ticket whose
+//! loop is at Build or Verify, working, waiting or parked there, has its
+//! pull request read as a round waiting at Watch has, for an end, which
+//! ends the loop, or for a push of the loop's own a crash cut short, which
+//! is adopted; both under the project's lock.
+//!
 //! Since OWL-273, a ticket an answered intake round left at Intake
 //! (`left_at_intake`), its second intake cut off by a usage limit or a
 //! refusal, is resumed while the tracker still shows it needs input: its
@@ -65,6 +74,7 @@ use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
 use crate::on_demand::{self, Delivered, Landed, OnDemand, PIPELINE, Stop};
+use crate::pr_reviews;
 use crate::project::ProjectLock;
 use crate::reversal::{self, Current};
 use crate::ticket_ref::{self, Stored, TicketRecord};
@@ -468,7 +478,9 @@ impl Watch<'_> {
         for (ticket, stored, status, outlived) in waiting {
             // A stage a stop left at working first (OWL-265): an end then
             // moves the stage it shows to review, which it would not do
-            // from working, so the two may make two moves in one pass.
+            // from working, so the two may make two moves in one pass. A
+            // review loop working at Build or Verify shows working by right
+            // (OWL-307): its stage is left as it is.
             if outlived {
                 self.unstick(memory, sink, out, &ticket, &stored, status);
             }
@@ -576,15 +588,17 @@ impl Watch<'_> {
             }
         ) {
             // A read that asks for no repair leaves room for a correction
-            // (OWL-146).
+            // (OWL-146), then for the reviews on the pull request (OWL-307),
+            // read once the pass ran no correction.
             if matches!(
                 seen.decision,
                 Decision::Follow {
                     adopt: false,
                     action: Action::Green | Action::WaitChecks | Action::WaitBaseRed,
                 }
-            ) {
-                self.correct(memory, sink, continued, ticket, stored, commit);
+            ) && !self.correct(memory, sink, continued, ticket, stored, commit.clone())
+            {
+                self.review(memory, sink, continued, ticket, stored, commit);
             }
             return;
         }
@@ -592,17 +606,41 @@ impl Watch<'_> {
             commit,
             answer: None,
         };
-        if memory.holds.admit(ticket, &held, now) != Admit::Go {
-            return;
-        }
-        let Some(outcome) = on_demand.repair_seen(
-            ticket,
-            &held.commit,
-            seen.failing_for,
-            &mut memory.following,
+        let failing_for = seen.failing_for;
+        self.held_run(
+            memory,
             sink,
-        ) else {
-            return;
+            continued,
+            ticket,
+            held,
+            |seen, following, sink| {
+                on_demand.repair_seen(ticket, seen, failing_for, following, sink)
+            },
+        );
+    }
+
+    /// Runs what watch decided for `ticket` from `held`, unless a hold or a
+    /// pause keeps it back ([`Holds::admit`]), with watch's memory of the
+    /// pull requests it follows: `run` returns `None` when it ran nothing.
+    /// Its outcome is told, then what it did is held as a continue is
+    /// ([`Holds::after`]), from the ticket ref read after it. Returns
+    /// whether it ran.
+    fn held_run(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        continued: &mut Continued<'_>,
+        ticket: &TicketId,
+        held: Seen,
+        run: impl FnOnce(&str, &mut Following, &mut EventSink<'_>) -> Option<Result<Delivered, Stop>>,
+    ) -> bool {
+        let on_demand = self.on_demand;
+        let now = (on_demand.clock)();
+        if memory.holds.admit(ticket, &held, now) != Admit::Go {
+            return false;
+        }
+        let Some(outcome) = run(&held.commit, &mut memory.following, sink) else {
+            return false;
         };
         continued(ticket, &outcome, sink);
         let git = &on_demand.executor.git;
@@ -614,6 +652,112 @@ impl Watch<'_> {
         memory
             .holds
             .after(ticket, held, &outcome, after.as_deref(), now);
+        true
+    }
+
+    /// The reviews on a followed pull request whose read asked for no
+    /// repair (OWL-307, architecture section 5, "Review comments on the
+    /// pull request"): one read of them, at `commit`, the ticket ref after
+    /// the look. Those due ([`pr_reviews::due`], by `[forge].reviewers` as
+    /// watch loaded it) that the ticket's decider wrote start a review loop
+    /// ([`OnDemand::review_seen`]), held as a continue is, the hold lifted
+    /// by a newer review. The decider is the ticket's assignee, read only
+    /// once a review is due; a ticket whose zones' owners decide is left to
+    /// the loop, which reads them under the lock with the reviewers at the
+    /// base commit. A delivery made before OWL-307 is dated first, and no
+    /// review is due at that pass.
+    fn review(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        continued: &mut Continued<'_>,
+        ticket: &TicketId,
+        stored: &Stored,
+        commit: String,
+    ) {
+        let on_demand = self.on_demand;
+        let Some(forge) = &on_demand.config.forge else {
+            return;
+        };
+        let Some(delivery) = &stored.record.delivery else {
+            return;
+        };
+        let Some(pr) = &delivery.pull_request else {
+            return;
+        };
+        let now = (on_demand.clock)();
+        let Some(delivered_at) = delivery.delivered_at else {
+            if let Err(reason) = self.date_delivery(ticket, &commit, now) {
+                self.unreadable(
+                    memory,
+                    sink,
+                    ticket,
+                    format!("dating its delivery: {reason}"),
+                );
+            }
+            return;
+        };
+        let (read, warnings) = memory
+            .following
+            .reviews(on_demand.forge, ticket, pr.number, now);
+        for warning in warnings {
+            sink.emit(ticket, None, EventKind::Warning, warning);
+        }
+        let Some(read) = read else {
+            return;
+        };
+        let answered = stored
+            .record
+            .review
+            .as_ref()
+            .map(|review| review.answered_reviews.clone())
+            .unwrap_or_default();
+        let due = pr_reviews::due(&read.reviews, &forge.reviewers, delivered_at, &answered);
+        if due.is_empty() {
+            return;
+        }
+        let decider = match on_demand.tracker.ticket(ticket) {
+            Ok(found) => on_demand::known_decider(&found),
+            Err(e) => {
+                let reason = format!("reading the ticket: {e}");
+                return self.unreadable(memory, sink, ticket, reason);
+            }
+        };
+        if decider
+            .as_ref()
+            .is_some_and(|decider| !pr_reviews::instructed(&due, &decider.id))
+        {
+            return;
+        }
+        let held = Seen {
+            commit,
+            answer: pr_reviews::newest(&due),
+        };
+        self.held_run(memory, sink, continued, ticket, held, |seen, _, sink| {
+            on_demand.review_seen(ticket, seen, read, sink)
+        });
+    }
+
+    /// Dates the delivery of `ticket`, whose ref is at `seen`, at `now`
+    /// (OWL-307), under the project's lock: the delivery was made before
+    /// OWL-307 kept its date, so the reviews already on its pull request
+    /// were never this delivery's to answer. Nothing is written when the
+    /// project is busy or the ref moved.
+    fn date_delivery(&self, ticket: &TicketId, seen: &str, now: Timestamp) -> Result<(), String> {
+        let Some(_lock) = self.locked_at(ticket, seen)? else {
+            return Ok(());
+        };
+        let git = &self.on_demand.executor.git;
+        let checkout = self.on_demand.dirs.checkout();
+        let Some(current) = ticket_ref::read(git, &checkout, ticket)? else {
+            return Ok(());
+        };
+        let mut record = current.record;
+        let Some(delivery) = record.delivery.as_mut() else {
+            return Ok(());
+        };
+        delivery.delivered_at = Some(now);
+        ticket_ref::write(git, &checkout, ticket, &record, Some(seen)).map(|_| ())
     }
 
     /// A ticket in `status`, its round waiting at Watch (OWL-242) or parked
@@ -645,27 +789,42 @@ impl Watch<'_> {
         for warning in warnings {
             sink.emit(ticket, None, EventKind::Warning, warning);
         }
+        // A review loop's ticket is read for its end, and for a push of its
+        // own a crash cut short, which ends the loop as its command would
+        // have (OWL-307).
+        let in_loop = status.stage() != Stage::Watch;
         let seen = match look {
             Look::Read(seen) if matches!(seen.decision, Decision::End(_)) => seen,
+            Look::Read(seen)
+                if in_loop && matches!(seen.decision, Decision::Follow { adopt: true, .. }) =>
+            {
+                seen
+            }
             _ => return false,
         };
-        // The stage first: a round closed or a park ended in the ref is no
-        // longer read, so a stage left at needs input would stay there.
-        if let Err(reason) = on_demand.review_after_end(ticket, status, sink) {
-            self.unreadable(memory, sink, ticket, reason);
-            return true;
-        }
-        let change =
+        let change = if in_loop {
+            self.close_loop(sink, ticket, stored, status, &seen, now)
+        } else {
+            // The stage first: a round closed or a park ended in the ref is
+            // no longer read, so a stage left at needs input would stay
+            // there.
+            if let Err(reason) = on_demand.review_after_end(ticket, status, sink) {
+                self.unreadable(memory, sink, ticket, reason);
+                return true;
+            }
             follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
                 Some(changed) => self.write_seen(ticket, &stored.commit, &changed.record),
                 None => Ok(None),
-            });
+            })
+        };
         let commit = match change {
             Ok(Some(commit)) => commit,
             // Busy, or the ref moved: the next pass reads it again.
             Ok(None) => return true,
             Err(reason) => {
-                let doing = if matches!(status, Status::Parked { .. }) {
+                let doing = if in_loop {
+                    "ending its review loop"
+                } else if matches!(status, Status::Parked { .. }) {
                     "ending its park"
                 } else {
                     "closing its round"
@@ -680,9 +839,64 @@ impl Watch<'_> {
             sink.emit(ticket, None, EventKind::Decision, event);
             self.line(out, &format!("{ticket}: {seen}; {said}"));
         }
-        // Dropped, the following having ended.
+        // Dropped, the following having ended; posted, a review loop's
+        // push adopted.
         on_demand.post_owed_report(ticket, stored, &seen, commit, &mut memory.following, sink);
         true
+    }
+
+    /// The end of a review loop (OWL-307) that `seen`, a read of its pull
+    /// request, decided for a ticket in `status` at Build or Verify: its
+    /// following ended, or its own push adopted. Under the project's lock
+    /// from the start, since a person's `continue` may be running the loop:
+    /// busy, the ref moved or a run left the project unverified, nothing is
+    /// moved or written (`Ok(None)`), and the next pass reads it again.
+    /// Otherwise the stage moves to review, while it shows what `status`
+    /// set, then the ref keeps what the read changed; its new commit is
+    /// returned.
+    #[allow(clippy::too_many_arguments)]
+    fn close_loop(
+        &self,
+        sink: &mut EventSink<'_>,
+        ticket: &TicketId,
+        stored: &Stored,
+        status: Status,
+        seen: &follow::Seen,
+        now: Timestamp,
+    ) -> Result<Option<String>, String> {
+        let on_demand = self.on_demand;
+        let Some(_lock) = self.locked_at(ticket, &stored.commit)? else {
+            return Ok(None);
+        };
+        if !matches!(on_demand.dirs.unverified(), Ok(None)) {
+            return Ok(None);
+        }
+        let Some(changed) = follow::changed(&stored.record, PIPELINE, seen, now)? else {
+            return Ok(None);
+        };
+        if matches!(seen.decision, Decision::End(_)) {
+            on_demand.review_after_end(ticket, status, sink)?;
+        } else {
+            on_demand.review_after_working(ticket, sink);
+        }
+        let git = &on_demand.executor.git;
+        let written = ticket_ref::write(
+            git,
+            &on_demand.dirs.checkout(),
+            ticket,
+            &changed.record,
+            Some(&stored.commit),
+        )?;
+        // Told once the ref keeps it (OWL-239).
+        if let Some(replaced) = &changed.replaced {
+            let pushed = stored
+                .record
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.pushed.as_deref());
+            on_demand.replaced(ticket, replaced, pushed, sink);
+        }
+        Ok(Some(written))
     }
 
     /// A ticket in `status` at Watch whose delivery is followed, its stage
@@ -707,7 +921,8 @@ impl Watch<'_> {
         status: Status,
     ) {
         let on_demand = self.on_demand;
-        let Some(to) = VisibleStage::of(status) else {
+        // Working is what a review loop at Build or Verify shows (OWL-307).
+        let Some(to) = VisibleStage::of(status).filter(|to| *to != VisibleStage::Working) else {
             return;
         };
         let stale = &memory.stale;
@@ -786,7 +1001,7 @@ impl Watch<'_> {
     /// decider of the latest ask before a reply, or the ticket's assignee,
     /// read only once a reply is found; a ticket whose zones' owners decide
     /// is left to [`OnDemand::correct_seen`], which reads them under the
-    /// lock.
+    /// lock. Returns whether a correction ran.
     fn correct(
         &self,
         memory: &mut Memory,
@@ -795,27 +1010,29 @@ impl Watch<'_> {
         ticket: &TicketId,
         stored: &Stored,
         commit: String,
-    ) {
+    ) -> bool {
         let on_demand = self.on_demand;
         let questions = &stored.record.questions;
         if questions.decisions.is_empty() {
-            return;
+            return false;
         }
         let comments = match on_demand.tracker.comments(ticket) {
             Ok(comments) => comments,
             Err(e) => {
                 let reason = format!("reading its comments: {e}");
-                return self.unreadable(memory, sink, ticket, reason);
+                self.unreadable(memory, sink, ticket, reason);
+                return false;
             }
         };
         if reversal::reversals(&comments, questions, Current::Unresolved).is_empty() {
-            return;
+            return false;
         }
         let decider = match on_demand.tracker.ticket(ticket) {
             Ok(found) => on_demand::known_decider(&found),
             Err(e) => {
                 let reason = format!("reading the ticket: {e}");
-                return self.unreadable(memory, sink, ticket, reason);
+                self.unreadable(memory, sink, ticket, reason);
+                return false;
             }
         };
         let current = decider.as_ref().map_or(Current::Unresolved, Current::Known);
@@ -823,30 +1040,20 @@ impl Watch<'_> {
         let now = (on_demand.clock)();
         let window = on_demand.config.policy.quiet_window();
         if reversed.is_empty() || reversal::counts_at(&reversed, now, window).is_some() {
-            return;
+            return false;
         }
         let held = Seen {
             commit,
             answer: reversal::newest(&reversed).map(|reply| reply.last_edit()),
         };
-        if memory.holds.admit(ticket, &held, now) != Admit::Go {
-            return;
-        }
-        let Some(outcome) =
-            on_demand.correct_seen(ticket, &held.commit, &mut memory.following, sink)
-        else {
-            return;
-        };
-        continued(ticket, &outcome, sink);
-        let git = &on_demand.executor.git;
-        let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket)
-            .ok()
-            .flatten()
-            .map(|stored| stored.commit);
-        let now = (on_demand.clock)();
-        memory
-            .holds
-            .after(ticket, held, &outcome, after.as_deref(), now);
+        self.held_run(
+            memory,
+            sink,
+            continued,
+            ticket,
+            held,
+            |seen, following, sink| on_demand.correct_seen(ticket, seen, following, sink),
+        )
     }
 
     /// Writes `record` as the ticket ref of `ticket` under the project's
@@ -1200,11 +1407,17 @@ impl Watch<'_> {
 
 /// What an end of the following adds to the `ended` event, and the words it
 /// adds to watch's line, for a ticket in `status` whose ref keeps `round`:
-/// `parked` for a park at Watch it ends (OWL-243), and the round for one
-/// whose questions waited, closed unanswered (OWL-242).
+/// `review_loop` for a review loop it ends (OWL-307), `parked` for a park it
+/// ends (OWL-243), and the round for one whose questions waited, closed
+/// unanswered (OWL-242).
 fn ended_marks(status: Status, round: u32) -> (Data, String) {
     let mut marks = Data::new();
     let mut said = Vec::new();
+    // A review loop's ticket, at Build or Verify (OWL-307).
+    if status.stage() != Stage::Watch {
+        marks.insert("review_loop".to_owned(), json!(true));
+        said.push("its review loop ends".to_owned());
+    }
     if matches!(status, Status::Parked { .. }) {
         marks.insert("parked".to_owned(), json!(true));
         said.push("it is no longer parked".to_owned());

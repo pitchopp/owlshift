@@ -1018,6 +1018,13 @@ pub struct TicketDelivery {
     pub branch: String,
     /// The branch the pull request merges into.
     pub base_branch: String,
+    /// When the delivery's first push was kept under way, before its pull
+    /// request could be reviewed (OWL-307): a review submitted before it is
+    /// not this delivery's. Kept by a retry of the same delivery and by every
+    /// later push; absent from a delivery made before OWL-307 until watch
+    /// stamps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<Timestamp>,
     /// The commit Owlshift last pushed, once the forge showed it as the head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pushed: Option<String>,
@@ -1190,6 +1197,7 @@ impl TicketDelivery {
             pull_request: None,
             branch: branch.to_owned(),
             base_branch: base_branch.to_owned(),
+            delivered_at: None,
             pushed: None,
             base_at_push: None,
             rebased_onto: None,
@@ -1220,8 +1228,8 @@ impl TicketDelivery {
     /// format 2 is format 3 without a correction's push or report, format 3
     /// is format 4 without an owed delivery report, a report's `notes` or an
     /// owed report's `unchanged`, and format 4 is format 5 without a review
-    /// loop's push or a report's `reviews`, so each is refused in an older
-    /// format.
+    /// loop's push, a report's `reviews` or `delivered_at` (OWL-307), so
+    /// each is refused in an older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
@@ -1261,6 +1269,7 @@ impl TicketDelivery {
             .and_then(|owed| owed.get("kind"))
             .is_some_and(|kind| kind == "delivery");
         let unchanged = owed.is_some_and(|owed| owed.contains_key("unchanged"));
+        let delivered_at = fields.contains_key("delivered_at");
         for (field, kept) in [
             ("owed", format == 1 && owed.is_some()),
             ("pushing.report", format == 1 && report),
@@ -1271,6 +1280,7 @@ impl TicketDelivery {
             ("unchanged correction", format <= 3 && unchanged),
             ("review loop's push", review),
             ("report's reviews", reviews),
+            ("delivered_at", delivered_at),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -1300,12 +1310,13 @@ impl TicketDelivery {
     /// Checks the commits are full ids, the branches git branch names, the
     /// link a plain `https://` URL, that a push under way names its `onto`
     /// exactly when it is a rebase's and keeps a report only for a fix, a
-    /// rebase or a correction, that an owed report counts from 1 (exactly 1
-    /// for a delivery), of a pushed commit with its pull request (and for a
-    /// rebase its base), and is unchanged only for a correction that kept its
-    /// report, that a report names questions
-    /// exactly when it is a correction's and keeps notes only for a
-    /// delivery, and that an ended delivery pushes nothing.
+    /// rebase, a correction or a review loop, that an owed report counts
+    /// from 1 (exactly 1 for a delivery or a review loop), of a pushed commit
+    /// with its pull request (and for a rebase its base), and is unchanged
+    /// only for a correction or a review loop that kept its report (OWL-307),
+    /// that a report names questions exactly when it is a correction's and
+    /// keeps notes only for a delivery or a review loop, and that an ended
+    /// delivery pushes nothing.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
         for (field, branch) in [("branch", &self.branch), ("base_branch", &self.base_branch)] {
@@ -1382,13 +1393,14 @@ impl TicketDelivery {
                 "a report names questions if and only if it is a correction's".to_owned(),
             );
         }
-        // The runner's notes are the first delivery's (OWL-236).
-        if reports
-            .into_iter()
-            .flatten()
-            .any(|(kind, report)| kind != PushKind::Delivery && !report.notes.is_empty())
-        {
-            return invalid("a report keeps notes only if it is a delivery's".to_owned());
+        // The runner's notes are those of a Build's delivery: the first one
+        // (OWL-236), or a review loop's (OWL-307).
+        if reports.into_iter().flatten().any(|(kind, report)| {
+            !matches!(kind, PushKind::Delivery | PushKind::Review) && !report.notes.is_empty()
+        }) {
+            return invalid(
+                "a report keeps notes only if it is a delivery's or a review loop's".to_owned(),
+            );
         }
         // A review loop's report names the reviews it answers, each once,
         // and no other report does (OWL-300).
@@ -1410,23 +1422,25 @@ impl TicketDelivery {
             }
         }
         if let Some(owed) = &self.owed {
-            if owed.unchanged && owed.kind != PushKind::Correction {
+            // A correction, or a review loop's Build (OWL-307), that changed
+            // nothing.
+            if owed.unchanged && !matches!(owed.kind, PushKind::Correction | PushKind::Review) {
                 return invalid(
-                    "an owed report is unchanged only if it is a correction's".to_owned(),
+                    "an owed report is unchanged only if it is a correction's or a review loop's"
+                        .to_owned(),
                 );
             }
             // No push is ever adopted for it, so its run always kept its
-            // report, which names its questions (the rule above).
+            // report, which names its questions or its reviews (the rules
+            // above).
             if owed.unchanged && owed.report.is_none() {
-                return invalid(
-                    "an unchanged correction's owed report keeps its questions".to_owned(),
-                );
+                return invalid("an unchanged owed report keeps its run's report".to_owned());
             }
             if owed.count == 0 {
                 return invalid("an owed report counts from 1".to_owned());
             }
-            if owed.kind == PushKind::Delivery && owed.count != 1 {
-                return invalid("a delivery's owed report counts 1".to_owned());
+            if matches!(owed.kind, PushKind::Delivery | PushKind::Review) && owed.count != 1 {
+                return invalid("a delivery's or a review loop's owed report counts 1".to_owned());
             }
             if self.pushed.is_none() || self.pull_request.is_none() {
                 return invalid(
