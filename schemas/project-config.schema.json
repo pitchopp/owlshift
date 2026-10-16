@@ -29,7 +29,7 @@
       "type": "string"
     },
     "roles": {
-      "description": "Settings per role (OWL-312), keyed by the role's name as its prompt\nfile is (`build`, `resolver`, `intake`, `design`, `design_review`, `arbiter`): rules added to that role's\nbrief alone. Only a role whose brief carries rules is accepted\n([`RULE_ROLES`]). A file using it requires an Owlshift that reads it.",
+      "description": "Settings per role (OWL-312), keyed by the role's name as its prompt\nfile is (`build`, `resolver`, `intake`, `design`, `design_review`,\n`arbiter`): rules added to that role's brief alone. Only a role whose\nbrief carries rules is accepted ([`RULE_ROLES`]). A file using it\nrequires an Owlshift that reads it.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/RoleSettings"

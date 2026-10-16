@@ -47,9 +47,10 @@ pub struct ProjectConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub zones: BTreeMap<String, ZoneSettings>,
     /// Settings per role (OWL-312), keyed by the role's name as its prompt
-    /// file is (`build`, `resolver`, `intake`, `design`, `design_review`, `arbiter`): rules added to that role's
-    /// brief alone. Only a role whose brief carries rules is accepted
-    /// ([`RULE_ROLES`]). A file using it requires an Owlshift that reads it.
+    /// file is (`build`, `resolver`, `intake`, `design`, `design_review`,
+    /// `arbiter`): rules added to that role's brief alone. Only a role whose
+    /// brief carries rules is accepted ([`RULE_ROLES`]). A file using it
+    /// requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, RoleSettings>,
 }
