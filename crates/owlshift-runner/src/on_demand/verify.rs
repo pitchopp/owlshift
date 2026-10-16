@@ -287,6 +287,16 @@ impl OnDemand<'_> {
                 ))
             })?;
         let diff = self.review_diff(p, &built.commit)?;
+        // A pass run again in place of its own record, after its delivery
+        // failed, takes back the follow-ups that record proposed.
+        let withdrawn = p
+            .review
+            .as_ref()
+            .and_then(|review| {
+                design::replaced_pass(review, Stage::Verify, state.review_pass_due())
+            })
+            .map(|replaced| review_followups(&replaced.findings))
+            .unwrap_or_default();
         let next = |outcome: PassOutcome| match outcome {
             PassOutcome::Passed => "deliver",
             PassOutcome::Revise => "build",
@@ -311,6 +321,9 @@ impl OnDemand<'_> {
             sink,
         )?;
         if let Some(build) = review.build.as_mut() {
+            build
+                .followups
+                .retain(|followup| !withdrawn.contains(followup));
             gather(&mut build.followups, &review_followups(&findings));
         }
         p.review = Some(review);

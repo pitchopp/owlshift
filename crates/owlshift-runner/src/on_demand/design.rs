@@ -216,17 +216,24 @@ pub(crate) fn settle_pass(
     Some(verdict)
 }
 
-/// Keeps `kept` as the latest pass of `review`: appended, or in place of
-/// the last pass when that is the same pass of the same stage run again,
-/// such as a Verify pass that passed before its delivery failed (OWL-304).
-/// A pass 1 run again is appended, which the numbering allows.
+/// The last pass of `review` when pass `pass` at `stage` runs again in its
+/// place: the same pass of the same stage, above 1, such as a Verify pass
+/// that passed before its delivery failed (OWL-304). A pass 1 run again is
+/// appended, which the numbering allows.
+pub(crate) fn replaced_pass(review: &TicketReview, stage: Stage, pass: u32) -> Option<&ReviewPass> {
+    review
+        .passes
+        .last()
+        .filter(|last| last.stage == stage && last.pass.get() == pass && pass > 1)
+}
+
+/// Keeps `kept` as the latest pass of `review`: in place of the pass it
+/// runs again ([`replaced_pass`]), else appended.
 pub(crate) fn push_pass(review: &mut TicketReview, kept: ReviewPass) {
-    match review.passes.last_mut() {
-        Some(last) if last.stage == kept.stage && last.pass == kept.pass && kept.pass.get() > 1 => {
-            *last = kept;
-        }
-        _ => review.passes.push(kept),
+    if replaced_pass(review, kept.stage, kept.pass.get()).is_some() {
+        review.passes.pop();
     }
+    review.passes.push(kept);
 }
 
 /// Records what the run given `given`, the latest pass's findings at

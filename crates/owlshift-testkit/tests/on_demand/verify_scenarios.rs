@@ -434,6 +434,68 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
     }
 }
 
+/// A last pass proposes a follow-up, then the push is refused. `continue`
+/// runs that pass again in place of its record; clean this time, it takes
+/// back its follow-up, so the delivery files none.
+#[test]
+fn a_pass_run_again_after_a_failed_delivery_takes_back_its_proposals() {
+    let bench = Bench::verifying(false);
+    bench.inbox.borrow_mut().on = true;
+    // Someone else's commit is already on the ticket's branch: the push is
+    // refused.
+    let checkout = &bench.remote.checkout;
+    for args in [
+        &["switch", "--quiet", "-c", BRANCH][..],
+        &["commit", "--quiet", "--allow-empty", "-m", "Other"],
+        &["push", "--quiet", "origin", BRANCH],
+        &["switch", "--quiet", "main"],
+    ] {
+        bench.env.run(checkout, args).unwrap();
+    }
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[("major", "The greeting has no full stop.")])),
+        bench.reviewing(&ruled(&["confirmed"])),
+        bench.reply(Some("Hello, again"), Some(DONE)),
+        bench.reviewing(&found(&[(
+            "major",
+            "GREETING.md could open with a heading.",
+        )])),
+        bench.reviewing(&ruled(&["confirmed"])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    assert!(
+        matches!(&outcome, Err(Stop::Delivery(why)) if why.contains("rejected")),
+        "{outcome:?}\n{printed}"
+    );
+    let review = bench.record().review.unwrap();
+    assert_eq!(
+        review.passes[1].findings[0].outcome,
+        Some(FindingOutcome::Proposed)
+    );
+    assert_eq!(review.build.unwrap().followups.len(), 1);
+
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "--delete", BRANCH])
+        .unwrap();
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reviewing(&found(&[]))]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let passes: Vec<(Stage, u32, usize)> = bench
+        .record()
+        .review
+        .unwrap()
+        .passes
+        .iter()
+        .map(|pass| (pass.stage, pass.pass.get(), pass.findings.len()))
+        .collect();
+    assert_eq!(passes, [(Stage::Verify, 1, 1), (Stage::Verify, 2, 0)]);
+    assert!(bench.inbox.borrow().tickets.is_empty(), "nothing filed");
+    let report = bench.comments().pop().unwrap();
+    assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
+    assert!(!report.contains("Proposed follow-up"), "{report}");
+}
+
 /// A usage limit cuts a Verify pass short: the Build Verify reviews is
 /// kept, and `continue` runs the pass again on it alone, then delivers its
 /// commit, with no Build run (part F's rule for Design review).
