@@ -47,13 +47,13 @@ pub use owlshift_contracts::result::Effort;
 ///   otherwise opens it with its access token, and it offers the model MCP
 ///   resource tools and `request_plugin_install`, checked live on
 ///   2026-10-16 (OWL-132, recordings `apps_disabled` and its control).
-/// - `--disable image_generation`, `--disable multi_agent` and
-///   `web_search="disabled"` take image generation, the collaboration tools
-///   (`spawn_agent` and the rest) and web search away from the critic: it
-///   returns JSON, sub-agents multiply a run's cost, and web search searches
-///   on the operator's account, against the design's "without network where
-///   the harness allows it" (OWL-316, recordings `critic_tools` and its
-///   control).
+/// - `--disable image_generation` and `web_search="disabled"` take image
+///   generation and web search away from the critic: it returns JSON, and
+///   web search searches on the operator's account, against the design's
+///   "without network where the harness allows it" (OWL-316, recordings
+///   `critic_tools` and its control). The collaboration tools
+///   (`spawn_agent` and the rest) stay: neither `--disable multi_agent` nor
+///   `--disable multi_agent_v2` took them away, checked live on 2026-10-16.
 /// - `--ignore-rules` drops execpolicy `.rules` files: the runner injects the
 ///   project's rules in the brief (C2, "Rules").
 /// - `skills.include_instructions=false` lists no skill to the model, the
@@ -77,8 +77,6 @@ const LAUNCH_ARGS: &[&str] = &[
     "apps",
     "--disable",
     "image_generation",
-    "--disable",
-    "multi_agent",
     "-c",
     "web_search=\"disabled\"",
     "--ignore-rules",
@@ -489,7 +487,7 @@ mod tests {
         assert_eq!(
             joined(&request),
             "exec --ephemeral --json --ignore-user-config --disable apps \
-             --disable image_generation --disable multi_agent -c web_search=\"disabled\" \
+             --disable image_generation -c web_search=\"disabled\" \
              --ignore-rules \
              -c skills.include_instructions=false -c project_doc_max_bytes=0 \
              --dangerously-bypass-approvals-and-sandbox \

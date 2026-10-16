@@ -292,11 +292,10 @@ fn recorded_argv(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The flags OWL-316 added to take image generation, the collaboration tools
-/// and web search away from a critic run.
-const TOOLS_OFF: [&[&str]; 3] = [
+/// The flags OWL-316 added to take image generation and web search away
+/// from a critic run.
+const TOOLS_OFF: [&[&str]; 2] = [
     &["--disable", "image_generation"],
-    &["--disable", "multi_agent"],
     &["-c", "web_search=\"disabled\""],
 ];
 
@@ -333,9 +332,9 @@ fn offered(names: &[String], tool: &str) -> bool {
         .any(|name| name.rsplit('.').next() == Some(tool))
 }
 
-/// OWL-316: a critic run is offered neither web search, nor image
-/// generation, nor the collaboration tools, which the same run without the
-/// flags of [`TOOLS_OFF`] is offered. Both runs asked the model to give, as
+/// OWL-316: a critic run is offered neither web search nor image
+/// generation, which the same run without the flags of [`TOOLS_OFF`] is
+/// offered. Both runs asked the model to give, as
 /// its result's summary, the names of the tools it can call; the control's
 /// command line differs by those flags alone, and the adapter's is
 /// `command()`'s, so a change to its flags fails here until the pair is
@@ -350,16 +349,7 @@ fn a_critic_run_is_offered_only_the_tools_it_keeps() {
         before_tools_off(&adapter)
     );
     let (adapter, control) = (tools("critic_tools"), tools("critic_tools_control"));
-    for tool in [
-        "web__run",
-        "image_gen__imagegen",
-        "spawn_agent",
-        "send_message",
-        "wait_agent",
-        "list_agents",
-        "interrupt_agent",
-        "followup_task",
-    ] {
+    for tool in ["web__run", "image_gen__imagegen"] {
         assert!(
             offered(&control, tool),
             "the control lacks {tool}: {control:?}"

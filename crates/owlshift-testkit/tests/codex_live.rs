@@ -370,27 +370,16 @@ fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
     }
 }
 
-/// The flags OWL-316 passes to take image generation, the collaboration
-/// tools and web search away from a critic run.
-const TOOLS_OFF: [&[&str]; 3] = [
+/// The flags OWL-316 passes to take image generation and web search away
+/// from a critic run.
+const TOOLS_OFF: [&[&str]; 2] = [
     &["--disable", "image_generation"],
-    &["--disable", "multi_agent"],
     &["-c", "web_search=\"disabled\""],
 ];
 
 /// The tools those flags take away, as the model named them on 2026-10-16
-/// in OWL-132's recordings: web search, image generation and the
-/// collaboration tools.
-const TOOLS_TURNED_OFF: [&str; 8] = [
-    "web__run",
-    "image_gen__imagegen",
-    "spawn_agent",
-    "send_message",
-    "wait_agent",
-    "list_agents",
-    "interrupt_agent",
-    "followup_task",
-];
+/// in OWL-132's recordings.
+const TOOLS_TURNED_OFF: [&str; 2] = ["web__run", "image_gen__imagegen"];
 
 /// OWL-316: the adapter's command line offers a critic run none of the
 /// tools in [`TOOLS_TURNED_OFF`], while the same run without the flags in
@@ -406,10 +395,9 @@ fn a_live_critic_run_is_offered_only_the_tools_it_keeps() {
     if recording_asked() {
         let values = live.login_values();
         let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
-                     command line (the control: without `--disable image_generation`, \
-                     `--disable multi_agent` and `-c web_search=\"disabled\"`) and the prompt \
-                     on standard input, and a CODEX_HOME of the run's own holding a copy of the \
-                     user's ChatGPT login";
+                     command line (the control: without `--disable image_generation` and \
+                     `-c web_search=\"disabled\"`) and the prompt on standard input, and a \
+                     CODEX_HOME of the run's own holding a copy of the user's ChatGPT login";
         let control_argv = TOOLS_OFF
             .iter()
             .fold(adapter_argv(), |argv, flags| without(argv, flags));
