@@ -47,7 +47,7 @@ pub use owlshift_contracts::result::Effort;
 ///   otherwise opens it with its access token, and it offers the model MCP
 ///   resource tools and `request_plugin_install`, checked live on
 ///   2026-10-16 (OWL-132, recordings `apps_disabled` and its control).
-/// - `--disable image_generation` and `web_search="disabled"` take image
+/// - `--disable image_generation` and `-c web_search="disabled"` take image
 ///   generation and web search away from the critic: it returns JSON, and
 ///   web search searches on the operator's account, against the design's
 ///   "without network where the harness allows it" (OWL-316, recordings

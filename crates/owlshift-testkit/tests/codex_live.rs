@@ -427,6 +427,8 @@ fn a_live_critic_run_is_offered_only_the_tools_it_keeps() {
             "adapter offers {tool}: {adapter:?}"
         );
     }
+    // Kept because no flag removes it: gone, the build plan is out of date.
+    assert!(offered(&adapter, "spawn_agent"), "{adapter:?}");
 }
 
 /// The tool names a run's result lists as its summary, which must include
@@ -445,11 +447,18 @@ fn tools(run: &codex::Run) -> Vec<String> {
     names
 }
 
-/// Whether `names` holds `tool`, whatever namespace prefix the model gave it.
+/// Whether `names` holds `tool`, whatever namespace prefix the model gave it
+/// and whether it wrote `.` or `__` between the parts of a name, as
+/// `codex_fixtures.rs` reads the recordings.
 fn offered(names: &[String], tool: &str) -> bool {
-    names
-        .iter()
-        .any(|name| name.rsplit('.').next() == Some(tool))
+    let key = |name: &str| name.to_lowercase().replace("__", "_").replace('.', "_");
+    let tool = key(tool);
+    names.iter().map(|name| key(name)).any(|name| {
+        name == tool
+            || name
+                .strip_suffix(tool.as_str())
+                .is_some_and(|prefix| prefix.ends_with('_'))
+    })
 }
 
 /// The files of a run's two streams, and its exit code.

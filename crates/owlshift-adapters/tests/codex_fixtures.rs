@@ -325,21 +325,42 @@ fn tools(name: &str) -> Vec<String> {
     names
 }
 
-/// Whether `names` holds `tool`, whatever namespace prefix the model gave it.
+/// Whether `names` holds `tool`, whatever namespace prefix the model gave it
+/// and whether it wrote `.` or `__` between the parts of a name
+/// (`tools.web__run` or `web.run`), so that a respelling in one run of a
+/// pair cannot pass for an absence.
 fn offered(names: &[String], tool: &str) -> bool {
-    names
-        .iter()
-        .any(|name| name.rsplit('.').next() == Some(tool))
+    let key = |name: &str| name.to_lowercase().replace("__", "_").replace('.', "_");
+    let tool = key(tool);
+    names.iter().map(|name| key(name)).any(|name| {
+        name == tool
+            || name
+                .strip_suffix(tool.as_str())
+                .is_some_and(|prefix| prefix.ends_with('_'))
+    })
+}
+
+#[test]
+fn a_tool_is_found_however_its_name_is_spelled() {
+    let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+    for spelling in ["tools.web__run", "web.run", "web__run", "functions.web.run"] {
+        assert!(offered(&names(&[spelling]), "web__run"), "{spelling}");
+    }
+    assert!(!offered(
+        &names(&["tools.list_mcp_resources"]),
+        "read_mcp_resource"
+    ));
+    assert!(!offered(&names(&["tools.web__runner"]), "web__run"));
 }
 
 /// OWL-316: a critic run is offered neither web search nor image
 /// generation, which the same run without the flags of [`TOOLS_OFF`] is
-/// offered. Both runs asked the model to give, as
-/// its result's summary, the names of the tools it can call; the control's
-/// command line differs by those flags alone, and the adapter's is
-/// `command()`'s, so a change to its flags fails here until the pair is
-/// recorded again. The tools kept, and why, are in the build plan
-/// (OWL-132's entry).
+/// offered. Both runs asked the model to give, as its result's summary, the
+/// names of the tools it can call; the control's command line differs by
+/// those flags alone, and the adapter's is `command()`'s, so a change to its
+/// flags fails here until the pair is recorded again. The tools kept, and
+/// why, are in the build plan (OWL-132's entry); `spawn_agent` is checked
+/// still offered, so that a recording without it sends the reader there.
 #[test]
 fn a_critic_run_is_offered_only_the_tools_it_keeps() {
     let adapter = adapter_argv(Some(codex::Effort::Low));
@@ -359,6 +380,9 @@ fn a_critic_run_is_offered_only_the_tools_it_keeps() {
             "the adapter offers {tool}: {adapter:?}"
         );
     }
+    // Kept because no flag removes it (OWL-316): if it is gone, the build
+    // plan's decision and its open point are out of date.
+    assert!(offered(&adapter, "spawn_agent"), "{adapter:?}");
 }
 
 /// OWL-132: on a ChatGPT login, the ChatGPT apps server offers the model
