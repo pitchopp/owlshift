@@ -91,7 +91,14 @@ impl Repo {
     }
 
     fn project_at(&self, commit: &str, stack: &str, tail: &str) -> Result<ProjectRules, String> {
-        let all = [Role::Build, Role::Resolver, Role::Intake];
+        let all = [
+            Role::Build,
+            Role::Resolver,
+            Role::Intake,
+            Role::Design,
+            Role::DesignReview,
+            Role::Arbiter,
+        ];
         self.project_in(commit, stack, tail, &all)
     }
 

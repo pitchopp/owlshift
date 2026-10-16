@@ -47,9 +47,10 @@ pub struct ProjectConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub zones: BTreeMap<String, ZoneSettings>,
     /// Settings per role (OWL-312), keyed by the role's name as its prompt
-    /// file is (`build`, `resolver`, `intake`): rules added to that role's
-    /// brief alone. Only a role whose brief carries rules is accepted
-    /// ([`RULE_ROLES`]). A file using it requires an Owlshift that reads it.
+    /// file is (`build`, `resolver`, `intake`, `design`, `design_review`,
+    /// `arbiter`): rules added to that role's brief alone. Only a role whose
+    /// brief carries rules is accepted ([`RULE_ROLES`]). A file using it
+    /// requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, RoleSettings>,
 }
@@ -68,10 +69,18 @@ pub struct RoleSettings {
 }
 
 /// The roles whose brief carries rules, and so accept `[roles.<role>]`.
-/// Each role the quality pipeline adds joins this list as it is built
-/// (OWL-302, OWL-303, OWL-304); `answer_check` never does, since it judges
+/// Each role the quality pipeline adds joins this list as it is built: the
+/// design, design review and arbiter roles did with OWL-318, `verify` joins
+/// with OWL-304; `answer_check` never does, since it judges
 /// the decider's answers from the brief alone.
-pub const RULE_ROLES: [Role; 3] = [Role::Build, Role::Resolver, Role::Intake];
+pub const RULE_ROLES: [Role; 6] = [
+    Role::Build,
+    Role::Resolver,
+    Role::Intake,
+    Role::Design,
+    Role::DesignReview,
+    Role::Arbiter,
+];
 
 /// The rule file read when `stack.rules` is left out.
 pub const DEFAULT_RULE_FILE: &str = "AGENTS.md";
@@ -1238,7 +1247,10 @@ mod tests {
 
         let tail = "[roles.build]\nrules = [\"docs/skills/frontend/SKILL.md\"]\n\
                     [roles.resolver]\nrules = []\n\
-                    [roles.intake]\nrules = [\"docs/zones.md\"]";
+                    [roles.intake]\nrules = [\"docs/zones.md\"]\n\
+                    [roles.design]\nrules = [\"docs/design.md\"]\n\
+                    [roles.design_review]\nrules = [\"docs/review.md\"]\n\
+                    [roles.arbiter]\nrules = [\"docs/arbiter.md\"]";
         let named = project("", tail).unwrap();
         assert_eq!(
             named.role_rule_files(Role::Build),
@@ -1246,7 +1258,12 @@ mod tests {
         );
         assert!(named.role_rule_files(Role::Resolver).is_empty());
         assert_eq!(named.role_rule_files(Role::Intake), ["docs/zones.md"]);
-        assert!(named.role_rule_files(Role::Design).is_empty());
+        assert_eq!(named.role_rule_files(Role::Design), ["docs/design.md"]);
+        assert_eq!(
+            named.role_rule_files(Role::DesignReview),
+            ["docs/review.md"]
+        );
+        assert_eq!(named.role_rule_files(Role::Arbiter), ["docs/arbiter.md"]);
         assert_eq!(ProjectConfig::parse(&named.render()).unwrap(), named);
 
         // 32 files for the role alone fit only beside an empty `stack.rules`.
@@ -1271,7 +1288,7 @@ mod tests {
                 "",
                 "[roles.bulid]\nrules = [\"a.md\"]",
                 "roles.bulid.rules: `bulid` is not a role whose brief carries rules \
-                 (a role joins as it is built); the roles that do: build, resolver, intake",
+                 (a role joins as it is built); the roles that do: build, resolver, intake, design, design_review, arbiter",
             ),
             (
                 "a role not built yet",
