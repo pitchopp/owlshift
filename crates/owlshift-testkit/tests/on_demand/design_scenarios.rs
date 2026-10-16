@@ -10,19 +10,19 @@ use owlshift_core::vocab::Harness as HarnessKind;
 use super::*;
 
 /// The plan of a design run.
-const PLAN: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+pub(super) const PLAN: &str = r#"{"goal":"Add GREETING.md saying Hello.",
 "criteria":["GREETING.md says Hello."],
 "approach":"Write GREETING.md with the line the gate greps.",
 "steps":[{"what":"Add GREETING.md.","test":"The gate's grep for Hello."}]}"#;
 
 /// The plan a design run revises it to.
-const REVISED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+pub(super) const REVISED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
 "criteria":["GREETING.md says Hello."],
 "approach":"Write GREETING.md with the line the gate greps, the word checked.",
 "steps":[{"what":"Add GREETING.md.","test":"The gate's grep for the word Hello."}]}"#;
 
 /// A plan with a fork.
-const FORKED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+pub(super) const FORKED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
 "criteria":["GREETING.md says Hello."],
 "approach":"Write GREETING.md with the line the gate greps.",
 "steps":[{"what":"Add GREETING.md.","test":"The gate's grep for Hello."}],
@@ -30,12 +30,12 @@ const FORKED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
 "reason":"The repository's docs are Markdown."}]}"#;
 
 /// A design run's `done` with `plan`.
-fn designed(plan: &str) -> String {
+pub(super) fn designed(plan: &str) -> String {
     format!(r#"{{"format":9,"status":"done","summary":"Planned the greeting.","plan":{plan}}}"#)
 }
 
 /// A review run's `done` with a finding per (severity, claim).
-fn reviewed(findings: &[(&str, &str)]) -> String {
+pub(super) fn reviewed(findings: &[(&str, &str)]) -> String {
     let findings: Vec<Value> = findings
         .iter()
         .enumerate()
@@ -54,7 +54,7 @@ fn reviewed(findings: &[(&str, &str)]) -> String {
 }
 
 /// The arbiter's `done` with a ruling per outcome, on F1..Fn.
-fn ruled(outcomes: &[&str]) -> String {
+pub(super) fn ruled(outcomes: &[&str]) -> String {
     let rulings: Vec<Value> = outcomes
         .iter()
         .enumerate()
@@ -70,7 +70,7 @@ fn ruled(outcomes: &[&str]) -> String {
 }
 
 /// A design run's answer to an approval round.
-fn answered(approval: &str, plan: Option<&str>) -> String {
+pub(super) fn answered(approval: &str, plan: Option<&str>) -> String {
     let mut result = json!({
         "format": 9,
         "status": "done",
@@ -84,7 +84,7 @@ fn answered(approval: &str, plan: Option<&str>) -> String {
 }
 
 /// A Build run that cannot follow its plan.
-const REPLAN: &str = r#"{"format":9,"status":"questions",
+pub(super) const REPLAN: &str = r#"{"format":9,"status":"questions",
 "summary":"Step 1 cannot be followed as written.",
 "questions":[{"id":"Q1","category":"naming","context":"Step 1 names the file to write.",
 "text":"Which file should hold the greeting?","replan":true}]}"#;
@@ -102,27 +102,27 @@ impl Bench {
     }
 
     /// A read-only run's reply: its result alone.
-    fn read(&self, result: &str) -> Reply {
+    pub(super) fn read(&self, result: &str) -> Reply {
         self.reply(None, Some(result))
     }
 
     /// A Build run's reply that delivers.
-    fn built(&self) -> Reply {
+    pub(super) fn built(&self) -> Reply {
         self.reply(Some("Hello"), Some(DONE))
     }
 
     /// The role of every run, oldest first.
-    fn roles(&self) -> Vec<Role> {
+    pub(super) fn roles(&self) -> Vec<Role> {
         self.briefs().iter().map(|brief| brief.role).collect()
     }
 
     /// The decision events holding `key`.
-    fn decisions(&self, key: &str) -> Vec<Value> {
+    pub(super) fn decisions(&self, key: &str) -> Vec<Value> {
         data_of(&self.events(), EventKind::Decision, key)
     }
 
     /// The comment starting with `header`, the last one when several do.
-    fn marked(&self, header: &str) -> String {
+    pub(super) fn marked(&self, header: &str) -> String {
         self.comments()
             .into_iter()
             .rev()

@@ -10,7 +10,7 @@ use owlshift_contracts::refs::EndedWhy;
 use super::*;
 
 /// `ann-dev` is the decider's login, `bob` another listed reviewer's.
-const FORGE: &str = "[forge]\nreviewers = { ann-dev = \"maintainer\", bob = \"bob\" }\n";
+pub(super) const FORGE: &str = "[forge]\nreviewers = { ann-dev = \"maintainer\", bob = \"bob\" }\n";
 
 /// After the delivery, which the bench's clock dates a day before.
 const AFTER: &str = "2026-10-03T09:00:00Z";
@@ -33,7 +33,7 @@ const ASKS_WHICH_CASE: &str = r#"{"format":9,"status":"questions",
 
 /// A review as GitHub's GraphQL node gives it: `comments` are (path, line,
 /// body).
-fn review(id: u64, login: &str, body: &str, comments: &[(&str, u32, &str)]) -> Value {
+pub(super) fn review(id: u64, login: &str, body: &str, comments: &[(&str, u32, &str)]) -> Value {
     let comments: Vec<Value> = comments
         .iter()
         .map(|(path, line, body)| json!({ "path": path, "line": line, "body": body }))
