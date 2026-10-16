@@ -99,8 +99,9 @@ kind = \"markdown\"
     text.push_str(&format!(
         "\
 # How a person admits a ticket to Owlshift's queue: {{ label = \"...\" }},
-# {{ state = \"...\" }} or \"delegation\". `owlshift do TICKET` does not use
-# it: it runs the ticket it is given.
+# \"ready\" (the move to the ready state below, which {{ state = \"...\" }}
+# would repeat) or \"delegation\". `owlshift do TICKET` does not use it: it
+# runs the ticket it is given.
 admit = {{ label = \"agent\" }}
 # The tracker states that show where a ticket stands.
 states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\" }}
