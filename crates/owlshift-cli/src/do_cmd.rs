@@ -24,12 +24,15 @@ use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::{EventLog, EventSink, printable};
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
-use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
+use owlshift_runner::codex_machine::codex_critic;
+use owlshift_runner::executor::CodexHarness;
+use owlshift_runner::on_demand::{self, Delivered, OnDemand, Reviewers, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{
-    ANSWER_CHECK_ROLE, BUILD_ROLE, INTAKE_ROLE, REBASE_ROLE, RESOLVER_ROLE,
+    ANSWER_CHECK_ROLE, ARBITER_ROLE, BUILD_ROLE, DESIGN_REVIEW_ROLE, DESIGN_ROLE, INTAKE_ROLE,
+    REBASE_ROLE, RESOLVER_ROLE,
 };
-use owlshift_runner::routing::{ClaudeRouter, claude_model};
+use owlshift_runner::routing::{ClaudeRouter, CodexRouter, Router, claude_model};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
 use owlshift_runner::{forge, secrets, tracker};
@@ -123,6 +126,12 @@ fn run_with(
         .map_err(|error| format!("the built-in rebase role: {error}"))?;
     let intake_prompt = strip_role_front_matter(Role::Intake, INTAKE_ROLE)
         .map_err(|error| format!("the built-in intake role: {error}"))?;
+    let design_prompt = strip_role_front_matter(Role::Design, DESIGN_ROLE)
+        .map_err(|error| format!("the built-in design role: {error}"))?;
+    let design_review_prompt = strip_role_front_matter(Role::DesignReview, DESIGN_REVIEW_ROLE)
+        .map_err(|error| format!("the built-in design review role: {error}"))?;
+    let arbiter_prompt = strip_role_front_matter(Role::Arbiter, ARBITER_ROLE)
+        .map_err(|error| format!("the built-in arbiter role: {error}"))?;
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
@@ -220,6 +229,30 @@ fn run_with(
         },
         models: project.models.clone(),
     };
+    // Design on the ticket's routing, its reviewers on their seats', the
+    // arbiter on the standard tier (OWL-303).
+    let routed = |prompt: &str| ClaudeRouter {
+        harness: ClaudeHarness {
+            prompt: prompt.to_owned(),
+            ..harness.clone()
+        },
+        models: project.models.clone(),
+    };
+    let design = routed(&design_prompt);
+    let reviewer = routed(&design_review_prompt);
+    let arbiter = routed(&arbiter_prompt);
+    // The critic on Codex when Codex can run it here; otherwise it stands
+    // in on Claude Code (architecture section 5, "Without Codex").
+    let critic = codex_critic(system, &agent).ok().map(|found| CodexRouter {
+        harness: CodexHarness {
+            program: found.program,
+            prompt: design_review_prompt.clone(),
+            model: None,
+            effort: None,
+            login: found.login,
+        },
+        models: project.models.clone(),
+    });
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let on_demand = OnDemand {
@@ -228,6 +261,12 @@ fn run_with(
         forge: &forge,
         build: &build,
         intake: &intake,
+        design: &design,
+        design_review: Reviewers {
+            claude: &reviewer,
+            codex: critic.as_ref().map(|critic| critic as &dyn Router),
+        },
+        arbiter: &arbiter,
         answer_check: &check,
         resolver: &resolver,
         rebase: &rebase,

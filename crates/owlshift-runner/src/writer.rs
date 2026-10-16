@@ -1840,6 +1840,12 @@ impl ResumeComment {
                      understanding:",
                     self.round
                 )
+            } else if self.return_to == Stage::Design {
+                format!(
+                    "Every question of round {} is answered. The design runs again with these \
+                     answers, and its plan is reviewed again, with this understanding:",
+                    self.round
+                )
             } else if self.return_to == Stage::Ready {
                 format!(
                     "Every question of round {} is answered. The ticket is back in the ready \
