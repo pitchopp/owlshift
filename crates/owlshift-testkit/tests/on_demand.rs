@@ -8904,6 +8904,9 @@ fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
 #[path = "on_demand/drain_scenarios.rs"]
 mod drain_scenarios;
 
+#[path = "on_demand/design_scenarios.rs"]
+mod design_scenarios;
+
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every
 /// source; a named file the base commit lacks refuses the run.

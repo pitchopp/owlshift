@@ -1470,6 +1470,9 @@ pub struct PlanComment {
     pub reviewers: Vec<PlanReviewer>,
     /// The findings of that pass, as the ticket's review record keeps them.
     pub findings: Vec<KeptFinding>,
+    /// The findings the loop's earlier passes rejected, each with its pass:
+    /// the arbiter's or the author's rejections, listed with their reasons.
+    pub earlier: Vec<(u32, KeptFinding)>,
     /// Findings of the pass that stand but a round could not ask, past
     /// [`owlshift_contracts::result::MAX_QUESTIONS`]: the pass after the round
     /// reviews the plan whole.
@@ -1527,7 +1530,7 @@ impl PlanComment {
                 PLAN_FINDING_CHARS,
             ));
         }
-        for (kept, reason) in &rejected {
+        for (_, kept, reason) in &rejected {
             texts.push(Fit::capped(
                 flatten(&kept.finding.claim),
                 FINDING_KEPT,
@@ -1545,20 +1548,33 @@ impl PlanComment {
     }
 
     /// The findings left, each with what became of it, and those rejected,
-    /// each with its reason, in id order.
+    /// each with its pass and its reason, the earlier passes' first, each
+    /// pass in id order.
     #[allow(clippy::type_complexity)]
-    fn sorted(&self) -> (Vec<(&KeptFinding, &'static str)>, Vec<(&KeptFinding, &str)>) {
-        let mut left = Vec::new();
-        let mut rejected = Vec::new();
-        for kept in &self.findings {
-            let reason = kept
-                .ruling
+    fn sorted(
+        &self,
+    ) -> (
+        Vec<(&KeptFinding, &'static str)>,
+        Vec<(u32, &KeptFinding, &str)>,
+    ) {
+        fn reason_of(kept: &KeptFinding) -> &str {
+            kept.ruling
                 .as_ref()
                 .map(|ruling| ruling.reason.as_str())
-                .or(kept.response.as_ref().map(|response| response.reason.as_str()));
+                .or(kept.response.as_ref().map(|response| response.reason.as_str()))
+                .unwrap_or_default()
+        }
+        let mut left = Vec::new();
+        let mut rejected: Vec<(u32, &KeptFinding, &str)> = self
+            .earlier
+            .iter()
+            .filter(|(_, kept)| kept.outcome == Some(FindingOutcome::Rejected))
+            .map(|(pass, kept)| (*pass, kept, reason_of(kept)))
+            .collect();
+        for kept in &self.findings {
             match kept.outcome {
                 Some(FindingOutcome::Rejected) => {
-                    rejected.push((kept, reason.unwrap_or_default()));
+                    rejected.push((self.pass, kept, reason_of(kept)));
                 }
                 Some(FindingOutcome::Asked) => left.push((kept, "asked below")),
                 _ if self.not_asked.contains(&kept.finding.id) => left.push((
@@ -1578,7 +1594,7 @@ impl PlanComment {
         &self,
         texts: &[String],
         left: &[(&KeptFinding, &'static str)],
-        rejected: &[(&KeptFinding, &str)],
+        rejected: &[(u32, &KeptFinding, &str)],
     ) -> String {
         let plan = &self.plan;
         let mut texts = texts.iter();
@@ -1663,9 +1679,9 @@ impl PlanComment {
         if !rejected.is_empty() {
             let lines: Vec<String> = rejected
                 .iter()
-                .map(|(kept, _)| {
+                .map(|(pass, kept, _)| {
                     format!(
-                        "{}: {} Rejected: {}",
+                        "Pass {pass}, {}: {} Rejected: {}",
                         finding_label(kept),
                         next(),
                         next()
@@ -3358,6 +3374,10 @@ Merge state reported by the forge: `CLEAN`.
                 kept_finding(4, Severity::Major, None, None),
             ],
             not_asked: vec![FindingId::nth(4)],
+            earlier: vec![(
+                1,
+                kept_finding(1, Severity::Minor, Some(FindingOutcome::Rejected), Some("Earlier.")),
+            )],
             next: PlanNext::Findings,
             run: Some("r1".to_owned()),
         };
@@ -3379,8 +3399,9 @@ Merge state reported by the forge: `CLEAN`.
             "- F3, major, critic and conformance on Claude Code, standing in for Codex: Claim 3. \
              (asked below)",
             "Claim 4. (not asked in this round",
-            "**Findings rejected.**\n- F1, major, critic and conformance on Claude Code, standing \
-             in for Codex: Claim 1. Rejected: Not so.",
+            "**Findings rejected.**\n- Pass 1, F1, minor, critic and conformance on Claude Code, \
+             standing in for Codex: Claim 1. Rejected: Earlier.\n- Pass 2, F1, major, critic and \
+             conformance on Claude Code, standing in for Codex: Claim 1. Rejected: Not so.",
             "**Next.** The findings asked below go to the decider",
         ] {
             assert!(body.contains(line), "{line}\n---\n{body}");
@@ -3391,6 +3412,7 @@ Merge state reported by the forge: `CLEAN`.
         let quiet = PlanComment {
             findings: Vec::new(),
             not_asked: Vec::new(),
+            earlier: Vec::new(),
             next: PlanNext::Build,
             ..comment
         }
@@ -3419,6 +3441,7 @@ Merge state reported by the forge: `CLEAN`.
             reviewers: Vec::new(),
             findings,
             not_asked: Vec::new(),
+            earlier: Vec::new(),
             next: PlanNext::Build,
             run: None,
         }

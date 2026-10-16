@@ -224,6 +224,33 @@ pub(crate) fn pass_findings(
     kept
 }
 
+/// The findings the loop's Design review passes before `pass` rejected,
+/// oldest pass first, each with its pass: the passes that end `review`
+/// before its last one, `pass` itself, back to the loop's pass 1.
+pub(crate) fn earlier_rejected(review: &TicketReview, pass: u32) -> Vec<(u32, KeptFinding)> {
+    let mut passes: Vec<&ReviewPass> = Vec::new();
+    let mut expected = pass;
+    for kept in review.passes.iter().rev() {
+        if expected == 0 || kept.stage != Stage::DesignReview || kept.pass.get() != expected {
+            break;
+        }
+        if expected < pass {
+            passes.push(kept);
+        }
+        expected -= 1;
+    }
+    passes
+        .into_iter()
+        .rev()
+        .flat_map(|kept| {
+            kept.findings
+                .iter()
+                .filter(|finding| finding.outcome == Some(FindingOutcome::Rejected))
+                .map(|finding| (kept.pass.get(), finding.clone()))
+        })
+        .collect()
+}
+
 /// What the design run due at Design in `state` is given (assumption A4 of
 /// OWL-303): nothing before a review pass ended in this loop; else, by the
 /// latest Design review pass of `review`, settled again under
@@ -1167,6 +1194,7 @@ impl OnDemand<'_> {
                 .collect(),
             findings: findings.clone(),
             not_asked: not_asked.clone(),
+            earlier: earlier_rejected(&review, pass),
             next: match (event, verdict.outcome) {
                 (Event::Completed, _) => PlanNext::Build,
                 (_, PassOutcome::Passed) => PlanNext::Approval,
@@ -1452,6 +1480,29 @@ mod tests {
         // A record that does not end with the state's pass is refused.
         assert!(design_input(&after_two, Some(&clean), arbiter, true).is_err());
         assert!(design_input(&after_one, None, arbiter, true).is_err());
+    }
+
+    /// The PLAN comment lists the rejections of the loop's earlier passes,
+    /// never those of an earlier loop.
+    #[test]
+    fn the_earlier_rejections_are_the_loops_own() {
+        let seats = [seat(
+            &[Mandate::Critic],
+            HarnessKind::Codex,
+            vec![finding(1, Severity::Major)],
+        )];
+        let mut rejected = pass_findings(&seats, Some(&[ruling(1, RulingOutcome::Rejected)]));
+        settle_pass(Stage::DesignReview, 1, &mut rejected, FindingsConfirmation::Arbiter);
+        let record = review(&[
+            (1, rejected.clone()),
+            (1, rejected.clone()),
+            (2, Vec::new()),
+            (3, Vec::new()),
+        ]);
+        let earlier = earlier_rejected(&record, 3);
+        assert_eq!(earlier.len(), 1, "the first loop's pass is left out");
+        assert_eq!(earlier[0].0, 1);
+        assert!(earlier_rejected(&record, 1).is_empty());
     }
 
     fn plan(forks: Vec<Fork>) -> Plan {
