@@ -1,7 +1,9 @@
 //! Per-ticket routing in the runner (OWL-305, architecture section 5,
 //! "Per-ticket routing"): the `tier:` and `effort:` labels read off the
 //! ticket at dispatch, the model of each tier, and the [`Router`] that gives
-//! a run the harness its routing names.
+//! a run the harness its routing names. Since OWL-303 the `variant:` label
+//! too, which overrides intake's verdict on the ticket's pipeline
+//! ([`ticket_variant`]), and the Codex critic's router ([`CodexRouter`]).
 //!
 //! The rules are the core's ([`owlshift_core::routing`]): the ticket's
 //! routing from intake's verdict under the labels' values, then each role's
@@ -10,9 +12,10 @@
 
 use owlshift_contracts::config::Models;
 use owlshift_core::routing::RunRouting;
-use owlshift_core::vocab::{Effort, Tier};
+use owlshift_core::vocab::{Effort, Tier, Variant};
 
 use crate::executor::Harness;
+use crate::executor::codex::CodexHarness;
 use crate::executor::harness::ClaudeHarness;
 
 /// The prefix of a label that sets the ticket's tier, matched without
@@ -20,6 +23,19 @@ use crate::executor::harness::ClaudeHarness;
 pub const TIER_LABEL_PREFIX: &str = "tier:";
 /// The prefix of a label that sets the ticket's effort.
 pub const EFFORT_LABEL_PREFIX: &str = "effort:";
+/// The prefix of a label that sets the ticket's pipeline variant (OWL-303).
+pub const VARIANT_LABEL_PREFIX: &str = "variant:";
+
+/// The ticket's pipeline variant (architecture section 5, "The roster",
+/// *The variant*): its `variant:` label's, else intake's verdict, else the
+/// project's `pipeline.default`, read at each dispatch.
+pub fn ticket_variant(
+    label: Option<Variant>,
+    verdict: Option<Variant>,
+    default: Variant,
+) -> Variant {
+    label.or(verdict).unwrap_or(default)
+}
 
 /// Gives a run the harness its routing names. One router serves one harness
 /// family: the caller picks it by the routing's `harness`, which the core's
@@ -78,11 +94,55 @@ impl Router for ClaudeRouter {
     }
 }
 
-/// What a ticket's `tier:` and `effort:` labels give its routing.
+/// The Codex model of `tier` in `[models]`, `None` for Codex's own default
+/// (architecture section 5, "Per-ticket routing": the critic runs on the
+/// standard tier).
+pub fn codex_model(models: &Models, tier: Tier) -> Option<&str> {
+    match tier {
+        Tier::Deep => &models.deep,
+        Tier::Standard => &models.standard,
+        Tier::Fast => &models.fast,
+    }
+    .as_ref()
+    .and_then(|models| models.codex.as_deref())
+}
+
+/// Codex, routed (OWL-303): the critic's harness, given the model of the
+/// routing's tier and its effort for each run, which the adapter maps one
+/// to one (check C2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodexRouter {
+    /// The critic's harness: its program, prompt and the user's login file.
+    pub harness: CodexHarness,
+    /// The project's `[models]`.
+    pub models: Models,
+}
+
+impl CodexRouter {
+    /// The harness of a run routed `routing`.
+    pub fn codex(&self, routing: RunRouting) -> CodexHarness {
+        CodexHarness {
+            model: codex_model(&self.models, routing.tier).map(str::to_owned),
+            effort: routing.effort,
+            ..self.harness.clone()
+        }
+    }
+}
+
+impl Router for CodexRouter {
+    fn harness(&self, routing: RunRouting) -> Box<dyn Harness + '_> {
+        Box::new(self.codex(routing))
+    }
+}
+
+/// What a ticket's `tier:`, `effort:` and `variant:` labels give its
+/// routing and its pipeline.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteLabels {
     pub tier: Option<Tier>,
     pub effort: Option<Effort>,
+    /// The pipeline variant a `variant:` label names (OWL-303).
+    pub variant: Option<Variant>,
     /// The labels left out, in the labels' order, each with the reason: a
     /// value that names no tier or effort, or one that two labels of the
     /// same prefix disagree on, both then left out. The runner tells them
@@ -103,6 +163,12 @@ const TIERS: [(&str, Tier); 3] = [
     ("fast", Tier::Fast),
 ];
 
+const VARIANTS: [(&str, Variant); 3] = [
+    ("trivial", Variant::Trivial),
+    ("standard", Variant::Standard),
+    ("risky", Variant::Risky),
+];
+
 const EFFORTS: [Effort; 5] = [
     Effort::Low,
     Effort::Medium,
@@ -111,8 +177,9 @@ const EFFORTS: [Effort; 5] = [
     Effort::Max,
 ];
 
-/// Reads the `tier:` and `effort:` labels among `labels`: the prefix
-/// without regard to case, the value trimmed and without regard to case.
+/// Reads the `tier:`, `effort:` and `variant:` labels among `labels`: the
+/// prefix without regard to case, the value trimmed and without regard to
+/// case.
 /// Other labels play no part. A label repeating a value already read
 /// counts once.
 pub fn route_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> RouteLabels {
@@ -131,11 +198,19 @@ pub fn route_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> RouteLabel
             .find(|effort| effort.as_str() == value)
             .ok_or_else(|| format!("`{value}` is not an effort: low, medium, high, xhigh or max"))
     });
+    let variant = read_prefix(&labels, VARIANT_LABEL_PREFIX, &mut ignored, |value| {
+        VARIANTS
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, variant)| *variant)
+            .ok_or_else(|| format!("`{value}` is not a variant: trivial, standard or risky"))
+    });
     // In the labels' order, whichever prefix left each out.
     ignored.sort_by_key(|left: &IgnoredLabel| labels.iter().position(|label| *label == left.label));
     RouteLabels {
         tier,
         effort,
+        variant,
         ignored,
     }
 }
@@ -219,6 +294,36 @@ mod tests {
             labels(&["tiered", "effortless", "é"]),
             RouteLabels::default()
         );
+    }
+
+    /// OWL-303: a `variant:` label is read as the others are, and overrides
+    /// intake's verdict, which overrides the project's default.
+    #[test]
+    fn the_variant_label_overrides_the_verdict_which_overrides_the_default() {
+        let read = labels(&["Variant: Risky", "variant:huge", "tier:fast"]);
+        assert_eq!(read.variant, Some(Variant::Risky));
+        assert_eq!(
+            read.ignored,
+            [ignored(
+                "variant:huge",
+                "`huge` is not a variant: trivial, standard or risky"
+            )]
+        );
+        assert_eq!(
+            labels(&["variant:trivial", "variant:risky"]).variant,
+            None,
+            "two variants disagree"
+        );
+        use Variant::{Risky, Standard, Trivial};
+        let cases = [
+            (Some(Risky), Some(Trivial), Standard, Risky),
+            (None, Some(Trivial), Standard, Trivial),
+            (None, None, Standard, Standard),
+            (None, None, Trivial, Trivial),
+        ];
+        for (label, verdict, default, expected) in cases {
+            assert_eq!(ticket_variant(label, verdict, default), expected);
+        }
     }
 
     #[test]
@@ -313,5 +418,47 @@ mod tests {
             (default.model.as_deref(), default.effort),
             (Some("sonnet"), None)
         );
+    }
+
+    /// OWL-303: the Codex router gives the tier's Codex model, Codex's own
+    /// default when the project names none, and the routing's effort.
+    #[test]
+    fn the_codex_router_gives_the_tiers_codex_model_and_the_effort() {
+        let router = CodexRouter {
+            harness: CodexHarness {
+                program: PathBuf::from("codex"),
+                prompt: "# Design review".to_owned(),
+                model: Some("set aside".to_owned()),
+                effort: None,
+                login: PathBuf::from("auth.json"),
+            },
+            models: Models {
+                deep: None,
+                standard: Some(TierModels {
+                    claude: Some("sonnet".to_owned()),
+                    codex: Some("gpt-6-astra".to_owned()),
+                }),
+                fast: None,
+            },
+        };
+        let routed = router.codex(RunRouting {
+            harness: Harness::Codex,
+            tier: Tier::Standard,
+            effort: Some(Effort::High),
+        });
+        assert_eq!(
+            routed,
+            CodexHarness {
+                model: Some("gpt-6-astra".to_owned()),
+                effort: Some(Effort::High),
+                ..router.harness.clone()
+            }
+        );
+        let deep = router.codex(RunRouting {
+            harness: Harness::Codex,
+            tier: Tier::Deep,
+            effort: None,
+        });
+        assert_eq!((deep.model, deep.effort), (None, None));
     }
 }

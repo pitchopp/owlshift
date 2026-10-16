@@ -1049,6 +1049,8 @@ mod tests {
             questions: TicketQuestions::new(),
             delivery: Some(delivery),
             intake: None,
+            plan: None,
+            review: None,
         }
     }
 

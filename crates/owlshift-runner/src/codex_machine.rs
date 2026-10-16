@@ -7,14 +7,20 @@
 //! allow `danger-full-access` stops every Codex run, since the adapter turns
 //! Codex's sandbox off.
 //!
-//! This module reads text only; the caller reads the files. A value whose
-//! shape Codex's own files do not have is never guessed at: it makes the
-//! whole file [`Unreadable::Shape`], so a report says it cannot tell what the
-//! file does rather than naming a server or a mode that may not be one.
+//! This module reads text only; the caller reads the files, but for
+//! [`codex_critic`], which `owlshift do` asks once per command (OWL-303). A
+//! value whose shape Codex's own files do not have is never guessed at: it
+//! makes the whole file [`Unreadable::Shape`], so a report says it cannot tell
+//! what the file does rather than naming a server or a mode that may not be
+//! one.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
+
+use crate::agent_env::AgentEnv;
+use crate::system::System;
 
 /// The machine's Codex configuration.
 pub const CONFIG: &str = "/etc/codex/config.toml";
@@ -181,6 +187,64 @@ pub fn requirements(text: &str) -> Result<Requirements, Unreadable> {
     })
 }
 
+/// What a Codex critic run needs, found on this machine (OWL-303).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexCritic {
+    /// The `codex` program.
+    pub program: PathBuf,
+    /// The user's login file, which each run copies.
+    pub login: PathBuf,
+}
+
+/// Whether Codex can run the critic of the review roles on this machine
+/// (architecture section 5, "Without Codex"): `codex` on the `PATH`, the
+/// login file a run copies ([`crate::executor::codex::user_login`]), and no
+/// [`REQUIREMENTS`] that refuses [`FULL_ACCESS`]. Otherwise why not, and the
+/// critic stands in on Claude Code. A requirements file that cannot be read
+/// or told counts as refusing, unlike `owlshift doctor`'s warning: a run
+/// that would stop before it starts is not tried.
+pub fn codex_critic(system: &dyn System, agent: &AgentEnv) -> Result<CodexCritic, String> {
+    critic_readiness(
+        system.locate("codex"),
+        crate::executor::codex::user_login(agent),
+        |path| system.is_file(path),
+        system.read_text_file(Path::new(REQUIREMENTS)),
+    )
+}
+
+/// [`codex_critic`]'s verdict from what it read: the program found, the
+/// login file's place, whether a path is a file, and the requirements file's
+/// text, `None` when there is none.
+pub fn critic_readiness(
+    program: Option<PathBuf>,
+    login: Option<PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+    requirements_text: Result<Option<String>, String>,
+) -> Result<CodexCritic, String> {
+    let program = program.ok_or("`codex` is not on the PATH")?;
+    let login = login.ok_or("neither `CODEX_HOME` nor `HOME` names Codex's folder")?;
+    if !is_file(&login) {
+        return Err(format!(
+            "Codex has no login file at {}: run `codex login`",
+            login.display()
+        ));
+    }
+    match requirements_text {
+        Ok(None) => {}
+        Ok(Some(text)) => match requirements(&text) {
+            Ok(required) if !required.refuses_full_access() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{REQUIREMENTS} does not allow `{FULL_ACCESS}`, which a Codex agent run needs"
+                ));
+            }
+            Err(error) => return Err(format!("{REQUIREMENTS} {error}")),
+        },
+        Err(error) => return Err(format!("{REQUIREMENTS} could not be read: {error}")),
+    }
+    Ok(CodexCritic { program, login })
+}
+
 /// `text` as a TOML table; an error keeps only its line.
 fn parse(text: &str) -> Result<Table, Unreadable> {
     text.parse::<Table>().map_err(|error| Unreadable::Syntax {
@@ -194,6 +258,70 @@ fn parse(text: &str) -> Result<Table, Unreadable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-303: the critic runs on Codex only with the program, its login
+    /// file and requirements that let a run start.
+    #[test]
+    fn codex_runs_the_critic_only_when_installed_logged_in_and_allowed() {
+        let program = || Some(PathBuf::from("/bin/codex"));
+        let login = || Some(PathBuf::from("/home/me/.codex/auth.json"));
+        let ready = CodexCritic {
+            program: PathBuf::from("/bin/codex"),
+            login: PathBuf::from("/home/me/.codex/auth.json"),
+        };
+        let allows = r#"allowed_sandbox_modes = ["read-only", "danger-full-access"]"#;
+        let refuses = r#"allowed_sandbox_modes = ["read-only"]"#;
+        let verdict = |program, login, file: bool, text: Result<Option<&str>, &str>| {
+            critic_readiness(
+                program,
+                login,
+                |_| file,
+                text.map(|t| t.map(str::to_owned)).map_err(str::to_owned),
+            )
+        };
+        assert_eq!(
+            verdict(program(), login(), true, Ok(None)),
+            Ok(ready.clone())
+        );
+        assert_eq!(
+            verdict(program(), login(), true, Ok(Some(allows))),
+            Ok(ready)
+        );
+        let refused = [
+            (verdict(None, login(), true, Ok(None)), "not on the PATH"),
+            (
+                verdict(program(), None, true, Ok(None)),
+                "names Codex's folder",
+            ),
+            (
+                verdict(program(), login(), false, Ok(None)),
+                "no login file",
+            ),
+            (
+                verdict(program(), login(), true, Ok(Some(refuses))),
+                "does not allow",
+            ),
+            (
+                verdict(
+                    program(),
+                    login(),
+                    true,
+                    Ok(Some("allowed_sandbox_modes = 1")),
+                ),
+                "a shape Owlshift does not know",
+            ),
+            (
+                verdict(program(), login(), true, Err("permission denied")),
+                "could not be read",
+            ),
+        ];
+        for (verdict, why) in refused {
+            assert!(
+                verdict.as_ref().is_err_and(|e| e.contains(why)),
+                "{why}: {verdict:?}"
+            );
+        }
+    }
 
     #[test]
     fn servers_and_hooks_are_named_in_key_order_but_disabled_servers() {

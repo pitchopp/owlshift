@@ -46,6 +46,12 @@
 //! Intake ([`OnDemand::intake`], OWL-248) runs the intake role on an admitted
 //! ticket for the drain, and `continue` runs it again on a ticket at Intake;
 //! see the `intake` module.
+//!
+//! From P5 (OWL-303) a ticket goes through the stages of its variant: a
+//! `standard` or `risky` ticket is dispatched from Ready to Design, whose
+//! plan Design review reviews before Build; see the `design` module. The
+//! variant is the ticket's `variant:` label, else intake's verdict, else the
+//! project's `pipeline.default`, read at each command.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -85,6 +91,7 @@ use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
     Verdict as AnswerVerdict,
 };
+use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::GatePolicy;
@@ -111,7 +118,7 @@ use crate::proposals::{self, Filing};
 use crate::rebase;
 use crate::resolver::{self, Fallback, Resolved};
 use crate::reversal;
-use crate::routing::{Router, claude_model, route_labels};
+use crate::routing::{Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
@@ -136,14 +143,19 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 const HEAD_READS: u32 = 5;
 
 mod correction;
+mod design;
 mod drain;
 mod intake;
+
+use design::Built;
 
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
 
-/// The pipeline of this version: the build stage alone, in the core machine.
+/// The pipeline of the paths at Watch and of intake: their moves are the
+/// same in every variant. From Ready to delivery a command follows the
+/// ticket's own pipeline instead (`Prepared::pipeline`, OWL-303).
 pub(crate) const PIPELINE: Pipeline = Pipeline::new(Variant::Trivial);
 
 /// The executor of `owlshift do`: `git` for the runner's own commands,
@@ -389,6 +401,15 @@ pub struct OnDemand<'a> {
     /// Runs the intake role (`roles/intake.md`) on the standard tier
     /// (OWL-248).
     pub intake: &'a dyn Harness,
+    /// Runs the design role (`roles/design.md`) on the ticket's routing
+    /// (OWL-303).
+    pub design: &'a dyn Router,
+    /// Runs the reviewers of Design review (`roles/design_review.md`), each
+    /// on its seat's routing (OWL-303).
+    pub design_review: Reviewers<'a>,
+    /// Runs the arbiter (`roles/arbiter.md`) on its role's routing: the
+    /// standard tier, without an effort (OWL-303).
+    pub arbiter: &'a dyn Router,
     /// Runs the answer check (`roles/answer_check.md`).
     pub answer_check: &'a dyn Harness,
     /// Runs the resolver (`roles/resolver.md`).
@@ -408,6 +429,16 @@ pub struct OnDemand<'a> {
     /// This machine's clock, read for the quiet window alone
     /// ([`answer_check::counts_at`]).
     pub clock: &'a dyn Fn() -> Timestamp,
+}
+
+/// The reviewers of a review stage, by harness (OWL-303): on Claude Code,
+/// and on Codex for the critic when Codex can run it on this machine
+/// ([`crate::codex_machine::codex_critic`]); without it the critic stands in
+/// on Claude Code.
+#[derive(Clone, Copy)]
+pub struct Reviewers<'a> {
+    pub claude: &'a dyn Router,
+    pub codex: Option<&'a dyn Router>,
 }
 
 /// A ticket delivered.
@@ -900,6 +931,23 @@ struct Prepared {
     /// The intake record, as the ticket ref keeps it or as intake just made
     /// it: every write of the ref carries it ([`OnDemand::store_delivery`]).
     intake: Option<TicketIntake>,
+    /// The ticket's plan, as the ticket ref keeps it or as a design run just
+    /// made it (OWL-303): every write of the ref carries it, as `intake`.
+    plan: Option<TicketPlan>,
+    /// The ticket's review passes, as the ticket ref keeps them or as a
+    /// review pass just added one (OWL-303): every write carries them.
+    review: Option<TicketReview>,
+    /// The ticket's pipeline, of its variant read at this command (OWL-303).
+    pipeline: Pipeline,
+    /// Runs in a row of this command whose questions the resolver all
+    /// decided, across its stages: never reset in a command, it bounds
+    /// Build's and Design's re-runs, a `replan` the resolver decided among
+    /// them ([`MAX_RESOLVED_PASSES`]).
+    settled: u32,
+    /// Why the Codex critic cannot run in this command although Codex is
+    /// configured: its harness's check failed (OWL-303). The critic stands
+    /// in on Claude Code, and the review pass warns of it.
+    critic: Option<String>,
 }
 
 impl Prepared {
@@ -1012,7 +1060,9 @@ impl OnDemand<'_> {
         // the thread, and a new round follows them.
         let ready = TicketState::restore(Status::Active(Stage::Ready), round, 0, 0, 0, 0)
             .map_err(core_error)?;
-        let state = match ready.apply(PIPELINE, Event::Dispatched) {
+        // To the first stage of its variant after Ready: Design for
+        // `standard` and `risky`, Build for `trivial` (OWL-303).
+        let state = match ready.apply(p.pipeline, Event::Dispatched) {
             Ok(Transition::To(state)) => state,
             other => return Err(core_error(other)),
         };
@@ -1025,7 +1075,7 @@ impl OnDemand<'_> {
             .map_err(|e| refused("starting the ticket's branch from the base", e))?;
         let dispatched = self.dispatch(p, command, sink)?;
         self.show_after(ticket, None, Event::Dispatched, sink);
-        self.build(p, &dispatched, state, sink)
+        self.drive(p, command, dispatched, state, sink)
     }
 
     /// `owlshift continue`: picks `ticket` up where its ticket ref left it. A
@@ -1124,7 +1174,7 @@ impl OnDemand<'_> {
         // A person typing `continue` on a parked ticket is the restart the
         // core waits for.
         if let Status::Parked { at, .. } = state.status() {
-            state = match state.apply(PIPELINE, Event::Restarted) {
+            state = match state.apply(p.pipeline, Event::Restarted) {
                 Ok(Transition::To(state)) => state,
                 other => return Err(core_error(other)),
             };
@@ -1174,17 +1224,21 @@ impl OnDemand<'_> {
         {
             return self.watch_once(&mut p, sink);
         }
-        if state.status() != Status::Active(Stage::Build) {
+        // Design, Design review and Build run on (OWL-303).
+        if !matches!(
+            state.status(),
+            Status::Active(Stage::Design | Stage::DesignReview | Stage::Build)
+        ) {
             return Err(Stop::Refused(format!(
                 "nothing to continue: {ticket} is at {} and waits for no answer; run `owlshift do \
                  {ticket}` to run it again",
                 stage_name(state.stage())
             )));
         }
-        // Build may ask a new round, which goes to the decider now.
+        // A stage's run may ask a new round, which goes to the decider now.
         p.current()?;
         let dispatched = self.dispatch(&p, Command::Continue, sink)?;
-        self.build(&mut p, &dispatched, state, sink)
+        self.drive(&mut p, Command::Continue, dispatched, state, sink)
     }
 
     /// Everything before a run: the lock, the marker, the confinement, the
@@ -1228,11 +1282,34 @@ impl OnDemand<'_> {
             .map_err(|e| Stop::Refused(e.to_string()))?;
         // A harness's needs do not depend on its run's tier or effort.
         let build = self.build.harness(PROJECT_DEFAULT);
-        for harness in [&*build, self.answer_check, self.resolver, self.intake] {
+        let design = self.design.harness(PROJECT_DEFAULT);
+        let reviewer = self.design_review.claude.harness(PROJECT_DEFAULT);
+        let arbiter = self.arbiter.harness(PROJECT_DEFAULT);
+        for harness in [
+            &*build,
+            self.answer_check,
+            self.resolver,
+            self.intake,
+            &*design,
+            &*reviewer,
+            &*arbiter,
+        ] {
             harness
                 .sandbox_needs(&self.executor.agent)
                 .map_err(|e| Stop::Refused(e.to_string()))?;
         }
+        // The Codex critic only stands in when its harness cannot run here
+        // (architecture section 5, "Without Codex"): nothing is refused.
+        let critic = self.design_review.codex.and_then(|codex| {
+            codex
+                .harness(RunRouting {
+                    harness: owlshift_core::vocab::Harness::Codex,
+                    ..PROJECT_DEFAULT
+                })
+                .sandbox_needs(&self.executor.agent)
+                .err()
+                .map(|e| e.to_string())
+        });
         // The ticket ref lives in the dedicated checkout: without one,
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
@@ -1282,6 +1359,7 @@ impl OnDemand<'_> {
                 text,
             });
         }
+        let labels = route_labels(found.labels.iter().map(String::as_str));
         let stored = ticket_ref::read(git, &checkout, ticket).map_err(|e| {
             Stop::Refused(format!(
                 "reading the ticket's ref: {e}. `owlshift forget {ticket}` starts its record \
@@ -1301,6 +1379,22 @@ impl OnDemand<'_> {
             intake: stored
                 .as_ref()
                 .and_then(|stored| stored.record.intake.clone()),
+            plan: stored
+                .as_ref()
+                .and_then(|stored| stored.record.plan.clone()),
+            review: stored
+                .as_ref()
+                .and_then(|stored| stored.record.review.clone()),
+            pipeline: Pipeline::new(ticket_variant(
+                labels.variant,
+                stored
+                    .as_ref()
+                    .and_then(|stored| stored.record.intake.as_ref())
+                    .map(|record| record.variant),
+                self.config.pipeline.default,
+            )),
+            settled: 0,
+            critic,
             stored,
             heeded: false,
             repairing: false,
@@ -1517,24 +1611,25 @@ impl OnDemand<'_> {
     /// Runs Build from `state` until it delivers or stops: a failed run gets
     /// one more run before the core parks the ticket, and a refused result
     /// never spends that last run ([`stage_event`]); questions open a round.
+    /// A `replan` the resolver settles sends the ticket back to Design
+    /// ([`Built::Replan`], OWL-303).
     fn build(
         &self,
         p: &mut Prepared,
         dispatched: &Dispatched,
         mut state: TicketState,
         sink: &mut EventSink<'_>,
-    ) -> Result<Delivered, Stop> {
+    ) -> Result<Built, Stop> {
         let current = person(p.current()?, &p.found);
         self.keep(p, &state)?;
         let harness = self.build.harness(dispatched.build);
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
-        // Runs in a row whose questions the resolver all decided. Neither
-        // this count nor `integrating` below is reset in a command: they also
-        // bound the refused results kept from the last attempt, each followed
-        // by a told run that parks, stops, delivers, or goes on through one
-        // of them (OWL-183).
-        let mut settled = 0u32;
+        // Runs in a row whose questions the resolver all decided are
+        // `p.settled`. Neither that count nor `integrating` below is reset
+        // in a command: they also bound the refused results kept from the
+        // last attempt, each followed by a told run that parks, stops,
+        // delivers, or goes on through one of them (OWL-183).
         // The late comments a Build run of this command was given to
         // integrate (OWL-139): one such run per delivery.
         let mut integrating: Option<Vec<Comment>> = None;
@@ -1552,6 +1647,8 @@ impl OnDemand<'_> {
             // Why an earlier Build result was refused, from the ticket ref,
             // whatever command ran it (OWL-192).
             tell_build(&mut brief, &p.questions());
+            // The plan the Build follows, with its base (OWL-303).
+            brief.plan = design::given_plan(p);
             let (ran, event) =
                 self.run_role_once(p, &*harness, &state, &brief, attempt, &mut gathered, sink)?;
             let result = (event != Event::ResultRefused)
@@ -1563,6 +1660,11 @@ impl OnDemand<'_> {
             let asked = result
                 .map(|result| asked_choices(&brief, result))
                 .unwrap_or_default();
+            // A Build that cannot follow its plan asks a `replan` (OWL-303):
+            // once settled, the ticket goes back to Design. On `trivial`,
+            // which has no Design, it is a plain question.
+            let replan = p.pipeline.contains(Stage::Design)
+                && result.is_some_and(|result| result.questions.iter().any(|q| q.replan));
             // Questions go through the resolver before any reaches the
             // decider: the core's `Questions` comes after it, for what is
             // left, and a run whose questions were all decided runs again.
@@ -1578,19 +1680,35 @@ impl OnDemand<'_> {
             } else if event == Event::Questions
                 && let Some(result) = result
             {
+                // On an approved plan a `replan` goes to the decider, never
+                // to the resolver (architecture section 5, "Plan approval").
+                let forced = if design::plan_approved(p) {
+                    result
+                        .questions
+                        .iter()
+                        .filter(|q| q.replan)
+                        .map(|q| q.id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 match self.resolve(
                     p,
                     &state,
                     result,
                     &asked,
+                    &forced,
                     &dispatched.rules,
                     &current,
-                    settled,
+                    p.settled,
                     &ran.run,
                     sink,
                 )? {
                     Routing::Settled => {
-                        settled += 1;
+                        p.settled += 1;
+                        if replan {
+                            return self.replanned(p, state, &ran.run, sink);
+                        }
                         continue;
                     }
                     Routing::Ask(asked) => round = Some(asked),
@@ -1618,7 +1736,7 @@ impl OnDemand<'_> {
                         integrating = Some(late);
                         continue;
                     }
-                    let asked = match state.apply(PIPELINE, Event::Questions) {
+                    let asked = match state.apply(p.pipeline, Event::Questions) {
                         Ok(Transition::To(asked)) => asked,
                         other => return Err(core_error(other)),
                     };
@@ -1633,7 +1751,13 @@ impl OnDemand<'_> {
                     ));
                 }
             }
-            match state.apply(PIPELINE, event) {
+            // A round that carries a `replan` returns to Design (OWL-301).
+            let event = if event == Event::Questions && replan {
+                Event::ReplanRound
+            } else {
+                event
+            };
+            match state.apply(p.pipeline, event) {
                 Ok(Transition::To(next)) => state = next,
                 Ok(Transition::Parked {
                     state: parked,
@@ -1698,6 +1822,7 @@ impl OnDemand<'_> {
             }
         };
         self.deliver(p, dispatched, report, gathered, &state, sink)
+            .map(Built::Delivered)
     }
 
     /// One run of the build role from `brief` on `harness`, in `state`, for
@@ -1905,6 +2030,7 @@ impl OnDemand<'_> {
         state: &TicketState,
         result: &RunResult,
         asked: &[ReopenedChoice],
+        forced: &[QuestionId],
         rules: &ProjectRules,
         current: &Person,
         settled: u32,
@@ -1912,7 +2038,15 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Routing, Stop> {
         let ticket = p.ticket.clone();
-        let routed = resolver::route(&p.policy, &result.questions, asked);
+        let mut routed = resolver::route(&p.policy, &result.questions, asked);
+        // `forced` go to the decider whatever their category, as a `replan`
+        // on an approved plan does (OWL-303).
+        let (to_decider, to_resolver): (Vec<Question>, Vec<Question>) = routed
+            .to_resolver
+            .into_iter()
+            .partition(|question| forced.contains(&question.id));
+        routed.to_resolver = to_resolver;
+        routed.to_decider.extend(to_decider);
         let all = |fallback| Routing::Ask(Round::of(&result.questions, &[], asked, fallback));
         if result.status == result::Status::PremiseFalse || routed.to_resolver.is_empty() {
             return Ok(all(None));
@@ -1977,7 +2111,7 @@ impl OnDemand<'_> {
         let Some(resolutions) = resolutions else {
             // The floor: a run that broke isolation is quarantined, and the
             // ticket parks until a person looks.
-            return match state.apply(PIPELINE, Event::Quarantined) {
+            return match state.apply(p.pipeline, Event::Quarantined) {
                 Ok(Transition::Parked {
                     state: parked,
                     reason,
@@ -2143,7 +2277,7 @@ impl OnDemand<'_> {
         // refusal's reason for the next check.
         let verdicts: Vec<AnswerVerdict> =
             answer_check::keep(&mut questions, read_through, event, &ran.report.outcome);
-        let next = match state.apply(PIPELINE, event) {
+        let next = match state.apply(p.pipeline, event) {
             Ok(Transition::To(next)) => next,
             Ok(Transition::Parked {
                 state: parked,
@@ -2602,6 +2736,8 @@ impl OnDemand<'_> {
             questions,
             delivery,
             intake: p.intake.clone(),
+            plan: p.plan.clone(),
+            review: p.review.clone(),
         };
         let kept = p
             .stored
@@ -2729,6 +2865,11 @@ impl OnDemand<'_> {
         };
         marked.map_err(|e| refused("the project's marker", e))?;
         sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
+        // What the run's harness home left to say, such as a refreshed login
+        // not written back (OWL-299): a warning each (OWL-303).
+        for warning in run_warnings(brief.role, &report) {
+            sink.emit(ticket, Some(&run), EventKind::Warning, warning);
+        }
         if let Some(usage) = &report.usage {
             sink.emit(ticket, Some(&run), EventKind::Usage, usage_data(usage));
         }
@@ -3028,7 +3169,8 @@ impl OnDemand<'_> {
                 browser: false,
             },
             gate: self.config.stack.gate.clone(),
-            always_human: if matches!(role, Role::Build | Role::Resolver) {
+            // Design asks under them too (OWL-303).
+            always_human: if matches!(role, Role::Build | Role::Resolver | Role::Design) {
                 p.policy.additions()
             } else {
                 Vec::new()
@@ -3138,7 +3280,7 @@ impl OnDemand<'_> {
         // at Deliver, to Watch, which follows the pull request.
         let mut watching = *state;
         for _ in 0..2 {
-            watching = match watching.apply(PIPELINE, Event::Completed) {
+            watching = match watching.apply(p.pipeline, Event::Completed) {
                 Ok(Transition::To(next)) => next,
                 other => return Err(core_error(other)),
             };
@@ -5345,6 +5487,22 @@ fn park_detail(outcome: &Outcome) -> String {
 }
 
 /// The `run_ended` event's details.
+/// The `warning` events of a run's [`RunReport::warnings`] (OWL-303): one
+/// each, `what` = `run_warning`, with the role and the warning.
+fn run_warnings(role: Role, report: &RunReport) -> Vec<Data> {
+    report
+        .warnings
+        .iter()
+        .map(|warning| {
+            data([
+                ("what", json!("run_warning")),
+                ("role", json!(role.as_str())),
+                ("warning", json!(warning)),
+            ])
+        })
+        .collect()
+}
+
 fn run_ended(report: &RunReport) -> Data {
     let (outcome, reason, status) = match &report.outcome {
         Outcome::Finished { result, .. } => ("finished", None, Some(status_name(result.status))),
@@ -5465,6 +5623,25 @@ mod tests {
             gate: None,
             warnings: Vec::new(),
         }
+    }
+
+    /// OWL-303: each warning a run's harness home left is one `warning`
+    /// event, naming the role.
+    #[test]
+    fn each_run_warning_is_a_warning_event() {
+        assert!(run_warnings(Role::Build, &report(None)).is_empty());
+        let warned = RunReport {
+            warnings: vec!["the login was not written back".to_owned()],
+            ..report(None)
+        };
+        let events = run_warnings(Role::DesignReview, &warned);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["what"], json!("run_warning"));
+        assert_eq!(events[0]["role"], json!("design_review"));
+        assert_eq!(
+            events[0]["warning"],
+            json!("the login was not written back")
+        );
     }
 
     #[test]

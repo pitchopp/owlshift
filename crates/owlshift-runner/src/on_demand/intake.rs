@@ -341,6 +341,7 @@ impl OnDemand<'_> {
                     &state,
                     result,
                     &[],
+                    &[],
                     &rules,
                     &current,
                     settled,

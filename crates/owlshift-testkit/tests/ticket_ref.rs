@@ -12,6 +12,7 @@ use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{PersistedState, TicketDelivery, TicketQuestions};
+use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::executor::Git;
 use owlshift_runner::forget;
@@ -105,6 +106,8 @@ fn record(state: &str, round: u32) -> TicketRecord {
         questions: TicketQuestions::parse(&questions(round)).unwrap(),
         delivery: None,
         intake: None,
+        plan: None,
+        review: None,
     }
 }
 
@@ -179,8 +182,55 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
     };
     let five = ticket_ref::write(&repo.git, &repo.root, &ticket(), &taken_in, Some(&four)).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().record, taken_in);
-    ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&five)).unwrap();
+    let six = ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&five)).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().record, second);
+
+    // So are a plan and its review passes (OWL-303).
+    let planned = TicketRecord {
+        plan: Some(ticket_plan()),
+        review: Some(ticket_review()),
+        ..second.clone()
+    };
+    let seven = ticket_ref::write(&repo.git, &repo.root, &ticket(), &planned, Some(&six)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, planned);
+    ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&seven)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, second);
+}
+
+fn ticket_plan() -> TicketPlan {
+    TicketPlan::parse(include_str!(
+        "../../owlshift-contracts/tests/fixtures/ticket-plan.json"
+    ))
+    .unwrap()
+}
+
+fn ticket_review() -> TicketReview {
+    TicketReview::parse(include_str!(
+        "../../owlshift-contracts/tests/fixtures/ticket-review.json"
+    ))
+    .unwrap()
+}
+
+/// OWL-303: a `plan.json` or `review.json` that does not parse makes the ref
+/// unreadable, naming the file.
+#[test]
+fn an_invalid_plan_or_review_makes_the_ref_unreadable() {
+    let repo = Repo::new();
+    let state = repo.blob(r#"{"format":2,"stage":"design","round":0,"reasks":0,"failed_runs":0}"#);
+    let questions = repo.blob(&TicketQuestions::new().render());
+    let broken = repo.blob("{");
+    for file in ["plan.json", "review.json"] {
+        repo.plant(&[
+            ("100644", &state, "state.json"),
+            ("100644", &questions, "questions.json"),
+            ("100644", &broken, file),
+        ]);
+        let error = repo.read().unwrap_err();
+        assert!(
+            error.contains(&format!("holds an invalid {file}")),
+            "{error}"
+        );
+    }
 }
 
 fn intake() -> TicketIntake {
@@ -214,6 +264,8 @@ fn record_of(len: usize) -> TicketRecord {
             questions: TicketQuestions::parse(&questions).unwrap(),
             delivery: None,
             intake: None,
+            plan: None,
+            review: None,
         }
     };
     let base = with(1).questions.render().len();
@@ -311,8 +363,9 @@ fn kept_everything() -> TicketRecord {
             "../../owlshift-contracts/tests/fixtures/ticket-questions.json"
         ))
         .unwrap(),
-        // Forgetting drops the delivery too (OWL-209), and the intake
-        // record, so the drain runs intake again (OWL-248).
+        // Forgetting drops the delivery too (OWL-209), the intake record,
+        // so the drain runs intake again (OWL-248), and the plan and its
+        // review passes, so the next dispatch designs anew (OWL-303).
         delivery: Some(
             TicketDelivery::parse(include_str!(
                 "../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
@@ -320,6 +373,8 @@ fn kept_everything() -> TicketRecord {
             .unwrap(),
         ),
         intake: Some(intake()),
+        plan: Some(ticket_plan()),
+        review: Some(ticket_review()),
     }
 }
 
@@ -338,6 +393,8 @@ fn forgotten(round: u32, questions: &TicketQuestions) -> TicketRecord {
         },
         delivery: None,
         intake: None,
+        plan: None,
+        review: None,
     }
 }
 

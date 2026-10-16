@@ -47,7 +47,7 @@ use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
 };
-use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Stop};
+use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Reviewers, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::routing::{ClaudeRouter, Router};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
@@ -614,6 +614,9 @@ struct Bench {
     inbox: RefCell<FakeInbox>,
     /// The routing each routed harness was asked for, in order (OWL-305).
     routed: Rc<RefCell<Vec<RunRouting>>>,
+    /// Codex can run the critic of the review roles (OWL-303): the bench's
+    /// one harness then plays it too.
+    codex: Cell<bool>,
 }
 
 const DONE: &str = r#"{"format":9,"status":"done","summary":"Added GREETING.md; the gate passes.",
@@ -733,6 +736,7 @@ impl Bench {
             waited: Cell::new(SignedDuration::from_mins(10)),
             inbox: RefCell::default(),
             routed: Rc::default(),
+            codex: Cell::new(false),
         }
     }
 
@@ -1070,9 +1074,16 @@ impl Bench {
             executor: &executor,
             tracker: &tracker,
             forge: &forge,
-            // One harness plays every run, a reply each, whatever its role.
+            // One harness plays every run, a reply each, whatever its role,
+            // the Codex critic's too when the bench gives Codex.
             build: &harness,
             intake: &harness,
+            design: &harness,
+            design_review: Reviewers {
+                claude: &harness,
+                codex: self.codex.get().then_some(&harness as &dyn Router),
+            },
+            arbiter: &harness,
             answer_check: &harness,
             resolver: &harness,
             rebase: &harness,
@@ -2230,6 +2241,12 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         forge: &forge,
         build: &router,
         intake: &harness,
+        design: &router,
+        design_review: Reviewers {
+            claude: &router,
+            codex: None,
+        },
+        arbiter: &router,
         answer_check: &harness,
         resolver: &harness,
         rebase: &router,
@@ -2304,6 +2321,12 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         forge: &forge,
         build: &router,
         intake: &harness,
+        design: &router,
+        design_review: Reviewers {
+            claude: &router,
+            codex: None,
+        },
+        arbiter: &router,
         answer_check: &harness,
         resolver: &harness,
         rebase: &router,
@@ -8880,6 +8903,9 @@ fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
 /// (OWL-254, build plan part K).
 #[path = "on_demand/drain_scenarios.rs"]
 mod drain_scenarios;
+
+#[path = "on_demand/design_scenarios.rs"]
+mod design_scenarios;
 
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every
