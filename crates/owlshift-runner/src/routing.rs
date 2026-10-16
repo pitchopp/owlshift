@@ -29,7 +29,11 @@ pub const VARIANT_LABEL_PREFIX: &str = "variant:";
 /// The ticket's pipeline variant (architecture section 5, "The roster",
 /// *The variant*): its `variant:` label's, else intake's verdict, else the
 /// project's `pipeline.default`, read at each dispatch.
-pub fn ticket_variant(label: Option<Variant>, verdict: Option<Variant>, default: Variant) -> Variant {
+pub fn ticket_variant(
+    label: Option<Variant>,
+    verdict: Option<Variant>,
+    default: Variant,
+) -> Variant {
     label.or(verdict).unwrap_or(default)
 }
 

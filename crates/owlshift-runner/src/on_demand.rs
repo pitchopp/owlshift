@@ -1379,7 +1379,9 @@ impl OnDemand<'_> {
             intake: stored
                 .as_ref()
                 .and_then(|stored| stored.record.intake.clone()),
-            plan: stored.as_ref().and_then(|stored| stored.record.plan.clone()),
+            plan: stored
+                .as_ref()
+                .and_then(|stored| stored.record.plan.clone()),
             review: stored
                 .as_ref()
                 .and_then(|stored| stored.record.review.clone()),
@@ -5636,7 +5638,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["what"], json!("run_warning"));
         assert_eq!(events[0]["role"], json!("design_review"));
-        assert_eq!(events[0]["warning"], json!("the login was not written back"));
+        assert_eq!(
+            events[0]["warning"],
+            json!("the login was not written back")
+        );
     }
 
     #[test]

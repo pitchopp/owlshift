@@ -64,11 +64,11 @@ use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
     Verdict as AnswerVerdict,
 };
+use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Severity};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{
     Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, MAX_RESOLVED_PASSES, ParkReason, Status,
 };
-use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Severity};
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
 
 use crate::executor::Git;
@@ -1561,7 +1561,10 @@ impl PlanComment {
             kept.ruling
                 .as_ref()
                 .map(|ruling| ruling.reason.as_str())
-                .or(kept.response.as_ref().map(|response| response.reason.as_str()))
+                .or(kept
+                    .response
+                    .as_ref()
+                    .map(|response| response.reason.as_str()))
                 .unwrap_or_default()
         }
         let mut left = Vec::new();
@@ -3368,7 +3371,12 @@ Merge state reported by the forge: `CLEAN`.
                 },
             ],
             findings: vec![
-                kept_finding(1, Severity::Major, Some(FindingOutcome::Rejected), Some("Not so.")),
+                kept_finding(
+                    1,
+                    Severity::Major,
+                    Some(FindingOutcome::Rejected),
+                    Some("Not so."),
+                ),
                 kept_finding(2, Severity::Minor, None, None),
                 kept_finding(3, Severity::Major, Some(FindingOutcome::Asked), None),
                 kept_finding(4, Severity::Major, None, None),
@@ -3376,7 +3384,12 @@ Merge state reported by the forge: `CLEAN`.
             not_asked: vec![FindingId::nth(4)],
             earlier: vec![(
                 1,
-                kept_finding(1, Severity::Minor, Some(FindingOutcome::Rejected), Some("Earlier.")),
+                kept_finding(
+                    1,
+                    Severity::Minor,
+                    Some(FindingOutcome::Rejected),
+                    Some("Earlier."),
+                ),
             )],
             next: PlanNext::Findings,
             run: Some("r1".to_owned()),

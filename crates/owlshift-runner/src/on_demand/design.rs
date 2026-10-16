@@ -41,11 +41,12 @@ use sha2::{Digest, Sha256};
 use owlshift_contracts::brief::{GivenFindings, GivenPlan, ReviewBrief};
 use owlshift_contracts::config::FindingsConfirmation;
 use owlshift_contracts::ids::FindingId;
-use owlshift_contracts::result::{ApprovalOutcome, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES};
+use owlshift_contracts::result::{
+    ApprovalOutcome, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES,
+};
 use owlshift_contracts::review::{
     Finding, FindingOutcome, FindingsMode, KeptApproval, KeptFinding, KeptResponse, KeptRuling,
-    Plan, ResponseOutcome, ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan,
-    TicketReview,
+    Plan, ResponseOutcome, ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan, TicketReview,
 };
 use owlshift_core::review::{Fate, PassOutcome, PassVerdict, Standing, settle};
 use owlshift_core::roster;
@@ -300,7 +301,10 @@ pub(crate) fn design_input(
                 ),
                 FindingsConfirmation::Author => (
                     FindingsMode::Answer,
-                    last.findings.iter().map(|kept| kept.finding.clone()).collect(),
+                    last.findings
+                        .iter()
+                        .map(|kept| kept.finding.clone())
+                        .collect(),
                 ),
             };
             DesignInput {
@@ -391,9 +395,10 @@ pub(crate) fn approval_question(plan: &Plan) -> Question {
         return detailed;
     }
     let mut options = vec![APPROVE.to_owned()];
-    options.extend((1..=plan.forks.len()).map(|n| {
-        format!("Change fork {n}: its options are in the PLAN comment")
-    }));
+    options.extend(
+        (1..=plan.forks.len())
+            .map(|n| format!("Change fork {n}: its options are in the PLAN comment")),
+    );
     let per_fork = question(options);
     if weight(&per_fork) <= budget {
         return per_fork;
@@ -418,7 +423,12 @@ pub(crate) fn residue_questions(
         .iter()
         .filter(|kept| kept.outcome == Some(FindingOutcome::Asked))
         .collect();
-    asked.sort_by_key(|kept| (kept.finding.severity != Severity::Blocker, kept.finding.id.number()));
+    asked.sort_by_key(|kept| {
+        (
+            kept.finding.severity != Severity::Blocker,
+            kept.finding.id.number(),
+        )
+    });
     let over: Vec<FindingId> = asked
         .iter()
         .skip(MAX_QUESTIONS)
@@ -443,7 +453,9 @@ pub(crate) fn residue_questions(
                 let criterion = finding
                     .criterion
                     .as_deref()
-                    .map(|criterion| format!(" It bears on the criterion: {}.", clip(criterion, cap)))
+                    .map(|criterion| {
+                        format!(" It bears on the criterion: {}.", clip(criterion, cap))
+                    })
                     .unwrap_or_default();
                 Question {
                     id: QuestionId::nth(u32::try_from(n + 1).unwrap_or(u32::MAX)),
@@ -639,8 +651,15 @@ impl OnDemand<'_> {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let (ran, event) =
-                self.run_role_once(p, harness, state, brief, attempt, &mut Gathered::default(), sink)?;
+            let (ran, event) = self.run_role_once(
+                p,
+                harness,
+                state,
+                brief,
+                attempt,
+                &mut Gathered::default(),
+                sink,
+            )?;
             let event = match (event, ran.result()) {
                 (Event::Completed, Some(result)) => {
                     let result = result.clone();
@@ -700,8 +719,8 @@ impl OnDemand<'_> {
                 p.policy
                     .plan_approval_required(p.pipeline, !kept.plan.forks.is_empty())
             });
-            let input = design_input(&state, p.review.as_ref(), confirmation, required)
-                .map_err(|e| {
+            let input =
+                design_input(&state, p.review.as_ref(), confirmation, required).map_err(|e| {
                     Stop::Refused(format!(
                         "{e}: `owlshift forget {}` starts its record over",
                         p.ticket
@@ -824,12 +843,12 @@ impl OnDemand<'_> {
                 .clone()
                 .ok_or_else(|| Stop::Refused("an approval of no plan".to_owned()))?;
             let questions = p.questions();
-            let ask = questions
-                .latest()
-                .ok_or_else(|| Stop::Refused("an approval round the ref keeps no ask of".to_owned()))?;
+            let ask = questions.latest().ok_or_else(|| {
+                Stop::Refused("an approval round the ref keeps no ask of".to_owned())
+            })?;
             let approver = person(&ask.decider, &p.found);
-            let comment = answer_check::newest_decider_comment(comments, &approver)
-                .ok_or_else(|| {
+            let comment =
+                answer_check::newest_decider_comment(comments, &approver).ok_or_else(|| {
                     Stop::Refused(format!(
                         "the plan of {ticket} is approved, but no comment of its decider holds the \
                          approval"
@@ -1021,16 +1040,22 @@ impl OnDemand<'_> {
         let mut findings = pass_findings(&outputs, None);
         if confirmation == FindingsConfirmation::Arbiter && !findings.is_empty() {
             let comments = self.comments(&ticket)?;
-            let mut brief =
-                self.brief(p, Role::Arbiter, &comments, &dispatched.rules, None, &current);
+            let mut brief = self.brief(
+                p,
+                Role::Arbiter,
+                &comments,
+                &dispatched.rules,
+                None,
+                &current,
+            );
             brief.plan = Some(given.clone());
             brief.findings = Some(GivenFindings {
                 mode: FindingsMode::Rule,
                 findings: findings.iter().map(|kept| kept.finding.clone()).collect(),
                 diff: None,
             });
-            let routing = role_routing(Role::Arbiter, dispatched.routing)
-                .expect("the arbiter has its layer");
+            let routing =
+                role_routing(Role::Arbiter, dispatched.routing).expect("the arbiter has its layer");
             let harness = self.arbiter.harness(routing);
             let (ran, result) = self.review_run(p, &*harness, &mut state, &brief, sink)?;
             findings = pass_findings(&outputs, Some(&result.rulings));
@@ -1111,10 +1136,7 @@ impl OnDemand<'_> {
                 ("outcome", json!(outcome_name(verdict.outcome))),
                 ("next", json!(next_name)),
                 ("findings", json!(findings.len())),
-                (
-                    "standing",
-                    json!(standing(&findings, confirmation).len()),
-                ),
+                ("standing", json!(standing(&findings, confirmation).len())),
                 ("reviewers", json!(reviewers)),
             ]),
         );
@@ -1136,9 +1158,11 @@ impl OnDemand<'_> {
                         ("pass", json!(pass)),
                         (
                             "asked",
-                            finding_ids(findings.iter().filter(|kept| {
-                                kept.outcome == Some(FindingOutcome::Asked)
-                            })),
+                            finding_ids(
+                                findings
+                                    .iter()
+                                    .filter(|kept| kept.outcome == Some(FindingOutcome::Asked)),
+                            ),
                         ),
                         ("noted", finding_ids(noted)),
                         (
@@ -1337,10 +1361,17 @@ mod tests {
         assert_eq!(kept[2].finding.severity, Severity::Blocker);
         assert_eq!(kept[2].reviewer.harness, HarnessKind::Claude);
         assert_eq!(
-            kept[1].ruling.as_ref().map(|r| (r.outcome, r.reason.as_str())),
+            kept[1]
+                .ruling
+                .as_ref()
+                .map(|r| (r.outcome, r.reason.as_str())),
             Some((RulingOutcome::Rejected, "Checked 2."))
         );
-        assert!(pass_findings(&seats, None).iter().all(|k| k.ruling.is_none()));
+        assert!(
+            pass_findings(&seats, None)
+                .iter()
+                .all(|k| k.ruling.is_none())
+        );
     }
 
     /// The arbiter's confirmed findings stand, or the author's unrejected
@@ -1363,16 +1394,26 @@ mod tests {
         ];
         // Before the last pass: the confirmed ones are fixed, a revision.
         let mut first = pass_findings(&seats, Some(&rulings));
-        let verdict =
-            settle_pass(Stage::DesignReview, 1, &mut first, FindingsConfirmation::Arbiter).unwrap();
+        let verdict = settle_pass(
+            Stage::DesignReview,
+            1,
+            &mut first,
+            FindingsConfirmation::Arbiter,
+        )
+        .unwrap();
         assert_eq!(verdict.outcome, PassOutcome::Revise);
         assert_eq!(verdict.fates, [Fate::Fix, Fate::Fix]);
         let outcomes: Vec<_> = first.iter().map(|k| k.outcome).collect();
         assert_eq!(outcomes, [None, Some(FindingOutcome::Rejected), None]);
         // The last pass: the major is asked, the minor noted.
         let mut last = pass_findings(&seats, Some(&rulings));
-        let verdict =
-            settle_pass(Stage::DesignReview, 2, &mut last, FindingsConfirmation::Arbiter).unwrap();
+        let verdict = settle_pass(
+            Stage::DesignReview,
+            2,
+            &mut last,
+            FindingsConfirmation::Arbiter,
+        )
+        .unwrap();
         assert_eq!(verdict.outcome, PassOutcome::Ask);
         let outcomes: Vec<_> = last.iter().map(|k| k.outcome).collect();
         assert_eq!(
@@ -1454,7 +1495,10 @@ mod tests {
         let unjudged = review(&[(1, pass_findings(&seats, None))]);
         let answer = design_input(&after_one, Some(&unjudged), author, true).unwrap();
         let given = answer.findings.unwrap();
-        assert_eq!((given.mode, given.findings.len()), (FindingsMode::Answer, 2));
+        assert_eq!(
+            (given.mode, given.findings.len()),
+            (FindingsMode::Answer, 2)
+        );
         // A clean pass was followed by the approval round, while it is still
         // required (the variant may have changed since).
         let clean = review(&[(1, Vec::new())]);
@@ -1462,7 +1506,10 @@ mod tests {
             findings: None,
             approval: true,
         };
-        assert_eq!(design_input(&after_one, Some(&clean), arbiter, true), Ok(approval));
+        assert_eq!(
+            design_input(&after_one, Some(&clean), arbiter, true),
+            Ok(approval)
+        );
         assert_eq!(
             design_input(&after_one, Some(&clean), arbiter, false),
             Ok(DesignInput::default())
@@ -1492,7 +1539,12 @@ mod tests {
             vec![finding(1, Severity::Major)],
         )];
         let mut rejected = pass_findings(&seats, Some(&[ruling(1, RulingOutcome::Rejected)]));
-        settle_pass(Stage::DesignReview, 1, &mut rejected, FindingsConfirmation::Arbiter);
+        settle_pass(
+            Stage::DesignReview,
+            1,
+            &mut rejected,
+            FindingsConfirmation::Arbiter,
+        );
         let record = review(&[
             (1, rejected.clone()),
             (1, rejected.clone()),
@@ -1590,7 +1642,11 @@ mod tests {
         let (first, _) = &questions[0];
         assert_eq!(first.id, QuestionId::nth(1));
         assert_eq!(first.category, FINDING_CATEGORY);
-        assert!(first.context.contains("Finding F2 of design review pass 2, a blocker"));
+        assert!(
+            first
+                .context
+                .contains("Finding F2 of design review pass 2, a blocker")
+        );
         assert_eq!(first.options[1], "Leave the plan as it is");
 
         let many: Vec<KeptFinding> = (1..=70).map(|n| asked(n, Severity::Major, 2_000)).collect();
@@ -1600,7 +1656,11 @@ mod tests {
         assert_eq!(over[0], FindingId::nth(65));
         let total: usize = questions.iter().map(|(q, _)| weight(q)).sum();
         assert!(total <= MAX_QUESTIONS_BYTES, "{total}");
-        assert!(questions.iter().all(|(q, _)| weight(q) <= MAX_QUESTION_BYTES));
+        assert!(
+            questions
+                .iter()
+                .all(|(q, _)| weight(q) <= MAX_QUESTION_BYTES)
+        );
     }
 
     #[test]

@@ -165,7 +165,10 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
         .iter()
         .map(|brief| brief.review.as_ref().unwrap().mandates.clone())
         .collect();
-    assert_eq!(mandates, [vec![Mandate::Critic], vec![Mandate::Conformance]]);
+    assert_eq!(
+        mandates,
+        [vec![Mandate::Critic], vec![Mandate::Conformance]]
+    );
 
     let record = bench.record();
     let kept = record.plan.expect("plan.json");
@@ -267,7 +270,10 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
     assert_eq!(routed[2].harness, HarnessKind::Claude);
     let briefs = bench.briefs();
     let ruling = briefs[3].findings.as_ref().unwrap();
-    assert_eq!((ruling.mode, ruling.findings.len()), (FindingsMode::Rule, 2));
+    assert_eq!(
+        (ruling.mode, ruling.findings.len()),
+        (FindingsMode::Rule, 2)
+    );
     let fix = briefs[4].findings.as_ref().expect("the confirmed finding");
     assert_eq!(fix.mode, FindingsMode::Fix);
     let ids: Vec<&str> = fix.findings.iter().map(|f| f.id.as_str()).collect();
@@ -275,7 +281,14 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
     assert!(briefs[4].plan.is_some(), "the revision gets the plan");
 
     let record = bench.record();
-    assert!(record.plan.unwrap().plan.approach.contains("the word checked"));
+    assert!(
+        record
+            .plan
+            .unwrap()
+            .plan
+            .approach
+            .contains("the word checked")
+    );
     let review = record.review.unwrap();
     let first = &review.passes[0].findings;
     assert_eq!(first[0].outcome, Some(FindingOutcome::Fixed));
@@ -339,7 +352,10 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
     assert!(!roles.contains(&Role::Arbiter), "{roles:?}");
     let briefs = bench.briefs();
     let answer = briefs[3].findings.as_ref().unwrap();
-    assert_eq!((answer.mode, answer.findings.len()), (FindingsMode::Answer, 1));
+    assert_eq!(
+        (answer.mode, answer.findings.len()),
+        (FindingsMode::Answer, 1)
+    );
     let ended = data_of(&bench.events(), EventKind::RunEnded, "outcome");
     assert_eq!(ended[3]["outcome"], "failed", "{:?}", ended[3]);
     let review = bench.record().review.unwrap();
@@ -365,7 +381,10 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     let bench = Bench::of("standard", false);
     let replies = vec![
         bench.read(&designed(PLAN)),
-        bench.read(&reviewed(&[("major", "Step 1's test does not check the word.")])),
+        bench.read(&reviewed(&[(
+            "major",
+            "Step 1's test does not check the word.",
+        )])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed"])),
         bench.read(&designed(REVISED)),
@@ -403,10 +422,20 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     ] {
         assert!(plan.contains(text), "{text}\n---\n{plan}");
     }
-    assert!(bench.comments().last().unwrap().starts_with("[owlshift] QUESTIONS · round 1"));
+    assert!(
+        bench
+            .comments()
+            .last()
+            .unwrap()
+            .starts_with("[owlshift] QUESTIONS · round 1")
+    );
     let record = bench.record();
     assert_eq!(
-        (record.state.stage, record.state.waiting, record.state.review_passes),
+        (
+            record.state.stage,
+            record.state.waiting,
+            record.state.review_passes
+        ),
         (Stage::Design, Some(Waiting::NeedsInput), 2)
     );
     let residue = bench
@@ -419,7 +448,11 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
 
     bench.answer("Q1: settle it as it says, with the word checked.");
     let replies = vec![
-        bench.read(&check(&[("Q1", "answered", "Settle it as the finding says.")])),
+        bench.read(&check(&[(
+            "Q1",
+            "answered",
+            "Settle it as the finding says.",
+        )])),
         bench.read(&designed(REVISED)),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
@@ -535,7 +568,10 @@ fn a_changed_plan_gets_one_more_pass_and_is_asked_again() {
         bench.read(&reviewed(&[])),
     ];
     let (outcome, _) = bench.run(replies, None);
-    assert!(matches!(outcome, Err(Stop::NeedsInput { .. })), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(Stop::NeedsInput { .. })),
+        "{outcome:?}"
+    );
     bench.answer("Use plain text instead.");
     let replies = vec![
         bench.read(&check(&[("Q1", "answered", "Plain text instead.")])),
@@ -594,11 +630,26 @@ fn a_replan_the_resolver_settles_sends_the_ticket_back_to_design() {
     );
     let briefs = bench.briefs();
     let again = &briefs[5];
-    assert!(again.plan.as_ref().unwrap().plan.approach.ends_with("greps."));
+    assert!(
+        again
+            .plan
+            .as_ref()
+            .unwrap()
+            .plan
+            .approach
+            .ends_with("greps.")
+    );
     assert!(shape(again).contains(&"decision".to_owned()));
     assert_eq!(bench.decisions("replan")[0]["replan"], "decided");
     let record = bench.record();
-    assert!(record.plan.unwrap().plan.approach.contains("the word checked"));
+    assert!(
+        record
+            .plan
+            .unwrap()
+            .plan
+            .approach
+            .contains("the word checked")
+    );
     let passes: Vec<u32> = record
         .review
         .unwrap()
@@ -621,7 +672,10 @@ fn a_replan_on_an_approved_plan_goes_to_the_decider_and_returns_to_design() {
         bench.read(&reviewed(&[])),
     ];
     let (outcome, _) = bench.run(replies, None);
-    assert!(matches!(outcome, Err(Stop::NeedsInput { .. })), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(Stop::NeedsInput { .. })),
+        "{outcome:?}"
+    );
     bench.answer("Approved.");
     let replies = vec![
         bench.read(&check(&[("Q1", "answered", "Approved.")])),

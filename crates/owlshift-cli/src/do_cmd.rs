@@ -20,12 +20,12 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::{Role, Tier};
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
+use owlshift_runner::codex_machine::codex_critic;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::{EventLog, EventSink, printable};
+use owlshift_runner::executor::CodexHarness;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
-use owlshift_runner::codex_machine::codex_critic;
-use owlshift_runner::executor::CodexHarness;
 use owlshift_runner::on_demand::{self, Delivered, OnDemand, Reviewers, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{

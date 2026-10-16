@@ -279,18 +279,35 @@ mod tests {
                 text.map(|t| t.map(str::to_owned)).map_err(str::to_owned),
             )
         };
-        assert_eq!(verdict(program(), login(), true, Ok(None)), Ok(ready.clone()));
-        assert_eq!(verdict(program(), login(), true, Ok(Some(allows))), Ok(ready));
+        assert_eq!(
+            verdict(program(), login(), true, Ok(None)),
+            Ok(ready.clone())
+        );
+        assert_eq!(
+            verdict(program(), login(), true, Ok(Some(allows))),
+            Ok(ready)
+        );
         let refused = [
             (verdict(None, login(), true, Ok(None)), "not on the PATH"),
-            (verdict(program(), None, true, Ok(None)), "names Codex's folder"),
-            (verdict(program(), login(), false, Ok(None)), "no login file"),
+            (
+                verdict(program(), None, true, Ok(None)),
+                "names Codex's folder",
+            ),
+            (
+                verdict(program(), login(), false, Ok(None)),
+                "no login file",
+            ),
             (
                 verdict(program(), login(), true, Ok(Some(refuses))),
                 "does not allow",
             ),
             (
-                verdict(program(), login(), true, Ok(Some("allowed_sandbox_modes = 1"))),
+                verdict(
+                    program(),
+                    login(),
+                    true,
+                    Ok(Some("allowed_sandbox_modes = 1")),
+                ),
                 "a shape Owlshift does not know",
             ),
             (
@@ -299,7 +316,10 @@ mod tests {
             ),
         ];
         for (verdict, why) in refused {
-            assert!(verdict.as_ref().is_err_and(|e| e.contains(why)), "{why}: {verdict:?}");
+            assert!(
+                verdict.as_ref().is_err_and(|e| e.contains(why)),
+                "{why}: {verdict:?}"
+            );
         }
     }
 

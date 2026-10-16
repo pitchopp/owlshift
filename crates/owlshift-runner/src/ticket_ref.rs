@@ -202,9 +202,9 @@ fn read_listed(
         REVIEW_FILE,
         PROPOSALS_FILE,
     ]
-        .into_iter()
-        .filter(|file| has(file))
-        .collect();
+    .into_iter()
+    .filter(|file| has(file))
+    .collect();
     let wanted: Vec<&str> = [STATE_FILE, QUESTIONS_FILE]
         .into_iter()
         .chain(optional)

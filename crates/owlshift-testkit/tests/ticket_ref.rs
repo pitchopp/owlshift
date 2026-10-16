@@ -226,7 +226,10 @@ fn an_invalid_plan_or_review_makes_the_ref_unreadable() {
             ("100644", &broken, file),
         ]);
         let error = repo.read().unwrap_err();
-        assert!(error.contains(&format!("holds an invalid {file}")), "{error}");
+        assert!(
+            error.contains(&format!("holds an invalid {file}")),
+            "{error}"
+        );
     }
 }
 
