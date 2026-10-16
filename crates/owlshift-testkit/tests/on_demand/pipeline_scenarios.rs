@@ -721,8 +721,7 @@ fn scenario_a_risky_plan_refused_approved_and_replanned() {
     let last_kept = bench
         .decisions("plan")
         .into_iter()
-        .filter(|data| data["plan"] == "kept")
-        .last()
+        .rfind(|data| data["plan"] == "kept")
         .unwrap();
     assert_eq!(json!(approval.plan_sha256), last_kept["plan_sha256"]);
     assert_eq!(
