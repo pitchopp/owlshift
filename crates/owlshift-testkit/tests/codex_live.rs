@@ -13,14 +13,16 @@
 //! ```
 //!
 //! One thread, since the tests share the user's login; each makes its own
-//! backup, the apps-server check's with `.apps` appended to the name. A
-//! second test, OWL-132's, runs two short critic runs that list their tools,
-//! with and without `--disable apps`.
+//! backup, the apps-server check's with `.apps` appended to the name and the
+//! tools check's with `.tools`. Two tests run two short critic runs each that
+//! list their tools: OWL-132's with and without `--disable apps`, OWL-316's
+//! with and without the flags in [`TOOLS_OFF`].
 //!
 //! With `OWLSHIFT_RECORD_CODEX=1` they also write their runs' streams as the
-//! recordings `critic`, `apps_disabled` and `apps_disabled_control` of
-//! `owlshift-adapters`' `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs`
-//! then checks them like the others.
+//! recordings `critic`, `apps_disabled`, `apps_disabled_control`,
+//! `critic_tools` and `critic_tools_control` of `owlshift-adapters`'
+//! `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs` then checks them
+//! like the others.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -161,13 +163,13 @@ impl Live {
     }
 
     /// Runs `codex exec` on `TOOLS_PROMPT` with the adapter's command line,
-    /// or with `--disable apps` taken off it, outside the executor: through
+    /// less each run of arguments in `cut`, outside the executor: through
     /// it, the run without the flag started its turn and never ended it,
     /// confined or not (2026-10-16, twice each). The run gets the
     /// environment of OWL-130's checks (`HOME`, `PATH`, `USER`, `LANG`) and a
     /// `CODEX_HOME` of its own holding a copy of the user's login, brought
     /// back under `codex_login_kept`, as the executor does.
-    fn run_direct(&self, id: &str, apps_left_on: bool) -> (codex::Run, Logs) {
+    fn run_direct(&self, id: &str, cut: &[&[&str]]) -> (codex::Run, Logs) {
         let files = self.tmp.path().join(format!("run-{id}"));
         let home = files.join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -190,8 +192,8 @@ impl Live {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        if apps_left_on {
-            args = without_apps_disabled(args);
+        for flags in cut {
+            args = without(args, flags);
         }
         let mut command = Command::new("codex");
         command
@@ -328,8 +330,8 @@ const APPS_TOOLS: [&str; 4] = [
 #[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
     let live = Live::new(".apps");
-    let (adapter, adapter_logs) = live.run_direct("LIVE-APPS", false);
-    let (control, control_logs) = live.run_direct("LIVE-APPS-CONTROL", true);
+    let (adapter, adapter_logs) = live.run_direct("LIVE-APPS", &[]);
+    let (control, control_logs) = live.run_direct("LIVE-APPS-CONTROL", &[&APPS_OFF]);
     if recording_asked() {
         let values = live.login_values();
         let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
@@ -341,7 +343,7 @@ fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
             (
                 &control_logs,
                 "apps_disabled_control",
-                without_apps_disabled(adapter_argv()),
+                without(adapter_argv(), &APPS_OFF),
             ),
         ] {
             record(
@@ -358,24 +360,6 @@ fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
             );
         }
     }
-    let tools = |run: &codex::Run| -> Vec<String> {
-        let codex::Outcome::Completed { text } = &run.outcome else {
-            panic!("{:?}", run.outcome);
-        };
-        let result: serde_json::Value = serde_json::from_str(text).unwrap();
-        let names: Vec<String> = serde_json::from_str(result["summary"].as_str().unwrap())
-            .unwrap_or_else(|e| panic!("the summary is not a JSON array of names: {e}"));
-        assert!(
-            names.iter().any(|name| name.ends_with("exec_command")),
-            "{names:?}"
-        );
-        names
-    };
-    let offered = |names: &[String], tool: &str| {
-        names
-            .iter()
-            .any(|name| name.rsplit('.').next() == Some(tool))
-    };
     let (adapter, control) = (tools(&adapter), tools(&control));
     for tool in APPS_TOOLS {
         assert!(offered(&control, tool), "control lacks {tool}: {control:?}");
@@ -384,6 +368,97 @@ fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
             "adapter offers {tool}: {adapter:?}"
         );
     }
+}
+
+/// The flags OWL-316 passes to take image generation and web search away
+/// from a critic run.
+const TOOLS_OFF: [&[&str]; 2] = [
+    &["--disable", "image_generation"],
+    &["-c", "web_search=\"disabled\""],
+];
+
+/// The tools those flags take away, as the model named them on 2026-10-16
+/// in OWL-132's recordings.
+const TOOLS_TURNED_OFF: [&str; 2] = ["web__run", "image_gen__imagegen"];
+
+/// OWL-316: the adapter's command line offers a critic run none of the
+/// tools in [`TOOLS_TURNED_OFF`], while the same run without the flags in
+/// [`TOOLS_OFF`] offers them all. Two short runs outside the executor, as
+/// OWL-132's; with `OWLSHIFT_RECORD_CODEX=1` they are recorded as
+/// `critic_tools` and `critic_tools_control`.
+#[test]
+#[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
+fn a_live_critic_run_is_offered_only_the_tools_it_keeps() {
+    let live = Live::new(".tools");
+    let (adapter, adapter_logs) = live.run_direct("LIVE-TOOLS", &[]);
+    let (control, control_logs) = live.run_direct("LIVE-TOOLS-CONTROL", &TOOLS_OFF);
+    if recording_asked() {
+        let values = live.login_values();
+        let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
+                     command line (the control: without `--disable image_generation` and \
+                     `-c web_search=\"disabled\"`) and the prompt on standard input, and a \
+                     CODEX_HOME of the run's own holding a copy of the user's ChatGPT login";
+        let control_argv = TOOLS_OFF
+            .iter()
+            .fold(adapter_argv(), |argv, flags| without(argv, flags));
+        for (logs, name, argv) in [
+            (&adapter_logs, "critic_tools", adapter_argv()),
+            (&control_logs, "critic_tools_control", control_argv),
+        ] {
+            record(
+                logs,
+                live.tmp.path(),
+                &Recording {
+                    name,
+                    argv,
+                    prompt: TOOLS_PROMPT,
+                    confinement: "none: env -i with HOME, PATH, USER, LANG and CODEX_HOME",
+                    setup: Some(setup),
+                },
+                &values,
+            );
+        }
+    }
+    let (adapter, control) = (tools(&adapter), tools(&control));
+    for tool in TOOLS_TURNED_OFF {
+        assert!(offered(&control, tool), "control lacks {tool}: {control:?}");
+        assert!(
+            !offered(&adapter, tool),
+            "adapter offers {tool}: {adapter:?}"
+        );
+    }
+    // Kept because no flag removes it: gone, the build plan is out of date.
+    assert!(offered(&adapter, "spawn_agent"), "{adapter:?}");
+}
+
+/// The tool names a run's result lists as its summary, which must include
+/// the run's own shell, so that an empty or unrelated list fails.
+fn tools(run: &codex::Run) -> Vec<String> {
+    let codex::Outcome::Completed { text } = &run.outcome else {
+        panic!("{:?}", run.outcome);
+    };
+    let result: serde_json::Value = serde_json::from_str(text).unwrap();
+    let names: Vec<String> = serde_json::from_str(result["summary"].as_str().unwrap())
+        .unwrap_or_else(|e| panic!("the summary is not a JSON array of names: {e}"));
+    assert!(
+        names.iter().any(|name| name.ends_with("exec_command")),
+        "{names:?}"
+    );
+    names
+}
+
+/// Whether `names` holds `tool`, whatever namespace prefix the model gave it
+/// and whether it wrote `.` or `__` between the parts of a name, as
+/// `codex_fixtures.rs` reads the recordings.
+fn offered(names: &[String], tool: &str) -> bool {
+    let key = |name: &str| name.to_lowercase().replace("__", "_").replace('.', "_");
+    let tool = key(tool);
+    names.iter().map(|name| key(name)).any(|name| {
+        name == tool
+            || name
+                .strip_suffix(tool.as_str())
+                .is_some_and(|prefix| prefix.ends_with('_'))
+    })
 }
 
 /// The files of a run's two streams, and its exit code.
@@ -411,13 +486,16 @@ fn read_only() -> Permissions {
     }
 }
 
-/// `args` without the pair `--disable apps`.
-fn without_apps_disabled(mut args: Vec<String>) -> Vec<String> {
+/// The flag OWL-132 passes to keep the ChatGPT apps server out.
+const APPS_OFF: [&str; 2] = ["--disable", "apps"];
+
+/// `args` without the one run of arguments `cut`, which it must hold.
+fn without(mut args: Vec<String>, cut: &[&str]) -> Vec<String> {
     let at = args
-        .windows(2)
-        .position(|pair| pair == ["--disable", "apps"])
-        .expect("the adapter passes `--disable apps`");
-    args.drain(at..at + 2);
+        .windows(cut.len())
+        .position(|run| run == cut)
+        .unwrap_or_else(|| panic!("the adapter does not pass {cut:?}"));
+    args.drain(at..at + cut.len());
     args
 }
 
