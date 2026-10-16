@@ -55,8 +55,9 @@ pub use owlshift_contracts::result::Effort;
 ///   `critic_tools` and its control). The collaboration tools
 ///   (`spawn_agent` and the rest) stay offered: neither
 ///   `--disable multi_agent` nor `--disable multi_agent_v2` took them away,
-///   checked live on 2026-10-16. The runner refuses a run whose stream shows
-///   a call to one ([`Run::collaboration`], OWL-317).
+///   checked live on 2026-10-16, and `-c agents.max_depth=0` does not refuse
+///   a spawn (OWL-320), so none is passed. The runner refuses a run whose
+///   stream shows a call to one ([`Run::collaboration`], OWL-317).
 /// - `--ignore-rules` drops execpolicy `.rules` files: the runner injects the
 ///   project's rules in the brief (C2, "Rules").
 /// - `skills.include_instructions=false` lists no skill to the model, the
