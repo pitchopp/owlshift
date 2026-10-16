@@ -70,7 +70,18 @@ pub fn late_comments<'c>(
     now: &'c [Comment],
     decider: &Person,
 ) -> Vec<&'c Comment> {
-    let seen = newest_decider_edit(read, decider);
+    edited_after(newest_decider_edit(read, decider), now, decider)
+}
+
+/// The decider's comments of `now` last edited after `seen`, the newest
+/// decider edit a run's brief held, all of them when it held none: those
+/// the run did not see ([`late_comments`]), read again from a kept mark
+/// when the run's own comments are gone (OWL-304).
+pub fn edited_after<'c>(
+    seen: Option<Timestamp>,
+    now: &'c [Comment],
+    decider: &Person,
+) -> Vec<&'c Comment> {
     decider_comments(now, decider)
         .filter(|comment| seen.is_none_or(|seen| comment.last_edit() > seen))
         .collect()

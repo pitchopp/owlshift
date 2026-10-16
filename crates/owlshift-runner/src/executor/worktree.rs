@@ -298,16 +298,42 @@ fn check_spec(git: &Git, main: &Path, worktree: &Path, branch: &str) -> Result<(
 /// link: the two directories must be real ones, and each file is removed,
 /// never opened, then created anew.
 pub(super) fn write_run_files(worktree: &Path, brief: &Brief) -> Result<PathBuf, ExecutorError> {
+    make_run_dir(worktree)?;
+    remove(&worktree.join(super::RESULT_PATH))?;
+    let brief_file = worktree.join(BRIEF_PATH);
+    replace(&brief_file, brief.render().as_bytes())?;
+    Ok(brief_file)
+}
+
+/// Writes `content` as the file `path` of [`RUN_DIR`], a relative path
+/// naming a file right in it, as [`write_run_files`] writes the brief:
+/// nothing through a link. The runner writes there between runs, such as
+/// the diff a Verify pass reviews (OWL-304). Returns the file's path.
+pub(super) fn write_run_file(
+    worktree: &Path,
+    path: &str,
+    content: &[u8],
+) -> Result<PathBuf, ExecutorError> {
+    let name = path
+        .strip_prefix(RUN_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|name| !name.is_empty() && !name.contains(['/', '\\']) && *name != "..")
+        .ok_or_else(|| ExecutorError::Spec(format!("{path} is no file of {RUN_DIR}")))?;
+    let file = make_run_dir(worktree)?.join(name);
+    replace(&file, content)?;
+    Ok(file)
+}
+
+/// Makes [`RUN_DIR`], its directories real ones, with its `.gitignore`;
+/// returns its path.
+fn make_run_dir(worktree: &Path) -> Result<PathBuf, ExecutorError> {
     let mut dir = worktree.to_owned();
     for segment in RUN_DIR.split('/') {
         dir.push(segment);
         real_dir(&dir)?;
     }
     replace(&dir.join(".gitignore"), b"*\n")?;
-    remove(&worktree.join(super::RESULT_PATH))?;
-    let brief_file = worktree.join(BRIEF_PATH);
-    replace(&brief_file, brief.render().as_bytes())?;
-    Ok(brief_file)
+    Ok(dir)
 }
 
 fn layout(path: &Path, error: impl std::fmt::Display) -> ExecutorError {
@@ -347,4 +373,48 @@ fn replace(path: &Path, content: &[u8]) -> Result<(), ExecutorError> {
         .open(path)
         .and_then(|mut file| file.write_all(content))
         .map_err(|e| layout(path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::DIFF_PATH;
+    use super::*;
+
+    /// The diff a Verify pass reviews goes beside the brief, out of git;
+    /// a path that is no file right in the run folder is refused.
+    #[test]
+    fn a_run_file_is_written_in_the_run_folder_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = write_run_file(tmp.path(), DIFF_PATH, b"one\n").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"one\n");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(RUN_DIR).join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        write_run_file(tmp.path(), DIFF_PATH, b"two\n").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"two\n");
+        for path in [
+            ".owlshift/run",
+            ".owlshift/run/",
+            ".owlshift/run/a/b",
+            "a/diff.patch",
+        ] {
+            assert!(write_run_file(tmp.path(), path, b"").is_err(), "{path}");
+        }
+    }
+
+    /// A link left where the file goes is replaced, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_file_replaces_a_link_without_following_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "kept").unwrap();
+        fs::create_dir_all(tmp.path().join(RUN_DIR)).unwrap();
+        let place = tmp.path().join(DIFF_PATH);
+        std::os::unix::fs::symlink(&outside, &place).unwrap();
+        write_run_file(tmp.path(), DIFF_PATH, b"diff").unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "kept");
+        assert!(!fs::symlink_metadata(&place).unwrap().is_symlink());
+    }
 }

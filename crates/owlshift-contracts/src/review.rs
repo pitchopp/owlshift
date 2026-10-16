@@ -6,11 +6,13 @@
 
 use std::num::NonZeroU32;
 
+use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::format::{self, ContractError, Format, PLAN_FORMAT, REVIEW_FORMAT};
 use crate::ids::{FindingId, check_name, is_commit_id, is_lower_hex};
+use crate::result::{Decision, Followup, PullRequest};
 use crate::{Harness, Role, Stage};
 
 /// The most bytes a plan weighs, rendered as JSON: it is kept whole in the
@@ -422,6 +424,12 @@ pub struct TicketReview {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("uniqueItems" = true))]
     pub answered_reviews: Vec<u64>,
+    /// What the Build that Verify reviews gave for its delivery (OWL-304):
+    /// kept once a Build is done and its gate passed, so that `continue`
+    /// runs a Verify pass cut short again and delivers. Dropped when the
+    /// ticket is delivered or dispatched again from Ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<KeptBuild>,
 }
 
 /// One review pass: the roster's findings on the plan or the diff.
@@ -437,6 +445,42 @@ pub struct ReviewPass {
     #[serde(default)]
     #[schemars(length(max = MAX_PASS_FINDINGS))]
     pub findings: Vec<KeptFinding>,
+    /// The reviewers that ran the pass, in seat order, those that found
+    /// nothing included (OWL-304): what the DELIVERY report names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<Reviewer>,
+}
+
+/// What a Build gave for its delivery, kept while Verify reviews it
+/// (OWL-304, [`TicketReview::build`]): what the push, the pull request and
+/// the DELIVERY report take, gathered over the delivery's Build runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeptBuild {
+    /// The commit the runner's gate passed on, a full commit id: what is
+    /// pushed.
+    pub commit: String,
+    /// The Build run's `summary`.
+    pub summary: String,
+    /// The pull request the Build run proposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PullRequest>,
+    /// The project gate's commands, all passed.
+    #[serde(default)]
+    pub gate: Vec<String>,
+    /// The runner's own notes the report lists, such as the late comments a
+    /// Build run was given (OWL-139).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Decision>,
+    /// The follow-ups the delivery's Build runs proposed, then those its
+    /// Verify passes proposed from findings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followups: Vec<Followup>,
+    /// The newest edit of the decider's comments the Build run's brief
+    /// held, when it held one: a comment of theirs edited later is one the
+    /// Build did not see (OWL-139).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<Timestamp>,
 }
 
 /// A finding as the ticket ref keeps it.
@@ -475,6 +519,10 @@ pub struct Reviewer {
     /// Claude Code without Codex.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stand_in: bool,
+    /// A reviewer on Claude Code that ran on the author's own model, no
+    /// other one being configured (OWL-304): the reports say so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_model: bool,
 }
 
 /// The arbiter's ruling, as kept with its finding.
@@ -529,7 +577,9 @@ impl TicketReview {
     /// both ruled on and responded to, nor given an outcome its ruling or
     /// response contradicts (a rejected ruling or response gives
     /// `rejected` only, a confirmed ruling anything but `rejected`, a fixed
-    /// response `fixed` only); and each answered review is named once.
+    /// response `fixed` only); each reviewer a pass names is of its role,
+    /// with its mandates distinct and a model named; each answered review is
+    /// named once; and the kept build's commit is a full commit id.
     ///
     /// Passes are numbered from 1 in each run of consecutive passes at one
     /// stage, each pass the one before it plus 1, or 1 again: a review loop
@@ -565,6 +615,18 @@ impl TicketReview {
                 }
             };
             let at = format!("{:?} pass {}", pass.stage, pass.pass);
+            for reviewer in &pass.reviewers {
+                if reviewer.role != role {
+                    return invalid(format!(
+                        "{at} names a reviewer of role {}",
+                        reviewer.role.as_str()
+                    ));
+                }
+                check_mandates(Self::CONTRACT, &reviewer.mandates)?;
+                if let Err(broken) = check_name(&reviewer.model) {
+                    return invalid(format!("the model of a reviewer of {at} {broken}"));
+                }
+            }
             let findings: Vec<Finding> = pass.findings.iter().map(|k| k.finding.clone()).collect();
             check_findings(Self::CONTRACT, &findings, MAX_PASS_FINDINGS, false)?;
             for kept in &pass.findings {
@@ -624,6 +686,14 @@ impl TicketReview {
                 self.answered_reviews[n]
             ));
         }
+        if let Some(build) = &self.build
+            && !is_commit_id(&build.commit)
+        {
+            return invalid(format!(
+                "the kept build's commit {:?} is not a full commit id",
+                build.commit
+            ));
+        }
         Ok(())
     }
 }
@@ -679,9 +749,24 @@ mod tests {
                     },
                     "ruling": { "outcome": "confirmed", "reason": "seen at src/lib.rs:1" },
                     "outcome": "fixed"
+                }],
+                "reviewers": [{
+                    "role": "design_review", "mandates": ["critic", "conformance"],
+                    "harness": "claude", "model": "m", "stand_in": true, "same_model": true
                 }]
             }],
-            "answered_reviews": [7, 9]
+            "answered_reviews": [7, 9],
+            "build": {
+                "commit": "e".repeat(40),
+                "summary": "Added the file.",
+                "pr": { "branch": "owlshift/demo-1", "title": "T", "body": "B" },
+                "gate": ["make test"],
+                "notes": [{ "question": "Q", "decision": "D", "basis": "B" }],
+                "followups": [{
+                    "title": "T", "why": "W", "source": "reviewer", "done_when": "D"
+                }],
+                "seen": "2026-10-16T09:00:00Z"
+            }
         })
     }
 
@@ -802,6 +887,19 @@ mod tests {
                     "blank claim",
                 ),
                 (&|d| d["answered_reviews"] = json!([7, 7]), "answered twice"),
+                (
+                    &|d| d["passes"][0]["reviewers"][0]["role"] = "verify".into(),
+                    "names a reviewer of role verify",
+                ),
+                (
+                    &|d| d["passes"][0]["reviewers"][0]["model"] = " ".into(),
+                    "the model of a reviewer",
+                ),
+                (
+                    &|d| d["build"]["commit"] = "main".into(),
+                    "not a full commit id",
+                ),
+                (&|d| d["build"]["extra"] = 1.into(), "unknown field"),
                 (&|d| d["passes"][0]["pass"] = 0.into(), "nonzero"),
                 (&|d| d["format"] = 2.into(), "upgrade Owlshift"),
             ],
@@ -880,6 +978,9 @@ mod tests {
                     pass["pass"] = n.into();
                     for kept in pass["findings"].as_array_mut().unwrap() {
                         kept["reviewer"]["role"] = stage.into();
+                    }
+                    for reviewer in pass["reviewers"].as_array_mut().unwrap() {
+                        reviewer["role"] = stage.into();
                     }
                     pass
                 })
