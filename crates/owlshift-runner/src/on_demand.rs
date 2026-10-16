@@ -892,7 +892,8 @@ impl Command {
     /// The roles whose briefs the command may build, and so the `[roles]`
     /// tables it reads (OWL-312): Build and the resolver in the Build loop,
     /// with the design, design review and arbiter roles of the Design stage
-    /// (OWL-318; the commands that dispatch Build may run Design first),
+    /// (OWL-318; the commands that dispatch Build may run Design first) and
+    /// the verify role of Verify (OWL-321),
     /// Build alone in a fix or a correction (no resolver runs there), none
     /// in a rebase, whose brief takes `stack.rules` only.
     fn briefed_roles(self) -> &'static [Role] {
@@ -902,6 +903,7 @@ impl Command {
                 Role::Resolver,
                 Role::Design,
                 Role::DesignReview,
+                Role::Verify,
                 Role::Arbiter,
             ],
             Command::Fix | Command::Correct => &[Role::Build],

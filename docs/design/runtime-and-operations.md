@@ -153,7 +153,7 @@ rules = ["AGENTS.md"]     # files whose text reaches every role that takes rules
 
 [roles.build]
 rules = ["docs/skills/frontend/SKILL.md"]   # added to stack.rules for this role only
-# also accepted: [roles.resolver], [roles.intake], [roles.design], [roles.design_review], [roles.arbiter]
+# also accepted: [roles.resolver], [roles.intake], [roles.design], [roles.design_review], [roles.verify], [roles.arbiter]
 
 [pipeline]
 default = "standard"
