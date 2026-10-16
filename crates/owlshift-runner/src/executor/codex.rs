@@ -11,7 +11,8 @@
 //! `result.json`: the run's last message is the result, which the executor
 //! writes once the run is over ([`SandboxNeeds::result_in_message`]). A run
 //! whose stream shows a call to one of Codex's collaboration tools is
-//! refused (OWL-317).
+//! stopped at that call, its whole process tree with it, and refused
+//! (OWL-317, OWL-319).
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -138,7 +139,16 @@ impl Harness for CodexHarness {
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
         let prompt = prompt_with_brief_file(&self.prompt, run.brief_file);
-        let ran = codex::drive(child, &prompt, |line| log.stdout(line))?;
+        let ran = codex::drive(
+            child,
+            &prompt,
+            |line| log.stdout(line),
+            || {
+                if let Some(stop) = run.stop {
+                    stop.stop();
+                }
+            },
+        )?;
         log.stderr(&ran.stderr);
         let mut end = codex_end(ran, self.model.as_deref());
         if let (HarnessStatus::Completed, Some(text)) = (end.status.clone(), end.message.take()) {
@@ -286,17 +296,27 @@ pub fn prompt_with_brief_file(prompt: &str, brief_file: &Path) -> String {
 /// the one asked for, if any.
 ///
 /// A run whose stream shows a call to a collaboration tool is refused
-/// (architecture section 5, "Its sub-agents", OWL-317): completed, it fails
-/// and its last message is not used; failed, its reason names the tools
-/// too. A usage limit stays one, and the executor reads a timeout before
-/// any of this.
+/// (architecture section 5, "Its sub-agents", OWL-317), and stopped at the
+/// first such call (OWL-319): completed or stopped, it fails with the
+/// refusal and its last message is not used; failed on its own, its reason
+/// names the tools too. A usage limit Codex reported stays one; a timeout
+/// counts only for a run its driver did not stop.
 fn codex_end(run: codex::Run, model: Option<&str>) -> HarnessEnd {
-    let refused =
-        (!run.collaboration.is_empty()).then(|| collaboration_refusal(&run.collaboration));
+    let refused = (!run.collaboration.is_empty()).then(|| {
+        let mut refusal = collaboration_refusal(&run.collaboration);
+        if run.stopped {
+            refusal.push_str("; Owlshift stopped the run at that call");
+        }
+        refusal
+    });
     let (status, message) = match (run.outcome, refused) {
         (codex::Outcome::Completed { text }, None) => (HarnessStatus::Completed, Some(text)),
-        (codex::Outcome::Completed { .. }, Some(refusal)) => (HarnessStatus::Failed(refusal), None),
         (codex::Outcome::UsageLimit, _) => (HarnessStatus::UsageLimit { resets_at: None }, None),
+        // The stop ended the run: what its end looked like is the stop's.
+        (codex::Outcome::Failed(_), Some(refusal)) if run.stopped => {
+            (HarnessStatus::Failed(refusal), None)
+        }
+        (codex::Outcome::Completed { .. }, Some(refusal)) => (HarnessStatus::Failed(refusal), None),
         (codex::Outcome::Failed(failure), refusal) => {
             let mut reason = describe(&failure);
             if let Some(refusal) = refusal {
@@ -358,9 +378,16 @@ fn describe(failure: &codex::Failure) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
 
+    use owlshift_contracts::brief::Brief;
+
+    use super::super::watch;
     use super::*;
 
     fn login(account: &str) -> Value {
@@ -542,6 +569,7 @@ mod tests {
             outcome,
             usage: Some(owlshift_adapters::harness::Usage::default()),
             collaboration: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            stopped: false,
             malformed_lines: 0,
             oversized_lines: 0,
             stderr: Vec::new(),
@@ -578,6 +606,194 @@ mod tests {
 
         let end = codex_end(run(codex::Outcome::UsageLimit, &["wait"]), None);
         assert_eq!(end.status, HarnessStatus::UsageLimit { resets_at: None });
+
+        // OWL-319: a run stopped at the call fails with the refusal alone,
+        // however its end looked; a usage limit Codex reported stays one.
+        let stopped = |outcome| codex::Run {
+            stopped: true,
+            ..run(outcome, &["wait"])
+        };
+        for outcome in [
+            codex::Outcome::Failed(codex::Failure::Signal),
+            codex::Outcome::Failed(codex::Failure::Unfinished),
+            completed(),
+        ] {
+            let end = codex_end(stopped(outcome.clone()), None);
+            assert_eq!(
+                end.status,
+                HarnessStatus::Failed(format!(
+                    "{}; Owlshift stopped the run at that call",
+                    collaboration_refusal(&["wait".to_owned()])
+                )),
+                "{outcome:?}"
+            );
+            assert_eq!(end.message, None);
+        }
+        let end = codex_end(stopped(codex::Outcome::UsageLimit), None);
+        assert_eq!(end.status, HarnessStatus::UsageLimit { resets_at: None });
+    }
+
+    /// The helpers act only when run alone by [`helper`].
+    fn helper_requested() -> bool {
+        std::env::args().any(|arg| arg == "--exact")
+    }
+
+    /// The command running one of the helper tests below in a fresh copy of
+    /// this test binary.
+    fn helper(name: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            &format!("executor::codex::tests::{name}"),
+            "--ignored",
+            "--nocapture",
+            "--quiet",
+            "--test-threads=1",
+        ]);
+        command
+    }
+
+    /// The variable naming the heartbeat file of [`helper_heartbeat`].
+    const HEARTBEAT: &str = "OWLSHIFT_TEST_HEARTBEAT";
+
+    /// How long the helpers last unless stopped.
+    const HELPER_LIFE: Duration = Duration::from_secs(60);
+
+    /// Plays `codex` as a Node wrapper: starts a child that inherits its
+    /// output, as the native binary does, waits until that child beats, then
+    /// prints the start of the recording `critic_collaboration`, up to its
+    /// `wait` item, and sleeps, as the runs that hung did (OWL-317).
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_collaborate() {
+        if helper_requested() {
+            let heartbeat = std::env::var_os(HEARTBEAT).unwrap();
+            // It outlives this process unless the tree is stopped.
+            drop(helper("helper_heartbeat").spawn().unwrap());
+            let started = Instant::now();
+            while fs::metadata(&heartbeat).map_or(0, |m| m.len()) == 0 {
+                assert!(started.elapsed() < Duration::from_secs(30), "no heartbeat");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Raw, after a newline: libtest's own output may hold a line
+            // still open.
+            let mut out = io::stdout();
+            out.write_all(
+                concat!(
+                    "\n",
+                    r#"{"thread_id":"t","type":"thread.started"}"#,
+                    "\n",
+                    r#"{"type":"turn.started"}"#,
+                    "\n",
+                    r#"{"item":{"agents_states":{},"id":"item_1","prompt":null,"receiver_thread_ids":[],"sender_thread_id":"t","status":"in_progress","tool":"wait","type":"collab_tool_call"},"type":"item.started"}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            out.flush().unwrap();
+            std::thread::sleep(HELPER_LIFE);
+        }
+    }
+
+    /// Appends a byte to the heartbeat file every 20 ms.
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_heartbeat() {
+        if helper_requested() {
+            let path = std::env::var_os(HEARTBEAT).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            let started = Instant::now();
+            while started.elapsed() < HELPER_LIFE {
+                file.write_all(b".").unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// Stops and reaps a helper's tree however the test ends.
+    struct Reaped(Arc<owlshift_platform::process::ProcessTree>, Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.1.kill();
+            let _ = self.1.wait();
+        }
+    }
+
+    /// OWL-319: a critic run is stopped at its first collaboration item, its
+    /// whole process tree with it, well before the deadline, and refused;
+    /// the deadline does not count. Runs on the three platforms.
+    #[test]
+    fn a_critic_run_is_stopped_at_its_first_collaboration_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        fs::create_dir(&files).unwrap();
+        let heartbeat = dir.path().join("heartbeat");
+        let brief = Brief::parse(&format!(
+            r#"{{"format":{},"role":"intake","project":"p",
+                "ticket":{{"id":"T-1","title":"t","author":{{"name":"a","relation":"decider"}},"description":"d"}},
+                "decider":"a","permissions":{{"level":"read_only","network":false,"browser":false}},
+                "gate":[],"always_human":[],"result_path":"result.json"}}"#,
+            owlshift_contracts::format::BRIEF_FORMAT
+        ))
+        .unwrap();
+        let harness = CodexHarness {
+            program: PathBuf::from("codex"),
+            prompt: "Review.".to_owned(),
+            model: None,
+            effort: None,
+            login: dir.path().join("auth.json"),
+        };
+        let mut command = helper("helper_collaborate");
+        command
+            .env(HEARTBEAT, &heartbeat)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (child, tree, watchdog) = watch::spawn(&mut command, Duration::from_secs(120)).unwrap();
+        let mut reaped = Reaped(Arc::clone(&tree), child);
+        let stop = watchdog.run_stop();
+        let (brief_file, result_file) = (files.join("brief.json"), files.join("result.json"));
+        let run = HarnessRun {
+            worktree: dir.path(),
+            brief: &brief,
+            brief_file: &brief_file,
+            result_file: &result_file,
+            stop: Some(&stop),
+        };
+        let mut log = RunLog::create(dir.path()).unwrap();
+        let started = Instant::now();
+        let end = harness.drive(&run, &mut reaped.1, &mut log).unwrap();
+        let elapsed = started.elapsed();
+
+        // The heartbeat child stopped with the tree: nothing has stopped it
+        // since but the run's own stop.
+        std::thread::sleep(Duration::from_secs(1));
+        let beats = fs::metadata(&heartbeat).unwrap().len();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            fs::metadata(&heartbeat).unwrap().len(),
+            beats,
+            "the heartbeat child outlived the stop"
+        );
+        assert!(beats > 0);
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+        assert!(!watchdog.finish(), "the deadline does not count");
+        let HarnessStatus::Failed(reason) = &end.status else {
+            panic!("{:?}", end.status);
+        };
+        assert!(
+            reason.contains("collaboration tools (wait)")
+                && reason.ends_with("Owlshift stopped the run at that call"),
+            "{reason}"
+        );
+        assert_eq!(end.message, None);
     }
 
     #[test]

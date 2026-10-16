@@ -26,7 +26,7 @@ use owlshift_contracts::brief::Brief;
 use owlshift_platform::keychain::Secret;
 use owlshift_platform::process::{find_executable_in, hand_over_on_descriptor};
 
-use super::{BRIEF_PATH, RunLog};
+use super::{BRIEF_PATH, RunLog, RunStop};
 use crate::agent_env::{AgentEnv, CredentialFinding, billing_finding, mcp_findings};
 
 /// Why a harness could not build its command; the adapter's own error type
@@ -52,6 +52,12 @@ pub struct HarnessRun<'a> {
     /// read-only harness keeps there the files of its own the run needs,
     /// made by [`Harness::command`].
     pub result_file: &'a Path,
+    /// Stops the run's whole process tree from [`Harness::drive`], before
+    /// the deadline: `None` while [`Harness::command`] builds the command,
+    /// which comes before the tree; `Some` while the run is driven. A run
+    /// stopped so is judged by the harness's end, never as timed out
+    /// (OWL-319).
+    pub stop: Option<&'a RunStop>,
 }
 
 /// A harness CLI, or a stand-in for one.
@@ -64,7 +70,8 @@ pub trait Harness {
     /// Reads the spawned child's output to its end, passing every byte to
     /// `log` as it comes, and says how the run ended. The executor stops the
     /// child's process tree at the deadline, which closes its output: this
-    /// must then return.
+    /// must then return. It may stop the tree sooner with
+    /// [`HarnessRun::stop`].
     fn drive(
         &self,
         run: &HarnessRun<'_>,

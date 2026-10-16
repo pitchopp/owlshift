@@ -232,10 +232,17 @@ impl Live {
             }
         });
         let mut stdout = Vec::new();
-        let run = codex::drive(&mut child, prompt, |line| {
-            stdout.extend_from_slice(line.strip_suffix(b"\n").unwrap_or(line));
-            stdout.push(b'\n');
-        })
+        // No stop at a collaboration call: the live checks watch whole runs
+        // (OWL-317, OWL-320).
+        let run = codex::drive(
+            &mut child,
+            prompt,
+            |line| {
+                stdout.extend_from_slice(line.strip_suffix(b"\n").unwrap_or(line));
+                stdout.push(b'\n');
+            },
+            || {},
+        )
         .unwrap();
         let _ = ended.send(());
         watchdog.join().unwrap();

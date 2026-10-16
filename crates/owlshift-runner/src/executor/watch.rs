@@ -2,6 +2,9 @@
 //! runs whose output is streamed rather than captured: the harness run and
 //! the gate's commands. The executor's own git commands are captured by
 //! `owlshift_platform::process::run_command` (see `git.rs`).
+//!
+//! A harness run's driver may also stop its tree before the deadline, with
+//! the watchdog's [`RunStop`] (OWL-319).
 
 use std::io;
 use std::process::{Child, Command};
@@ -17,7 +20,30 @@ use owlshift_platform::process::ProcessTree;
 pub(crate) struct Watchdog {
     cancel: Option<Sender<()>>,
     fired: Arc<AtomicBool>,
+    /// Shared with the [`RunStop`]s this watch hands out.
+    stopped: Arc<AtomicBool>,
+    tree: Arc<ProcessTree>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Stops a run's whole process tree from its harness's driver, before the
+/// deadline: on Unix its process group, on Windows its Job Object. A run
+/// stopped so is judged by its harness's own end, never as timed out, even
+/// when the deadline passed in the same moment (OWL-319).
+#[derive(Debug)]
+pub struct RunStop {
+    tree: Arc<ProcessTree>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl RunStop {
+    /// Stops every process of the run's tree, without waiting for them to
+    /// end. Best effort: should the stop fail, the deadline still stops the
+    /// tree, and the executor stops it again once the run is driven.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let _ = self.tree.kill();
+    }
 }
 
 /// Spawns `command` as the root of a process tree, and starts a watchdog
@@ -46,19 +72,33 @@ pub(crate) fn spawn(
     let watchdog = Watchdog {
         cancel: Some(cancel),
         fired,
+        stopped: Arc::new(AtomicBool::new(false)),
+        tree: Arc::clone(&tree),
         thread: Some(thread),
     };
     Ok((child, tree, watchdog))
 }
 
 impl Watchdog {
-    /// Ends the watch; whether the deadline passed and the tree was stopped.
+    /// A handle that stops the watched tree before the deadline.
+    pub(crate) fn run_stop(&self) -> RunStop {
+        RunStop {
+            tree: Arc::clone(&self.tree),
+            stopped: Arc::clone(&self.stopped),
+        }
+    }
+
+    /// Ends the watch; whether the deadline passed and the tree was stopped
+    /// for it. A run its driver stopped with [`Watchdog::run_stop`]'s handle
+    /// did not time out, whichever stop came first: the driver stops a run
+    /// for a reason of its own, such as a Codex critic's call to a
+    /// collaboration tool, which says more than the deadline (OWL-319).
     pub(crate) fn finish(mut self) -> bool {
         self.cancel.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        self.fired.load(Ordering::SeqCst)
+        self.fired.load(Ordering::SeqCst) && !self.stopped.load(Ordering::SeqCst)
     }
 }
 

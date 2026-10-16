@@ -56,8 +56,9 @@ pub use owlshift_contracts::result::Effort;
 ///   (`spawn_agent` and the rest) stay offered: neither
 ///   `--disable multi_agent` nor `--disable multi_agent_v2` took them away,
 ///   checked live on 2026-10-16, and `-c agents.max_depth=0` does not refuse
-///   a spawn (OWL-320), so none is passed. The runner refuses a run whose
-///   stream shows a call to one ([`Run::collaboration`], OWL-317).
+///   a spawn (OWL-320), so none is passed. The runner stops a run at the
+///   first call to one its stream shows, and refuses it
+///   ([`Run::collaboration`], OWL-317 and OWL-319).
 /// - `--ignore-rules` drops execpolicy `.rules` files: the runner injects the
 ///   project's rules in the brief (C2, "Rules").
 /// - `skills.include_instructions=false` lists no skill to the model, the
@@ -261,6 +262,9 @@ pub struct Run {
     /// once, in the order first seen; `unnamed` for an item without one. The
     /// outcome does not depend on it: the runner judges it.
     pub collaboration: Vec<String>,
+    /// [`drive`] called its stop at the first collaboration item: the
+    /// outcome then reads a run the runner stopped. Never set on a replay.
+    pub stopped: bool,
     /// Output lines that were not JSON objects.
     pub malformed_lines: usize,
     /// Output lines longer than the stream's line cap, not parsed.
@@ -311,14 +315,52 @@ pub enum Failure {
 /// the end and returns what it reported, as the Claude Code adapter's
 /// `drive` does: every byte of standard output reaches `on_line`, and it
 /// returns at most the stream's grace period after the child exits.
-pub fn drive(child: &mut Child, prompt: &str, on_line: impl FnMut(&[u8])) -> io::Result<Run> {
-    let mut transcript = Transcript::default();
-    let driven = stream::drive(child, prompt, on_line, &mut transcript)?;
-    let mut run = transcript.finish(driven.exit_code, driven.stderr);
+///
+/// `stop` is called once, as soon as the stream shows its first
+/// [`COLLABORATION_ITEM`], and [`Run::stopped`] says so (OWL-319). It must
+/// stop the child's whole process tree: `codex` is a Node wrapper around a
+/// native binary that holds the output open, and once the tree is stopped
+/// the output closes and this returns.
+pub fn drive(
+    child: &mut Child,
+    prompt: &str,
+    on_line: impl FnMut(&[u8]),
+    stop: impl FnOnce(),
+) -> io::Result<Run> {
+    let mut guarded = Guarded {
+        transcript: Transcript::default(),
+        stop: Some(stop),
+    };
+    let driven = stream::drive(child, prompt, on_line, &mut guarded)?;
+    let stopped = guarded.stop.is_none();
+    let mut run = guarded.transcript.finish(driven.exit_code, driven.stderr);
+    run.stopped = stopped;
     if !driven.prompt_delivered && matches!(run.outcome, Outcome::Completed { .. }) {
         run.outcome = Outcome::Failed(Failure::PromptNotDelivered);
     }
     Ok(run)
+}
+
+/// A transcript that calls its stop at the first collaboration item.
+struct Guarded<F: FnOnce()> {
+    transcript: Transcript,
+    /// `None` once called.
+    stop: Option<F>,
+}
+
+impl<F: FnOnce()> Sink for Guarded<F> {
+    fn line(&mut self, line: &[u8]) {
+        self.transcript.feed(line);
+        if !self.transcript.collaboration.is_empty()
+            && let Some(stop) = self.stop.take()
+        {
+            stop();
+        }
+    }
+
+    fn oversized(&mut self) {
+        self.transcript.oversized();
+    }
 }
 
 /// Reads a `codex exec --json` stream one line at a time. [`drive`] uses it
@@ -434,6 +476,7 @@ impl Transcript {
             outcome,
             usage: self.usage,
             collaboration: self.collaboration,
+            stopped: false,
             malformed_lines: self.malformed_lines,
             oversized_lines: self.oversized_lines,
             stderr,
@@ -733,6 +776,31 @@ mod tests {
         let shell = r#"{"type":"item.completed","item":{"type":"command_execution","command":"spawn_agent","tool":"wait"}}"#;
         let run = replay(&[STARTED, named, shell, COMPLETED], Some(0));
         assert!(run.collaboration.is_empty(), "{:?}", run.collaboration);
+    }
+
+    /// OWL-319: the stop is called once, at the first collaboration item and
+    /// not before; a stream without one never calls it.
+    #[test]
+    fn the_stop_is_called_at_the_first_collaboration_item_only() {
+        let wait = r#"{"type":"item.started","item":{"type":"collab_tool_call","tool":"wait"}}"#;
+        let calls = std::cell::Cell::new(0);
+        let mut guarded = Guarded {
+            transcript: Transcript::default(),
+            stop: Some(|| calls.set(calls.get() + 1)),
+        };
+        for (line, expected) in [(STARTED, 0), (MESSAGE, 0), (wait, 1), (wait, 1)] {
+            guarded.line(line.as_bytes());
+            assert_eq!(calls.get(), expected, "{line}");
+        }
+        let mut guarded = Guarded {
+            transcript: Transcript::default(),
+            stop: Some(|| calls.set(calls.get() + 1)),
+        };
+        for line in [STARTED, MESSAGE, COMPLETED] {
+            guarded.line(line.as_bytes());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(guarded.stop.is_some());
     }
 
     #[test]
