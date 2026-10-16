@@ -905,26 +905,35 @@ impl Brief {
             return mismatch("pull request reviews", "build only");
         }
         for review in &self.pull_request_reviews {
-            let id = review.id;
-            let broken = if review.body.trim().is_empty() && review.comments.is_empty() {
-                "has neither a body nor a comment"
-            } else if review
-                .comments
-                .iter()
-                .any(|c| c.path.trim().is_empty() || c.body.trim().is_empty())
-            {
-                "has a comment without a path or a body"
-            } else if format::render_json(review).len() > MAX_PULL_REQUEST_REVIEW_BYTES {
-                "is over the bytes a review may weigh"
-            } else {
-                continue;
-            };
-            return Err(ContractError::invalid(
-                CONTRACT,
-                format!("pull request review {id} {broken}"),
-            ));
+            if let Some(broken) = pull_request_review_problem(review) {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!("pull request review {} {broken}", review.id),
+                ));
+            }
         }
         Ok(())
+    }
+}
+
+/// What is wrong with a pull request review as a brief gives it, if
+/// anything: neither a body nor a comment, a comment without a path or a
+/// body, or more than [`MAX_PULL_REQUEST_REVIEW_BYTES`] rendered. The
+/// review record keeps the reviews of a loop under way by the same rule
+/// (OWL-307).
+pub(crate) fn pull_request_review_problem(review: &PullRequestReview) -> Option<&'static str> {
+    if review.body.trim().is_empty() && review.comments.is_empty() {
+        Some("has neither a body nor a comment")
+    } else if review
+        .comments
+        .iter()
+        .any(|c| c.path.trim().is_empty() || c.body.trim().is_empty())
+    {
+        Some("has a comment without a path or a body")
+    } else if format::render_json(review).len() > MAX_PULL_REQUEST_REVIEW_BYTES {
+        Some("is over the bytes a review may weigh")
+    } else {
+        None
     }
 }
 

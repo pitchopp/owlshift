@@ -677,7 +677,7 @@ impl OnDemand<'_> {
                 Status::Active(Stage::Verify) => {
                     match self.verify_pass(p, &dispatched, state, sink)? {
                         Verified::Passed(verified) => {
-                            return self.deliver(p, &dispatched, &verified, sink);
+                            return self.deliver_verified(p, &dispatched, &verified, sink);
                         }
                         Verified::Revise(next) => state = next,
                     }
@@ -1258,6 +1258,7 @@ impl OnDemand<'_> {
             format: Format,
             passes: Vec::new(),
             answered_reviews: Vec::new(),
+            answering: Vec::new(),
             build: None,
         });
         push_pass(
@@ -1609,6 +1610,7 @@ mod tests {
                 })
                 .collect(),
             answered_reviews: Vec::new(),
+            answering: Vec::new(),
             build: None,
         }
     }

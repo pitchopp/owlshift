@@ -1,0 +1,100 @@
+{
+  "recorded": "2026-10-16 on pitchopp/owlshift-live-sandbox, recorded live",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Reviews($owner: String!, $name: String!, $number: Int!) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(last: 100, states: [COMMENTED, APPROVED, CHANGES_REQUESTED, DISMISSED]) { nodes { fullDatabaseId author { login } state submittedAt body commit { oid } comments(first: 100) { nodes { path line body } } } } } } }",
+        "variables": {
+          "name": "owlshift-live-sandbox",
+          "number": 2,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "rateLimit": {
+            "cost": 1,
+            "remaining": 4776,
+            "resetAt": "2026-10-16T13:26:42Z"
+          },
+          "repository": {
+            "pullRequest": {
+              "reviews": {
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "pitchopp"
+                    },
+                    "body": "Please rename the file.",
+                    "comments": {
+                      "nodes": [
+                        {
+                          "body": "Say two in digits.",
+                          "line": null,
+                          "path": "owl-307-review.txt"
+                        }
+                      ]
+                    },
+                    "commit": {
+                      "oid": "3c54cbdd60532571972973e354bb22619f1916fe"
+                    },
+                    "fullDatabaseId": "5547776064",
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-10-16T12:29:56Z"
+                  },
+                  {
+                    "author": {
+                      "login": "pitchopp"
+                    },
+                    "body": "",
+                    "comments": {
+                      "nodes": [
+                        {
+                          "body": "Inline only.",
+                          "line": 3,
+                          "path": "owl-307-review.txt"
+                        }
+                      ]
+                    },
+                    "commit": {
+                      "oid": "3c54cbdd60532571972973e354bb22619f1916fe"
+                    },
+                    "fullDatabaseId": "5547776257",
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-10-16T12:29:57Z"
+                  },
+                  {
+                    "author": {
+                      "login": "pitchopp"
+                    },
+                    "body": "",
+                    "comments": {
+                      "nodes": [
+                        {
+                          "body": "A reply in the thread.",
+                          "line": 3,
+                          "path": "owl-307-review.txt"
+                        }
+                      ]
+                    },
+                    "commit": {
+                      "oid": "9afe46360130ed0da77820f1e7a33078c9c29d54"
+                    },
+                    "fullDatabaseId": "5547785363",
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-10-16T12:30:52Z"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "rate": {
+        "remaining": 4776,
+        "reset": 1792157202
+      }
+    }
+  ]
+}

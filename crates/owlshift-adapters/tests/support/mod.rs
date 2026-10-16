@@ -120,6 +120,14 @@ impl Replay {
         }
     }
 
+    /// Exchanges a test made from a recorded one, under `name`.
+    pub fn from_exchanges(name: &str, exchanges: Vec<Exchange>) -> Self {
+        Self {
+            name: name.to_owned(),
+            left: Arc::new(Mutex::new(exchanges.into())),
+        }
+    }
+
     /// Fails unless every recorded exchange was used.
     pub fn assert_done(&self) {
         let left = self.left.lock().unwrap().len();

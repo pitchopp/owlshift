@@ -22,18 +22,10 @@ impl OnDemand<'_> {
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        let mut p = match self.prepare(ticket, Command::Correct) {
+        let mut p = match self.prepare_at_watch(ticket, seen, Command::Correct)? {
             Ok(p) => p,
-            Err(Stop::Busy(_)) => return None,
             Err(stop) => return Some(Err(stop)),
         };
-        let stored = p.stored.as_ref()?;
-        if stored.commit != seen
-            || !TicketState::try_from(&stored.record.state)
-                .is_ok_and(|state| state.status() == Status::Active(Stage::Watch))
-        {
-            return None;
-        }
         Some(self.correct(&mut p, following, sink))
     }
 
@@ -249,7 +241,6 @@ impl OnDemand<'_> {
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
-        let ticket = p.ticket.clone();
         let state = match done.state.apply(PIPELINE, Event::Corrected) {
             Ok(Transition::To(next)) => next,
             other => return Err(core_error(other)),
@@ -257,11 +248,6 @@ impl OnDemand<'_> {
         let corrected = question_texts(&p.questions(), reversed);
         let mut questions = p.questions();
         reversal::followed(&mut questions, reversed);
-        let mut kept = p
-            .stored
-            .as_ref()
-            .and_then(|stored| stored.record.delivery.clone())
-            .unwrap_or_else(|| delivery.clone());
         let owed = OwedReport {
             kind: PushKind::Correction,
             // Never 0: a correction runs for one reversed decision at least.
@@ -274,17 +260,76 @@ impl OnDemand<'_> {
             )),
             unchanged: true,
         };
-        let replaced = kept.owed.replace(owed);
-        self.store_delivery(p, &state, questions, Some(kept.clone()))
-            .map_err(|e| refused("keeping the replies the correction followed", e))?;
-        // Told once the ref keeps it (OWL-239).
-        if let Some(replaced) = &replaced {
-            self.replaced(&ticket, replaced, kept.pushed.as_deref(), sink);
-        }
+        let kept = self.owe_unchanged(
+            p,
+            delivery,
+            &state,
+            questions,
+            owed,
+            "keeping the replies the correction followed",
+            sink,
+        )?;
         self.corrected_event(p, "unchanged", reversed, sink);
-        let what = "the correction run found the pull request already following the replies";
-        let head = Branch::new(&delivery.branch).map_err(|e| refused("the ticket's branch", e))?;
-        let base = Branch::new(&delivery.base_branch).map_err(|e| refused("the base branch", e))?;
+        self.post_unchanged(
+            p,
+            kept,
+            pushed,
+            &state,
+            "the correction run found the pull request already following the replies, which \
+             were kept as followed",
+            following,
+            sink,
+        )
+    }
+
+    /// The report `owed` of a run that pushed nothing (a correction, or a
+    /// review loop's Build, OWL-307) kept in the ref, with `state` and
+    /// `questions`, from the delivery the ref keeps (`delivery` without
+    /// one), in the write that keeps what the run settled (OWL-236): so a
+    /// refusal or a crash leaves it for the next pass. A report it
+    /// replaces is told once kept (OWL-239). Returns the delivery kept.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn owe_unchanged(
+        &self,
+        p: &mut Prepared,
+        delivery: &TicketDelivery,
+        state: &TicketState,
+        questions: TicketQuestions,
+        owed: OwedReport,
+        keeping: &str,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketDelivery, Stop> {
+        let mut kept = p
+            .stored
+            .as_ref()
+            .and_then(|stored| stored.record.delivery.clone())
+            .unwrap_or_else(|| delivery.clone());
+        let replaced = kept.owed.replace(owed);
+        self.store_delivery(p, state, questions, Some(kept.clone()))
+            .map_err(|e| refused(keeping, e))?;
+        if let Some(replaced) = &replaced {
+            self.replaced(&p.ticket, replaced, kept.pushed.as_deref(), sink);
+        }
+        Ok(kept)
+    }
+
+    /// Posts the report [`Self::owe_unchanged`] kept, only while the pull
+    /// request is still open at `pushed`, Owlshift's last push; otherwise
+    /// it stays owed, and the next read that ends the following drops it.
+    /// `done` says what was done, for the stop.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn post_unchanged(
+        &self,
+        p: &mut Prepared,
+        kept: TicketDelivery,
+        pushed: &CommitId,
+        state: &TicketState,
+        done: &str,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        let head = Branch::new(&kept.branch).map_err(|e| refused("the ticket's branch", e))?;
+        let base = Branch::new(&kept.base_branch).map_err(|e| refused("the base branch", e))?;
         let pull_request = self
             .forge
             .find_open_pull_request(&head, &base)
@@ -299,14 +344,14 @@ impl OnDemand<'_> {
             })
             .map_err(|reason| {
                 Stop::Delivery(format!(
-                    "{what}, but it could not be read at Owlshift's push for the report: \
-                     {reason}; the report stays owed while watch follows the pull request"
+                    "{done}, but the pull request could not be read at Owlshift's push for the \
+                     report: {reason}; the report stays owed while watch follows the pull \
+                     request"
                 ))
             })?;
         let checks = self.forge.checks(pull_request.number, pushed);
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
-        let done = format!("{what}, which were kept as followed");
-        let comment = self.post_and_settle(p, &state, kept, checks, &done, following, sink)?;
+        let comment = self.post_and_settle(p, state, kept, checks, done, following, sink)?;
         Ok(Delivered {
             pull_request,
             opened: false,

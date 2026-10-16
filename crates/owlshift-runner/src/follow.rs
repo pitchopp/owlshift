@@ -21,7 +21,7 @@ use serde_json::json;
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::{
     BaseChecks, Branch, Check, CheckKind, CheckSet, CheckState, CommitId, ErrorKind, Mergeable,
-    PrState, PullRequestRead, Verdict,
+    PrState, PullRequestRead, ReviewsRead, Verdict,
 };
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
@@ -319,6 +319,9 @@ pub struct Following {
     /// The commit and the refusal of the owed report last warned of, per
     /// ticket (OWL-232).
     unposted: HashMap<TicketId, (String, String)>,
+    /// The kind of the last failure of a reviews read warned of, per ticket
+    /// (OWL-307).
+    reviews_unread: HashMap<TicketId, &'static str>,
 }
 
 /// A warning a look records, beside the events of what it read.
@@ -467,13 +470,7 @@ impl Following {
             ]));
             return (Look::Paused { until }, warnings);
         }
-        let kind = match error.kind {
-            ErrorKind::NotFound => "not_found",
-            ErrorKind::Unauthorized => "unauthorized",
-            ErrorKind::HeadMoved => "head_moved",
-            ErrorKind::RateLimited => "rate_limited",
-            ErrorKind::Other => "other",
-        };
+        let kind = unread_kind(error.kind);
         if self.unread.get(ticket) != Some(&kind) {
             self.unread.insert(ticket.clone(), kind);
             warnings.push(data([
@@ -580,6 +577,7 @@ impl Following {
         self.overdue.remove(ticket);
         self.moved.remove(ticket);
         self.unposted.remove(ticket);
+        self.reviews_unread.remove(ticket);
     }
 
     /// Forgets the tickets `kept` does not name.
@@ -590,6 +588,58 @@ impl Following {
         self.overdue.retain(|t, _| kept.contains(t));
         self.moved.retain(|t, _| kept.contains(t));
         self.unposted.retain(|t, _| kept.contains(t));
+        self.reviews_unread.retain(|t, _| kept.contains(t));
+    }
+
+    /// Reads the reviews of pull request `number` at `now` (OWL-307), one
+    /// request, at a pass whose read of it asked for no repair. Returns the
+    /// read, or none, and the warnings to record now: a spent budget pauses
+    /// every forge read, as a look's does; any other failure is a
+    /// `reviews_unreadable` warning, once per kind until a read succeeds.
+    pub fn reviews(
+        &mut self,
+        forge: &GitHubForge,
+        ticket: &TicketId,
+        number: u64,
+        now: Timestamp,
+    ) -> (Option<ReviewsRead>, Vec<Warning>) {
+        let mut warnings = Vec::new();
+        if self.paused_until.is_some_and(|until| now < until) {
+            return (None, warnings);
+        }
+        match forge.reviews(number) {
+            Ok(read) => {
+                self.reviews_unread.remove(ticket);
+                (Some(read), warnings)
+            }
+            Err(error) if error.kind == ErrorKind::RateLimited => {
+                let (_, warned) = self.failed(ticket, &error, now, warnings);
+                (None, warned)
+            }
+            Err(error) => {
+                let kind = unread_kind(error.kind);
+                if self.reviews_unread.get(ticket) != Some(&kind) {
+                    self.reviews_unread.insert(ticket.clone(), kind);
+                    warnings.push(data([
+                        ("what", json!("reviews_unreadable")),
+                        ("kind", json!(kind)),
+                        ("reason", json!(error.message)),
+                    ]));
+                }
+                (None, warnings)
+            }
+        }
+    }
+}
+
+/// A forge failure's kind, as warnings name it.
+fn unread_kind(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::Unauthorized => "unauthorized",
+        ErrorKind::HeadMoved => "head_moved",
+        ErrorKind::RateLimited => "rate_limited",
+        ErrorKind::Other => "other",
     }
 }
 
@@ -633,18 +683,21 @@ pub fn landed_owing(
     delivery.owed.replace(owed)
 }
 
-/// Whether an end of the following brings a ticket in `status` back to
-/// Watch with the core's [`Event::FollowingEnded`]: a round waiting at Watch
-/// (OWL-242), or a park at Watch (OWL-243).
+/// Whether an end of the following brings a ticket in `status`, whose
+/// delivery watch follows, back to Watch with the core's
+/// [`Event::FollowingEnded`]: a round waiting at Watch (OWL-242), a park at
+/// Watch (OWL-243), or a review loop at Build or Verify, working, waiting or
+/// parked there (OWL-307), since only a review loop takes a followed
+/// delivery's ticket there.
 pub fn ends_with_following(status: Status) -> bool {
     matches!(
         status,
         Status::NeedsInput {
-            return_to: Stage::Watch
+            return_to: Stage::Watch | Stage::Build
         } | Status::Parked {
-            at: Stage::Watch,
+            at: Stage::Watch | Stage::Build | Stage::Verify,
             ..
-        }
+        } | Status::Active(Stage::Build | Stage::Verify)
     )
 }
 
@@ -661,7 +714,8 @@ pub struct Changed {
 
 /// The record `seen` leaves in the ticket ref, `None` when it changes
 /// nothing: the following ended, closing a round that waited at Watch
-/// (OWL-242) or ending a park there (OWL-243), a push adopted, or the fix
+/// (OWL-242), ending a park there (OWL-243) or ending a review loop
+/// (OWL-307), a push adopted, a review loop's ending it, or the fix
 /// passes and
 /// failed runs cleared by a green read (`ChecksGreen`). A fix, a rebase or a
 /// park is decided only: the repair runs them ([`OnDemand::repair_seen`]).
@@ -682,12 +736,19 @@ pub fn changed(
     match &seen.decision {
         Decision::End(reason) => {
             // A round waiting at Watch, or a park there, ends with the
-            // following (OWL-242, OWL-243).
+            // following (OWL-242, OWL-243), and so does a review loop
+            // (OWL-307), its reviews never answered and its kept Build gone.
             let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
             if ends_with_following(state.status()) {
                 match state.apply(pipeline, Event::FollowingEnded) {
                     Ok(Transition::To(closed)) => next.state = (&closed).into(),
                     other => return Err(format!("the core state machine: {other:?}")),
+                }
+                if state.stage() != Stage::Watch
+                    && let Some(review) = next.review.as_mut()
+                {
+                    review.answering.clear();
+                    review.build = None;
                 }
             }
             let why = ended_why(*reason);
@@ -704,11 +765,38 @@ pub fn changed(
                     PushKind::Fix => Some(Event::FixPushed),
                     PushKind::Rebase => Some(Event::RebasePushed),
                     PushKind::Correction => Some(Event::Corrected),
-                    // No run pushes a review loop's commit yet; how its
-                    // push is adopted comes with the loop (OWL-301, OWL-307).
                     PushKind::Delivery | PushKind::Review => None,
                 };
                 match event {
+                    // A review loop's push a crash cut short ends the loop
+                    // as its command would have (OWL-307): from Verify to
+                    // Watch, the reviews it answers answered, its report
+                    // owed.
+                    None if pushing.kind == PushKind::Review => {
+                        let mut state =
+                            TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
+                        while matches!(
+                            state.status(),
+                            Status::Active(Stage::Verify | Stage::Deliver)
+                        ) {
+                            state = match state.apply(pipeline, Event::Completed) {
+                                Ok(Transition::To(completed)) => completed,
+                                other => return Err(format!("the core state machine: {other:?}")),
+                            };
+                        }
+                        next.state = (&state).into();
+                        if let Some(review) = next.review.as_mut() {
+                            let answered = pushing.report.iter().flat_map(|kept| &kept.reviews);
+                            for answered in answered {
+                                if !review.answered_reviews.contains(&answered.id) {
+                                    review.answered_reviews.push(answered.id);
+                                }
+                            }
+                            review.answering.clear();
+                            review.build = None;
+                        }
+                        replaced = landed_owing(&mut delivery, pushing, 1);
+                    }
                     None => landed(&mut delivery, pushing),
                     // A fix, rebase or correction push a crash cut short
                     // counts as the run would have (OWL-112, OWL-210,
@@ -777,6 +865,7 @@ mod tests {
     use owlshift_adapters::graphql::{RateHeaders, Response, Transport};
     use owlshift_contracts::refs::TicketQuestions;
     use owlshift_contracts::refs::{DeliveredPullRequest, KeptReport, PersistedState, Pushing};
+    use owlshift_contracts::review::TicketReview;
     use owlshift_core::state::Status;
     use owlshift_core::vocab::Stage;
     use serde_json::Value;
@@ -1349,5 +1438,125 @@ mod tests {
                 "{park:?}"
             );
         }
+    }
+
+    /// A review loop under way (OWL-307): its reviews and kept Build.
+    fn under_way() -> TicketReview {
+        TicketReview {
+            answered_reviews: vec![3],
+            answering: vec![owlshift_contracts::brief::PullRequestReview {
+                id: 9,
+                author: owlshift_contracts::brief::Author {
+                    name: "ann-dev".to_owned(),
+                    relation: owlshift_contracts::brief::Relation::Decider,
+                },
+                body: "Rename it.".to_owned(),
+                comments: Vec::new(),
+            }],
+            build: Some(owlshift_contracts::review::KeptBuild {
+                commit: PUSHING.to_owned(),
+                summary: "Renamed it.".to_owned(),
+                pr: None,
+                gate: Vec::new(),
+                notes: Vec::new(),
+                followups: Vec::new(),
+                seen: None,
+            }),
+            ..TicketReview::new()
+        }
+    }
+
+    /// The end of the following ends a review loop wherever it is, working,
+    /// waiting or parked at Build or Verify (OWL-307): back at Watch, its
+    /// reviews never answered and its kept Build dropped.
+    #[test]
+    fn an_end_ends_a_review_loop() {
+        let pipeline = Pipeline::new(owlshift_core::vocab::Variant::Trivial);
+        for status in [
+            Status::Active(Stage::Build),
+            Status::Active(Stage::Verify),
+            Status::NeedsInput {
+                return_to: Stage::Build,
+            },
+            Status::Parked {
+                at: Stage::Verify,
+                awaiting_input: false,
+            },
+        ] {
+            let state = TicketState::restore(status, 1, 0, 0, 0, 0).unwrap();
+            let mut looping = record(delivery(), state);
+            looping.review = Some(under_way());
+            let ended = changed(
+                &looping,
+                pipeline,
+                &seen_with(Decision::End(EndReason::Merged), PUSHED),
+                at(5),
+            )
+            .unwrap()
+            .unwrap()
+            .record;
+            let state = TicketState::try_from(&ended.state).unwrap();
+            assert_eq!(state.status(), Status::Active(Stage::Watch), "{status:?}");
+            let review = ended.review.unwrap();
+            assert!(review.answering.is_empty() && review.build.is_none());
+            assert_eq!(review.answered_reviews, [3]);
+            assert_eq!(ended.delivery.unwrap().ended.unwrap().why, EndedWhy::Merged);
+        }
+    }
+
+    /// A review loop's push a crash cut short, adopted by a read (OWL-307),
+    /// ends the loop as its command would have: from Verify to Watch, the
+    /// reviews its report names answered, its report owed, counting 1.
+    #[test]
+    fn an_adopted_review_push_ends_its_loop() {
+        let pipeline = Pipeline::new(owlshift_core::vocab::Variant::Trivial);
+        let verifying = TicketState::restore(Status::Active(Stage::Verify), 1, 0, 0, 0, 0).unwrap();
+        let mut d = delivery();
+        d.pushing = Some(Pushing {
+            commit: PUSHING.to_owned(),
+            kind: PushKind::Review,
+            base: BASE.to_owned(),
+            onto: None,
+            report: Some(KeptReport {
+                summary: "Renamed it.".to_owned(),
+                gate: Some(Vec::new()),
+                checks: Vec::new(),
+                questions: Vec::new(),
+                notes: Vec::new(),
+                followups: Vec::new(),
+                reviews: vec![owlshift_contracts::refs::AnsweredReview {
+                    id: 9,
+                    author: "ann-dev".to_owned(),
+                }],
+            }),
+        });
+        let mut looping = record(d, verifying);
+        looping.review = Some(under_way());
+        let adopted = changed(
+            &looping,
+            pipeline,
+            &seen_with(
+                Decision::Follow {
+                    adopt: true,
+                    action: Action::WaitChecks,
+                },
+                PUSHING,
+            ),
+            at(5),
+        )
+        .unwrap()
+        .unwrap()
+        .record;
+        let state = TicketState::try_from(&adopted.state).unwrap();
+        assert_eq!(state.status(), Status::Active(Stage::Watch));
+        assert_eq!((state.fix_passes(), state.repairs()), (0, 0));
+        let review = adopted.review.unwrap();
+        assert_eq!(review.answered_reviews, [3, 9]);
+        assert!(review.answering.is_empty() && review.build.is_none());
+        let delivery = adopted.delivery.unwrap();
+        assert_eq!(delivery.pushed.as_deref(), Some(PUSHING));
+        let owed = delivery.owed.unwrap();
+        assert_eq!((owed.kind, owed.count), (PushKind::Review, 1));
+        TicketReview::parse(&review.render()).unwrap();
     }
 }

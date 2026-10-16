@@ -11,6 +11,7 @@ use owlshift_contracts::config::{FindingsConfirmation, ProjectConfig};
 use owlshift_contracts::drain::TicketProposals;
 use owlshift_contracts::refs::{PushKind, TicketDelivery, TicketQuestions};
 use owlshift_contracts::result::RunResult;
+use owlshift_contracts::review::TicketReview;
 use serde_json::{Value, json};
 
 fn fixture(name: &str) -> String {
@@ -672,6 +673,123 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("upgrade Owlshift"), "{error}");
+}
+
+/// What a review loop keeps (OWL-307): the delivery's start, a review
+/// loop's owed report unchanged or with notes, and the reviews the loop
+/// under way answers.
+#[test]
+fn a_review_loop_keeps_its_start_its_report_and_its_reviews() {
+    let delivery = json_fixture("ticket-delivery.json");
+    let mut started = delivery.clone();
+    started["delivered_at"] = "2026-10-16T12:00:00Z".into();
+    let read = TicketDelivery::parse(&started.to_string()).unwrap();
+    assert_eq!(
+        read.delivered_at,
+        Some("2026-10-16T12:00:00Z".parse().unwrap())
+    );
+    assert_eq!(TicketDelivery::parse(&read.render()).unwrap(), read);
+    let mut in_4 = started.clone();
+    in_4["format"] = 4.into();
+    let error = TicketDelivery::parse(&in_4.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("format 4 keeps no delivered_at"), "{error}");
+
+    let mut unchanged = delivery;
+    unchanged["owed"] = json!({
+        "kind": "review",
+        "count": 1,
+        "unchanged": true,
+        "report": {
+            "summary": "The comment asks for what the code already does.",
+            "notes": [{
+                "question": "Late comment",
+                "decision": "Given to one more Build run before delivery, to integrate",
+                "basis": "The decider's comments posted or edited at 2026-10-16T12:00:00Z"
+            }],
+            "reviews": [{ "id": 5547776064u64, "author": "ada" }]
+        }
+    });
+    TicketDelivery::parse(&unchanged.to_string()).unwrap();
+    for (case, edit, reason) in [
+        (
+            "an unchanged fix",
+            &(|d: &mut Value| {
+                d["owed"]["kind"] = "fix".into();
+                d["owed"]["report"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reviews");
+                d["owed"]["report"].as_object_mut().unwrap().remove("notes");
+            }) as &dyn Fn(&mut Value),
+            "unchanged only if it is a correction's or a review loop's",
+        ),
+        (
+            "a review loop's report counting 2",
+            &|d| d["owed"]["count"] = 2.into(),
+            "owed report counts 1",
+        ),
+        (
+            "notes on a correction",
+            &|d| {
+                d["owed"]["kind"] = "correction".into();
+                d["owed"]["report"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reviews");
+                d["owed"]["report"]["questions"] = json!(["Which file?"]);
+            },
+            "keeps notes only if it is a delivery's or a review loop's",
+        ),
+    ] {
+        let mut document = unchanged.clone();
+        edit(&mut document);
+        let error = TicketDelivery::parse(&document.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(reason), "{case}: {error}");
+    }
+
+    let review = json_fixture("ticket-review.json");
+    let answering = json!({
+        "id": 5547776257u64,
+        "author": { "name": "ada", "relation": "decider" },
+        "comments": [{ "path": "src/lib.rs", "line": 3, "body": "Say two in digits." }]
+    });
+    let mut under_way = review.clone();
+    under_way["answering"] = json!([answering.clone()]);
+    let read = TicketReview::parse(&under_way.to_string()).unwrap();
+    assert_eq!(read.answering[0].id, 5_547_776_257);
+    assert_eq!(TicketReview::parse(&read.render()).unwrap(), read);
+    for (case, answering, reason) in [
+        (
+            "twice",
+            json!([answering.clone(), answering.clone()]),
+            "is answered twice by the loop under way",
+        ),
+        (
+            "already answered",
+            json!([{
+                "id": 3141592653u64,
+                "author": { "name": "ada", "relation": "decider" },
+                "body": "Rename it."
+            }]),
+            "is under way although answered",
+        ),
+        (
+            "empty",
+            json!([{ "id": 9, "author": { "name": "ada", "relation": "other" } }]),
+            "has neither a body nor a comment",
+        ),
+    ] {
+        let mut document = review.clone();
+        document["answering"] = answering;
+        let error = TicketReview::parse(&document.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(reason), "{case}: {error}");
+    }
 }
 
 #[test]

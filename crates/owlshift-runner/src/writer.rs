@@ -59,7 +59,7 @@ use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{FindingId, QuestionId, TicketId};
-use owlshift_contracts::refs::{DeliveredPullRequest, PushKind};
+use owlshift_contracts::refs::{AnsweredReview, DeliveredPullRequest, PushKind};
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
     Verdict as AnswerVerdict,
@@ -106,6 +106,20 @@ pub struct DeliveryReport {
     /// the delivery's report. `None` for a repair, which gets no Verify pass,
     /// and for a delivery whose review record keeps none.
     pub review: Option<ReportedReview>,
+    /// A review loop's outcome (OWL-307): the pull request reviews it
+    /// answers, and whether its Build pushed a commit. `None` otherwise.
+    pub reviewed: Option<Reviewed>,
+}
+
+/// A review loop a DELIVERY report names (OWL-307, architecture section 5,
+/// "Review comments on the pull request").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reviewed {
+    /// The reviews the loop answers, each with its author's login.
+    pub reviews: Vec<AnsweredReview>,
+    /// Whether the loop pushed a commit; `false` when its Build found
+    /// nothing to change.
+    pub pushed: bool,
 }
 
 /// What the DELIVERY report says of the Verify passes a delivery went
@@ -319,7 +333,16 @@ const FIX_PASS_LEAD: &str = "**Fix pass ";
 const REBASE_LEAD: &str = "**Rebased onto ";
 const CORRECTED_LEAD: &str = "**Corrected after delivery,**";
 const UNCORRECTED_LEAD: &str = "**No correction needed after delivery:**";
-const LEADS: [&str; 4] = [FIX_PASS_LEAD, REBASE_LEAD, CORRECTED_LEAD, UNCORRECTED_LEAD];
+const REVIEWED_LEAD: &str = "**Changed after reviews on the pull request,**";
+const UNREVIEWED_LEAD: &str = "**No change after reviews on the pull request:**";
+const LEADS: [&str; 6] = [
+    FIX_PASS_LEAD,
+    REBASE_LEAD,
+    CORRECTED_LEAD,
+    UNCORRECTED_LEAD,
+    REVIEWED_LEAD,
+    UNREVIEWED_LEAD,
+];
 
 /// The most characters a list of a lead line takes (OWL-228): the red
 /// checks of a fix pass, the questions of a correction.
@@ -454,6 +477,29 @@ impl DeliveryReport {
                 code(short(&rebase.onto)),
                 rebase.repair
             ))
+        } else if let Some(reviewed) = &self.reviewed {
+            // Each review linked on the pull request, with its author.
+            let reviews: Vec<String> = reviewed
+                .reviews
+                .iter()
+                .map(|review| {
+                    let url = format!("{}#pullrequestreview-{}", pr.url, review.id);
+                    format!(
+                        "{} by {}",
+                        link(&format!("review {}", review.id), &url),
+                        code(&flatten(&review.author))
+                    )
+                })
+                .collect();
+            let listed = listed(&reviews, LEAD_LIST_CHARS);
+            Some(if reviewed.pushed {
+                format!("{REVIEWED_LEAD} to follow {listed}.")
+            } else {
+                format!(
+                    "{UNREVIEWED_LEAD} the Build run found nothing to change for {listed}, and \
+                     nothing was pushed."
+                )
+            })
         } else {
             self.correction.as_ref().map(|correction| {
                 let questions: Vec<String> = correction
@@ -3010,6 +3056,7 @@ mod tests {
             rebase: None,
             correction: None,
             review: None,
+            reviewed: None,
         }
     }
 
@@ -4626,7 +4673,51 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             }),
             with(&|r| r.correction = Some(corrected(true))),
             with(&|r| r.correction = Some(corrected(false))),
+            with(&|r| r.reviewed = Some(reviewed(true))),
+            with(&|r| r.reviewed = Some(reviewed(false))),
         ]
+    }
+
+    /// A review loop answering two reviews (OWL-307).
+    fn reviewed(pushed: bool) -> Reviewed {
+        Reviewed {
+            reviews: vec![
+                AnsweredReview {
+                    id: 5_547_776_064,
+                    author: "ann-dev".to_owned(),
+                },
+                AnsweredReview {
+                    id: 5_547_776_257,
+                    author: "bob".to_owned(),
+                },
+            ],
+            pushed,
+        }
+    }
+
+    /// A review loop's lead names each review it answers, linked on the
+    /// pull request with its author, and says when nothing was pushed
+    /// (OWL-307).
+    #[test]
+    fn a_review_loops_lead_names_the_reviews_it_answers() {
+        let mut changed = report(Err(forge::Error::new(ErrorKind::Unauthorized, "not read")));
+        changed.reviewed = Some(reviewed(true));
+        let lead = changed.lead_lines().0.unwrap();
+        let url = &changed.pull_request.url;
+        assert!(lead.starts_with(REVIEWED_LEAD), "{lead}");
+        assert!(
+            lead.contains(&format!(
+                "[review 5547776064]({url}#pullrequestreview-5547776064) by `ann-dev`"
+            )),
+            "{lead}"
+        );
+        assert!(lead.contains("by `bob`"), "{lead}");
+        let mut unchanged = changed.clone();
+        unchanged.reviewed = Some(reviewed(false));
+        let lead = unchanged.lead_lines().0.unwrap();
+        assert!(lead.starts_with(UNREVIEWED_LEAD), "{lead}");
+        assert!(lead.ends_with("and nothing was pushed."), "{lead}");
+        assert!(unchanged.render().contains(&changed.summary));
     }
 
     /// Each lead line `lead_lines` renders starts as one of `LEADS` does.

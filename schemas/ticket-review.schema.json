@@ -14,6 +14,13 @@
       },
       "uniqueItems": true
     },
+    "answering": {
+      "description": "The pull request reviews the review loop under way answers\n(OWL-307), as read when it started: each one an instruction of the\ndecider or quoted data, as the loop's Build runs are given them.\nPresent from the loop's start to its push landing, or its report\nowed, when their ids move to `answered_reviews`; dropped when watch\nstops following the pull request.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PullRequestReview"
+      }
+    },
     "build": {
       "description": "What the Build that Verify reviews gave for its delivery (OWL-304):\nkept once a Build is done and its gate passed, so that `continue`\nruns a Verify pass cut short again and delivers. Dropped when the\nticket is delivered or dispatched again from Ready.",
       "anyOf": [
@@ -44,6 +51,23 @@
     "format"
   ],
   "$defs": {
+    "Author": {
+      "description": "Who wrote a ticket or a comment, relative to the ticket.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/Relation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "relation"
+      ]
+    },
     "Decision": {
       "description": "A decision the role took on its own.",
       "type": "object",
@@ -377,12 +401,80 @@
         "body"
       ]
     },
+    "PullRequestReview": {
+      "description": "A review submitted on the delivered pull request (OWL-300, architecture\nsection 5, \"Review comments on the pull request\").",
+      "type": "object",
+      "properties": {
+        "author": {
+          "description": "Its author: `decider` when that forge login maps to the ticket's\ndecider, whose review is an instruction; `other` for another listed\nreviewer, whose review is quoted data.",
+          "$ref": "#/$defs/Author"
+        },
+        "body": {
+          "description": "The review's body; empty when it has inline comments only.",
+          "type": "string"
+        },
+        "comments": {
+          "description": "Its inline comments, in the forge's order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReviewComment"
+          }
+        },
+        "id": {
+          "description": "The forge's id of the review.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "author"
+      ]
+    },
+    "Relation": {
+      "description": "Whether a text comes from the decider, from the runner, or from someone\nelse (whose text is quoted as data).",
+      "type": "string",
+      "enum": [
+        "decider",
+        "owlshift",
+        "other"
+      ]
+    },
     "ResponseOutcome": {
       "description": "What the author did with a finding.",
       "type": "string",
       "enum": [
         "fixed",
         "rejected"
+      ]
+    },
+    "ReviewComment": {
+      "description": "An inline comment of a pull request review.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "line": {
+          "description": "The line of the file, when the forge gives one.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "path": {
+          "description": "The file, from the repository's root.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "body"
       ]
     },
     "ReviewPass": {

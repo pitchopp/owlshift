@@ -19,6 +19,14 @@
       "description": "The ticket's branch.",
       "type": "string"
     },
+    "delivered_at": {
+      "description": "When the delivery's first push was kept under way, before its pull\nrequest could be reviewed (OWL-307): a review submitted before it is\nnot this delivery's. Kept by a retry of the same delivery and by every\nlater push; absent from a delivery made before OWL-307 until watch\nstamps it.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
     "ended": {
       "description": "Why and when watch stopped following the pull request.",
       "anyOf": [

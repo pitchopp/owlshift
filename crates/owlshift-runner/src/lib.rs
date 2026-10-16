@@ -18,6 +18,7 @@ pub mod forget;
 pub mod init;
 pub mod notify;
 pub mod on_demand;
+pub mod pr_reviews;
 pub mod project;
 pub mod proposals;
 pub mod rebase;

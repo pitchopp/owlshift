@@ -284,6 +284,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     let facts = admission_facts(system, config, accounts);
     checks.extend(drain_admission_check(config, facts.as_ref()));
     checks.extend(proposals_inbox_check(config, facts.as_ref()));
+    checks.extend(forge_reviewers_check(config));
     checks.extend(drain_slot_check(system, config));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
@@ -1111,6 +1112,39 @@ fn tracker_check(config: &Effective) -> Check {
             ),
         )
     }
+}
+
+/// Whose reviews on Owlshift's pull requests are read (OWL-307, build plan
+/// "P5 · Quality pipeline", "Contracts and formats"): the logins
+/// `[forge].reviewers` lists, read from the working tree here, while watch
+/// reads the base commit. Without `[forge]` no review is read, which blocks
+/// nothing: a warning. None without a project configuration.
+fn forge_reviewers_check(config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "forge reviewers";
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    Some(match &config.forge {
+        Some(forge) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "{} reviewer(s) in the working tree (watch reads the base commit): a review of \
+                 the ticket's decider on a delivered pull request goes back to Build",
+                forge.reviewers.len()
+            ),
+        ),
+        None => Check::warn(
+            Section::Project,
+            SUBJECT,
+            "`[forge].reviewers` is not set: no review on Owlshift's pull requests is read",
+            format!(
+                "{DOES_NOT_BLOCK} to have the decider's reviews on a delivered pull request \
+                 handled, map each forge login to its tracker account under `[forge]`, as \
+                 `reviewers = {{ login = \"account\" }}`, written as a zone's owner is."
+            ),
+        ),
+    })
 }
 
 /// Whether each state named under `[tracker].states` is exactly one
@@ -3231,6 +3265,35 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
         );
         let report = run(&ready().unstored(&own().key), &config);
         assert_eq!(line(&report, "drain admission").status, Status::Ok);
+    }
+
+    /// OWL-307: without `[forge].reviewers` no review is read, a warning
+    /// that blocks nothing; with it, how many are listed.
+    #[test]
+    fn forge_reviewers_are_named_or_warned_of() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (_dir, without) = project_tracked_by(tracker);
+        let report = run(&system, &without);
+        let warned = line(&report, "forge reviewers");
+        assert_eq!(warned.status, Status::Warn);
+        assert_eq!(
+            warned.detail,
+            "`[forge].reviewers` is not set: no review on Owlshift's pull requests is read"
+        );
+        let (_dir, with) = project_tracked_by(&format!(
+            "{tracker}\n[forge]\nreviewers = {{ ann-dev = \"u-ann\", bob = \"u-bob\" }}"
+        ));
+        let report = run(&system, &with);
+        let named = line(&report, "forge reviewers");
+        assert_eq!(named.status, Status::Ok);
+        assert!(
+            named.detail.starts_with("2 reviewer(s)"),
+            "{}",
+            named.detail
+        );
     }
 
     /// OWL-155: delegation and a missing `admitters` warn without the

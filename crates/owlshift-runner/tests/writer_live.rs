@@ -102,6 +102,7 @@ fn posts_the_delivery_report_on_a_real_ticket() {
         rebase: None,
         correction: None,
         review: None,
+        reviewed: None,
     };
     let writer = Writer::new(&tracker);
     let posted = writer.post_delivery_report(&report).unwrap();

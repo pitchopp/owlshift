@@ -235,10 +235,17 @@ impl OnDemand<'_> {
     /// worktree, with no external diff, text conversion or colour.
     fn review_diff(&self, p: &Prepared, commit: &str) -> Result<GivenDiff, Stop> {
         let git = &self.executor.git;
-        let base = git
-            .run(&p.checkout, &["merge-base", &p.base.commit, commit])
-            .map_err(|e| refused("reading the commit the Build started from", e))?;
-        let base = String::from_utf8_lossy(&base).trim().to_owned();
+        // A review loop's Build started from Owlshift's last push to the
+        // pull request: Verify reviews the loop's own change (OWL-307).
+        let base = match super::loop_base(p) {
+            Some(pushed) => pushed.to_string(),
+            None => {
+                let base = git
+                    .run(&p.checkout, &["merge-base", &p.base.commit, commit])
+                    .map_err(|e| refused("reading the commit the Build started from", e))?;
+                String::from_utf8_lossy(&base).trim().to_owned()
+            }
+        };
         CommitId::new(base.as_str())
             .map_err(|e| refused("reading the commit the Build started from", e))?;
         let diff = git
@@ -466,6 +473,7 @@ mod tests {
             format: Format,
             passes,
             answered_reviews: Vec::new(),
+            answering: Vec::new(),
             build: None,
         }
     }
