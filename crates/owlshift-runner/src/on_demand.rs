@@ -2631,6 +2631,43 @@ impl OnDemand<'_> {
         }
     }
 
+    /// Parks the ticket for a `premise_false` that asks no question, which
+    /// asks the decider nothing (architecture section 5, "A false premise"):
+    /// a person looks, rather than the stage running again at each pass.
+    /// `what` names the run in the PARKED comment.
+    #[allow(clippy::too_many_arguments)]
+    fn park_false_premise(
+        &self,
+        p: &mut Prepared,
+        pipeline: Pipeline,
+        state: &TicketState,
+        what: &str,
+        run: &str,
+        result: &RunResult,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let parked = match state.apply(pipeline, Event::Blocked) {
+            Ok(Transition::Parked { state, .. }) => state,
+            other => return core_error(other),
+        };
+        let detail = format!(
+            "the {what} found its premise false, with no question: {} Look, then type \
+             `owlshift continue {}`",
+            result.summary, p.ticket
+        );
+        let questions = p.questions();
+        self.park_with(
+            p,
+            &parked,
+            ParkReason::Blocked,
+            Some(run),
+            detail,
+            Some(questions),
+            Vec::new(),
+            sink,
+        )
+    }
+
     /// Keeps `state` in the ticket's ref, when the ticket has one: a ref is
     /// made only once a question round opens, a decision is kept or a Build
     /// or resolver result is refused.
@@ -3972,25 +4009,10 @@ impl OnDemand<'_> {
                 // it parks, so a person looks rather than watch running the
                 // repair again at each pass.
                 if !result.asks() {
-                    let parked = match state.apply(PIPELINE, Event::Blocked) {
-                        Ok(Transition::Parked { state, .. }) => state,
-                        other => return Err(core_error(other)),
-                    };
-                    let detail = format!(
-                        "the {} run of pull request #{} found its premise false, with no \
-                         question: {} Look, then type `owlshift continue {}`",
-                        run.what, run.pull_request, result.summary, p.ticket
+                    let what = format!("{} run of pull request #{}", run.what, run.pull_request);
+                    return Err(
+                        self.park_false_premise(p, PIPELINE, &state, &what, &ran.run, result, sink)
                     );
-                    return Err(self.park_with(
-                        p,
-                        &parked,
-                        ParkReason::Blocked,
-                        Some(&ran.run),
-                        detail,
-                        None,
-                        Vec::new(),
-                        sink,
-                    ));
                 }
                 let waiting = match state.apply(PIPELINE, Event::Questions) {
                     Ok(Transition::To(waiting)) => waiting,
