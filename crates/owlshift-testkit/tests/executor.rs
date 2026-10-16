@@ -22,8 +22,8 @@ use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_runner::agent_env::{AgentEnv, CredentialFinding};
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
-    Executor, ExecutorError, Git, Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus,
-    Outcome, RunLog, RunReport, RunSpec, Violation,
+    Executor, ExecutorError, Failure, Git, Harness, HarnessEnd, HarnessError, HarnessRun,
+    HarnessStatus, Outcome, RunLog, RunReport, RunSpec, Violation,
 };
 use owlshift_testkit::git::{GitEnv, seed};
 
@@ -436,6 +436,61 @@ impl Harness for Script {
     ) -> io::Result<HarnessEnd> {
         let run = drive_plain(child, log)?;
         Ok(HarnessEnd::new(run.exit_code, HarnessStatus::Completed))
+    }
+}
+
+/// A harness that sleeps, and whose driver stops the run itself when
+/// `stops`, then reports a failure of its own.
+struct StopsItself {
+    stops: bool,
+}
+
+impl Harness for StopsItself {
+    fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        Ok(command)
+    }
+
+    fn drive(
+        &self,
+        run: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        if self.stops {
+            run.stop.expect("a driven run has its stop").stop();
+        }
+        let run = drive_plain(child, log)?;
+        Ok(HarnessEnd::new(
+            run.exit_code,
+            HarnessStatus::Failed("stopped by its driver".to_owned()),
+        ))
+    }
+}
+
+/// OWL-319: a run its driver stopped is judged by its harness's end, even
+/// when the deadline passed first; one it did not stop timed out.
+#[test]
+fn a_run_its_driver_stopped_did_not_time_out() {
+    let bench = Bench::new();
+    // The deadline passes at once, before or while the run is driven.
+    let executor = Executor {
+        timeout: Duration::ZERO,
+        ..bench.executor.clone()
+    };
+    for stops in [true, false] {
+        let report = bench
+            .run_with(&executor, &StopsItself { stops }, &bench.brief)
+            .unwrap();
+        match (&report.outcome, stops) {
+            (Outcome::Failed(Failure::Harness(reason)), true) => {
+                assert_eq!(reason, "stopped by its driver");
+            }
+            (Outcome::Failed(Failure::TimedOut), false) => {}
+            (other, _) => panic!("stops: {stops}: {other:?}"),
+        }
+        assert!(report.elapsed < Duration::from_secs(20), "{report:?}");
     }
 }
 

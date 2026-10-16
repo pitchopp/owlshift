@@ -89,6 +89,7 @@ pub use harness::{
     SandboxNeeds,
 };
 pub use isolation::{Violation, check_worktree_link};
+pub use watch::RunStop;
 
 /// The directory of the run's own files, relative to the worktree.
 pub const RUN_DIR: &str = ".owlshift/run";
@@ -497,6 +498,7 @@ impl Executor {
             brief: &brief,
             brief_file: &brief_file,
             result_file: &result_file,
+            stop: None,
         };
         let login = needs.login;
         let inner = harness.command(&context).map_err(ExecutorError::Command)?;
@@ -576,7 +578,14 @@ impl Executor {
         let (mut child, tree, watchdog) =
             watch::spawn(&mut command, self.timeout).map_err(ExecutorError::Spawn)?;
         drop(command);
-        let driven = harness.drive(&context, &mut child, &mut log);
+        let stop = watchdog.run_stop();
+        let driving = HarnessRun {
+            stop: Some(&stop),
+            ..context
+        };
+        let driven = harness.drive(&driving, &mut child, &mut log);
+        // False when the driver stopped the run itself, even past the
+        // deadline: its harness's end says why (OWL-319).
         let timed_out = watchdog.finish();
         // Whatever the run left running is stopped before anything it wrote
         // is read, so nothing changes behind the checks. Best effort: a
