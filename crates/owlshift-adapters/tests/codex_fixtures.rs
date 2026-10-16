@@ -15,8 +15,9 @@
 //! local stand-in for the model, with the adapter's own command line; their
 //! records say how (build plan, OWL-130's entry). `apps_disabled` and its
 //! control were recorded for OWL-132 on 2026-10-16 by
-//! `owlshift-testkit/tests/codex_live.rs`, on a ChatGPT login, and
-//! `critic_tools` and its control by the same file for OWL-316.
+//! `owlshift-testkit/tests/codex_live.rs`, on a ChatGPT login,
+//! `critic_tools` and its control by the same file for OWL-316, and
+//! `critic_collaboration` by it for OWL-317.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::{Harness, Role};
 
 /// Every recording, so that one added without its checks fails here.
-const FIXTURES: [&str; 19] = [
+const FIXTURES: [&str; 20] = [
     "success",
     "write_refused",
     "nested_sandbox",
@@ -48,6 +49,7 @@ const FIXTURES: [&str; 19] = [
     "apps_disabled_control",
     "critic_tools",
     "critic_tools_control",
+    "critic_collaboration",
 ];
 
 /// The one id left in the recordings, where each thread id was.
@@ -215,8 +217,8 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
     // the adapter's command line of then, before OWL-131's two `-c` and
     // OWL-132's `--disable apps`, confined; its last message is the result
     // the runner validated. The stand-in runs of OWL-131 and the live
-    // apps-server runs of OWL-132 and the tool-list runs of OWL-316 end the
-    // same way.
+    // apps-server runs of OWL-132, the tool-list runs of OWL-316 and the
+    // sub-agent run of OWL-317 end the same way.
     for name in [
         "critic",
         "trusted_repo_mcp",
@@ -225,6 +227,7 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
         "apps_disabled_control",
         "critic_tools",
         "critic_tools_control",
+        "critic_collaboration",
     ] {
         let run = replay(name);
         let Outcome::Completed { text } = &run.outcome else {
@@ -383,6 +386,27 @@ fn a_critic_run_is_offered_only_the_tools_it_keeps() {
     // Kept because no flag removes it (OWL-316): if it is gone, the build
     // plan's decision and its open point are out of date.
     assert!(offered(&adapter, "spawn_agent"), "{adapter:?}");
+}
+
+/// OWL-317: a critic run asked to start a sub-agent, list the agents and
+/// wait for it, on the adapter's command line, reports its `wait_agent`
+/// call, the one that left an item; its `spawn_agent` call left none, the
+/// guard's documented limit (architecture section 5, "Its sub-agents"),
+/// checked here so that a release that adds one sends the reader there. No
+/// other recording reports a call.
+#[test]
+fn a_critic_run_that_waits_for_a_sub_agent_is_seen() {
+    let name = "critic_collaboration";
+    assert_eq!(recorded_argv(name), adapter_argv(Some(codex::Effort::Low)));
+    assert_eq!(replay(name).collaboration, ["wait"]);
+    let spawns: Vec<Value> = events(name)
+        .into_iter()
+        .filter(|event| event["item"]["tool"] == "spawn_agent")
+        .collect();
+    assert_eq!(spawns, Vec::<Value>::new());
+    for other in FIXTURES.into_iter().filter(|other| *other != name) {
+        assert_eq!(replay(other).collaboration, Vec::<String>::new(), "{other}");
+    }
 }
 
 /// OWL-132: on a ChatGPT login, the ChatGPT apps server offers the model

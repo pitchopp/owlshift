@@ -13,16 +13,17 @@
 //! ```
 //!
 //! One thread, since the tests share the user's login; each makes its own
-//! backup, the apps-server check's with `.apps` appended to the name and the
-//! tools check's with `.tools`. Two tests run two short critic runs each that
-//! list their tools: OWL-132's with and without `--disable apps`, OWL-316's
-//! with and without the flags in [`TOOLS_OFF`].
+//! backup, the apps-server check's with `.apps` appended to the name, the
+//! tools check's with `.tools` and the sub-agent check's with `.collab`. Two
+//! tests run two short critic runs each that list their tools: OWL-132's
+//! with and without `--disable apps`, OWL-316's with and without the flags
+//! in [`TOOLS_OFF`]. OWL-317's runs one that starts a sub-agent.
 //!
 //! With `OWLSHIFT_RECORD_CODEX=1` they also write their runs' streams as the
 //! recordings `critic`, `apps_disabled`, `apps_disabled_control`,
-//! `critic_tools` and `critic_tools_control` of `owlshift-adapters`'
-//! `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs` then checks them
-//! like the others.
+//! `critic_tools`, `critic_tools_control` and `critic_collaboration` of
+//! `owlshift-adapters`' `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs`
+//! then checks them like the others.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -169,7 +170,7 @@ impl Live {
     /// environment of OWL-130's checks (`HOME`, `PATH`, `USER`, `LANG`) and a
     /// `CODEX_HOME` of its own holding a copy of the user's login, brought
     /// back under `codex_login_kept`, as the executor does.
-    fn run_direct(&self, id: &str, cut: &[&[&str]]) -> (codex::Run, Logs) {
+    fn run_direct(&self, id: &str, cut: &[&[&str]], prompt: &str) -> (codex::Run, Logs) {
         let files = self.tmp.path().join(format!("run-{id}"));
         let home = files.join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -219,7 +220,7 @@ impl Live {
             }
         });
         let mut stdout = Vec::new();
-        let run = codex::drive(&mut child, TOOLS_PROMPT, |line| {
+        let run = codex::drive(&mut child, prompt, |line| {
             stdout.extend_from_slice(line.strip_suffix(b"\n").unwrap_or(line));
             stdout.push(b'\n');
         })
@@ -330,8 +331,8 @@ const APPS_TOOLS: [&str; 4] = [
 #[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
     let live = Live::new(".apps");
-    let (adapter, adapter_logs) = live.run_direct("LIVE-APPS", &[]);
-    let (control, control_logs) = live.run_direct("LIVE-APPS-CONTROL", &[&APPS_OFF]);
+    let (adapter, adapter_logs) = live.run_direct("LIVE-APPS", &[], TOOLS_PROMPT);
+    let (control, control_logs) = live.run_direct("LIVE-APPS-CONTROL", &[&APPS_OFF], TOOLS_PROMPT);
     if recording_asked() {
         let values = live.login_values();
         let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
@@ -390,8 +391,8 @@ const TOOLS_TURNED_OFF: [&str; 2] = ["web__run", "image_gen__imagegen"];
 #[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_live_critic_run_is_offered_only_the_tools_it_keeps() {
     let live = Live::new(".tools");
-    let (adapter, adapter_logs) = live.run_direct("LIVE-TOOLS", &[]);
-    let (control, control_logs) = live.run_direct("LIVE-TOOLS-CONTROL", &TOOLS_OFF);
+    let (adapter, adapter_logs) = live.run_direct("LIVE-TOOLS", &[], TOOLS_PROMPT);
+    let (control, control_logs) = live.run_direct("LIVE-TOOLS-CONTROL", &TOOLS_OFF, TOOLS_PROMPT);
     if recording_asked() {
         let values = live.login_values();
         let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
@@ -429,6 +430,55 @@ fn a_live_critic_run_is_offered_only_the_tools_it_keeps() {
     }
     // Kept because no flag removes it: gone, the build plan is out of date.
     assert!(offered(&adapter, "spawn_agent"), "{adapter:?}");
+}
+
+/// The prompt of OWL-317's check: the model starts a sub-agent, as a critic
+/// run may on its own, and waits for it.
+const COLLABORATION_PROMPT: &str = "Do not run any shell command. Use the spawn_agent tool \
+once, to start one sub-agent whose only task is to reply with the single word PONG. Then call \
+list_agents once, then wait for that sub-agent with wait_agent. Your last message is the result \
+JSON the output schema describes, with status `done`, no finding, and as `summary` the \
+sub-agent's reply.";
+
+/// OWL-317: a critic run asked to start a sub-agent and wait for it, with
+/// the adapter's command line, reports its `wait_agent` call, the only one
+/// of its collaboration calls that leaves an item. One run outside the
+/// executor, as OWL-132's; with `OWLSHIFT_RECORD_CODEX=1` it is recorded as
+/// `critic_collaboration` before the checks, so that a run that hangs after
+/// its wait, as two did on 2026-10-16, is kept to look at but fails here.
+#[test]
+#[ignore = "live: runs `codex exec` once on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
+fn a_live_critic_run_that_starts_a_sub_agent_is_seen() {
+    let live = Live::new(".collab");
+    let (run, logs) = live.run_direct("LIVE-COLLAB", &[], COLLABORATION_PROMPT);
+    if recording_asked() {
+        record(
+            &logs,
+            live.tmp.path(),
+            &Recording {
+                name: "critic_collaboration",
+                argv: adapter_argv(),
+                prompt: COLLABORATION_PROMPT,
+                confinement: "none: env -i with HOME, PATH, USER, LANG and CODEX_HOME",
+                setup: Some(
+                    "a scratch repository; codex exec spawned by the test with the adapter's \
+                     command line and the prompt on standard input, and a CODEX_HOME of the \
+                     run's own holding a copy of the user's ChatGPT login",
+                ),
+            },
+            &live.login_values(),
+        );
+    }
+    assert!(
+        matches!(run.outcome, codex::Outcome::Completed { .. }),
+        "{:?}",
+        run.outcome
+    );
+    assert!(
+        run.collaboration.iter().any(|tool| tool == "wait"),
+        "{:?}",
+        run.collaboration
+    );
 }
 
 /// The tool names a run's result lists as its summary, which must include
@@ -605,6 +655,32 @@ fn brief(base: String) -> Brief {
     }
 }
 
+/// `text` with every UUID-shaped substring, 8-4-4-4-12 hexadecimal digits,
+/// replaced with the placeholder `codex_fixtures.rs` checks for.
+fn without_uuids(text: &str) -> String {
+    const PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
+    let shape = |s: &[u8]| {
+        s.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+    };
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.len() - i >= 36 && shape(&bytes[i..i + 36]) {
+            out.push_str(PLACEHOLDER);
+            i += 36;
+        } else {
+            let c = text[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
 /// What a recording is named and says of its run.
 struct Recording<'a> {
     name: &'a str,
@@ -638,7 +714,8 @@ fn record(logs: &Logs, scratch: &Path, recording: &Recording<'_>, login_values: 
         for (from, to) in &replaced {
             text = text.replace(from.as_str(), to);
         }
-        text
+        // The sub-agents' thread ids too (OWL-317).
+        without_uuids(&text)
     };
     let stream: Vec<String> = fs::read_to_string(&logs.stdout)
         .unwrap()

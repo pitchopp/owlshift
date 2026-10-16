@@ -1,0 +1,7 @@
+{"thread_id":"00000000-0000-4000-8000-000000000000","type":"thread.started"}
+{"type":"turn.started"}
+{"item":{"id":"item_0","text":"I’ll start the sub-agent, list agents once, and wait for its reply.\n","type":"agent_message"},"type":"item.completed"}
+{"item":{"agents_states":{},"id":"item_1","prompt":null,"receiver_thread_ids":[],"sender_thread_id":"00000000-0000-4000-8000-000000000000","status":"in_progress","tool":"wait","type":"collab_tool_call"},"type":"item.started"}
+{"item":{"agents_states":{},"id":"item_1","prompt":null,"receiver_thread_ids":[],"sender_thread_id":"00000000-0000-4000-8000-000000000000","status":"completed","tool":"wait","type":"collab_tool_call"},"type":"item.completed"}
+{"item":{"id":"item_2","text":"{\"findings\":[],\"format\":  9, \"status\":\"done\",\"summary\":\"PONG\"}","type":"agent_message"},"type":"item.completed"}
+{"type":"turn.completed","usage":{"cache_write_input_tokens":0,"cached_input_tokens":17792,"input_tokens":36661,"output_tokens":139,"reasoning_output_tokens":0}}
