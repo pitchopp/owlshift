@@ -11,11 +11,12 @@
 //!
 //! Every CLI behaviour relied on here was checked live and is recorded in
 //! `docs/design/build-plan.md`, under checks C2 and C7 (Codex) and OWL-130's
-//! entry (OWL-131), with codex-cli 0.154.0: the flags, the stream's events,
-//! the rule that a run
+//! entry (OWL-131, OWL-132, OWL-316, OWL-317), with codex-cli 0.154.0: the
+//! flags, the stream's events, the rule that a run
 //! failed exactly when its stream ends in `turn.failed` or is empty, the
-//! usage-limit message, and the effort levels. The recordings are replayed
-//! by `tests/codex_fixtures.rs`.
+//! usage-limit message, the effort levels, and the item a collaboration
+//! tool's call leaves. The recordings are replayed by
+//! `tests/codex_fixtures.rs`.
 
 use std::fmt;
 use std::io;
@@ -52,8 +53,10 @@ pub use owlshift_contracts::result::Effort;
 ///   web search searches on the operator's account, against the design's
 ///   "without network where the harness allows it" (OWL-316, recordings
 ///   `critic_tools` and its control). The collaboration tools
-///   (`spawn_agent` and the rest) stay: neither `--disable multi_agent` nor
-///   `--disable multi_agent_v2` took them away, checked live on 2026-10-16.
+///   (`spawn_agent` and the rest) stay offered: neither
+///   `--disable multi_agent` nor `--disable multi_agent_v2` took them away,
+///   checked live on 2026-10-16. The runner refuses a run whose stream shows
+///   a call to one ([`Run::collaboration`], OWL-317).
 /// - `--ignore-rules` drops execpolicy `.rules` files: the runner injects the
 ///   project's rules in the brief (C2, "Rules").
 /// - `skills.include_instructions=false` lists no skill to the model, the
@@ -99,6 +102,12 @@ pub const LIMIT_MESSAGES: [&str; 3] = [
     "You're out of credits",
     "Usage limit reached",
 ];
+
+/// The type of the item a call to one of Codex's collaboration tools leaves
+/// in the stream. With codex-cli 0.154.0 a `wait_agent` call leaves one,
+/// with `tool` `wait`; `spawn_agent` and `list_agents` leave none (OWL-317,
+/// recording `critic_collaboration`).
+pub const COLLABORATION_ITEM: &str = "collab_tool_call";
 
 /// One critic run, as the runner asks for it.
 #[derive(Clone, Debug, PartialEq)]
@@ -247,6 +256,10 @@ pub struct Run {
     /// Tokens from `turn.completed`; `None` when the run left none. Codex
     /// reports no cost and no model in its stream (C2).
     pub usage: Option<Usage>,
+    /// The `tool` of every [`COLLABORATION_ITEM`] the stream carried, each
+    /// once, in the order first seen; `unnamed` for an item without one. The
+    /// outcome does not depend on it: the runner judges it.
+    pub collaboration: Vec<String>,
     /// Output lines that were not JSON objects.
     pub malformed_lines: usize,
     /// Output lines longer than the stream's line cap, not parsed.
@@ -320,6 +333,8 @@ pub struct Transcript {
     usage: Option<Usage>,
     /// A usage-limit message was seen in an `error` or `turn.failed` event.
     limit: bool,
+    /// See [`Run::collaboration`].
+    collaboration: Vec<String>,
     malformed_lines: usize,
     oversized_lines: usize,
 }
@@ -342,7 +357,8 @@ impl Sink for Transcript {
 
 impl Transcript {
     /// Reads one output line. Events of an unknown type are skipped; a line
-    /// that is not a JSON object is counted.
+    /// that is not a JSON object is counted. A [`COLLABORATION_ITEM`] is
+    /// noted whichever of its started, updated or completed events comes.
     pub fn feed(&mut self, line: &[u8]) {
         let event = match serde_json::from_slice::<Value>(line) {
             Ok(event) if event.is_object() => event,
@@ -353,9 +369,20 @@ impl Transcript {
             }
         };
         self.started = true;
-        match str_field(&event, "type") {
+        let kind = str_field(&event, "type");
+        let item = &event["item"];
+        if matches!(
+            kind,
+            Some("item.started" | "item.updated" | "item.completed")
+        ) && str_field(item, "type") == Some(COLLABORATION_ITEM)
+        {
+            let tool = str_field(item, "tool").unwrap_or("unnamed");
+            if !self.collaboration.iter().any(|seen| seen == tool) {
+                self.collaboration.push(tool.to_owned());
+            }
+        }
+        match kind {
             Some("item.completed") => {
-                let item = &event["item"];
                 if str_field(item, "type") == Some("agent_message") {
                     self.last_message = str_field(item, "text").map(str::to_owned);
                 }
@@ -405,6 +432,7 @@ impl Transcript {
             exit_code,
             outcome,
             usage: self.usage,
+            collaboration: self.collaboration,
             malformed_lines: self.malformed_lines,
             oversized_lines: self.oversized_lines,
             stderr,
@@ -670,6 +698,40 @@ mod tests {
             replay(&[STARTED, quoted, failed], Some(1)).outcome,
             Outcome::Failed(Failure::Error { .. })
         ));
+    }
+
+    /// OWL-317: a collaboration call is read from Codex's own items, from
+    /// any of their three events, each tool once; never from what the model
+    /// wrote. The outcome is left to the runner.
+    #[test]
+    fn a_collaboration_call_is_read_from_codex_items_only() {
+        let item = |event: &str, tool: &str| {
+            format!(
+                r#"{{"type":"{event}","item":{{"id":"item_1","type":"collab_tool_call"{tool},"status":"completed"}}}}"#
+            )
+        };
+        for event in ["item.started", "item.updated", "item.completed"] {
+            let call = item(event, r#","tool":"wait""#);
+            let run = replay(&[STARTED, &call, MESSAGE, COMPLETED], Some(0));
+            assert_eq!(run.collaboration, ["wait"], "{event}");
+            assert_eq!(run.outcome, Outcome::Completed { text: "{}".into() });
+        }
+        let (started, completed) = (
+            item("item.started", r#","tool":"wait""#),
+            item("item.completed", r#","tool":"wait""#),
+        );
+        let spawn = item("item.completed", r#","tool":"spawn_agent""#);
+        let unnamed = item("item.completed", "");
+        let run = replay(
+            &[STARTED, &started, &completed, &spawn, &unnamed, COMPLETED],
+            Some(0),
+        );
+        assert_eq!(run.collaboration, ["wait", "spawn_agent", "unnamed"]);
+
+        let named = r#"{"type":"item.completed","item":{"type":"agent_message","text":"collab_tool_call spawn_agent"}}"#;
+        let shell = r#"{"type":"item.completed","item":{"type":"command_execution","command":"spawn_agent","tool":"wait"}}"#;
+        let run = replay(&[STARTED, named, shell, COMPLETED], Some(0));
+        assert!(run.collaboration.is_empty(), "{:?}", run.collaboration);
     }
 
     #[test]

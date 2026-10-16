@@ -9,7 +9,9 @@
 //! and skills stay out, and nothing the run writes there outlives it but a
 //! refreshed login that [`codex_login_kept`] accepts. Codex cannot write
 //! `result.json`: the run's last message is the result, which the executor
-//! writes once the run is over ([`SandboxNeeds::result_in_message`]).
+//! writes once the run is over ([`SandboxNeeds::result_in_message`]). A run
+//! whose stream shows a call to one of Codex's collaboration tools is
+//! refused (OWL-317).
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -282,17 +284,42 @@ pub fn prompt_with_brief_file(prompt: &str, brief_file: &Path) -> String {
 /// What a Codex run reported, as the executor reads it. Codex names neither
 /// its version nor, by default, its model in the stream (C2): the model is
 /// the one asked for, if any.
+///
+/// A run whose stream shows a call to a collaboration tool is refused
+/// (architecture section 5, "Its sub-agents", OWL-317): completed, it fails
+/// and its last message is not used; failed, its reason names the tools
+/// too. A usage limit stays one, and the executor reads a timeout before
+/// any of this.
 fn codex_end(run: codex::Run, model: Option<&str>) -> HarnessEnd {
-    let (status, message) = match run.outcome {
-        codex::Outcome::Completed { text } => (HarnessStatus::Completed, Some(text)),
-        codex::Outcome::UsageLimit => (HarnessStatus::UsageLimit { resets_at: None }, None),
-        codex::Outcome::Failed(failure) => (HarnessStatus::Failed(describe(&failure)), None),
+    let refused =
+        (!run.collaboration.is_empty()).then(|| collaboration_refusal(&run.collaboration));
+    let (status, message) = match (run.outcome, refused) {
+        (codex::Outcome::Completed { text }, None) => (HarnessStatus::Completed, Some(text)),
+        (codex::Outcome::Completed { .. }, Some(refusal)) => (HarnessStatus::Failed(refusal), None),
+        (codex::Outcome::UsageLimit, _) => (HarnessStatus::UsageLimit { resets_at: None }, None),
+        (codex::Outcome::Failed(failure), refusal) => {
+            let mut reason = describe(&failure);
+            if let Some(refusal) = refusal {
+                reason.push_str("; ");
+                reason.push_str(&refusal);
+            }
+            (HarnessStatus::Failed(reason), None)
+        }
     };
     let mut end = HarnessEnd::new(run.exit_code, status);
     end.usage = run.usage;
     end.model = model.map(str::to_owned);
     end.message = message;
     end
+}
+
+/// Why a run that called a collaboration tool is refused, naming the tools.
+fn collaboration_refusal(tools: &[String]) -> String {
+    format!(
+        "Codex's critic called its collaboration tools ({}): sub-agents run outside the \
+         review's roster and the run's usage, so its result is refused",
+        tools.join(", ")
+    )
 }
 
 /// The most characters of Codex's failure message put in the reason.
@@ -503,6 +530,54 @@ mod tests {
         assert!(!text.contains("codex login"), "{text}");
         assert!(text.len() < 400, "{}", text.len());
         assert!(describe(&codex::Failure::NoThread).contains("standard error"));
+    }
+
+    /// OWL-317: a call to a collaboration tool refuses a completed run and
+    /// is added to a failed run's reason; a usage limit stays one, and the
+    /// usage is kept.
+    #[test]
+    fn a_critic_run_that_called_the_collaboration_tools_is_refused() {
+        let run = |outcome: codex::Outcome, tools: &[&str]| codex::Run {
+            exit_code: Some(0),
+            outcome,
+            usage: Some(owlshift_adapters::harness::Usage::default()),
+            collaboration: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            malformed_lines: 0,
+            oversized_lines: 0,
+            stderr: Vec::new(),
+        };
+        let completed = || codex::Outcome::Completed { text: "{}".into() };
+
+        let end = codex_end(run(completed(), &[]), None);
+        assert_eq!(
+            (end.status, end.message.as_deref()),
+            (HarnessStatus::Completed, Some("{}"))
+        );
+
+        let end = codex_end(run(completed(), &["wait", "spawn_agent"]), None);
+        let HarnessStatus::Failed(reason) = &end.status else {
+            panic!("{:?}", end.status);
+        };
+        assert!(
+            reason.contains("collaboration tools (wait, spawn_agent)"),
+            "{reason}"
+        );
+        assert_eq!(end.message, None);
+        assert!(end.usage.is_some());
+
+        let failed = codex::Outcome::Failed(codex::Failure::Unfinished);
+        let end = codex_end(run(failed, &["wait"]), None);
+        let HarnessStatus::Failed(reason) = &end.status else {
+            panic!("{:?}", end.status);
+        };
+        assert!(
+            reason.starts_with("Codex's stream ended without the turn's end; ")
+                && reason.contains("collaboration tools (wait)"),
+            "{reason}"
+        );
+
+        let end = codex_end(run(codex::Outcome::UsageLimit, &["wait"]), None);
+        assert_eq!(end.status, HarnessStatus::UsageLimit { resets_at: None });
     }
 
     #[test]

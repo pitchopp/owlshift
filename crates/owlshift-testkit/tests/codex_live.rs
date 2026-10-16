@@ -13,16 +13,17 @@
 //! ```
 //!
 //! One thread, since the tests share the user's login; each makes its own
-//! backup, the apps-server check's with `.apps` appended to the name and the
-//! tools check's with `.tools`. Two tests run two short critic runs each that
-//! list their tools: OWL-132's with and without `--disable apps`, OWL-316's
-//! with and without the flags in [`TOOLS_OFF`].
+//! backup, the apps-server check's with `.apps` appended to the name, the
+//! tools check's with `.tools` and the sub-agent check's with `.collab`. Two
+//! tests run two short critic runs each that list their tools: OWL-132's
+//! with and without `--disable apps`, OWL-316's with and without the flags
+//! in [`TOOLS_OFF`]. OWL-317's runs one that starts a sub-agent.
 //!
 //! With `OWLSHIFT_RECORD_CODEX=1` they also write their runs' streams as the
 //! recordings `critic`, `apps_disabled`, `apps_disabled_control`,
-//! `critic_tools` and `critic_tools_control` of `owlshift-adapters`'
-//! `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs` then checks them
-//! like the others.
+//! `critic_tools`, `critic_tools_control` and `critic_collaboration` of
+//! `owlshift-adapters`' `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs`
+//! then checks them like the others.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -432,70 +433,52 @@ fn a_live_critic_run_is_offered_only_the_tools_it_keeps() {
 }
 
 /// The prompt of OWL-317's check: the model starts a sub-agent, as a critic
-/// run may on its own.
-const COLLABORATION_PROMPT: &str = "Do not run any shell command. Call the spawn_agent tool \
+/// run may on its own, and waits for it.
+const COLLABORATION_PROMPT: &str = "Do not run any shell command. Use the spawn_agent tool \
 once, to start one sub-agent whose only task is to reply with the single word PONG. Then call \
-the wait_agent tool once, to wait for that sub-agent. Your last message is the result JSON the \
-output schema describes, with status `done`, no finding, and as `summary` a JSON object with \
-two keys: `spawn_agent`, the exact output the spawn_agent call returned to you, and \
-`wait_agent`, the exact output the wait_agent call returned to you, each `null` for a call \
-you did not make.";
+list_agents once, then wait for that sub-agent with wait_agent. Your last message is the result \
+JSON the output schema describes, with status `done`, no finding, and as `summary` the \
+sub-agent's reply.";
 
-/// The flag OWL-317 passes to refuse a critic run's sub-agents.
-const DEPTH_OFF: [&str; 2] = ["-c", "agents.max_depth=0"];
-
-/// OWL-317: a critic run asked to start a sub-agent, with the adapter's
-/// command line and without [`DEPTH_OFF`], outside the executor as OWL-132's
-/// pair; with `OWLSHIFT_RECORD_CODEX=1` they are recorded as
-/// `critic_collaboration` and `critic_collaboration_control`.
+/// OWL-317: a critic run asked to start a sub-agent and wait for it, with
+/// the adapter's command line, reports its `wait_agent` call, the only one
+/// of its collaboration calls that leaves an item. One run outside the
+/// executor, as OWL-132's; with `OWLSHIFT_RECORD_CODEX=1` it is recorded as
+/// `critic_collaboration` before the checks, so that a run that hangs after
+/// its wait, as two did on 2026-10-16, is kept to look at but fails here.
 #[test]
-#[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
+#[ignore = "live: runs `codex exec` once on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_live_critic_run_that_starts_a_sub_agent_is_seen() {
     let live = Live::new(".collab");
-    let (adapter, adapter_logs) = live.run_direct("LIVE-COLLAB", &[], COLLABORATION_PROMPT);
-    let (control, control_logs) =
-        live.run_direct("LIVE-COLLAB-CONTROL", &[&DEPTH_OFF], COLLABORATION_PROMPT);
+    let (run, logs) = live.run_direct("LIVE-COLLAB", &[], COLLABORATION_PROMPT);
     if recording_asked() {
-        let values = live.login_values();
-        let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
-                     command line (the control: without `-c agents.max_depth=0`) and the \
-                     prompt on standard input, and a CODEX_HOME of the run's own holding a \
-                     copy of the user's ChatGPT login";
-        for (logs, name, argv) in [
-            (&adapter_logs, "critic_collaboration", adapter_argv()),
-            (
-                &control_logs,
-                "critic_collaboration_control",
-                without(adapter_argv(), &DEPTH_OFF),
-            ),
-        ] {
-            record(
-                logs,
-                live.tmp.path(),
-                &Recording {
-                    name,
-                    argv,
-                    prompt: COLLABORATION_PROMPT,
-                    confinement: "none: env -i with HOME, PATH, USER, LANG and CODEX_HOME",
-                    setup: Some(setup),
-                },
-                &values,
-            );
-        }
+        record(
+            &logs,
+            live.tmp.path(),
+            &Recording {
+                name: "critic_collaboration",
+                argv: adapter_argv(),
+                prompt: COLLABORATION_PROMPT,
+                confinement: "none: env -i with HOME, PATH, USER, LANG and CODEX_HOME",
+                setup: Some(
+                    "a scratch repository; codex exec spawned by the test with the adapter's \
+                     command line and the prompt on standard input, and a CODEX_HOME of the \
+                     run's own holding a copy of the user's ChatGPT login",
+                ),
+            },
+            &live.login_values(),
+        );
     }
-    // The probe: every item the streams carried, and what the model said.
-    for (name, run, logs) in [
-        ("adapter", &adapter, &adapter_logs),
-        ("control", &control, &control_logs),
-    ] {
-        for line in fs::read_to_string(&logs.stdout).unwrap().lines() {
-            let event: serde_json::Value = serde_json::from_str(line).unwrap();
-            if event["item"]["type"] != "agent_message" {
-                eprintln!("{name}: {event}");
-            }
-        }
-        eprintln!("{name}: {:?}", run.outcome);
-    }
+    assert!(
+        matches!(run.outcome, codex::Outcome::Completed { .. }),
+        "{:?}",
+        run.outcome
+    );
+    assert!(
+        run.collaboration.iter().any(|tool| tool == "wait"),
+        "{:?}",
+        run.collaboration
+    );
 }
 
 /// The tool names a run's result lists as its summary, which must include
