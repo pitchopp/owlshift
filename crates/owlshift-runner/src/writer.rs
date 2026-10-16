@@ -58,7 +58,7 @@ use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::{QuestionId, TicketId};
+use owlshift_contracts::ids::{FindingId, QuestionId, TicketId};
 use owlshift_contracts::refs::{DeliveredPullRequest, PushKind};
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
@@ -68,6 +68,7 @@ use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{
     Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, MAX_RESOLVED_PASSES, ParkReason, Status,
 };
+use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Severity};
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
 
 use crate::executor::Git;
@@ -1411,8 +1412,8 @@ impl IntakeComment {
             sections.push(format!("**Dependencies:**\n{}", bullets(&lines)));
         }
         sections.push(
-            "In this version the verdict is recorded and shown: the Build runs as `owlshift do` \
-             runs it."
+            "The variant and the routing are followed from the ticket's dispatch; a `variant:`, \
+             `tier:` or `effort:` label on the ticket overrides them."
                 .to_owned(),
         );
         sections.push(
@@ -1426,6 +1427,337 @@ impl IntakeComment {
             .render(),
         );
         sections.join("\n\n")
+    }
+}
+
+/// What follows a PLAN comment (OWL-303).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanNext {
+    /// The review passes are over and the Build follows the plan.
+    Build,
+    /// The plan waits for the decider's approval, asked in the QUESTIONS
+    /// comment that follows.
+    Approval,
+    /// Findings the passes left go to the decider, asked in the QUESTIONS
+    /// comment that follows.
+    Findings,
+}
+
+/// A reviewer of the pass a PLAN comment reports (OWL-303).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanReviewer {
+    pub mandates: Vec<Mandate>,
+    pub harness: Harness,
+    /// The model it ran on, `None` for its harness's default.
+    pub model: Option<String>,
+    /// It stood in on Claude Code for the Codex critic.
+    pub stand_in: bool,
+    /// A reviewer on Claude Code that ran on the design run's own model, no
+    /// other one being configured.
+    pub same_model: bool,
+}
+
+/// The PLAN comment (OWL-303, architecture section 5, "Kept and shown"):
+/// once a ticket's review passes end, its plan, the reviewers of the pass
+/// that ended, the findings left and those rejected with their reasons, and
+/// what follows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanComment {
+    pub ticket: TicketId,
+    pub plan: Plan,
+    /// The review pass that ended, from 1.
+    pub pass: u32,
+    pub reviewers: Vec<PlanReviewer>,
+    /// The findings of that pass, as the ticket's review record keeps them.
+    pub findings: Vec<KeptFinding>,
+    /// Findings of the pass that stand but a round could not ask, past
+    /// [`owlshift_contracts::result::MAX_QUESTIONS`]: the pass after the round
+    /// reviews the plan whole.
+    pub not_asked: Vec<FindingId>,
+    pub next: PlanNext,
+    /// The design run that wrote the plan.
+    pub run: Option<String>,
+}
+
+/// Why a plan's text is cut in a PLAN comment.
+const PLAN_KEPT: &str = "the ticket's record keeps the whole plan";
+
+/// Why a finding's text is cut in a PLAN comment.
+const FINDING_KEPT: &str = "the ticket's review record keeps it whole";
+
+/// The most characters a finding's claim or reason keeps in a PLAN comment
+/// that does not hold whole: findings give way before the plan.
+const PLAN_FINDING_CHARS: usize = 1_000;
+
+impl PlanComment {
+    /// The comment body: the `[owlshift] PLAN` header, the plan's goal,
+    /// criteria, approach, steps with their tests, forks, alternatives,
+    /// files, risks and what is out of scope, the reviewers, the findings
+    /// left and rejected, what follows, and the footer. Every text comes
+    /// from a model, so each is flattened to one line; the comment is cut to
+    /// hold in [`MAX_COMMENT_CHARS`], the findings first.
+    pub fn render(&self) -> String {
+        let plan = &self.plan;
+        let mut texts: Vec<Fit> = Vec::new();
+        let mut push = |text: &str| texts.push(Fit::new(flatten(text), PLAN_KEPT));
+        push(&plan.goal);
+        plan.criteria.iter().for_each(|c| push(c));
+        push(&plan.approach);
+        for step in &plan.steps {
+            push(&step.what);
+            push(&step.test);
+        }
+        for fork in &plan.forks {
+            push(&fork.choice);
+            push(&fork.options.join(" / "));
+            push(&fork.reason);
+        }
+        for alternative in &plan.alternatives {
+            push(&alternative.approach);
+            push(&alternative.reason);
+        }
+        plan.files.iter().for_each(|f| push(f));
+        plan.risks.iter().for_each(|r| push(r));
+        plan.out_of_scope.iter().for_each(|o| push(o));
+        let (left, rejected) = self.sorted();
+        for (kept, _) in &left {
+            texts.push(Fit::capped(
+                flatten(&kept.finding.claim),
+                FINDING_KEPT,
+                PLAN_FINDING_CHARS,
+            ));
+        }
+        for (kept, reason) in &rejected {
+            texts.push(Fit::capped(
+                flatten(&kept.finding.claim),
+                FINDING_KEPT,
+                PLAN_FINDING_CHARS,
+            ));
+            texts.push(Fit::capped(
+                flatten(reason),
+                FINDING_KEPT,
+                PLAN_FINDING_CHARS,
+            ));
+        }
+        fitted(MAX_COMMENT_CHARS, texts, |texts| {
+            self.body(texts, &left, &rejected)
+        })
+    }
+
+    /// The findings left, each with what became of it, and those rejected,
+    /// each with its reason, in id order.
+    #[allow(clippy::type_complexity)]
+    fn sorted(&self) -> (Vec<(&KeptFinding, &'static str)>, Vec<(&KeptFinding, &str)>) {
+        let mut left = Vec::new();
+        let mut rejected = Vec::new();
+        for kept in &self.findings {
+            let reason = kept
+                .ruling
+                .as_ref()
+                .map(|ruling| ruling.reason.as_str())
+                .or(kept.response.as_ref().map(|response| response.reason.as_str()));
+            match kept.outcome {
+                Some(FindingOutcome::Rejected) => {
+                    rejected.push((kept, reason.unwrap_or_default()));
+                }
+                Some(FindingOutcome::Asked) => left.push((kept, "asked below")),
+                _ if self.not_asked.contains(&kept.finding.id) => left.push((
+                    kept,
+                    "not asked in this round, past the questions one round holds: the next pass \
+                     reviews the plan again",
+                )),
+                Some(FindingOutcome::Fixed | FindingOutcome::Proposed) => {}
+                None => left.push((kept, "noted for the Build")),
+            }
+        }
+        (left, rejected)
+    }
+
+    /// The body of `texts`, in the order [`Self::render`] gives them.
+    fn body(
+        &self,
+        texts: &[String],
+        left: &[(&KeptFinding, &'static str)],
+        rejected: &[(&KeptFinding, &str)],
+    ) -> String {
+        let plan = &self.plan;
+        let mut texts = texts.iter();
+        let mut next = || texts.next().cloned().unwrap_or_default();
+        let header = Header {
+            kind: MarkerKind::Plan,
+            round: None,
+        };
+        let mut sections = vec![header.render(), format!("**Goal.** {}", next())];
+        let criteria: Vec<String> = plan.criteria.iter().map(|_| next()).collect();
+        sections.push(format!("**Criteria.**\n{}", bullets(&criteria)));
+        sections.push(format!("**Approach.** {}", next()));
+        let steps: Vec<String> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(n, _)| format!("{}. {} Test: {}", n + 1, next(), next()))
+            .collect();
+        sections.push(format!("**Steps.**\n{}", steps.join("\n")));
+        if plan.forks.is_empty() {
+            sections.push("**Forks.** None.".to_owned());
+        } else {
+            let forks: Vec<String> = plan
+                .forks
+                .iter()
+                .enumerate()
+                .map(|(n, _)| {
+                    format!(
+                        "Fork {}: {} (options: {}). Why: {}",
+                        n + 1,
+                        next(),
+                        next(),
+                        next()
+                    )
+                })
+                .collect();
+            sections.push(format!("**Forks.**\n{}", bullets(&forks)));
+        }
+        let mut list = |title: &str, count: usize, pair: bool| {
+            if count == 0 {
+                return;
+            }
+            let lines: Vec<String> = (0..count)
+                .map(|_| {
+                    if pair {
+                        format!("{}: {}", next(), next())
+                    } else {
+                        next()
+                    }
+                })
+                .collect();
+            sections.push(format!("**{title}.**\n{}", bullets(&lines)));
+        };
+        list("Alternatives set aside", plan.alternatives.len(), true);
+        list("Files", plan.files.len(), false);
+        list("Risks", plan.risks.len(), false);
+        list("Out of scope", plan.out_of_scope.len(), false);
+        let reviewers: Vec<String> = self.reviewers.iter().map(reviewer_line).collect();
+        let mut review = format!(
+            "**Design review, pass {}.** {}",
+            self.pass,
+            if reviewers.is_empty() {
+                "No reviewer.".to_owned()
+            } else {
+                format!("Reviewers:\n{}", bullets(&reviewers))
+            }
+        );
+        if self.reviewers.iter().any(|reviewer| reviewer.stand_in) {
+            review.push_str(
+                "\nThe critic ran on Claude Code, standing in for Codex, which is not usable on \
+                 the machine that ran the review.",
+            );
+        }
+        sections.push(review);
+        if !left.is_empty() {
+            let lines: Vec<String> = left
+                .iter()
+                .map(|(kept, fate)| format!("{}: {} ({fate})", finding_label(kept), next()))
+                .collect();
+            sections.push(format!("**Findings left.**\n{}", bullets(&lines)));
+        }
+        if !rejected.is_empty() {
+            let lines: Vec<String> = rejected
+                .iter()
+                .map(|(kept, _)| {
+                    format!(
+                        "{}: {} Rejected: {}",
+                        finding_label(kept),
+                        next(),
+                        next()
+                    )
+                })
+                .collect();
+            sections.push(format!("**Findings rejected.**\n{}", bullets(&lines)));
+        }
+        sections.push(
+            match self.next {
+                PlanNext::Build => "**Next.** The Build follows this plan.",
+                PlanNext::Approval => {
+                    "**Next.** The plan waits for the decider's approval, asked below."
+                }
+                PlanNext::Findings => {
+                    "**Next.** The findings asked below go to the decider; the design runs again \
+                     with the answers."
+                }
+            }
+            .to_owned(),
+        );
+        sections.push(
+            Footer {
+                format: Format,
+                kind: MarkerKind::Plan,
+                ticket: self.ticket.clone(),
+                round: None,
+                run: self.run.clone(),
+            }
+            .render(),
+        );
+        sections.join("\n\n")
+    }
+}
+
+/// A reviewer as a PLAN comment names it: its mandates, harness and model.
+fn reviewer_line(reviewer: &PlanReviewer) -> String {
+    let mandates: Vec<&str> = reviewer.mandates.iter().map(|m| mandate_name(*m)).collect();
+    let model = reviewer
+        .model
+        .as_deref()
+        .map_or_else(|| "its default model".to_owned(), code);
+    let same = if reviewer.same_model {
+        ", the design run's own model: no other is configured"
+    } else {
+        ""
+    };
+    format!(
+        "{} on {} ({model}{same})",
+        mandates.join(" and "),
+        harness_name(reviewer.harness)
+    )
+}
+
+/// A finding's id, severity and reviewer, as a PLAN comment lists it.
+fn finding_label(kept: &KeptFinding) -> String {
+    let mandates: Vec<&str> = kept
+        .reviewer
+        .mandates
+        .iter()
+        .map(|m| mandate_name(*m))
+        .collect();
+    format!(
+        "{}, {}, {} on {}{}",
+        kept.finding.id,
+        match kept.finding.severity {
+            Severity::Blocker => "blocker",
+            Severity::Major => "major",
+            Severity::Minor => "minor",
+        },
+        mandates.join(" and "),
+        harness_name(kept.reviewer.harness),
+        if kept.reviewer.stand_in {
+            ", standing in for Codex"
+        } else {
+            ""
+        }
+    )
+}
+
+fn mandate_name(mandate: Mandate) -> &'static str {
+    match mandate {
+        Mandate::Critic => "critic",
+        Mandate::Conformance => "conformance",
+        Mandate::Debt => "debt",
+    }
+}
+
+fn harness_name(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Claude => "Claude Code",
+        Harness::Codex => "Codex",
     }
 }
 
@@ -2286,6 +2618,12 @@ impl<'a> Writer<'a> {
         self.post(&comment.ticket, &comment.render())
     }
 
+    /// Posts a PLAN comment and returns it as the tracker recorded it
+    /// (OWL-303).
+    pub fn post_plan(&self, comment: &PlanComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
     /// Posts a RESUME comment and returns it as the tracker recorded it.
     pub fn post_resume(&self, comment: &ResumeComment) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
@@ -2917,6 +3255,172 @@ Merge state reported by the forge: `CLEAN`.
             ..comment
         };
         assert!(none.render().contains("**Dependencies:** none found."));
+    }
+
+    fn plan_of(text: &str) -> Plan {
+        use owlshift_contracts::review::{Alternative, Fork, PlanStep};
+        Plan {
+            goal: format!("Greet {text}"),
+            criteria: vec!["GREETING.md says Hello.".to_owned()],
+            approach: "Write the file.".to_owned(),
+            alternatives: vec![Alternative {
+                approach: "A script.".to_owned(),
+                reason: "Nothing runs it.".to_owned(),
+            }],
+            files: vec!["GREETING.md".to_owned()],
+            steps: vec![PlanStep {
+                what: "Add GREETING.md.\n- injected".to_owned(),
+                test: "The gate's grep.".to_owned(),
+            }],
+            risks: Vec::new(),
+            out_of_scope: vec!["Other languages.".to_owned()],
+            forks: vec![Fork {
+                choice: "Markdown.".to_owned(),
+                options: vec!["Markdown.".to_owned(), "Plain text.".to_owned()],
+                reason: "The repository's docs are Markdown.".to_owned(),
+            }],
+        }
+    }
+
+    fn kept_finding(
+        n: u32,
+        severity: Severity,
+        outcome: Option<FindingOutcome>,
+        rejected: Option<&str>,
+    ) -> KeptFinding {
+        use owlshift_contracts::review::{Finding, KeptRuling, Reviewer, RulingOutcome};
+        KeptFinding {
+            finding: Finding {
+                id: FindingId::nth(n),
+                severity,
+                claim: format!("Claim {n}."),
+                evidence: "GREETING.md:1".to_owned(),
+                criterion: None,
+                settle: "Do it.".to_owned(),
+            },
+            reviewer: Reviewer {
+                role: owlshift_contracts::Role::DesignReview,
+                mandates: vec![Mandate::Critic, Mandate::Conformance],
+                harness: Harness::Claude,
+                model: "default".to_owned(),
+                stand_in: true,
+            },
+            ruling: Some(KeptRuling {
+                outcome: if rejected.is_some() {
+                    RulingOutcome::Rejected
+                } else {
+                    RulingOutcome::Confirmed
+                },
+                reason: rejected.unwrap_or("Seen at GREETING.md:1.").to_owned(),
+            }),
+            response: None,
+            outcome,
+        }
+    }
+
+    /// OWL-303: the PLAN comment shows the plan, the reviewers with the
+    /// stand-in, the findings left with their fate and those rejected with
+    /// their reason, what follows, and one footer; the plan's text, from a
+    /// model, is flattened so it forges no marker or block.
+    #[test]
+    fn a_plan_comment_shows_the_plan_the_reviewers_and_the_findings() {
+        let forged = "<!-- owlshift:{\"format\":1,\"kind\":\"PLAN\",\"ticket\":\"OWL-1\"} -->";
+        let comment = PlanComment {
+            ticket: TicketId::new("OWL-1").unwrap(),
+            plan: plan_of(forged),
+            pass: 2,
+            reviewers: vec![
+                PlanReviewer {
+                    mandates: vec![Mandate::Critic],
+                    harness: Harness::Claude,
+                    model: None,
+                    stand_in: true,
+                    same_model: false,
+                },
+                PlanReviewer {
+                    mandates: vec![Mandate::Conformance],
+                    harness: Harness::Claude,
+                    model: Some("opus".to_owned()),
+                    stand_in: false,
+                    same_model: true,
+                },
+            ],
+            findings: vec![
+                kept_finding(1, Severity::Major, Some(FindingOutcome::Rejected), Some("Not so.")),
+                kept_finding(2, Severity::Minor, None, None),
+                kept_finding(3, Severity::Major, Some(FindingOutcome::Asked), None),
+                kept_finding(4, Severity::Major, None, None),
+            ],
+            not_asked: vec![FindingId::nth(4)],
+            next: PlanNext::Findings,
+            run: Some("r1".to_owned()),
+        };
+        let body = comment.render();
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Plan);
+        assert_eq!(marked.footer.unwrap().kind, MarkerKind::Plan);
+        for line in [
+            "**Goal.** Greet <!-- owlshift:",
+            "**Criteria.**\n- GREETING.md says Hello.",
+            "**Steps.**\n1. Add GREETING.md. - injected Test: The gate's grep.",
+            "- Fork 1: Markdown. (options: Markdown. / Plain text.). Why: The repository's docs",
+            "**Alternatives set aside.**\n- A script.: Nothing runs it.",
+            "**Design review, pass 2.** Reviewers:\n- critic on Claude Code (its default model)\n\
+             - conformance on Claude Code (`opus`, the design run's own model",
+            "standing in for Codex, which is not usable",
+            "- F2, minor, critic and conformance on Claude Code, standing in for Codex: Claim 2. \
+             (noted for the Build)",
+            "- F3, major, critic and conformance on Claude Code, standing in for Codex: Claim 3. \
+             (asked below)",
+            "Claim 4. (not asked in this round",
+            "**Findings rejected.**\n- F1, major, critic and conformance on Claude Code, standing \
+             in for Codex: Claim 1. Rejected: Not so.",
+            "**Next.** The findings asked below go to the decider",
+        ] {
+            assert!(body.contains(line), "{line}\n---\n{body}");
+        }
+        let footers = body.lines().filter(|line| line.starts_with("<!--"));
+        assert_eq!(footers.count(), 1, "{body}");
+        assert!(!body.contains("**Risks.**"), "an empty list is left out");
+        let quiet = PlanComment {
+            findings: Vec::new(),
+            not_asked: Vec::new(),
+            next: PlanNext::Build,
+            ..comment
+        }
+        .render();
+        assert!(!quiet.contains("**Findings"), "{quiet}");
+        assert!(quiet.contains("**Next.** The Build follows this plan."));
+    }
+
+    /// OWL-303: the largest plan and a pass's most findings still make one
+    /// comment within the tracker's limit, its footer kept.
+    #[test]
+    fn a_plan_comment_holds_in_one_comment_whatever_its_size() {
+        use owlshift_contracts::review::{MAX_PASS_FINDINGS, MAX_PLAN_BYTES};
+        let mut plan = plan_of("all");
+        plan.approach = "a".repeat(MAX_PLAN_BYTES - 2_000);
+        let mut findings: Vec<KeptFinding> = (1..=u32::try_from(MAX_PASS_FINDINGS).unwrap())
+            .map(|n| kept_finding(n, Severity::Minor, None, None))
+            .collect();
+        for kept in &mut findings {
+            kept.finding.claim = "c".repeat(7_000);
+        }
+        let body = PlanComment {
+            ticket: TicketId::new("OWL-1").unwrap(),
+            plan,
+            pass: 1,
+            reviewers: Vec::new(),
+            findings,
+            not_asked: Vec::new(),
+            next: PlanNext::Build,
+            run: None,
+        }
+        .render();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS, "{}", chars(&body));
+        assert!(body.contains("(cut: the ticket's review record keeps it whole)"));
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.footer.unwrap().kind, MarkerKind::Plan);
     }
 
     #[test]
