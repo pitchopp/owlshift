@@ -14,13 +14,15 @@
 //!
 //! One thread, since the tests share the user's login; each makes its own
 //! backup, the apps-server check's with `.apps` appended to the name, the
-//! tools check's with `.tools` and the sub-agent check's with `.collab`. Two
-//! tests run two short critic runs each that list their tools: OWL-132's
-//! with and without `--disable apps`, OWL-316's with and without the flags
-//! in [`TOOLS_OFF`]. OWL-317's runs one that starts a sub-agent.
+//! tools check's with `.tools`, the sub-agent check's with `.collab` and the
+//! depth check's with `.depth`. Two tests run two short critic runs each that
+//! list their tools: OWL-132's with and without `--disable apps`, OWL-316's
+//! with and without the flags in [`TOOLS_OFF`]. OWL-317's runs one that
+//! starts a sub-agent; OWL-320's runs two that start one, with and without
+//! [`DEPTH_LIMIT`], and records neither.
 //!
-//! With `OWLSHIFT_RECORD_CODEX=1` they also write their runs' streams as the
-//! recordings `critic`, `apps_disabled`, `apps_disabled_control`,
+//! With `OWLSHIFT_RECORD_CODEX=1` the others also write their runs' streams
+//! as the recordings `critic`, `apps_disabled`, `apps_disabled_control`,
 //! `critic_tools`, `critic_tools_control` and `critic_collaboration` of
 //! `owlshift-adapters`' `fixtures/codex/`, scrubbed; `tests/codex_fixtures.rs`
 //! then checks them like the others.
@@ -163,14 +165,21 @@ impl Live {
         report
     }
 
-    /// Runs `codex exec` on `TOOLS_PROMPT` with the adapter's command line,
-    /// less each run of arguments in `cut`, outside the executor: through
-    /// it, the run without the flag started its turn and never ended it,
-    /// confined or not (2026-10-16, twice each). The run gets the
-    /// environment of OWL-130's checks (`HOME`, `PATH`, `USER`, `LANG`) and a
-    /// `CODEX_HOME` of its own holding a copy of the user's login, brought
-    /// back under `codex_login_kept`, as the executor does.
-    fn run_direct(&self, id: &str, cut: &[&[&str]], prompt: &str) -> (codex::Run, Logs) {
+    /// Runs `codex exec` on `prompt` with the adapter's command line, less
+    /// each run of arguments in `cut` and with each run in `add` ([`with`]),
+    /// outside the executor: through it, the run without `--disable apps`
+    /// started its turn and never ended it, confined or not (2026-10-16,
+    /// twice each). The run gets the environment of OWL-130's checks
+    /// (`HOME`, `PATH`, `USER`, `LANG`) and a `CODEX_HOME` of its own holding
+    /// a copy of the user's login, brought back under `codex_login_kept`, as
+    /// the executor does.
+    fn run_direct(
+        &self,
+        id: &str,
+        cut: &[&[&str]],
+        add: &[&[&str]],
+        prompt: &str,
+    ) -> (codex::Run, Logs) {
         let files = self.tmp.path().join(format!("run-{id}"));
         let home = files.join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -195,6 +204,9 @@ impl Live {
             .collect();
         for flags in cut {
             args = without(args, flags);
+        }
+        for flags in add {
+            args = with(args, flags);
         }
         let mut command = Command::new("codex");
         command
@@ -331,8 +343,9 @@ const APPS_TOOLS: [&str; 4] = [
 #[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_live_critic_run_is_offered_no_tool_of_the_apps_server() {
     let live = Live::new(".apps");
-    let (adapter, adapter_logs) = live.run_direct("LIVE-APPS", &[], TOOLS_PROMPT);
-    let (control, control_logs) = live.run_direct("LIVE-APPS-CONTROL", &[&APPS_OFF], TOOLS_PROMPT);
+    let (adapter, adapter_logs) = live.run_direct("LIVE-APPS", &[], &[], TOOLS_PROMPT);
+    let (control, control_logs) =
+        live.run_direct("LIVE-APPS-CONTROL", &[&APPS_OFF], &[], TOOLS_PROMPT);
     if recording_asked() {
         let values = live.login_values();
         let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
@@ -391,8 +404,9 @@ const TOOLS_TURNED_OFF: [&str; 2] = ["web__run", "image_gen__imagegen"];
 #[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_live_critic_run_is_offered_only_the_tools_it_keeps() {
     let live = Live::new(".tools");
-    let (adapter, adapter_logs) = live.run_direct("LIVE-TOOLS", &[], TOOLS_PROMPT);
-    let (control, control_logs) = live.run_direct("LIVE-TOOLS-CONTROL", &TOOLS_OFF, TOOLS_PROMPT);
+    let (adapter, adapter_logs) = live.run_direct("LIVE-TOOLS", &[], &[], TOOLS_PROMPT);
+    let (control, control_logs) =
+        live.run_direct("LIVE-TOOLS-CONTROL", &TOOLS_OFF, &[], TOOLS_PROMPT);
     if recording_asked() {
         let values = live.login_values();
         let setup = "a scratch repository; codex exec spawned by the test with the adapter's \
@@ -450,7 +464,7 @@ sub-agent's reply.";
 #[ignore = "live: runs `codex exec` once on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
 fn a_live_critic_run_that_starts_a_sub_agent_is_seen() {
     let live = Live::new(".collab");
-    let (run, logs) = live.run_direct("LIVE-COLLAB", &[], COLLABORATION_PROMPT);
+    let (run, logs) = live.run_direct("LIVE-COLLAB", &[], &[], COLLABORATION_PROMPT);
     if recording_asked() {
         record(
             &logs,
@@ -479,6 +493,293 @@ fn a_live_critic_run_that_starts_a_sub_agent_is_seen() {
         "{:?}",
         run.collaboration
     );
+}
+
+/// The flag OWL-320 tries: Codex's bound on how deep a thread may start
+/// sub-agents, the critic's thread being at depth 0.
+const DEPTH_LIMIT: [&str; 2] = ["-c", "agents.max_depth=0"];
+
+/// The prompt of OWL-320's check. The sub-agent's task is one the parent
+/// cannot do itself: Codex gives every shell command the running thread's id
+/// as `CODEX_THREAD_ID` (the 0.154.0 binary's exec environment), so only
+/// another thread writes an id other than the parent's to [`SPAWN_FILE`],
+/// which the test reads whatever the run came to, a hang after `wait`
+/// included. `fork_turns` `"none"`: in the first pair of 2026-10-16 the
+/// control's spawn failed with "collab spawn failed: no thread with id",
+/// most likely a fork looking up the parent's thread, which `--ephemeral`
+/// keeps nowhere.
+const SPAWN_PROMPT: &str = "Do not run any shell command yourself. Call the spawn_agent tool \
+once, with fork_turns set to \"none\", to start one sub-agent whose only task is to run the \
+shell command `echo \"$CODEX_THREAD_ID\" >> spawned.txt` in the current folder and then to \
+reply DONE. Then wait for that sub-agent with wait_agent. If spawn_agent returns an error, do \
+not retry and do not run the command yourself: your summary is then that error's text, word \
+for word. Your last message is the result JSON the output schema describes, with status \
+`done`, no finding, and as `summary` the sub-agent's reply.";
+
+/// The file [`SPAWN_PROMPT`]'s command appends to, in the run's folder.
+const SPAWN_FILE: &str = "spawned.txt";
+
+/// What Codex says when it refuses a call: the depth limit's message, the
+/// only one the 0.154.0 binary holds for it, found next to the spawn
+/// handlers and in no instruction the model is given; and the refusal of a
+/// tool the run does not offer, as `trusted_repo_mcp` shows for an MCP tool.
+const DEPTH_REFUSAL: &str = "Agent depth limit reached";
+const UNOFFERED_SPAWN: &str = "unsupported call: spawn_agent";
+
+/// Who did the sub-agent's task in a run of [`SPAWN_PROMPT`] (OWL-320).
+#[derive(Debug, PartialEq)]
+enum Spawn {
+    /// [`SPAWN_FILE`] or the reply holds a thread id that is not the
+    /// parent's and that was made during the run: a UUIDv7 whose time lies
+    /// between the parent's and the run's end. No model makes one up.
+    AtWork { child: String },
+    /// Codex refused the spawn: on standard error, or `relayed` when only
+    /// the model's own text carries the refusal's message.
+    Refused { relayed: bool },
+    /// Neither: the parent did the task itself, no id came back, or the
+    /// spawn failed for another reason. The pair settles nothing.
+    Unsettled(String),
+}
+
+/// Reads a run of [`SPAWN_PROMPT`]: its raw `--json` stream, its standard
+/// error, its last message when it completed, what it left in
+/// [`SPAWN_FILE`], and when it ended, in milliseconds since the Unix epoch.
+fn spawn_verdict(
+    stream: &str,
+    stderr: &str,
+    last: Option<&str>,
+    written: &str,
+    ended_ms: u64,
+) -> Spawn {
+    let events: Vec<serde_json::Value> = stream
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let Some(parent) = events
+        .iter()
+        .find(|event| event["type"] == "thread.started")
+        .and_then(|event| event["thread_id"].as_str())
+    else {
+        return Spawn::Unsettled("no thread started".into());
+    };
+    let Some(started_ms) = uuid_v7_ms(parent) else {
+        return Spawn::Unsettled(format!("the thread id {parent} is not a UUIDv7"));
+    };
+    let summary = last
+        .map(|last| {
+            serde_json::from_str::<serde_json::Value>(last)
+                .ok()
+                .and_then(|result| result["summary"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| last.to_owned())
+        })
+        .unwrap_or_default();
+    let child = uuids(written)
+        .into_iter()
+        .chain(uuids(&summary))
+        .find(|id| {
+            *id != parent && uuid_v7_ms(id).is_some_and(|ms| (started_ms..=ended_ms).contains(&ms))
+        });
+    let messages: Vec<&str> = events
+        .iter()
+        .filter(|event| event["item"]["type"] == "agent_message")
+        .filter_map(|event| event["item"]["text"].as_str())
+        .collect();
+    let machine = stderr.contains(DEPTH_REFUSAL) || stderr.contains(UNOFFERED_SPAWN);
+    let relayed =
+        summary.contains(DEPTH_REFUSAL) || messages.iter().any(|text| text.contains(DEPTH_REFUSAL));
+    match child {
+        Some(child) if machine || relayed => Spawn::Unsettled(format!(
+            "a sub-agent's id {child} and a refusal in the same run"
+        )),
+        Some(child) => Spawn::AtWork {
+            child: child.to_owned(),
+        },
+        None if machine => Spawn::Refused { relayed: false },
+        None if relayed => Spawn::Refused { relayed: true },
+        None => {
+            let itself = written.contains(parent)
+                || events.iter().any(|event| {
+                    event["item"]["type"] == "command_execution"
+                        && event["item"]["aggregated_output"]
+                            .as_str()
+                            .is_some_and(|output| output.contains(parent))
+                });
+            let errors: Vec<&str> = stderr
+                .lines()
+                .filter(|line| line.contains("ERROR"))
+                .collect();
+            Spawn::Unsettled(if itself {
+                "the parent wrote its own thread id".into()
+            } else if last.is_none() {
+                format!("the run did not complete, no sub-agent's id, no refusal: {errors:?}")
+            } else {
+                format!("no sub-agent's id and no refusal: {summary:?}, {errors:?}")
+            })
+        }
+    }
+}
+
+/// The time a UUIDv7 carries, in milliseconds since the Unix epoch: its
+/// first 48 bits. `None` for another version.
+fn uuid_v7_ms(id: &str) -> Option<u64> {
+    if id.len() != 36 || id.as_bytes()[14] != b'7' {
+        return None;
+    }
+    u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
+}
+
+/// Every UUID-shaped substring of `text`, in order.
+fn uuids(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    (0..bytes.len().saturating_sub(35))
+        .filter(|&i| uuid_at(&bytes[i..]))
+        .map(|i| &text[i..i + 36])
+        .collect()
+}
+
+/// Whether `bytes` opens with 8-4-4-4-12 hexadecimal digits.
+fn uuid_at(bytes: &[u8]) -> bool {
+    bytes.len() >= 36
+        && bytes[..36].iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+fn now_ms() -> u64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    u64::try_from(since.as_millis()).unwrap()
+}
+
+/// The verdict of a live run of [`SPAWN_PROMPT`] that ended at `ended_ms`
+/// and left `written` in [`SPAWN_FILE`], printed with the run's first event
+/// and that file for the build plan.
+fn spawn_of(id: &str, run: &codex::Run, logs: &Logs, written: &str, ended_ms: u64) -> Spawn {
+    let stream = fs::read_to_string(&logs.stdout).unwrap();
+    let last = match &run.outcome {
+        codex::Outcome::Completed { text } => Some(text.as_str()),
+        _ => None,
+    };
+    let verdict = spawn_verdict(
+        &stream,
+        &String::from_utf8_lossy(&run.stderr),
+        last,
+        written,
+        ended_ms,
+    );
+    eprintln!(
+        "{id}: {:?}, {SPAWN_FILE}: {written:?}, verdict: {verdict:?}",
+        stream.lines().next()
+    );
+    verdict
+}
+
+#[test]
+fn a_spawn_is_judged_from_codex_records() {
+    // A parent started at 0x019a_0000_0000 ms, a run ended a minute later.
+    let parent = "019a0000-0000-7000-8000-000000000001";
+    let child = "019a0000-0001-7000-8000-000000000002";
+    let later = "019b0000-0000-7000-8000-000000000003";
+    let ended = 0x019a_0000_0000_u64 + 60_000;
+    let started = format!(r#"{{"type":"thread.started","thread_id":"{parent}"}}"#);
+    let result = |summary: &str| serde_json::json!({ "summary": summary }).to_string();
+    let verdict = |stream: &str, stderr: &str, summary: &str| {
+        spawn_verdict(stream, stderr, Some(&result(summary)), "", ended)
+    };
+    let at_work = Spawn::AtWork {
+        child: child.into(),
+    };
+    assert_eq!(verdict(&started, "", child), at_work);
+    // The file is read even when the run hung after its wait.
+    let hung = |written: &str| spawn_verdict(&started, "", None, written, ended);
+    assert_eq!(hung(&format!("{child}\n")), at_work);
+    assert!(matches!(hung(&format!("{parent}\n")), Spawn::Unsettled(why) if why.contains("own")));
+    let failed = verdict(
+        &started,
+        "ERROR codex_core::tools::router: error=collab spawn failed: no thread with id",
+        "collab spawn failed",
+    );
+    assert!(matches!(failed, Spawn::Unsettled(why) if why.contains("no thread with id")));
+    assert_eq!(
+        verdict(
+            &started,
+            "ERROR codex_core: Agent depth limit reached.",
+            "none"
+        ),
+        Spawn::Refused { relayed: false }
+    );
+    assert_eq!(
+        verdict(
+            &started,
+            "",
+            "Agent depth limit reached. Solve the task yourself."
+        ),
+        Spawn::Refused { relayed: true }
+    );
+    let echoed = format!(
+        "{started}\n{}",
+        serde_json::json!({
+            "type": "item.completed",
+            "item": { "type": "command_execution", "aggregated_output": format!("{parent}\n") },
+        })
+    );
+    assert!(matches!(verdict(&echoed, "", parent), Spawn::Unsettled(_)));
+    // An id made after the run, or none at all, is no sub-agent.
+    assert!(matches!(verdict(&started, "", later), Spawn::Unsettled(_)));
+    assert!(matches!(hung(""), Spawn::Unsettled(_)));
+    assert_eq!(uuid_v7_ms(parent), Some(0x019a_0000_0000));
+    assert_eq!(uuid_v7_ms("019a0000-0000-4000-8000-000000000001"), None);
+}
+
+/// OWL-320: `-c agents.max_depth=0` does not make Codex refuse a critic's
+/// `spawn_agent`, checked live on 2026-10-16. Two runs of [`SPAWN_PROMPT`]
+/// outside the executor, as OWL-132's: the probe on the adapter's command
+/// line with [`DEPTH_LIMIT`], the control without it, each in a folder
+/// without [`SPAWN_FILE`]. The control must show a sub-agent at work, or the
+/// probe settles nothing; the probe showed one too ([`spawn_verdict`]), so
+/// the adapter does not pass the flag. A release where the probe stops
+/// showing one fails here and sends the reader to the build plan (OWL-317's
+/// entry). Both runs hung after their wait on 2026-10-16, so the test takes
+/// the watchdog's ten minutes; the runs are not recorded, a hung stream
+/// being no fixture.
+#[test]
+#[ignore = "live: runs `codex exec` twice on your Codex login; set OWLSHIFT_LIVE_CODEX=1"]
+fn a_depth_limit_of_zero_does_not_stop_a_live_critic_run_from_starting_a_sub_agent() {
+    let live = Live::new(".depth");
+    let file = live.main.join(SPAWN_FILE);
+    // Each run starts without the file and leaves it to be read.
+    let spawn_run = |id: &str, add: &[&[&str]]| {
+        let _ = fs::remove_file(&file);
+        let (run, logs) = live.run_direct(id, &[], add, SPAWN_PROMPT);
+        let ended = now_ms();
+        let written = fs::read_to_string(&file).unwrap_or_default();
+        (run, logs, written, ended)
+    };
+    let (probe, probe_logs, probe_written, probe_ended) = spawn_run("LIVE-DEPTH", &[&DEPTH_LIMIT]);
+    let (control, control_logs, control_written, control_ended) =
+        spawn_run("LIVE-DEPTH-CONTROL", &[]);
+    let probe = spawn_of(
+        "LIVE-DEPTH",
+        &probe,
+        &probe_logs,
+        &probe_written,
+        probe_ended,
+    );
+    let control = spawn_of(
+        "LIVE-DEPTH-CONTROL",
+        &control,
+        &control_logs,
+        &control_written,
+        control_ended,
+    );
+    assert!(
+        matches!(control, Spawn::AtWork { .. }),
+        "the control shows no sub-agent at work, so the probe settles nothing: {control:?}"
+    );
+    // Not refused on 2026-10-16: refused, the build plan is out of date.
+    assert!(matches!(probe, Spawn::AtWork { .. }), "{probe:?}");
 }
 
 /// The tool names a run's result lists as its summary, which must include
@@ -546,6 +847,17 @@ fn without(mut args: Vec<String>, cut: &[&str]) -> Vec<String> {
         .position(|run| run == cut)
         .unwrap_or_else(|| panic!("the adapter does not pass {cut:?}"));
     args.drain(at..at + cut.len());
+    args
+}
+
+/// `args` with the run of arguments `add` right before `--output-schema`,
+/// where the adapter's own flags end.
+fn with(mut args: Vec<String>, add: &[&str]) -> Vec<String> {
+    let at = args
+        .iter()
+        .position(|arg| arg == "--output-schema")
+        .expect("the adapter passes --output-schema");
+    args.splice(at..at, add.iter().map(|arg| (*arg).to_owned()));
     args
 }
 
@@ -659,17 +971,11 @@ fn brief(base: String) -> Brief {
 /// replaced with the placeholder `codex_fixtures.rs` checks for.
 fn without_uuids(text: &str) -> String {
     const PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
-    let shape = |s: &[u8]| {
-        s.iter().enumerate().all(|(i, c)| match i {
-            8 | 13 | 18 | 23 => *c == b'-',
-            _ => c.is_ascii_hexdigit(),
-        })
-    };
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes.len() - i >= 36 && shape(&bytes[i..i + 36]) {
+        if uuid_at(&bytes[i..]) {
             out.push_str(PLACEHOLDER);
             i += 36;
         } else {
