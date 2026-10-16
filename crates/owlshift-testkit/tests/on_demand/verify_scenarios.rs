@@ -164,6 +164,59 @@ fn a_trivial_ticket_is_verified_before_its_pull_request_opens() {
     }
 }
 
+/// OWL-321: `[roles.verify]` is accepted, and its file reaches the brief of
+/// the Verify reviewer after `stack.rules`, and no other role's.
+#[test]
+fn the_verify_roles_rules_reach_the_verify_brief_alone() {
+    let bench = Bench::verifying(false);
+    let checkout = &bench.remote.checkout;
+    fs::create_dir_all(checkout.join("docs/roles")).unwrap();
+    fs::write(
+        checkout.join("docs/roles/verify.md"),
+        "Read the diff twice.\n",
+    )
+    .unwrap();
+    let mut config = fs::read_to_string(checkout.join("owlshift.toml")).unwrap();
+    config.push_str("[roles.verify]\nrules = [\"docs/roles/verify.md\"]\n");
+    fs::write(checkout.join("owlshift.toml"), config).unwrap();
+    bench
+        .env
+        .run(checkout, &["add", "owlshift.toml", "docs/roles"])
+        .unwrap();
+    bench
+        .env
+        .run(
+            checkout,
+            &["commit", "--quiet", "-m", "Name the verify rules"],
+        )
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.run_roles(), [Role::Build, Role::Verify]);
+    let sources = |role| -> Vec<String> {
+        bench
+            .last_of(role)
+            .rules
+            .iter()
+            .map(|rule| rule.source.clone())
+            .collect()
+    };
+    assert_eq!(sources(Role::Build), ["AGENTS.md"]);
+    assert_eq!(sources(Role::Verify), ["AGENTS.md", "docs/roles/verify.md"]);
+    assert_eq!(
+        bench.last_of(Role::Verify).rules[1].text,
+        "Read the diff twice.\n"
+    );
+}
+
 /// With Codex, the critic runs on it on the standard tier; the arbiter,
 /// given the diff, confirms one finding and rejects the other; the Verify
 /// fix run gets the confirmed one alone, without the diff, and the second

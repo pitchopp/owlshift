@@ -48,7 +48,7 @@ pub struct ProjectConfig {
     pub zones: BTreeMap<String, ZoneSettings>,
     /// Settings per role (OWL-312), keyed by the role's name as its prompt
     /// file is (`build`, `resolver`, `intake`, `design`, `design_review`,
-    /// `arbiter`): rules added to that role's brief alone. Only a role whose
+    /// `verify`, `arbiter`): rules added to that role's brief alone. Only a role whose
     /// brief carries rules is accepted ([`RULE_ROLES`]). A file using it
     /// requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -70,15 +70,16 @@ pub struct RoleSettings {
 
 /// The roles whose brief carries rules, and so accept `[roles.<role>]`.
 /// Each role the quality pipeline adds joins this list as it is built: the
-/// design, design review and arbiter roles did with OWL-318, `verify` joins
-/// with OWL-304; `answer_check` never does, since it judges
-/// the decider's answers from the brief alone.
-pub const RULE_ROLES: [Role; 6] = [
+/// design, design review and arbiter roles did with OWL-318 and `verify`
+/// with OWL-321; `answer_check` never does, since it judges the decider's
+/// answers from the brief alone.
+pub const RULE_ROLES: [Role; 7] = [
     Role::Build,
     Role::Resolver,
     Role::Intake,
     Role::Design,
     Role::DesignReview,
+    Role::Verify,
     Role::Arbiter,
 ];
 
@@ -1250,6 +1251,7 @@ mod tests {
                     [roles.intake]\nrules = [\"docs/zones.md\"]\n\
                     [roles.design]\nrules = [\"docs/design.md\"]\n\
                     [roles.design_review]\nrules = [\"docs/review.md\"]\n\
+                    [roles.verify]\nrules = [\"docs/verify.md\"]\n\
                     [roles.arbiter]\nrules = [\"docs/arbiter.md\"]";
         let named = project("", tail).unwrap();
         assert_eq!(
@@ -1263,6 +1265,7 @@ mod tests {
             named.role_rule_files(Role::DesignReview),
             ["docs/review.md"]
         );
+        assert_eq!(named.role_rule_files(Role::Verify), ["docs/verify.md"]);
         assert_eq!(named.role_rule_files(Role::Arbiter), ["docs/arbiter.md"]);
         assert_eq!(ProjectConfig::parse(&named.render()).unwrap(), named);
 
@@ -1288,13 +1291,7 @@ mod tests {
                 "",
                 "[roles.bulid]\nrules = [\"a.md\"]",
                 "roles.bulid.rules: `bulid` is not a role whose brief carries rules \
-                 (a role joins as it is built); the roles that do: build, resolver, intake, design, design_review, arbiter",
-            ),
-            (
-                "a role not built yet",
-                "",
-                "[roles.verify]\nrules = [\"a.md\"]",
-                "roles.verify.rules: `verify` is not a role whose brief carries rules",
+                 (a role joins as it is built); the roles that do: build, resolver, intake, design, design_review, verify, arbiter",
             ),
             (
                 "a path that climbs",
