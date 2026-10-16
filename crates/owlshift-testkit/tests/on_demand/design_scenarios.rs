@@ -311,6 +311,80 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
     assert_eq!(ruling["rejected"], json!(["F2"]));
 }
 
+/// OWL-318: `[roles.design]`, `[roles.design_review]` and `[roles.arbiter]`
+/// are accepted, and each file reaches the brief of its role after
+/// `stack.rules`, and no other role's.
+#[test]
+fn the_design_roles_rules_reach_their_own_briefs() {
+    let bench = Bench::of("standard", true);
+    let checkout = &bench.remote.checkout;
+    let files = [
+        ("design", "Plan in small steps.\n"),
+        ("design_review", "Check the plan against the zones.\n"),
+        ("arbiter", "Rule on severity alone.\n"),
+    ];
+    let mut config = fs::read_to_string(checkout.join("owlshift.toml")).unwrap();
+    for (role, text) in files {
+        fs::create_dir_all(checkout.join("docs/roles")).unwrap();
+        fs::write(checkout.join(format!("docs/roles/{role}.md")), text).unwrap();
+        config.push_str(&format!(
+            "[roles.{role}]\nrules = [\"docs/roles/{role}.md\"]\n"
+        ));
+    }
+    fs::write(checkout.join("owlshift.toml"), config).unwrap();
+    bench
+        .env
+        .run(checkout, &["add", "owlshift.toml", "docs/roles"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["commit", "--quiet", "-m", "Name role rules"])
+        .unwrap();
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "main"])
+        .unwrap();
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[(
+            "major",
+            "Step 1's test does not check the word.",
+        )])),
+        bench.read(&reviewed(&[])),
+        bench.read(&ruled(&["confirmed"])),
+        bench.read(&designed(REVISED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = bench.briefs();
+    let mut seen = Vec::new();
+    for brief in &briefs {
+        let sources: Vec<&str> = brief.rules.iter().map(|r| r.source.as_str()).collect();
+        let own = match brief.role {
+            Role::Design => Some("design"),
+            Role::DesignReview => Some("design_review"),
+            Role::Arbiter => Some("arbiter"),
+            _ => None,
+        };
+        match own {
+            Some(role) => {
+                let file = format!("docs/roles/{role}.md");
+                assert_eq!(sources, ["AGENTS.md", file.as_str()], "{:?}", brief.role);
+                let text = files.iter().find(|(name, _)| *name == role).unwrap().1;
+                assert_eq!(brief.rules[1].text, text);
+                if !seen.contains(&role) {
+                    seen.push(role);
+                }
+            }
+            None => assert_eq!(sources, ["AGENTS.md"], "{:?}", brief.role),
+        }
+    }
+    assert_eq!(seen, ["design", "design_review", "arbiter"]);
+}
+
 /// `pipeline.findings = "author"`: no arbiter runs; the next design run
 /// answers every finding, a result that leaves one unanswered being refused
 /// as a failed run, and its rejection is kept and shown.
