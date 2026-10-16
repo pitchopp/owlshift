@@ -49,7 +49,7 @@ brief_result_refusal = "ask each of these choices as a question"
 author = "owlshift"
 first_line = "[owlshift] QUESTIONS · round 1"
 contains = [
-  "**Q1** (scope) Should the example show every key with comments, or only the required ones?",
-  "**Q2** (docs) Where should the README list the example?",
+  "### Q1 · Should the example show every key with comments, or only the required ones?",
+  "### Q2 · Where should the README list the example?",
 ]
 lacks = ["Owlshift decided"]

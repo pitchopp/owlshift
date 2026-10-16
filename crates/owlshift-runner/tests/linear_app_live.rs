@@ -17,8 +17,9 @@
 //!    the decider of this check;
 //! 2. opens the tracker as `owlshift do` does (`owlshift_runner::tracker::
 //!    linear`): the app's token is requested and checked;
-//! 3. posts a QUESTIONS comment through the Writer, mentioning the decider,
-//!    and reads it back through the tracker;
+//! 3. posts a QUESTIONS comment through the Writer, mentioning the decider
+//!    at the end of its header line (OWL-324), and reads it back through
+//!    the tracker;
 //! 4. moves the issue's stage through the tracker;
 //! 5. requests two more tokens with the same scopes, revokes one, and checks
 //!    the other still answers;
@@ -44,7 +45,9 @@ use owlshift_adapters::tracker::{Author, Tracker};
 use owlshift_contracts::brief::{MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES};
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::ids::{QuestionId, TicketId};
-use owlshift_contracts::result::{MAX_QUESTIONS, Question, RefusedChoice};
+use owlshift_contracts::result::{
+    MAX_QUESTIONS, Question, QuestionOption, Recommendation, RefusedChoice,
+};
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::secrets::TrackerAccounts;
 use owlshift_runner::tracker::{
@@ -214,8 +217,11 @@ fn a_question_round_through_the_app_reaches_its_decider() {
             context: "Nothing to decide: this checks how Linear tells you of a question."
                 .to_owned(),
             text: "Did Linear notify you of this comment?".to_owned(),
-            options: Vec::new(),
-            recommendation: None,
+            options: vec![QuestionOption::new("Yes"), QuestionOption::new("No")],
+            recommendation: Some(Recommendation {
+                option: Some("A".to_owned()),
+                why: "The header line mentions you.".to_owned(),
+            }),
             replan: false,
         }],
         premise_false: false,
@@ -248,10 +254,10 @@ fn a_question_round_through_the_app_reaches_its_decider() {
         "comment marked QUESTIONS: {}",
         marked.header.kind == MarkerKind::Questions
     );
-    let mentions = back
-        .body
-        .contains("\n\nWaiting for https://linear.app/owlshift/profiles/");
-    println!("comment mentions the decider's profile link: {mentions}");
+    let mentions = back.body.lines().next().is_some_and(|header| {
+        header.starts_with("[owlshift] QUESTIONS · round 1 · https://linear.app/owlshift/profiles/")
+    });
+    println!("comment's header line mentions the decider's profile link: {mentions}");
     let author = query(
         &key,
         "query A($id: String!) { comment(id: $id) { user { id app } } }",
@@ -307,7 +313,7 @@ fn a_question_round_through_the_app_reaches_its_decider() {
     assert!(matches!(back.author, Author::Other { .. }));
     assert_eq!(back.body, posted.body, "Linear did not keep the body");
     assert_eq!(marked.header.kind, MarkerKind::Questions);
-    assert!(mentions, "no mention line");
+    assert!(mentions, "no mention on the header line");
     assert_eq!(author["comment"]["user"]["app"], true);
     assert_eq!((kept, gone), (200, 401));
     assert!(mentioned, "no issueCommentMention from the app user");
@@ -330,9 +336,21 @@ fn maximal_round(ticket: TicketId) -> QuestionsComment {
                 id: QuestionId::new(format!("Q{n}")).unwrap(),
                 category: "scope".to_owned(),
                 context: "c".repeat(980),
-                text: format!("Which {n}? {}", "t".repeat(900)),
-                options: vec!["o".repeat(20), "p".repeat(20)],
-                recommendation: Some("r".repeat(20)),
+                text: format!("Which {n}? {}", "t".repeat(600)),
+                options: vec![
+                    QuestionOption {
+                        label: "o".repeat(20),
+                        detail: Some("d".repeat(100)),
+                    },
+                    QuestionOption {
+                        label: "p".repeat(20),
+                        detail: Some("e".repeat(100)),
+                    },
+                ],
+                recommendation: Some(Recommendation {
+                    option: Some("B".to_owned()),
+                    why: "r".repeat(20),
+                }),
                 replan: false,
             })
             .collect(),
@@ -445,10 +463,10 @@ fn a_maximal_question_round_reaches_linear_in_parts() {
     cleanup.comments.extend(parts.iter().map(|c| c.id.clone()));
     let posted = posted.unwrap_or_else(|e| panic!("{e}"));
     let mention = tracker.mention(&decider).unwrap().unwrap();
-    let room = MAX_COMMENT_CHARS - format!("Waiting for {mention}").chars().count() - 2;
+    let room = MAX_COMMENT_CHARS - format!(" · {mention}").chars().count();
     let mut expected = round.parts(room);
     let last = expected.len() - 1;
-    expected[last] = expected[last].replacen("\n\n", &format!("\n\nWaiting for {mention}\n\n"), 1);
+    expected[last] = expected[last].replacen('\n', &format!(" · {mention}\n"), 1);
     let sizes: Vec<usize> = parts.iter().map(|c| c.body.chars().count()).collect();
     println!(
         "round of {whole} characters posted in {} parts: {sizes:?}",

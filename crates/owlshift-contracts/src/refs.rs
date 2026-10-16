@@ -533,6 +533,26 @@ impl LegacyBuildRefusal {
     }
 }
 
+/// A question as formats 2 to 11 kept it, given the shape of format 12
+/// (OWL-324): each option, a string, becomes an option of that label; the
+/// recommendation, a string, becomes its `why`, naming no option, since a
+/// free text cannot be told to mean one. Anything else is left as it is,
+/// for the strict parse to judge.
+fn upgrade_question(question: &mut serde_json::Value) {
+    if let Some(options) = question.get_mut("options").and_then(|o| o.as_array_mut()) {
+        for option in options {
+            if let Some(label) = option.as_str() {
+                *option = serde_json::json!({ "label": label });
+            }
+        }
+    }
+    if let Some(recommendation) = question.get_mut("recommendation")
+        && let Some(why) = recommendation.as_str()
+    {
+        *recommendation = serde_json::json!({ "why": why });
+    }
+}
+
 /// Why a kept refusal reason is refused: blank, or past the cap.
 fn reason_flaw(reason: &str) -> Option<&'static str> {
     if reason.trim().is_empty() {
@@ -690,12 +710,14 @@ impl TicketQuestions {
     /// format-7 one, written before every refused list was kept (OWL-195),
     /// and a format-8 one, written before the refused choices were typed
     /// (OWL-198), a format-9 one, written before a decision kept its
-    /// reversal (OWL-146), and a format-10 one, written before a question
-    /// kept its `replan` (OWL-300), are read as the current format with what
-    /// they lack
-    /// empty, a format-6 or 7 Build refusal upgraded
-    /// (`LegacyBuildRefusal::upgrade`) and a format-8 one's lists kept as
-    /// text, and the next write gives them the current format.
+    /// reversal (OWL-146), a format-10 one, written before a question
+    /// kept its `replan` (OWL-300), and a format-11 one, written before a
+    /// question's options and recommendation were structured (OWL-324), are
+    /// read as the current format with what they lack empty, a format-6 or 7
+    /// Build refusal upgraded (`LegacyBuildRefusal::upgrade`), a format-8
+    /// one's lists kept as text, and every question's options and
+    /// recommendation upgraded (`upgrade_question`), and the next write
+    /// gives them the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -705,16 +727,18 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 10 document read as the current format, or `None` for
+    /// A format-2 to 11 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
     /// in their own shape, format 9 adds the typed choices to it, format 10
-    /// a decision's reversal, and format 11 a question's `replan`.
+    /// a decision's reversal, format 11 a question's `replan`, and format 12
+    /// reshaped a question's options and recommendation, which every older
+    /// format keeps as strings.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=10).contains(&format) {
+        if !(2..=11).contains(&format) {
             return None;
         }
         let asked = document["asks"]
@@ -727,9 +751,10 @@ impl TicketQuestions {
             .into_iter()
             .flatten()
             .map(|decision| &decision["question"]);
-        let replan = asked
-            .chain(decided)
-            .any(|question| question.get("replan").is_some());
+        let replan = format <= 10
+            && asked
+                .chain(decided)
+                .any(|question| question.get("replan").is_some());
         let typed = format <= 8
             && document["build_refusal"]
                 .as_object()
@@ -790,6 +815,20 @@ impl TicketQuestions {
                 )));
             };
             *kept = serde_json::to_value(upgraded).expect("a Build refusal serializes");
+        }
+        if let Some(asks) = document.get_mut("asks").and_then(|a| a.as_array_mut()) {
+            for ask in asks {
+                if let Some(questions) = ask.get_mut("questions").and_then(|q| q.as_array_mut()) {
+                    questions.iter_mut().for_each(upgrade_question);
+                }
+            }
+        }
+        if let Some(decisions) = document.get_mut("decisions").and_then(|d| d.as_array_mut()) {
+            for decision in decisions {
+                if let Some(question) = decision.get_mut("question") {
+                    upgrade_question(question);
+                }
+            }
         }
         document["format"] = QUESTIONS_FORMAT.into();
         Some(

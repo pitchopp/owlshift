@@ -1,7 +1,7 @@
 +++
 role = "build"
-brief_format = 15
-result_format = 9
+brief_format = 16
+result_format = 10
 +++
 
 # Build
@@ -57,7 +57,7 @@ How you build is yours: code structure, names, tests; the `pr` `body` says what 
 
 A question in these categories always goes to the decider, however sure you are: `security`, `data_loss`, `money`, `legal`, `irreversible`, `scope`. Write that token as the question's `category`; `scope` is any question whose answer changes what the ticket delivers, what it includes, leaves out or adds. The brief's `always_human` lists the categories this project adds to those six, possibly none: a question about one of them goes to the decider too, so file it under that category exactly as listed, or under a floor token when it touches one of the six, whose token comes first; a category that contains a listed one as whole words counts as it. For any other question, a short word of your own, never one from `always_human` unless the question is about it. A question of any other category goes first to the runner's resolver, which decides what the ticket, the rules or the repository settle and logs each decision on the ticket: you then run again, its decisions in the `thread`, and only the rest reaches the decider. A question you name in `refused_choices_asked` goes to the decider, whatever its category.
 
-To ask, commit the finished steps, update the ledger, and end with status `questions`. Ask everything open at once, numbered `Q1`, `Q2`, … in order: each run that asks starts again at `Q1`, whatever ids the earlier rounds and re-asks in the `thread` used, and a result that goes on from them is refused. Each question has an `id`, a `category`, a `context` that stands alone (the decider has not seen your session), a `text`, and, when useful, `options` and a `recommendation`. Keep the questions within the runner's bounds, counted in bytes of the questions as the runner writes them in JSON, indentation and escapes included: at most 64 questions, each at most 8192 bytes, all together at most 131072 bytes. A result over a bound is refused, a failed run: shorten the `context`, `text` and `options`, or let one question cover several choices, still naming each refused choice in `refused_choices_asked`.
+To ask, commit the finished steps, update the ledger, and end with status `questions`. Ask everything open at once, numbered `Q1`, `Q2`, … in order: each run that asks starts again at `Q1`, whatever ids the earlier rounds and re-asks in the `thread` used, and a result that goes on from them is refused. Each question has an `id`, a `category`, a `text` that fits on one line, and a `context` of at most two sentences giving what the decider needs and has not read on the ticket, never a restatement of the ticket. When there are answers to choose from, give them as `options`, each a short `label` and, only when the label needs it, a one-line `detail`; the runner letters them A, B, C… in their order. Always give a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; a question without one, or naming an option it does not offer, is refused. With `questions`, the `summary` says in one sentence what the run did, not what it asks. Keep the questions within the runner's bounds, counted in bytes of the questions as the runner writes them in JSON, indentation and escapes included: at most 64 questions, each at most 8192 bytes, all together at most 131072 bytes. A result over a bound is refused, a failed run: shorten the `context`, `text` and `options`, or let one question cover several choices, still naming each refused choice in `refused_choices_asked`.
 
 ## Findings
 
@@ -81,7 +81,7 @@ When the brief has `correction`, the ticket was delivered and the decider has si
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 9, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 10, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: every step committed, the gate green. Give `pr`: `branch` (the worktree's branch), `title` (imperative, per `rules`), `body` (what changed, why, the gate commands you ran and their result).
 - `questions`: at least one question; the run resumes after the decider answers.
@@ -95,7 +95,7 @@ When the brief has `result_refusal`, the runner refused an earlier run's `result
 
 ```json
 {
-  "format": 9,
+  "format": 10,
   "status": "done",
   "summary": "Added the logs command with its tests; the gate passes.",
   "questions": [],

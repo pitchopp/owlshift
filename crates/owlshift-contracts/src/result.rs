@@ -65,7 +65,10 @@ pub const MAX_QUESTIONS: usize = 64;
 /// The result of one run, written by the role as `result.json`.
 ///
 /// Beyond this schema, the runner also requires question ids to be Q1, Q2, …
-/// Qn in order; verdicts in increasing question order, each with a reason
+/// Qn in order; on each question, options with a label that is not blank
+/// and a recommendation whose `why` is not blank and which names, by its
+/// capital letter, an option the question offers, or none when it offers
+/// none (OWL-324); verdicts in increasing question order, each with a reason
 /// that is not only whitespace and, on a counter-question and nowhere else,
 /// a reply that is not either; resolutions in increasing question order; and,
 /// against the run's brief, verdicts from the answer check only, covering
@@ -266,20 +269,97 @@ pub enum Status {
 #[serde(deny_unknown_fields)]
 pub struct Question {
     pub id: QuestionId,
-    /// What the question is about, such as `scope` or `security`.
+    /// What the question is about, such as `scope` or `security`: what the
+    /// runner routes it by. No comment shows it (OWL-324).
     pub category: String,
-    /// What the reader needs to know to answer.
+    /// What the reader needs to know to answer: at most two sentences, not
+    /// restating the ticket.
     pub context: String,
+    /// The question itself, on one line.
     pub text: String,
+    /// The answers to choose from, which the runner letters A, B, C… in
+    /// this order (format 10, OWL-324: [`option_letter`]).
     #[serde(default)]
-    pub options: Vec<String>,
+    pub options: Vec<QuestionOption>,
+    /// The answer the asking run recommends: required in `result.json`
+    /// (format 10, OWL-324), where the runner refuses a question without
+    /// one; absent only from a question a ticket ref kept before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recommendation: Option<String>,
+    pub recommendation: Option<Recommendation>,
     /// The Build cannot follow its plan, and asks how (format 9, OWL-300):
     /// once answered or decided, the ticket goes back to Design. Only on a
     /// build run's question.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replan: bool,
+}
+
+/// One answer a question offers (format 10, OWL-324): a short label, and
+/// at most one line of detail when the label needs it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionOption {
+    /// A few words, not blank.
+    #[schemars(regex(pattern = r"\S"))]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl QuestionOption {
+    /// An option with a label alone.
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: None,
+        }
+    }
+}
+
+/// The answer the asking run recommends (format 10, OWL-324): with
+/// options, the letter of one of them and why; without, the proposed
+/// answer itself as `why`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Recommendation {
+    /// The letter of the recommended option, as the runner letters them
+    /// ([`option_letter`]): required when the question has options, refused
+    /// when it has none. A recommendation a ticket ref kept before format
+    /// 10 has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^[A-Z]+$"))]
+    pub option: Option<String>,
+    /// Why that option, or, without options, the proposed answer; not
+    /// blank.
+    #[schemars(regex(pattern = r"\S"))]
+    pub why: String,
+}
+
+/// The letter of the option at `index` from 0, as the runner shows it: A to
+/// Z, then AA, AB… as spreadsheet columns go.
+pub fn option_letter(index: usize) -> String {
+    let mut letters = Vec::new();
+    let mut n = index + 1;
+    while n > 0 {
+        let rem = (n - 1) % 26;
+        letters.push(char::from(b'A' + u8::try_from(rem).expect("below 26")));
+        n = (n - 1) / 26;
+    }
+    letters.iter().rev().collect()
+}
+
+/// The place, from 0, of the option of `options` lettered `letter`
+/// ([`option_letter`]), compared as written: a lowercase letter names none.
+pub fn option_index(options: &[QuestionOption], letter: &str) -> Option<usize> {
+    (0..options.len()).find(|&index| option_letter(index) == letter)
+}
+
+impl Question {
+    /// The place, from 0, of the option its recommendation names, when it
+    /// names one that exists.
+    pub fn recommended_option(&self) -> Option<usize> {
+        let letter = self.recommendation.as_ref()?.option.as_deref()?;
+        option_index(&self.options, letter)
+    }
 }
 
 /// The answer check's verdict on one question: how the decider's answers
@@ -456,6 +536,7 @@ impl RunResult {
     /// Checks the rules the types alone do not carry.
     pub fn validate(&self) -> Result<(), ContractError> {
         check_question_order(CONTRACT, &self.questions)?;
+        check_options(&self.questions)?;
         check_questions_size(&self.questions)?;
         if self.status == Status::Questions && self.questions.is_empty() {
             return Err(ContractError::invalid(
@@ -1156,6 +1237,62 @@ fn check_questions_size(questions: &[Question]) -> Result<(), ContractError> {
     Ok(())
 }
 
+/// Every question of a result offers options with a label and recommends
+/// an answer (format 10, OWL-324): with options, the capital letter of one
+/// of them, as the runner letters them; without, the proposed answer alone.
+/// Each reason names the question and what to write, for the retry.
+fn check_options(questions: &[Question]) -> Result<(), ContractError> {
+    for question in questions {
+        let id = &question.id;
+        let refused = |why: String| Err(ContractError::invalid(CONTRACT, format!("{id} {why}")));
+        if let Some(n) = question
+            .options
+            .iter()
+            .position(|o| o.label.trim().is_empty())
+        {
+            return refused(format!(
+                "has a blank label on option {}: give each option a short label",
+                option_letter(n)
+            ));
+        }
+        let Some(recommendation) = &question.recommendation else {
+            return refused(
+                "has no recommendation: give every question one, the letter of the option you \
+                 recommend and why, or your proposed answer as `why` when it has no options"
+                    .to_owned(),
+            );
+        };
+        if recommendation.why.trim().is_empty() {
+            return refused("has a recommendation with a blank `why`".to_owned());
+        }
+        match (&recommendation.option, question.options.is_empty()) {
+            (None, false) => {
+                return refused(format!(
+                    "recommends no option: name one by its capital letter, A to {}, in the \
+                     recommendation's `option`",
+                    option_letter(question.options.len() - 1)
+                ));
+            }
+            (Some(letter), true) => {
+                return refused(format!(
+                    "recommends option {letter:?} but offers no options: leave `option` out and \
+                     give the proposed answer as `why`"
+                ));
+            }
+            (Some(letter), false) if option_index(&question.options, letter).is_none() => {
+                return refused(format!(
+                    "recommends option {letter:?}, which it does not offer: name one by its \
+                     capital letter, A for the first, up to {} for the last of its {}",
+                    option_letter(question.options.len() - 1),
+                    question.options.len()
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Requires question ids Q1..Qn in order.
 pub(crate) fn check_question_order(
     contract: &'static str,
@@ -1176,10 +1313,20 @@ pub(crate) fn check_question_order(
     Ok(())
 }
 
-/// Adds to the schema the nine rules of [`RunResult::validate`] that JSON
+/// Adds to the schema the ten rules of [`RunResult::validate`] that JSON
 /// Schema can express.
 fn result_invariants(schema: &mut Schema) {
     let rules = json!([
+        {
+            "properties": {
+                "questions": {
+                    "items": {
+                        "properties": { "recommendation": { "type": "object" } },
+                        "required": ["recommendation"]
+                    }
+                }
+            }
+        },
         {
             "if": { "properties": { "status": { "const": "questions" } }, "required": ["status"] },
             "then": { "properties": { "questions": { "minItems": 1 } }, "required": ["questions"] }

@@ -1,5 +1,5 @@
 {
-  "format": 9,
+  "format": 10,
   "status": "questions",
   "summary": "The greeting's file and tone are not settled.",
   "questions": [
@@ -7,14 +7,28 @@
       "id": "Q1",
       "category": "naming",
       "context": "The repository holds a README.md and nothing else at its root.",
-      "text": "Which file should hold the greeting?"
+      "text": "Which file should hold the greeting?",
+      "recommendation": {
+        "why": "GREETING.md, at the repository root."
+      }
     },
     {
       "id": "Q2",
       "category": "tone",
       "context": "The ticket only says the file greets the reader.",
       "text": "Should the greeting be formal or casual?",
-      "options": ["Formal", "Casual"]
+      "options": [
+        {
+          "label": "Formal"
+        },
+        {
+          "label": "Casual"
+        }
+      ],
+      "recommendation": {
+        "option": "B",
+        "why": "The README is casual."
+      }
     }
   ]
 }

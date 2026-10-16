@@ -151,7 +151,11 @@ const ANSWER_CHECK_BRIEF_FIELDS: &[&str] = &[
     "thread.questions.context",
     "thread.questions.text",
     "thread.questions.options",
+    "thread.questions.options.label",
+    "thread.questions.options.detail",
     "thread.questions.recommendation",
+    "thread.questions.recommendation.option",
+    "thread.questions.recommendation.why",
     "thread.author.relation",
     "thread.body",
     "result_refusal",
@@ -187,7 +191,11 @@ const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "resolve.context",
     "resolve.text",
     "resolve.options",
+    "resolve.options.label",
+    "resolve.options.detail",
     "resolve.recommendation",
+    "resolve.recommendation.option",
+    "resolve.recommendation.why",
     "ticket.description",
     "ticket.author.relation",
     "thread.author.relation",
@@ -546,6 +554,28 @@ fn answer_check_prompt_names_its_fields_classes_and_inputs() {
         assert!(
             names(&text, relation),
             "roles/answer_check.md does not name {relation}"
+        );
+    }
+}
+
+/// The answer check knows the decider's short answers (OWL-324): an option
+/// by its question and letter, a bare letter on a one-question ask only, and
+/// `ok` taking every recommendation; a recognition only a model's run can
+/// show, which this pins in the prompt.
+#[test]
+fn answer_check_prompt_states_the_short_answers() {
+    let text = answer_check_prompt();
+    for rule in [
+        "lettered A, B, C… in their order",
+        "such as `Q1: B`",
+        "a bare letter such as `B` when the latest ask has one question only",
+        "takes the `recommendation` of every question of the latest ask that has one",
+        "`Q2: ok` that of Q2 alone",
+        "a bare letter when the latest ask has several questions",
+    ] {
+        assert!(
+            text.contains(rule),
+            "roles/answer_check.md does not state: {rule}"
         );
     }
 }

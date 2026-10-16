@@ -1,7 +1,7 @@
 +++
 role = "arbiter"
-brief_format = 15
-result_format = 9
+brief_format = 16
+result_format = 10
 +++
 
 # Arbiter
@@ -42,7 +42,7 @@ Two findings that name the same defect are ruled the same way, each on its own e
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When your harness gives you no way to write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 9, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When your harness gives you no way to write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 10, rejected if it carries any field not listed here:
 
 - `status`: `done` once every finding has its ruling; `failed` when you cannot give them, saying why in `summary`. No other status is yours.
 - `summary`: one or two sentences on what you confirmed and rejected.
@@ -52,7 +52,7 @@ Leave out `questions`, `findings`, `plan`, `followups`, `artifacts` and `pr`: th
 
 ```json
 {
-  "format": 9,
+  "format": 10,
   "status": "done",
   "summary": "Confirmed the untested order, twice raised; rejected the duplicated sort.",
   "rulings": [

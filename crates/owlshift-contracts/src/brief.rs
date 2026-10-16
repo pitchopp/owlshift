@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::Role;
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
 use crate::ids::{QuestionId, RelativePath, TicketId, is_commit_id};
-use crate::result::{Question, RefusedChoice, check_question_order, first_not_ascending};
+use crate::result::{
+    Question, QuestionOption, Recommendation, RefusedChoice, check_question_order,
+    first_not_ascending,
+};
 use crate::review::{
     Finding, FindingsMode, MAX_PASS_FINDINGS, Mandate, Plan, check_findings, check_mandates,
 };
@@ -269,10 +272,11 @@ pub struct ToResolve {
     /// What the reader needs to know to answer.
     pub context: String,
     pub text: String,
+    /// The options, lettered A, B, C… in this order (format 16, OWL-324).
     #[serde(default)]
-    pub options: Vec<String>,
+    pub options: Vec<QuestionOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recommendation: Option<String>,
+    pub recommendation: Option<Recommendation>,
 }
 
 impl From<&Question> for ToResolve {

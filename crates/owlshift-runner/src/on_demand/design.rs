@@ -42,7 +42,8 @@ use owlshift_contracts::brief::{GivenDiff, GivenFindings, GivenPlan, ReviewBrief
 use owlshift_contracts::config::FindingsConfirmation;
 use owlshift_contracts::ids::FindingId;
 use owlshift_contracts::result::{
-    ApprovalOutcome, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES,
+    ApprovalOutcome, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES, QuestionOption,
+    Recommendation,
 };
 use owlshift_contracts::review::{
     Finding, FindingOutcome, FindingsMode, KeptApproval, KeptFinding, KeptResponse, KeptRuling,
@@ -449,7 +450,8 @@ fn fitting(budget: usize, make: impl Fn(usize) -> Question) -> Question {
 /// question, whether the decider approves the plan of the PLAN comment,
 /// with its forks' other options as the options to change, cut so the
 /// question holds in [`MAX_QUESTION_BYTES`]; past that, one option per fork,
-/// its options left to the PLAN comment.
+/// its options left to the PLAN comment. It recommends approval, option A
+/// (OWL-324): the plan passed its review.
 pub(crate) fn approval_question(plan: &Plan) -> Question {
     let budget = MAX_QUESTION_BYTES - 256;
     let question = |options: Vec<String>| Question {
@@ -461,8 +463,11 @@ pub(crate) fn approval_question(plan: &Plan) -> Question {
         text: "Do you approve the plan of the PLAN comment as it is, or change it, such as \
                choosing a fork otherwise?"
             .to_owned(),
-        options,
-        recommendation: None,
+        options: options.into_iter().map(QuestionOption::new).collect(),
+        recommendation: Some(Recommendation {
+            option: Some("A".to_owned()),
+            why: "The plan passed its design review.".to_owned(),
+        }),
         replan: false,
     };
     let each = |cap: usize| {
@@ -503,7 +508,8 @@ pub(crate) fn approval_question(plan: &Plan) -> Question {
 /// review pass `pass` at `stage` asks, blockers first, then by id, at most
 /// [`MAX_QUESTIONS`], each cut so the round holds in [`MAX_QUESTION_BYTES`]
 /// each and [`MAX_QUESTIONS_BYTES`] together. A Design review finding asks
-/// how the plan settles it, a Verify one how the change does (OWL-304).
+/// how the plan settles it, a Verify one how the change does (OWL-304);
+/// each recommends settling it, option A (OWL-324).
 /// Returns the questions, each with the finding it asks, and the findings
 /// past the cap, left for the pass after the round.
 pub(crate) fn residue_questions(
@@ -577,10 +583,14 @@ pub(crate) fn residue_questions(
                         clip(&finding.claim, cap)
                     ),
                     options: vec![
-                        format!("Settle it: {}", clip(&finding.settle, cap)),
-                        format!("Leave the {work} as it is"),
+                        QuestionOption::new(format!("Settle it: {}", clip(&finding.settle, cap))),
+                        QuestionOption::new(format!("Leave the {work} as it is")),
                     ],
-                    recommendation: None,
+                    recommendation: Some(Recommendation {
+                        option: Some("A".to_owned()),
+                        why: "The finding still stands after the passes the design allows."
+                            .to_owned(),
+                    }),
                     replan: false,
                 }
             };
@@ -1740,14 +1750,19 @@ mod tests {
             options: vec![choice.to_owned(), other.to_owned()],
             reason: "R".to_owned(),
         };
+        let labels = |question: &Question| -> Vec<String> {
+            question.options.iter().map(|o| o.label.clone()).collect()
+        };
         let question = approval_question(&plan(vec![fork("Markdown", "Plain text")]));
         assert_eq!(question.category, APPROVAL_CATEGORY);
         assert_eq!(
-            question.options,
+            labels(&question),
             [APPROVE, "Fork 1: Plain text instead of Markdown"]
         );
+        // It recommends approval, option A (OWL-324).
+        assert_eq!(question.recommended_option(), Some(0));
         let none = approval_question(&plan(Vec::new()));
-        assert_eq!(none.options, [APPROVE]);
+        assert_eq!(labels(&none), [APPROVE]);
         // Alternatives past 8 KiB are cut, then left to the PLAN comment.
         let long = "x".repeat(3_000);
         let other = "y".repeat(3_000);
@@ -1801,7 +1816,9 @@ mod tests {
                 .context
                 .contains("Finding F2 of design review pass 2, a blocker")
         );
-        assert_eq!(first.options[1], "Leave the plan as it is");
+        assert_eq!(first.options[1].label, "Leave the plan as it is");
+        // It recommends settling it, option A (OWL-324).
+        assert_eq!(first.recommended_option(), Some(0));
         // At Verify, the change settles it (OWL-304).
         let (questions, _) = residue_questions(&findings, Stage::Verify, 3);
         let (first, _) = &questions[0];
@@ -1811,7 +1828,7 @@ mod tests {
                 .contains("Finding F2 of verify pass 3, a blocker")
         );
         assert!(first.text.ends_with("How should the change settle it?"));
-        assert_eq!(first.options[1], "Leave the change as it is");
+        assert_eq!(first.options[1].label, "Leave the change as it is");
 
         let many: Vec<KeptFinding> = (1..=70).map(|n| asked(n, Severity::Major, 2_000)).collect();
         let (questions, over) = residue_questions(&many, Stage::DesignReview, 3);

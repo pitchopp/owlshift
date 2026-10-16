@@ -4,7 +4,9 @@
 //! `[owlshift] QUESTIONS · round 2` and may end with a machine-readable footer,
 //! `<!-- owlshift:{…} -->`, on its last non-blank line. A tracker that shows
 //! HTML comments may lose or display the footer; the header alone still
-//! identifies the comment.
+//! identifies the comment. A comment that waits for the decider (QUESTIONS,
+//! RE-ASK, REPLY) may end its header line with ` · ` and their mention
+//! (OWL-324), which a reader passes over.
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -24,7 +26,11 @@ pub const FOOTER_CLOSE: &str = " -->";
 
 const HEADER: &str = "comment header";
 const FOOTER: &str = "comment footer";
+/// What separates the parts of a header line: its kind, its round, the
+/// mention of the person it waits for.
+pub const HEADER_SEPARATOR: &str = " · ";
 const ROUND_SEPARATOR: &str = " · round ";
+const ROUND_PREFIX: &str = "round ";
 
 /// What a marked comment is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -83,6 +89,12 @@ impl MarkerKind {
         matches!(self, Self::Questions | Self::ReAsk | Self::Resume)
     }
 
+    /// Whether a comment of this kind waits for the decider, so its header
+    /// may end with their mention (OWL-324).
+    pub fn waits_for_decider(self) -> bool {
+        matches!(self, Self::Questions | Self::ReAsk | Self::Reply)
+    }
+
     fn check_round(
         self,
         contract: &'static str,
@@ -125,25 +137,16 @@ impl Header {
         }
     }
 
-    /// Parses a header line; a trailing line break or spaces are ignored.
+    /// Parses a header line; a trailing line break or spaces are ignored. A
+    /// kind that waits for the decider may end the line with ` · ` and a
+    /// mention, which is passed over (OWL-324); any other kind may not.
     pub fn parse(line: &str) -> Result<Self, ContractError> {
         let line = line.trim_end();
         let rest = line
             .strip_prefix(HEADER_PREFIX)
             .ok_or_else(|| ContractError::invalid(HEADER, format!("{line:?} is not a header")))?;
-        let (kind, round) = match rest.split_once(ROUND_SEPARATOR) {
-            Some((kind, round)) => {
-                let round = if round.bytes().all(|b| b.is_ascii_digit()) && !round.starts_with('0')
-                {
-                    round.parse::<NonZeroU32>().ok()
-                } else {
-                    None
-                };
-                let round = round.ok_or_else(|| {
-                    ContractError::invalid(HEADER, format!("{line:?} has an invalid round"))
-                })?;
-                (kind, Some(round))
-            }
+        let (kind, rest) = match rest.split_once(HEADER_SEPARATOR) {
+            Some((kind, rest)) => (kind, Some(rest)),
             None => (rest, None),
         };
         let kind = MarkerKind::ALL
@@ -152,6 +155,36 @@ impl Header {
             .ok_or_else(|| {
                 ContractError::invalid(HEADER, format!("{line:?} has an unknown kind"))
             })?;
+        let (round, mention) = match rest {
+            Some(rest) => match rest.strip_prefix(ROUND_PREFIX) {
+                Some(round) => {
+                    let (round, mention) = match round.split_once(HEADER_SEPARATOR) {
+                        Some((round, mention)) => (round, Some(mention)),
+                        None => (round, None),
+                    };
+                    let round =
+                        if round.bytes().all(|b| b.is_ascii_digit()) && !round.starts_with('0') {
+                            round.parse::<NonZeroU32>().ok()
+                        } else {
+                            None
+                        };
+                    let round = round.ok_or_else(|| {
+                        ContractError::invalid(HEADER, format!("{line:?} has an invalid round"))
+                    })?;
+                    (Some(round), mention)
+                }
+                None => (None, Some(rest)),
+            },
+            None => (None, None),
+        };
+        if let Some(mention) = mention
+            && (!kind.waits_for_decider() || mention.trim().is_empty())
+        {
+            return Err(ContractError::invalid(
+                HEADER,
+                format!("{line:?} has an unexpected part after its kind and round"),
+            ));
+        }
         kind.check_round(HEADER, round)?;
         Ok(Self { kind, round })
     }

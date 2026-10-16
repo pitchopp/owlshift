@@ -1,7 +1,7 @@
 +++
 role = "intake"
-brief_format = 15
-result_format = 9
+brief_format = 16
+result_format = 10
 +++
 
 # Intake
@@ -28,7 +28,7 @@ The verdict is recorded and shown on the ticket; in this version the Build does 
 
 ## What you ask
 
-Ask the decider what would stop the work or change what it delivers and that nothing settles: the ticket's intent where it reads two ways, a missing acceptance criterion, a prerequisite named without its identifier, a premise you cannot check from here. Do not ask how to build it: that is the Build's, which reads the code. Ask everything open at once, numbered `Q1`, `Q2`, … in order. Each question has an `id`, a `category`, a `context` that stands alone (the decider has not seen the ticket through your eyes), a `text`, and, when useful, `options` and a `recommendation`.
+Ask the decider what would stop the work or change what it delivers and that nothing settles: the ticket's intent where it reads two ways, a missing acceptance criterion, a prerequisite named without its identifier, a premise you cannot check from here. Do not ask how to build it: that is the Build's, which reads the code. Ask everything open at once, numbered `Q1`, `Q2`, … in order. Each question has an `id`, a `category`, a `text` that fits on one line, and a `context` of at most two sentences giving what the decider needs and has not read on the ticket, never a restatement of the ticket. When there are answers to choose from, give them as `options`, each a short `label` and, only when the label needs it, a one-line `detail`; the runner letters them A, B, C… in their order. Always give a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; a question without one, or naming an option it does not offer, is refused. With `questions`, the `summary` says in one sentence what you found, not what you ask.
 
 A question in these categories always goes to the decider: `security`, `data_loss`, `money`, `legal`, `irreversible`, `scope`. Write that token as the question's `category`; `scope` is any question whose answer changes what the ticket delivers. For any other question, a short word of your own, written as a token: lowercase ASCII letters and digits, words joined by `_`. A question of another category goes first to the runner's resolver, which decides what the ticket, the rules or the repository settle: you then run again, its decisions in the `thread`, and only the rest reaches the decider.
 
@@ -36,7 +36,7 @@ Keep the questions within the runner's bounds, counted in bytes of the questions
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 9, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 10, rejected if it carries any field not listed here:
 
 - `status`: `done` when nothing is left to ask; `questions` when the decider must answer first; `blocked` when the ticket cannot be read for what it asks (say why in `summary`); `failed` when you cannot finish. `premise_false` when the repository or its documents contradict what the ticket rests on (a file, a symbol, a behaviour that is not there): give the evidence in `summary`. A premise only the outside world can show (a CLI flag, an external API, a price) is never `premise_false`, since you have no network: it is a question.
 - `summary`: one or two sentences on the ticket as you read it.
@@ -47,7 +47,7 @@ Leave out `decisions`, `resolutions`, `verdicts`, `followups`, `artifacts` and `
 
 ```json
 {
-  "format": 9,
+  "format": 10,
   "status": "done",
   "summary": "A small documentation change that waits for OWL-41.",
   "intake": {

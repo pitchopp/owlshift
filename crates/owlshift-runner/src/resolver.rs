@@ -475,7 +475,7 @@ mod tests {
         let finished = |status: &str| Outcome::Finished {
             result: Box::new(
                 RunResult::parse(&format!(
-                    r#"{{"format":9,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":10,"status":"{status}","summary":"s"}}"#
                 ))
                 .unwrap(),
             ),
@@ -513,7 +513,7 @@ mod tests {
         let finished = |status: &str| Outcome::Finished {
             result: Box::new(
                 RunResult::parse(&format!(
-                    r#"{{"format":9,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":10,"status":"{status}","summary":"s"}}"#
                 ))
                 .unwrap(),
             ),

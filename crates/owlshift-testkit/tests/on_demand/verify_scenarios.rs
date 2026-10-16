@@ -25,7 +25,7 @@ fn found(findings: &[(&str, &str)]) -> String {
             })
         })
         .collect();
-    json!({ "format": 9, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 10, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -42,11 +42,11 @@ fn ruled(outcomes: &[&str]) -> String {
             })
         })
         .collect();
-    json!({ "format": 9, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+    json!({ "format": 10, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
 }
 
 const FAILED_REVIEW: &str =
-    r#"{"format":9,"status":"failed","summary":"Could not read the diff."}"#;
+    r#"{"format":10,"status":"failed","summary":"Could not read the diff."}"#;
 
 impl Bench {
     /// A bench whose verify seats play from its reply queue, with Codex
@@ -413,7 +413,7 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
             .starts_with("The greeting still has no full stop.")
     );
     assert!(question.text.ends_with("How should the change settle it?"));
-    assert_eq!(question.options[1], "Leave the change as it is");
+    assert_eq!(question.options[1].label, "Leave the change as it is");
     assert!(
         question
             .context

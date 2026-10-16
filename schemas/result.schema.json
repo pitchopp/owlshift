@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift result.json",
-  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, resolutions from the resolver only, covering\nexactly the questions it was given, no decisions from the build role,\nno `done` from a Build run told that its predecessor's decisions were\nrefused, from such a run when it asks, every refused choice of its\nbrief named in `refused_choices_asked` (OWL-193), `intake` from the\nintake role only, which gives it whenever it ends `done` or `questions`\n(OWL-245), and the quality pipeline's fields from their roles only\n(OWL-300, [`RunResult::validate_against`]).",
+  "description": "The result of one run, written by the role as `result.json`.\n\nBeyond this schema, the runner also requires question ids to be Q1, Q2, …\nQn in order; on each question, options with a label that is not blank\nand a recommendation whose `why` is not blank and which names, by its\ncapital letter, an option the question offers, or none when it offers\nnone (OWL-324); verdicts in increasing question order, each with a reason\nthat is not only whitespace and, on a counter-question and nowhere else,\na reply that is not either; resolutions in increasing question order; and,\nagainst the run's brief, verdicts from the answer check only, covering\nexactly its latest ask, resolutions from the resolver only, covering\nexactly the questions it was given, no decisions from the build role,\nno `done` from a Build run told that its predecessor's decisions were\nrefused, from such a run when it asks, every refused choice of its\nbrief named in `refused_choices_asked` (OWL-193), `intake` from the\nintake role only, which gives it whenever it ends `done` or `questions`\n(OWL-245), and the quality pipeline's fields from their roles only\n(OWL-300, [`RunResult::validate_against`]).",
   "type": "object",
   "properties": {
     "approval": {
@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 9
+      "const": 10
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -138,6 +138,22 @@
   },
   "additionalProperties": false,
   "allOf": [
+    {
+      "properties": {
+        "questions": {
+          "items": {
+            "properties": {
+              "recommendation": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "recommendation"
+            ]
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -820,27 +836,33 @@
       "type": "object",
       "properties": {
         "category": {
-          "description": "What the question is about, such as `scope` or `security`.",
+          "description": "What the question is about, such as `scope` or `security`: what the\nrunner routes it by. No comment shows it (OWL-324).",
           "type": "string"
         },
         "context": {
-          "description": "What the reader needs to know to answer.",
+          "description": "What the reader needs to know to answer: at most two sentences, not\nrestating the ticket.",
           "type": "string"
         },
         "id": {
           "$ref": "#/$defs/QuestionId"
         },
         "options": {
+          "description": "The answers to choose from, which the runner letters A, B, C… in\nthis order (format 10, OWL-324: [`option_letter`]).",
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/QuestionOption"
           }
         },
         "recommendation": {
-          "type": [
-            "string",
-            "null"
+          "description": "The answer the asking run recommends: required in `result.json`\n(format 10, OWL-324), where the runner refuses a question without\none; absent only from a question a ticket ref kept before.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Recommendation"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "replan": {
@@ -848,6 +870,7 @@
           "type": "boolean"
         },
         "text": {
+          "description": "The question itself, on one line.",
           "type": "string"
         }
       },
@@ -863,6 +886,50 @@
       "description": "A question's identifier within a round: Q1, Q2, and so on.",
       "type": "string",
       "pattern": "^Q[1-9][0-9]*$"
+    },
+    "QuestionOption": {
+      "description": "One answer a question offers (format 10, OWL-324): a short label, and\nat most one line of detail when the label needs it.",
+      "type": "object",
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "A few words, not blank.",
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "label"
+      ]
+    },
+    "Recommendation": {
+      "description": "The answer the asking run recommends (format 10, OWL-324): with\noptions, the letter of one of them and why; without, the proposed\nanswer itself as `why`.",
+      "type": "object",
+      "properties": {
+        "option": {
+          "description": "The letter of the recommended option, as the runner letters them\n([`option_letter`]): required when the question has options, refused\nwhen it has none. A recommendation a ticket ref kept before format\n10 has none.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Z]+$"
+        },
+        "why": {
+          "description": "Why that option, or, without options, the proposed answer; not\nblank.",
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "why"
+      ]
     },
     "RefusedChoiceAsked": {
       "description": "Where a Build run told of refused choices asks one of them (OWL-193):\nthe choice's place in its brief's `refused_choices`, from 1, and the id\nof the question of the same result that asks it. Several choices may\nname one question.",

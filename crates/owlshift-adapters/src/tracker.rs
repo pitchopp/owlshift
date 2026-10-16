@@ -62,7 +62,9 @@ pub trait Tracker {
 
     /// The text that, written in a comment, makes the tracker notify the
     /// account `account` (OWL-157): on Linear, the person's profile link.
-    /// `Ok(None)` when the tracker has no such text. An error when it has
+    /// The runner writes it at the end of a comment's header line
+    /// (OWL-324), so it holds no whitespace. `Ok(None)` when the tracker has
+    /// no such text. An error when it has
     /// one but could not give this account's: the comment still goes
     /// without it, and the runner reports it (OWL-170). Unlike a missing
     /// [`ticket_url`](Self::ticket_url), which only loses a convenience, a
