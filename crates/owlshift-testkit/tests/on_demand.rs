@@ -367,6 +367,23 @@ impl Harness for Replies {
     }
 }
 
+/// The verify seats' harness when a scenario plays none of their runs
+/// (OWL-304): every run reviews clean, takes no reply of the bench's queue
+/// and records no routing, so a scenario about something else keeps the
+/// replies it had before Verify had a role. Its runs still show in the
+/// event log and the briefs.
+struct CleanReview(FakeHarness);
+
+/// A Verify run's `done` with no finding.
+const CLEAN_REVIEW: &str =
+    r#"{"format":9,"status":"done","summary":"Nothing wrong found.","findings":[]}"#;
+
+impl Router for CleanReview {
+    fn harness(&self, _routing: RunRouting) -> Box<dyn Harness + '_> {
+        Box::new(self.0.clone())
+    }
+}
+
 /// The Markdown tracker, posting the runner's comments at a virtual clock.
 /// Every comment of the bench, the decider's included, takes the next
 /// minute of one clock, so its times read plainly and the quiet window is
@@ -617,6 +634,9 @@ struct Bench {
     /// Codex can run the critic of the review roles (OWL-303): the bench's
     /// one harness then plays it too.
     codex: Cell<bool>,
+    /// The verify seats play from the bench's reply queue, as every other
+    /// run does; otherwise they review clean ([`CleanReview`], OWL-304).
+    verify_plays: Cell<bool>,
 }
 
 const DONE: &str = r#"{"format":9,"status":"done","summary":"Added GREETING.md; the gate passes.",
@@ -737,6 +757,7 @@ impl Bench {
             inbox: RefCell::default(),
             routed: Rc::default(),
             codex: Cell::new(false),
+            verify_plays: Cell::new(false),
         }
     }
 
@@ -935,6 +956,15 @@ impl Bench {
             .record
     }
 
+    /// The brief of the latest run of `role`.
+    fn last_of(&self, role: Role) -> Brief {
+        self.briefs()
+            .into_iter()
+            .rev()
+            .find(|brief| brief.role == role)
+            .unwrap_or_else(|| panic!("no {role:?} run"))
+    }
+
     /// The brief of every run, oldest first.
     fn briefs(&self) -> Vec<Brief> {
         self.events()
@@ -1037,6 +1067,30 @@ impl Bench {
             started: Cell::new(0),
             routed: self.routed.clone(),
         };
+        let clean_result = self.tmp.path().join("clean-review.json");
+        fs::write(&clean_result, CLEAN_REVIEW).unwrap();
+        let clean_reply = self.tmp.path().join("clean-review.toml");
+        let reply = Reply {
+            result: Some(clean_result),
+            ..Reply::default()
+        };
+        fs::write(&clean_reply, reply.render()).unwrap();
+        let clean = CleanReview(FakeHarness {
+            program: harness.program.clone(),
+            reply: clean_reply,
+            readable: Vec::new(),
+        });
+        let verify = if self.verify_plays.get() {
+            Reviewers {
+                claude: &harness,
+                codex: self.codex.get().then_some(&harness as &dyn Router),
+            }
+        } else {
+            Reviewers {
+                claude: &clean,
+                codex: self.codex.get().then_some(&clean as &dyn Router),
+            }
+        };
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
         let env = self.env.clone();
@@ -1083,6 +1137,7 @@ impl Bench {
                 claude: &harness,
                 codex: self.codex.get().then_some(&harness as &dyn Router),
             },
+            verify,
             arbiter: &harness,
             answer_check: &harness,
             resolver: &harness,
@@ -1197,6 +1252,10 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
             TrackerWrite,
             RunStarted,
             RunEnded,
+            // The Verify pass: its one critic, then the pass (OWL-304).
+            RunStarted,
+            RunEnded,
+            Decision,
             TrackerWrite,
             TrackerWrite,
             TrackerWrite,
@@ -1293,7 +1352,8 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
         .into_iter()
         .filter(|event| event.kind == EventKind::RunStarted)
         .collect();
-    assert_eq!(started.len(), 2);
+    // Two Build runs, then the Verify pass (OWL-304).
+    assert_eq!(started.len(), 3);
     let run_dir = started[1].data["run_dir"].as_str().unwrap();
     let brief =
         Brief::parse(&fs::read_to_string(Path::new(run_dir).join("brief.json")).unwrap()).unwrap();
@@ -1367,9 +1427,10 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
             (Role::Build, true, false),
             (Role::Resolver, false, false),
             (Role::Build, false, false),
+            (Role::Verify, false, false),
         ]
     );
-    assert_eq!(flags(&bench), [false, true, false, false]);
+    assert_eq!(flags(&bench), [false, true, false, false, false]);
 
     let bench = Bench::new(true);
     let (stopped, printed) = bench.run(
@@ -1729,7 +1790,9 @@ fn a_refused_artifact_is_told_and_never_spends_the_last_attempt() {
         [
             None,
             None,
-            Some("artifact `plan`: `.owlshift/run/plan.md` does not exist".to_owned())
+            Some("artifact `plan`: `.owlshift/run/plan.md` does not exist".to_owned()),
+            // The Verify pass (OWL-304).
+            None,
         ]
     );
 }
@@ -1773,15 +1836,17 @@ fn the_brief_lists_the_zones_the_ticket_declares() {
     let replies = vec![bench.reply(Some("Hello"), Some(DONE))];
     let (outcome, printed) = bench.run(replies, None);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let brief = bench.briefs().pop().unwrap();
+    let brief = bench.briefs().remove(0);
     assert_eq!(brief.zones, ["docs", "web/cart"]);
-    // OWL-134: the run log says the malformed label did not reach the agent.
+    // OWL-134: the run log says the malformed label did not reach the agent,
+    // once per run: the Build's, then the Verify pass's (OWL-304).
     let warnings: Vec<Event> = bench
         .events()
         .into_iter()
         .filter(|event| event.kind == EventKind::Warning)
         .collect();
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert_eq!(warnings[1].data["role"], "verify");
     let data = &warnings[0].data;
     assert_eq!(data["what"], "zone_label_left_out");
     assert_eq!(data["label"], "Zone:../x");
@@ -1900,7 +1965,8 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
                 vec![b.reply(Some("Hello"), Some(DONE))]
             }),
             |s| matches!(s, Stop::Delivery(reason) if reason.contains("rejected")),
-            Some(EventKind::RunEnded),
+            // The Verify pass's `pass` decision, before the push (OWL-304).
+            Some(EventKind::Decision),
         ),
         (
             "branch moved after the push",
@@ -2246,6 +2312,10 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
             claude: &router,
             codex: None,
         },
+        verify: Reviewers {
+            claude: &router,
+            codex: None,
+        },
         arbiter: &router,
         answer_check: &harness,
         resolver: &harness,
@@ -2323,6 +2393,10 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         intake: &harness,
         design: &router,
         design_review: Reviewers {
+            claude: &router,
+            codex: None,
+        },
+        verify: Reviewers {
             claude: &router,
             codex: None,
         },
@@ -2657,8 +2731,9 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
     ]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     // The REPLY reads as Owlshift's in the thread, before the answer it
-    // led to.
+    // led to. The Verify pass reviews the Build last (OWL-304).
     let mut briefs = bench.briefs();
+    assert_eq!(briefs.pop().unwrap().role, Role::Verify);
     let build = briefs.pop().unwrap();
     let last_check = briefs.pop().unwrap();
     assert_eq!(last_check.role, Role::AnswerCheck);
@@ -2773,7 +2848,8 @@ fn answers_in_the_second_of_their_ask_count() {
     ]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let mut briefs = bench.briefs();
-    briefs.pop();
+    // The Verify pass, then the Build (OWL-304).
+    briefs.truncate(briefs.len() - 2);
     let last_check = briefs.pop().unwrap();
     assert_eq!(last_check.role, Role::AnswerCheck);
     assert_eq!(
@@ -2965,9 +3041,9 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
                 assert_eq!(ran(), 1);
                 fs::remove_file(dirs.unverified_file()).unwrap();
             }
-            // Continued: the answer check and Build ran. The next pass finds
-            // no question waiting.
-            6 => assert_eq!(ran(), 3),
+            // Continued: the answer check, Build and its Verify pass ran
+            // (OWL-304). The next pass finds no question waiting.
+            6 => assert_eq!(ran(), 4),
             _ => return false,
         }
         true
@@ -2990,9 +3066,13 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
         [Ok(delivered)] => assert!(delivered.opened, "{delivered:?}"),
         other => panic!("{other:?}\n{lines}\n{printed}"),
     }
-    // The answer check, then Build, after `do`'s Build; one warning only.
+    // The answer check, then Build and its Verify pass (OWL-304), after
+    // `do`'s Build; one warning only.
     let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
-    assert_eq!(roles, [Role::Build, Role::AnswerCheck, Role::Build]);
+    assert_eq!(
+        roles,
+        [Role::Build, Role::AnswerCheck, Role::Build, Role::Verify]
+    );
     assert_eq!(warnings(), 1);
     let comments = bench.comments();
     assert!(
@@ -3095,6 +3175,8 @@ fn a_late_comment_gets_one_more_build_run_and_reaches_the_pull_request() {
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
 
     let mut briefs = bench.briefs();
+    // Verify follows the re-read and the Build it added (OWL-304).
+    assert_eq!(briefs.pop().unwrap().role, Role::Verify);
     let integrating = briefs.pop().unwrap();
     let first = briefs.pop().unwrap();
     assert_eq!((first.role, integrating.role), (Role::Build, Role::Build));
@@ -3572,6 +3654,7 @@ fn a_refused_check_is_told_to_the_next_check_across_commands() {
             (Role::AnswerCheck, freed_reason),
             (Role::AnswerCheck, kept),
             (Role::Build, None),
+            (Role::Verify, None),
         ]
     );
     assert_eq!(
@@ -3636,6 +3719,7 @@ fn watch_retries_a_refused_check_at_the_last_attempt() {
             (Role::AnswerCheck, false),
             (Role::AnswerCheck, true),
             (Role::Build, false),
+            (Role::Verify, false),
         ]
     );
 }
@@ -3923,8 +4007,7 @@ fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
     fs::write(bench.ticket_file(), labelled).unwrap();
     let (delivered, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let build = bench.briefs().pop().unwrap();
-    assert_eq!(build.role, Role::Build);
+    let build = bench.last_of(Role::Build);
     assert_eq!(shape(&build), ["questions", "Other", "Decider", "Owlshift"]);
 }
 
@@ -4090,8 +4173,7 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
         bench.reply(Some("Hello"), Some(DONE)),
     ]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let build = bench.briefs().pop().unwrap();
-    assert_eq!(build.role, Role::Build);
+    let build = bench.last_of(Role::Build);
     assert_eq!(
         shape(&build),
         ["decision", "questions", "Decider", "Owlshift"]
@@ -4271,6 +4353,7 @@ fn a_refused_resolver_result_is_told_to_the_replayed_round() {
             (Role::Build, None),
             (Role::Resolver, Some(kept)),
             (Role::Build, None),
+            (Role::Verify, None),
         ]
     );
     assert_eq!(bench.record().questions.resolver_refusal, None);
@@ -4361,6 +4444,7 @@ fn a_refused_resolver_result_is_told_when_its_round_was_posted_but_not_kept() {
             (Role::Build, None),
             (Role::Resolver, Some(kept)),
             (Role::Build, None),
+            (Role::Verify, None),
         ]
     );
     assert_eq!(bench.record().questions.resolver_refusal, None);
@@ -4913,9 +4997,9 @@ fn a_resume_whose_state_is_not_kept_is_posted_once_under_watch() {
                 bench.answer("Thanks.\n");
             }
             // The decider's comment lifted the hold: checked again, resumed,
-            // kept, built and delivered.
+            // kept, built, verified (OWL-304) and delivered.
             4 => {
-                assert_eq!((ran(), resumes()), (4, 2));
+                assert_eq!((ran(), resumes()), (5, 2));
                 assert_ne!(bench.ref_commit(), asked_at);
                 return false;
             }
@@ -5257,9 +5341,10 @@ fn a_red_pull_request_gets_fix_runs_until_the_bound_parks_it() {
 
     // Each fix run was the build role at Watch, told the failed check and
     // its excerpt: the job log's lines up to its first error, cleaned.
+    // The delivery's Build and Verify pass (OWL-304), then the fix runs.
     let briefs = bench.briefs();
-    assert_eq!(briefs.len(), 4);
-    for brief in &briefs[1..] {
+    assert_eq!(briefs.len(), 5);
+    for brief in &briefs[2..] {
         assert_eq!(brief.role, Role::Build);
         let failure = brief.check_failure.as_ref().expect("a check failure");
         assert_eq!(failure.pull_request, 1);
@@ -5332,7 +5417,8 @@ fn a_moved_ticket_waits_and_gets_its_fix_run_once_back() {
         matches!(&outcome, Err(Stop::Refused(why)) if why.contains("\"Done\"")),
         "{outcome:?}\n{printed}"
     );
-    assert_eq!(bench.briefs().len(), 1);
+    // The delivery's Build and Verify pass alone (OWL-304).
+    assert_eq!(bench.briefs().len(), 2);
     assert!(
         data_of(&bench.events(), EventKind::Decision, "watch")
             .iter()
@@ -5343,7 +5429,7 @@ fn a_moved_ticket_waits_and_gets_its_fix_run_once_back() {
     let (outcome, printed) =
         bench.continue_ticket(vec![bench.reply(Some("Hello again"), Some(FIXED))]);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    assert_eq!(bench.briefs().len(), 2);
+    assert_eq!(bench.briefs().len(), 3);
     assert_eq!(state_of(&bench).fix_passes(), 1);
 }
 
@@ -5758,7 +5844,8 @@ fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
         vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))],
         &mut |_| {
             pass += 1;
-            assert_eq!((bench.briefs().len(), asked()), (2, 1));
+            // The delivery's two runs (OWL-304), then the fix run that asked.
+            assert_eq!((bench.briefs().len(), asked()), (3, 1));
             bench.waited.set(SignedDuration::from_hours(pass * 3));
             pass < 3
         },
@@ -5830,7 +5917,10 @@ fn an_answer_after_the_pull_request_went_green_runs_no_fix() {
         "{look:?}\n{printed}"
     );
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(roles, [Role::Build, Role::Build, Role::AnswerCheck]);
+    assert_eq!(
+        roles,
+        [Role::Build, Role::Verify, Role::Build, Role::AnswerCheck]
+    );
     assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
     assert_eq!(bench.stage(), "In Review");
 }
@@ -6126,7 +6216,8 @@ fn a_red_no_run_fixes_and_a_refused_push_park_the_ticket() {
             if detail.contains("ci (CANCELLED)")),
         "{outcome:?}\n{printed}"
     );
-    assert_eq!(bench.briefs().len(), 1);
+    // The delivery's Build and Verify pass alone (OWL-304).
+    assert_eq!(bench.briefs().len(), 2);
 
     // The remote cannot lock the branch's ref: it refuses the push.
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
@@ -7087,6 +7178,15 @@ fn delivered_with_a_decision(bench: &Bench) -> String {
     decisions[0].comment.clone()
 }
 
+/// The `decision` events of correction runs, apart from a review pass's,
+/// which also tell an `outcome` (OWL-304).
+fn corrections(events: &[Event]) -> Vec<Value> {
+    data_of(events, EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "correction")
+        .collect()
+}
+
 /// A correction run's `done`, the greeting moved as the reply asks.
 const CORRECTED: &str = r#"{"format":9,"status":"done","summary":"Moved the greeting as the reply asks.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Corrected."}}"#;
@@ -7114,7 +7214,7 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
                 // Nothing to correct. A stranger replies, then the decider,
                 // within the quiet window.
                 1 => {
-                    assert_eq!(ran(), 3);
+                    assert_eq!(ran(), 4);
                     bench.reply_as("reviewer", &decision, "Keep GREETING.md.");
                     bench.reply_as("maintainer", &decision, "No: put it in HELLO.md.");
                     bench.waited.set(SignedDuration::ZERO);
@@ -7122,13 +7222,13 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
                 // Settling: nothing ran. Past the window now, and the tracker
                 // refuses the DELIVERY report.
                 2 => {
-                    assert_eq!(ran(), 3);
+                    assert_eq!(ran(), 4);
                     bench.waited.set(SignedDuration::from_mins(10));
                     bench.refuse.set(Some("[owlshift] DELIVERY"));
                 }
                 // The correction ran and was pushed; its report is owed.
                 3 => {
-                    assert_eq!(ran(), 4);
+                    assert_eq!(ran(), 5);
                     assert!(bench.record().delivery.unwrap().owed.is_some());
                     bench.refuse.set(None);
                 }
@@ -7144,7 +7244,7 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
         matches!(&outcomes[0], Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
         "{outcomes:?}\n{printed}"
     );
-    assert_eq!(ran(), 4);
+    assert_eq!(ran(), 5);
     // Working while the correction run worked, review once pushed, its
     // report refused or not (OWL-259).
     assert_eq!(stage_moves(&bench, delivered_events), ["working", "review"]);
@@ -7251,7 +7351,7 @@ fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_r
     let (delivered, printed) =
         bench.continue_ticket(vec![bench.reply(Some("Hello from HELLO.md"), Some(DONE))]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let build = bench.briefs().pop().unwrap();
+    let build = bench.last_of(Role::Build);
     assert!(
         build
             .thread
@@ -7268,7 +7368,7 @@ fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_r
         matches!(&look, Err(Stop::Watched { .. })),
         "{look:?}\n{printed}"
     );
-    assert_eq!(bench.briefs().len(), 4);
+    assert_eq!(bench.briefs().len(), 5);
 
     // A newer reply the pull request already follows. The tracker refuses
     // the report saying so: it is owed (OWL-236), and the next `continue`
@@ -7326,7 +7426,7 @@ fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_r
         .clone()
         .unwrap();
     assert_ne!(kept.comment, "");
-    let outcomes: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "outcome")
+    let outcomes: Vec<Value> = corrections(&bench.events())
         .into_iter()
         .map(|d| d["outcome"].clone())
         .collect();
@@ -7355,8 +7455,8 @@ fn a_correction_that_fails_then_asks_goes_to_the_decider_then_corrects() {
         "{outcome:?}\n{printed}"
     );
     let briefs = bench.briefs();
-    assert_eq!(briefs.len(), 5);
-    assert!(briefs[3..].iter().all(|b| b.correction.is_some()));
+    assert_eq!(briefs.len(), 6);
+    assert!(briefs[4..].iter().all(|b| b.correction.is_some()));
     let asked = bench.comments().pop().unwrap();
     assert!(asked.starts_with("[owlshift] QUESTIONS · round"), "{asked}");
     assert!(
@@ -7370,7 +7470,7 @@ fn a_correction_that_fails_then_asks_goes_to_the_decider_then_corrects() {
         }
     );
     assert!(bench.record().questions.decisions[0].reversed.is_none());
-    assert!(data_of(&bench.events(), EventKind::Decision, "outcome").is_empty());
+    assert!(corrections(&bench.events()).is_empty());
 
     bench.answer("Q1: Under a new Greeting heading. Go.\n");
     let (outcome, printed) = bench.continue_ticket(vec![
@@ -8266,7 +8366,7 @@ fn the_drain_takes_a_ticket_in_then_builds_it_once_its_blocker_is_done() {
         .collect();
     assert_eq!(dispatches, [json!("drain")]);
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(roles, [Role::Intake, Role::Build]);
+    assert_eq!(roles, [Role::Intake, Role::Build, Role::Verify]);
     assert_eq!(bench.record().intake.unwrap().gesture.account, "maintainer");
 }
 
@@ -8499,7 +8599,11 @@ fn the_open_pr_cap_holds_the_next_build_and_is_told_once() {
     let (outcomes, lines, _) = bench.drain(replies, 5, |_| {});
     assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}");
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(roles, [Role::Intake, Role::Intake, Role::Build], "{lines}");
+    assert_eq!(
+        roles,
+        [Role::Intake, Role::Intake, Role::Build, Role::Verify],
+        "{lines}"
+    );
     assert_eq!(pr_caps(&bench), [json!(["DEMO-2", 1, 1])], "{lines}");
     assert_eq!(
         lines.matches("reached their cap (1 of 1)").count(),
@@ -8600,7 +8704,7 @@ fn a_delivery_since_the_snapshot_holds_the_dispatch() {
     });
     assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}");
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(roles, [Role::Intake, Role::Build], "{lines}");
+    assert_eq!(roles, [Role::Intake, Role::Build, Role::Verify], "{lines}");
     assert_eq!(pr_caps(&bench), [json!(["DEMO-1", 1, 1])], "{lines}");
     assert_eq!(
         lines.matches("reached their cap (1 of 1)").count(),
@@ -8911,7 +9015,8 @@ fn the_drain_takes_in_an_intake_moved_back_to_todo_after_its_round() {
             Role::AnswerCheck,
             Role::Intake,
             Role::Intake,
-            Role::Build
+            Role::Build,
+            Role::Verify
         ]
     );
     // Watch continued the answered round once; the restart is the drain's.
@@ -9009,6 +9114,9 @@ mod drain_scenarios;
 
 #[path = "on_demand/design_scenarios.rs"]
 mod design_scenarios;
+
+#[path = "on_demand/verify_scenarios.rs"]
+mod verify_scenarios;
 
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every

@@ -152,7 +152,8 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
             Role::Design,
             Role::DesignReview,
             Role::DesignReview,
-            Role::Build
+            Role::Build,
+            Role::Verify
         ]
     );
     let briefs = bench.briefs();
@@ -186,7 +187,9 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
         assert_eq!((&given.base, &given.plan), (&kept.base, &kept.plan));
     }
     let review = record.review.expect("review.json");
-    assert_eq!(review.passes.len(), 1);
+    // The Design review pass, then the Verify pass (OWL-304).
+    assert_eq!(review.passes.len(), 2);
+    assert_eq!(review.passes[1].stage, Stage::Verify);
     assert_eq!(
         (review.passes[0].stage, review.passes[0].pass.get()),
         (Stage::DesignReview, 1)
@@ -210,12 +213,17 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
             .unwrap()
             .starts_with("[owlshift] DELIVERY")
     );
+    // Design review's pass, then Verify's (OWL-304).
     let passes = bench.decisions("review");
-    assert_eq!(passes.len(), 1, "{passes:?}");
+    assert_eq!(passes.len(), 2, "{passes:?}");
     assert_eq!(passes[0]["outcome"], "passed");
     assert_eq!(passes[0]["next"], "build");
     assert_eq!(passes[0]["reviewers"][0]["stand_in"], true);
     assert_eq!(passes[0]["reviewers"][1]["same_model"], true);
+    assert_eq!(
+        (&passes[1]["stage"], &passes[1]["next"]),
+        (&json!("verify"), &json!("deliver"))
+    );
     let dispatches: Vec<Value> = data_of(&bench.events(), EventKind::Dispatch, "command");
     assert_eq!(dispatches.len(), 2, "from Ready to Design, then to Build");
     assert!(
@@ -260,6 +268,7 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
             Role::DesignReview,
             Role::DesignReview,
             Role::Build,
+            Role::Verify,
         ]
     );
     let routed = bench.routed();
@@ -535,13 +544,14 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     let (outcome, printed) = bench.continue_ticket(replies);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let briefs = bench.briefs();
-    let after = &briefs[briefs.len() - 4];
+    // Design, its review pass, the Build and its Verify pass (OWL-304).
+    let after = &briefs[briefs.len() - 5];
     assert_eq!(after.role, Role::Design);
     assert!(after.findings.is_none() && !after.approval);
     assert!(after.plan.is_some());
     assert_eq!(latest_ask(after), ["Q1"]);
     let review = bench.record().review.unwrap();
-    assert_eq!(review.passes.len(), 3);
+    assert_eq!(review.passes.len(), 4);
     assert_eq!(review.passes[2].pass.get(), 3);
 }
 
@@ -602,7 +612,8 @@ fn a_risky_plan_is_approved_and_its_build_starts_from_the_moved_base() {
     let (outcome, printed) = bench.continue_ticket(replies);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let briefs = bench.briefs();
-    let approving = &briefs[briefs.len() - 2];
+    // The Build, then `risky`'s two Verify seats (OWL-304).
+    let approving = &briefs[briefs.len() - 4];
     assert_eq!(approving.role, Role::Design);
     assert!(approving.approval && approving.plan.is_some());
     let comments = MarkdownTracker::new(&bench.remote.checkout)
@@ -623,7 +634,7 @@ fn a_risky_plan_is_approved_and_its_build_starts_from_the_moved_base() {
         .unwrap();
     assert_eq!(json!(approval.plan_sha256), planned["plan_sha256"]);
     // The Build follows the plan written on the old base, from the new one.
-    let build = briefs.last().unwrap();
+    let build = bench.last_of(Role::Build);
     assert_eq!(build.plan.as_ref().unwrap().base, planned_on);
     let dispatched = data_of(&bench.events(), EventKind::Dispatch, "command");
     assert_eq!(dispatched.last().unwrap()["base_commit"], json!(moved));
@@ -700,6 +711,7 @@ fn a_replan_the_resolver_settles_sends_the_ticket_back_to_design() {
             Role::DesignReview,
             Role::DesignReview,
             Role::Build,
+            Role::Verify,
         ]
     );
     let briefs = bench.briefs();
@@ -731,7 +743,8 @@ fn a_replan_the_resolver_settles_sends_the_ticket_back_to_design() {
         .iter()
         .map(|pass| pass.pass.get())
         .collect();
-    assert_eq!(passes, [1, 1], "a new loop of passes");
+    // Design review's two loops, then the Verify pass (OWL-304).
+    assert_eq!(passes, [1, 1, 1], "a new loop of passes");
 }
 
 /// On an approved plan, a `replan` goes to the decider without the
@@ -786,7 +799,7 @@ fn a_trivial_label_skips_design_and_an_unknown_one_is_left_out() {
     bench.add_labels(&["variant:trivial", "variant:huge"]);
     let (outcome, printed) = bench.run(vec![bench.built()], None);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    assert_eq!(bench.roles(), [Role::Build]);
+    assert_eq!(bench.roles(), [Role::Build, Role::Verify]);
     assert!(bench.record().plan.is_none());
     let ignored = data_of(&bench.events(), EventKind::Warning, "label");
     assert!(

@@ -38,7 +38,7 @@ use std::num::NonZeroU32;
 
 use sha2::{Digest, Sha256};
 
-use owlshift_contracts::brief::{GivenFindings, GivenPlan, ReviewBrief};
+use owlshift_contracts::brief::{GivenDiff, GivenFindings, GivenPlan, ReviewBrief};
 use owlshift_contracts::config::FindingsConfirmation;
 use owlshift_contracts::ids::FindingId;
 use owlshift_contracts::result::{
@@ -95,6 +95,27 @@ pub(crate) struct SeatOutput {
     /// A reviewer on Claude Code on the design run's own model.
     pub same_model: bool,
     pub findings: Vec<Finding>,
+}
+
+/// One review pass as it ran ([`OnDemand::run_review_pass`]), settled and
+/// not kept yet: what Design review and Verify each make of it.
+pub(super) struct PassRun {
+    /// The pass, from 1.
+    pub pass: u32,
+    pub outputs: Vec<SeatOutput>,
+    /// The pass's findings, numbered across the seats, each with what the
+    /// pass made of it.
+    pub findings: Vec<KeptFinding>,
+    pub verdict: PassVerdict,
+    /// The residue round's questions when the pass asks, each with its
+    /// finding.
+    pub questions: Vec<(Question, FindingId)>,
+    /// Findings the round could not ask, past the questions it holds.
+    pub not_asked: Vec<FindingId>,
+    /// The pass's last run, its arbiter's when one ran.
+    pub last_run: Option<String>,
+    /// The ticket's review record with the pass, checked.
+    pub review: TicketReview,
 }
 
 /// The kept plan as a brief gives it.
@@ -164,8 +185,9 @@ pub(crate) fn standing(
 
 /// Settles review pass number `pass` at `stage` over its `findings`
 /// (OWL-301's [`settle`]) and records each finding's outcome: `rejected` for
-/// one the arbiter rejected, `asked` for one the decider gets; the others
-/// keep none until a run fixes them, a noted `minor` never.
+/// one the arbiter rejected, `asked` for one the decider gets, `proposed`
+/// for one Verify files as a follow-up (OWL-304); the others keep none
+/// until a run fixes them, a noted `minor` never.
 pub(crate) fn settle_pass(
     stage: Stage,
     pass: u32,
@@ -185,11 +207,78 @@ pub(crate) fn settle_pass(
         }
     }
     for ((n, _), fate) in standing.iter().zip(&verdict.fates) {
-        if *fate == Fate::Ask {
-            findings[*n].outcome = Some(FindingOutcome::Asked);
+        match fate {
+            Fate::Ask => findings[*n].outcome = Some(FindingOutcome::Asked),
+            Fate::Propose => findings[*n].outcome = Some(FindingOutcome::Proposed),
+            Fate::Fix | Fate::Note => {}
         }
     }
     Some(verdict)
+}
+
+/// The last pass of `review` when pass `pass` at `stage` runs again in its
+/// place: the same pass of the same stage, above 1, such as a Verify pass
+/// that passed before its delivery failed (OWL-304). A pass 1 run again is
+/// appended, which the numbering allows.
+pub(crate) fn replaced_pass(review: &TicketReview, stage: Stage, pass: u32) -> Option<&ReviewPass> {
+    review
+        .passes
+        .last()
+        .filter(|last| last.stage == stage && last.pass.get() == pass && pass > 1)
+}
+
+/// Keeps `kept` as the latest pass of `review`: in place of the pass it
+/// runs again ([`replaced_pass`]), else appended.
+pub(crate) fn push_pass(review: &mut TicketReview, kept: ReviewPass) {
+    if replaced_pass(review, kept.stage, kept.pass.get()).is_some() {
+        review.passes.pop();
+    }
+    review.passes.push(kept);
+}
+
+/// Records what the run given `given`, the latest pass's findings at
+/// `stage`, did with them, on that pass: the author's response to each in
+/// answer mode, every one fixed in fix mode (OWL-303, OWL-304).
+pub(crate) fn mark_answered(
+    review: &mut TicketReview,
+    stage: Stage,
+    given: &GivenFindings,
+    result: &RunResult,
+) {
+    let Some(last) = review
+        .passes
+        .iter_mut()
+        .rev()
+        .find(|pass| pass.stage == stage)
+    else {
+        return;
+    };
+    for kept in &mut last.findings {
+        if !given.findings.iter().any(|f| f.id == kept.finding.id) {
+            continue;
+        }
+        match given.mode {
+            FindingsMode::Answer => {
+                if let Some(response) = result
+                    .finding_responses
+                    .iter()
+                    .find(|response| response.finding == kept.finding.id)
+                {
+                    kept.response = Some(KeptResponse {
+                        outcome: response.outcome,
+                        reason: response.reason.clone(),
+                    });
+                    kept.outcome = Some(match response.outcome {
+                        ResponseOutcome::Fixed => FindingOutcome::Fixed,
+                        ResponseOutcome::Rejected => FindingOutcome::Rejected,
+                    });
+                }
+            }
+            FindingsMode::Fix | FindingsMode::Rule => {
+                kept.outcome = Some(FindingOutcome::Fixed);
+            }
+        }
+    }
 }
 
 /// A pass's findings as `review.json` keeps them: every seat's, in seat
@@ -410,15 +499,23 @@ pub(crate) fn approval_question(plan: &Plan) -> Question {
 }
 
 /// The residue round's questions (architecture section 5, "Design review",
-/// The bound): one per finding `findings` asks, blockers first, then by id,
-/// at most [`MAX_QUESTIONS`], each cut so the round holds in
-/// [`MAX_QUESTION_BYTES`] each and [`MAX_QUESTIONS_BYTES`] together. Returns
-/// the questions, each with the finding it asks, and the findings past the
-/// cap, left for the pass after the round.
+/// The bound, and "Verify", The residue): one per finding `findings` of
+/// review pass `pass` at `stage` asks, blockers first, then by id, at most
+/// [`MAX_QUESTIONS`], each cut so the round holds in [`MAX_QUESTION_BYTES`]
+/// each and [`MAX_QUESTIONS_BYTES`] together. A Design review finding asks
+/// how the plan settles it, a Verify one how the change does (OWL-304).
+/// Returns the questions, each with the finding it asks, and the findings
+/// past the cap, left for the pass after the round.
 pub(crate) fn residue_questions(
     findings: &[KeptFinding],
+    stage: Stage,
     pass: u32,
 ) -> (Vec<(Question, FindingId)>, Vec<FindingId>) {
+    let (pass_name, work) = if stage == Stage::Verify {
+        ("verify", "change")
+    } else {
+        ("design review", "plan")
+    };
     let mut asked: Vec<&KeptFinding> = findings
         .iter()
         .filter(|kept| kept.outcome == Some(FindingOutcome::Asked))
@@ -461,7 +558,7 @@ pub(crate) fn residue_questions(
                     id: QuestionId::nth(u32::try_from(n + 1).unwrap_or(u32::MAX)),
                     category: FINDING_CATEGORY.to_owned(),
                     context: format!(
-                        "Finding {} of design review pass {pass}, {}, raised by the {} reviewer \
+                        "Finding {} of {pass_name} pass {pass}, {}, raised by the {} reviewer \
                          on {}{}, still stands after the passes the design allows. Evidence: \
                          {}. {judged}{criterion}",
                         finding.id,
@@ -476,12 +573,12 @@ pub(crate) fn residue_questions(
                         clip(&finding.evidence, cap),
                     ),
                     text: format!(
-                        "{} How should the plan settle it?",
+                        "{} How should the {work} settle it?",
                         clip(&finding.claim, cap)
                     ),
                     options: vec![
                         format!("Settle it: {}", clip(&finding.settle, cap)),
-                        "Leave the plan as it is".to_owned(),
+                        format!("Leave the {work} as it is"),
                     ],
                     recommendation: None,
                     replan: false,
@@ -575,6 +672,16 @@ impl OnDemand<'_> {
                     Built::Delivered(delivered) => return Ok(delivered),
                     Built::Replan(next) => state = next,
                 },
+                // A Verify pass `continue` runs again on the kept Build
+                // (OWL-304), then the delivery or a Verify fix run.
+                Status::Active(Stage::Verify) => {
+                    match self.verify_pass(p, &dispatched, state, sink)? {
+                        Verified::Passed(verified) => {
+                            return self.deliver(p, &dispatched, &verified, sink);
+                        }
+                        Verified::Revise(next) => state = next,
+                    }
+                }
                 other => return Err(core_error(other)),
             }
         }
@@ -903,39 +1010,8 @@ impl OnDemand<'_> {
             .ok_or_else(|| Stop::Refused("a design run done without a plan".to_owned()))?;
         // What the run did with the findings it was given, on the pass that
         // raised them.
-        if let (Some(given), Some(review)) = (&brief.findings, p.review.as_mut())
-            && let Some(last) = review
-                .passes
-                .iter_mut()
-                .rev()
-                .find(|pass| pass.stage == Stage::DesignReview)
-        {
-            for kept in &mut last.findings {
-                if !given.findings.iter().any(|f| f.id == kept.finding.id) {
-                    continue;
-                }
-                match given.mode {
-                    FindingsMode::Answer => {
-                        if let Some(response) = result
-                            .finding_responses
-                            .iter()
-                            .find(|response| response.finding == kept.finding.id)
-                        {
-                            kept.response = Some(KeptResponse {
-                                outcome: response.outcome,
-                                reason: response.reason.clone(),
-                            });
-                            kept.outcome = Some(match response.outcome {
-                                ResponseOutcome::Fixed => FindingOutcome::Fixed,
-                                ResponseOutcome::Rejected => FindingOutcome::Rejected,
-                            });
-                        }
-                    }
-                    FindingsMode::Fix | FindingsMode::Rule => {
-                        kept.outcome = Some(FindingOutcome::Fixed);
-                    }
-                }
-            }
+        if let (Some(given), Some(review)) = (&brief.findings, p.review.as_mut()) {
+            mark_answered(review, Stage::DesignReview, given, result);
         }
         let base = self.branch_head(p).unwrap_or_else(|| p.base.commit.clone());
         let kept = TicketPlan {
@@ -971,33 +1047,38 @@ impl OnDemand<'_> {
         Ok(next)
     }
 
-    /// One Design review pass on the kept plan: each seat of the roster,
-    /// the arbiter when findings are to be confirmed by it, the pass settled
-    /// by the core, then a loop back to Design, or the PLAN comment and
-    /// Build or a round for the decider.
-    fn review_pass(
+    /// One review pass at `stage`, Design review or Verify, shared by both
+    /// (OWL-303, OWL-304): each seat of the roster on its seat's routing,
+    /// the critic on Codex when Codex can run it, else standing in on
+    /// Claude Code with a `critic_stands_in` warning; the arbiter when the
+    /// pass has findings the project confirms so; the pass settled by the
+    /// core; its `ruling`, `pass` and `residue` events, `next` naming what
+    /// each outcome leads to; and the review record with the pass, checked,
+    /// not kept yet. The seats read `plan` and, at Verify, `diff`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_review_pass(
         &self,
         p: &mut Prepared,
         dispatched: &Dispatched,
-        mut state: TicketState,
+        state: &mut TicketState,
+        stage: Stage,
+        plan: Option<GivenPlan>,
+        diff: Option<GivenDiff>,
+        next: &dyn Fn(PassOutcome) -> &'static str,
         sink: &mut EventSink<'_>,
-    ) -> Result<TicketState, Stop> {
+    ) -> Result<PassRun, Stop> {
         let ticket = p.ticket.clone();
         let current = person(p.current()?, &p.found);
-        let kept = p.plan.clone().ok_or_else(|| {
-            Stop::Refused(format!(
-                "{ticket} is at design review but its ref keeps no plan: `owlshift forget \
-                 {ticket}` starts its record over"
-            ))
-        })?;
-        let given = GivenPlan {
-            base: kept.base.clone(),
-            plan: kept.plan.clone(),
+        let (role, reviewers) = if stage == Stage::Verify {
+            (Role::Verify, self.verify)
+        } else {
+            (Role::DesignReview, self.design_review)
         };
+        let stage_key = stage_name(stage);
         let pass = state.review_pass_due();
         let pass_id = NonZeroU32::new(pass).expect("a pass due counts from 1");
-        let codex = self.design_review.codex.filter(|_| p.critic.is_none());
-        if let (Some(_), Some(why)) = (self.design_review.codex, &p.critic) {
+        let codex = reviewers.codex.filter(|_| p.critic.is_none());
+        if let (Some(_), Some(why)) = (reviewers.codex, &p.critic) {
             sink.emit(
                 &ticket,
                 None,
@@ -1006,7 +1087,7 @@ impl OnDemand<'_> {
             );
         }
         let models = &self.config.models;
-        let seats = roster::roster(p.pipeline.variant(), Stage::DesignReview, codex.is_some());
+        let seats = roster::roster(p.pipeline.variant(), stage, codex.is_some());
         let mut outputs: Vec<SeatOutput> = Vec::new();
         let mut routings = Vec::new();
         let mut last_run = None;
@@ -1016,37 +1097,28 @@ impl OnDemand<'_> {
                 (HarnessKind::Codex, Some(codex)) => {
                     (codex, codex_model(models, routed.routing.tier))
                 }
-                _ => (
-                    self.design_review.claude,
-                    claude_model(models, routed.routing.tier),
-                ),
+                _ => (reviewers.claude, claude_model(models, routed.routing.tier)),
             };
             let harness = router.harness(routed.routing);
             let comments = self.comments(&ticket)?;
-            let mut brief = self.brief(
-                p,
-                Role::DesignReview,
-                &comments,
-                &dispatched.rules,
-                None,
-                &current,
-            );
-            brief.plan = Some(given.clone());
+            let mut brief = self.brief(p, role, &comments, &dispatched.rules, None, &current);
+            brief.plan = plan.clone();
             brief.review = Some(ReviewBrief {
                 mandates: seat.mandates.to_vec(),
                 pass: pass_id,
-                diff: None,
+                diff: diff.clone(),
             });
-            let (ran, result) = self.review_run(p, &*harness, &mut state, &brief, sink)?;
+            let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
             last_run = Some(ran.run.clone());
             routings.push(routed);
             outputs.push(SeatOutput {
                 reviewer: Reviewer {
-                    role: Role::DesignReview,
+                    role,
                     mandates: seat.mandates.to_vec(),
                     harness: seat.harness,
                     model: model.unwrap_or("default").to_owned(),
                     stand_in: seat.stand_in,
+                    same_model: routed.same_model,
                 },
                 model: model.map(str::to_owned),
                 same_model: routed.same_model,
@@ -1065,53 +1137,44 @@ impl OnDemand<'_> {
                 None,
                 &current,
             );
-            brief.plan = Some(given.clone());
+            brief.plan = plan.clone();
             brief.findings = Some(GivenFindings {
                 mode: FindingsMode::Rule,
                 findings: findings.iter().map(|kept| kept.finding.clone()).collect(),
-                diff: None,
+                diff: diff.clone(),
             });
             let routing =
                 role_routing(Role::Arbiter, dispatched.routing).expect("the arbiter has its layer");
             let harness = self.arbiter.harness(routing);
-            let (ran, result) = self.review_run(p, &*harness, &mut state, &brief, sink)?;
+            let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
             findings = pass_findings(&outputs, Some(&result.rulings));
+            let ruled = |outcome: RulingOutcome| {
+                finding_ids(findings.iter().filter(|kept| {
+                    kept.ruling
+                        .as_ref()
+                        .is_some_and(|ruling| ruling.outcome == outcome)
+                }))
+            };
             sink.emit(
                 &ticket,
                 Some(&ran.run),
                 EventKind::Decision,
                 data([
                     ("review", json!("ruling")),
-                    ("stage", json!("design_review")),
+                    ("stage", json!(stage_key)),
                     ("pass", json!(pass)),
-                    (
-                        "confirmed",
-                        finding_ids(findings.iter().filter(|kept| {
-                            kept.ruling
-                                .as_ref()
-                                .is_some_and(|r| r.outcome == RulingOutcome::Confirmed)
-                        })),
-                    ),
-                    (
-                        "rejected",
-                        finding_ids(findings.iter().filter(|kept| {
-                            kept.ruling
-                                .as_ref()
-                                .is_some_and(|r| r.outcome == RulingOutcome::Rejected)
-                        })),
-                    ),
+                    ("confirmed", ruled(RulingOutcome::Confirmed)),
+                    ("rejected", ruled(RulingOutcome::Rejected)),
                 ]),
             );
             last_run = Some(ran.run.clone());
         }
-        let verdict = settle_pass(Stage::DesignReview, pass, &mut findings, confirmation)
-            .expect("design review settles");
-        let gate = self.plan_gate(p, &kept);
-        let event = verdict.outcome.design_review_event(gate);
+        let verdict =
+            settle_pass(stage, pass, &mut findings, confirmation).expect("a review stage settles");
         // The residue round asks what it can; the rest waits for the pass
         // after the round (OWL-303).
         let (questions, not_asked) = if verdict.outcome == PassOutcome::Ask {
-            residue_questions(&findings, pass)
+            residue_questions(&findings, stage, pass)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1120,13 +1183,7 @@ impl OnDemand<'_> {
                 kept.outcome = None;
             }
         }
-        let next_name = match event {
-            Event::LoopBack => "design",
-            Event::Completed => "build",
-            _ if verdict.outcome == PassOutcome::Passed => "approval",
-            _ => "questions",
-        };
-        let reviewers: Vec<Value> = outputs
+        let reviewers_data: Vec<Value> = outputs
             .iter()
             .zip(&routings)
             .map(|(output, routed)| {
@@ -1148,30 +1205,37 @@ impl OnDemand<'_> {
             EventKind::Decision,
             data([
                 ("review", json!("pass")),
-                ("stage", json!("design_review")),
+                ("stage", json!(stage_key)),
                 ("pass", json!(pass)),
                 ("outcome", json!(outcome_name(verdict.outcome))),
-                ("next", json!(next_name)),
+                ("next", json!(next(verdict.outcome))),
                 ("findings", json!(findings.len())),
                 ("standing", json!(standing(&findings, confirmation).len())),
-                ("reviewers", json!(reviewers)),
+                ("reviewers", json!(reviewers_data)),
             ]),
         );
         if verdict.outcome != PassOutcome::Revise {
-            let noted: Vec<&KeptFinding> = standing(&findings, confirmation)
+            // Design review notes a `minor` for the Build; Verify proposes
+            // what it does not ask as a follow-up (OWL-304).
+            let (label, fate) = if stage == Stage::Verify {
+                ("proposed", Fate::Propose)
+            } else {
+                ("noted", Fate::Note)
+            };
+            let left: Vec<&KeptFinding> = standing(&findings, confirmation)
                 .iter()
                 .zip(&verdict.fates)
-                .filter(|(_, fate)| **fate == Fate::Note)
+                .filter(|(_, f)| **f == fate)
                 .map(|((n, _), _)| &findings[*n])
                 .collect();
-            if verdict.outcome == PassOutcome::Ask || !noted.is_empty() {
+            if verdict.outcome == PassOutcome::Ask || !left.is_empty() {
                 sink.emit(
                     &ticket,
                     last_run.as_deref(),
                     EventKind::Decision,
                     data([
                         ("review", json!("residue")),
-                        ("stage", json!("design_review")),
+                        ("stage", json!(stage_key)),
                         ("pass", json!(pass)),
                         (
                             "asked",
@@ -1181,7 +1245,7 @@ impl OnDemand<'_> {
                                     .filter(|kept| kept.outcome == Some(FindingOutcome::Asked)),
                             ),
                         ),
-                        ("noted", finding_ids(noted)),
+                        (label, finding_ids(left)),
                         (
                             "not_asked",
                             json!(not_asked.iter().map(FindingId::as_str).collect::<Vec<_>>()),
@@ -1194,18 +1258,86 @@ impl OnDemand<'_> {
             format: Format,
             passes: Vec::new(),
             answered_reviews: Vec::new(),
+            build: None,
         });
-        review.passes.push(ReviewPass {
-            stage: Stage::DesignReview,
-            pass: pass_id,
-            findings: findings.clone(),
-        });
+        push_pass(
+            &mut review,
+            ReviewPass {
+                stage,
+                pass: pass_id,
+                findings: findings.clone(),
+                reviewers: outputs
+                    .iter()
+                    .map(|output| output.reviewer.clone())
+                    .collect(),
+            },
+        );
         review.validate().map_err(|e| {
             Stop::Refused(format!(
                 "the review record of {ticket} would not read back ({e}): `owlshift forget \
                  {ticket}` starts it over"
             ))
         })?;
+        Ok(PassRun {
+            pass,
+            outputs,
+            findings,
+            verdict,
+            questions,
+            not_asked,
+            last_run,
+            review,
+        })
+    }
+
+    /// One Design review pass on the kept plan ([`Self::run_review_pass`]),
+    /// then a loop back to Design, or the PLAN comment and Build or a round
+    /// for the decider.
+    fn review_pass(
+        &self,
+        p: &mut Prepared,
+        dispatched: &Dispatched,
+        mut state: TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketState, Stop> {
+        let ticket = p.ticket.clone();
+        let kept = p.plan.clone().ok_or_else(|| {
+            Stop::Refused(format!(
+                "{ticket} is at design review but its ref keeps no plan: `owlshift forget \
+                 {ticket}` starts its record over"
+            ))
+        })?;
+        let given = GivenPlan {
+            base: kept.base.clone(),
+            plan: kept.plan.clone(),
+        };
+        let gate = self.plan_gate(p, &kept);
+        let next = |outcome: PassOutcome| match outcome.design_review_event(gate) {
+            Event::LoopBack => "design",
+            Event::Completed => "build",
+            _ if outcome == PassOutcome::Passed => "approval",
+            _ => "questions",
+        };
+        let PassRun {
+            pass,
+            outputs,
+            findings,
+            verdict,
+            questions,
+            not_asked,
+            last_run,
+            review,
+        } = self.run_review_pass(
+            p,
+            dispatched,
+            &mut state,
+            Stage::DesignReview,
+            Some(given),
+            None,
+            &next,
+            sink,
+        )?;
+        let event = verdict.outcome.design_review_event(gate);
         if event == Event::LoopBack {
             let next = match state.apply(p.pipeline, Event::LoopBack) {
                 Ok(Transition::To(next)) => next,
@@ -1331,6 +1463,7 @@ mod tests {
             harness,
             model: "default".to_owned(),
             stand_in: false,
+            same_model: false,
         }
     }
 
@@ -1472,9 +1605,11 @@ mod tests {
                     stage: Stage::DesignReview,
                     pass: NonZeroU32::new(*pass).unwrap(),
                     findings: findings.clone(),
+                    reviewers: Vec::new(),
                 })
                 .collect(),
             answered_reviews: Vec::new(),
+            build: None,
         }
     }
 
@@ -1652,7 +1787,7 @@ mod tests {
                 ..asked(3, Severity::Minor, 10)
             },
         ];
-        let (questions, over) = residue_questions(&findings, 2);
+        let (questions, over) = residue_questions(&findings, Stage::DesignReview, 2);
         let asked_ids: Vec<&str> = questions.iter().map(|(_, id)| id.as_str()).collect();
         assert_eq!(asked_ids, ["F2", "F1"]);
         assert!(over.is_empty());
@@ -1665,9 +1800,19 @@ mod tests {
                 .contains("Finding F2 of design review pass 2, a blocker")
         );
         assert_eq!(first.options[1], "Leave the plan as it is");
+        // At Verify, the change settles it (OWL-304).
+        let (questions, _) = residue_questions(&findings, Stage::Verify, 3);
+        let (first, _) = &questions[0];
+        assert!(
+            first
+                .context
+                .contains("Finding F2 of verify pass 3, a blocker")
+        );
+        assert!(first.text.ends_with("How should the change settle it?"));
+        assert_eq!(first.options[1], "Leave the change as it is");
 
         let many: Vec<KeptFinding> = (1..=70).map(|n| asked(n, Severity::Major, 2_000)).collect();
-        let (questions, over) = residue_questions(&many, 3);
+        let (questions, over) = residue_questions(&many, Stage::DesignReview, 3);
         assert_eq!(questions.len(), MAX_QUESTIONS);
         assert_eq!(over.len(), 6);
         assert_eq!(over[0], FindingId::nth(65));

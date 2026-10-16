@@ -27,8 +27,7 @@
 //! once with `go` ([`crate::answer_check`]), then resumes the Build
 //! after a RESUME comment of what was understood, asks again what is
 //! missing, or parks the ticket. Every park, of a Build or of an answer
-//! check, posts a PARKED comment saying why and what restarts it. In this
-//! version the build stage is the whole pipeline.
+//! check, posts a PARKED comment saying why and what restarts it.
 //!
 //! Before a ticket that went through a round is delivered, the thread is
 //! read again (OWL-139): a decider comment the done Build run did not see
@@ -51,7 +50,10 @@
 //! `standard` or `risky` ticket is dispatched from Ready to Design, whose
 //! plan Design review reviews before Build; see the `design` module. The
 //! variant is the ticket's `variant:` label, else intake's verdict, else the
-//! project's `pipeline.default`, read at each command.
+//! project's `pipeline.default`, read at each command. Every variant's Build,
+//! once its gate passed, goes through Verify before the push (OWL-304): its
+//! roster reviews the diff, and what it finds is fixed, rejected, asked or
+//! proposed; see the `verify` module.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -146,8 +148,10 @@ mod correction;
 mod design;
 mod drain;
 mod intake;
+mod verify;
 
 use design::Built;
+use verify::Verified;
 
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
@@ -407,6 +411,9 @@ pub struct OnDemand<'a> {
     /// Runs the reviewers of Design review (`roles/design_review.md`), each
     /// on its seat's routing (OWL-303).
     pub design_review: Reviewers<'a>,
+    /// Runs the reviewers of Verify (`roles/verify.md`), each on its seat's
+    /// routing (OWL-304).
+    pub verify: Reviewers<'a>,
     /// Runs the arbiter (`roles/arbiter.md`) on its role's routing: the
     /// standard tier, without an effort (OWL-303).
     pub arbiter: &'a dyn Router,
@@ -1074,6 +1081,11 @@ impl OnDemand<'_> {
             Ok(Transition::To(state)) => state,
             other => return Err(core_error(other)),
         };
+        // A new delivery: what an earlier one's Build gave Verify goes, kept
+        // with the next write (OWL-304).
+        if let Some(review) = p.review.as_mut() {
+            review.build = None;
+        }
         // The branch starts from the base this command fetched (OWL-274):
         // one an earlier run, such as the ticket's intake, made at an older
         // base is fast-forwarded when it has no commits of its own. Before
@@ -1179,6 +1191,12 @@ impl OnDemand<'_> {
             return Err(nothing_to_continue(ticket));
         };
         let mut state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
+        // At Verify, parked or cut short, the pass runs again on the Build
+        // the ref keeps (OWL-304): refused, before a park is restarted or
+        // anything kept, when that Build is no longer what would be pushed.
+        if state.stage() == Stage::Verify {
+            self.verify_resumable(&p)?;
+        }
         // A person typing `continue` on a parked ticket is the restart the
         // core waits for.
         if let Status::Parked { at, .. } = state.status() {
@@ -1232,10 +1250,10 @@ impl OnDemand<'_> {
         {
             return self.watch_once(&mut p, sink);
         }
-        // Design, Design review and Build run on (OWL-303).
+        // Design, Design review, Build and Verify run on (OWL-303, OWL-304).
         if !matches!(
             state.status(),
-            Status::Active(Stage::Design | Stage::DesignReview | Stage::Build)
+            Status::Active(Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify)
         ) {
             return Err(Stop::Refused(format!(
                 "nothing to continue: {ticket} is at {} and waits for no answer; run `owlshift do \
@@ -1292,6 +1310,7 @@ impl OnDemand<'_> {
         let build = self.build.harness(PROJECT_DEFAULT);
         let design = self.design.harness(PROJECT_DEFAULT);
         let reviewer = self.design_review.claude.harness(PROJECT_DEFAULT);
+        let verifier = self.verify.claude.harness(PROJECT_DEFAULT);
         let arbiter = self.arbiter.harness(PROJECT_DEFAULT);
         for harness in [
             &*build,
@@ -1300,6 +1319,7 @@ impl OnDemand<'_> {
             self.intake,
             &*design,
             &*reviewer,
+            &*verifier,
             &*arbiter,
         ] {
             harness
@@ -1307,17 +1327,23 @@ impl OnDemand<'_> {
                 .map_err(|e| Stop::Refused(e.to_string()))?;
         }
         // The Codex critic only stands in when its harness cannot run here
-        // (architecture section 5, "Without Codex"): nothing is refused.
-        let critic = self.design_review.codex.and_then(|codex| {
-            codex
-                .harness(RunRouting {
-                    harness: owlshift_core::vocab::Harness::Codex,
-                    ..PROJECT_DEFAULT
-                })
-                .sandbox_needs(&self.executor.agent)
-                .err()
-                .map(|e| e.to_string())
-        });
+        // (architecture section 5, "Without Codex"): nothing is refused. Both
+        // review stages run the same Codex program and login with their own
+        // prompts, whose needs do not differ: one check serves them both.
+        let critic = self
+            .design_review
+            .codex
+            .or(self.verify.codex)
+            .and_then(|codex| {
+                codex
+                    .harness(RunRouting {
+                        harness: owlshift_core::vocab::Harness::Codex,
+                        ..PROJECT_DEFAULT
+                    })
+                    .sandbox_needs(&self.executor.agent)
+                    .err()
+                    .map(|e| e.to_string())
+            });
         // The ticket ref lives in the dedicated checkout: without one,
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
@@ -1631,7 +1657,14 @@ impl OnDemand<'_> {
         let current = person(p.current()?, &p.found);
         self.keep(p, &state)?;
         let harness = self.build.harness(dispatched.build);
+        let confirmation = self.config.pipeline.findings();
         let mut gathered = Gathered::default();
+        // The delivery's notes and follow-ups gathered so far, kept with the
+        // Build Verify reviewed, its proposed findings included (OWL-304).
+        if let Some(kept) = p.review.as_ref().and_then(|review| review.build.as_ref()) {
+            gather(&mut gathered.decisions, &kept.notes);
+            gather(&mut gathered.followups, &kept.followups);
+        }
         let mut attempt = 0u32;
         // Runs in a row whose questions the resolver all decided are
         // `p.settled`. Neither that count nor `integrating` below is reset
@@ -1641,7 +1674,7 @@ impl OnDemand<'_> {
         // The late comments a Build run of this command was given to
         // integrate (OWL-139): one such run per delivery.
         let mut integrating: Option<Vec<Comment>> = None;
-        let report = loop {
+        loop {
             attempt += 1;
             let comments = self.comments(&p.ticket)?;
             let mut brief = self.brief(
@@ -1657,6 +1690,15 @@ impl OnDemand<'_> {
             tell_build(&mut brief, &p.questions());
             // The plan the Build follows, with its base (OWL-303).
             brief.plan = design::given_plan(p);
+            // The findings of the latest Verify pass, to fix or answer
+            // (OWL-304).
+            brief.findings = verify::verify_input(&state, p.review.as_ref(), confirmation)
+                .map_err(|e| {
+                    Stop::Refused(format!(
+                        "{e}: `owlshift forget {}` starts its record over",
+                        p.ticket
+                    ))
+                })?;
             let (ran, event) =
                 self.run_role_once(p, &*harness, &state, &brief, attempt, &mut gathered, sink)?;
             let result = (event != Event::ResultRefused)
@@ -1807,10 +1849,13 @@ impl OnDemand<'_> {
                         sink,
                     ));
                 }
-                // Build completed: in this version, delivery follows. The
-                // decider's replies to DECISION comments its brief held are
-                // followed, so none starts a correction once delivered
-                // (OWL-146).
+                // Build completed: Verify follows (OWL-304). The decider's
+                // replies to DECISION comments its brief held are followed,
+                // so none starts a correction once delivered (OWL-146). What
+                // the run gives its delivery is kept with the state, the ref
+                // made when it has none, so `continue` runs a Verify pass cut
+                // short again; the findings a Verify fix run was given are
+                // marked fixed or answered on the pass that raised them.
                 _ => {
                     let mut questions = p.questions();
                     let reversed = reversal::reversals(
@@ -1818,18 +1863,36 @@ impl OnDemand<'_> {
                         &questions,
                         reversal::Current::Known(&current),
                     );
-                    if reversal::followed(&mut questions, &reversed) {
-                        self.store(p, &state, questions).map_err(|e| {
-                            refused("keeping the replies Build followed in the ticket's ref", e)
-                        })?;
-                    } else {
-                        self.keep(p, &state)?;
+                    reversal::followed(&mut questions, &reversed);
+                    let built = self.kept_build(p, &ran.report, &gathered, &comments)?;
+                    let review = p.review.get_or_insert_with(|| TicketReview {
+                        format: Format,
+                        passes: Vec::new(),
+                        answered_reviews: Vec::new(),
+                        build: None,
+                    });
+                    if let (Some(given), Some(result)) = (&brief.findings, ran.result()) {
+                        design::mark_answered(review, Stage::Verify, given, result);
                     }
-                    break ran.report;
+                    review.build = Some(built);
+                    self.store(p, &state, questions).map_err(|e| {
+                        refused("keeping the Build Verify reviews in the ticket's ref", e)
+                    })?;
+                    match self.verify_pass(p, dispatched, state, sink)? {
+                        Verified::Passed(verified) => {
+                            state = verified;
+                            break;
+                        }
+                        // A Verify fix run follows, its findings given.
+                        Verified::Revise(next) => {
+                            state = next;
+                            attempt = 0;
+                        }
+                    }
                 }
             }
-        };
-        self.deliver(p, dispatched, report, gathered, &state, sink)
+        }
+        self.deliver(p, dispatched, &state, sink)
             .map(Built::Delivered)
     }
 
@@ -3236,35 +3299,33 @@ impl OnDemand<'_> {
         }
     }
 
-    /// Delivers a Build `done` whose gate passed. The push leaves from the
-    /// dedicated checkout, never from the worktree (`Writer::push_branch`).
-    /// Delivers the gated commit: the ticket ref keeps the push under way
-    /// (`pushing`, OWL-209) before it, with `state`, the state Build left;
-    /// once the forge shows the commit as the pull request's head, the ref
-    /// keeps the pull request, `pushed`, `base_at_push` and Watch, in one
-    /// write, and watch follows it from its next pass.
+    /// Delivers the Build Verify passed, as `review.json` keeps it
+    /// ([`KeptBuild`], OWL-304): its gated commit, its pull request and what
+    /// its report says. The push leaves from the dedicated checkout, never
+    /// from the worktree (`Writer::push_branch`). The ticket ref keeps the
+    /// push under way (`pushing`, OWL-209) before it, with `state`, the
+    /// state Verify left; once the forge shows the commit as the pull
+    /// request's head, the ref keeps the pull request, `pushed`,
+    /// `base_at_push` and Watch, in one write, the kept Build dropped, and
+    /// watch follows it from its next pass.
     fn deliver(
         &self,
         p: &mut Prepared,
         dispatched: &Dispatched,
-        report: RunReport,
-        gathered: Gathered,
         state: &TicketState,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = &p.ticket.clone();
         let (head, base) = (&dispatched.head, &dispatched.base_branch);
-        let (Outcome::Finished { result, .. }, Some(gate)) = (&report.outcome, &report.gate) else {
-            return Err(Stop::Delivery(
-                "the run did not report a passing gate".to_owned(),
-            ));
-        };
-        let commit = gate
-            .commit
-            .as_deref()
-            .filter(|_| gate.passed())
-            .and_then(|commit| CommitId::new(commit).ok())
-            .ok_or_else(|| Stop::Delivery("the gate's commit is unknown".to_owned()))?;
+        let built = p
+            .review
+            .as_ref()
+            .and_then(|review| review.build.clone())
+            .ok_or_else(|| {
+                Stop::Delivery("the ticket's ref keeps no Build to deliver".to_owned())
+            })?;
+        let commit = CommitId::new(built.commit.as_str())
+            .map_err(|e| Stop::Delivery(format!("the kept Build's commit: {e}")))?;
         let writer = Writer::new(self.tracker);
         let delivery =
             |what: &str, error: &dyn fmt::Display| Stop::Delivery(format!("{what}: {error}"));
@@ -3299,9 +3360,9 @@ impl OnDemand<'_> {
             ]),
         );
 
-        let (title, body) = match &result.pr {
+        let (title, body) = match &built.pr {
             Some(pr) => (pr.title.clone(), pr.body.clone()),
-            None => (p.found.title.clone(), result.summary.clone()),
+            None => (p.found.title.clone(), built.summary.clone()),
         };
         let opened = writer
             .open_pull_request(self.forge, head, base, &title, &body)
@@ -3321,8 +3382,8 @@ impl OnDemand<'_> {
         // The pull request is open, whatever the steps below find.
         self.show(ticket, None, VisibleStage::Review, sink);
         let pull_request = self.head_at(opened.pull_request, head, base, &commit)?;
-        // Delivered: Completed at Verify, which has no role before P5, then
-        // at Deliver, to Watch, which follows the pull request.
+        // Delivered: Completed at Verify, then at Deliver, to Watch, which
+        // follows the pull request.
         let mut watching = *state;
         for _ in 0..2 {
             watching = match watching.apply(p.pipeline, Event::Completed) {
@@ -3341,21 +3402,27 @@ impl OnDemand<'_> {
         // that refuses it, or a crash, leaves it for the next pass (OWL-236).
         // It lists the resolver's decisions kept on the ticket, an earlier
         // command's included, then the runner's own note of late comments
-        // this one gave a run: Build takes no decision of its own (OWL-176).
+        // a run was given: Build takes no decision of its own (OWL-176). Its
+        // follow-ups are the delivery's Build runs' and those its Verify
+        // passes proposed from findings (OWL-304).
         kept.owed = Some(OwedReport {
             kind: PushKind::Delivery,
             count: 1,
             report: Some(KeptReport {
-                summary: result.summary.clone(),
-                gate: Some(gate.commands.clone()),
+                summary: built.summary,
+                gate: Some(built.gate),
                 checks: Vec::new(),
                 questions: Vec::new(),
-                notes: gathered.decisions,
-                followups: gathered.followups,
+                notes: built.notes,
+                followups: built.followups,
                 reviews: Vec::new(),
             }),
             unchanged: false,
         });
+        // Delivered: the Build Verify reviewed is no longer kept.
+        if let Some(review) = p.review.as_mut() {
+            review.build = None;
+        }
         // Its follow-ups are owed in the same write (OWL-253).
         let owed = self.owe(p, kept.owed.iter());
         let questions = p.questions();
@@ -4595,6 +4662,7 @@ impl OnDemand<'_> {
                 &ticket,
                 &kept,
                 &p.questions(),
+                p.review.as_ref(),
                 proposals.as_ref(),
                 checks,
                 following,
@@ -4628,13 +4696,15 @@ impl OnDemand<'_> {
     /// or, for a push adopted from a ref that kept nothing, that its summary
     /// was not kept. Every DELIVERY report is posted here, the first
     /// delivery's and a correction's that pushed nothing included (OWL-236),
-    /// so a post retried renders as the first try did.
+    /// so a post retried renders as the first try did. A delivery's report
+    /// names the Verify passes `review` keeps of it (OWL-304).
     #[allow(clippy::too_many_arguments)]
     fn post_owed(
         &self,
         ticket: &TicketId,
         delivery: &TicketDelivery,
         questions: &TicketQuestions,
+        review: Option<&TicketReview>,
         proposals: Option<&TicketProposals>,
         checks: Result<CheckSet, forge::Error>,
         following: &mut Following,
@@ -4727,6 +4797,9 @@ impl OnDemand<'_> {
             fix_pass,
             rebase,
             correction,
+            review: review
+                .filter(|_| owed.kind == PushKind::Delivery)
+                .and_then(verify::reported_review),
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
             Ok(comment) => {
@@ -4854,6 +4927,7 @@ impl OnDemand<'_> {
                 ticket,
                 delivery,
                 &record.questions,
+                record.review.as_ref(),
                 proposals,
                 checks,
                 following,

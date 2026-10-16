@@ -255,9 +255,12 @@ fn scenario_s4_unblocked_by_a_merge() {
             (Role::Intake, "DEMO-1".to_owned()),
             (Role::Intake, "DEMO-2".to_owned()),
             (Role::Build, "DEMO-1".to_owned()),
+            (Role::Verify, "DEMO-1".to_owned()),
             (Role::Intake, "DEMO-3".to_owned()),
             (Role::Build, "DEMO-2".to_owned()),
+            (Role::Verify, "DEMO-2".to_owned()),
             (Role::Build, "DEMO-3".to_owned()),
+            (Role::Verify, "DEMO-3".to_owned()),
         ]
     );
 }
@@ -366,7 +369,8 @@ fn a_start_that_would_overwrite_a_local_change_holds_the_drained_ticket() {
         bench.runs(),
         [
             (Role::Intake, TICKET.to_owned()),
-            (Role::Build, TICKET.to_owned())
+            (Role::Build, TICKET.to_owned()),
+            (Role::Verify, TICKET.to_owned())
         ]
     );
     assert_eq!(dispatched(&bench.events()), [TICKET]);
@@ -490,7 +494,7 @@ fn scenario_s3_questions_at_intake() {
             vec![json!("answer_check"), json!("intake")],
             vec![],
             vec![json!("intake")],
-            vec![json!("build")],
+            vec![json!("build"), json!("verify")],
         ],
         "{lines}"
     );
@@ -502,8 +506,7 @@ fn scenario_s3_questions_at_intake() {
         .map(|(n, _)| n + 1)
         .collect();
     assert_eq!(dispatches, [6]);
-    let build = bench.briefs().pop().unwrap();
-    assert_eq!(build.role, Role::Build);
+    let build = bench.last_of(Role::Build);
     assert!(build.ticket.description.contains("Say it in English."));
     // Back in the column after the answered round, blocked by both.
     let mut told = waits(&passes[2]);
@@ -662,7 +665,9 @@ fn scenario_s6_the_human_is_the_bottleneck() {
             (Role::Intake, "DEMO-2".to_owned()),
             (Role::Build, "DEMO-1".to_owned()),
             (Role::Build, "DEMO-1".to_owned()),
+            (Role::Verify, "DEMO-1".to_owned()),
             (Role::Build, "DEMO-2".to_owned()),
+            (Role::Verify, "DEMO-2".to_owned()),
         ]
     );
 }
@@ -1041,6 +1046,7 @@ fn scenario_s13_proposed_follow_ups() {
         [
             (Role::Intake, "DEMO-1".to_owned()),
             (Role::Build, "DEMO-1".to_owned()),
+            (Role::Verify, "DEMO-1".to_owned()),
             (Role::Intake, "DEMO-9".to_owned()),
         ]
     );

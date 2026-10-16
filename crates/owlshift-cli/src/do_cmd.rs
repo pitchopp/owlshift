@@ -30,7 +30,7 @@ use owlshift_runner::on_demand::{self, Delivered, OnDemand, Reviewers, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{
     ANSWER_CHECK_ROLE, ARBITER_ROLE, BUILD_ROLE, DESIGN_REVIEW_ROLE, DESIGN_ROLE, INTAKE_ROLE,
-    REBASE_ROLE, RESOLVER_ROLE,
+    REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
 use owlshift_runner::routing::{ClaudeRouter, CodexRouter, Router, claude_model};
 use owlshift_runner::system::System;
@@ -132,6 +132,8 @@ fn run_with(
         .map_err(|error| format!("the built-in design review role: {error}"))?;
     let arbiter_prompt = strip_role_front_matter(Role::Arbiter, ARBITER_ROLE)
         .map_err(|error| format!("the built-in arbiter role: {error}"))?;
+    let verify_prompt = strip_role_front_matter(Role::Verify, VERIFY_ROLE)
+        .map_err(|error| format!("the built-in verify role: {error}"))?;
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
@@ -240,19 +242,26 @@ fn run_with(
     };
     let design = routed(&design_prompt);
     let reviewer = routed(&design_review_prompt);
+    let verifier = routed(&verify_prompt);
     let arbiter = routed(&arbiter_prompt);
-    // The critic on Codex when Codex can run it here; otherwise it stands
-    // in on Claude Code (architecture section 5, "Without Codex").
-    let critic = codex_critic(system, &agent).ok().map(|found| CodexRouter {
-        harness: CodexHarness {
-            program: found.program,
-            prompt: design_review_prompt.clone(),
-            model: None,
-            effort: None,
-            login: found.login,
-        },
-        models: project.models.clone(),
-    });
+    // The critic on Codex when Codex can run it here, with each review
+    // stage's prompt; otherwise it stands in on Claude Code (architecture
+    // section 5, "Without Codex").
+    let codex = codex_critic(system, &agent).ok();
+    let critic_of = |prompt: &str| {
+        codex.as_ref().map(|found| CodexRouter {
+            harness: CodexHarness {
+                program: found.program.clone(),
+                prompt: prompt.to_owned(),
+                model: None,
+                effort: None,
+                login: found.login.clone(),
+            },
+            models: project.models.clone(),
+        })
+    };
+    let critic = critic_of(&design_review_prompt);
+    let verify_critic = critic_of(&verify_prompt);
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let on_demand = OnDemand {
@@ -265,6 +274,10 @@ fn run_with(
         design_review: Reviewers {
             claude: &reviewer,
             codex: critic.as_ref().map(|critic| critic as &dyn Router),
+        },
+        verify: Reviewers {
+            claude: &verifier,
+            codex: verify_critic.as_ref().map(|critic| critic as &dyn Router),
         },
         arbiter: &arbiter,
         answer_check: &check,

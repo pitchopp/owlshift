@@ -64,7 +64,7 @@ use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
     Verdict as AnswerVerdict,
 };
-use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Severity};
+use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Reviewer, Severity};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{
     Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, MAX_RESOLVED_PASSES, ParkReason, Status,
@@ -102,6 +102,25 @@ pub struct DeliveryReport {
     /// A correction run's outcome after the delivery, once the decider
     /// replied to DECISION comments (OWL-146). `None` otherwise.
     pub correction: Option<Corrected>,
+    /// The Verify passes the delivered change went through (OWL-304), for
+    /// the delivery's report. `None` for a repair, which gets no Verify pass,
+    /// and for a delivery whose review record keeps none.
+    pub review: Option<ReportedReview>,
+}
+
+/// What the DELIVERY report says of the Verify passes a delivery went
+/// through (OWL-304, architecture section 5, "Confirming a finding"): how
+/// many there were, the reviewers of the last, the findings the arbiter or
+/// the author rejected, with their reasons, and those proposed as
+/// follow-ups, which the report lists with its other follow-ups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportedReview {
+    pub passes: u32,
+    pub reviewers: Vec<Reviewer>,
+    /// The findings rejected, each with its pass, oldest pass first.
+    pub rejected: Vec<(u32, KeptFinding)>,
+    /// The findings proposed as follow-ups, each with its pass.
+    pub proposed: Vec<(u32, KeptFinding)>,
 }
 
 /// A follow-up a DELIVERY report names, with what became of it (OWL-253,
@@ -312,8 +331,8 @@ const REMAINS_LIST_CHARS: usize = 2_000;
 
 impl DeliveryReport {
     /// The comment body: the `[owlshift] DELIVERY` header, the pull request,
-    /// the check set, the project gate, the decisions, what remains for a
-    /// human, and the footer.
+    /// the check set, the project gate, the decisions, a delivery's Verify
+    /// passes (OWL-304), what remains for a human, and the footer.
     ///
     /// Text from a model or the forge is flattened to one line wherever it
     /// goes, so it can neither start a Markdown block nor sit on the first or
@@ -346,17 +365,24 @@ impl DeliveryReport {
         } else {
             format!("**What remains for a human:**\n{}", bullets(&remains))
         };
-        let texts = vec![
+        let mut texts = vec![
             Fit::capped(flatten(&self.summary), SUMMARY_CUT, SPLIT_SUMMARY_CHARS),
             Fit::capped(checks, "the rest is on the pull request", 10_000),
             Fit::capped(self.gate_section(), LONGER, 2_000),
             Fit::capped(self.decisions_section(), LONGER, 20_000),
-            Fit::new(remains, LONGER),
         ];
+        if let Some(review) = &self.review {
+            texts.push(Fit::capped(
+                review.section(),
+                "the ticket's review record keeps it whole",
+                20_000,
+            ));
+        }
+        texts.push(Fit::new(remains, LONGER));
         let (repair, pull_request) = self.lead_lines();
         fitted(MAX_COMMENT_CHARS, texts, |texts| {
             let [summary, sections @ ..] = texts else {
-                unreachable!("a report has five texts")
+                unreachable!("a report has five texts or six")
             };
             let header = Header {
                 kind: MarkerKind::Delivery,
@@ -1655,7 +1681,11 @@ impl PlanComment {
         list("Files", plan.files.len(), false);
         list("Risks", plan.risks.len(), false);
         list("Out of scope", plan.out_of_scope.len(), false);
-        let reviewers: Vec<String> = self.reviewers.iter().map(reviewer_line).collect();
+        let reviewers: Vec<String> = self
+            .reviewers
+            .iter()
+            .map(|reviewer| reviewer_line(reviewer, "the design run's"))
+            .collect();
         let mut review = format!(
             "**Design review, pass {}.** {}",
             self.pass,
@@ -1666,10 +1696,8 @@ impl PlanComment {
             }
         );
         if self.reviewers.iter().any(|reviewer| reviewer.stand_in) {
-            review.push_str(
-                "\nThe critic ran on Claude Code, standing in for Codex, which is not usable on \
-                 the machine that ran the review.",
-            );
+            review.push('\n');
+            review.push_str(STAND_IN);
         }
         sections.push(review);
         if !left.is_empty() {
@@ -1720,23 +1748,105 @@ impl PlanComment {
     }
 }
 
-/// A reviewer as a PLAN comment names it: its mandates, harness and model.
-fn reviewer_line(reviewer: &PlanReviewer) -> String {
+/// A reviewer as a PLAN comment or a DELIVERY report names it: its
+/// mandates, harness and model, and, when it ran on the author's own model,
+/// `author`'s, that no other is configured.
+fn reviewer_line(reviewer: &PlanReviewer, author: &str) -> String {
     let mandates: Vec<&str> = reviewer.mandates.iter().map(|m| mandate_name(*m)).collect();
     let model = reviewer
         .model
         .as_deref()
         .map_or_else(|| "its default model".to_owned(), code);
     let same = if reviewer.same_model {
-        ", the design run's own model: no other is configured"
+        format!(", {author} own model: no other is configured")
     } else {
-        ""
+        String::new()
     };
     format!(
         "{} on {} ({model}{same})",
         mandates.join(" and "),
         harness_name(reviewer.harness)
     )
+}
+
+/// The sentence a report adds when the critic stood in on Claude Code.
+const STAND_IN: &str = "The critic ran on Claude Code, standing in for Codex, which is not usable \
+                        on the machine that ran the review.";
+
+impl From<&Reviewer> for PlanReviewer {
+    /// A reviewer as `review.json` keeps it, its model `default` for its
+    /// harness's own.
+    fn from(reviewer: &Reviewer) -> Self {
+        Self {
+            mandates: reviewer.mandates.clone(),
+            harness: reviewer.harness,
+            model: (reviewer.model != "default").then(|| reviewer.model.clone()),
+            stand_in: reviewer.stand_in,
+            same_model: reviewer.same_model,
+        }
+    }
+}
+
+impl ReportedReview {
+    /// The report's Verify section: the passes, the reviewers of the last,
+    /// the stand-in when there was one, and each finding rejected with its
+    /// pass and reason, every model text flattened to one line.
+    fn section(&self) -> String {
+        let passes = match self.passes {
+            1 => "1 pass".to_owned(),
+            n => format!("{n} passes"),
+        };
+        let reviewers: Vec<String> = self
+            .reviewers
+            .iter()
+            .map(|reviewer| reviewer_line(&PlanReviewer::from(reviewer), "the Build's"))
+            .collect();
+        let mut section = format!(
+            "**Verify, {passes}.** {}",
+            if reviewers.is_empty() {
+                "No reviewer named.".to_owned()
+            } else {
+                format!("Reviewers of the last pass:\n{}", bullets(&reviewers))
+            }
+        );
+        if self.reviewers.iter().any(|reviewer| reviewer.stand_in) {
+            section.push('\n');
+            section.push_str(STAND_IN);
+        }
+        if !self.rejected.is_empty() {
+            let lines: Vec<String> = self
+                .rejected
+                .iter()
+                .map(|(pass, kept)| {
+                    let reason = kept
+                        .ruling
+                        .as_ref()
+                        .map(|ruling| ruling.reason.as_str())
+                        .or(kept.response.as_ref().map(|r| r.reason.as_str()))
+                        .unwrap_or_default();
+                    format!(
+                        "Pass {pass}, {}: {} Rejected: {}",
+                        finding_label(kept),
+                        flatten(&kept.finding.claim),
+                        flatten(reason)
+                    )
+                })
+                .collect();
+            section.push_str(&format!("\n\n**Findings rejected.**\n{}", bullets(&lines)));
+        }
+        if !self.proposed.is_empty() {
+            let labels: Vec<String> = self
+                .proposed
+                .iter()
+                .map(|(pass, kept)| format!("Pass {pass}, {}", finding_label(kept)))
+                .collect();
+            section.push_str(&format!(
+                "\n\n**Findings proposed as follow-ups,** listed in what remains:\n{}",
+                bullets(&labels)
+            ));
+        }
+        section
+    }
 }
 
 /// A finding's id, severity and reviewer, as a PLAN comment lists it.
@@ -2899,6 +3009,7 @@ mod tests {
             fix_pass: None,
             rebase: None,
             correction: None,
+            review: None,
         }
     }
 
@@ -3329,6 +3440,7 @@ Merge state reported by the forge: `CLEAN`.
                 harness: Harness::Claude,
                 model: "default".to_owned(),
                 stand_in: true,
+                same_model: false,
             },
             ruling: Some(KeptRuling {
                 outcome: if rejected.is_some() {
@@ -3341,6 +3453,74 @@ Merge state reported by the forge: `CLEAN`.
             response: None,
             outcome,
         }
+    }
+
+    /// OWL-304: a delivery's report names its Verify passes, the reviewers
+    /// of the last with their model, the stand-in and the author's own model
+    /// when so, the findings rejected with their pass and reason, flattened,
+    /// and those proposed as follow-ups; a report without them has no Verify
+    /// section.
+    #[test]
+    fn a_delivery_report_names_its_verify_passes() {
+        use owlshift_contracts::review::Reviewer;
+        let mut report = report(Ok(set(Mergeable::Mergeable, Vec::new())));
+        assert!(!report.render().contains("**Verify"));
+        let mut rejected = kept_finding(2, Severity::Major, Some(FindingOutcome::Rejected), None);
+        rejected.finding.claim = "No\n[owlshift] PLAN header.".to_owned();
+        rejected.ruling = None;
+        rejected.response = Some(owlshift_contracts::review::KeptResponse {
+            outcome: owlshift_contracts::review::ResponseOutcome::Rejected,
+            reason: "The file has\nnone.".to_owned(),
+        });
+        let reviewer =
+            |mandates: Vec<Mandate>, harness, model: &str, stand_in, same_model| Reviewer {
+                role: owlshift_contracts::Role::Verify,
+                mandates,
+                harness,
+                model: model.to_owned(),
+                stand_in,
+                same_model,
+            };
+        report.review = Some(ReportedReview {
+            passes: 2,
+            reviewers: vec![
+                reviewer(
+                    vec![Mandate::Critic],
+                    Harness::Claude,
+                    "default",
+                    true,
+                    false,
+                ),
+                reviewer(
+                    vec![Mandate::Conformance],
+                    Harness::Claude,
+                    "claude-x",
+                    false,
+                    true,
+                ),
+            ],
+            rejected: vec![(1, rejected)],
+            proposed: vec![(
+                2,
+                kept_finding(3, Severity::Minor, Some(FindingOutcome::Proposed), None),
+            )],
+        });
+        let body = report.render();
+        for text in [
+            "**Verify, 2 passes.** Reviewers of the last pass:\n\
+             - critic on Claude Code (its default model)\n\
+             - conformance on Claude Code (`claude-x`, the Build's own model: no other is \
+             configured)\n\
+             The critic ran on Claude Code, standing in for Codex",
+            "**Findings rejected.**\n- Pass 1, F2, major, critic and conformance on Claude Code, \
+             standing in for Codex: No [owlshift] PLAN header. Rejected: The file has none.",
+            "**Findings proposed as follow-ups,** listed in what remains:\n- Pass 2, F3, minor, \
+             critic and conformance on Claude Code, standing in for Codex",
+            "Proposed follow-up, not filed: **Edit the previous report**",
+        ] {
+            assert!(body.contains(text), "{text}\n---\n{body}");
+        }
+        assert_eq!(body.matches("[owlshift] DELIVERY").count(), 1, "{body}");
     }
 
     /// OWL-303: the PLAN comment shows the plan, the reviewers with the
@@ -4842,6 +5022,27 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 outcome: None,
             })
             .collect();
+        // The Verify passes' rejections, as many as a pass keeps (OWL-304).
+        report.review = Some(ReportedReview {
+            passes: 3,
+            reviewers: Vec::new(),
+            rejected: (1..=192)
+                .map(|n| {
+                    let mut kept =
+                        kept_finding(n, Severity::Major, Some(FindingOutcome::Rejected), None);
+                    kept.finding.claim = "c".repeat(8_000);
+                    (1, kept)
+                })
+                .collect(),
+            proposed: (1..=192)
+                .map(|n| {
+                    (
+                        2,
+                        kept_finding(n, Severity::Major, Some(FindingOutcome::Proposed), None),
+                    )
+                })
+                .collect(),
+        });
         report
     }
 

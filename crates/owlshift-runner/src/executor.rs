@@ -96,6 +96,16 @@ pub const RUN_DIR: &str = ".owlshift/run";
 /// Where the executor writes the brief, relative to the worktree.
 pub const BRIEF_PATH: &str = ".owlshift/run/brief.json";
 
+/// Where the runner writes the diff a Verify pass reviews, relative to the
+/// worktree (OWL-302, OWL-304): beside the brief, out of git.
+pub const DIFF_PATH: &str = ".owlshift/run/diff.patch";
+
+/// Writes `content` at [`DIFF_PATH`] in `worktree`, through no link, the
+/// run folder made as for a run; returns the file's path.
+pub fn write_diff(worktree: &Path, content: &[u8]) -> Result<PathBuf, ExecutorError> {
+    worktree::write_run_file(worktree, DIFF_PATH, content)
+}
+
 /// Where the role writes `result.json`, relative to the worktree: the
 /// brief's `result_path`.
 pub const RESULT_PATH: &str = ".owlshift/run/result.json";

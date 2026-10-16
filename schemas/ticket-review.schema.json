@@ -14,6 +14,17 @@
       },
       "uniqueItems": true
     },
+    "build": {
+      "description": "What the Build that Verify reviews gave for its delivery (OWL-304):\nkept once a Build is done and its gate passed, so that `continue`\nruns a Verify pass cut short again and delivers. Dropped when the\nticket is delivered or dispatched again from Ready.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KeptBuild"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
@@ -33,6 +44,28 @@
     "format"
   ],
   "$defs": {
+    "Decision": {
+      "description": "A decision the role took on its own.",
+      "type": "object",
+      "properties": {
+        "basis": {
+          "description": "What the decision rests on: the ticket, the code, the docs, a fact.",
+          "type": "string"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question",
+        "decision",
+        "basis"
+      ]
+    },
     "Finding": {
       "description": "A finding of a review run (architecture section 5, \"Design review\").\nEvery text is not blank.",
       "type": "object",
@@ -102,12 +135,119 @@
         }
       ]
     },
+    "Followup": {
+      "description": "A follow-up ticket proposed to a human.",
+      "type": "object",
+      "properties": {
+        "blocked_by_parent": {
+          "description": "Whether the follow-up waits for the current ticket to be done.",
+          "type": "boolean",
+          "default": false
+        },
+        "done_when": {
+          "description": "When the follow-up counts as done.",
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/FollowupSource"
+        },
+        "title": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "why",
+        "source",
+        "done_when"
+      ]
+    },
+    "FollowupSource": {
+      "description": "Who found the follow-up.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "reviewer",
+        "ci"
+      ]
+    },
     "Harness": {
       "description": "A harness: a vendor CLI that runs one role headless.",
       "type": "string",
       "enum": [
         "claude",
         "codex"
+      ]
+    },
+    "KeptBuild": {
+      "description": "What a Build gave for its delivery, kept while Verify reviews it\n(OWL-304, [`TicketReview::build`]): what the push, the pull request and\nthe DELIVERY report take, gathered over the delivery's Build runs.",
+      "type": "object",
+      "properties": {
+        "commit": {
+          "description": "The commit the runner's gate passed on, a full commit id: what is\npushed.",
+          "type": "string"
+        },
+        "followups": {
+          "description": "The follow-ups the delivery's Build runs proposed, then those its\nVerify passes proposed from findings.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Followup"
+          }
+        },
+        "gate": {
+          "description": "The project gate's commands, all passed.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "description": "The runner's own notes the report lists, such as the late comments a\nBuild run was given (OWL-139).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Decision"
+          }
+        },
+        "pr": {
+          "description": "The pull request the Build run proposed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PullRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seen": {
+          "description": "The newest edit of the decider's comments the Build run's brief\nheld, when it held one: a comment of theirs edited later is one the\nBuild did not see (OWL-139).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "summary": {
+          "description": "The Build run's `summary`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "summary"
       ]
     },
     "KeptFinding": {
@@ -216,6 +356,27 @@
         }
       ]
     },
+    "PullRequest": {
+      "description": "The pull request the runner opens for a finished ticket.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "title",
+        "body"
+      ]
+    },
     "ResponseOutcome": {
       "description": "What the author did with a finding.",
       "type": "string",
@@ -242,6 +403,13 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 1
+        },
+        "reviewers": {
+          "description": "The reviewers that ran the pass, in seat order, those that found\nnothing included (OWL-304): what the DELIVERY report names.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Reviewer"
+          }
         },
         "stage": {
           "description": "`design_review` or `verify`.",
@@ -277,6 +445,10 @@
         "role": {
           "description": "The reviewer's role: `design_review` or `verify`, the pass's stage.",
           "$ref": "#/$defs/Role"
+        },
+        "same_model": {
+          "description": "A reviewer on Claude Code that ran on the author's own model, no\nother one being configured (OWL-304): the reports say so.",
+          "type": "boolean"
         },
         "stand_in": {
           "description": "It stood in for a reviewer of another harness, such as the critic on\nClaude Code without Codex.",
