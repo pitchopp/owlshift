@@ -38,10 +38,10 @@ Keep the questions within the runner's bounds, counted in bytes of the questions
 
 Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 9, rejected if it carries any field not listed here:
 
-- `status`: `done` when nothing is left to ask; `questions` when the decider must answer first; `blocked` when the ticket cannot be read for what it asks (say why in `summary`); `failed` when you cannot finish. Never `premise_false`: a premise you doubt is a question.
+- `status`: `done` when nothing is left to ask; `questions` when the decider must answer first; `blocked` when the ticket cannot be read for what it asks (say why in `summary`); `failed` when you cannot finish. `premise_false` when the repository or its documents contradict what the ticket rests on (a file, a symbol, a behaviour that is not there): give the evidence in `summary`. A premise only the outside world can show (a CLI flag, an external API, a price) is never `premise_false`, since you have no network: it is a question.
 - `summary`: one or two sentences on the ticket as you read it.
 - `intake`, with `done` and with `questions`: your `variant`, `routing` and `dependencies`, as above. With `questions`, record what you can tell now: once the decider has answered, you run again with their answers in the `thread`, and that run's record replaces this one.
-- `questions`, with `questions` only: at least one, as above.
+- `questions`, with `questions` and with `premise_false`: at least one, as above. With `premise_false`, give no `intake`, and let the question hold the evidence in its `context` and offer two `options`: a re-scope you propose, written out, or closing the ticket, with your `recommendation`. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, read the ticket as re-scoped.
 
 Leave out `decisions`, `resolutions`, `verdicts`, `followups`, `artifacts` and `pr`: they belong to other roles. An example:
 

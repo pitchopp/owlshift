@@ -748,6 +748,23 @@ impl OnDemand<'_> {
                 sink,
             )?;
             let result = ran.result();
+            // A false premise that asks nothing parks the ticket
+            // (architecture section 5, "A false premise"); with questions it
+            // is a round, all to the decider.
+            if event == Event::Questions
+                && let Some(result) = result
+                && !result.asks()
+            {
+                return Err(self.park_false_premise(
+                    p,
+                    p.pipeline,
+                    &state,
+                    "design run",
+                    &ran.run,
+                    result,
+                    sink,
+                ));
+            }
             if event == Event::Questions
                 && let Some(result) = result
             {

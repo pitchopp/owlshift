@@ -7579,6 +7579,109 @@ fn an_intake_round_returns_the_ticket_to_the_ready_column() {
     assert_eq!(roles, [Role::Intake, Role::AnswerCheck, Role::Intake]);
 }
 
+/// A false premise at intake (OWL-306, S8): its questions all go to the
+/// decider, with no resolver run, the round returning to Intake; the QUESTIONS
+/// comment says the premise is false; no intake record is kept; the answered
+/// round runs intake again.
+#[test]
+fn a_false_premise_at_intake_is_a_round_to_the_decider() {
+    let bench = Bench::drained();
+    let premise = r#"{"format":9,"status":"premise_false",
+"summary":"The ticket extends a README section that does not exist.",
+"questions":[{"id":"Q1","category":"naming","context":"The ticket extends README.md's Usage section; there is none.",
+"text":"Re-scope to write the section, or close the ticket?",
+"options":["Re-scope: write the section.","Close the ticket."],"recommendation":"Re-scope"}]}"#;
+    let asks = bench.reply(None, Some(premise));
+    let stop = bench
+        .intake(vec![asks], gesture("maintainer"))
+        .expect_err("the premise goes to the decider");
+    assert!(
+        matches!(
+            &stop,
+            Stop::NeedsInput {
+                status: owlshift_contracts::result::Status::PremiseFalse,
+                posted: Ok(round),
+                ..
+            } if round.get() == 1
+        ),
+        "{stop}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Intake]);
+    let kept = bench.record();
+    assert!(kept.intake.is_none(), "a premise round has no record");
+    assert_eq!(
+        TicketState::try_from(&kept.state).unwrap().status(),
+        Status::NeedsInput {
+            return_to: Stage::Intake
+        }
+    );
+    assert_eq!(bench.stage(), "Needs Input");
+    assert!(
+        bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] QUESTIONS")
+                && c.contains("The run found the ticket's premise false."))
+    );
+
+    bench.answer("Re-scope: write the section.");
+    let (outcome, _) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&check(&[(
+                "Q1",
+                "answered",
+                "Re-scope: write the section.",
+            )])),
+        ),
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+    ]);
+    let stop = outcome.expect_err("back to the ready column");
+    assert!(matches!(stop, Stop::Ready { .. }), "{stop}");
+    assert!(bench.record().intake.is_some());
+}
+
+/// A false premise at intake that asks nothing parks the ticket at Intake,
+/// which `continue` restarts (OWL-306).
+#[test]
+fn a_false_premise_at_intake_without_a_question_parks_the_ticket() {
+    let bench = Bench::drained();
+    let premise = r#"{"format":9,"status":"premise_false","summary":"The section is not there."}"#;
+    let stop = bench
+        .intake(
+            vec![bench.reply(None, Some(premise))],
+            gesture("maintainer"),
+        )
+        .expect_err("parked");
+    assert!(
+        matches!(
+            &stop,
+            Stop::Parked {
+                reason: ParkReason::Blocked,
+                ..
+            }
+        ),
+        "{stop}"
+    );
+    let kept = bench.record();
+    assert!(kept.intake.is_none());
+    assert!(matches!(
+        TicketState::try_from(&kept.state).unwrap().status(),
+        Status::Parked {
+            at: Stage::Intake,
+            ..
+        }
+    ));
+    let parked = bench.comments().pop().unwrap();
+    assert!(parked.starts_with("[owlshift] PARKED"), "{parked}");
+    assert!(
+        parked.contains("found its premise false, with no question"),
+        "{parked}"
+    );
+    assert!(parked.contains("owlshift continue"), "{parked}");
+}
+
 /// A prerequisite the decider names only in an answer to an intake round
 /// (OWL-269): the answers' RESUME returns to Intake, which runs again with
 /// them; cut off there by a usage limit, the ticket stays at Intake, shown

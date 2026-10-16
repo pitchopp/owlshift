@@ -751,3 +751,69 @@ fn a_reviewer_failing_twice_parks_the_ticket_at_design_review() {
     );
     assert!(record.plan.is_some(), "the plan is kept for the restart");
 }
+
+/// A design run that finds the premise false and asks (OWL-306, S8): every
+/// question goes to the decider without the resolver, the round returns to
+/// Design, the QUESTIONS comment says so, and no plan is kept.
+#[test]
+fn a_false_premise_at_design_is_a_round_to_the_decider() {
+    let bench = Bench::of("standard", false);
+    let premise = r#"{"format":9,"status":"premise_false",
+"summary":"The greeting file the ticket extends is not in the repository.",
+"questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; no such file exists.",
+"text":"Re-scope to create GREETING.md, or close the ticket?",
+"options":["Re-scope: create GREETING.md.","Close the ticket."],"recommendation":"Re-scope"}]}"#;
+    let (outcome, printed) = bench.run(vec![bench.read(premise)], None);
+    let stop = outcome.expect_err("the premise goes to the decider");
+    assert!(
+        matches!(
+            &stop,
+            Stop::NeedsInput { status: owlshift_contracts::result::Status::PremiseFalse, posted: Ok(round), .. }
+                if round.get() == 1
+        ),
+        "{stop:?}\n{printed}"
+    );
+    assert_eq!(bench.roles(), [Role::Design]);
+    let record = bench.record();
+    assert_eq!(
+        (record.state.stage, record.state.waiting),
+        (Stage::Design, Some(Waiting::NeedsInput))
+    );
+    assert!(record.plan.is_none());
+    assert!(
+        bench
+            .marked("[owlshift] QUESTIONS")
+            .contains("The run found the ticket's premise false.")
+    );
+}
+
+/// A design run that finds the premise false and asks nothing parks the
+/// ticket at Design, `continue` restarting it (OWL-306).
+#[test]
+fn a_false_premise_at_design_without_a_question_parks_the_ticket() {
+    let bench = Bench::of("standard", false);
+    let premise = r#"{"format":9,"status":"premise_false","summary":"The file is not there."}"#;
+    let (outcome, printed) = bench.run(vec![bench.read(premise)], None);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::Blocked,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.roles(), [Role::Design]);
+    let record = bench.record();
+    assert_eq!(
+        (record.state.stage, record.state.waiting),
+        (Stage::Design, Some(Waiting::Parked))
+    );
+    let parked = bench.marked("[owlshift] PARKED");
+    assert!(
+        parked.contains("found its premise false, with no question"),
+        "{parked}"
+    );
+    assert!(parked.contains("owlshift continue"), "{parked}");
+}

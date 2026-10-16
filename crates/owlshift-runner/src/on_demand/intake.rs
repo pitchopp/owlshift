@@ -310,17 +310,12 @@ impl OnDemand<'_> {
             )?;
             let mut result = ran.result();
             if let Some(found) = result {
-                // A false premise waits for P5 (S8), and a dependency the
-                // ticket's text does not name is refused: either is a failed
-                // run.
-                let refusal = if found.status == result::Status::PremiseFalse {
-                    Some("intake records no false premise before P5".to_owned())
-                } else {
-                    found
-                        .intake
-                        .as_ref()
-                        .and_then(|verdict| unfounded(verdict, &p.found, &comments))
-                };
+                // A dependency the ticket's text does not name is refused: a
+                // failed run.
+                let refusal = found
+                    .intake
+                    .as_ref()
+                    .and_then(|verdict| unfounded(verdict, &p.found, &comments));
                 if let Some(reason) = refusal {
                     sink.emit(
                         &p.ticket,
@@ -330,6 +325,58 @@ impl OnDemand<'_> {
                     );
                     event = Event::RunFailed;
                     result = None;
+                }
+            }
+            // A false premise (OWL-306, S8) carries no record: the contract
+            // gives `intake` with `done` and `questions` only. Its questions
+            // all go to the decider, the round returning to Intake; with
+            // none, the ticket parks.
+            if event == Event::Questions
+                && let Some(result) = result
+                && result.status == result::Status::PremiseFalse
+            {
+                if !result.asks() {
+                    return Err(self.park_false_premise(
+                        p,
+                        PIPELINE,
+                        &state,
+                        "intake run",
+                        &ran.run,
+                        result,
+                        sink,
+                    ));
+                }
+                match self.resolve(
+                    p,
+                    &state,
+                    result,
+                    &[],
+                    &[],
+                    &rules,
+                    &current,
+                    settled,
+                    &ran.run,
+                    sink,
+                )? {
+                    Routing::Settled => {
+                        settled += 1;
+                        continue;
+                    }
+                    Routing::Ask(round) => {
+                        let asked = match state.apply(PIPELINE, Event::Questions) {
+                            Ok(Transition::To(asked)) => asked,
+                            other => return Err(core_error(other)),
+                        };
+                        return Err(self.ask(
+                            p,
+                            &asked,
+                            result.status,
+                            &result.summary,
+                            round,
+                            &ran.run,
+                            sink,
+                        ));
+                    }
                 }
             }
             let verdict = result.and_then(|result| result.intake.as_ref());

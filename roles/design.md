@@ -67,7 +67,7 @@ Your last action is writing `result.json` at `result_path`, whatever the outcome
 - `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the findings are to `answer`.
 - `questions`: at least one question; you run again once they are answered or decided.
 - `blocked`: something outside your reach stops you (a permission, a file you cannot read). Say what in `summary`.
-- `premise_false`: the ticket rests on something the repository contradicts (a file, a symbol, a behaviour that is not there). Give the evidence in `summary`.
+- `premise_false`: the ticket rests on something the repository contradicts (a file, a symbol, a behaviour that is not there). Give the evidence in `summary`, and ask at least one question that holds the evidence in its `context` and offers two `options`: a re-scope you propose, written out, or closing the ticket, with your `recommendation`. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, plan the ticket as re-scoped.
 - `failed`: you could not write the plan for a reason of your own run. Say why in `summary`.
 
 Always give `summary`, one or two sentences. Leave out `pr`, `artifacts`, `followups`, `findings` and `rulings`: they belong to other roles. An example:
