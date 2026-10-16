@@ -2742,6 +2742,11 @@ impl OnDemand<'_> {
         };
         marked.map_err(|e| refused("the project's marker", e))?;
         sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
+        // What the run's harness home left to say, such as a refreshed login
+        // not written back (OWL-299): a warning each (OWL-303).
+        for warning in run_warnings(brief.role, &report) {
+            sink.emit(ticket, Some(&run), EventKind::Warning, warning);
+        }
         if let Some(usage) = &report.usage {
             sink.emit(ticket, Some(&run), EventKind::Usage, usage_data(usage));
         }
@@ -5358,6 +5363,22 @@ fn park_detail(outcome: &Outcome) -> String {
 }
 
 /// The `run_ended` event's details.
+/// The `warning` events of a run's [`RunReport::warnings`] (OWL-303): one
+/// each, `what` = `run_warning`, with the role and the warning.
+fn run_warnings(role: Role, report: &RunReport) -> Vec<Data> {
+    report
+        .warnings
+        .iter()
+        .map(|warning| {
+            data([
+                ("what", json!("run_warning")),
+                ("role", json!(role.as_str())),
+                ("warning", json!(warning)),
+            ])
+        })
+        .collect()
+}
+
 fn run_ended(report: &RunReport) -> Data {
     let (outcome, reason, status) = match &report.outcome {
         Outcome::Finished { result, .. } => ("finished", None, Some(status_name(result.status))),
@@ -5478,6 +5499,22 @@ mod tests {
             gate: None,
             warnings: Vec::new(),
         }
+    }
+
+    /// OWL-303: each warning a run's harness home left is one `warning`
+    /// event, naming the role.
+    #[test]
+    fn each_run_warning_is_a_warning_event() {
+        assert!(run_warnings(Role::Build, &report(None)).is_empty());
+        let warned = RunReport {
+            warnings: vec!["the login was not written back".to_owned()],
+            ..report(None)
+        };
+        let events = run_warnings(Role::DesignReview, &warned);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["what"], json!("run_warning"));
+        assert_eq!(events[0]["role"], json!("design_review"));
+        assert_eq!(events[0]["warning"], json!("the login was not written back"));
     }
 
     #[test]
