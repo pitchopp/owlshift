@@ -43,7 +43,7 @@ impl Bench {
     }
 
     /// The ticket `id` as the tracker shows it.
-    fn shown(&self, id: &str) -> markdown::Ticket {
+    pub(super) fn shown(&self, id: &str) -> markdown::Ticket {
         MarkdownTracker::new(&self.remote.checkout)
             .ticket(&TicketId::new(id).unwrap())
             .unwrap()
@@ -78,7 +78,7 @@ impl Bench {
     /// Merges `id`'s pull request as the forge does: `main` moves to its
     /// branch, a fast-forward, and the pull request reads merged. Nothing
     /// moves the ticket's stage. Returns `main`'s new head.
-    fn merge(&self, id: &str) -> String {
+    pub(super) fn merge(&self, id: &str) -> String {
         let tip = self.tip_of(id);
         self.env
             .run(&self.remote.bare, &["update-ref", "refs/heads/main", &tip])
@@ -118,7 +118,7 @@ fn dispatched(events: &[Event]) -> Vec<String> {
 
 /// The events of each pass of a drain: `events` from `start`, cut at `ends`,
 /// the event count after each pass but the last.
-fn by_pass(events: &[Event], start: usize, ends: &[usize]) -> Vec<Vec<Event>> {
+pub(super) fn by_pass(events: &[Event], start: usize, ends: &[usize]) -> Vec<Vec<Event>> {
     let mut cuts = vec![start];
     cuts.extend_from_slice(ends);
     cuts.push(events.len());
@@ -144,7 +144,7 @@ fn waits(events: &[Event]) -> Vec<(String, Value, Value)> {
 }
 
 /// The position in `events` of watch's reading `id`'s pull request merged.
-fn merge_read(events: &[Event], id: &str) -> Option<usize> {
+pub(super) fn merge_read(events: &[Event], id: &str) -> Option<usize> {
     events.iter().position(|e| {
         e.kind == EventKind::Decision
             && e.ticket.as_ref().is_some_and(|t| t.as_str() == id)

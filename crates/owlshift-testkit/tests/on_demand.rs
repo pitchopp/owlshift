@@ -9312,3 +9312,9 @@ fn an_intake_pass_gives_its_resolver_the_resolver_rules() {
 /// The review loop on a delivered pull request (OWL-307, build plan part J).
 #[path = "on_demand/review_scenarios.rs"]
 mod review_scenarios;
+
+/// The quality pipeline's scenarios, S8, S9's findings and passes, S17's
+/// routing, the variants, approval, `replan` and a review loop, played by
+/// `watch --drain` on this bench (OWL-310, build plan "P5", part M).
+#[path = "on_demand/pipeline_scenarios.rs"]
+mod pipeline_scenarios;
