@@ -907,6 +907,39 @@ impl Command {
             Command::Intake => &[Role::Intake, Role::Resolver],
         }
     }
+
+    /// Whether the command's dispatch refuses an empty gate (OWL-332): every
+    /// dispatch but a rebase's leads to Build runs, and the build role stops
+    /// `blocked` without a gate; the rebase role passes an empty one.
+    fn refuses_empty_gate(self) -> bool {
+        !matches!(self, Command::Rebase)
+    }
+}
+
+/// Why a dispatch is refused when the gate its runs would take, at `at`,
+/// is empty (OWL-332): the file it came from, `file`, and the fix, merging
+/// a gate to `base`. A branch configured at an older commit than `base`
+/// keeps that commit's gate, which the fix alone does not change.
+fn empty_gate(at: &Base, base: &Base, file: ProjectFile) -> String {
+    let source = match file {
+        ProjectFile::Commit => format!("owlshift.toml at {}", at.remote_ref),
+        ProjectFile::Local => format!("your owlshift.toml, {} holding none", at.remote_ref),
+    };
+    let mut text = format!(
+        "the project declares no gate: `stack.gate` is empty in {source}, and the build role \
+         stops `blocked` without one. List the project's lint, formatter and test commands under \
+         `stack.gate` in owlshift.toml and merge it to {}",
+        base.remote_ref
+    );
+    if at.commit != base.commit {
+        text.push_str(&format!(
+            "; the ticket's branch takes its gate from {}, the commit it was made from: once the \
+             gate is merged, `owlshift do` starts a branch with no commits of its own again from \
+             {}, and one with commits of its own must first be rebased onto it",
+            at.remote_ref, base.remote_ref
+        ));
+    }
+    text
 }
 
 /// What a command holds once the project is its own and the ticket read.
@@ -1227,6 +1260,15 @@ impl OnDemand<'_> {
                 return Err(why);
             }
             state = self.rebuild_loop(&mut p, state, why, sink)?;
+        }
+        // A ticket that goes on to a dispatch is refused on an empty gate
+        // before a park is restarted or an answer check runs (OWL-332):
+        // `dispatch` would refuse it after them.
+        if matches!(
+            state.stage(),
+            Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify
+        ) {
+            self.refuse_empty_gate(&p, Command::Continue)?;
         }
         // A person typing `continue` on a parked ticket is the restart the
         // core waits for.
@@ -1596,6 +1638,9 @@ impl OnDemand<'_> {
             .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
         let at = self.configuring_base(p, command)?;
         let (rules, project_file) = self.rules_at(p, &at, command.briefed_roles(), sink)?;
+        if command.refuses_empty_gate() && rules.gate().is_empty() {
+            return Err(Stop::Refused(empty_gate(&at, &p.base, project_file)));
+        }
         sink.emit(
             &p.ticket,
             None,
@@ -1677,6 +1722,29 @@ impl OnDemand<'_> {
         } else {
             p.base.ancestor(&made_from)
         })
+    }
+
+    /// Refuses `command` when the gate its dispatch would take is empty
+    /// (OWL-332), read as [`Self::rules_at`] reads it, before anything else:
+    /// for `continue`, whose park restart and answer check come before its
+    /// dispatch, and which fast-forwards no branch, so its configuring commit
+    /// is already the dispatch's. `do` checks in [`Self::dispatch`] alone,
+    /// after its branch may have been fast-forwarded to the base.
+    fn refuse_empty_gate(&self, p: &Prepared, command: Command) -> Result<(), Stop> {
+        if !command.refuses_empty_gate() {
+            return Ok(());
+        }
+        let at = self.configuring_base(p, command)?;
+        let found = project::project_file_at(&self.executor.git, &p.checkout, &at)
+            .map_err(|e| refused("the project file", e))?;
+        let (gate, file) = match &found {
+            Some(config) => (&config.stack.gate, ProjectFile::Commit),
+            None => (&self.config.stack.gate, ProjectFile::Local),
+        };
+        if gate.is_empty() {
+            return Err(Stop::Refused(empty_gate(&at, &p.base, file)));
+        }
+        Ok(())
     }
 
     /// The project's rules and gate at `at` (OWL-331): read from the project
@@ -6058,6 +6126,50 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// OWL-332: every dispatch but a rebase's refuses an empty gate, and the
+    /// refusal says where the gate was read and how to give one; a branch
+    /// configured at an older commit is told the merge alone does not reach
+    /// it.
+    #[test]
+    fn an_empty_gate_is_refused_by_every_dispatch_but_a_rebase() {
+        for command in [
+            Command::Do,
+            Command::Continue,
+            Command::Fix,
+            Command::Intake,
+            Command::Drain,
+            Command::Correct,
+        ] {
+            assert!(command.refuses_empty_gate(), "{}", command.name());
+        }
+        assert!(!Command::Rebase.refuses_empty_gate());
+
+        let base = Base {
+            remote_ref: "origin/main".to_owned(),
+            branch: "main".to_owned(),
+            commit: "a".repeat(40),
+        };
+        let at_base = empty_gate(&base, &base, ProjectFile::Commit);
+        assert!(
+            at_base.starts_with(
+                "the project declares no gate: `stack.gate` is empty in owlshift.toml at \
+                 origin/main, and the build role stops `blocked` without one."
+            ),
+            "{at_base}"
+        );
+        assert!(at_base.ends_with("merge it to origin/main"), "{at_base}");
+        let older = base.ancestor(&"b".repeat(40));
+        let kept = empty_gate(&older, &base, ProjectFile::Local);
+        assert!(
+            kept.contains("your owlshift.toml, origin/main at bbbbbbbbbbbb holding none"),
+            "{kept}"
+        );
+        assert!(
+            kept.ends_with("one with commits of its own must first be rebased onto it"),
+            "{kept}"
+        );
     }
 
     #[test]

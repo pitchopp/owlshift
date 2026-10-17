@@ -15,6 +15,7 @@ pub use owlshift_adapters::forge::DefaultBranch;
 use owlshift_adapters::forge::Repo;
 
 pub use crate::forge::TokenTryError;
+pub use crate::project::DefaultBranchFile;
 use crate::secrets::TrackerAccounts;
 use crate::ticket_ref::{self, RefState};
 pub use crate::tracker::{AppError, StatesError};
@@ -161,6 +162,13 @@ pub trait System {
             .map(Some)
             .map_err(|_| "git could not list them in the dedicated checkout".to_owned())
     }
+    /// The project file at the default branch of the checkout at `root`, as
+    /// its last fetch left `refs/remotes/origin/HEAD`
+    /// ([`crate::project::project_file_at_origin_head`], OWL-332): nothing
+    /// is fetched. Only `owlshift doctor` asks.
+    fn default_branch_file(&self, root: &Path) -> Result<DefaultBranchFile, String> {
+        crate::project::project_file_at_origin_head(&crate::project::runner_git(), root)
+    }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
     #[cfg(unix)]
@@ -301,6 +309,9 @@ pub(crate) mod fake {
         /// What reading the project's ticket refs gives; `None`: no
         /// dedicated checkout.
         ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
+        /// What reading the project file at the default branch gives;
+        /// `None`: the default branch is unknown here.
+        default_branch_file: Option<Result<DefaultBranchFile, String>>,
         /// Files that are not there; every other one is.
         missing_files: Vec<PathBuf>,
         /// What reading a text file gives; a file not here has no text,
@@ -440,6 +451,15 @@ pub(crate) mod fake {
             self
         }
 
+        /// Reading the project file at the default branch gives this.
+        pub(crate) fn default_branch_file_is(
+            mut self,
+            answer: Result<DefaultBranchFile, String>,
+        ) -> Self {
+            self.default_branch_file = Some(answer);
+            self
+        }
+
         /// Puts a program on the fake `PATH`.
         pub(crate) fn install(mut self, program: &str) -> Self {
             self.located.insert(
@@ -517,6 +537,15 @@ pub(crate) mod fake {
         /// answer; never git.
         fn ticket_refs(&self, _root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
             self.ticket_refs.clone().transpose()
+        }
+
+        /// As [`Self::default_branch_file_is`] scripted it; never git.
+        fn default_branch_file(&self, _root: &Path) -> Result<DefaultBranchFile, String> {
+            self.default_branch_file.clone().unwrap_or_else(|| {
+                Ok(DefaultBranchFile::Unknown(
+                    "`origin/HEAD` is not set".to_owned(),
+                ))
+            })
         }
 
         fn secret_stored(&self, account: &str) -> Result<bool, String> {

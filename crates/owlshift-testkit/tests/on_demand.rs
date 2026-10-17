@@ -9582,6 +9582,57 @@ fn a_base_without_a_project_file_takes_the_persons_gate() {
     assert_eq!(dispatched[0]["project_file"], json!("local"));
 }
 
+/// OWL-332: an empty gate at the base refuses `do` before any run, with no
+/// dispatch recorded and no ticket ref kept, and says how to give one.
+#[test]
+fn an_empty_gate_refuses_do_before_any_run() {
+    let bench = Bench::new(true);
+    let config = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
+    bench.merge_into_main(&[("owlshift.toml", &config.replace(GATE_LINE, "gate = []"))]);
+    let (refused, printed) = bench.run(Vec::new(), None);
+    match &refused {
+        Err(Stop::Refused(why)) => assert!(
+            why.contains("`stack.gate` is empty in owlshift.toml at origin/main")
+                && why.ends_with("merge it to origin/main"),
+            "{why}"
+        ),
+        other => panic!("{other:?}\n{printed}"),
+    }
+    assert!(bench.briefs().is_empty());
+    assert!(data_of(&bench.events(), EventKind::Dispatch, "command").is_empty());
+}
+
+/// OWL-332: `continue` on a ticket whose gate is empty is refused before
+/// its answer check runs or anything is kept: here the base has no
+/// `owlshift.toml`, so the person's file, emptied after the round was
+/// asked, gives the gate.
+#[test]
+fn an_empty_gate_refuses_continue_before_its_answer_check() {
+    let bench = Bench::new(true);
+    bench.merge_into_main(&[("owlshift.toml", "")]);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let config_path = bench.remote.checkout.join("owlshift.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, config.replace(GATE_LINE, "gate = []")).unwrap();
+    bench.answer("ok");
+    let (runs, kept) = (bench.briefs().len(), bench.ref_commit());
+
+    let (refused, printed) = bench.continue_ticket(Vec::new());
+    match &refused {
+        Err(Stop::Refused(why)) => assert!(
+            why.contains("`stack.gate` is empty in your owlshift.toml, origin/main"),
+            "{why}"
+        ),
+        other => panic!("{other:?}\n{printed}"),
+    }
+    assert_eq!(bench.briefs().len(), runs);
+    assert_eq!(bench.ref_commit(), kept);
+}
+
 /// The review loop on a delivered pull request (OWL-307, build plan part J).
 #[path = "on_demand/review_scenarios.rs"]
 mod review_scenarios;

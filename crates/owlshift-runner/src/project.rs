@@ -421,23 +421,27 @@ pub fn sync_checkout_within(
             git.run(&checkout, &head).map_err(failed)?
         }
     };
-    let target = String::from_utf8_lossy(&target).trim().to_owned();
+    // Resolved now, right after the fetch reset every remote-tracking ref a
+    // run could have moved (OWL-51).
+    resolve_origin_ref(git, &checkout, String::from_utf8_lossy(&target).trim())
+}
+
+/// The base `target`, the full name `refs/remotes/origin/HEAD` points to,
+/// names in the repository at `checkout`: its branch of origin and the
+/// commit it is at, resolved by that full name, which no local branch
+/// shadows (OWL-51). A run can make that ref symbolic, pointing at another
+/// branch of origin: a fetch keeps such a ref, and git follows it (git
+/// 2.54, 2026-09-29), so it is refused. Shared by [`sync_checkout`] and
+/// [`project_file_at_origin_head`].
+fn resolve_origin_ref(git: &Git, checkout: &Path, target: &str) -> Result<Base, String> {
+    let failed = |e: crate::executor::GitError| e.to_string();
     let branch = target
         .strip_prefix("refs/remotes/origin/")
         .filter(|branch| !branch.is_empty())
         .ok_or_else(|| format!("origin's default branch is {target:?}, not a branch of origin"))?
         .to_owned();
-    // Resolved now, right after the fetch reset every remote-tracking ref a
-    // run could have moved, and by its full name, which no local branch
-    // shadows (OWL-51). A run can also make that ref symbolic, pointing at
-    // another branch of origin: the fetch keeps such a ref, and git follows
-    // it (git 2.54, 2026-09-29), so it is refused.
     let symbolic = git
-        .output(
-            &checkout,
-            &["symbolic-ref", "--quiet", target.as_str()],
-            None,
-        )
+        .output(checkout, &["symbolic-ref", "--quiet", target], None)
         .map_err(failed)?
         .success();
     if symbolic {
@@ -450,7 +454,7 @@ pub fn sync_checkout_within(
     let full = format!("{target}^{{commit}}");
     let commit = git
         .run(
-            &checkout,
+            checkout,
             &["rev-parse", "--verify", "--end-of-options", full.as_str()],
         )
         .map_err(|e| format!("origin's default branch {target} does not resolve: {e}"))?;
@@ -460,6 +464,50 @@ pub fn sync_checkout_within(
         branch,
         commit,
     })
+}
+
+/// The project file at the default branch, as the person's own checkout at
+/// `root` last fetched it (OWL-332): what `owlshift doctor` checks the gate
+/// of, since `owlshift do` reads the file at that branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefaultBranchFile {
+    /// The default branch is not known here, for this reason: no
+    /// `refs/remotes/origin/HEAD`, or one that does not resolve to a branch
+    /// of origin.
+    Unknown(String),
+    /// The default branch's commit, and its project file, `None` when it
+    /// has none.
+    Read {
+        base: Base,
+        file: Option<Box<ProjectConfig>>,
+    },
+}
+
+/// The project file at `refs/remotes/origin/HEAD` of the checkout at
+/// `root`, as its last fetch left that ref (OWL-332), read as
+/// [`project_file_at`] reads it: nothing is fetched, written or asked of
+/// the network, so a stale checkout gives what its last fetch saw. A
+/// default branch that cannot be resolved is [`DefaultBranchFile::Unknown`];
+/// only a file `project_file_at` refuses is an error.
+pub fn project_file_at_origin_head(git: &Git, root: &Path) -> Result<DefaultBranchFile, String> {
+    let head = [
+        "symbolic-ref",
+        "--quiet",
+        "--no-recurse",
+        "refs/remotes/origin/HEAD",
+    ];
+    let unknown = |reason: String| Ok(DefaultBranchFile::Unknown(reason));
+    let target = match git.output(root, &head, None) {
+        Ok(out) if out.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        Ok(_) => return unknown("`origin/HEAD` is not set".to_owned()),
+        Err(e) => return unknown(format!("`origin/HEAD` could not be read: {e}")),
+    };
+    let base = match resolve_origin_ref(git, root, &target) {
+        Ok(base) => base,
+        Err(reason) => return unknown(reason),
+    };
+    let file = project_file_at(git, root, &base)?.map(Box::new);
+    Ok(DefaultBranchFile::Read { base, file })
 }
 
 /// The most bytes of the project file read at the base commit.

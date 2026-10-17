@@ -109,8 +109,8 @@ states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs I
 [stack]
 # The project's full gate: lint, formatter and tests, run in order from the
 # repository root. The build role runs it before it reports done, then
-# Owlshift runs it again on the commit it delivers. With no command, the
-# build role stops with `blocked`.
+# Owlshift runs it again on the commit it delivers. With no command,
+# `owlshift do` refuses to start a ticket.
 {gate}# Agents start from an almost empty environment. Name here the variables of
 # your environment the gate needs, such as a feature flag; the whole agent
 # run sees them. Credential variables are refused, and each machine that
