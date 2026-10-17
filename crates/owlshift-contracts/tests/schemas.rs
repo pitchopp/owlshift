@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use owlshift_contracts::result::RunResult;
 use owlshift_contracts::schema;
 use serde_json::{Value, json};
 
@@ -129,7 +130,7 @@ fn project_config_schema_accepts_the_ready_gesture() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t", "recommendation": { "why": "r" } });
-    let base = |status: &str| json!({ "format": 10, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 11, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -160,10 +161,35 @@ fn result_schema_carries_the_expressible_rules() {
     named["refused_choices_asked"][0]["choice"] = json!(0);
     assert!(!validator.is_valid(&named));
 
-    for format in [1, 2, 3, 4, 5, 6, 7, 8, 9, 11] {
+    for format in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
+    }
+
+    // A `ticket` basis quotes, and no other kind does (OWL-337); schema and
+    // type agree.
+    let resolver: Value = serde_json::from_str(&fixture("result-resolver.json")).unwrap();
+    for (kind, quote, valid) in [
+        ("settled", None, true),
+        ("settled", Some(json!("Add GREETING.md")), false),
+        ("ticket", None, false),
+        ("ticket", Some(json!("Add GREETING.md")), true),
+        ("ticket", Some(Value::Null), false),
+        ("fact", Some(Value::Null), false),
+    ] {
+        let mut document = resolver.clone();
+        document["resolutions"][0]["basis_kind"] = json!(kind);
+        if let Some(quote) = quote {
+            document["resolutions"][0]["quote"] = quote;
+        }
+        let case = format!("{kind} {:?}", document["resolutions"][0].get("quote"));
+        assert_eq!(validator.is_valid(&document), valid, "schema: {case}");
+        assert_eq!(
+            RunResult::parse(&document.to_string()).is_ok(),
+            valid,
+            "type: {case}"
+        );
     }
 
     // Every question recommends, with an object (OWL-324): absent or null
@@ -279,22 +305,22 @@ fn result_schema_carries_the_expressible_rules() {
     };
     for (resolution, done, valid) in [
         (
-            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d", "basis": "b" }),
+            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d", "basis": "b", "basis_kind": "fact" }),
             true,
             true,
         ),
         (
-            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d", "basis": "b" }),
+            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d", "basis": "b", "basis_kind": "fact" }),
             false,
             false,
         ),
         (
-            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d", "basis": " " }),
+            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d", "basis": " ", "basis_kind": "fact" }),
             true,
             false,
         ),
         (
-            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d" }),
+            json!({ "outcome": "decided", "question": "Q1", "category": "naming", "decision": "d", "basis_kind": "fact" }),
             true,
             false,
         ),
@@ -311,12 +337,12 @@ fn result_schema_carries_the_expressible_rules() {
         (json!({ "question": "Q1", "reason": "r" }), true, false),
         // The resolver's label is required; its form is the runner's to judge.
         (
-            json!({ "outcome": "decided", "question": "Q1", "decision": "d", "basis": "b" }),
+            json!({ "outcome": "decided", "question": "Q1", "decision": "d", "basis": "b", "basis_kind": "fact" }),
             true,
             false,
         ),
         (
-            json!({ "outcome": "decided", "question": "Q1", "category": "", "decision": "d", "basis": "b" }),
+            json!({ "outcome": "decided", "question": "Q1", "category": "", "decision": "d", "basis": "b", "basis_kind": "fact" }),
             true,
             true,
         ),

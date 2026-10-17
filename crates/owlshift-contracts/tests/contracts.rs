@@ -256,10 +256,15 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(11);
+            v["format"] = json!(12);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 10, before the resolver's decisions named their basis kind",
+        parse(|v| v["format"] = json!(10)),
+        "unknown format 10",
     );
     rejects(
         "format 9, before a question's options were lettered",
@@ -310,20 +315,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 11, "status""#),
+        RunResult::parse(r#"{"format": 12, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 10, "status""#),
+        RunResult::parse(r#"{"format": 11, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(11));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(12));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 11,
-            supported: 10,
+            found: 12,
+            supported: 11,
             ..
         })
     ));
@@ -1086,6 +1091,7 @@ fn resolutions_against_the_brief() {
         Brief::parse(
             &edited("brief.json", |v| {
                 v["role"] = json!("resolver");
+                v["delegation"] = json!("discoverable");
                 v["permissions"]["level"] = json!("read_only");
                 v.as_object_mut().unwrap().remove("result_refusal");
             })
@@ -1152,6 +1158,37 @@ fn resolutions_against_the_brief() {
         })),
         "questions to resolve are given but the role is build, not resolver",
     );
+    // The delegation level (format 17, OWL-337): in the resolver's brief,
+    // always, and only there.
+    let leveled = |level: Option<&str>| {
+        Brief::parse(&edited("brief.json", |v| {
+            v["role"] = json!("resolver");
+            v["resolve"] = json!([question("Q1")]);
+            if let Some(level) = level {
+                v["delegation"] = json!(level);
+            }
+        }))
+    };
+    for level in ["none", "facts", "discoverable", "ticket", "all"] {
+        leveled(Some(level)).unwrap_or_else(|e| panic!("{level}: {e}"));
+    }
+    rejects(
+        "a resolver's brief without its delegation level",
+        leveled(None),
+        "the resolver's brief, and only it, gives the delegation level: the role is resolver and \
+         a level is not given",
+    );
+    rejects(
+        "an unknown delegation level",
+        leveled(Some("most")),
+        "unknown variant `most`",
+    );
+    rejects(
+        "a delegation level in a build brief",
+        Brief::parse(&edited("brief.json", |v| v["delegation"] = json!("all"))),
+        "the resolver's brief, and only it, gives the delegation level: the role is build and a \
+         level is given",
+    );
 
     // The result's own rules.
     let parse = |edit: fn(&mut Value)| RunResult::parse(&edited("result-resolver.json", edit));
@@ -1193,6 +1230,50 @@ fn resolutions_against_the_brief() {
         parse(|v| v["resolutions"][1]["reason"] = json!("")),
         "the resolution of Q3 has no reason",
     );
+    // Format 11 (OWL-337): each decision names its basis kind, a `ticket`
+    // basis quotes, as an intake dependency does, and no other kind does.
+    rejects(
+        "a decision without its basis kind",
+        parse(|v| {
+            v["resolutions"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("basis_kind");
+        }),
+        "missing field `basis_kind`",
+    );
+    rejects(
+        "an unknown basis kind",
+        parse(|v| v["resolutions"][0]["basis_kind"] = json!("hunch")),
+        "unknown variant `hunch`",
+    );
+    rejects(
+        "a ticket basis without a quote",
+        parse(|v| v["resolutions"][0]["basis_kind"] = json!("ticket")),
+        "the resolution of Q1 has a `ticket` basis but no quote",
+    );
+    rejects(
+        "a quote on another basis",
+        parse(|v| v["resolutions"][0]["quote"] = json!("Add GREETING.md")),
+        "the resolution of Q1 has a quote but a `settled` basis",
+    );
+    let quoted = |quote: &str| {
+        RunResult::parse(&edited("result-resolver.json", |v| {
+            v["resolutions"][0]["basis_kind"] = json!("ticket");
+            v["resolutions"][0]["quote"] = json!(quote);
+        }))
+    };
+    quoted("Add GREETING.md saying Hello.").expect("a quote on one line");
+    for (quote, broken) in [
+        (" ", "has a quote that is blank"),
+        ("Add\nGREETING.md", "has a quote that holds a control character"),
+    ] {
+        let error = quoted(quote).unwrap_err().to_string();
+        assert!(error.contains(broken), "{quote:?}: {error}");
+    }
+    let long = "word ".repeat(103);
+    let error = quoted(&long).unwrap_err().to_string();
+    assert!(error.contains("past the 512 a quote may weigh"), "{error}");
     rejects(
         "a pass with a decision",
         parse(|v| v["resolutions"][1]["decision"] = json!("d")),
@@ -1295,8 +1376,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(17)),
+        parse(|v| v["format"] = json!(18)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 16, before the resolver's brief carried the delegation level",
+        parse(|v| v["format"] = json!(16)),
+        "unknown format 16",
     );
     rejects(
         "format 15, before a question's options were lettered",
@@ -1383,6 +1469,7 @@ fn brief_rejections() {
     Brief::parse(&edited("brief.json", |v| v["role"] = json!("answer_check"))).unwrap();
     Brief::parse(&edited("brief.json", |v| {
         v["role"] = json!("resolver");
+        v["delegation"] = json!("ticket");
         v["resolve"] =
             json!([{ "id": "Q1", "context": "c", "text": "t", "recommendation": { "why": "r" } }]);
     }))

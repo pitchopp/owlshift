@@ -14,7 +14,7 @@ use crate::review::{
     Finding, FindingResponse, FindingsMode, MAX_FINDINGS, Plan, Ruling, check_answers,
     check_findings,
 };
-use crate::{Role, Variant};
+use crate::{BasisKind, Role, Variant};
 
 /// The answer check's classes live in the core, which folds them into one
 /// state-machine event.
@@ -221,25 +221,34 @@ pub(crate) fn check_dependencies<'a>(
         ));
     }
     for (ticket, quote) in dependencies {
-        let broken = if quote.trim().is_empty() {
-            "is blank".to_owned()
-        } else if quote.chars().any(char::is_control) {
-            "holds a control character: quote the words on one line".to_owned()
-        } else if quote.len() > MAX_QUOTE_BYTES {
-            format!(
-                "weighs {} bytes, past the {MAX_QUOTE_BYTES} a quote may weigh: quote only the \
-                 words that name the dependency",
-                quote.len()
-            )
-        } else {
-            continue;
-        };
-        return Err(ContractError::invalid(
-            contract,
-            format!("the quote of dependency {ticket} {broken}"),
-        ));
+        if let Err(broken) = check_quote(quote, "name the dependency") {
+            return Err(ContractError::invalid(
+                contract,
+                format!("the quote of dependency {ticket} {broken}"),
+            ));
+        }
     }
     Ok(())
+}
+
+/// The rules of a quote from a ticket, an intake dependency's (OWL-245) or
+/// a resolver's `ticket` basis (OWL-337) alike: not blank, without a
+/// control character and at most [`MAX_QUOTE_BYTES`]. `Err` says what is
+/// broken, `words` naming what the quote's words are for.
+fn check_quote(quote: &str, words: &str) -> Result<(), String> {
+    if quote.trim().is_empty() {
+        Err("is blank".to_owned())
+    } else if quote.chars().any(char::is_control) {
+        Err("holds a control character: quote the words on one line".to_owned())
+    } else if quote.len() > MAX_QUOTE_BYTES {
+        Err(format!(
+            "weighs {} bytes, past the {MAX_QUOTE_BYTES} a quote may weigh: quote only the words \
+             that {words}",
+            quote.len()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Where a Build run told of refused choices asks one of them (OWL-193):
@@ -387,9 +396,11 @@ pub struct Verdict {
 }
 
 /// The resolver's outcome on one question it was given: decided, with its
-/// own label for the question, the decision and what settles it, or passed
-/// on to the decider, with why. Every text but the label is not empty and
-/// not only whitespace; the runner judges the label.
+/// own label for the question, the decision, what settles it and the kind
+/// of that basis, or passed on to the decider, with why. Every text but the
+/// label is not empty and not only whitespace; a `ticket` basis has a quote,
+/// and no other kind has one; the runner judges the label, the kind against
+/// the project's delegation level and the quote against the ticket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Resolution {
@@ -410,6 +421,22 @@ pub enum Resolution {
         /// What settles it: the ticket, a rule, a file, an earlier answer.
         #[schemars(regex(pattern = r"\S"))]
         basis: String,
+        /// The kind of that basis (format 11, OWL-337): `fact`, `settled` or
+        /// `ticket`. The runner refuses a kind the project's delegation level
+        /// does not allow.
+        basis_kind: BasisKind,
+        /// With a `ticket` basis only, and then required: the words of the
+        /// ticket's title, description or a comment of its decider that
+        /// settle the question, on one line and at most
+        /// [`MAX_QUOTE_BYTES`]. The runner refuses a decision whose quote it
+        /// does not find there.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_string"
+        )]
+        #[schemars(with = "String", regex(pattern = r"\S"))]
+        quote: Option<String>,
     },
     /// Not settled by anything the resolver may rely on: the question goes
     /// to the decider.
@@ -1097,7 +1124,8 @@ pub struct RefusedChoice {
 }
 
 /// The rules of the resolver's resolutions: in increasing question order,
-/// each text not only whitespace.
+/// each text not only whitespace; a quote with a `ticket` basis, keeping a
+/// quote's rules ([`check_quote`]), and none with another kind (OWL-337).
 fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
     if let Some(id) = first_not_ascending(resolutions.iter().map(Resolution::question)) {
         return Err(ContractError::invalid(
@@ -1106,24 +1134,46 @@ fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
         ));
     }
     for resolution in resolutions {
-        let blank = match resolution {
+        let id = resolution.question();
+        let broken = match resolution {
             Resolution::Decided {
-                decision, basis, ..
+                decision,
+                basis,
+                basis_kind,
+                quote,
+                ..
             } => {
                 if decision.trim().is_empty() {
-                    Some("decision")
+                    Some("has no decision".to_owned())
                 } else if basis.trim().is_empty() {
-                    Some("basis")
+                    Some("has no basis".to_owned())
                 } else {
-                    None
+                    match (basis_kind, quote) {
+                        (BasisKind::Ticket, None) => Some(
+                            "has a `ticket` basis but no quote: quote the ticket's words that \
+                             settle it"
+                                .to_owned(),
+                        ),
+                        (BasisKind::Ticket, Some(quote)) => check_quote(quote, "settle it")
+                            .err()
+                            .map(|broken| format!("has a quote that {broken}")),
+                        (kind, Some(_)) => Some(format!(
+                            "has a quote but a `{}` basis: only a `ticket` basis quotes",
+                            kind.as_str()
+                        )),
+                        (_, None) => None,
+                    }
                 }
             }
-            Resolution::PassedOn { reason, .. } => reason.trim().is_empty().then_some("reason"),
+            Resolution::PassedOn { reason, .. } => reason
+                .trim()
+                .is_empty()
+                .then(|| "has no reason".to_owned()),
         };
-        if let Some(field) = blank {
+        if let Some(broken) = broken {
             return Err(ContractError::invalid(
                 CONTRACT,
-                format!("the resolution of {} has no {field}", resolution.question()),
+                format!("the resolution of {id} {broken}"),
             ));
         }
     }
@@ -1342,6 +1392,17 @@ fn result_invariants(schema: &mut Schema) {
         {
             "if": { "properties": { "resolutions": { "minItems": 1 } }, "required": ["resolutions"] },
             "then": { "properties": { "status": { "const": "done" } } }
+        },
+        {
+            "properties": {
+                "resolutions": {
+                    "items": {
+                        "if": { "properties": { "basis_kind": { "const": "ticket" } }, "required": ["basis_kind"] },
+                        "then": { "required": ["quote"] },
+                        "else": { "not": { "required": ["quote"] } }
+                    }
+                }
+            }
         },
         {
             "if": { "properties": { "refused_choices_asked": { "minItems": 1 } }, "required": ["refused_choices_asked"] },

@@ -16,15 +16,15 @@ pub(super) const FORGE: &str = "[forge]\nreviewers = { ann-dev = \"maintainer\",
 const AFTER: &str = "2026-10-03T09:00:00Z";
 
 /// A loop Build's `done` on a new commit.
-const RENAMED: &str = r#"{"format":10,"status":"done","summary":"Says hello in capitals, as the review asks.",
+const RENAMED: &str = r#"{"format":11,"status":"done","summary":"Says hello in capitals, as the review asks.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Capitals."}}"#;
 
 /// A loop Build's `done` with nothing to change.
-const NOTHING_TO_CHANGE: &str = r#"{"format":10,"status":"done","summary":"GREETING.md already says Hello in the words the review asks for: nothing to change.",
+const NOTHING_TO_CHANGE: &str = r#"{"format":11,"status":"done","summary":"GREETING.md already says Hello in the words the review asks for: nothing to change.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Unchanged."}}"#;
 
 /// A loop Build that asks what the review leaves open.
-const ASKS_WHICH_CASE: &str = r#"{"format":10,"status":"questions",
+const ASKS_WHICH_CASE: &str = r#"{"format":11,"status":"questions",
 "summary":"The review asks for capitals without saying which words.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The review on the pull request asks for capitals.",

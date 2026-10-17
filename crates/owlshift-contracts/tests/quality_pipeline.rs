@@ -65,7 +65,7 @@ fn brief(role: &str) -> Value {
 }
 
 fn base_result(status: &str) -> Value {
-    json!({ "format": 10, "status": status, "summary": "s" })
+    json!({ "format": 11, "status": status, "summary": "s" })
 }
 
 fn question(replan: bool) -> Value {
@@ -521,7 +521,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 17.into()),
+            with(brief("build"), "format", 18.into()),
             "upgrade Owlshift",
         ),
     ] {

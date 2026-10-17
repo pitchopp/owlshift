@@ -100,6 +100,36 @@
         }
       ]
     },
+    "DelegationLevel": {
+      "description": "What a project lets the resolver decide without its decider\n(`policy.resolver_delegation`, architecture section 4, \"Delegation\nlevel\", OWL-328). `Ord` sorts the levels from nothing to everything but\nthe floor.",
+      "oneOf": [
+        {
+          "description": "Nothing: no resolver run, every question goes to the decider.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "What the resolver observes offline in the worktree.",
+          "type": "string",
+          "const": "facts"
+        },
+        {
+          "description": "Facts, and what the ticket, the decider's comments, earlier\ndecisions and the project's rules settle.",
+          "type": "string",
+          "const": "discoverable"
+        },
+        {
+          "description": "The same, and a `scope` question the ticket's own text answers,\nquoted.",
+          "type": "string",
+          "const": "ticket"
+        },
+        {
+          "description": "Everything but the floor.",
+          "type": "string",
+          "const": "all"
+        }
+      ]
+    },
     "FindingsConfirmation": {
       "description": "Who confirms a review finding.",
       "oneOf": [
@@ -234,11 +264,57 @@
           "format": "uint16",
           "maximum": 1440,
           "minimum": 1
+        },
+        "resolver_budget_usd": {
+          "description": "A ceiling, in dollars, on what one chain of runs costs: the asking\nruns and their resolver runs since the command's last stop, past\nwhich the next run's questions go to the decider. A positive number;\nrequired with `resolver_passes = \"unlimited\"` (OWL-328). A file using\nit requires an Owlshift that reads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usd"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolver_delegation": {
+          "description": "What the resolver may decide without the decider (OWL-328,\narchitecture section 4, \"Delegation level\"): `none`, `facts`,\n`discoverable`, `ticket` or `all`. Absent: `discoverable`. `security`\nand `irreversible` questions, and those of `always_human`, go to a\nhuman at every level. A file using it requires an Owlshift that\nreads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DelegationLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolver_passes": {
+          "description": "The runs in a row the resolver may unblock in one command: a whole\nnumber from 1 to 50, or `\"unlimited\"`, which needs\n`resolver_budget_usd`. Absent: 5 (OWL-328). A file using it requires\nan Owlshift that reads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolverPasses"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
         "always_human"
+      ]
+    },
+    "ResolverPasses": {
+      "description": "A whole number of runs from 1 to 50, or \"unlimited\".",
+      "oneOf": [
+        {
+          "type": "integer",
+          "maximum": 50,
+          "minimum": 1
+        },
+        {
+          "const": "unlimited"
+        }
       ]
     },
     "RoleSettings": {
@@ -402,6 +478,11 @@
         "linear",
         "markdown"
       ]
+    },
+    "Usd": {
+      "description": "A positive number of dollars.",
+      "type": "number",
+      "exclusiveMinimum": 0
     },
     "Variant": {
       "description": "A pipeline variant.",
