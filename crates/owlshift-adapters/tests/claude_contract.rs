@@ -1,13 +1,14 @@
 //! Contract tests of the Claude Code harness: recorded `claude -p` output
 //! replayed through the adapter, with no model and no login.
 //!
-//! The fixtures in `fixtures/claude/` were recorded on 2026-09-29 with Claude
-//! Code 2.1.284 by `tests/claude_record.rs`, which also scrubs them: session,
-//! message, request and tool-use ids, timestamps, paths and thinking
-//! signatures replaced, the user's skills, plugins, agents, commands and
-//! memory paths removed from the `init` event, and the inbox socket
-//! replaced (see `docs/design/build-plan.md`, OWL-14, OWL-46, OWL-52, OWL-53
-//! and OWL-77 results). Each test states the exit status and standard error
+//! The fixtures in `fixtures/claude/` were recorded on 2026-10-17 with Claude
+//! Code 2.1.300 by `tests/claude_record.rs` (OWL-327), but for the
+//! `peer_inbox_*` pair, made by hand on 2.1.283 (see its test). The recorder
+//! also scrubs them: session, message, request and tool-use ids, timestamps,
+//! paths and thinking signatures replaced, the user's skills, plugins,
+//! agents, commands and memory paths removed from the `init` event, and the
+//! inbox socket replaced (see `docs/design/build-plan.md`, OWL-14, OWL-46,
+//! OWL-52, OWL-53, OWL-77 and OWL-327 results). Each test states the exit status and standard error
 //! the run had, since both decide the outcome; the recorder checks them.
 //! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
 //! limit on purpose (C7's open item). It follows the shapes C7 logged.
@@ -56,25 +57,45 @@ fn success() {
         }
     );
     assert_eq!(run.billing, Billing::Subscription);
-    assert_eq!(run.harness_version.as_deref(), Some("2.1.284"));
-    assert_eq!(run.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+    assert_eq!(run.harness_version.as_deref(), Some("2.1.300"));
+    assert_eq!(run.model.as_deref(), Some("claude-haiku-5-5"));
     assert_eq!(run.malformed_lines, 0);
     assert!(run.permission_denials.is_empty());
 
     let usage = run.usage.unwrap();
     assert_eq!(
         (usage.input_tokens, usage.output_tokens),
-        (10, 51),
+        (2, 4),
         "{usage:?}"
     );
-    assert_eq!(usage.cache_read_input_tokens, 13689);
-    assert_eq!(usage.cache_creation_input_tokens, 7179);
-    assert_eq!(usage.cost_usd, Some(0.0159919));
-    assert_eq!((usage.duration_ms, usage.num_turns), (Some(1052), Some(1)));
-    let haiku = &usage.models["claude-haiku-4-5-20251001"];
-    assert_eq!((haiku.input_tokens, haiku.output_tokens), (10, 51));
+    assert_eq!(usage.cache_read_input_tokens, 11092);
+    assert_eq!(usage.cache_creation_input_tokens, 6535);
+    assert_eq!(usage.cost_usd, Some(0.00142012));
+    assert_eq!((usage.duration_ms, usage.num_turns), (Some(1268), Some(1)));
+    let haiku = &usage.models["claude-haiku-5-5"];
+    assert_eq!((haiku.input_tokens, haiku.output_tokens), (2, 4));
 
     let limit = run.rate_limit.unwrap();
+    assert_eq!(limit.status, RateLimitStatus::Allowed);
+    assert_eq!(limit.window.as_deref(), Some("five_hour"));
+    assert_eq!(
+        limit.resets_at,
+        Some(Timestamp::from_second(1792274400).unwrap())
+    );
+    assert_eq!(limit.five_hour_utilization, Some(0.03));
+    assert_eq!(limit.seven_day_utilization, Some(0.05));
+}
+
+/// Constructed: the warning a run reported on 2.1.284, when the seven-day
+/// window passed its threshold (the success run of OWL-77). The 2.1.300
+/// recording reports a plain `allowed`, so this line keeps the warning read.
+#[test]
+fn rate_limit_warning() {
+    let line = br#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1790748000,"rateLimitType":"seven_day","utilization":0.8,"isUsingOverage":false,"surpassedThreshold":0.75,"unifiedWindows":{"five_hour":{"utilization":0.19,"resetsAt":1790701200},"seven_day":{"utilization":0.8,"resetsAt":1790748000}}}}
+"#;
+    let mut transcript = Transcript::default();
+    transcript.feed(line);
+    let limit = transcript.finish(Some(0), Vec::new()).rate_limit.unwrap();
     assert_eq!(limit.status, RateLimitStatus::AllowedWarning);
     assert_eq!(limit.window.as_deref(), Some("seven_day"));
     assert_eq!(
@@ -96,6 +117,106 @@ fn read_only_denial() {
         run.outcome
     );
     assert_eq!(run.permission_denials, ["Write"]);
+}
+
+/// The three calls of a run recorded by `after_cd` in `claude_record.rs`,
+/// each with whether its result was an error: a Bash `cd sub && pwd` that
+/// printed `sub`, then a `Write` of the result, then one of the same name
+/// below `sub`. Checks the order and the paths, and returns the two writes'
+/// error flags.
+fn writes_after_cd(name: &str) -> (bool, bool) {
+    let events = recorded_events(name);
+    let calls = tool_calls(&events);
+    let results = tool_results(&events);
+    let result_of = |call: &Value| {
+        let found = results
+            .iter()
+            .find(|result| result["tool_use_id"] == call["id"]);
+        let result = found.unwrap_or_else(|| panic!("{name}: no result for {call}"));
+        (result["content"].to_string(), result["is_error"] == true)
+    };
+    let names: Vec<&str> = calls.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Bash", "Write", "Write"], "{name}");
+    assert_eq!(calls[0]["input"]["command"], "cd sub && pwd", "{name}");
+    let (printed, failed) = result_of(calls[0]);
+    assert!(
+        !failed && printed.contains("/work/sub"),
+        "{name}: {printed}"
+    );
+    let paths: Vec<&Value> = calls[1..]
+        .iter()
+        .map(|call| &call["input"]["file_path"])
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/work/.owlshift/result.json",
+            "/work/sub/.owlshift/result.json"
+        ],
+        "{name}"
+    );
+    (result_of(calls[1]).1, result_of(calls[2]).1)
+}
+
+/// The denied write's path, from the `result` record.
+fn denied_path(name: &str) -> Value {
+    let events = recorded_events(name);
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .unwrap();
+    result["permission_denials"][0]["tool_input"]["file_path"].clone()
+}
+
+/// The read-only rule holds after a Bash `cd` (OWL-323): the adapter's
+/// read-only argv names the result anchored at the working directory, and
+/// `read_only_after_cd.jsonl`, recorded with that argv in a folder whose path
+/// holds a space, shows the result written after `cd sub` and the same name
+/// below `sub` refused. Exit 0, empty stderr.
+#[test]
+fn the_read_only_result_survives_a_cd() {
+    let dir = Path::new("/work");
+    let request = Request {
+        workdir: dir.to_path_buf(),
+        model: None,
+        effort: None,
+        permissions: Permissions {
+            level: PermissionLevel::ReadOnly,
+            network: false,
+            browser: false,
+        },
+        result_path: RelativePath::new(".owlshift/result.json").unwrap(),
+        json_schema: None,
+        max_budget_usd: None,
+    };
+    let args: Vec<String> = command(Path::new("claude"), &request)
+        .unwrap()
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let at = args.iter().position(|arg| arg == "--allowedTools").unwrap();
+    assert_eq!(args[at + 1], "Edit(/.owlshift/result.json)");
+
+    let name = "read_only_after_cd.jsonl";
+    assert_eq!(writes_after_cd(name), (false, true));
+    let run = replay(name, 0);
+    assert!(matches!(run.outcome, Outcome::Completed { .. }), "{run:?}");
+    assert_eq!(run.permission_denials, ["Write"]);
+    assert_eq!(denied_path(name), "/work/sub/.owlshift/result.json");
+}
+
+/// What the rule shipped before OWL-323, `Edit(./.owlshift/result.json)`,
+/// did on Claude Code: after the same `cd`, the result was refused and the
+/// same name below `sub` written, as in Locary's first run. This pins the
+/// CLI's behaviour the anchor answers, not the adapter's argv. Exit 0, empty
+/// stderr.
+#[test]
+fn a_dot_rule_follows_the_shell_after_a_cd() {
+    let name = "read_only_after_cd_dot_rule.jsonl";
+    assert_eq!(writes_after_cd(name), (true, false));
+    let run = replay(name, 0);
+    assert_eq!(run.permission_denials, ["Write"]);
+    assert_eq!(denied_path(name), "/work/.owlshift/result.json");
 }
 
 /// An unknown model: exit 1, `is_error: true` although `subtype` says

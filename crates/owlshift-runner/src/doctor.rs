@@ -2581,7 +2581,7 @@ mod tests {
     #[test]
     fn an_untested_or_unreadable_version_warns_without_failing() {
         let why = "Does not block `owlshift do`: an untested version usually works. \
-                   If a run misbehaves, install a tested version: claude 2.1.283, 2.1.284.";
+                   If a run misbehaves, install a tested version: claude 2.1.283, 2.1.284, 2.1.300.";
         for answer in [
             Answer::Exit(0, "9.9.9 (Claude Code)\n", ""),
             Answer::Exit(0, "2.1.283-beta.1 (Claude Code)\n", ""),
@@ -2698,7 +2698,7 @@ mod tests {
             claude.why.as_deref(),
             Some(
                 "Does not block `owlshift do`: an untested version usually works. If a run \
-                 misbehaves, install a tested version: claude 2.1.283, 2.1.284."
+                 misbehaves, install a tested version: claude 2.1.283, 2.1.284, 2.1.300."
             )
         );
         assert_eq!(claude.fix, []);
