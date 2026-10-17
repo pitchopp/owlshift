@@ -60,12 +60,17 @@
   ],
   "$defs": {
     "Admit": {
-      "description": "The admission gesture: delegating the ticket to Owlshift, a label, or a\nstate.",
+      "description": "The admission gesture: delegating the ticket to Owlshift, a label, or a\nstate. `\"ready\"` (OWL-322) is the state gesture on `states.ready` written\nwithout repeating the state; a file using it requires an Owlshift that\nreads it.",
       "oneOf": [
         {
           "description": "The ticket is delegated to Owlshift's agent identity.",
           "type": "string",
           "const": "delegation"
+        },
+        {
+          "description": "The ticket is moved to `states.ready`.",
+          "type": "string",
+          "const": "ready"
         },
         {
           "description": "The ticket carries this label.",
@@ -81,7 +86,7 @@
           ]
         },
         {
-          "description": "The ticket is in this state.",
+          "description": "The ticket is in this state, which must be `states.ready`.",
           "type": "object",
           "properties": {
             "state": {
@@ -348,7 +353,7 @@
       "type": "object",
       "properties": {
         "admit": {
-          "description": "The gesture by which a person admits a ticket to the queue. A state\ngesture is the move to the ready column, so it names\n`states.ready`.",
+          "description": "The gesture by which a person admits a ticket to the queue. A state\ngesture is the move to the ready column, so it names\n`states.ready`; `\"ready\"` says so without repeating it.",
           "$ref": "#/$defs/Admit"
         },
         "admitters": {

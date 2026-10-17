@@ -109,6 +109,20 @@ fn fixtures_validate_against_the_committed_schemas() {
     }
 }
 
+/// The unit form `admit = "ready"` (OWL-322) is in the committed schema, and
+/// a bare label is not.
+#[test]
+fn project_config_schema_accepts_the_ready_gesture() {
+    let validator = validator("project-config");
+    let text = fixture("owlshift.toml");
+    let with = |admit: &str| -> Value {
+        toml::from_str(&text.replace("admit = { label = \"agent\" }", admit)).unwrap()
+    };
+    assert!(validator.is_valid(&with("admit = \"ready\"")));
+    assert!(validator.is_valid(&with("admit = { state = \"Todo\" }")));
+    assert!(!validator.is_valid(&with("admit = \"label\"")));
+}
+
 /// The schema carries the rules of `result.json` that JSON Schema can express;
 /// question order is checked by `RunResult::parse` only.
 #[test]

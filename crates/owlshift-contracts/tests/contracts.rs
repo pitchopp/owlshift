@@ -2492,6 +2492,29 @@ fn project_config_rejections() {
     ))
     .unwrap();
     assert_eq!(state.tracker.admit, Admit::State("Todo".into()));
+    // OWL-322: `"ready"` is the state gesture on `states.ready`, whatever
+    // that state is called, and renders as the long form it stands for.
+    let ready_text = replaced(
+        "owlshift.toml",
+        "admit = { label = \"agent\" }",
+        "admit = \"ready\"",
+    );
+    let ready = ProjectConfig::parse(&ready_text).unwrap();
+    assert_eq!(ready.tracker.admit, state.tracker.admit);
+    assert_eq!(ProjectConfig::parse(&ready.render()).unwrap(), ready);
+    let renamed =
+        ProjectConfig::parse(&ready_text.replace("ready = \"Todo\"", "ready = \"Up next\""))
+            .unwrap();
+    assert_eq!(renamed.tracker.admit, Admit::State("Up next".into()));
+    rejects(
+        "a bare label gesture",
+        ProjectConfig::parse(&replaced(
+            "owlshift.toml",
+            "admit = { label = \"agent\" }",
+            "admit = \"label\"",
+        )),
+        "invalid type: unit variant, expected newtype variant",
+    );
 
     // `requires` stays readable in a file a newer binary wrote.
     let newer = replaced(

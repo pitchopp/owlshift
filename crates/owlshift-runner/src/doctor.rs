@@ -1330,7 +1330,7 @@ fn drain_admission_check(
             problems.push("`admit = \"delegation\"` is not built".to_owned());
             fixes.push(
                 "Decision D8's app takes no delegation scope, so nothing can be delegated to \
-                 Owlshift: set `admit` under `[tracker]` to `{ label = … }` or `{ state = … }`.",
+                 Owlshift: set `admit` under `[tracker]` to `{ label = … }` or `\"ready\"`.",
             );
         }
         Admit::Label(_) | Admit::State(_) => {}

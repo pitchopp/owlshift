@@ -140,7 +140,7 @@ requires = ">=0.1"
 [tracker]
 kind = "linear"
 team = "LOC"
-admit = { label = "agent" }   # or { state = "Todo" }, which must be the ready state
+admit = { label = "agent" }   # or "ready" (the move to the ready state), or { state = "Todo" }, which must be the ready state
 admitters = ["2f9c51d0-6a3e-4b7e-9d41-0c8a7e5b3f12"]   # whose gesture admits; `watch --drain` needs it
 exclude = "no-agent"          # optional: a label that keeps a ticket out for good
 states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }

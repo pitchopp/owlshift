@@ -8542,6 +8542,28 @@ fn the_drain_takes_a_ticket_in_then_builds_it_once_its_blocker_is_done() {
     assert_eq!(bench.record().intake.unwrap().gesture.account, "maintainer");
 }
 
+/// `admit = "ready"` (OWL-322) admits as `{ state = "Todo" }` does: the
+/// ticket in the ready column, its gesture by a listed admitter, is taken in
+/// and built, with no label on it.
+#[test]
+fn the_ready_gesture_admits_a_ticket_in_the_ready_column() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "",
+        ", parked = \"Parked\"",
+        "admit = \"ready\"\nadmitters = [\"maintainer\"]",
+    );
+    let intake = bench.reply(None, Some(&intake_result("done", None, "")));
+    let build = bench.reply(Some("Hello"), Some(DONE));
+    let (outcomes, lines, printed) = bench.drain(vec![intake, build], 2, |_| {});
+    assert!(
+        matches!(outcomes[..], [Err(Stop::Ready { .. }), Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.record().intake.unwrap().gesture.account, "maintainer");
+}
+
 /// Per-ticket routing (OWL-305, architecture section 5): the Build follows
 /// intake's verdict, an `effort:` label overriding its effort and a `tier:`
 /// label naming no tier left out with a warning; the dispatch's `routing`

@@ -87,8 +87,11 @@ pub const RULE_ROLES: [Role; 7] = [
 pub const DEFAULT_RULE_FILE: &str = "AGENTS.md";
 
 /// The tracker and how Owlshift maps onto it.
+// Read through `TrackerForm`, which is what the file may say: `admit =
+// "ready"` is resolved there to the state gesture on `states.ready`
+// (OWL-322), so a parsed `Tracker` never holds it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "TrackerForm")]
 pub struct Tracker {
     pub kind: TrackerKind,
     /// The tracker's team key; required for Linear.
@@ -96,7 +99,7 @@ pub struct Tracker {
     pub team: Option<String>,
     /// The gesture by which a person admits a ticket to the queue. A state
     /// gesture is the move to the ready column, so it names
-    /// `states.ready`.
+    /// `states.ready`; `"ready"` says so without repeating it.
     pub admit: Admit,
     /// The tracker accounts whose gesture admits a ticket to the drain
     /// (`owlshift watch --drain`), each by its identifier as the tracker
@@ -114,6 +117,76 @@ pub struct Tracker {
     pub exclude: Option<String>,
     /// The tracker states that show a ticket's visible stage.
     pub states: States,
+}
+
+/// What `[tracker]` may say, before `admit = "ready"` is resolved: the same
+/// keys as [`Tracker`] with [`AdmitForm`] for `admit`. It is also the
+/// schema of `[tracker]`, so the docs of the keys are written here too.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(
+    rename = "Tracker",
+    description = "The tracker and how Owlshift maps onto it."
+)]
+struct TrackerForm {
+    kind: TrackerKind,
+    /// The tracker's team key; required for Linear.
+    team: Option<String>,
+    /// The gesture by which a person admits a ticket to the queue. A state
+    /// gesture is the move to the ready column, so it names
+    /// `states.ready`; `"ready"` says so without repeating it.
+    admit: AdmitForm,
+    /// The tracker accounts whose gesture admits a ticket to the drain
+    /// (`owlshift watch --drain`), each by its identifier as the tracker
+    /// reports it (a Linear user's id, the name on the Markdown tracker),
+    /// written exactly, as a zone's owner is. Optional for the file;
+    /// `--drain` refuses to start without it. When set, at least one, each
+    /// once, none blank, padded or holding a control character. A file
+    /// using it requires an Owlshift that reads it (OWL-245).
+    #[schemars(length(min = 1))]
+    admitters: Option<Vec<String>>,
+    /// A label that keeps a ticket out of the drain, whatever else it
+    /// carries; optional, and never the admission label (OWL-245).
+    exclude: Option<String>,
+    /// The tracker states that show a ticket's visible stage.
+    states: States,
+}
+
+impl From<TrackerForm> for Tracker {
+    fn from(form: TrackerForm) -> Self {
+        let admit = match form.admit {
+            AdmitForm::Delegation => Admit::Delegation,
+            AdmitForm::Label(label) => Admit::Label(label),
+            AdmitForm::State(state) => Admit::State(state),
+            AdmitForm::Ready => Admit::State(form.states.ready.clone()),
+        };
+        Self {
+            kind: form.kind,
+            team: form.team,
+            admit,
+            admitters: form.admitters,
+            exclude: form.exclude,
+            states: form.states,
+        }
+    }
+}
+
+/// The admission gesture: delegating the ticket to Owlshift, a label, or a
+/// state. `"ready"` (OWL-322) is the state gesture on `states.ready` written
+/// without repeating the state; a file using it requires an Owlshift that
+/// reads it.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(rename = "Admit")]
+enum AdmitForm {
+    /// The ticket is delegated to Owlshift's agent identity.
+    Delegation,
+    /// The ticket is moved to `states.ready`.
+    Ready,
+    /// The ticket carries this label.
+    Label(String),
+    /// The ticket is in this state, which must be `states.ready`.
+    State(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
