@@ -22,7 +22,7 @@ pub mod render;
 
 use std::path::{MAIN_SEPARATOR, Path};
 
-use owlshift_adapters::forge::Repo;
+use owlshift_adapters::forge::{ErrorKind as ForgeErrorKind, Repo};
 use owlshift_adapters::harness::{self, Login, tested};
 use owlshift_adapters::tracker::linear::{
     AdmissionFacts, LinearTracker, StateMismatch, find_state,
@@ -44,10 +44,11 @@ use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
 };
+use crate::forge::GITHUB_TOKEN_HELP;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::{
-    AppError, DataDirSource, RunError, StatesError, System, exact_version_of, older_than,
-    version_of,
+    AppError, DataDirSource, DefaultBranch, RunError, StatesError, System, TokenTryError,
+    exact_version_of, older_than, version_of,
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
@@ -275,6 +276,11 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.push(tracker_check(config));
     let stored = project_secrets(system, config);
     checks.extend(stored.as_ref().map(secrets_check));
+    checks.extend(
+        stored
+            .as_ref()
+            .and_then(|found| forge_access_check(system, found)),
+    );
     let accounts = match &stored {
         Some(Ok(found)) => found.tracker.as_ref().map(|tracker| &tracker.accounts),
         _ => None,
@@ -1691,6 +1697,102 @@ fn project_secrets(
     })
 }
 
+/// Whether the project's GitHub token reads its repository's default branch
+/// (OWL-334): GitHub opens a pull request only on branches the token can
+/// read, which a fine-grained token gets with contents (read), so without it
+/// a delivery pushes its branch and then stops. Read-only, one query; the
+/// pull request permission is not tried. None when the secrets are
+/// unresolved or no token is stored: the `secrets` line says so.
+fn forge_access_check(
+    system: &dyn System,
+    found: &Result<ProjectSecrets, Unresolved>,
+) -> Option<Check> {
+    const SUBJECT: &str = "forge access";
+    let Ok(found) = found else {
+        return None;
+    };
+    found.forge.token?;
+    let repo = &found.repo;
+    let account = &found.forge.account;
+    let place = format!("the GitHub token under `{}`", account.token);
+    let why = "`owlshift do` opens the pull request with this token once the ticket's branch is \
+               pushed, and GitHub opens none on branches the token cannot read: the ticket would \
+               stay undelivered.";
+    let edit = "Edit the token on GitHub (Settings > Developer settings > Fine-grained tokens) \
+                and save: the token keeps its value, so nothing needs storing again";
+    let shared = if account.source == Source::Shared {
+        " This is the shared token, which may serve other projects; `owlshift init \
+         --replace-secrets` stores one of this project's own."
+    } else {
+        ""
+    };
+    let fail = |detail: String, fix: String| {
+        Some(Check::fail(
+            Section::Project,
+            SUBJECT,
+            detail,
+            why,
+            vec![Step::act(fix)],
+        ))
+    };
+    match system.github_default_branch(repo) {
+        Ok(DefaultBranch::Readable(branch)) => Some(Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "{place} reads `{branch}`, the default branch of github.com/{repo} (its pull \
+                 request permission is not tried)"
+            ),
+        )),
+        Ok(DefaultBranch::Empty) => Some(Check::info(
+            Section::Project,
+            SUBJECT,
+            format!("not checked: github.com/{repo} has no default branch yet"),
+        )),
+        Ok(DefaultBranch::Forbidden(message)) => fail(
+            format!(
+                "{place} cannot read the branches of github.com/{repo}, which needs contents \
+                 (read): {message}"
+            ),
+            format!(
+                "Give the token contents (read): {edit}, after setting Repository permissions > \
+                 Contents to Read-only.{shared}"
+            ),
+        ),
+        Err(TokenTryError::Credential(reason)) => {
+            fail(format!("not checked: {reason}"), KEYCHAIN_FIX.to_owned())
+        }
+        Err(TokenTryError::Forge(error)) => match error.kind {
+            ForgeErrorKind::Unauthorized => fail(
+                format!("GitHub refused {place}: {error}"),
+                format!(
+                    "Run `owlshift init --replace-secrets` and paste a valid token: \
+                     {GITHUB_TOKEN_HELP}"
+                ),
+            ),
+            ForgeErrorKind::NotFound => fail(
+                format!("{place} does not see github.com/{repo}: {error}"),
+                format!(
+                    "Give the token access to github.com/{repo}: {edit}, after adding the \
+                     repository under Repository access.{shared}"
+                ),
+            ),
+            ForgeErrorKind::HeadMoved | ForgeErrorKind::RateLimited | ForgeErrorKind::Other => {
+                Some(Check::warn(
+                    Section::Project,
+                    SUBJECT,
+                    format!("not checked: {error}"),
+                    format!(
+                        "{DOES_NOT_BLOCK} doctor could not ask GitHub whether the token reads \
+                         the branches of github.com/{repo}. Without contents (read), a delivery \
+                         stops after its push."
+                    ),
+                ))
+            }
+        },
+    }
+}
+
 /// Which keychain account each tracker and forge secret of the project is
 /// read from (OWL-308). A secret read from an account every project of the
 /// machine shares is a warning: the project works, on a key or token that
@@ -3042,6 +3144,118 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
 
     /// OWL-157: the Linear app Owlshift writes as. None stored warns, since
     /// writing through the key still works; what `do` would refuse fails.
+    #[test]
+    fn the_github_token_is_tried_on_the_default_branch() {
+        use owlshift_adapters::forge::{Branch, Error};
+
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, owl) = markdown_project();
+        let access = |system: &FakeSystem| {
+            let report = run(system, &owl);
+            let found = report
+                .checks
+                .iter()
+                .find(|check| check.subject == "forge access")
+                .cloned();
+            (found, report.ready())
+        };
+
+        let readable = Ok(DefaultBranch::Readable(Branch::new("develop").unwrap()));
+        let (found, ready_to_run) = access(&ready().github_default_branch_is(readable));
+        let found = found.unwrap();
+        assert_eq!(found.status, Status::Ok, "{found:?}");
+        assert!(
+            found.detail.starts_with(
+                "the GitHub token under `github.com/pitchopp/owlshift/github` reads `develop`"
+            ),
+            "{found:?}"
+        );
+        assert!(ready_to_run);
+
+        let (empty, _) = access(&ready().github_default_branch_is(Ok(DefaultBranch::Empty)));
+        assert_eq!(empty.unwrap().status, Status::Info);
+
+        // The answer GitHub gave on 2026-10-17 to a token without contents
+        // (read): the line names the permission, and editing the token is
+        // the fix, never storing it again.
+        let refusal = "GitHub: FORBIDDEN: Resource not accessible by personal access token";
+        let forbidden = Ok(DefaultBranch::Forbidden(refusal.into()));
+        let (failed, ready_to_run) = access(&ready().github_default_branch_is(forbidden.clone()));
+        let failed = failed.unwrap();
+        assert_eq!(failed.status, Status::Fail, "{failed:?}");
+        assert!(
+            failed.detail.contains("contents (read)") && failed.detail.ends_with(refusal),
+            "{failed:?}"
+        );
+        assert_eq!(
+            failed.fix.len(),
+            1,
+            "editing the token is the one step: {failed:?}"
+        );
+        let Step::Do(fix) = &failed.fix[0] else {
+            panic!("{failed:?}");
+        };
+        assert!(
+            fix.contains("Contents to Read-only") && fix.contains("keeps its value"),
+            "{fix}"
+        );
+        assert!(!fix.contains("replace-secrets"), "{fix}");
+        assert!(!ready_to_run);
+        // The shared token may be another project's: the fix says so.
+        let (shared, _) = access(&ready().only_shared().github_default_branch_is(forbidden));
+        let Step::Do(fix) = &shared.unwrap().fix[0] else {
+            panic!("a step to do");
+        };
+        assert!(fix.contains("shared token"), "{fix}");
+
+        let forge_error = |kind, message| Err(TokenTryError::Forge(Error::new(kind, message)));
+        for (answer, status, fix) in [
+            (
+                forge_error(ForgeErrorKind::Unauthorized, "GitHub refused the token"),
+                Status::Fail,
+                "owlshift init --replace-secrets",
+            ),
+            (
+                forge_error(ForgeErrorKind::NotFound, "no repository"),
+                Status::Fail,
+                "Repository access",
+            ),
+            (
+                Err(TokenTryError::Credential("the keychain is locked".into())),
+                Status::Fail,
+                KEYCHAIN_FIX,
+            ),
+            (
+                forge_error(ForgeErrorKind::Other, "GitHub: connection refused"),
+                Status::Warn,
+                "",
+            ),
+            (
+                forge_error(ForgeErrorKind::RateLimited, "GitHub's rate limit"),
+                Status::Warn,
+                "",
+            ),
+        ] {
+            let (found, ready_to_run) = access(&ready().github_default_branch_is(answer));
+            let found = found.unwrap();
+            assert_eq!(found.status, status, "{found:?}");
+            assert_eq!(ready_to_run, status != Status::Fail, "{found:?}");
+            if status == Status::Fail {
+                let Step::Do(step) = &found.fix[0] else {
+                    panic!("{found:?}");
+                };
+                assert!(step.contains(fix), "{found:?}");
+            }
+        }
+
+        // No token: the `secrets` line fails, and no token is tried.
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let none = ready()
+            .unstored(&secrets::ForgeAccount::project(&repo).token)
+            .unstored(&secrets::ForgeAccount::shared().token);
+        assert_eq!(access(&none).0, None);
+    }
+
     #[test]
     fn the_linear_app_is_checked_as_do_checks_it() {
         use owlshift_adapters::tracker::Error;

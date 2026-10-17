@@ -38,9 +38,9 @@ use jiff::Timestamp;
 use owlshift_contracts::brief::MAX_EXCERPT_BYTES;
 
 use crate::forge::{
-    BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId, Error,
-    ErrorKind, InlineComment, Mergeable, PrState, PullRequest, PullRequestRead, RateLimit, Repo,
-    Review, ReviewsRead,
+    BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId,
+    DefaultBranch, Error, ErrorKind, InlineComment, Mergeable, PrState, PullRequest,
+    PullRequestRead, RateLimit, Repo, Review, ReviewsRead,
 };
 pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
@@ -355,7 +355,7 @@ impl GitHubForge {
                 "draft": new.draft,
             }
         });
-        let data: CreateData = self.call(CREATE_MUTATION, variables)?;
+        let data: CreateData = self.call(CREATE_MUTATION, variables).map_err(refs_hint)?;
         match data.create_pull_request.and_then(|c| c.pull_request) {
             Some(pr) => pr.into_pull_request(),
             None => Err(invalid(format!(
@@ -363,6 +363,33 @@ impl GitHubForge {
                 new.head
             ))),
         }
+    }
+
+    /// Whether the token reads the repository's default branch (OWL-334),
+    /// in one read-only query: GitHub opens a pull request only on refs the
+    /// token can read, which a fine-grained token gets with contents (read).
+    /// A refusal is [`DefaultBranch::Forbidden`]: a GraphQL error of type
+    /// `FORBIDDEN`, or HTTP 403 that is no rate limit. A repository the
+    /// token cannot see is [`ErrorKind::NotFound`].
+    pub fn default_branch(&self) -> Result<DefaultBranch, Error> {
+        let variables = json!({ "owner": self.repo.owner(), "name": self.repo.name() });
+        let response = self.send(DEFAULT_BRANCH_QUERY, variables)?;
+        if let Some(message) = forbidden(&response) {
+            return Ok(DefaultBranch::Forbidden(message));
+        }
+        let data: DefaultBranchData = decode(&response)?;
+        let Some(repository) = data.repository else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("GitHub shows this token no repository {}", self.repo),
+            ));
+        };
+        let Some(found) = repository.default_branch_ref else {
+            return Ok(DefaultBranch::Empty);
+        };
+        // A ref read whole: its name and the commit it points at.
+        CommitId::new(found.target.oid)?;
+        Branch::new(found.name).map(DefaultBranch::Readable)
     }
 
     /// Every check of pull request `number`, which must be at
@@ -744,12 +771,15 @@ impl GitHubForge {
 
     /// Sends one request and returns its `data`, decoded.
     fn call<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T, Error> {
+        decode(&self.send(query, variables)?)
+    }
+
+    /// Sends one request and returns GitHub's answer, undecoded.
+    fn send(&self, query: &str, variables: Value) -> Result<Response, Error> {
         let request = json!({ "query": query, "variables": variables });
-        let response = self
-            .transport
+        self.transport
             .send(&request)
-            .map_err(|e| invalid(format!("GitHub: {e}")))?;
-        decode(&response)
+            .map_err(|e| invalid(format!("GitHub: {e}")))
     }
 }
 
@@ -760,6 +790,9 @@ const OPEN_QUERY: &str = "query OpenPullRequests($owner: String!, $name: String!
 
 const REPOSITORY_ID_QUERY: &str = "query RepositoryId($owner: String!, $name: String!) { \
     repository(owner: $owner, name: $name) { id } }";
+
+const DEFAULT_BRANCH_QUERY: &str = "query DefaultBranch($owner: String!, $name: String!) { \
+    repository(owner: $owner, name: $name) { defaultBranchRef { name target { oid } } } }";
 
 const CREATE_MUTATION: &str = "mutation OpenPullRequest($input: CreatePullRequestInput!) { \
     createPullRequest(input: $input) { pullRequest { number url state headRefOid } } }";
@@ -938,6 +971,52 @@ struct RestOutput {
     text: Option<String>,
 }
 
+/// GitHub's words when `createPullRequest` cannot read a ref of the pull
+/// request, as answered on 2026-10-17 to a token without contents (read)
+/// (OWL-334).
+const REFS_UNREADABLE: &str = "not all refs are readable";
+
+/// `error` with what it most likely means when it is GitHub refusing to
+/// open a pull request on refs the token cannot read; any other unchanged.
+fn refs_hint(mut error: Error) -> Error {
+    if error.message.starts_with("GitHub: UNPROCESSABLE: ")
+        && error.message.contains(REFS_UNREADABLE)
+    {
+        error.message.push_str(
+            " (the GitHub token probably lacks contents (read), which GitHub needs to read a \
+             pull request's branches)",
+        );
+    }
+    error
+}
+
+/// The refusal in `response` that is neither a rejected token nor a spent
+/// budget: HTTP 403 without the rate-limit headers, or a GraphQL error of
+/// type `FORBIDDEN` among no `RATE_LIMITED` one. GitHub answered such an
+/// error, "Resource not accessible by personal access token", to a token
+/// without contents (read) on 2026-10-17 (OWL-334).
+fn forbidden(response: &Response) -> Option<String> {
+    let envelope = serde_json::from_str::<Envelope>(&response.body).ok();
+    let rate = response.rate;
+    let limited = rate.remaining == Some(0) || rate.retry_after.is_some();
+    if response.status == 403 && !limited {
+        let message = envelope.and_then(|e| e.message).unwrap_or_default();
+        return Some(format!("GitHub answered HTTP 403 {message}"));
+    }
+    let errors = envelope?.errors;
+    if response.status != 200
+        || errors
+            .iter()
+            .any(|error| error.kind.as_deref() == Some("RATE_LIMITED"))
+    {
+        return None;
+    }
+    errors
+        .into_iter()
+        .find(|error| error.kind.as_deref() == Some("FORBIDDEN"))
+        .map(|error| format!("GitHub: FORBIDDEN: {}", error.message))
+}
+
 /// Reads a GraphQL answer: a rejected token first, then a spent budget, then
 /// GraphQL errors, then `data`.
 fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
@@ -1079,6 +1158,24 @@ struct Envelope {
     /// The REST-shaped error of a refused or rate-limited request.
     #[serde(default)]
     message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DefaultBranchData {
+    repository: Option<DefaultBranchRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DefaultBranchRepository {
+    default_branch_ref: Option<GhRef>,
+}
+
+/// A ref, with the commit it points at.
+#[derive(Deserialize)]
+struct GhRef {
+    name: String,
+    target: GhOid,
 }
 
 #[derive(Deserialize)]
@@ -1794,6 +1891,128 @@ mod tests {
             r#"{"data":{"createPullRequest":null}}"#.to_owned(),
         ]);
         assert!(forge.open_pull_request(new).is_err());
+    }
+
+    /// OWL-334: a pull request GitHub cannot open on unreadable refs says
+    /// what the token probably lacks; another refusal is left as it is.
+    #[test]
+    fn unreadable_refs_name_the_missing_permission() {
+        let head = Branch::new("owl-17").unwrap();
+        let base = Branch::new("main").unwrap();
+        let new = NewPullRequest {
+            head: &head,
+            base: &base,
+            title: "t",
+            body: "b",
+            draft: false,
+        };
+        let refused = |message: &str| {
+            let (forge, _) = forge(vec![
+                r#"{"data":{"repository":{"id":"R_1"}}}"#.to_owned(),
+                format!(
+                    r#"{{"data":{{"createPullRequest":null}},"errors":[{{"type":"UNPROCESSABLE","message":"{message}"}}]}}"#
+                ),
+            ]);
+            forge.open_pull_request(new).unwrap_err()
+        };
+        let unreadable = refused("not all refs are readable");
+        assert_eq!(unreadable.kind, ErrorKind::Other);
+        assert!(
+            unreadable
+                .message
+                .starts_with("GitHub: UNPROCESSABLE: not all refs are readable (")
+                && unreadable.message.contains("lacks contents (read)"),
+            "{unreadable}"
+        );
+        let exists = refused("A pull request already exists");
+        assert_eq!(
+            exists.message,
+            "GitHub: UNPROCESSABLE: A pull request already exists"
+        );
+    }
+
+    /// Answers every request with one HTTP answer, or with no answer.
+    struct Fixed(Result<Response, String>);
+
+    impl Transport for Fixed {
+        fn send(&self, _request: &Value) -> Result<Response, String> {
+            self.0.clone()
+        }
+    }
+
+    fn default_branch(answer: Result<Response, String>) -> Result<DefaultBranch, Error> {
+        let repo = Repo::parse("pitchopp/locary").unwrap();
+        GitHubForge::with_transport(Fixed(answer), repo).default_branch()
+    }
+
+    /// OWL-334: the default branch read tells a readable ref, a repository
+    /// with none, a token refused its contents, and the errors of any other
+    /// read apart.
+    #[test]
+    fn the_default_branch_read_tells_a_refused_token_apart() {
+        let ok = |body: &str| default_branch(Ok(answer(200, body)));
+        let readable = format!(
+            r#"{{"data":{{"repository":{{"defaultBranchRef":{{"name":"develop","target":{{"oid":"{HEAD}"}}}}}}}}}}"#
+        );
+        assert_eq!(
+            ok(&readable),
+            Ok(DefaultBranch::Readable(Branch::new("develop").unwrap()))
+        );
+        assert_eq!(
+            ok(r#"{"data":{"repository":{"defaultBranchRef":null}}}"#),
+            Ok(DefaultBranch::Empty)
+        );
+        // The shape GitHub answered on 2026-10-17 to a token without
+        // contents (read).
+        let forbidden = r#"{"data":{"repository":{"defaultBranchRef":null}},"errors":[{"type":"FORBIDDEN","path":["repository","defaultBranchRef"],"message":"Resource not accessible by personal access token"}]}"#;
+        assert_eq!(
+            ok(forbidden),
+            Ok(DefaultBranch::Forbidden(
+                "GitHub: FORBIDDEN: Resource not accessible by personal access token".into()
+            ))
+        );
+        let rest_refusal = default_branch(Ok(answer(
+            403,
+            r#"{"message":"Resource not accessible by personal access token"}"#,
+        )));
+        assert!(
+            matches!(&rest_refusal, Ok(DefaultBranch::Forbidden(m)) if m.contains("403 Resource")),
+            "{rest_refusal:?}"
+        );
+
+        let kind = |result: Result<DefaultBranch, Error>| result.unwrap_err().kind;
+        assert_eq!(
+            kind(default_branch(Ok(answer(
+                401,
+                r#"{"message":"Bad credentials"}"#
+            )))),
+            ErrorKind::Unauthorized
+        );
+        let missing = r#"{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","message":"Could not resolve"}]}"#;
+        assert_eq!(kind(ok(missing)), ErrorKind::NotFound);
+        assert_eq!(
+            kind(ok(r#"{"data":{"repository":null}}"#)),
+            ErrorKind::NotFound
+        );
+        let unreachable = default_branch(Err("connection refused".into())).unwrap_err();
+        assert_eq!(unreachable.kind, ErrorKind::Other);
+        assert_eq!(unreachable.message, "GitHub: connection refused");
+        // A spent budget stays one, whatever else the answer says.
+        let spent = Response {
+            status: 403,
+            body: r#"{"message":"API rate limit exceeded"}"#.into(),
+            rate: RateHeaders {
+                remaining: Some(0),
+                ..Default::default()
+            },
+        };
+        assert_eq!(kind(default_branch(Ok(spent))), ErrorKind::RateLimited);
+        let both = r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"slow down"},{"type":"FORBIDDEN","message":"no"}]}"#;
+        assert_eq!(kind(ok(both)), ErrorKind::RateLimited);
+        // A ref without its commit is not read whole.
+        let no_oid =
+            r#"{"data":{"repository":{"defaultBranchRef":{"name":"main","target":{"oid":"zz"}}}}}"#;
+        assert_eq!(kind(ok(no_oid)), ErrorKind::Other);
     }
 
     #[test]

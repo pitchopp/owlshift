@@ -11,8 +11,10 @@ pub use owlshift_platform::process::{Captured, RunError};
 pub use owlshift_platform::process::{SentinelProbe, SentinelStatus};
 use owlshift_platform::sandbox::SandboxError;
 
+pub use owlshift_adapters::forge::DefaultBranch;
 use owlshift_adapters::forge::Repo;
 
+pub use crate::forge::TokenTryError;
 use crate::secrets::TrackerAccounts;
 use crate::ticket_ref::{self, RefState};
 pub use crate::tracker::{AppError, StatesError};
@@ -129,6 +131,14 @@ pub trait System {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| AppError::Keychain(error.to_string()))
             .and_then(|keychain| crate::tracker::linear_app_user(&keychain, accounts, team))
+    }
+    /// What the GitHub token of the project of `repo` reads of the
+    /// repository's default branch, the token resolved and read as `owlshift
+    /// do` reads it, over the network (OWL-334). Only `owlshift doctor` asks.
+    fn github_default_branch(&self, repo: &Repo) -> Result<DefaultBranch, TokenTryError> {
+        owlshift_platform::keychain::Keychain::system()
+            .map_err(|error| TokenTryError::Credential(error.to_string()))
+            .and_then(|keychain| crate::forge::default_branch(&keychain, repo))
     }
     /// The ticket refs of the project whose repository is at `root`, each
     /// with its state ([`ticket_ref::states`]), read in its dedicated
@@ -283,6 +293,9 @@ pub(crate) mod fake {
         /// What checking the Linear app gives, both of its entries being
         /// stored; `None`: no app is stored.
         linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
+        /// What trying the GitHub token on its repository gives; `None`: its
+        /// default branch `main` is readable.
+        github_default_branch: Option<Result<DefaultBranch, TokenTryError>>,
         /// The repository `origin` names; `None`: `pitchopp/owlshift`.
         origin: Option<Result<Repo, String>>,
         /// What reading the project's ticket refs gives; `None`: no
@@ -406,6 +419,15 @@ pub(crate) mod fake {
             answer: Result<&str, owlshift_adapters::tracker::Error>,
         ) -> Self {
             self.linear_app = Some(answer.map(str::to_owned));
+            self
+        }
+
+        /// Trying the GitHub token on its repository gives this.
+        pub(crate) fn github_default_branch_is(
+            mut self,
+            answer: Result<DefaultBranch, TokenTryError>,
+        ) -> Self {
+            self.github_default_branch = Some(answer);
             self
         }
 
@@ -589,6 +611,16 @@ pub(crate) mod fake {
                         })
                 }
             }
+        }
+
+        /// As [`Self::github_default_branch_is`] scripted it, whatever is
+        /// stored; never the keychain or the network.
+        fn github_default_branch(&self, _repo: &Repo) -> Result<DefaultBranch, TokenTryError> {
+            self.github_default_branch.clone().unwrap_or_else(|| {
+                Ok(DefaultBranch::Readable(
+                    owlshift_adapters::forge::Branch::new("main").unwrap(),
+                ))
+            })
         }
 
         #[cfg(unix)]
