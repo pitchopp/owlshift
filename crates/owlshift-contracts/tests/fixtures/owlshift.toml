@@ -20,7 +20,7 @@ plan_approval = "on-fork"   # always | on-fork | never
 
 [models]
 deep     = { claude = "claude-opus-5-5" }
-standard = { claude = "claude-sonnet-5", codex = "gpt-5.6-sol" }
+standard = { claude = "claude-sonnet-5", codex = "gpt-6-astra" }
 fast     = { claude = "claude-haiku-4-5" }
 
 [policy]

@@ -24,7 +24,7 @@ You may read the repository in this worktree, at the base commit; you change no 
 - `routing`, how its runs should work: `harness` `claude`; `tier` `fast` for mechanical work, `standard` for most, `deep` for subtle reasoning across the code; `effort` one of `low`, `medium`, `high`, `xhigh` and `max`, as hard as the work needs to be thought through.
 - `dependencies`, the tickets that must land before this one can be built, each with its `ticket` identifier and its `quote`: the words of the ticket's title, description or thread that name it, copied exactly, on one line, at most 512 bytes, the identifier among them. Only tickets the text names by their identifier, as the tracker writes it (`OWL-12`), and only as a prerequisite of this one: a ticket mentioned as related, as a follow-up, or as blocked by this one is not a dependency. At most 64. A prerequisite the text names in words without an identifier ("after the billing rework") is a question, never a guess: ask which ticket it is. A dependency whose identifier the text does not hold is refused, a failed run.
 
-The verdict is recorded and shown on the ticket; in this version the Build does not follow it yet.
+The verdict is recorded and shown on the ticket. Design, Build and their fix runs follow its tier and effort, and the reviewers its effort, so the routing decides how hard the ticket is worked; a `tier:` or `effort:` label on the ticket overrides it.
 
 ## What you ask
 
