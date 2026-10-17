@@ -413,6 +413,40 @@ mod tests {
         )
     }
 
+    /// Starts the gh the credential check will find, once for this test
+    /// binary and off the probes' clocks: its first start on a fresh Windows
+    /// runner can outlive the probe's deadline (OWL-56). The test bench's
+    /// `gh::warm_up` does the same; the runner cannot depend on the bench.
+    fn warm_up_gh(env: &[(OsString, OsString)]) {
+        use std::sync::OnceLock;
+
+        use owlshift_platform::process::{OUTPUT_CAP, find_executable_in, run_command};
+
+        static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
+        let started = STARTED.get_or_init(|| {
+            let path = env
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            let Some(gh) = find_executable_in("gh", path) else {
+                return Ok(());
+            };
+            let mut command = Command::new(&gh);
+            command
+                .arg("--version")
+                .env_clear()
+                .envs(env.iter().map(|(n, v)| (n, v)));
+            match run_command(&mut command, None, Duration::from_secs(120), OUTPUT_CAP) {
+                Ok(captured) if captured.success() => Ok(()),
+                outcome => Err(format!("{} --version: {outcome:?}", gh.display())),
+            }
+        });
+        if let Err(error) = started {
+            panic!("gh did not start: {error}");
+        }
+    }
+
     /// The operator's project file, its gate `commands`.
     fn local_config(commands: &[&str]) -> ProjectConfig {
         let items: Vec<String> = commands
@@ -500,7 +534,9 @@ mod tests {
             let parent = std::env::vars_os()
                 .filter(|(name, _)| name != "HOME")
                 .chain([(OsString::from("HOME"), self.root.join("home").into())]);
-            AgentEnv::new(parent).unwrap()
+            let agent = AgentEnv::new(parent).unwrap();
+            warm_up_gh(agent.vars());
+            agent
         }
 
         fn executor(&self, agent: AgentEnv) -> Executor {
