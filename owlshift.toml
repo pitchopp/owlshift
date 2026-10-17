@@ -59,3 +59,6 @@ plan_approval = "on-fork"
 # Question categories always left to a human, on top of the floor's
 # security, data_loss, money, legal, irreversible and scope.
 always_human = []
+resolver_delegation = "all"   # none | facts | discoverable (par défaut) | ticket | all
+resolver_passes = "unlimited"              # 1 à 50, ou "unlimited"
+resolver_budget_usd = 5.0        # obligatoire avec "unlimited"
