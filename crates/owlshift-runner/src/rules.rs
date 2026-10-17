@@ -26,16 +26,37 @@ const MAX_RULE_BYTES: u64 = 64 * 1024;
 const RULES: &str = "the project's rules";
 
 /// The rules a project gives its briefs: those of every brief, and those of
-/// one role's alone (OWL-312).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// one role's alone (OWL-312); and its gate, `stack.gate`, from the same
+/// project file, so that a run's rules and gate always come from one commit
+/// (OWL-331).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectRules {
     /// The rules of `stack.rules`, in order.
     common: Vec<Rule>,
     /// The rules of `[roles.<role>]`, in order, for each role that has any.
     roles: BTreeMap<Role, Vec<Rule>>,
+    /// The commands of `stack.gate`, in order.
+    gate: Vec<String>,
 }
 
 impl ProjectRules {
+    /// No rule and no gate: for the brief of a role told neither, such as
+    /// the answer check (architecture section 9), whose run never runs a
+    /// gate. Never for a Build or a rebase, where an empty gate passes.
+    pub fn none() -> Self {
+        Self {
+            common: Vec::new(),
+            roles: BTreeMap::new(),
+            gate: Vec::new(),
+        }
+    }
+
+    /// The project's gate: `stack.gate` of the project file the rules were
+    /// listed from.
+    pub fn gate(&self) -> &[String] {
+        &self.gate
+    }
+
     /// The rules of `stack.rules`, which every brief holds.
     pub fn common(&self) -> &[Rule] {
         &self.common
@@ -84,7 +105,8 @@ struct Listed<'a> {
 /// file, files over 64 KiB together in one brief (`stack.rules` and the
 /// role's), a file not in UTF-8, and any git failure are errors: a reason
 /// that names the file. Every file is listed and measured before any is
-/// read.
+/// read. The gate is `config`'s `stack.gate`: `config` is the project file
+/// at `base`, or the person's own when `base` has none (OWL-331).
 pub fn project_rules(
     git: &Git,
     checkout: &Path,
@@ -114,6 +136,7 @@ pub fn project_rules(
     let mut rules = ProjectRules {
         common: read_all(git, checkout, base, &common)?,
         roles: BTreeMap::new(),
+        gate: config.stack.gate.clone(),
     };
     for (role, listed) in own {
         let read = read_all(git, checkout, base, &listed)?;

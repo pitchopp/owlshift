@@ -245,7 +245,10 @@ fn component(name: &str) -> String {
 }
 
 /// The branch new ticket branches start from, as the dedicated checkout
-/// knows it after a fetch.
+/// knows it after a fetch. [`Base::ancestor`] also names an older commit
+/// of that branch, the one a ticket's branch was made from, which a run's
+/// project file and rules are then read at (OWL-331): such a value is
+/// read from, never started from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Base {
     /// The remote-tracking name, such as `origin/main`, for messages and
@@ -258,6 +261,19 @@ pub struct Base {
     /// fetch, resolved once through that full name: what new branches start
     /// from and what the project's rules are read at.
     pub commit: String,
+}
+
+impl Base {
+    /// `commit`, an ancestor of this base's commit, named in messages as
+    /// this base at that commit (`origin/main at 0123456789ab`).
+    pub fn ancestor(&self, commit: &str) -> Base {
+        let short = commit.get(..12).unwrap_or(commit);
+        Base {
+            remote_ref: format!("{} at {short}", self.remote_ref),
+            branch: self.branch.clone(),
+            commit: commit.to_owned(),
+        }
+    }
 }
 
 /// How long the first clone of a project may take (OWL-60): a large
@@ -457,7 +473,7 @@ const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024;
 /// No project file at the base means no owners. A file over 64 KiB, not
 /// text, requiring a newer Owlshift or invalid is an error naming it.
 pub fn zone_owners_at(git: &Git, checkout: &Path, base: &Base) -> Result<ZoneOwners, String> {
-    match config_at(git, checkout, base)? {
+    match project_file_at(git, checkout, base)? {
         Some(config) => config
             .zone_owners()
             .map_err(|e| format!("{PROJECT_FILE} on {}: {e}", base.remote_ref)),
@@ -474,7 +490,7 @@ pub fn admitters_at(
     checkout: &Path,
     base: &Base,
 ) -> Result<Option<Vec<String>>, String> {
-    Ok(config_at(git, checkout, base)?.and_then(|config| config.tracker.admitters))
+    Ok(project_file_at(git, checkout, base)?.and_then(|config| config.tracker.admitters))
 }
 
 /// The `[forge].reviewers` of the project file as the base commit holds it
@@ -487,13 +503,23 @@ pub fn forge_reviewers_at(
     checkout: &Path,
     base: &Base,
 ) -> Result<Option<BTreeMap<String, String>>, String> {
-    Ok(config_at(git, checkout, base)?
+    Ok(project_file_at(git, checkout, base)?
         .and_then(|config| config.forge)
         .map(|forge| forge.reviewers))
 }
 
-/// The project file at the base commit, parsed; `None` when there is none.
-fn config_at(git: &Git, checkout: &Path, base: &Base) -> Result<Option<ProjectConfig>, String> {
+/// The project file at `base.commit`, parsed, `None` when that commit has
+/// none: read in the dedicated `checkout` as the rules are, a file over
+/// 64 KiB, not text, requiring a newer Owlshift or invalid being an error
+/// naming it. `base` is the fetched base, or an ancestor of it
+/// ([`Base::ancestor`]) such as the commit a ticket's branch was made from,
+/// whose gate and rules a run of that branch takes (OWL-331): any commit
+/// the default branch held, never a ticket's branch, which agents write.
+pub fn project_file_at(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+) -> Result<Option<ProjectConfig>, String> {
     let file = PROJECT_FILE;
     let Some(text) = rules::text_at_base(
         git,

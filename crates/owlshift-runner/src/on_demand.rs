@@ -1006,6 +1006,24 @@ struct Dispatched {
     build: RunRouting,
 }
 
+/// Where a dispatch's project file came from (OWL-331): the commit its
+/// runs are configured at, or, when that commit has none, the person's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectFile {
+    Commit,
+    Local,
+}
+
+impl ProjectFile {
+    /// Its name in the `dispatch` event.
+    fn as_str(self) -> &'static str {
+        match self {
+            ProjectFile::Commit => "commit",
+            ProjectFile::Local => "local",
+        }
+    }
+}
+
 /// One run through the executor: its id, its report, and the isolation
 /// breaches it was quarantined for.
 struct Ran {
@@ -1560,9 +1578,10 @@ impl OnDemand<'_> {
 
     /// What a Build needs, read just before its first run: the forge is asked
     /// before an hour of Build, so a refused token or an unknown repository
-    /// shows now, and the project's rules come from the base commit, after
-    /// the fetch, never from the ticket's branch, which agents write. Every
-    /// Build run of the command gets the same rules.
+    /// shows now, and the project's rules and gate come from the commit the
+    /// ticket's branch was made from ([`Self::configuring_base`]), after the
+    /// fetch, never from the ticket's branch, which agents write. Every
+    /// Build run of the command gets the same rules and gate.
     fn dispatch(
         &self,
         p: &Prepared,
@@ -1575,14 +1594,8 @@ impl OnDemand<'_> {
             .forge
             .find_open_pull_request(&head, &base_branch)
             .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
-        let rules = rules::project_rules(
-            &self.executor.git,
-            &p.checkout,
-            &p.base,
-            self.config,
-            command.briefed_roles(),
-        )
-        .map_err(|e| refused("the project's rules", e))?;
+        let at = self.configuring_base(p, command)?;
+        let (rules, project_file) = self.rules_at(p, &at, command.briefed_roles(), sink)?;
         sink.emit(
             &p.ticket,
             None,
@@ -1597,6 +1610,8 @@ impl OnDemand<'_> {
                 ("checkout", path(&p.checkout)),
                 ("pull_request", json!(open.map(|pr| pr.number))),
                 ("rules", json!(rules.sources())),
+                ("configured_at", json!(at.commit)),
+                ("project_file", json!(project_file.as_str())),
             ]),
         );
         let (routing, build) = self.route(p, command, sink);
@@ -1607,6 +1622,103 @@ impl OnDemand<'_> {
             routing,
             build,
         })
+    }
+
+    /// The commit a run of `command` takes its project file and rules at
+    /// (OWL-331, architecture section 5, "Which commit configures a run"):
+    /// the fetched base for a rebase, which rebases onto it, and for a
+    /// ticket whose branch does not exist yet, which starts there; otherwise
+    /// the commit the ticket's branch was made from, its merge-base with the
+    /// base, so that a run's gate and rules are those of the code it works
+    /// on, whatever the default branch took since. That commit is one the
+    /// default branch held, never one of the branch's own, which agents
+    /// write. A branch git cannot read, or one sharing no history with the
+    /// base, refuses the run.
+    fn configuring_base(&self, p: &Prepared, command: Command) -> Result<Base, Stop> {
+        if matches!(command, Command::Rebase) {
+            return Ok(p.base.clone());
+        }
+        let git = &self.executor.git;
+        let head_ref = format!("refs/heads/{}", p.branch);
+        let shown = git
+            .output(
+                &p.checkout,
+                &["show-ref", "--verify", "--quiet", head_ref.as_str()],
+                None,
+            )
+            .map_err(|e| refused("reading the ticket's branch", e))?;
+        match shown.code {
+            Some(0) => {}
+            // `show-ref --verify` exits 1 for a ref that does not exist.
+            Some(1) => return Ok(p.base.clone()),
+            _ => {
+                return Err(Stop::Refused(format!(
+                    "reading the ticket's branch {head_ref}: {}",
+                    String::from_utf8_lossy(&shown.stderr).trim()
+                )));
+            }
+        }
+        let made_from = git
+            .run(
+                &p.checkout,
+                &["merge-base", head_ref.as_str(), p.base.commit.as_str()],
+            )
+            .map_err(|e| {
+                Stop::Refused(format!(
+                    "finding the commit of {} the ticket's branch {} was made from, whose gate \
+                     and rules its runs take: {}. A branch sharing no history with the base \
+                     has none",
+                    p.base.remote_ref, p.branch, e.detail
+                ))
+            })?;
+        let made_from = String::from_utf8_lossy(&made_from).trim().to_owned();
+        Ok(if made_from == p.base.commit {
+            p.base.clone()
+        } else {
+            p.base.ancestor(&made_from)
+        })
+    }
+
+    /// The project's rules and gate at `at` (OWL-331): read from the project
+    /// file `at` holds, or from the person's own file, the one this command
+    /// loaded, when `at` has none, as a project adopting Owlshift may not
+    /// have merged it yet. The project file's `stack.gate_env` cannot follow:
+    /// the agent environment is made once per command from the person's
+    /// file, so names that differ are a `warning` event (`gate_env_differs`).
+    fn rules_at(
+        &self,
+        p: &Prepared,
+        at: &Base,
+        briefed: &[Role],
+        sink: &mut EventSink<'_>,
+    ) -> Result<(ProjectRules, ProjectFile), Stop> {
+        let git = &self.executor.git;
+        let found = project::project_file_at(git, &p.checkout, at)
+            .map_err(|e| refused("the project file", e))?;
+        let (config, file) = match &found {
+            Some(config) => (config, ProjectFile::Commit),
+            None => (self.config, ProjectFile::Local),
+        };
+        let mut declared = config.stack.gate_env_names();
+        let mut loaded = self.config.stack.gate_env_names();
+        declared.sort_unstable();
+        loaded.sort_unstable();
+        if declared != loaded {
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("gate_env_differs")),
+                    ("configured_at", json!(at.commit)),
+                    ("declared", json!(declared)),
+                    ("passed", json!(loaded)),
+                ]),
+            );
+        }
+        let rules = rules::project_rules(git, &p.checkout, at, config, briefed)
+            .map_err(|e| refused("the project's rules", e))?;
+        Ok((rules, file))
     }
 
     /// The ticket's routing at a dispatch (OWL-305, architecture section 5,
@@ -2385,7 +2497,7 @@ impl OnDemand<'_> {
             p,
             Role::AnswerCheck,
             &comments,
-            &ProjectRules::default(),
+            &ProjectRules::none(),
             None,
             &current,
         );
@@ -3337,7 +3449,8 @@ impl OnDemand<'_> {
                 network: false,
                 browser: false,
             },
-            gate: self.config.stack.gate.clone(),
+            // From the project file the rules were read from (OWL-331).
+            gate: rules.gate().to_vec(),
             // Design asks under them too (OWL-303).
             always_human: if matches!(role, Role::Build | Role::Resolver | Role::Design) {
                 p.policy.additions()
