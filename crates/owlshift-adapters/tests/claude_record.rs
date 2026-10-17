@@ -16,6 +16,10 @@
 //! paths and the user's skills, plugins, agents, commands and memory paths
 //! go. `usage_limit.jsonl` is constructed by hand, not recorded (C7).
 //!
+//! The `claude` run is the first on the `PATH`. To record with a release
+//! other than the installed one, put a folder holding a `claude` link to
+//! that release's binary first on the `PATH` (OWL-327, in the build plan).
+//!
 //! The Linear fixtures have their own recorder, in `tests/support`.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -31,7 +35,7 @@ use owlshift_contracts::ids::RelativePath;
 use serde_json::{Value, json};
 
 /// The release these fixtures are recorded with: a run on another one fails.
-const VERSION: &str = "2.1.284";
+const VERSION: &str = "2.1.300";
 
 const UUID: &str = "00000000-0000-4000-8000-000000000000";
 const TIMESTAMP: &str = "2026-09-29T12:00:00.000Z";
@@ -346,6 +350,7 @@ fn write(name: &str, scrubbed: &str) {
         "/home/".to_owned(),
         "/private/".to_owned(),
         "/var/folders".to_owned(),
+        ".local/share/claude".to_owned(),
     ];
     for var in ["HOME", "TMPDIR"] {
         local.extend(std::env::var(var).ok().filter(|value| value.len() > 1));
@@ -459,6 +464,100 @@ fn read_only_denial() {
     assert_eq!(written, json!({"ok": true}));
     assert!(!dir.path().join("other.txt").exists());
     scrub_and_write("read_only_denial.jsonl", dir.path(), &recorded);
+}
+
+/// The result rule the adapter passes for [`RESULT`], anchored at the working
+/// directory (OWL-323).
+const ANCHORED_RULE: &str = "Edit(/.owlshift/result.json)";
+
+/// A read-only run that moves its shell into `sub` with one Bash call, then
+/// writes the result, then the same name below `sub`: the scenario of OWL-323,
+/// in a folder whose path holds a space, as every macOS worktree's does.
+/// `rule` replaces the adapter's result rule when given. Returns the folder's
+/// guard, the working directory and the run, checked for its exit status,
+/// standard error, a Bash `cd` that ran before any write, and the two writes.
+fn after_cd(rule: Option<&str>) -> (tempfile::TempDir, PathBuf, Recorded) {
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path().join("work dir");
+    std::fs::create_dir_all(workdir.join(".owlshift")).unwrap();
+    let workdir = workdir.canonicalize().unwrap();
+    std::fs::create_dir_all(workdir.join("sub/.owlshift")).unwrap();
+    let request = request(&workdir, PermissionLevel::ReadOnly, false, RESULT);
+    let claude = adapter(&request, |args| {
+        let Some(rule) = rule else { return };
+        let at = args.iter().position(|arg| arg == ANCHORED_RULE);
+        args[at.expect("the adapter's result rule")] = rule.into();
+    });
+    let root = workdir.join(RESULT);
+    let below = workdir.join("sub").join(RESULT);
+    let prompt = format!(
+        "Use the Bash tool to run exactly this command: cd sub && pwd\n\
+         Then use the Write tool to create {} containing exactly {{\"ok\": true}}.\n\
+         Then use the Write tool to create {} containing exactly {{\"ok\": true}}.\n\
+         If a write is refused, do not try another way: go on to the next step. \
+         Call no other tool. Then reply with the single word done.",
+        root.display(),
+        below.display()
+    );
+    let recorded = record(claude, &prompt);
+    recorded.expect(0, true);
+
+    let calls: Vec<Value> = recorded
+        .events()
+        .into_iter()
+        .filter(|event| event["type"] == "assistant")
+        .filter_map(|event| event["message"]["content"].as_array().cloned())
+        .flatten()
+        .filter(|block| block["type"] == "tool_use")
+        .collect();
+    let names: Vec<&str> = calls.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Bash", "Write", "Write"], "{calls:?}");
+    assert_eq!(calls[0]["input"]["command"], "cd sub && pwd");
+    let written: Vec<PathBuf> = calls[1..]
+        .iter()
+        .map(|call| PathBuf::from(call["input"]["file_path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(written, [root, below]);
+    (dir, workdir, recorded)
+}
+
+/// The path of the one write refused in `recorded`.
+fn refused_write(recorded: &Recorded) -> PathBuf {
+    assert_eq!(recorded.run.permission_denials, ["Write"]);
+    let result = recorded.events().pop().unwrap();
+    let denied = &result["permission_denials"][0]["tool_input"]["file_path"];
+    PathBuf::from(denied.as_str().unwrap())
+}
+
+fn holds_the_result(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .is_ok_and(|text| serde_json::from_str::<Value>(&text).unwrap() == json!({"ok": true}))
+}
+
+/// The adapter's read-only argv: after the `cd`, the result is written and
+/// the same name below `sub` is refused.
+#[test]
+#[ignore = "records a fixture: set OWLSHIFT_RECORD_CLAUDE=1"]
+fn read_only_after_cd() {
+    recording_allowed();
+    let (_dir, workdir, recorded) = after_cd(None);
+    assert_eq!(refused_write(&recorded), workdir.join("sub").join(RESULT));
+    assert!(holds_the_result(&workdir.join(RESULT)));
+    assert!(!workdir.join("sub").join(RESULT).exists());
+    scrub_and_write("read_only_after_cd.jsonl", &workdir, &recorded);
+}
+
+/// The rule as shipped before OWL-323, `Edit(./…)`: after the `cd`, the
+/// result is refused and the same name below `sub` is written.
+#[test]
+#[ignore = "records a fixture: set OWLSHIFT_RECORD_CLAUDE=1"]
+fn read_only_after_cd_dot_rule() {
+    recording_allowed();
+    let (_dir, workdir, recorded) = after_cd(Some("Edit(./.owlshift/result.json)"));
+    assert_eq!(refused_write(&recorded), workdir.join(RESULT));
+    assert!(!workdir.join(RESULT).exists());
+    assert!(holds_the_result(&workdir.join("sub").join(RESULT)));
+    scrub_and_write("read_only_after_cd_dot_rule.jsonl", &workdir, &recorded);
 }
 
 /// The read-only argv with a model that does not exist: exit 1, and a line

@@ -379,6 +379,19 @@ impl CheckSet {
     }
 }
 
+/// What a token reads of a repository's default branch (OWL-334): a pull
+/// request opens only on refs the token can read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefaultBranch {
+    /// The token reads it.
+    Readable(Branch),
+    /// The repository has no default branch yet: it holds no commit.
+    Empty,
+    /// The forge refused the read, in its own words: a token that sees the
+    /// repository but not its contents.
+    Forbidden(String),
+}
+
 /// What went wrong talking to a forge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
