@@ -1339,6 +1339,13 @@ Designed on 2026-10-15 (OWL-296). The rules are [architecture](architecture.md) 
     *Temporary folder, as a Build's gate has it:* one run folder for every command (`RunPaths::temp`).
     Under bwrap a folder in `/tmp` is made anew and empty for each command; on macOS commands share it.
     Native Windows is refused (D9).
+    *Checked on Locary, 2026-10-17* (debug binary at 16e62a3, macOS):
+    - `--at 4c5d3f82` (`make lint`, `make test`): red, `make lint`: exit status 2, in 0.5 s.
+    - `--at 302a7ca5` (`ci/owlshift/gate.sh` setup, lint, test): all three pass, then red on
+      "the gate changed files: scripts/__pycache__/*.pyc". A Build there is red the same way;
+      LOC-1407 passed because its Build ignored `scripts/__pycache__` (squashed into be3b17dc).
+    - `--at be3b17dc` (the same gate with that ignore): green, 3 commands in 757.0 s, exit 0.
+      Run from a clean clone: the operator's owlshift.toml held a field this binary refuses.
 - **M · The scenarios.** (OWL-310) After F, G, H, I, J and OWL-32. S8, S9's findings and review passes, S17's routing part, each variant walked end to end, plan approval given and refused, a `replan`, and a review loop, played by the test bench on the Markdown tracker with the fake harness and the bench's fake GitHub, as acceptance.
   - *As built* (OWL-310, 2026-10-16). Played as part K played P4: in Rust, on the runner's own `owlshift watch --drain` (`Watch::run_drain`), in `owlshift-testkit/tests/on_demand/pipeline_scenarios.rs`, a module of `on_demand.rs` whose bench and helpers it shares with parts F, G and J's files. The drain dispatches, watch continues every answer, and no command is typed. Six tests, each asserting the runs of every pass:
     - *S8* (`scenario_s8_a_false_premise_at_intake_is_rescoped`, `scenario_s8_a_false_premise_at_design_is_closed`). Intake finds the premise false and asks to re-scope or close: needs input, no intake record, nothing built or pushed. Watch continues the re-scope; intake runs again with it in its thread, and the drain dispatches the ticket in that same pass, since watch's continue runs before the drain reads the column. At Design, the closure answered makes the design run end `blocked`: the ticket parks at Design, with no plan, no Build and no dispatch after the park. That pins the runner's park on `blocked`, not the closure, which is the decider's act in the tracker.
