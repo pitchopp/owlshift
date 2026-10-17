@@ -7104,7 +7104,18 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
     let bench = delivered_with_rules();
     let delivered_events = bench.events().len();
     let first_push = bench.remote_branch().unwrap();
-    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    // The merge also adds a gate command only the rebased code passes: the
+    // rebase run takes the gate of the base it rebases onto (OWL-331).
+    let config = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
+    let onto_gate = [
+        "git grep -q Hello -- GREETING.md",
+        "git grep -q short -- AGENTS.md",
+    ];
+    let gated = config.replace(
+        GATE_LINE,
+        &format!("gate = [\"{}\", \"{}\"]", onto_gate[0], onto_gate[1]),
+    );
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED), ("owlshift.toml", &gated)]);
     bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
     let (outcome, printed) = bench.continue_during(
         vec![bench.reply(None, Some(REBASED))],
@@ -7135,6 +7146,9 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
     let briefs = bench.briefs();
     let brief = briefs.last().unwrap();
     assert_eq!(brief.role, Role::Rebase);
+    assert_eq!(brief.gate, onto_gate);
+    let configured = data_of(events, EventKind::Dispatch, "configured_at");
+    assert_eq!(configured[0]["configured_at"], json!(main));
     let told = brief.rebase.as_ref().expect("what to rebase");
     assert_eq!(
         (
@@ -9491,6 +9505,81 @@ fn an_intake_pass_gives_its_resolver_the_resolver_rules() {
     };
     assert_eq!(sources(&briefs[0]), ["AGENTS.md", "docs/intake.md"]);
     assert_eq!(sources(&briefs[1]), ["AGENTS.md", "docs/resolver.md"]);
+}
+
+/// The bench's gate line in `owlshift.toml`.
+const GATE_LINE: &str = "gate = [\"git grep -q Hello -- GREETING.md\"]";
+
+/// OWL-331: the base moves, with a new gate, its script and new rules,
+/// between two Builds of one ticket. The resumed Build keeps the gate and
+/// rules of the commit its branch was made from, which the code it works on
+/// was written for, so the ticket delivers where the new gate would stop it
+/// `blocked` (exit 127, no script). Neither the person's own file, edited or
+/// pulled, nor the branch's own edit of `owlshift.toml` configures a run.
+#[test]
+fn a_resumed_build_keeps_the_gate_and_rules_of_its_own_base() {
+    let bench = Bench::new(true);
+    let old_gate = vec!["git grep -q Hello -- GREETING.md".to_owned()];
+    let config_path = bench.remote.checkout.join("owlshift.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    let failing = original.replace(GATE_LINE, "gate = [\"false\"]");
+    fs::write(&config_path, &failing).unwrap();
+    let old_base = bench.remote_main();
+    let mut asking = bench.reply(Some("Hello"), Some(ROUND_1));
+    asking
+        .files
+        .insert(RelativePath::new("owlshift.toml").unwrap(), failing);
+    let (asked, printed) = bench.run(vec![asking], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    assert_eq!(bench.last_of(Role::Build).gate, old_gate);
+
+    let new_config = original.replace(GATE_LINE, "gate = [\"sh gate.sh\"]");
+    let new_base = bench.merge_into_main(&[
+        ("owlshift.toml", &new_config),
+        ("gate.sh", "exit 0\n"),
+        ("AGENTS.md", "Write the test first.\n"),
+    ]);
+    fs::write(&config_path, &new_config).unwrap();
+    bench.answer("ok");
+    let answered = check(&[
+        ("Q1", "answered", "English, the recommendation."),
+        ("Q2", "answered", "Hello, reader."),
+    ]);
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello again"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let build = bench.last_of(Role::Build);
+    assert_eq!(build.gate, old_gate);
+    let rules: Vec<&str> = build.rules.iter().map(|rule| rule.text.as_str()).collect();
+    assert_eq!(rules, [AGENTS]);
+    let dispatched = data_of(&bench.events(), EventKind::Dispatch, "configured_at");
+    let last = dispatched.last().unwrap();
+    assert_ne!(old_base, new_base);
+    assert_eq!(
+        (&last["configured_at"], &last["project_file"]),
+        (&json!(old_base), &json!("commit"))
+    );
+}
+
+/// OWL-331: a base whose default branch holds no `owlshift.toml`, as in a
+/// project adopting Owlshift, runs the gate of the person's own file.
+#[test]
+fn a_base_without_a_project_file_takes_the_persons_gate() {
+    let bench = Bench::new(true);
+    bench.merge_into_main(&[("owlshift.toml", "")]);
+    let (delivered, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.last_of(Role::Build).gate,
+        ["git grep -q Hello -- GREETING.md"]
+    );
+    let dispatched = data_of(&bench.events(), EventKind::Dispatch, "project_file");
+    assert_eq!(dispatched[0]["project_file"], json!("local"));
 }
 
 /// The review loop on a delivered pull request (OWL-307, build plan part J).

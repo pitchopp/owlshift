@@ -282,14 +282,11 @@ impl OnDemand<'_> {
             )));
         }
         let current = person(p.current()?, &p.found);
-        let rules = rules::project_rules(
-            &self.executor.git,
-            &p.checkout,
-            &p.base,
-            self.config,
-            &[Role::Intake, Role::Resolver],
-        )
-        .map_err(|e| refused("the project's rules", e))?;
+        // At the commit its branch was made from (OWL-331): a resumed intake
+        // reuses its worktree as it is, on an older base than the one just
+        // fetched.
+        let at = self.configuring_base(p, Command::Intake)?;
+        let (rules, _) = self.rules_at(p, &at, &[Role::Intake, Role::Resolver], sink)?;
         // The text the briefs hold, read once: an edit made while intake
         // runs is a text intake did not read, which the next pass takes in.
         let text = text_sha256(&p.found.title, &p.found.description);
