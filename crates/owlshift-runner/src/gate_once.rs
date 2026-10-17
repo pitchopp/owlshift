@@ -615,7 +615,15 @@ mod tests {
         let wrote = bench.gate(&executor, &[], Some("origin/writes")).unwrap();
         let failure = wrote.run.as_ref().unwrap().report.failure.clone().unwrap();
         assert_eq!(failure.command, None);
-        assert_eq!(failure.reason, "the gate changed files: stray.txt");
+        // A machine with git-lfs configured adds a note on the drivers.
+        assert!(
+            failure.reason == "the gate changed files: stray.txt"
+                || failure
+                    .reason
+                    .starts_with("the gate changed files: stray.txt (read with the filter"),
+            "{}",
+            failure.reason
+        );
         assert!(!bench.left_over());
 
         let unknown = bench
