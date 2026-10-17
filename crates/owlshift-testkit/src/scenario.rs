@@ -95,7 +95,8 @@
 //!   (`owlshift_runner::on_demand::stage_event`), and no DELIVERY comment is
 //!   written;
 //! - no bound on the runs in a row whose questions the resolver all decided
-//!   (`owlshift_core::state::MAX_RESOLVED_PASSES`), which `owlshift do` counts
+//!   (the project's pass limit and ceiling,
+//!   `owlshift_core::gate::GatePolicy::chain_end`), which `owlshift do` counts
 //!   per command: a scenario's commands are only its `continue` steps, and
 //!   it plays each run by hand.
 
@@ -133,7 +134,7 @@ use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, Ru
 use owlshift_runner::on_demand::{
     account_author, asked_choices, build_refusal_after, stage_event, tell_build, thread,
 };
-use owlshift_runner::resolver::{self, Fallback, Resolved};
+use owlshift_runner::resolver::{self, Fallback, Quotable, Resolved};
 use owlshift_runner::writer::{
     DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReopenedChoice, ReplyComment,
     Restart, ResumeComment, VisibleStage, Writer,
@@ -604,6 +605,7 @@ impl Driver {
             timeout,
             gate_timeout: timeout,
         };
+        let policy = config.gate_policy();
         Ok(Self {
             executor,
             scenario: name.to_owned(),
@@ -612,7 +614,7 @@ impl Driver {
             tracker: MarkdownTracker::new(&remote.checkout),
             states: config.tracker.states,
             pipeline: Pipeline::new(config.pipeline.default),
-            policy: GatePolicy::new(&config.policy.always_human, config.pipeline.plan_approval),
+            policy,
             pending: None,
             resolving: Vec::new(),
             refuse_questions: false,
@@ -903,14 +905,22 @@ impl Driver {
             Resolved::Fallback(fallback) => (Vec::new(), Some(fallback)),
             Resolved::Done(resolutions) => {
                 let mut decided = Vec::new();
+                // What a `ticket` basis may quote: the resolver's brief
+                // (OWL-337).
+                let quotable = self
+                    .last_brief
+                    .as_ref()
+                    .map(Quotable::of)
+                    .unwrap_or_default();
                 for (question, decision, basis) in
-                    resolver::decisions(&self.policy, &given, resolutions)
+                    resolver::decisions(&self.policy, &given, resolutions, &quotable)
                 {
                     let body = DecisionComment {
                         ticket: self.id.clone(),
                         question: question.clone(),
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
+                        level: self.policy.level(),
                         run: None,
                     }
                     .render();
@@ -1222,6 +1232,7 @@ impl Driver {
             } else {
                 Vec::new()
             },
+            delegation: (role == Role::Resolver).then(|| self.policy.level()),
             gate_failure: if role == Role::Build {
                 self.gate_failure.clone()
             } else {

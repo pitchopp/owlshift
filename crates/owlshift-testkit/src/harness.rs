@@ -11,7 +11,9 @@ use owlshift_runner::executor::{
     Harness, HarnessEnd, HarnessError, HarnessRun, HarnessStatus, RunLog, SandboxNeeds,
 };
 
-use crate::reply::usage_limit;
+use owlshift_adapters::harness::Usage;
+
+use crate::reply::{cost_usd, usage_limit};
 
 /// `owlshift-fake-harness`, playing one reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +40,9 @@ impl Harness for FakeHarness {
     }
 
     /// A usage-limit line on standard error is a usage limit, exit status 0
-    /// is a completed run, anything else a failure.
+    /// is a completed run, anything else a failure. A cost line on standard
+    /// error is the run's reported cost (OWL-337); without one, the run
+    /// reports no usage.
     fn drive(
         &self,
         _run: &HarnessRun<'_>,
@@ -57,7 +61,12 @@ impl Harness for FakeHarness {
             (None, Some(code)) => HarnessStatus::Failed(format!("exit status {code}")),
             (None, None) => HarnessStatus::Failed("ended by a signal".to_owned()),
         };
-        Ok(HarnessEnd::new(run.exit_code, status))
+        let mut end = HarnessEnd::new(run.exit_code, status);
+        end.usage = cost_usd(&String::from_utf8_lossy(&run.stderr)).map(|cost| Usage {
+            cost_usd: Some(cost),
+            ..Usage::default()
+        });
+        Ok(end)
     }
 
     /// The reply's folder and the bench's own files, read.

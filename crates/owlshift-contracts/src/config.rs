@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use owlshift_core::agent_env::{check_declared, check_names};
 use owlshift_core::decider::ZoneOwners;
+use owlshift_core::gate::{GatePolicy, PassLimit, ResolverPolicy, usd_micros};
 use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
+use owlshift_core::vocab::DelegationLevel;
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -480,7 +482,131 @@ pub struct Policy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 20))]
     pub max_open_prs: Option<u8>,
+    /// What the resolver may decide without the decider (OWL-328,
+    /// architecture section 4, "Delegation level"): `none`, `facts`,
+    /// `discoverable`, `ticket` or `all`. Absent: `discoverable`. `security`
+    /// and `irreversible` questions, and those of `always_human`, go to a
+    /// human at every level. A file using it requires an Owlshift that
+    /// reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_delegation: Option<DelegationLevel>,
+    /// The runs in a row the resolver may unblock in one command: a whole
+    /// number from 1 to 50, or `"unlimited"`, which needs
+    /// `resolver_budget_usd`. Absent: 5 (OWL-328). A file using it requires
+    /// an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_passes: Option<ResolverPasses>,
+    /// A ceiling, in dollars, on what one chain of runs costs: the asking
+    /// runs and their resolver runs since the command's last stop, past
+    /// which the next run's questions go to the decider. A positive number;
+    /// required with `resolver_passes = "unlimited"` (OWL-328). A file using
+    /// it requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_budget_usd: Option<Usd>,
 }
+
+/// `policy.resolver_passes`: a whole number of runs, or `"unlimited"`
+/// (OWL-328). A number outside 1 to 50 parses, and
+/// [`ProjectConfig::validate`] refuses it, naming the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResolverPasses {
+    Runs(u32),
+    Unlimited,
+}
+
+/// The one word `policy.resolver_passes` takes instead of a number.
+const UNLIMITED: &str = "unlimited";
+
+/// What a refusal of `policy.resolver_passes` says it must be.
+const RESOLVER_PASSES_SHAPE: &str =
+    "policy.resolver_passes must be a whole number from 1 to 50, or \"unlimited\"";
+
+impl Serialize for ResolverPasses {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Runs(runs) => serializer.serialize_u32(*runs),
+            Self::Unlimited => serializer.serialize_str(UNLIMITED),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolverPasses {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ResolverPasses;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a whole number from 1 to 50, or \"unlimited\"")
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                u32::try_from(value)
+                    .map(ResolverPasses::Runs)
+                    .map_err(|_| E::custom(RESOLVER_PASSES_SHAPE))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                u32::try_from(value)
+                    .map(ResolverPasses::Runs)
+                    .map_err(|_| E::custom(RESOLVER_PASSES_SHAPE))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == UNLIMITED {
+                    Ok(ResolverPasses::Unlimited)
+                } else {
+                    Err(E::custom(RESOLVER_PASSES_SHAPE))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl JsonSchema for ResolverPasses {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ResolverPasses".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A whole number of runs from 1 to 50, or \"unlimited\".",
+            "oneOf": [
+                { "type": "integer", "minimum": 1, "maximum": 50 },
+                { "const": UNLIMITED }
+            ]
+        })
+    }
+}
+
+/// An amount in dollars, as `policy.resolver_budget_usd` writes it: a
+/// positive finite number once [`ProjectConfig::validate`] passed it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Usd(pub f64);
+
+// A parsed file's amount is finite ([`ProjectConfig::validate`]), so
+// equality is reflexive.
+impl Eq for Usd {}
+
+impl JsonSchema for Usd {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Usd".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A positive number of dollars.",
+            "type": "number",
+            "exclusiveMinimum": 0
+        })
+    }
+}
+
+/// The range of `policy.resolver_passes` as a number of runs (the schema
+/// repeats it as literals).
+const RESOLVER_PASSES: std::ops::RangeInclusive<u32> = 1..=50;
 
 /// The range of `policy.quiet_window_minutes`, in minutes (the schema
 /// attribute on the field repeats it as literals).
@@ -513,6 +639,64 @@ impl Policy {
         self.max_open_prs.map_or(DEFAULT_MAX_OPEN_PRS, |cap| {
             cap.clamp(*MAX_OPEN_PRS.start(), *MAX_OPEN_PRS.end())
         })
+    }
+
+    /// Checks the resolver's keys (OWL-328): a number of passes from 1 to
+    /// 50, a ceiling that is a positive number of dollars, at least the
+    /// millionth of a dollar the gate counts in (a smaller one would round
+    /// to a ceiling of nothing, which ends every chain before its first
+    /// resolver run), and a ceiling beside `"unlimited"`, which nothing else
+    /// bounds.
+    fn check_resolver(&self) -> Result<(), String> {
+        if let Some(ResolverPasses::Runs(runs)) = self.resolver_passes
+            && !RESOLVER_PASSES.contains(&runs)
+        {
+            return Err(RESOLVER_PASSES_SHAPE.to_owned());
+        }
+        if let Some(Usd(usd)) = self.resolver_budget_usd
+            && !(usd > 0.0 && usd_micros(usd).is_some_and(|micros| micros >= 1))
+        {
+            return Err(
+                "policy.resolver_budget_usd must be a positive number of dollars, at least \
+                 0.000001"
+                    .to_owned(),
+            );
+        }
+        if self.resolver_passes == Some(ResolverPasses::Unlimited)
+            && self.resolver_budget_usd.is_none()
+        {
+            return Err(
+                "policy.resolver_passes = \"unlimited\" needs policy.resolver_budget_usd: an \
+                 unlimited chain of runs is bounded by a dollar ceiling instead"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// What the project lets the resolver do (OWL-328): its level, pass
+    /// limit and ceiling, each the project's or its default
+    /// ([`ResolverPolicy::default`]). A number of passes outside the range,
+    /// possible only in a configuration built in code, is clamped into it;
+    /// so is an amount below a millionth of a dollar, to that millionth, and
+    /// an amount that is not a positive number sets no ceiling.
+    pub fn resolver(&self) -> ResolverPolicy {
+        let passes = match self.resolver_passes {
+            None => PassLimit::default(),
+            Some(ResolverPasses::Runs(runs)) => {
+                PassLimit::Runs(runs.clamp(*RESOLVER_PASSES.start(), *RESOLVER_PASSES.end()))
+            }
+            Some(ResolverPasses::Unlimited) => PassLimit::Unlimited,
+        };
+        ResolverPolicy {
+            level: self.resolver_delegation.unwrap_or_default(),
+            passes,
+            ceiling_micros: self
+                .resolver_budget_usd
+                .filter(|usd| usd.0 > 0.0)
+                .and_then(|usd| usd_micros(usd.0))
+                .map(|micros| micros.max(1)),
+        }
     }
 }
 
@@ -624,6 +808,9 @@ impl ProjectConfig {
                 "policy.max_open_prs must be a whole number from 1 to 20",
             ));
         }
+        self.policy
+            .check_resolver()
+            .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         if let Some(forge) = &self.forge {
             forge
                 .check_reviewers()
@@ -631,6 +818,15 @@ impl ProjectConfig {
         }
         self.zone_owners()?;
         check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
+    }
+
+    /// The project's gate policy (architecture section 4): `always_human`,
+    /// the plan-approval mode and what the resolver may do, read from this
+    /// file. `owlshift do` and the test bench's stand-in driver build theirs
+    /// here alike.
+    pub fn gate_policy(&self) -> GatePolicy {
+        GatePolicy::new(&self.policy.always_human, self.pipeline.plan_approval)
+            .with_resolver(self.policy.resolver())
     }
 
     /// The owners `zones` names, checked: each key a folder from the
@@ -1052,6 +1248,9 @@ mod tests {
             always_human: Vec::new(),
             quiet_window_minutes: Some(0),
             max_open_prs: None,
+            resolver_delegation: None,
+            resolver_passes: None,
+            resolver_budget_usd: None,
         };
         assert_eq!(built.quiet_window(), Duration::from_secs(60));
 
@@ -1072,6 +1271,85 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("from 1 to 1440"), "{error}");
+    }
+
+    /// OWL-328: the resolver's three keys, their defaults, their refusals,
+    /// each naming its key, and the policy they give the gate.
+    #[test]
+    fn the_resolvers_keys_have_defaults_and_are_checked() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.policy.resolver(), ResolverPolicy::default());
+        assert_eq!(absent.policy.resolver().passes, PassLimit::Runs(5));
+        assert!(!absent.render().contains("resolver"));
+        assert_eq!(absent.gate_policy().level(), DelegationLevel::Discoverable);
+
+        for level in DelegationLevel::ALL {
+            let set =
+                project("", &format!("resolver_delegation = \"{}\"", level.as_str())).unwrap();
+            assert_eq!(set.policy.resolver().level, level);
+            assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+        }
+        let set = project("", "resolver_passes = 50\nresolver_budget_usd = 2.5").unwrap();
+        assert_eq!(
+            set.policy.resolver(),
+            ResolverPolicy {
+                level: DelegationLevel::Discoverable,
+                passes: PassLimit::Runs(50),
+                ceiling_micros: Some(2_500_000),
+            }
+        );
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+        let unlimited = project(
+            "",
+            "resolver_passes = \"unlimited\"\nresolver_budget_usd = 5",
+        )
+        .unwrap();
+        assert_eq!(unlimited.policy.resolver().passes, PassLimit::Unlimited);
+        assert_eq!(unlimited.policy.resolver().ceiling_micros, Some(5_000_000));
+        assert_eq!(
+            ProjectConfig::parse(&unlimited.render()).unwrap(),
+            unlimited
+        );
+        assert_eq!(
+            unlimited.gate_policy().resolver(),
+            unlimited.policy.resolver()
+        );
+
+        let refused = |lines: &str| project("", lines).unwrap_err().to_string();
+        for bad in ["0", "51", "-1", "\"many\"", "2.5"] {
+            let error = refused(&format!("resolver_passes = {bad}"));
+            assert!(error.contains("resolver_passes"), "{bad}: {error}");
+        }
+        assert!(refused("resolver_passes = 51").contains("from 1 to 50"));
+        for bad in ["0", "-1.5", "nan", "inf", "\"5\""] {
+            let error = refused(&format!("resolver_budget_usd = {bad}"));
+            assert!(error.contains("resolver_budget_usd"), "{bad}: {error}");
+        }
+        let error = refused("resolver_passes = \"unlimited\"");
+        assert!(
+            error.contains("policy.resolver_passes")
+                && error.contains("policy.resolver_budget_usd"),
+            "{error}"
+        );
+        assert!(refused("resolver_delegation = \"most\"").contains("resolver_delegation"));
+    }
+
+    /// A ceiling below the millionth of a dollar the gate counts in would
+    /// round to nothing and end every chain before its first resolver run:
+    /// the file is refused, naming the key; the millionth itself is kept.
+    #[test]
+    fn a_ceiling_below_a_millionth_of_a_dollar_is_refused() {
+        for tiny in ["1e-9", "0.0000004"] {
+            let error = project("", &format!("resolver_budget_usd = {tiny}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("policy.resolver_budget_usd") && error.contains("at least 0.000001"),
+                "{tiny}: {error}"
+            );
+        }
+        let smallest = project("", "resolver_budget_usd = 0.000001").unwrap();
+        assert_eq!(smallest.policy.resolver().ceiling_micros, Some(1));
     }
 
     /// A project file whose `[tracker]` admits by `admit` and adds `extra`.

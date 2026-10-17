@@ -194,6 +194,102 @@ pub enum Mandate {
     Debt,
 }
 
+/// What a project lets the resolver decide without its decider
+/// (`policy.resolver_delegation`, architecture section 4, "Delegation
+/// level", OWL-328). `Ord` sorts the levels from nothing to everything but
+/// the floor.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationLevel {
+    /// Nothing: no resolver run, every question goes to the decider.
+    None,
+    /// What the resolver observes offline in the worktree.
+    Facts,
+    /// Facts, and what the ticket, the decider's comments, earlier
+    /// decisions and the project's rules settle.
+    #[default]
+    Discoverable,
+    /// The same, and a `scope` question the ticket's own text answers,
+    /// quoted.
+    Ticket,
+    /// Everything but the floor.
+    All,
+}
+
+impl DelegationLevel {
+    /// Every level, from nothing to everything but the floor.
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::Facts,
+        Self::Discoverable,
+        Self::Ticket,
+        Self::All,
+    ];
+
+    /// The name the project file and the brief write.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Facts => "facts",
+            Self::Discoverable => "discoverable",
+            Self::Ticket => "ticket",
+            Self::All => "all",
+        }
+    }
+
+    /// Whether the resolver may rest a decision on a basis of this kind at
+    /// this level: `facts` allows `fact`, `discoverable` adds `settled`,
+    /// `ticket` and `all` add `ticket`; `none` allows nothing.
+    pub fn allows(self, kind: BasisKind) -> bool {
+        match kind {
+            BasisKind::Fact => self >= Self::Facts,
+            BasisKind::Settled => self >= Self::Discoverable,
+            BasisKind::Ticket => self >= Self::Ticket,
+        }
+    }
+}
+
+/// What a resolver's decision rests on (OWL-328): the runner allows a kind
+/// by the project's delegation level ([`DelegationLevel::allows`]).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BasisKind {
+    /// Observed in the worktree, offline: a file, an existing pattern, a
+    /// documented behaviour.
+    Fact,
+    /// Settled by the ticket, the decider's comments, earlier decisions or
+    /// the project's rules.
+    Settled,
+    /// The ticket's own text, which the decision quotes.
+    Ticket,
+}
+
+impl BasisKind {
+    /// The name `result.json` writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fact => "fact",
+            Self::Settled => "settled",
+            Self::Ticket => "ticket",
+        }
+    }
+}
+
 /// How the decider's answers left one question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +349,43 @@ mod tests {
                 serde_json::Value::String(role.as_str().to_owned()),
                 "{role:?}"
             );
+        }
+    }
+
+    #[test]
+    fn delegation_names_match_the_serde_names() {
+        for level in DelegationLevel::ALL {
+            let serialized = serde_json::to_value(level).expect("a level always serializes");
+            assert_eq!(serialized, level.as_str(), "{level:?}");
+        }
+        assert!(DelegationLevel::ALL.is_sorted());
+        assert_eq!(DelegationLevel::default(), DelegationLevel::Discoverable);
+        for kind in [BasisKind::Fact, BasisKind::Settled, BasisKind::Ticket] {
+            let serialized = serde_json::to_value(kind).expect("a kind always serializes");
+            assert_eq!(serialized, kind.as_str(), "{kind:?}");
+        }
+    }
+
+    /// The kinds each level allows, as build-plan.md's "Delegation and
+    /// passes" lists them.
+    #[test]
+    fn each_level_allows_its_basis_kinds() {
+        use BasisKind::{Fact, Settled, Ticket};
+        let cases: [(DelegationLevel, &[BasisKind]); 5] = [
+            (DelegationLevel::None, &[]),
+            (DelegationLevel::Facts, &[Fact]),
+            (DelegationLevel::Discoverable, &[Fact, Settled]),
+            (DelegationLevel::Ticket, &[Fact, Settled, Ticket]),
+            (DelegationLevel::All, &[Fact, Settled, Ticket]),
+        ];
+        for (level, allowed) in cases {
+            for kind in [Fact, Settled, Ticket] {
+                assert_eq!(
+                    level.allows(kind),
+                    allowed.contains(&kind),
+                    "{level:?} {kind:?}"
+                );
+            }
         }
     }
 

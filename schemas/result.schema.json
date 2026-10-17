@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 10
+      "const": 11
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -229,6 +229,36 @@
         "properties": {
           "status": {
             "const": "done"
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "resolutions": {
+          "items": {
+            "else": {
+              "not": {
+                "required": [
+                  "quote"
+                ]
+              }
+            },
+            "if": {
+              "properties": {
+                "basis_kind": {
+                  "const": "ticket"
+                }
+              },
+              "required": [
+                "basis_kind"
+              ]
+            },
+            "then": {
+              "required": [
+                "quote"
+              ]
+            }
           }
         }
       }
@@ -493,6 +523,26 @@
         }
       },
       "additionalProperties": false
+    },
+    "BasisKind": {
+      "description": "What a resolver's decision rests on (OWL-328): the runner allows a kind\nby the project's delegation level ([`DelegationLevel::allows`]).",
+      "oneOf": [
+        {
+          "description": "Observed in the worktree, offline: a file, an existing pattern, a\ndocumented behaviour.",
+          "type": "string",
+          "const": "fact"
+        },
+        {
+          "description": "Settled by the ticket, the decider's comments, earlier decisions or\nthe project's rules.",
+          "type": "string",
+          "const": "settled"
+        },
+        {
+          "description": "The ticket's own text, which the decision quotes.",
+          "type": "string",
+          "const": "ticket"
+        }
+      ]
     },
     "Decision": {
       "description": "A decision the role took on its own.",
@@ -956,7 +1006,7 @@
       "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
     },
     "Resolution": {
-      "description": "The resolver's outcome on one question it was given: decided, with its\nown label for the question, the decision and what settles it, or passed\non to the decider, with why. Every text but the label is not empty and\nnot only whitespace; the runner judges the label.",
+      "description": "The resolver's outcome on one question it was given: decided, with its\nown label for the question, the decision, what settles it and the kind\nof that basis, or passed on to the decider, with why. Every text but the\nlabel is not empty and not only whitespace; a `ticket` basis has a quote,\nand no other kind has one; the runner judges the label, the kind against\nthe project's delegation level and the quote against the ticket.",
       "oneOf": [
         {
           "description": "Settled by what the ticket, the thread, the project's rules or the\nrepository already establish; the runner logs it on the ticket as a\nreversible decision.",
@@ -966,6 +1016,10 @@
               "description": "What settles it: the ticket, a rule, a file, an earlier answer.",
               "type": "string",
               "pattern": "\\S"
+            },
+            "basis_kind": {
+              "description": "The kind of that basis (format 11, OWL-337): `fact`, `settled` or\n`ticket`. The runner refuses a kind the project's delegation level\ndoes not allow.",
+              "$ref": "#/$defs/BasisKind"
             },
             "category": {
               "description": "The resolver's own label for the question, read from its text and\ncontext: a floor token when the question touches a floor topic.\nThe runner logs the decision only when this label is a token and\nit and the raising run's category both route to the resolver,\nand otherwise sends the question to the decider\n(`owlshift_core::gate::GatePolicy::route_decided`).",
@@ -981,6 +1035,11 @@
             },
             "question": {
               "$ref": "#/$defs/QuestionId"
+            },
+            "quote": {
+              "description": "With a `ticket` basis only, and then required: the words of the\nticket's title, description or a comment of its decider that\nsettle the question, on one line and at most\n[`MAX_QUOTE_BYTES`]. The runner refuses a decision whose quote it\ndoes not find there.",
+              "type": "string",
+              "pattern": "\\S"
             }
           },
           "additionalProperties": false,
@@ -989,7 +1048,8 @@
             "question",
             "category",
             "decision",
-            "basis"
+            "basis",
+            "basis_kind"
           ]
         },
         {

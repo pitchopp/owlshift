@@ -893,14 +893,10 @@ impl OnDemand<'_> {
                     &[],
                     &dispatched.rules,
                     &current,
-                    p.settled,
-                    &ran.run,
+                    &ran,
                     sink,
                 )? {
-                    Routing::Settled => {
-                        p.settled += 1;
-                        continue;
-                    }
+                    Routing::Settled => continue,
                     Routing::Ask(round) => {
                         let asked = match state.apply(p.pipeline, Event::Questions) {
                             Ok(Transition::To(asked)) => asked,

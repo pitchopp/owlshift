@@ -7,7 +7,6 @@ use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::Role;
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
 use crate::ids::{QuestionId, RelativePath, TicketId, is_commit_id};
 use crate::result::{
@@ -17,6 +16,7 @@ use crate::result::{
 use crate::review::{
     Finding, FindingsMode, MAX_PASS_FINDINGS, Mandate, Plan, check_findings, check_mandates,
 };
+use crate::{DelegationLevel, Role};
 
 const CONTRACT: &str = "brief";
 
@@ -77,14 +77,20 @@ pub struct Brief {
     /// delivers. The runner is its only author; an empty list means the
     /// project has no gate.
     pub gate: Vec<String>,
-    /// The always-human categories the project adds to the floor's six
-    /// (`policy.always_human`, OWL-151): normalized (lowercase words joined by
-    /// `_`), each once, without the ones the floor already covers. A question
-    /// filed under one of them, or whose category contains it as whole words,
-    /// goes to the decider and never to the resolver. Written in Build's and
+    /// The always-human categories the project adds to those of its
+    /// delegation level (`policy.always_human`, OWL-151): normalized
+    /// (lowercase words joined by `_`), each once, without the ones the
+    /// level already keeps for a human (OWL-337). A question filed under one
+    /// of them, or whose category contains it as whole words, goes to the
+    /// decider and never to the resolver. Written in Build's, Design's and
     /// the resolver's briefs, empty when the project adds none; the runner is
     /// its only author.
     pub always_human: Vec<String>,
+    /// The project's delegation level (`policy.resolver_delegation`, format
+    /// 17, OWL-337): what the resolver may decide, and on which kinds of
+    /// basis. In the resolver's brief, always, and only there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationLevel>,
     /// The runner ran `gate` itself after the ticket's previous Build `done`,
     /// and it failed (OWL-16): what the next Build run fixes first. Absent
     /// when no gate run of the runner has failed since the last green one.
@@ -650,8 +656,9 @@ impl Brief {
     /// Checks the rules the types alone do not carry: rounds increase through
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
     /// order, distinct questions of an earlier round; a resolver's brief has
-    /// questions to `resolve`, in increasing order, and no other brief has
-    /// any; only Build's, the answer check's and the resolver's briefs have
+    /// questions to `resolve`, in increasing order, and a `delegation`
+    /// level, and no other brief has either; only Build's, the answer
+    /// check's and the resolver's briefs have
     /// a `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
     /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
@@ -783,6 +790,21 @@ impl Brief {
             }
         }
         self.check_quality_pipeline()?;
+        if self.delegation.is_some() != (self.role == Role::Resolver) {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "the resolver's brief, and only it, gives the delegation level: the role is \
+                     {} and a level is {}",
+                    self.role.as_str(),
+                    if self.delegation.is_some() {
+                        "given"
+                    } else {
+                        "not given"
+                    }
+                ),
+            ));
+        }
         match (self.role == Role::Resolver, self.resolve.is_empty()) {
             (true, true) => Err(ContractError::invalid(
                 CONTRACT,

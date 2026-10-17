@@ -16,7 +16,7 @@ use owlshift_contracts::review::{MAX_FINDING_BYTES, MAX_FINDINGS, MAX_PLAN_BYTES
 use owlshift_contracts::schema;
 use owlshift_core::floor::FloorCategory;
 use owlshift_core::gate::{GatePolicy, Route};
-use owlshift_core::vocab::PlanApproval;
+use owlshift_core::vocab::{DelegationLevel, PlanApproval};
 use serde_json::{Value, json};
 
 /// The line budget of the build prompt, which the harness re-reads every run.
@@ -38,7 +38,15 @@ const ANSWER_CHECK_ONLY: &[&str] = &[
 /// `result.json` fields and values only the resolver writes (OWL-138): the
 /// build prompt need not name them, and a build result carrying them is
 /// refused.
-const RESOLVER_ONLY: &[&str] = &["resolutions", "outcome", "decided", "passed_on"];
+const RESOLVER_ONLY: &[&str] = &[
+    "resolutions",
+    "outcome",
+    "decided",
+    "passed_on",
+    "basis_kind",
+    "fact",
+    "settled",
+];
 
 /// `result.json` fields the build prompt need not name since Build takes no
 /// decision of its own (OWL-176): a decision's `basis`, which the resolver's
@@ -203,6 +211,7 @@ const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "rules.text",
     "rules.source",
     "always_human",
+    "delegation",
     "result_refusal",
     "result_path",
 ];
@@ -642,6 +651,8 @@ fn resolver_prompt_names_its_fields_outcomes_and_inputs() {
         "category",
         "decision",
         "basis",
+        "basis_kind",
+        "quote",
         "reason",
         "done",
         "failed",
@@ -672,6 +683,24 @@ fn resolver_prompt_names_its_fields_outcomes_and_inputs() {
         floor.is_empty(),
         "roles/resolver.md does not name these floor categories: {floor:?}"
     );
+    // Every delegation level and basis kind the brief and the result carry
+    // (OWL-337).
+    let result_kinds: BTreeSet<String> = resolve(&result, &result, &["resolutions", "basis_kind"])
+        .into_iter()
+        .flat_map(|node| allowed_values(&result, node))
+        .collect();
+    let kinds: BTreeSet<String> = ["fact", "settled", "ticket"].map(String::from).into();
+    assert_eq!(result_kinds, kinds, "the basis kinds changed");
+    let missing: Vec<&str> = DelegationLevel::ALL
+        .iter()
+        .map(|level| level.as_str())
+        .chain(["fact", "settled", "ticket"])
+        .filter(|word| !names(&text, word))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "roles/resolver.md does not name these levels or basis kinds: {missing:?}"
+    );
 }
 
 #[test]
@@ -696,9 +725,14 @@ fn resolver_example_result_parses() {
     // the floor.
     let policy = GatePolicy::new(Vec::<String>::new(), PlanApproval::Never);
     for resolution in &result.resolutions {
-        if let Resolution::Decided { category, .. } = resolution {
+        if let Resolution::Decided {
+            category,
+            basis_kind,
+            ..
+        } = resolution
+        {
             assert_eq!(
-                policy.route_decided("naming", category),
+                policy.route_decided("naming", category, *basis_kind),
                 Route::Resolver,
                 "the example labels a decision {category:?}"
             );

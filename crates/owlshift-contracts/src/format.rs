@@ -26,8 +26,9 @@ use crate::Role;
 /// Build's `correction` and a thread decision's `reversed` (OWL-146); format
 /// 15 the quality pipeline's `plan`, `approval`, `findings`, `review` and
 /// `pull_request_reviews`, and a question's `replan` (OWL-300); format 16 a
-/// question's lettered options and structured recommendation (OWL-324).
-pub const BRIEF_FORMAT: u32 = 16;
+/// question's lettered options and structured recommendation (OWL-324);
+/// format 17 the resolver's `delegation` (OWL-337).
+pub const BRIEF_FORMAT: u32 = 17;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -37,8 +38,9 @@ pub const BRIEF_FORMAT: u32 = 16;
 /// `finding_responses`, a question's `replan`, and `premise_false` from the
 /// intake, design and build roles only (OWL-300); format 10 a question's
 /// options as `{label, detail}` and its required `recommendation` as
-/// `{option, why}` (OWL-324).
-pub const RESULT_FORMAT: u32 = 10;
+/// `{option, why}` (OWL-324); format 11 the resolver's `basis_kind` on each
+/// decision, and its `quote` on a `ticket` one (OWL-337).
+pub const RESULT_FORMAT: u32 = 11;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.

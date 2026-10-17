@@ -1,5 +1,5 @@
 {
-  "format": 10,
+  "format": 11,
   "status": "done",
   "summary": "The README lists every file at the root.",
   "resolutions": [
@@ -8,7 +8,8 @@
       "category": "docs",
       "outcome": "decided",
       "decision": "Yes, in the README's list of files.",
-      "basis": "README.md lists every file at the root."
+      "basis": "README.md lists every file at the root.",
+      "basis_kind": "fact"
     }
   ]
 }

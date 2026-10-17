@@ -14,7 +14,9 @@
 //! category ([`unlabelled`]), and the resolver labels each one it decides
 //! itself. Of its decisions, the runner keeps only those on questions it gave
 //! the resolver whose two labels, the raising run's and the resolver's, both
-//! route there ([`settle`], OWL-144), posts each as a DECISION comment
+//! route there (OWL-144), whose basis is of a kind the project's delegation
+//! level allows and, for a `ticket` basis, quotes the ticket's text
+//! ([`Quotable`], OWL-328) ([`settle`]), posts each as a DECISION comment
 //! ([`crate::writer::DecisionComment`]) and keeps it in the ticket ref; the
 //! decider gets the rest as a round ([`left_for_decider`]).
 //! `owlshift do` and `owlshift continue` run it ([`crate::on_demand`]); the
@@ -22,14 +24,15 @@
 
 use std::time::Duration;
 
-use owlshift_contracts::brief::ToResolve;
+use owlshift_contracts::BasisKind;
+use owlshift_contracts::brief::{Brief, Relation, ThreadEntry, ToResolve};
 use owlshift_contracts::ids::QuestionId;
 use owlshift_contracts::refs::KeptDecision;
 use owlshift_contracts::result::{Decision, Question, Resolution, Status};
-use owlshift_core::gate::{GatePolicy, Route};
+use owlshift_core::gate::{ChainEnd, GatePolicy, Route};
 
 use crate::executor::Outcome;
-use crate::writer::ReopenedChoice;
+use crate::writer::{ReopenedChoice, flatten};
 
 /// The executor's deadline for a resolver run: a short role, like the answer
 /// check, that reads what it needs and decides.
@@ -86,19 +89,82 @@ pub enum Fallback {
     UsageLimit,
     /// The resolver run failed, or left no valid result.
     Failed,
-    /// The resolver already settled every question of
-    /// [`owlshift_core::state::MAX_RESOLVED_PASSES`] runs in a row.
-    PassLimit,
+    /// The resolver already settled every question of this many runs in a
+    /// row, the project's pass limit (`policy.resolver_passes`, OWL-328).
+    PassLimit(u32),
+    /// The chain's cost reached the project's ceiling
+    /// (`policy.resolver_budget_usd`, OWL-328).
+    Budget,
+    /// A run of the chain reported no cost, so the project's ceiling could
+    /// not be checked (OWL-337).
+    CostUnreported,
 }
 
 impl Fallback {
-    /// The name events give it.
+    /// The name events give it: a chain ended by its pass limit or by its
+    /// ceiling is a `pass_limit`, whose [`Fallback::reason`] says which.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UsageLimit => "usage_limit",
             Self::Failed => "failed",
-            Self::PassLimit => "pass_limit",
+            Self::PassLimit(_) | Self::Budget | Self::CostUnreported => "pass_limit",
         }
+    }
+
+    /// Why a chain ended at its ceiling, as the `gate` event's `reason`
+    /// gives it: `budget` when its cost reached the ceiling,
+    /// `cost_unreported` when a run's cost was not reported. `None` for
+    /// every other fallback, a pass limit reached included.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Budget => Some("budget"),
+            Self::CostUnreported => Some("cost_unreported"),
+            Self::UsageLimit | Self::Failed | Self::PassLimit(_) => None,
+        }
+    }
+}
+
+impl From<ChainEnd> for Fallback {
+    fn from(end: ChainEnd) -> Self {
+        match end {
+            ChainEnd::Passes(limit) => Self::PassLimit(limit),
+            ChainEnd::Budget => Self::Budget,
+            ChainEnd::CostUnreported => Self::CostUnreported,
+        }
+    }
+}
+
+/// The ticket's text a `ticket` basis may quote (OWL-337), as the
+/// resolver's brief gave it: its title, its description and the thread's
+/// comments of the decider, nobody else's. The runner looks for the quote
+/// there, spaces collapsed, and refuses a decision whose quote it does not
+/// find.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Quotable {
+    texts: Vec<String>,
+}
+
+impl Quotable {
+    /// What `brief` lets a `ticket` basis quote.
+    pub fn of(brief: &Brief) -> Self {
+        let mut texts = vec![
+            flatten(&brief.ticket.title),
+            flatten(&brief.ticket.description),
+        ];
+        texts.extend(brief.thread.iter().filter_map(|entry| match entry {
+            ThreadEntry::Comment { author, body, .. } if author.relation == Relation::Decider => {
+                Some(flatten(body))
+            }
+            _ => None,
+        }));
+        Self { texts }
+    }
+
+    /// Whether `quote`, spaces collapsed, is in one of the texts: not blank,
+    /// and whole within a single text.
+    pub fn holds(&self, quote: &str) -> bool {
+        let quote = flatten(quote);
+        !quote.is_empty() && self.texts.iter().any(|text| text.contains(&quote))
     }
 }
 
@@ -159,17 +225,21 @@ pub struct Settled<'a> {
 
 /// Sorts the `decided` resolutions on questions of `given`, the questions
 /// the runner gave the resolver, by [`GatePolicy::route_decided`] on the
-/// category the raising run gave the question and the resolver's own label
-/// for it (OWL-144). A decision is logged only when both route to the
-/// resolver, the label a token; otherwise it is refused, whatever the
-/// resolver decided, and its question goes to the decider. A resolution on
-/// a question not in `given` is dropped, in neither list: the executor
-/// already refuses a result that names a question its brief did not give,
-/// and this keeps the floor independent of that check.
+/// category the raising run gave the question, the resolver's own label for
+/// it (OWL-144) and the kind of its basis (OWL-328), and finds a `ticket`
+/// basis's quote in `quotable`. A decision is logged only when both labels
+/// route to the resolver, the label a token, the project's delegation level
+/// allows the kind, and a `ticket` basis's quote is found; otherwise it is
+/// refused, whatever the resolver decided, and its question goes to the
+/// decider. A resolution on a question not in `given` is dropped, in
+/// neither list: the executor already refuses a result that names a question
+/// its brief did not give, and this keeps the floor independent of that
+/// check.
 pub fn settle<'a>(
     policy: &GatePolicy,
     given: &'a [Question],
     resolutions: &'a [Resolution],
+    quotable: &Quotable,
 ) -> Settled<'a> {
     let mut settled = Settled::default();
     for resolution in resolutions {
@@ -178,6 +248,8 @@ pub fn settle<'a>(
             category,
             decision,
             basis,
+            basis_kind,
+            quote,
         } = resolution
         else {
             continue;
@@ -185,11 +257,17 @@ pub fn settle<'a>(
         let Some(asked) = given.iter().find(|asked| asked.id == *question) else {
             continue;
         };
-        match policy.route_decided(&asked.category, category) {
-            Route::Resolver => settled
-                .logged
-                .push((asked, decision.as_str(), basis.as_str())),
-            Route::Human => settled.refused.push(&asked.id),
+        // The contract requires a quote with a `ticket` basis; a missing
+        // one is refused here too, so the floor does not lean on it.
+        let quoted = *basis_kind != BasisKind::Ticket
+            || quote.as_deref().is_some_and(|quote| quotable.holds(quote));
+        match policy.route_decided(&asked.category, category, *basis_kind) {
+            Route::Resolver if quoted => {
+                settled
+                    .logged
+                    .push((asked, decision.as_str(), basis.as_str()));
+            }
+            Route::Resolver | Route::Human => settled.refused.push(&asked.id),
         }
     }
     settled
@@ -201,8 +279,9 @@ pub fn decisions<'a>(
     policy: &GatePolicy,
     given: &'a [Question],
     resolutions: &'a [Resolution],
+    quotable: &Quotable,
 ) -> Vec<(&'a Question, &'a str, &'a str)> {
-    settle(policy, given, resolutions).logged
+    settle(policy, given, resolutions, quotable).logged
 }
 
 /// The ids of the questions passed on, in question order.
@@ -283,8 +362,11 @@ pub fn reported_reversing(kept: &KeptDecision, corrected: &[String]) -> Decision
 
 #[cfg(test)]
 mod tests {
+    use owlshift_contracts::DelegationLevel;
+    use owlshift_contracts::format::{BRIEF_FORMAT, RESULT_FORMAT};
     use owlshift_contracts::result::{RefusedChoice, RunResult};
     use owlshift_core::floor::FloorCategory;
+    use owlshift_core::gate::ResolverPolicy;
     use owlshift_core::vocab::PlanApproval;
 
     use super::*;
@@ -370,9 +452,16 @@ mod tests {
             category: "naming".into(),
             decision: format!("decision on {id}"),
             basis: "the ticket".into(),
+            basis_kind: BasisKind::Settled,
+            quote: None,
         };
         let resolutions = [decided("Q1"), decided("Q2")];
-        let logged = decisions(&policy, &routed.to_resolver, &resolutions);
+        let logged = decisions(
+            &policy,
+            &routed.to_resolver,
+            &resolutions,
+            &Quotable::default(),
+        );
         let logged: Vec<&str> = logged.iter().map(|(q, _, _)| q.id.as_str()).collect();
         assert_eq!(logged, ["Q2"]);
     }
@@ -402,6 +491,8 @@ mod tests {
             category: category.into(),
             decision: format!("decision on {id}"),
             basis: "the ticket".into(),
+            basis_kind: BasisKind::Settled,
+            quote: None,
         };
         let resolutions = [
             decided("Q1", "naming"),
@@ -421,7 +512,7 @@ mod tests {
             decided("Q9", "billing"),
             decided("Q10", "naming"),
         ];
-        let settled = settle(&policy, &given, &resolutions);
+        let settled = settle(&policy, &given, &resolutions, &Quotable::default());
         let found: Vec<(&str, &str)> = settled
             .logged
             .iter()
@@ -438,7 +529,177 @@ mod tests {
             .collect();
         assert_eq!(passed, ["Q4"]);
         // `decisions`, which the stand-in driver plays, logs the same.
-        assert_eq!(decisions(&policy, &given, &resolutions), settled.logged);
+        assert_eq!(
+            decisions(&policy, &given, &resolutions, &Quotable::default()),
+            settled.logged
+        );
+    }
+
+    /// A resolver's brief whose ticket says `description`, with a comment of
+    /// the decider and one of someone else.
+    fn quotable(description: &str) -> Quotable {
+        let brief = Brief::parse(&format!(
+            r#"{{"format":{BRIEF_FORMAT},"role":"resolver","project":"p",
+                "ticket":{{"id":"T-1","title":"Add a  greeting","author":{{"name":"o","relation":"other"}},"description":{description:?}}},
+                "decider":"a","thread":[
+                  {{"type":"comment","at":"2026-10-17T09:00:00Z","author":{{"name":"a","relation":"decider"}},"body":"Keep it\nto one file."}},
+                  {{"type":"comment","at":"2026-10-17T09:01:00Z","author":{{"name":"b","relation":"other"}},"body":"Add a README too."}}],
+                "resolve":[{{"id":"Q1","context":"c","text":"t","recommendation":{{"why":"r"}}}}],
+                "delegation":"ticket",
+                "permissions":{{"level":"read_only","network":false,"browser":false}},
+                "gate":[],"always_human":[],"result_path":"result.json"}}"#
+        ))
+        .unwrap();
+        Quotable::of(&brief)
+    }
+
+    /// OWL-337: a `ticket` basis's quote is looked for in the ticket's
+    /// title, its description, whoever wrote it, and the decider's comments,
+    /// spaces collapsed, never in someone else's comment; a blank quote is
+    /// never found.
+    #[test]
+    fn a_ticket_quote_is_found_in_the_tickets_text_only() {
+        let text = quotable("Add GREETING.md\n  saying Hello.\n\nNothing else.");
+        for found in [
+            "Add GREETING.md saying Hello.",
+            "GREETING.md   saying",
+            "Add a greeting",
+            "Keep it to one file.",
+            "Nothing else.",
+            // Line breaks are spaces too.
+            "Hello. Nothing else.",
+        ] {
+            assert!(text.holds(found), "{found:?}");
+        }
+        for missing in [
+            "Add a README too.",
+            "add greeting.md saying hello.",
+            // Never across two texts.
+            "Nothing else. Keep it",
+            "",
+            "   ",
+        ] {
+            assert!(!text.holds(missing), "{missing:?}");
+        }
+    }
+
+    /// OWL-337: a decision rests on a kind of basis the project's level
+    /// allows; a `ticket` basis on a quote found in the ticket's text; at
+    /// `ticket`, a `scope` question on a `ticket` basis only. Each other one
+    /// is refused, its question going to the decider.
+    #[test]
+    fn a_decision_needs_its_levels_basis_and_a_found_quote() {
+        let at = |level| {
+            GatePolicy::new(Vec::<String>::new(), PlanApproval::Never).with_resolver(
+                ResolverPolicy {
+                    level,
+                    ..ResolverPolicy::default()
+                },
+            )
+        };
+        let given = [
+            question("Q1", "naming"),
+            question("Q2", "naming"),
+            question("Q3", "scope"),
+            question("Q4", "scope"),
+            question("Q5", "testing"),
+        ];
+        let decided = |id: &str, kind: BasisKind, quote: Option<&str>| Resolution::Decided {
+            question: QuestionId::new(id).unwrap(),
+            category: "naming".into(),
+            decision: format!("decision on {id}"),
+            basis: "the ticket".into(),
+            basis_kind: kind,
+            quote: quote.map(str::to_owned),
+        };
+        let resolutions = [
+            decided("Q1", BasisKind::Fact, None),
+            decided("Q2", BasisKind::Settled, None),
+            decided(
+                "Q3",
+                BasisKind::Ticket,
+                Some("Add GREETING.md saying Hello."),
+            ),
+            decided("Q4", BasisKind::Settled, None),
+            decided("Q5", BasisKind::Ticket, Some("Add a README too.")),
+        ];
+        let text = quotable("Add GREETING.md saying Hello.");
+        let sorted = |level| {
+            let settled = settle(&at(level), &given, &resolutions, &text);
+            let ids = |list: Vec<&QuestionId>| -> Vec<String> {
+                list.iter().map(|id| id.as_str().to_owned()).collect()
+            };
+            (
+                ids(settled.logged.iter().map(|(q, _, _)| &q.id).collect()),
+                ids(settled.refused),
+            )
+        };
+        // Below `ticket`, Q3 and Q4, filed `scope`, never reach the
+        // resolver; were they decided, they are refused.
+        assert_eq!(
+            sorted(DelegationLevel::Facts),
+            (
+                vec!["Q1".to_owned()],
+                ["Q2", "Q3", "Q4", "Q5"].map(String::from).to_vec()
+            )
+        );
+        assert_eq!(
+            sorted(DelegationLevel::Discoverable),
+            (
+                vec!["Q1".to_owned(), "Q2".to_owned()],
+                ["Q3", "Q4", "Q5"].map(String::from).to_vec()
+            )
+        );
+        // At `ticket`: the quoted scope question stands, the scope question
+        // settled otherwise does not, nor a quote found nowhere but in
+        // another person's comment.
+        assert_eq!(
+            sorted(DelegationLevel::Ticket),
+            (
+                ["Q1", "Q2", "Q3"].map(String::from).to_vec(),
+                ["Q4", "Q5"].map(String::from).to_vec()
+            )
+        );
+        assert_eq!(
+            sorted(DelegationLevel::All),
+            (
+                ["Q1", "Q2", "Q3", "Q4"].map(String::from).to_vec(),
+                vec!["Q5".to_owned()]
+            )
+        );
+        assert_eq!(
+            sorted(DelegationLevel::None),
+            (
+                Vec::new(),
+                ["Q1", "Q2", "Q3", "Q4", "Q5"].map(String::from).to_vec()
+            )
+        );
+    }
+
+    /// A chain ended by its pass limit or its ceiling is a `pass_limit`,
+    /// the ceiling's saying why.
+    #[test]
+    fn a_chain_end_is_a_pass_limit_with_its_reason() {
+        let cases = [
+            (Fallback::from(ChainEnd::Passes(3)), "pass_limit", None),
+            (
+                Fallback::from(ChainEnd::Budget),
+                "pass_limit",
+                Some("budget"),
+            ),
+            (
+                Fallback::from(ChainEnd::CostUnreported),
+                "pass_limit",
+                Some("cost_unreported"),
+            ),
+            (Fallback::UsageLimit, "usage_limit", None),
+            (Fallback::Failed, "failed", None),
+        ];
+        for (fallback, name, reason) in cases {
+            assert_eq!(fallback.as_str(), name, "{fallback:?}");
+            assert_eq!(fallback.reason(), reason, "{fallback:?}");
+        }
+        assert_eq!(Fallback::from(ChainEnd::Passes(3)), Fallback::PassLimit(3));
     }
 
     #[test]
@@ -475,7 +736,7 @@ mod tests {
         let finished = |status: &str| Outcome::Finished {
             result: Box::new(
                 RunResult::parse(&format!(
-                    r#"{{"format":10,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":{RESULT_FORMAT},"status":"{status}","summary":"s"}}"#
                 ))
                 .unwrap(),
             ),
@@ -513,7 +774,7 @@ mod tests {
         let finished = |status: &str| Outcome::Finished {
             result: Box::new(
                 RunResult::parse(&format!(
-                    r#"{{"format":10,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":{RESULT_FORMAT},"status":"{status}","summary":"s"}}"#
                 ))
                 .unwrap(),
             ),

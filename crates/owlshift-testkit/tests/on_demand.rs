@@ -36,10 +36,10 @@ use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::refs::{AskDecider, PersistedState, Waiting};
 use owlshift_contracts::result::RefusedChoice;
-use owlshift_contracts::{Role, Stage};
+use owlshift_contracts::{DelegationLevel, Role, Stage};
 use owlshift_core::decider::DeciderRule;
 use owlshift_core::routing::RunRouting;
-use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason, Status, TicketState};
+use owlshift_core::state::{ParkReason, Status, TicketState};
 use owlshift_core::vocab::{Effort, Tier};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{Data, EventLog, EventSink};
@@ -384,7 +384,7 @@ struct CleanReview(FakeHarness);
 
 /// A Verify run's `done` with no finding.
 const CLEAN_REVIEW: &str =
-    r#"{"format":10,"status":"done","summary":"Nothing wrong found.","findings":[]}"#;
+    r#"{"format":11,"status":"done","summary":"Nothing wrong found.","findings":[]}"#;
 
 impl Router for CleanReview {
     fn harness(&self, _routing: RunRouting) -> Box<dyn Harness + '_> {
@@ -647,7 +647,7 @@ struct Bench {
     verify_plays: Cell<bool>,
 }
 
-const DONE: &str = r#"{"format":10,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const DONE: &str = r#"{"format":11,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
 /// The project's rules, which every brief carries (OWL-61).
@@ -797,6 +797,22 @@ impl Bench {
 
     /// Runs `owlshift do DEMO-1` with one reply per run; returns its outcome
     /// and what it printed.
+    /// Adds `lines` to the `[policy]` of the person's project file, which
+    /// `owlshift do` reads the policy from (OWL-331).
+    fn policy(&self, lines: &str) {
+        let path = self.remote.checkout.join("owlshift.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            text.replacen(
+                "always_human = []",
+                &format!("always_human = []\n{lines}"),
+                1,
+            ),
+        )
+        .unwrap();
+    }
+
     fn run(&self, replies: Vec<Reply>, first: Option<Agent>) -> (Result<Delivered, Stop>, String) {
         self.invoke(false, replies, first, Vec::new())
     }
@@ -1481,9 +1497,9 @@ fn a_reopened_choice_goes_to_the_decider() {
 "refused_choices_asked":[{{"choice":1,"question":"Q1"}},{{"choice":2,"question":"Q2"}}]}}"#,
         MIXED.strip_suffix("]}").unwrap()
     );
-    let decided_q3 = r#"{"format":10,"status":"done","summary":"The ticket names the heading.",
+    let decided_q3 = r#"{"format":11,"status":"done","summary":"The ticket names the heading.",
 "resolutions":[{"question":"Q3","outcome":"decided","category":"naming","decision":"Hello.",
-"basis":"The ticket's description."}]}"#;
+"basis":"The ticket's description.","basis_kind":"settled"}]}"#;
     let (stopped, printed) = bench.run(
         vec![
             bench.reply(None, Some(&decided)),
@@ -1898,7 +1914,7 @@ type Check = fn(&Stop) -> bool;
 /// itself went through.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
-    let blocked = r#"{"format":10,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":11,"status":"blocked","summary":"The gate needs network."}"#;
     let reset: jiff::Timestamp = "2026-09-29T15:00:00Z".parse().unwrap();
 
     let cases: Vec<(&str, Setup, Check, Option<EventKind>)> = vec![
@@ -2239,7 +2255,7 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         ]);
         *planted.borrow_mut() = commit;
     });
-    let blocked = r#"{"format":10,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":11,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], Some(agent));
     assert!(
         matches!(
@@ -2447,7 +2463,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
 }
 
 /// The Build run's first question round.
-const ROUND_1: &str = r#"{"format":10,"status":"questions",
+const ROUND_1: &str = r#"{"format":11,"status":"questions",
 "summary":"The greeting's language and words are not given.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The ticket names no language.",
@@ -2469,7 +2485,7 @@ fn check(verdicts: &[(&str, &str, &str)]) -> String {
             verdict
         })
         .collect();
-    json!({ "format": 10, "status": "done", "summary": "Checked.", "verdicts": verdicts })
+    json!({ "format": 11, "status": "done", "summary": "Checked.", "verdicts": verdicts })
         .to_string()
 }
 
@@ -2823,7 +2839,7 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
 }
 
 /// A round of two lettered questions, each recommending an option.
-const LETTERED: &str = r#"{"format":10,"status":"questions",
+const LETTERED: &str = r#"{"format":11,"status":"questions",
 "summary":"The greeting's language and ending are not given.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The ticket names no language.",
@@ -2836,7 +2852,7 @@ const LETTERED: &str = r#"{"format":10,"status":"questions",
    "recommendation":{"option":"B","why":"A greeting file needs none."}}]}"#;
 
 /// The next round: one lettered question.
-const LETTERED_NEXT: &str = r#"{"format":10,"status":"questions",
+const LETTERED_NEXT: &str = r#"{"format":11,"status":"questions",
 "summary":"Whether the README links to the greeting is not given.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The README lists the project's files.",
@@ -3385,7 +3401,7 @@ fn a_late_comment_the_build_cannot_follow_stops_in_needs_input() {
     let check = answered_round(&bench);
     // Not an always-human category: only the integration sends it to the
     // decider without a resolver run, which would need a reply of its own.
-    let asks = r#"{"format":10,"status":"questions",
+    let asks = r#"{"format":11,"status":"questions",
         "summary":"The greeting cannot say both Hello and Goodbye.",
         "questions":[{"id":"Q1","category":"wording","context":"Q2 was answered Hello; a later comment says Goodbye.",
           "text":"Hello or Goodbye?","options":[{"label":"Hello"},{"label":"Goodbye"}],"recommendation":{"option":"A","why":"The simplest reading of the ticket."}}]}"#;
@@ -3657,7 +3673,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     assert!(matches!(asked, Err(Stop::NeedsInput { .. })), "{asked:?}");
     bench.answer("Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\n");
 
-    let failed = r#"{"format":10,"status":"failed","summary":"The thread holds no ask."}"#;
+    let failed = r#"{"format":11,"status":"failed","summary":"The thread holds no ask."}"#;
     let (outcome, _) = bench.continue_ticket(vec![bench.reply(None, Some(failed))]);
     assert!(
         matches!(&outcome, Err(Stop::CheckFailed { .. })),
@@ -4032,7 +4048,7 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
     let bench = Bench::new(true);
     bench.refuse.set(Some("[owlshift] PARKED"));
     bench.refuse_stage.set(true);
-    let blocked = r#"{"format":10,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":11,"status":"blocked","summary":"The gate needs network."}"#;
     let (outcome, _) = bench.run(vec![bench.reply(None, Some(blocked))], None);
     let Err(
         stop @ Stop::Parked {
@@ -4070,7 +4086,7 @@ fn a_restart_at_build_shows_the_ticket_working_again() {
         ("Q1", "answered", "English."),
         ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
     ]);
-    let blocked = r#"{"format":10,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":11,"status":"blocked","summary":"The gate needs network."}"#;
     let (parked, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(None, Some(blocked)),
@@ -4206,7 +4222,7 @@ fn a_zone_owner_named_only_in_the_persons_checkout_decides_nothing() {
 
 /// A Build run's questions: Q1 discoverable (naming), Q2 always human
 /// (scope).
-const MIXED: &str = r#"{"format":10,"status":"questions",
+const MIXED: &str = r#"{"format":11,"status":"questions",
 "summary":"The greeting's file and words are not given.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
@@ -4215,7 +4231,7 @@ const MIXED: &str = r#"{"format":10,"status":"questions",
    "text":"What should the greeting say?","recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
 
 /// A Build run's one discoverable question.
-const NAMING: &str = r#"{"format":10,"status":"questions",
+const NAMING: &str = r#"{"format":11,"status":"questions",
 "summary":"The greeting's file is not named.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
@@ -4235,9 +4251,9 @@ fn asking_refused(result: &str, choices: u32) -> String {
 }
 
 /// The resolver decides Q1.
-const DECIDED_Q1: &str = r#"{"format":10,"status":"done","summary":"The ticket names the file.",
+const DECIDED_Q1: &str = r#"{"format":11,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
-"basis":"The ticket's description."}]}"#;
+"basis":"The ticket's description.","basis_kind":"settled"}]}"#;
 
 /// The events of a kind whose data holds `key`.
 fn data_of(events: &[Event], kind: EventKind, key: &str) -> Vec<Value> {
@@ -4471,9 +4487,9 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
 
 /// The resolver resolves Q2, which a brief giving Q1 alone did not give: its
 /// result is refused.
-const RESOLVED_Q2: &str = r#"{"format":10,"status":"done","summary":"The ticket names the file.",
+const RESOLVED_Q2: &str = r#"{"format":11,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q2","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
-"basis":"The ticket's description."}]}"#;
+"basis":"The ticket's description.","basis_kind":"settled"}]}"#;
 
 /// OWL-191: a refused resolver result is kept in the ticket ref before its
 /// fallback round is posted, so when the tracker refuses that round, the
@@ -4628,17 +4644,17 @@ fn a_refused_resolver_result_is_told_when_its_round_was_posted_but_not_kept() {
 /// decider and the resolver is never run.
 #[test]
 fn the_added_always_human_categories_reach_build_and_the_resolver() {
-    let raised = r#"{"format":10,"status":"questions",
+    let raised = r#"{"format":11,"status":"questions",
 "summary":"The tone and the file are open.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
    "text":"Which file should hold the greeting?","recommendation":{"why":"The simplest reading of the ticket."}},
   {"id":"Q2","category":"Brand Voice","context":"The ticket does not say how formal it is.",
    "text":"How formal should the greeting be?","recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
-    let resolved = r#"{"format":10,"status":"done","summary":"The file is named.",
+    let resolved = r#"{"format":11,"status":"done","summary":"The file is named.",
 "resolutions":[
   {"question":"Q1","outcome":"decided","category":"naming",
-   "decision":"GREETING.md, at the root.","basis":"The ticket's description."}]}"#;
+   "decision":"GREETING.md, at the root.","basis":"The ticket's description.","basis_kind":"settled"}]}"#;
     let bench = Bench::new(true);
     let config_path = bench.remote.checkout.join("owlshift.toml");
     let original = fs::read_to_string(&config_path).unwrap();
@@ -4684,7 +4700,7 @@ fn the_added_always_human_categories_reach_build_and_the_resolver() {
 /// one passed on, while the other decision of the same result stands.
 #[test]
 fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
-    let raised = r#"{"format":10,"status":"questions",
+    let raised = r#"{"format":11,"status":"questions",
 "summary":"The greeting's file, the old greetings and the tone are open.",
 "questions":[
   {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
@@ -4693,12 +4709,12 @@ fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
    "text":"May the old greetings file be deleted?","recommendation":{"why":"The simplest reading of the ticket."}},
   {"id":"Q3","category":"tone","context":"The ticket does not say how formal it is.",
    "text":"How formal should the greeting be?","recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
-    let resolved = r#"{"format":10,"status":"done","summary":"The file is named; the rest is not mine.",
+    let resolved = r#"{"format":11,"status":"done","summary":"The file is named; the rest is not mine.",
 "resolutions":[
   {"question":"Q1","outcome":"decided","category":"naming",
-   "decision":"GREETING.md, at the root.","basis":"The ticket's description."},
+   "decision":"GREETING.md, at the root.","basis":"The ticket's description.","basis_kind":"settled"},
   {"question":"Q2","outcome":"decided","category":"data_loss",
-   "decision":"Yes, delete it.","basis":"Nothing reads it."},
+   "decision":"Yes, delete it.","basis":"Nothing reads it.","basis_kind":"fact"},
   {"question":"Q3","outcome":"passed_on","reason":"A matter of tone."}]}"#;
     let bench = Bench::new(true);
     let (outcome, printed) = bench.run(
@@ -4755,14 +4771,25 @@ fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
     assert_eq!(opened[0]["raised_as"], json!(["Q2", "Q3"]));
 }
 
+/// The pass limit these benches set (`policy.resolver_passes`, OWL-328):
+/// the arithmetic of each is written for 3, the limit before OWL-328.
+const PASSES: u32 = 3;
+
+/// A bench whose project sets the pass limit to [`PASSES`].
+fn bench_at_passes() -> Bench {
+    let bench = Bench::new(true);
+    bench.policy(&format!("resolver_passes = {PASSES}"));
+    bench
+}
+
 /// A Build that keeps asking what the resolver settles runs at most
-/// `MAX_RESOLVED_PASSES` times in a row on decisions alone; the next run's
-/// questions all go to the decider, and the round says why.
+/// the project's pass limit times in a row on decisions alone; the next
+/// run's questions all go to the decider, and the round says why.
 #[test]
 fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
-    let bench = Bench::new(true);
+    let bench = bench_at_passes();
     let mut replies = Vec::new();
-    for _ in 0..MAX_RESOLVED_PASSES {
+    for _ in 0..PASSES {
         replies.push(bench.reply(None, Some(NAMING)));
         replies.push(bench.reply(None, Some(DECIDED_Q1)));
     }
@@ -4771,7 +4798,7 @@ fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
     let stop = outcome.expect_err("a round");
     assert_eq!(asked_texts(&stop), ["Which file should hold the greeting?"]);
     let comments = bench.comments();
-    let rounds = comments.len() - usize::try_from(MAX_RESOLVED_PASSES).unwrap();
+    let rounds = comments.len() - usize::try_from(PASSES).unwrap();
     assert_eq!(rounds, 1, "{comments:?}");
     assert!(
         comments
@@ -4782,6 +4809,187 @@ fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
     );
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
     assert_eq!(resolved.last().unwrap()["resolver"], "pass_limit");
+    assert!(resolved.last().unwrap().get("reason").is_none());
+}
+
+/// A Build run's one `scope` question, which the ticket's own text answers
+/// ("Add GREETING.md saying Hello.").
+const SCOPE: &str = r#"{"format":11,"status":"questions",
+"summary":"Whether the greeting is a file of its own is not said in so many words.",
+"questions":[
+  {"id":"Q1","category":"scope","context":"The repository has no greeting yet.",
+   "text":"Does the ticket ask for a GREETING.md file of its own?","recommendation":{"why":"The ticket names the file."}}]}"#;
+
+/// The resolver decides [`SCOPE`]'s question on a `ticket` basis, quoting
+/// `quote`.
+fn decided_scope(quote: &str) -> String {
+    format!(
+        r#"{{"format":11,"status":"done","summary":"The ticket names the file.",
+"resolutions":[{{"question":"Q1","outcome":"decided","category":"scope",
+"decision":"Yes: GREETING.md, at the root.","basis":"The ticket's description.",
+"basis_kind":"ticket","quote":{quote:?}}}]}}"#
+    )
+}
+
+/// OWL-328's bench: at `ticket`, a `scope` question the ticket's text
+/// answers is decided on a quoted `ticket` basis, the DECISION and the
+/// delivery report naming the level; at `discoverable`, the default, the
+/// same ticket's question goes to the decider, no resolver running; at
+/// `ticket` again, a quote the ticket does not hold is refused, its question
+/// going to the decider.
+#[test]
+fn a_quoted_scope_question_is_decided_at_ticket_and_asked_at_discoverable() {
+    let bench = Bench::new(true);
+    bench.policy("resolver_delegation = \"ticket\"");
+    let (delivered, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(SCOPE)),
+            bench.reply(
+                None,
+                Some(&decided_scope("Add  GREETING.md   saying Hello.")),
+            ),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = bench.briefs();
+    let roles: Vec<Role> = briefs.iter().map(|b| b.role).collect();
+    // Verify, which reviews clean on this bench, follows.
+    assert_eq!(
+        roles[..3],
+        [Role::Build, Role::Resolver, Role::Build],
+        "{printed}"
+    );
+    assert_eq!(briefs[1].delegation, Some(DelegationLevel::Ticket));
+    assert_eq!(briefs[0].delegation, None);
+    let comments = bench.comments();
+    assert!(
+        comments[0].starts_with("[owlshift] DECISION\n")
+            && comments[0].contains("delegation level, `ticket`"),
+        "{}",
+        comments[0]
+    );
+    let report = comments.last().unwrap();
+    assert!(
+        report.starts_with("[owlshift] DELIVERY")
+            && report.contains("allowed by this project's delegation level, `ticket`"),
+        "{report}"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["resolver"], "done");
+    assert_eq!(resolved[0]["level"], "ticket");
+    assert_eq!(resolved[0]["decided"], json!(["Q1"]));
+
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(SCOPE))], None);
+    let stop = outcome.expect_err("a round");
+    assert_eq!(
+        asked_texts(&stop),
+        ["Does the ticket ask for a GREETING.md file of its own?"],
+        "{printed}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build], "no resolver runs: {printed}");
+    assert!(data_of(&bench.events(), EventKind::Gate, "resolver").is_empty());
+
+    let bench = Bench::new(true);
+    bench.policy("resolver_delegation = \"ticket\"");
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(SCOPE)),
+            bench.reply(None, Some(&decided_scope("Add GREETING.md and a README."))),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop).len(), 1, "{printed}");
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.contains("[owlshift] DECISION"))
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["refused"], json!(["Q1"]));
+    assert_eq!(resolved[0]["to_decider"], json!(["Q1"]));
+}
+
+/// OWL-328's ceiling, through the runner: with `"unlimited"` passes and a
+/// $1 ceiling, the asking runs' and the resolver runs' costs add up, and
+/// once they reach the ceiling the next run's questions go to the decider,
+/// the round and the `gate` event saying why; a run that reports no cost
+/// ends the chain at the next check.
+#[test]
+fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
+    let costing = |bench: &Bench, result: &str, micros: Option<u64>| {
+        let mut reply = bench.reply(None, Some(result));
+        reply.cost_micros = micros;
+        reply
+    };
+    let unlimited = "resolver_passes = \"unlimited\"\nresolver_budget_usd = 1.0";
+    let cost = Some(300_000);
+
+    // 0.3, then 0.6 after the first resolver run, then 0.9: the second
+    // resolver runs; 1.5 once the third Build asked is past the ceiling.
+    let bench = Bench::new(true);
+    bench.policy(unlimited);
+    let (outcome, printed) = bench.run(
+        vec![
+            costing(&bench, NAMING, cost),
+            costing(&bench, DECIDED_Q1, cost),
+            costing(&bench, NAMING, cost),
+            costing(&bench, DECIDED_Q1, cost),
+            costing(&bench, NAMING, cost),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop), ["Which file should hold the greeting?"]);
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(
+        roles,
+        [
+            Role::Build,
+            Role::Resolver,
+            Role::Build,
+            Role::Resolver,
+            Role::Build
+        ],
+        "{printed}"
+    );
+    let round = bench.comments().pop().unwrap();
+    assert!(round.contains("dollar ceiling"), "{round}");
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    let last = resolved.last().unwrap();
+    assert_eq!(last["resolver"], "pass_limit");
+    assert_eq!(last["reason"], "budget");
+    assert_eq!(last["level"], "discoverable");
+
+    // A resolver run without a cost: the next check cannot read the
+    // chain's, which ends it.
+    let bench = Bench::new(true);
+    bench.policy(unlimited);
+    let (outcome, printed) = bench.run(
+        vec![
+            costing(&bench, NAMING, cost),
+            costing(&bench, DECIDED_Q1, None),
+            costing(&bench, NAMING, cost),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop).len(), 1, "{printed}");
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(
+        roles,
+        [Role::Build, Role::Resolver, Role::Build],
+        "{printed}"
+    );
+    let round = bench.comments().pop().unwrap();
+    assert!(round.contains("reported no cost"), "{round}");
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved.last().unwrap()["reason"], "cost_unreported");
 }
 
 /// The role of each run of a bench and whether its brief was told of a
@@ -4798,10 +5006,10 @@ fn runs_of(bench: &Bench) -> Vec<(Role, bool)> {
 /// (the next run is told why), and the told run can ask a question the
 /// resolver settles, after which a new refusal is let off again, so refusals
 /// and resolver passes alternate. `settled` is never reset in a command, so
-/// the alternation ends after `MAX_RESOLVED_PASSES` settled passes, with a
+/// the alternation ends after [`PASSES`] settled passes, with a
 /// round for the decider.
 ///
-/// With N = `MAX_RESOLVED_PASSES` = 3, the runs of the command are:
+/// With N = [`PASSES`] = 3, the runs of the command are:
 ///
 /// - N + 1 = 4 refused results, each let off: one before each of the N
 ///   settled passes and one before the run whose question hits the limit;
@@ -4813,16 +5021,16 @@ fn runs_of(bench: &Bench) -> Vec<(Role, bool)> {
 /// refusal let off after the limit, makes the command run on.
 #[test]
 fn refused_results_and_resolver_passes_alternate_up_to_the_ceiling() {
-    assert_eq!(MAX_RESOLVED_PASSES, 3, "the arithmetic above assumes 3");
-    let bench = Bench::new(true);
+    assert_eq!(PASSES, 3, "the arithmetic above assumes 3");
+    let bench = bench_at_passes();
     let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
     let mut replies = Vec::new();
     let mut expected = Vec::new();
-    for pass in 0..=MAX_RESOLVED_PASSES {
+    for pass in 0..=PASSES {
         replies.push(bench.reply(None, Some(&misnumbered)));
         replies.push(bench.reply(None, Some(NAMING)));
         expected.extend([(Role::Build, false), (Role::Build, true)]);
-        if pass < MAX_RESOLVED_PASSES {
+        if pass < PASSES {
             replies.push(bench.reply(None, Some(DECIDED_Q1)));
             expected.push((Role::Resolver, false));
         }
@@ -4864,13 +5072,13 @@ fn refused_results_and_resolver_passes_alternate_up_to_the_ceiling() {
 /// 1 + 9 + 2 + 2 = 14 runs, the last answered by a round about the comment.
 #[test]
 fn refusals_resolver_passes_and_a_late_comment_stop_at_the_ceiling() {
-    assert_eq!(MAX_RESOLVED_PASSES, 3, "the arithmetic above assumes 3");
-    let bench = Bench::new(true);
+    assert_eq!(PASSES, 3, "the arithmetic above assumes 3");
+    let bench = bench_at_passes();
     let check = answered_round(&bench);
     let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
     let mut replies = vec![check];
     let mut expected = vec![(Role::AnswerCheck, false)];
-    for _ in 0..MAX_RESOLVED_PASSES {
+    for _ in 0..PASSES {
         replies.push(bench.reply(None, Some(&misnumbered)));
         replies.push(bench.reply(None, Some(NAMING)));
         replies.push(bench.reply(None, Some(DECIDED_Q1)));
@@ -5432,7 +5640,7 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
 }
 
 /// A fix run's `done`: the greeting committed again.
-const FIXED: &str = r#"{"format":10,"status":"done","summary":"Kept the greeting on every platform.",
+const FIXED: &str = r#"{"format":11,"status":"done","summary":"Kept the greeting on every platform.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Fixed."}}"#;
 
 /// A delivered ticket, its pull request followed.
@@ -5880,7 +6088,7 @@ fn a_refused_move_from_a_stage_left_at_working_is_warned_of_once() {
 
 /// A repair run's question about something only a person holds (scenario
 /// S9).
-const ASKS_FOR_A_VARIABLE: &str = r#"{"format":10,"status":"questions",
+const ASKS_FOR_A_VARIABLE: &str = r#"{"format":11,"status":"questions",
 "summary":"The red is a missing environment variable.",
 "questions":[{"id":"Q1","category":"secrets","context":"CI lacks the GREETING_LOCALE variable the check reads.",
 "text":"Can someone set GREETING_LOCALE in CI and re-run the check?","recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
@@ -6051,7 +6259,7 @@ fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
 fn a_false_premise_without_a_question_parks_the_fix() {
     let bench = delivered();
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
-    let premise = r#"{"format":10,"status":"premise_false","summary":"The check tests a file this branch never had.","questions":[]}"#;
+    let premise = r#"{"format":11,"status":"premise_false","summary":"The check tests a file this branch never had.","questions":[]}"#;
     let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(premise))]);
     assert!(
         matches!(
@@ -6938,7 +7146,7 @@ fn an_owed_report_whose_checks_cannot_be_read_is_posted() {
 }
 
 /// A Build `done` proposing a follow-up.
-const DONE_WITH_FOLLOWUP: &str = r#"{"format":10,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const DONE_WITH_FOLLOWUP: &str = r#"{"format":11,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."},
 "followups":[{"title":"Greet in French","why":"Readers asked.","source":"agent","done_when":"It says Bonjour."}]}"#;
 
@@ -7042,10 +7250,10 @@ const AGENTS_RESOLVED: &str =
     "Sign off every commit (`git commit -s`), always, and keep it short.\n";
 
 /// A rebase run's `done`.
-const REBASED: &str = r#"{"format":10,"status":"done","summary":"Rebased onto the base; the conflict kept both sides."}"#;
+const REBASED: &str = r#"{"format":11,"status":"done","summary":"Rebased onto the base; the conflict kept both sides."}"#;
 
 /// A rebase run that could not resolve its conflict.
-const NOT_REBASED: &str = r#"{"format":10,"status":"failed","summary":"Could not resolve AGENTS.md; the rebase was aborted."}"#;
+const NOT_REBASED: &str = r#"{"format":11,"status":"failed","summary":"Could not resolve AGENTS.md; the rebase was aborted."}"#;
 
 /// A delivered ticket whose delivery also changed the project's rules, its
 /// pull request followed.
@@ -7374,7 +7582,7 @@ fn corrections(events: &[Event]) -> Vec<Value> {
 }
 
 /// A correction run's `done`, the greeting moved as the reply asks.
-const CORRECTED: &str = r#"{"format":10,"status":"done","summary":"Moved the greeting as the reply asks.",
+const CORRECTED: &str = r#"{"format":11,"status":"done","summary":"Moved the greeting as the reply asks.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Corrected."}}"#;
 
 /// Scenario S7's reversal (OWL-146): once the ticket is delivered, the
@@ -7564,7 +7772,7 @@ fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_r
     bench.refuse.set(Some("[owlshift] DELIVERY"));
     let (unchanged, printed) = bench.continue_ticket(vec![bench.reply(
         None,
-        Some(r#"{"format":10,"status":"done","summary":"HELLO.md already holds the greeting."}"#),
+        Some(r#"{"format":11,"status":"done","summary":"HELLO.md already holds the greeting."}"#),
     )]);
     assert!(
         matches!(&unchanged, Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
@@ -7631,7 +7839,7 @@ fn a_correction_that_fails_then_asks_goes_to_the_decider_then_corrects() {
     let bench = Bench::new(true);
     let decision = delivered_with_a_decision(&bench);
     bench.reply_as("maintainer", &decision, "Use the README instead. go");
-    let asks = r#"{"format":10,"status":"questions","summary":"The README has no greeting section.",
+    let asks = r#"{"format":11,"status":"questions","summary":"The README has no greeting section.",
 "questions":[{"id":"Q1","category":"scope","context":"The README holds the install steps only.",
 "text":"Where in the README should the greeting go?","recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
     let (outcome, printed) =
@@ -7686,7 +7894,7 @@ fn intake_result(status: &str, dependency: Option<&str>, questions: &str) -> Str
         .into_iter()
         .collect();
     let mut result = json!({
-        "format": 10,
+        "format": 11,
         "status": status,
         "summary": "A small greeting.",
         "intake": {
@@ -7872,7 +8080,7 @@ fn an_intake_round_returns_the_ticket_to_the_ready_column() {
 #[test]
 fn a_false_premise_at_intake_is_a_round_to_the_decider() {
     let bench = Bench::drained();
-    let premise = r#"{"format":10,"status":"premise_false",
+    let premise = r#"{"format":11,"status":"premise_false",
 "summary":"The ticket extends a README section that does not exist.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends README.md's Usage section; there is none.",
 "text":"Re-scope to write the section, or close the ticket?",
@@ -7933,7 +8141,7 @@ fn a_false_premise_at_intake_is_a_round_to_the_decider() {
 #[test]
 fn a_false_premise_at_intake_without_a_question_parks_the_ticket() {
     let bench = Bench::drained();
-    let premise = r#"{"format":10,"status":"premise_false","summary":"The section is not there."}"#;
+    let premise = r#"{"format":11,"status":"premise_false","summary":"The section is not there."}"#;
     let stop = bench
         .intake(
             vec![bench.reply(None, Some(premise))],
@@ -8046,7 +8254,7 @@ fn a_parked_intake_is_restarted_by_continue_and_returns_to_ready() {
     let failed = || {
         bench.reply(
             None,
-            Some(r#"{"format":10,"status":"failed","summary":"Lost."}"#),
+            Some(r#"{"format":11,"status":"failed","summary":"Lost."}"#),
         )
     };
     let stop = bench
@@ -8086,7 +8294,7 @@ fn continue_runs_intake_on_a_ticket_at_intake() {
     let failed = || {
         bench.reply(
             None,
-            Some(r#"{"format":10,"status":"failed","summary":"Lost."}"#),
+            Some(r#"{"format":11,"status":"failed","summary":"Lost."}"#),
         )
     };
     bench
@@ -8104,7 +8312,7 @@ fn continue_runs_intake_on_a_ticket_at_intake() {
 }
 
 /// A Build run's `done` with two follow-ups (OWL-253).
-const PROPOSING: &str = r#"{"format":10,"status":"done","summary":"Added GREETING.md; the gate passes.",
+const PROPOSING: &str = r#"{"format":11,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."},
 "followups":[
  {"title":"Translate the greeting","why":"Readers abroad.","evidence":["GREETING.md:1"],"source":"agent","done_when":"A French greeting exists."},
@@ -9259,7 +9467,7 @@ fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
     let failed = || {
         bench.reply(
             None,
-            Some(r#"{"format":10,"status":"failed","summary":"Lost."}"#),
+            Some(r#"{"format":11,"status":"failed","summary":"Lost."}"#),
         )
     };
     let asks = bench.reply(

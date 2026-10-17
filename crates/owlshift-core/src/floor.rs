@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use crate::vocab::DelegationLevel;
+
 /// Something the Writer does on the tracker, the forge or beyond. The Writer
 /// asks [`check_action`] before each one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -152,8 +154,12 @@ pub fn check_agent_environment<'a>(
     }
 }
 
-/// A question category that always goes to a human. Projects may add
-/// categories (see [`crate::gate::GatePolicy`]), never remove one of these.
+/// A question category that goes to a human by default (architecture
+/// section 4, "Always human"). Two are the floor proper, `security` and
+/// `irreversible`, which reach a human at every delegation level; the
+/// project's level may hand the other four to the resolver
+/// ([`FloorCategory::human_at`]). Projects may add categories (see
+/// [`crate::gate::GatePolicy`]), which stay human at every level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FloorCategory {
     Security,
@@ -188,16 +194,38 @@ impl FloorCategory {
             Self::Scope => "scope",
         }
     }
+
+    /// Whether a question of this category goes to a human at `level`: the
+    /// floor (`security`, `irreversible`) at every level; `scope` below
+    /// `ticket`; `data_loss`, `money` and `legal` below `all` (OWL-328).
+    /// The one place the levels' always-human sets are written.
+    pub fn human_at(self, level: DelegationLevel) -> bool {
+        match self {
+            Self::Security | Self::Irreversible => true,
+            Self::Scope => level < DelegationLevel::Ticket,
+            Self::DataLoss | Self::Money | Self::Legal => level < DelegationLevel::All,
+        }
+    }
 }
 
-/// Whether a question's category is one of the floor's. A blank category
-/// counts: a question that does not say what it is about goes to a human.
-pub fn is_floor_category(category: &str) -> bool {
+/// Whether a question's category goes to a human at `level` by the
+/// categories of [`FloorCategory`] ([`FloorCategory::human_at`]), in any
+/// spelling, as a whole-word token anywhere in it. A blank category counts
+/// at every level: a question that does not say what it is about goes to a
+/// human. A project's own additions are the gate's
+/// ([`crate::gate::GatePolicy::always_human`]).
+pub fn is_human_category(category: &str, level: DelegationLevel) -> bool {
     let category = normalize(category);
     category.is_empty()
         || FloorCategory::ALL
             .into_iter()
-            .any(|floor| matches_token(&category, floor.token()))
+            .any(|floor| floor.human_at(level) && matches_token(&category, floor.token()))
+}
+
+/// Whether a category names one of [`FloorCategory`]'s six as a whole-word
+/// token, in any spelling, whatever the level hands to the resolver.
+pub fn names_floor_category(category: &str, floor: FloorCategory) -> bool {
+    matches_token(&normalize(category), floor.token())
 }
 
 /// Whether a category is written as a token: words of ASCII lowercase
@@ -342,8 +370,9 @@ mod tests {
 
     #[test]
     fn floor_categories_are_recognized_in_any_spelling() {
+        let default = DelegationLevel::Discoverable;
         for category in FloorCategory::ALL {
-            assert!(is_floor_category(category.token()), "{category:?}");
+            assert!(is_human_category(category.token(), default), "{category:?}");
         }
         let spellings = [
             "Security",
@@ -361,18 +390,51 @@ mod tests {
             "possible security issue",
         ];
         for spelling in spellings {
-            assert!(is_floor_category(spelling), "{spelling:?}");
+            assert!(is_human_category(spelling, default), "{spelling:?}");
         }
     }
 
     #[test]
-    fn a_blank_category_counts_as_the_floor_and_others_do_not() {
-        for blank in ["", "   ", "--"] {
-            assert!(is_floor_category(blank), "{blank:?}");
+    fn a_blank_category_counts_as_human_and_others_do_not() {
+        for level in DelegationLevel::ALL {
+            for blank in ["", "   ", "--"] {
+                assert!(is_human_category(blank, level), "{blank:?} at {level:?}");
+            }
+            for other in ["testing", "naming", "securities", "scoped", "datalossy"] {
+                assert!(!is_human_category(other, level), "{other:?} at {level:?}");
+            }
         }
-        for other in ["testing", "naming", "securities", "scoped", "datalossy"] {
-            assert!(!is_floor_category(other), "{other:?}");
+    }
+
+    /// The floor proper reaches a human at every level; `scope` stops at
+    /// `ticket`, `data_loss`, `money` and `legal` at `all`.
+    #[test]
+    fn each_level_keeps_its_categories_for_a_human() {
+        use DelegationLevel as L;
+        use FloorCategory::{DataLoss, Irreversible, Legal, Money, Scope, Security};
+        let kept: [(L, &[FloorCategory]); 5] = [
+            (L::None, &FloorCategory::ALL),
+            (L::Facts, &FloorCategory::ALL),
+            (L::Discoverable, &FloorCategory::ALL),
+            (L::Ticket, &[Security, DataLoss, Money, Legal, Irreversible]),
+            (L::All, &[Security, Irreversible]),
+        ];
+        for (level, human) in kept {
+            for category in FloorCategory::ALL {
+                assert_eq!(
+                    category.human_at(level),
+                    human.contains(&category),
+                    "{category:?} at {level:?}"
+                );
+                assert_eq!(
+                    is_human_category(&format!("Possible {} issue", category.token()), level),
+                    human.contains(&category),
+                    "{category:?} at {level:?}"
+                );
+            }
         }
+        assert!(names_floor_category("Scope change", Scope));
+        assert!(!names_floor_category("scoped", Scope));
     }
 
     #[test]

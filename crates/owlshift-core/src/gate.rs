@@ -5,9 +5,12 @@
 //! policy: which questions go to a human rather than the resolver, and when a
 //! human approves the plan.
 
-use crate::floor::{is_floor_category, is_token, matches_token, normalize};
+use crate::floor::{
+    FloorCategory, is_human_category, is_token, matches_token, names_floor_category, normalize,
+};
 use crate::pipeline::Pipeline;
-use crate::vocab::{PlanApproval, Variant};
+use crate::state::MAX_RESOLVED_PASSES;
+use crate::vocab::{BasisKind, DelegationLevel, PlanApproval, Variant};
 
 /// Who settles a question a role raised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,9 +24,10 @@ pub enum Route {
 
 /// The categories of a project's `policy.always_human` as the gate reads
 /// them: normalized, in the project's order, each once, blank ones dropped.
-/// The floor's categories are not filtered out here, so a caller that shows
-/// the list as written can still tell which ones the floor covers
-/// ([`is_floor_category`]); [`GatePolicy::additions`] leaves them out.
+/// The default always-human categories are not filtered out here, so a
+/// caller that shows the list as written can still tell which ones the level
+/// covers ([`is_human_category`]); [`GatePolicy::additions`] leaves them
+/// out.
 pub fn normalized_categories<S: AsRef<str>>(
     always_human: impl IntoIterator<Item = S>,
 ) -> Vec<String> {
@@ -37,20 +41,136 @@ pub fn normalized_categories<S: AsRef<str>>(
     kept
 }
 
-/// A project's gate policy: the always-human categories it adds to the
-/// floor, and its plan-approval mode. Both come from the project file
-/// (`policy.always_human`, `pipeline.plan_approval`).
+/// How many runs in a row the resolver may unblock in one command
+/// (`policy.resolver_passes`, OWL-328).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PassLimit {
+    /// At most this many runs in a row whose questions it all decided.
+    Runs(u32),
+    /// No count: the chain's dollar ceiling bounds it instead.
+    Unlimited,
+}
+
+impl Default for PassLimit {
+    /// [`MAX_RESOLVED_PASSES`] runs.
+    fn default() -> Self {
+        Self::Runs(MAX_RESOLVED_PASSES)
+    }
+}
+
+/// What a project lets the resolver do (architecture section 4,
+/// "Delegation level" and "Resolver passes", OWL-328): the level, the pass
+/// limit and the dollar ceiling on one chain of runs. The default is the
+/// behaviour before OWL-328, with the default pass limit raised to
+/// [`MAX_RESOLVED_PASSES`]: `discoverable`, no ceiling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ResolverPolicy {
+    pub level: DelegationLevel,
+    pub passes: PassLimit,
+    /// The ceiling on one chain's cost, in millionths of a dollar
+    /// ([`usd_micros`]); `None` without one.
+    pub ceiling_micros: Option<u64>,
+}
+
+/// A dollar amount in millionths of a dollar, rounded: `None` for an
+/// amount that is negative or not a finite number, which no ceiling can be
+/// checked against.
+pub fn usd_micros(usd: f64) -> Option<u64> {
+    if !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    // `as` saturates a float past the integer's range.
+    Some((usd * 1_000_000.0).round() as u64)
+}
+
+/// The cost of one chain of runs so far: the asking runs and their resolver
+/// runs since the command's last stop (architecture section 4, "Resolver
+/// passes").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChainCost {
+    /// The sum of every run's reported cost, in millionths of a dollar.
+    Known(u64),
+    /// A run of the chain reported no cost: the ceiling cannot be checked.
+    Unreported,
+}
+
+/// One chain of runs as the runner counts it, for [`GatePolicy::chain_end`]:
+/// the runs in a row whose questions the resolver all decided, and what the
+/// chain's runs cost. The core does no I/O: the runner reports each run's
+/// cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Chain {
+    settled: u32,
+    cost: ChainCost,
+}
+
+impl Default for Chain {
+    fn default() -> Self {
+        Self {
+            settled: 0,
+            cost: ChainCost::Known(0),
+        }
+    }
+}
+
+impl Chain {
+    /// The runs in a row whose questions the resolver all decided.
+    pub const fn settled(self) -> u32 {
+        self.settled
+    }
+
+    /// What the chain's runs cost so far.
+    pub const fn cost(self) -> ChainCost {
+        self.cost
+    }
+
+    /// One more run of the chain, an asking run or a resolver run, with its
+    /// reported cost in dollars: `None`, or a cost that is negative or not a
+    /// finite number, leaves the chain's cost unreported for good.
+    pub fn ran(&mut self, cost_usd: Option<f64>) {
+        self.cost = match (self.cost, cost_usd.and_then(usd_micros)) {
+            (ChainCost::Known(sum), Some(cost)) => ChainCost::Known(sum.saturating_add(cost)),
+            _ => ChainCost::Unreported,
+        };
+    }
+
+    /// The resolver decided every question of the chain's latest asking run.
+    pub fn settled_once(&mut self) {
+        self.settled = self.settled.saturating_add(1);
+    }
+}
+
+/// Why a chain ends, the next run's questions going to the decider without
+/// the resolver ([`GatePolicy::chain_end`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChainEnd {
+    /// The pass limit, this many runs in a row, is reached.
+    Passes(u32),
+    /// The chain's cost reached its ceiling.
+    Budget,
+    /// A run of the chain reported no cost, so its ceiling could not be
+    /// checked.
+    CostUnreported,
+}
+
+/// A project's gate policy: the always-human categories it adds, its
+/// plan-approval mode, and what it lets the resolver do. All come from the
+/// project file (`policy.always_human`, `pipeline.plan_approval`,
+/// `policy.resolver_*`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GatePolicy {
     /// The project's categories, normalized, each once, blank ones dropped (a
-    /// floor category may appear: [`GatePolicy::additions`] leaves it out); the
-    /// floor's categories are always included on top.
+    /// default always-human category may appear: [`GatePolicy::additions`]
+    /// leaves out what the level covers); the level's are always included
+    /// on top.
     always_human: Vec<String>,
     plan_approval: PlanApproval,
+    resolver: ResolverPolicy,
 }
 
 impl GatePolicy {
-    /// A policy adding `always_human` to the floor's categories. There is no
+    /// A policy adding `always_human` to the level's categories, with the
+    /// default resolver settings ([`ResolverPolicy::default`]). There is no
     /// way to remove a floor category.
     pub fn new<S: AsRef<str>>(
         always_human: impl IntoIterator<Item = S>,
@@ -59,25 +179,44 @@ impl GatePolicy {
         Self {
             always_human: normalized_categories(always_human),
             plan_approval,
+            resolver: ResolverPolicy::default(),
         }
     }
 
-    /// The categories the project adds to the floor, as the gate reads them:
-    /// normalized, in the project's order, each once, with the blank ones and
-    /// those the floor already covers left out. What the runner tells a run,
-    /// so it can file a question under the word the gate matches.
+    /// The same policy with the project's resolver settings.
+    pub fn with_resolver(self, resolver: ResolverPolicy) -> Self {
+        Self { resolver, ..self }
+    }
+
+    /// The project's resolver settings.
+    pub fn resolver(&self) -> ResolverPolicy {
+        self.resolver
+    }
+
+    /// The project's delegation level.
+    pub fn level(&self) -> DelegationLevel {
+        self.resolver.level
+    }
+
+    /// The categories the project adds to its level's always-human set, as
+    /// the gate reads them: normalized, in the project's order, each once,
+    /// with the blank ones and those the level's set already covers left
+    /// out. What the runner tells a run, so it can file a question under the
+    /// word the gate matches: at `all`, a project's `money` is told, since
+    /// the level hands `money` to the resolver and the project keeps it.
     pub fn additions(&self) -> Vec<String> {
         self.always_human
             .iter()
-            .filter(|category| !is_floor_category(category))
+            .filter(|category| !is_human_category(category, self.level()))
             .cloned()
             .collect()
     }
 
-    /// Whether a question of this category always goes to a human: a floor
-    /// category (a blank one included), or one the project added.
+    /// Whether a question of this category always goes to a human at the
+    /// project's level: one of the level's categories (a blank one and the
+    /// floor's at every level), or one the project added.
     pub fn always_human(&self, category: &str) -> bool {
-        if is_floor_category(category) {
+        if is_human_category(category, self.level()) {
             return true;
         }
         let category = normalize(category);
@@ -86,10 +225,11 @@ impl GatePolicy {
             .any(|token| matches_token(&category, token))
     }
 
-    /// Who settles a question of this category: always-human categories go to
-    /// the decider, the rest to the resolver first.
+    /// Who settles a question of this category: always-human categories go
+    /// to the decider, the rest to the resolver first. At `none` every
+    /// question goes to the decider, and no resolver run starts.
     pub fn route(&self, category: &str) -> Route {
-        if self.always_human(category) {
+        if self.level() == DelegationLevel::None || self.always_human(category) {
             Route::Human
         } else {
             Route::Resolver
@@ -97,17 +237,48 @@ impl GatePolicy {
     }
 
     /// Who settles a question the resolver decided, from the category the
-    /// asking run gave it (`raised`) and the resolver's own label for it
-    /// (`labelled`, written without seeing `raised`): the resolver only when
-    /// both route to it and the label is a token ([`is_token`]). An
-    /// always-human category on either side, or a label the matcher could
-    /// misread, sends the question to the decider: the runner draws that
-    /// consequence, whatever the resolver decided.
-    pub fn route_decided(&self, raised: &str, labelled: &str) -> Route {
-        if !is_token(labelled) || self.always_human(raised) || self.always_human(labelled) {
+    /// asking run gave it (`raised`), the resolver's own label for it
+    /// (`labelled`, written without seeing `raised`) and the kind of the
+    /// decision's basis: the resolver only when both route to it, the label
+    /// is a token ([`is_token`]) and the level allows the kind
+    /// ([`DelegationLevel::allows`]); at `ticket`, a question either label
+    /// names `scope` only on a `ticket` basis (OWL-328). Anything else sends
+    /// the question to the decider: the runner draws that consequence,
+    /// whatever the resolver decided. A `ticket` basis's quote is the
+    /// runner's to find in the ticket's text.
+    pub fn route_decided(&self, raised: &str, labelled: &str, kind: BasisKind) -> Route {
+        let level = self.level();
+        let scope = |category: &str| names_floor_category(category, FloorCategory::Scope);
+        if self.route(raised) == Route::Human
+            || !is_token(labelled)
+            || self.always_human(labelled)
+            || !level.allows(kind)
+            || (level == DelegationLevel::Ticket
+                && kind != BasisKind::Ticket
+                && (scope(raised) || scope(labelled)))
+        {
             Route::Human
         } else {
             Route::Resolver
+        }
+    }
+
+    /// Whether the chain ends before its next resolver run, and why: the
+    /// pass limit reached; then, with a ceiling, a cost unreported or one
+    /// that reached it. Whichever comes first ends the chain; without a
+    /// ceiling the cost is not read. The runner asks before each resolver
+    /// run.
+    pub fn chain_end(&self, chain: Chain) -> Option<ChainEnd> {
+        if let PassLimit::Runs(limit) = self.resolver.passes
+            && chain.settled >= limit
+        {
+            return Some(ChainEnd::Passes(limit));
+        }
+        let ceiling = self.resolver.ceiling_micros?;
+        match chain.cost {
+            ChainCost::Unreported => Some(ChainEnd::CostUnreported),
+            ChainCost::Known(spent) if spent >= ceiling => Some(ChainEnd::Budget),
+            ChainCost::Known(_) => None,
         }
     }
 
@@ -265,11 +436,207 @@ mod tests {
         ];
         for (raised, labelled, route) in cases {
             assert_eq!(
-                policy.route_decided(raised, labelled),
+                policy.route_decided(raised, labelled, BasisKind::Settled),
                 route,
                 "{raised:?} labelled {labelled:?}"
             );
         }
+    }
+
+    /// A policy at `level`, the project adding `billing`.
+    fn at(level: DelegationLevel) -> GatePolicy {
+        GatePolicy::new(["billing"], PlanApproval::Never).with_resolver(ResolverPolicy {
+            level,
+            ..ResolverPolicy::default()
+        })
+    }
+
+    /// Each category at each level, as architecture section 4's table sets
+    /// it: the floor, a blank category and the project's additions go to the
+    /// decider at every level, `all` included; `scope` reaches the resolver
+    /// from `ticket`, `data_loss`, `money` and `legal` at `all`; `none`
+    /// sends everything to the decider.
+    #[test]
+    fn each_level_routes_its_categories() {
+        use DelegationLevel as L;
+        use Route::{Human as H, Resolver as R};
+        let categories = [
+            "security",
+            "irreversible",
+            "",
+            "billing",
+            "billing_address",
+            "scope",
+            "scope_change",
+            "data_loss",
+            "money",
+            "legal_wording",
+            "naming",
+        ];
+        let table: [(L, [Route; 11]); 5] = [
+            (L::None, [H, H, H, H, H, H, H, H, H, H, H]),
+            (L::Facts, [H, H, H, H, H, H, H, H, H, H, R]),
+            (L::Discoverable, [H, H, H, H, H, H, H, H, H, H, R]),
+            (L::Ticket, [H, H, H, H, H, R, R, H, H, H, R]),
+            (L::All, [H, H, H, H, H, R, R, R, R, R, R]),
+        ];
+        for (level, routes) in table {
+            let policy = at(level);
+            for (category, route) in categories.into_iter().zip(routes) {
+                assert_eq!(policy.route(category), route, "{category:?} at {level:?}");
+            }
+        }
+    }
+
+    /// The project's additions stay human at every level, so a run is told
+    /// those its level does not already keep: at `all`, a project's `money`
+    /// is told.
+    #[test]
+    fn additions_are_told_when_the_level_does_not_keep_them() {
+        let added = ["money", "scope_change", "security", "brand_voice"];
+        for level in DelegationLevel::ALL {
+            let policy =
+                GatePolicy::new(added, PlanApproval::Never).with_resolver(ResolverPolicy {
+                    level,
+                    ..ResolverPolicy::default()
+                });
+            let expected: &[&str] = match level {
+                DelegationLevel::All => &["money", "scope_change", "brand_voice"],
+                DelegationLevel::Ticket => &["scope_change", "brand_voice"],
+                _ => &["brand_voice"],
+            };
+            assert_eq!(policy.additions(), expected, "{level:?}");
+            for category in added {
+                assert_eq!(
+                    policy.route(category),
+                    Route::Human,
+                    "{category} at {level:?}"
+                );
+            }
+        }
+    }
+
+    /// A decision stands only on a basis the level allows; at `ticket`, a
+    /// question either label names `scope` only on a `ticket` basis; at
+    /// `none` nothing stands.
+    #[test]
+    fn a_decision_needs_a_basis_the_level_allows() {
+        use BasisKind::{Fact, Settled, Ticket};
+        use DelegationLevel as L;
+        let cases = [
+            (L::None, "naming", "naming", Fact, Route::Human),
+            (L::Facts, "naming", "naming", Fact, Route::Resolver),
+            (L::Facts, "naming", "naming", Settled, Route::Human),
+            (L::Facts, "naming", "naming", Ticket, Route::Human),
+            (
+                L::Discoverable,
+                "naming",
+                "naming",
+                Settled,
+                Route::Resolver,
+            ),
+            (L::Discoverable, "naming", "naming", Ticket, Route::Human),
+            (L::Discoverable, "naming", "scope", Ticket, Route::Human),
+            (L::Ticket, "naming", "naming", Ticket, Route::Resolver),
+            (L::Ticket, "naming", "naming", Settled, Route::Resolver),
+            (L::Ticket, "scope", "scope", Ticket, Route::Resolver),
+            (L::Ticket, "scope", "naming", Ticket, Route::Resolver),
+            (L::Ticket, "scope", "naming", Settled, Route::Human),
+            (L::Ticket, "naming", "scope_change", Fact, Route::Human),
+            (L::Ticket, "naming", "money", Ticket, Route::Human),
+            (L::All, "scope", "scope", Settled, Route::Resolver),
+            (L::All, "money", "legal", Fact, Route::Resolver),
+            (L::All, "naming", "security", Ticket, Route::Human),
+            (L::All, "irreversible", "naming", Ticket, Route::Human),
+            (L::All, "naming", "billing", Ticket, Route::Human),
+            (L::All, "naming", "Scope", Ticket, Route::Human),
+        ];
+        for (level, raised, labelled, kind, route) in cases {
+            assert_eq!(
+                at(level).route_decided(raised, labelled, kind),
+                route,
+                "{raised:?} labelled {labelled:?} on {kind:?} at {level:?}"
+            );
+        }
+    }
+
+    /// A chain of `settled` passes costing `cost` (in dollars, `None`
+    /// unreported) under `passes` and `ceiling`.
+    fn ends(
+        passes: PassLimit,
+        ceiling: Option<f64>,
+        settled: u32,
+        costs: &[Option<f64>],
+    ) -> Option<ChainEnd> {
+        let policy = GatePolicy::new(Vec::<String>::new(), PlanApproval::Never).with_resolver(
+            ResolverPolicy {
+                passes,
+                ceiling_micros: ceiling.and_then(usd_micros),
+                ..ResolverPolicy::default()
+            },
+        );
+        let mut chain = Chain::default();
+        for _ in 0..settled {
+            chain.settled_once();
+        }
+        for cost in costs {
+            chain.ran(*cost);
+        }
+        policy.chain_end(chain)
+    }
+
+    /// The pass limit at its default, a set value and unlimited with its
+    /// ceiling; a ceiling beside a number of passes, whichever comes first;
+    /// a run without a cost ends a chain only when a ceiling is set.
+    #[test]
+    fn a_chain_ends_at_its_pass_limit_or_its_ceiling() {
+        use PassLimit::{Runs, Unlimited};
+        let default = PassLimit::default();
+        assert_eq!(default, Runs(5));
+        assert_eq!(ends(default, None, 4, &[]), None);
+        assert_eq!(ends(default, None, 5, &[]), Some(ChainEnd::Passes(5)));
+        assert_eq!(ends(Runs(1), None, 0, &[]), None);
+        assert_eq!(ends(Runs(1), None, 1, &[]), Some(ChainEnd::Passes(1)));
+        // Without a ceiling the cost is not read.
+        assert_eq!(ends(Runs(3), None, 0, &[None]), None);
+        // Unlimited: the ceiling alone, reached at the ceiling.
+        let some = |costs: &[f64]| costs.iter().map(|c| Some(*c)).collect::<Vec<_>>();
+        assert_eq!(
+            ends(Unlimited, Some(1.0), 49, &some(&[0.3, 0.3, 0.3])),
+            None
+        );
+        assert_eq!(
+            ends(Unlimited, Some(1.0), 3, &some(&[0.3, 0.3, 0.4])),
+            Some(ChainEnd::Budget)
+        );
+        assert_eq!(
+            ends(Unlimited, Some(1.0), 3, &some(&[0.3, 0.3, 0.5])),
+            Some(ChainEnd::Budget)
+        );
+        assert_eq!(
+            ends(Unlimited, Some(1.0), 0, &[Some(0.1), None, Some(0.1)]),
+            Some(ChainEnd::CostUnreported)
+        );
+        // A cost that is not a dollar amount is unreported.
+        for broken in [-0.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                ends(Unlimited, Some(1.0), 0, &[Some(broken)]),
+                Some(ChainEnd::CostUnreported),
+                "{broken}"
+            );
+        }
+        // Passes and a ceiling: whichever is reached first.
+        assert_eq!(
+            ends(Runs(2), Some(1.0), 2, &some(&[0.1])),
+            Some(ChainEnd::Passes(2))
+        );
+        assert_eq!(
+            ends(Runs(2), Some(1.0), 1, &some(&[1.5])),
+            Some(ChainEnd::Budget)
+        );
+        assert_eq!(ends(Runs(2), Some(1.0), 1, &some(&[0.5])), None);
+        assert_eq!(usd_micros(0.4), Some(400_000));
+        assert_eq!(usd_micros(-1.0), None);
     }
 
     #[test]

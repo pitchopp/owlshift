@@ -1,5 +1,5 @@
 {
-  "format": 10,
+  "format": 11,
   "status": "done",
   "summary": "The ticket names the file; whether to sign off is the decider's call.",
   "resolutions": [
@@ -8,7 +8,8 @@
       "question": "Q1",
       "category": "naming",
       "decision": "GREETING.md, at the repository root.",
-      "basis": "The ticket's description names GREETING.md."
+      "basis": "The ticket's description names GREETING.md.",
+      "basis_kind": "settled"
     },
     {
       "outcome": "passed_on",
