@@ -14,15 +14,13 @@ keyring-core.workspace = true
 which.workspace = true
 
 # The system keychain takes one credential store per platform:
-# apple-native on macOS, zbus-secret-service on other Unix systems,
-# windows-native on Windows.
+# zbus-secret-service on Unix systems other than macOS, windows-native on
+# Windows. macOS needs none: its Keychain is reached through
+# `/usr/bin/security` (OWL-335).
 [target.'cfg(unix)'.dependencies]
 # `termios`: the terminal's width, for `owlshift doctor`'s report (OWL-99).
 rustix = { workspace = true, features = ["termios"] }
 signal-hook.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus-secret-service-keyring-store.workspace = true
