@@ -222,7 +222,12 @@ impl std::error::Error for CommandError {}
 /// Permission levels map onto Claude Code's own mechanism:
 ///
 /// - read-only: `--permission-mode dontAsk`, which denies every tool that
-///   would ask (Bash, writes), plus one allow rule for the result file;
+///   would ask (Bash, writes), plus one allow rule for the result file,
+///   anchored at the working directory (`Edit(/<result path>)`). A `./`
+///   rule is relative to the shell's current directory, which a Bash `cd`
+///   moves: the result's write was then refused, and the same name below
+///   allowed. Checked live with Claude Code 2.1.300 (OWL-323, recorded under
+///   check C1 in `docs/design/build-plan.md`);
 /// - write in worktree: `--permission-mode acceptEdits`, which confines the
 ///   file tools to the working directory, plus Bash. Bash itself is not
 ///   confined to the directory: the executor's isolation check covers its
@@ -256,7 +261,7 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
     match request.permissions.level {
         PermissionLevel::ReadOnly => {
             command.args(["--permission-mode", "dontAsk", "--allowedTools"]);
-            command.arg(format!("Edit(./{result_path})"));
+            command.arg(format!("Edit(/{result_path})"));
         }
         PermissionLevel::WriteWorktree => {
             command.args(["--permission-mode", "acceptEdits", "--allowedTools", "Bash"]);
@@ -752,7 +757,7 @@ mod tests {
             joined(&request),
             format!(
                 "-p --output-format stream-json --verbose \
-                 --permission-mode dontAsk --allowedTools Edit(./.owlshift/result.json) \
+                 --permission-mode dontAsk --allowedTools Edit(/.owlshift/result.json) \
                  --permission-prompts none --disallowedTools {} \
                  {} {} --no-session-persistence",
                 denied(),

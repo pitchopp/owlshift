@@ -39,7 +39,7 @@ Every question you decide carries your own `category` for it, read from its `tex
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 10, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 10, rejected if it carries any field not listed here:
 
 - `status`: `done` once every question of `resolve` has its resolution; `failed` when you cannot give them. No other status is yours: anything else fails the run, and every question then goes to the decider.
 - `summary`: one or two sentences on what you settled and what you passed on.

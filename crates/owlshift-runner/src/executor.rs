@@ -15,7 +15,9 @@
 //!   before the runner's git runs anywhere;
 //! - a run is [`Outcome::Finished`] only when the harness reports it
 //!   completed *and* the role left a valid `result.json`: an exit status is
-//!   never taken as proof;
+//!   never taken as proof. A read-only run that left none may have given it
+//!   as its last message, which the executor then writes there first
+//!   (architecture section 6, "Harness contract", OWL-323);
 //! - a usage limit is an interruption to resume, not a failure;
 //! - everything else is a [`Failure`] with its reason.
 //!
@@ -56,6 +58,7 @@ mod git;
 pub mod harness;
 mod home;
 pub mod isolation;
+mod message;
 mod watch;
 mod worktree;
 
@@ -222,7 +225,8 @@ pub struct RunReport {
     pub gate: Option<GateReport>,
     /// What the run's harness home left to say: a changed login that was
     /// not written back, or a result that could not be written from the
-    /// last message.
+    /// last message; and a read-only run's result read from its last
+    /// message, or not written from it (OWL-323).
     pub warnings: Vec<String>,
 }
 
@@ -605,6 +609,32 @@ impl Executor {
                 format!("it could not be written from the run's last message: {error}")
             });
         }
+        // A read-only run its harness reports completed, which left nothing
+        // at the result's place, has its result read from its last message
+        // (OWL-323): written there through no link, then judged as any
+        // result. A failed write leaves whatever it left to that judgment.
+        if !needs.result_in_message
+            && run_files.is_none()
+            && !timed_out
+            && brief.permissions.level == PermissionLevel::ReadOnly
+            && let Ok(end) = &driven
+            && end.status == HarnessStatus::Completed
+            && let Some(text) = end
+                .message
+                .as_deref()
+                .and_then(message::last_message_result)
+            && left_nothing(&result_file)
+        {
+            warnings.push(
+                match worktree::write_run_file(spec.worktree, RESULT_PATH, text.as_bytes()) {
+                    Ok(_) => from_message_warning(&end.permission_denials),
+                    Err(error) => format!(
+                        "the role left no {RESULT_PATH}, and the result of its last message \
+                         could not be written there: {error}"
+                    ),
+                },
+            );
+        }
         if let Some((_, _, seeded)) = &seeded {
             warnings.extend(home::write_back(seeded, |original, updated| {
                 harness.login_kept(original, updated)
@@ -712,6 +742,24 @@ fn read_only_clear(writable: &[PathBuf], run: &RunPaths) -> Result<(), ExecutorE
         }
     }
     Ok(())
+}
+
+/// Whether nothing is at `file`, not even a link: as `read_result` finds no
+/// result through `read_confined`, which a link there would make refused
+/// rather than missing.
+fn left_nothing(file: &Path) -> bool {
+    matches!(fs::symlink_metadata(file), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+/// The warning of a result read from the run's last message, naming the
+/// tools the harness refused, if any (OWL-323).
+fn from_message_warning(refused: &[String]) -> String {
+    let mut warning =
+        format!("the role left no {RESULT_PATH}: its result was read from its last message");
+    if !refused.is_empty() {
+        warning.push_str(&format!(" (the harness refused: {})", refused.join(", ")));
+    }
+    warning
 }
 
 /// The certificate bundle a harness command gets as `SSL_CERT_FILE`: on
