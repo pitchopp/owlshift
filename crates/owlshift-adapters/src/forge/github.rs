@@ -991,17 +991,20 @@ fn refs_hint(mut error: Error) -> Error {
 }
 
 /// The refusal in `response` that is neither a rejected token nor a spent
-/// budget: HTTP 403 without the rate-limit headers, or a GraphQL error of
-/// type `FORBIDDEN` among no `RATE_LIMITED` one. GitHub answered such an
-/// error, "Resource not accessible by personal access token", to a token
-/// without contents (read) on 2026-10-17 (OWL-334).
+/// budget: HTTP 403 without the rate-limit headers or a message naming a
+/// rate limit (a secondary limit may set neither header), or a GraphQL
+/// error of type `FORBIDDEN` among no `RATE_LIMITED` one. GitHub answered
+/// such an error, "Resource not accessible by personal access token", to a
+/// token without contents (read) on 2026-10-17 (OWL-334).
 fn forbidden(response: &Response) -> Option<String> {
     let envelope = serde_json::from_str::<Envelope>(&response.body).ok();
     let rate = response.rate;
-    let limited = rate.remaining == Some(0) || rate.retry_after.is_some();
-    if response.status == 403 && !limited {
+    if response.status == 403 {
         let message = envelope.and_then(|e| e.message).unwrap_or_default();
-        return Some(format!("GitHub answered HTTP 403 {message}"));
+        let limited = rate.remaining == Some(0)
+            || rate.retry_after.is_some()
+            || message.to_ascii_lowercase().contains("rate limit");
+        return (!limited).then(|| format!("GitHub answered HTTP 403 {message}"));
     }
     let errors = envelope?.errors;
     if response.status != 200
@@ -2007,6 +2010,16 @@ mod tests {
             },
         };
         assert_eq!(kind(default_branch(Ok(spent))), ErrorKind::RateLimited);
+        // A secondary limit may answer 403 with neither header: its words
+        // keep it from passing for a refused permission.
+        let secondary = default_branch(Ok(answer(
+            403,
+            r#"{"message":"You have exceeded a secondary rate limit. Please wait."}"#,
+        )));
+        assert!(
+            matches!(&secondary, Err(e) if e.message.contains("secondary rate limit")),
+            "{secondary:?}"
+        );
         let both = r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"slow down"},{"type":"FORBIDDEN","message":"no"}]}"#;
         assert_eq!(kind(ok(both)), ErrorKind::RateLimited);
         // A ref without its commit is not read whole.
