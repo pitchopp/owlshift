@@ -8,7 +8,8 @@
       "category": "docs",
       "outcome": "decided",
       "decision": "Yes, in the README's list of files.",
-      "basis": "README.md lists every file at the root."
+      "basis": "README.md lists every file at the root.",
+      "basis_kind": "fact"
     }
   ]
 }

@@ -8,7 +8,8 @@
       "category": "naming",
       "outcome": "decided",
       "decision": "GREETING.md, at the root.",
-      "basis": "The ticket's description names it."
+      "basis": "The ticket's description names it.",
+      "basis_kind": "settled"
     }
   ]
 }

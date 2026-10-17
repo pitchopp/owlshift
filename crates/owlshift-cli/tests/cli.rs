@@ -86,7 +86,7 @@ fn version_lists_the_format_versions() {
         concat!(
             "owlshift ",
             env!("CARGO_PKG_VERSION"),
-            "\nformats: brief 16, result 10, event 2, claim 1, ticket state 4, ticket questions 12, \
+            "\nformats: brief 17, result 11, event 2, claim 1, ticket state 4, ticket questions 12, \
              comment footer 1\n"
         )
     );
@@ -158,15 +158,15 @@ always_human = ["Billing!", "Data Loss", "", "billing"]
     let output = owlshift(repo.path(), config_dir.path(), &["config", "show"]);
     let shown = stdout(&output);
     assert!(output.status.success(), "{shown}");
-    for token in [
-        "security",
-        "data_loss",
-        "money",
-        "legal",
-        "irreversible",
-        "scope",
-    ] {
+    // The floor, then what the default delegation level keeps (OWL-328).
+    for token in ["security", "irreversible"] {
         assert!(shown.contains(&format!("  {token}  (floor)\n")), "{shown}");
+    }
+    for token in ["data_loss", "money", "legal", "scope"] {
+        assert!(
+            shown.contains(&format!("  {token}  (delegation level discoverable)\n")),
+            "{shown}"
+        );
     }
     // The tempdir may be reached through a symlink (`/private` on macOS), so
     // the origin is checked by its file name, not its full path.
@@ -176,11 +176,11 @@ always_human = ["Billing!", "Data Loss", "", "billing"]
         .unwrap_or_else(|| panic!("{shown}"));
     assert!(billing.ends_with("owlshift.toml)"), "{shown}");
     // Normalized as the gate reads it, listed once, blank dropped; an
-    // addition the floor already covers says so.
+    // addition the delegation level already covers says so.
     assert_eq!(shown.matches("\n  billing  (").count(), 1, "{shown}");
     assert!(
         shown.contains("  data_loss  (")
-            && shown.contains("owlshift.toml)  already covered by the floor\n"),
+            && shown.contains("owlshift.toml)  already covered by the delegation level\n"),
         "{shown}"
     );
     assert!(!shown.contains("\n    ("), "{shown}");

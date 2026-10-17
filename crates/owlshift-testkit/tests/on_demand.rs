@@ -36,10 +36,10 @@ use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, TicketId};
 use owlshift_contracts::refs::{AskDecider, PersistedState, Waiting};
 use owlshift_contracts::result::RefusedChoice;
-use owlshift_contracts::{Role, Stage};
+use owlshift_contracts::{DelegationLevel, Role, Stage};
 use owlshift_core::decider::DeciderRule;
 use owlshift_core::routing::RunRouting;
-use owlshift_core::state::{MAX_RESOLVED_PASSES, ParkReason, Status, TicketState};
+use owlshift_core::state::{ParkReason, Status, TicketState};
 use owlshift_core::vocab::{Effort, Tier};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{Data, EventLog, EventSink};
@@ -797,6 +797,18 @@ impl Bench {
 
     /// Runs `owlshift do DEMO-1` with one reply per run; returns its outcome
     /// and what it printed.
+    /// Adds `lines` to the `[policy]` of the person's project file, which
+    /// `owlshift do` reads the policy from (OWL-331).
+    fn policy(&self, lines: &str) {
+        let path = self.remote.checkout.join("owlshift.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            text.replacen("always_human = []", &format!("always_human = []\n{lines}"), 1),
+        )
+        .unwrap();
+    }
+
     fn run(&self, replies: Vec<Reply>, first: Option<Agent>) -> (Result<Delivered, Stop>, String) {
         self.invoke(false, replies, first, Vec::new())
     }
@@ -1483,7 +1495,7 @@ fn a_reopened_choice_goes_to_the_decider() {
     );
     let decided_q3 = r#"{"format":11,"status":"done","summary":"The ticket names the heading.",
 "resolutions":[{"question":"Q3","outcome":"decided","category":"naming","decision":"Hello.",
-"basis":"The ticket's description."}]}"#;
+"basis":"The ticket's description.","basis_kind":"settled"}]}"#;
     let (stopped, printed) = bench.run(
         vec![
             bench.reply(None, Some(&decided)),
@@ -4237,7 +4249,7 @@ fn asking_refused(result: &str, choices: u32) -> String {
 /// The resolver decides Q1.
 const DECIDED_Q1: &str = r#"{"format":11,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
-"basis":"The ticket's description."}]}"#;
+"basis":"The ticket's description.","basis_kind":"settled"}]}"#;
 
 /// The events of a kind whose data holds `key`.
 fn data_of(events: &[Event], kind: EventKind, key: &str) -> Vec<Value> {
@@ -4473,7 +4485,7 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
 /// result is refused.
 const RESOLVED_Q2: &str = r#"{"format":11,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q2","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
-"basis":"The ticket's description."}]}"#;
+"basis":"The ticket's description.","basis_kind":"settled"}]}"#;
 
 /// OWL-191: a refused resolver result is kept in the ticket ref before its
 /// fallback round is posted, so when the tracker refuses that round, the
@@ -4638,7 +4650,7 @@ fn the_added_always_human_categories_reach_build_and_the_resolver() {
     let resolved = r#"{"format":11,"status":"done","summary":"The file is named.",
 "resolutions":[
   {"question":"Q1","outcome":"decided","category":"naming",
-   "decision":"GREETING.md, at the root.","basis":"The ticket's description."}]}"#;
+   "decision":"GREETING.md, at the root.","basis":"The ticket's description.","basis_kind":"settled"}]}"#;
     let bench = Bench::new(true);
     let config_path = bench.remote.checkout.join("owlshift.toml");
     let original = fs::read_to_string(&config_path).unwrap();
@@ -4696,9 +4708,9 @@ fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
     let resolved = r#"{"format":11,"status":"done","summary":"The file is named; the rest is not mine.",
 "resolutions":[
   {"question":"Q1","outcome":"decided","category":"naming",
-   "decision":"GREETING.md, at the root.","basis":"The ticket's description."},
+   "decision":"GREETING.md, at the root.","basis":"The ticket's description.","basis_kind":"settled"},
   {"question":"Q2","outcome":"decided","category":"data_loss",
-   "decision":"Yes, delete it.","basis":"Nothing reads it."},
+   "decision":"Yes, delete it.","basis":"Nothing reads it.","basis_kind":"fact"},
   {"question":"Q3","outcome":"passed_on","reason":"A matter of tone."}]}"#;
     let bench = Bench::new(true);
     let (outcome, printed) = bench.run(
@@ -4755,14 +4767,25 @@ fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
     assert_eq!(opened[0]["raised_as"], json!(["Q2", "Q3"]));
 }
 
+/// The pass limit these benches set (`policy.resolver_passes`, OWL-328):
+/// the arithmetic of each is written for 3, the limit before OWL-328.
+const PASSES: u32 = 3;
+
+/// A bench whose project sets the pass limit to [`PASSES`].
+fn bench_at_passes() -> Bench {
+    let bench = Bench::new(true);
+    bench.policy(&format!("resolver_passes = {PASSES}"));
+    bench
+}
+
 /// A Build that keeps asking what the resolver settles runs at most
-/// `MAX_RESOLVED_PASSES` times in a row on decisions alone; the next run's
-/// questions all go to the decider, and the round says why.
+/// the project's pass limit times in a row on decisions alone; the next
+/// run's questions all go to the decider, and the round says why.
 #[test]
 fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
-    let bench = Bench::new(true);
+    let bench = bench_at_passes();
     let mut replies = Vec::new();
-    for _ in 0..MAX_RESOLVED_PASSES {
+    for _ in 0..PASSES {
         replies.push(bench.reply(None, Some(NAMING)));
         replies.push(bench.reply(None, Some(DECIDED_Q1)));
     }
@@ -4771,7 +4794,7 @@ fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
     let stop = outcome.expect_err("a round");
     assert_eq!(asked_texts(&stop), ["Which file should hold the greeting?"]);
     let comments = bench.comments();
-    let rounds = comments.len() - usize::try_from(MAX_RESOLVED_PASSES).unwrap();
+    let rounds = comments.len() - usize::try_from(PASSES).unwrap();
     assert_eq!(rounds, 1, "{comments:?}");
     assert!(
         comments
@@ -4782,6 +4805,175 @@ fn the_resolver_settles_a_bounded_number_of_runs_in_a_row() {
     );
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
     assert_eq!(resolved.last().unwrap()["resolver"], "pass_limit");
+    assert!(resolved.last().unwrap().get("reason").is_none());
+}
+
+/// A Build run's one `scope` question, which the ticket's own text answers
+/// ("Add GREETING.md saying Hello.").
+const SCOPE: &str = r#"{"format":11,"status":"questions",
+"summary":"Whether the greeting is a file of its own is not said in so many words.",
+"questions":[
+  {"id":"Q1","category":"scope","context":"The repository has no greeting yet.",
+   "text":"Does the ticket ask for a GREETING.md file of its own?","recommendation":{"why":"The ticket names the file."}}]}"#;
+
+/// The resolver decides [`SCOPE`]'s question on a `ticket` basis, quoting
+/// `quote`.
+fn decided_scope(quote: &str) -> String {
+    format!(
+        r#"{{"format":11,"status":"done","summary":"The ticket names the file.",
+"resolutions":[{{"question":"Q1","outcome":"decided","category":"scope",
+"decision":"Yes: GREETING.md, at the root.","basis":"The ticket's description.",
+"basis_kind":"ticket","quote":{quote:?}}}]}}"#
+    )
+}
+
+/// OWL-328's bench: at `ticket`, a `scope` question the ticket's text
+/// answers is decided on a quoted `ticket` basis, the DECISION and the
+/// delivery report naming the level; at `discoverable`, the default, the
+/// same ticket's question goes to the decider, no resolver running; at
+/// `ticket` again, a quote the ticket does not hold is refused, its question
+/// going to the decider.
+#[test]
+fn a_quoted_scope_question_is_decided_at_ticket_and_asked_at_discoverable() {
+    let bench = Bench::new(true);
+    bench.policy("resolver_delegation = \"ticket\"");
+    let (delivered, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(SCOPE)),
+            bench.reply(None, Some(&decided_scope("Add  GREETING.md   saying Hello."))),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        None,
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = bench.briefs();
+    let roles: Vec<Role> = briefs.iter().map(|b| b.role).collect();
+    // Verify, which reviews clean on this bench, follows.
+    assert_eq!(
+        roles[..3],
+        [Role::Build, Role::Resolver, Role::Build],
+        "{printed}"
+    );
+    assert_eq!(briefs[1].delegation, Some(DelegationLevel::Ticket));
+    assert_eq!(briefs[0].delegation, None);
+    let comments = bench.comments();
+    assert!(
+        comments[0].starts_with("[owlshift] DECISION\n")
+            && comments[0].contains("delegation level, `ticket`"),
+        "{}",
+        comments[0]
+    );
+    let report = comments.last().unwrap();
+    assert!(
+        report.starts_with("[owlshift] DELIVERY")
+            && report.contains("allowed by this project's delegation level, `ticket`"),
+        "{report}"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["resolver"], "done");
+    assert_eq!(resolved[0]["level"], "ticket");
+    assert_eq!(resolved[0]["decided"], json!(["Q1"]));
+
+    let bench = Bench::new(true);
+    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(SCOPE))], None);
+    let stop = outcome.expect_err("a round");
+    assert_eq!(
+        asked_texts(&stop),
+        ["Does the ticket ask for a GREETING.md file of its own?"],
+        "{printed}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build], "no resolver runs: {printed}");
+    assert!(data_of(&bench.events(), EventKind::Gate, "resolver").is_empty());
+
+    let bench = Bench::new(true);
+    bench.policy("resolver_delegation = \"ticket\"");
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(SCOPE)),
+            bench.reply(None, Some(&decided_scope("Add GREETING.md and a README."))),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop).len(), 1, "{printed}");
+    assert!(!bench.comments().iter().any(|c| c.contains("[owlshift] DECISION")));
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["refused"], json!(["Q1"]));
+    assert_eq!(resolved[0]["to_decider"], json!(["Q1"]));
+}
+
+/// OWL-328's ceiling, through the runner: with `"unlimited"` passes and a
+/// $1 ceiling, the asking runs' and the resolver runs' costs add up, and
+/// once they reach the ceiling the next run's questions go to the decider,
+/// the round and the `gate` event saying why; a run that reports no cost
+/// ends the chain at the next check.
+#[test]
+fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
+    let costing = |bench: &Bench, result: &str, micros: Option<u64>| {
+        let mut reply = bench.reply(None, Some(result));
+        reply.cost_micros = micros;
+        reply
+    };
+    let unlimited = "resolver_passes = \"unlimited\"\nresolver_budget_usd = 1.0";
+    let cost = Some(300_000);
+
+    // 0.3, then 0.6 after the first resolver run, then 0.9: the second
+    // resolver runs; 1.5 once the third Build asked is past the ceiling.
+    let bench = Bench::new(true);
+    bench.policy(unlimited);
+    let (outcome, printed) = bench.run(
+        vec![
+            costing(&bench, NAMING, cost),
+            costing(&bench, DECIDED_Q1, cost),
+            costing(&bench, NAMING, cost),
+            costing(&bench, DECIDED_Q1, cost),
+            costing(&bench, NAMING, cost),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop), ["Which file should hold the greeting?"]);
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(
+        roles,
+        [
+            Role::Build,
+            Role::Resolver,
+            Role::Build,
+            Role::Resolver,
+            Role::Build
+        ],
+        "{printed}"
+    );
+    let round = bench.comments().pop().unwrap();
+    assert!(round.contains("dollar ceiling"), "{round}");
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    let last = resolved.last().unwrap();
+    assert_eq!(last["resolver"], "pass_limit");
+    assert_eq!(last["reason"], "budget");
+    assert_eq!(last["level"], "discoverable");
+
+    // A resolver run without a cost: the next check cannot read the
+    // chain's, which ends it.
+    let bench = Bench::new(true);
+    bench.policy(unlimited);
+    let (outcome, printed) = bench.run(
+        vec![
+            costing(&bench, NAMING, cost),
+            costing(&bench, DECIDED_Q1, None),
+            costing(&bench, NAMING, cost),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop).len(), 1, "{printed}");
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::Resolver, Role::Build], "{printed}");
+    let round = bench.comments().pop().unwrap();
+    assert!(round.contains("reported no cost"), "{round}");
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved.last().unwrap()["reason"], "cost_unreported");
 }
 
 /// The role of each run of a bench and whether its brief was told of a
@@ -4798,10 +4990,10 @@ fn runs_of(bench: &Bench) -> Vec<(Role, bool)> {
 /// (the next run is told why), and the told run can ask a question the
 /// resolver settles, after which a new refusal is let off again, so refusals
 /// and resolver passes alternate. `settled` is never reset in a command, so
-/// the alternation ends after `MAX_RESOLVED_PASSES` settled passes, with a
+/// the alternation ends after [`PASSES`] settled passes, with a
 /// round for the decider.
 ///
-/// With N = `MAX_RESOLVED_PASSES` = 3, the runs of the command are:
+/// With N = [`PASSES`] = 3, the runs of the command are:
 ///
 /// - N + 1 = 4 refused results, each let off: one before each of the N
 ///   settled passes and one before the run whose question hits the limit;
@@ -4813,16 +5005,16 @@ fn runs_of(bench: &Bench) -> Vec<(Role, bool)> {
 /// refusal let off after the limit, makes the command run on.
 #[test]
 fn refused_results_and_resolver_passes_alternate_up_to_the_ceiling() {
-    assert_eq!(MAX_RESOLVED_PASSES, 3, "the arithmetic above assumes 3");
-    let bench = Bench::new(true);
+    assert_eq!(PASSES, 3, "the arithmetic above assumes 3");
+    let bench = bench_at_passes();
     let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
     let mut replies = Vec::new();
     let mut expected = Vec::new();
-    for pass in 0..=MAX_RESOLVED_PASSES {
+    for pass in 0..=PASSES {
         replies.push(bench.reply(None, Some(&misnumbered)));
         replies.push(bench.reply(None, Some(NAMING)));
         expected.extend([(Role::Build, false), (Role::Build, true)]);
-        if pass < MAX_RESOLVED_PASSES {
+        if pass < PASSES {
             replies.push(bench.reply(None, Some(DECIDED_Q1)));
             expected.push((Role::Resolver, false));
         }
@@ -4864,13 +5056,13 @@ fn refused_results_and_resolver_passes_alternate_up_to_the_ceiling() {
 /// 1 + 9 + 2 + 2 = 14 runs, the last answered by a round about the comment.
 #[test]
 fn refusals_resolver_passes_and_a_late_comment_stop_at_the_ceiling() {
-    assert_eq!(MAX_RESOLVED_PASSES, 3, "the arithmetic above assumes 3");
-    let bench = Bench::new(true);
+    assert_eq!(PASSES, 3, "the arithmetic above assumes 3");
+    let bench = bench_at_passes();
     let check = answered_round(&bench);
     let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
     let mut replies = vec![check];
     let mut expected = vec![(Role::AnswerCheck, false)];
-    for _ in 0..MAX_RESOLVED_PASSES {
+    for _ in 0..PASSES {
         replies.push(bench.reply(None, Some(&misnumbered)));
         replies.push(bench.reply(None, Some(NAMING)));
         replies.push(bench.reply(None, Some(DECIDED_Q1)));

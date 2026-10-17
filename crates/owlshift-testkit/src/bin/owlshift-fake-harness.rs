@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 use owlshift_contracts::brief::Brief;
 use owlshift_contracts::ids::RelativePath;
-use owlshift_testkit::reply::{OWN_FAILURE, Reply, usage_limit_line};
+use owlshift_testkit::reply::{OWN_FAILURE, Reply, cost_line, usage_limit_line};
 
 /// Plays one scripted run in the current directory, the worktree.
 #[derive(Parser)]
@@ -84,6 +84,9 @@ fn play(args: &Args) -> Result<i32, String> {
     }
     if let Some(reset) = reply.usage_limit {
         eprintln!("{}", usage_limit_line(reset));
+    }
+    if let Some(micros) = reply.cost_micros {
+        eprintln!("{}", cost_line(micros));
     }
     Ok(reply.exit_code())
 }

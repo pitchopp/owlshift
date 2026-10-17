@@ -221,6 +221,7 @@ fn run_live(
         },
         gate: Vec::new(),
         always_human: Vec::new(),
+        delegation: None,
         gate_failure: None,
         result_refusal: None,
         decisions_refused: false,

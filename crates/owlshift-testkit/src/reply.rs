@@ -5,7 +5,8 @@
 //! commits them (`commit`, dated `date`); writes files in the main checkout
 //! (`main_checkout`); copies a prepared `result.json`, valid or not, to the
 //! brief's result path (`result`); prints `stdout` and `stderr`, then the
-//! usage-limit line if `usage_limit` is set; and exits with `exit_code`, 0
+//! usage-limit line if `usage_limit` is set and the cost line if `cost_micros`
+//! is (OWL-337); and exits with `exit_code`, 0
 //! by default or 1 with a usage limit. `switch_branch` and `main_checkout`
 //! break isolation on purpose.
 
@@ -57,6 +58,11 @@ pub struct Reply {
     /// A usage limit reached, with its reset time: no result is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_limit: Option<Timestamp>,
+    /// The cost the run reports, in millionths of a dollar (OWL-337): the
+    /// fake harness prints it on standard error, and [`crate::harness::FakeHarness`]
+    /// reports it as the run's usage, as Claude Code reports its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +119,24 @@ impl Reply {
         self.exit_code
             .unwrap_or(if self.usage_limit.is_some() { 1 } else { 0 })
     }
+}
+
+/// The start of the line that reports a run's cost, on standard error, in
+/// millionths of a dollar (OWL-337).
+pub const COST_PREFIX: &str = "owlshift-fake-harness: cost in millionths of a dollar ";
+
+/// The line the fake harness prints on standard error for a run's cost.
+pub fn cost_line(micros: u64) -> String {
+    format!("{COST_PREFIX}{micros}")
+}
+
+/// The cost a run reported, in dollars, if it reported one.
+pub fn cost_usd(stderr: &str) -> Option<f64> {
+    stderr.lines().find_map(|line| {
+        let micros: u64 = line.strip_prefix(COST_PREFIX)?.trim().parse().ok()?;
+        // Exact for any cost a test writes.
+        Some(micros as f64 / 1_000_000.0)
+    })
 }
 
 /// The line the fake harness prints on standard error at a usage limit.
