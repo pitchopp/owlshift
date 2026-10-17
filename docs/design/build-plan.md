@@ -1331,8 +1331,8 @@ Designed on 2026-10-15 (OWL-296). The rules are [architecture](architecture.md) 
     `gate_once` tries a gate without a Build run: version, lock, marker and confinement as a Build's
     preparation, then the dedicated checkout synced and a fresh worktree on `owlshift-gate/check`.
     The commit is origin's default branch, or `--at` (a full id or `origin/<branch>`, read as a run's base).
-    The gate comes from the project file at that commit, or the operator's when it has none.
-    `gate_env` and `allow_gate_env` come from the loaded configuration, as for `do`.
+    The gate comes from the project file at that commit, or the operator's when it has none, as OWL-331 reads a Build's.
+    `gate_env` and `allow_gate_env` come from the loaded configuration; names that differ are noted, as a Build warns.
     `Executor::run_gate` shares `project_gate` with a Build's gate: same `RunPaths`, temporary folder,
     credential check, snapshot and guard. A breach writes the `unverified` marker and keeps the worktree.
     Otherwise the worktree is removed from the file system, then pruned, and its branch is deleted.

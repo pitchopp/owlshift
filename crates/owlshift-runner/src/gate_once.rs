@@ -24,6 +24,8 @@ use jiff::Timestamp;
 
 use crate::executor::gate::GATE_LOG;
 use crate::executor::{Executor, GateRun, GateSpec};
+use owlshift_contracts::config::ProjectConfig;
+
 use crate::project::{self, Base, ProjectDirs};
 
 /// The branch of `owlshift gate`'s worktree: no ticket's branch
@@ -43,9 +45,10 @@ pub struct GateOnce<'a> {
     pub dirs: &'a ProjectDirs,
     /// The URL of `origin`, which the dedicated checkout clones.
     pub remote_url: &'a str,
-    /// The `stack.gate` of the operator's project file, run when the commit
-    /// has no project file.
-    pub local_gate: &'a [String],
+    /// The operator's project file, the one the command loaded: its gate
+    /// runs when the commit has no project file, and its `stack.gate_env`
+    /// made the agent environment, as for a Build (OWL-331).
+    pub local: &'a ProjectConfig,
     /// The commit to check, a full id or a remote-tracking name such as
     /// `origin/fix-gate`; origin's default branch when `None`.
     pub at: Option<&'a str>,
@@ -71,6 +74,10 @@ pub struct Plan {
     pub commands: Vec<String>,
     /// The gate log.
     pub log: PathBuf,
+    /// The names the commit's `stack.gate_env` declares, when they differ
+    /// from those the agent environment passes, the operator's: a Build
+    /// warns of it too (`gate_env_differs`).
+    pub gate_env_differs: Option<Vec<String>>,
 }
 
 impl fmt::Display for Plan {
@@ -87,6 +94,14 @@ impl fmt::Display for Plan {
         )?;
         for command in &self.commands {
             writeln!(f, "  {command}")?;
+        }
+        if let Some(declared) = &self.gate_env_differs {
+            writeln!(
+                f,
+                "Note: the commit's stack.gate_env declares [{}]; the gate gets the variables \
+                 your owlshift.toml declares, as a Build's does.",
+                declared.join(", ")
+            )?;
         }
         writeln!(f, "Its whole output goes to {}.", self.log.display())
     }
@@ -214,11 +229,20 @@ impl GateOnce<'_> {
             branch: base.branch,
             commit: commit.clone(),
         };
-        let (commands, source) =
-            match project::gate_at(git, &checkout, &at_commit).map_err(Stop::Refused)? {
-                Some(gate) => (gate, Source::Commit),
-                None => (self.local_gate.to_vec(), Source::Local),
-            };
+        // As a Build takes its gate (OWL-331): the commit's project file
+        // wins, the operator's only when the commit has none.
+        let found = project::project_file_at(git, &checkout, &at_commit).map_err(Stop::Refused)?;
+        let (config, source) = match &found {
+            Some(config) => (config, Source::Commit),
+            None => (self.local, Source::Local),
+        };
+        let mut declared = config.stack.gate_env_names();
+        let mut passed = self.local.stack.gate_env_names();
+        declared.sort_unstable();
+        passed.sort_unstable();
+        let gate_env_differs =
+            (declared != passed).then(|| declared.iter().map(|n| (*n).to_owned()).collect());
+        let commands = config.stack.gate.clone();
         let run_dir = run_dir(dirs);
         let plan = Plan {
             commit,
@@ -226,6 +250,7 @@ impl GateOnce<'_> {
             source,
             commands,
             log: run_dir.join(GATE_LOG),
+            gate_env_differs,
         };
         let checked = |run, marker, warnings| Checked {
             plan: plan.clone(),
@@ -388,6 +413,15 @@ mod tests {
         )
     }
 
+    /// The operator's project file, its gate `commands`.
+    fn local_config(commands: &[&str]) -> ProjectConfig {
+        let items: Vec<String> = commands
+            .iter()
+            .map(|command| toml::Value::String((*command).to_owned()).to_string())
+            .collect();
+        ProjectConfig::parse(&project_file(&items.join(", "))).unwrap()
+    }
+
     /// An origin with a work clone that pushes to it, hermetic git, a home
     /// of its own and a data directory: what `owlshift gate` works with.
     struct Bench {
@@ -485,13 +519,13 @@ mod tests {
             local: &[&str],
             at: Option<&str>,
         ) -> Result<Checked, Stop> {
-            let local: Vec<String> = local.iter().map(|c| (*c).to_owned()).collect();
+            let local = local_config(local);
             let origin = self.origin.to_string_lossy().into_owned();
             GateOnce {
                 executor,
                 dirs: &self.dirs,
                 remote_url: &origin,
-                local_gate: &local,
+                local: &local,
                 at,
             }
             .run(&mut |_| {})
@@ -519,6 +553,10 @@ mod tests {
         let main = bench.push("main", Some(&project_file("\"echo one\", \"exit 3\"")));
         let fixed = bench.push("fixed", Some(&project_file("\"echo fixed\"")));
         bench.push("bare", None);
+        // A gate that writes an ignored file and an untracked one.
+        std::fs::write(bench.work.join(".gitignore"), "kept.log\n").unwrap();
+        let writes = "\"echo x > kept.log\", \"echo x > stray.txt\"";
+        bench.push("writes", Some(&project_file(writes)));
         let executor = bench.executor(bench.agent().without_confinement());
 
         let empty = bench.gate(&executor, &[], Some("origin/bare")).unwrap();
@@ -532,7 +570,7 @@ mod tests {
             executor: &executor,
             dirs: &bench.dirs,
             remote_url: &origin,
-            local_gate: &["echo local".to_owned()],
+            local: &local_config(&["echo local"]),
             at: None,
         }
         .run(&mut |plan| told = Some(plan.clone()))
@@ -570,6 +608,14 @@ mod tests {
             .unwrap();
         assert!(local.passed(), "{}", render(&local));
         assert_eq!(local.plan.source, Source::Local);
+        assert!(!bench.left_over());
+
+        // As a Build's gate: an untracked file the gate leaves fails it, an
+        // ignored one does not.
+        let wrote = bench.gate(&executor, &[], Some("origin/writes")).unwrap();
+        let failure = wrote.run.as_ref().unwrap().report.failure.clone().unwrap();
+        assert_eq!(failure.command, None);
+        assert_eq!(failure.reason, "the gate changed files: stray.txt");
         assert!(!bench.left_over());
 
         let unknown = bench
@@ -707,7 +753,7 @@ mod tests {
             executor: &executor,
             dirs: &dirs,
             remote_url: "https://github.com/acme/app.git",
-            local_gate: &["echo hi".to_owned()],
+            local: &local_config(&["echo hi"]),
             at: None,
         }
         .run(&mut |_| panic!("nothing runs"))

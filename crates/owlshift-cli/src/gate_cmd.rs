@@ -44,7 +44,7 @@ fn run_checked(
         executor: &executor,
         dirs: &dirs,
         remote_url: &remote_url,
-        local_gate: &project.stack.gate,
+        local: project,
         at,
     };
     let mut starting = |plan: &_| {
