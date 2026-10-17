@@ -19,7 +19,7 @@ Owlshift is an open-source runner that works a team's existing backlog continuou
 
 Early development. Steps P0 and P1 of the roadmap are built: the CLI runs one ticket to a verified pull request in the foreground. P2, questions on the ticket, is in progress: a run's questions are posted on the ticket, and `owlshift continue` picks the ticket up once they are answered. P3 has started with `owlshift watch`, which does that by itself. The commands available today:
 
-- `owlshift doctor`: check whether this machine is ready (git, the harness CLIs and their logins, the agent runs' isolation and Claude Code token, the configuration files), and say why each problem matters and how to fix it.
+- `owlshift doctor`: check whether this machine is ready (git, the harness CLIs and their logins, the agent runs' isolation and Claude Code token, the configuration files, whether the GitHub token can read the repository's branches), and say why each problem matters and how to fix it.
 - `owlshift config show`: print the effective configuration and the file each value comes from.
 - `owlshift init`: write a commented `owlshift.toml` for this repository, then store its tracker and forge secrets (under keychain accounts named by its GitHub repository) and the agent runs' Claude Code token that `owlshift do` needs in the system keychain.
 - `owlshift do TICKET`: run one ticket to a verified pull request, in the foreground; questions the run needs answered are posted on the ticket.
