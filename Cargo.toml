@@ -16,7 +16,6 @@ owlshift-contracts = { path = "crates/owlshift-contracts" }
 owlshift-adapters = { path = "crates/owlshift-adapters" }
 owlshift-platform = { path = "crates/owlshift-platform" }
 owlshift-runner = { path = "crates/owlshift-runner" }
-apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 clap = { version = "4.6", features = ["derive", "string"] }
 dirs = "7.0"
 jiff = { version = "0.2", features = ["serde"] }
