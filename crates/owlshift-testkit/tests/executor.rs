@@ -2,7 +2,9 @@
 //! the agent's reach, a worktree on another branch or whose `.git` was
 //! redirected, and run files reached through a link. A harness that must
 //! never run stands in. Then what it does after a run that redirects its
-//! `.git` link: a quarantine, with no runner git run through the link.
+//! `.git` link: a quarantine, with no runner git run through the link. And
+//! when a read-only run left no result but gave it as its last message
+//! (OWL-323).
 
 use std::fs;
 use std::io;
@@ -17,13 +19,14 @@ use owlshift_contracts::Role;
 use owlshift_contracts::brief::{
     Author, Brief, PermissionLevel, Permissions, RebaseBrief, Relation, TicketBrief,
 };
-use owlshift_contracts::format::Format;
+use owlshift_contracts::format::{Format, RESULT_FORMAT};
 use owlshift_contracts::ids::{RelativePath, TicketId};
+use owlshift_platform::keychain::Secret;
 use owlshift_runner::agent_env::{AgentEnv, CredentialFinding};
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
-    Executor, ExecutorError, Failure, Git, Harness, HarnessEnd, HarnessError, HarnessRun,
-    HarnessStatus, Outcome, RunLog, RunReport, RunSpec, Violation,
+    Executor, ExecutorError, Failure, Git, Harness, HarnessEnd, HarnessError, HarnessLogin,
+    HarnessRun, HarnessStatus, Outcome, RunLog, RunReport, RunSpec, SandboxNeeds, Violation,
 };
 use owlshift_testkit::git::{GitEnv, seed};
 
@@ -492,6 +495,210 @@ fn a_run_its_driver_stopped_did_not_time_out() {
         }
         assert!(report.elapsed < Duration::from_secs(20), "{report:?}");
     }
+}
+
+/// A harness that is a shell script, run in the worktree, whose driver
+/// reports a completed run ending on `message` with one `Write` refused, as
+/// Claude Code's driver reports a read-only run (OWL-323); logged in with
+/// `login` when given.
+struct EndsOn {
+    script: String,
+    message: String,
+    login: Option<Secret>,
+}
+
+impl Harness for EndsOn {
+    fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&self.script);
+        Ok(command)
+    }
+
+    fn drive(
+        &self,
+        _: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        let run = drive_plain(child, log)?;
+        let mut end = HarnessEnd::new(run.exit_code, HarnessStatus::Completed);
+        end.message = Some(self.message.clone());
+        end.permission_denials = vec!["Write".to_owned()];
+        Ok(end)
+    }
+
+    fn sandbox_needs(&self, _agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        Ok(SandboxNeeds {
+            login: self.login.clone().map(|token| HarnessLogin {
+                descriptor_variable: "OWLSHIFT_TEST_TOKEN_FD",
+                token,
+                config_variable: "OWLSHIFT_TEST_CONFIG_DIR",
+            }),
+            ..SandboxNeeds::default()
+        })
+    }
+}
+
+/// A valid `blocked` result.
+fn blocked(summary: &str) -> String {
+    format!(r#"{{"format":{RESULT_FORMAT},"status":"blocked","summary":"{summary}"}}"#)
+}
+
+impl Bench {
+    /// The bench's brief, for a read-only design run.
+    fn read_only_brief(&self) -> Brief {
+        let mut brief = self.brief.clone();
+        brief.role = Role::Design;
+        brief.permissions.level = PermissionLevel::ReadOnly;
+        brief
+    }
+
+    /// A run of [`EndsOn`], not logged in.
+    fn ends_on(&self, brief: &Brief, script: &str, message: &str) -> RunReport {
+        let harness = EndsOn {
+            script: script.to_owned(),
+            message: message.to_owned(),
+            login: None,
+        };
+        self.run_with(&self.executor, &harness, brief).unwrap()
+    }
+}
+
+/// The summary of a finished run.
+fn summary(report: &RunReport) -> &str {
+    match &report.outcome {
+        Outcome::Finished { result, .. } => &result.summary,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// OWL-323: a read-only run that left no result is read from its last
+/// message, with a warning naming the refused tools; a result file it left
+/// wins, with no warning; an invalid result there is refused as any; a
+/// write-in-worktree run, and a run past its deadline, get no such reading.
+#[test]
+fn a_read_only_run_without_a_result_is_read_from_its_last_message() {
+    let bench = Bench::new();
+    let read_only = bench.read_only_brief();
+    let message = format!(
+        "I could not write it.\n\n```json\n{}\n```",
+        blocked("from the message")
+    );
+
+    let report = bench.ends_on(&read_only, "true", &message);
+    assert_eq!(summary(&report), "from the message");
+    assert_eq!(
+        report.warnings,
+        [
+            "the role left no .owlshift/run/result.json: its result was read from its last \
+             message (the harness refused: Write)"
+        ]
+    );
+
+    let written = format!(
+        "printf '%s' '{}' > .owlshift/run/result.json",
+        blocked("from the file")
+    );
+    let report = bench.ends_on(&read_only, &written, &message);
+    assert_eq!(summary(&report), "from the file");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    let no_plan = format!(r#"{{"format":{RESULT_FORMAT},"status":"done","summary":"s"}}"#);
+    let report = bench.ends_on(&read_only, "true", &no_plan);
+    assert!(
+        matches!(&report.outcome, Outcome::Failed(Failure::InvalidResult(reason)) if reason.contains("no plan")),
+        "{:?}",
+        report.outcome
+    );
+
+    let report = bench.ends_on(&bench.brief, "true", &message);
+    assert!(
+        matches!(report.outcome, Outcome::Failed(Failure::NoResult)),
+        "{:?}",
+        report.outcome
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    let late = Executor {
+        timeout: Duration::ZERO,
+        ..bench.executor.clone()
+    };
+    let harness = EndsOn {
+        script: "sleep 30".into(),
+        message,
+        login: None,
+    };
+    let report = bench.run_with(&late, &harness, &read_only).unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Failed(Failure::TimedOut)),
+        "{:?}",
+        report.outcome
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(!bench.worktree.join(".owlshift/run/result.json").exists());
+}
+
+/// OWL-323: a result read from the last message goes through the secret
+/// check, and is never written through a link.
+#[cfg(unix)]
+#[test]
+fn a_result_from_the_last_message_holds_no_secret_and_follows_no_link() {
+    let bench = Bench::new();
+    let read_only = bench.read_only_brief();
+    let message = blocked("from the message");
+
+    let token = "sk-ant-oat01-owl323-FAKE";
+    let harness = EndsOn {
+        script: "true".into(),
+        message: blocked(token),
+        login: Some(Secret::new(token)),
+    };
+    let report = bench
+        .run_with(&bench.executor, &harness, &read_only)
+        .unwrap();
+    assert!(
+        matches!(
+            &report.outcome,
+            Outcome::Failed(Failure::Credentials(findings))
+                if matches!(findings[..], [CredentialFinding::LoginCopied { .. }])
+        ),
+        "{:?}",
+        report.outcome
+    );
+
+    // A link left at the result's place is not written over, and refused.
+    let outside = bench.tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let planted = format!(
+        "ln -s '{}' .owlshift/run/result.json",
+        outside.join("planted.json").display()
+    );
+    let report = bench.ends_on(&read_only, &planted, &message);
+    assert!(
+        matches!(report.outcome, Outcome::Failed(Failure::InvalidResult(_))),
+        "{:?}",
+        report.outcome
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+    // The run's folder made a link: nothing is written through it.
+    let linked = format!(
+        "rm -rf .owlshift/run && ln -s '{}' .owlshift/run",
+        outside.display()
+    );
+    let report = bench.ends_on(&read_only, &linked, &message);
+    assert!(
+        matches!(report.outcome, Outcome::Failed(_)),
+        "{:?}",
+        report.outcome
+    );
+    assert!(
+        report.warnings.len() == 1 && report.warnings[0].contains("could not be written there"),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
 }
 
 /// The `sh` command that points the worktree's `.git` at `evil`: the

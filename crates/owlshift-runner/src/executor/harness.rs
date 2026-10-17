@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 
 use owlshift_adapters::harness::claude::{self, EXIT_GRACE, Effort, STDERR_CAP, Usage};
-use owlshift_contracts::brief::Brief;
+use owlshift_contracts::brief::{Brief, PermissionLevel};
 use owlshift_platform::keychain::Secret;
 use owlshift_platform::process::{find_executable_in, hand_over_on_descriptor};
 
@@ -245,8 +245,13 @@ pub struct HarnessEnd {
     pub model: Option<String>,
     pub harness_version: Option<String>,
     /// The run's last message, when the harness gives its result that way
-    /// ([`SandboxNeeds::result_in_message`]).
+    /// ([`SandboxNeeds::result_in_message`]), or, for a read-only run, when
+    /// the result may be read from it should the role leave no result file
+    /// (Claude Code, OWL-323).
     pub message: Option<String>,
+    /// The tools the harness's permissions refused, each once, in the order
+    /// of their first refusal; empty when it reports none.
+    pub permission_denials: Vec<String>,
 }
 
 impl HarnessEnd {
@@ -260,6 +265,7 @@ impl HarnessEnd {
             model: None,
             harness_version: None,
             message: None,
+            permission_denials: Vec::new(),
         }
     }
 }
@@ -395,17 +401,21 @@ impl Harness for ClaudeHarness {
         Ok(claude::command(&self.program, &request)?)
     }
 
+    /// Drives `claude -p`; a read-only run's last message comes with its
+    /// end, for the executor to read the result from when the role left no
+    /// result file (OWL-323).
     fn drive(
         &self,
-        _run: &HarnessRun<'_>,
+        run: &HarnessRun<'_>,
         child: &mut Child,
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
-        let run = claude::drive(child, &prompt_with_brief(&self.prompt), |line| {
+        let ran = claude::drive(child, &prompt_with_brief(&self.prompt), |line| {
             log.stdout(line);
         })?;
-        log.stderr(&run.stderr);
-        Ok(claude_end(run))
+        log.stderr(&ran.stderr);
+        let read_only = run.brief.permissions.level == PermissionLevel::ReadOnly;
+        Ok(claude_end(ran, read_only))
     }
 
     /// The folders `claude` is installed in (the one on the `PATH` and the
@@ -466,8 +476,20 @@ pub fn prompt_with_brief(prompt: &str) -> String {
 }
 
 /// What a Claude Code run reported, as the executor reads it: an MCP server
-/// or an API-key source in its `init` event is a credential finding.
-fn claude_end(run: claude::Run) -> HarnessEnd {
+/// or an API-key source in its `init` event is a credential finding. The
+/// final message of a completed run comes along when `read_only`, and the
+/// refused tools always.
+fn claude_end(run: claude::Run, read_only: bool) -> HarnessEnd {
+    let mut permission_denials: Vec<String> = Vec::new();
+    for tool in &run.permission_denials {
+        if !permission_denials.contains(tool) {
+            permission_denials.push(tool.clone());
+        }
+    }
+    let message = match &run.outcome {
+        claude::Outcome::Completed { text } if read_only => Some(text.clone()),
+        _ => None,
+    };
     let status = match &run.outcome {
         claude::Outcome::Completed { .. } => HarnessStatus::Completed,
         claude::Outcome::UsageLimit { resets_at, .. } => HarnessStatus::UsageLimit {
@@ -485,7 +507,8 @@ fn claude_end(run: claude::Run) -> HarnessEnd {
         usage: run.usage,
         model: run.model,
         harness_version: run.harness_version,
-        message: None,
+        message,
+        permission_denials,
     }
 }
 
@@ -545,18 +568,30 @@ mod tests {
 
     #[test]
     fn a_claude_run_is_read_as_the_executor_needs_it() {
-        let end = claude_end(run(&[INIT, DONE], 0));
+        let end = claude_end(run(&[INIT, DONE], 0), false);
         assert_eq!(end.status, HarnessStatus::Completed);
         assert_eq!(end.findings, []);
         assert_eq!(end.harness_version.as_deref(), Some("2.1.283"));
+        assert_eq!(end.message, None, "a write run's message is not read");
 
-        let failed = claude_end(run(
-            &[
-                INIT,
-                r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":404,"terminal_reason":"api_error","result":"x"}"#,
-            ],
-            1,
-        ));
+        // OWL-323: a completed read-only run gives its final message, and
+        // the tools refused, each once, in the order of their first refusal.
+        let denied = r#"{"type":"result","is_error":false,"result":"ok","permission_denials":[{"tool_name":"Bash"},{"tool_name":"Write"},{"tool_name":"Bash"}]}"#;
+        let read_only = claude_end(run(&[INIT, denied], 0), true);
+        assert_eq!(read_only.message.as_deref(), Some("ok"));
+        assert_eq!(read_only.permission_denials, ["Bash", "Write"]);
+
+        let failed = claude_end(
+            run(
+                &[
+                    INIT,
+                    r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":404,"terminal_reason":"api_error","result":"x"}"#,
+                ],
+                1,
+            ),
+            true,
+        );
+        assert_eq!(failed.message, None, "a failed run gives no result");
         let HarnessStatus::Failed(reason) = failed.status else {
             panic!("{failed:?}");
         };
@@ -564,26 +599,32 @@ mod tests {
         assert!(!reason.contains("setup-token"), "{reason}");
 
         // A refused login names the token's fix.
-        let refused = claude_end(run(
-            &[
-                INIT,
-                r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":401,"terminal_reason":"api_error","result":"x"}"#,
-            ],
-            1,
-        ));
+        let refused = claude_end(
+            run(
+                &[
+                    INIT,
+                    r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":401,"terminal_reason":"api_error","result":"x"}"#,
+                ],
+                1,
+            ),
+            false,
+        );
         let HarnessStatus::Failed(reason) = refused.status else {
             panic!("{refused:?}");
         };
         assert!(reason.contains("API status 401"), "{reason}");
         assert!(reason.contains("`claude setup-token`"), "{reason}");
 
-        let limited = claude_end(run(
-            &[
-                INIT,
-                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1790000000,"rateLimitType":"five_hour"}}"#,
-            ],
-            1,
-        ));
+        let limited = claude_end(
+            run(
+                &[
+                    INIT,
+                    r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1790000000,"rateLimitType":"five_hour"}}"#,
+                ],
+                1,
+            ),
+            false,
+        );
         assert!(
             matches!(
                 limited.status,
@@ -594,7 +635,7 @@ mod tests {
 
         // An MCP server in `init` is a finding, even on a completed run.
         let init = r#"{"type":"system","subtype":"init","mcp_servers":[{"name":"claude.ai Linear","status":"connected"}]}"#;
-        let loaded = claude_end(run(&[init, DONE], 0));
+        let loaded = claude_end(run(&[init, DONE], 0), false);
         assert_eq!(
             loaded.findings,
             [CredentialFinding::McpServers(vec![
@@ -606,7 +647,7 @@ mod tests {
         // finding too; a run that does not say has none.
         let init =
             r#"{"type":"system","subtype":"init","mcp_servers":[],"apiKeySource":"apiKeyHelper"}"#;
-        let keyed = claude_end(run(&[init, DONE], 0));
+        let keyed = claude_end(run(&[init, DONE], 0), false);
         assert_eq!(
             keyed.findings,
             [CredentialFinding::ApiKey {
@@ -619,7 +660,7 @@ mod tests {
             "{text}"
         );
         let silent = r#"{"type":"system","subtype":"init","mcp_servers":[]}"#;
-        assert_eq!(claude_end(run(&[silent, DONE], 0)).findings, []);
+        assert_eq!(claude_end(run(&[silent, DONE], 0), false).findings, []);
     }
 
     fn claude(login: Option<&str>) -> ClaudeHarness {

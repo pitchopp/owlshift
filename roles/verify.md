@@ -49,7 +49,7 @@ A doubt you could not check is a `minor` finding at most, and says so. At most 6
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When your harness gives you no way to write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 10, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 10, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: your `findings`, possibly none.
 - `blocked`: something outside your reach stops you (no diff given, a file you cannot read). Say what in `summary`.
