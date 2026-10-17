@@ -97,6 +97,7 @@ fn posts_the_delivery_report_on_a_real_ticket() {
                 .to_owned(),
             basis: "The ticket's acceptance, validated before OWL-20".to_owned(),
         }],
+        level: None,
         followups: vec![],
         fix_pass: None,
         rebase: None,

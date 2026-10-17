@@ -29,9 +29,10 @@ use owlshift_adapters::tracker::linear::{
 };
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
-use owlshift_contracts::Harness;
 use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker, TrackerKind};
+use owlshift_contracts::{DelegationLevel, Harness};
 use owlshift_contracts::ids::TicketId;
+use owlshift_core::gate::PassLimit;
 use owlshift_core::schedule::{holds_slot, natural_cmp};
 use owlshift_core::vocab::Stage;
 use owlshift_platform::keychain::SERVICE;
@@ -291,6 +292,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(drain_admission_check(config, facts.as_ref()));
     checks.extend(proposals_inbox_check(config, facts.as_ref()));
     checks.extend(forge_reviewers_check(config));
+    checks.extend(resolver_check(config));
     checks.extend(drain_slot_check(system, config));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
@@ -1251,6 +1253,38 @@ fn forge_reviewers_check(config: &Effective) -> Option<Check> {
             ),
         ),
     })
+}
+
+/// What the project lets the resolver decide without its decider (OWL-328,
+/// architecture section 4, "Delegation level" and "Resolver passes"): the
+/// level, the pass limit and the ceiling on one chain of runs, read from
+/// the project file `owlshift do` reads. A note: none blocks `do`. None
+/// without a project configuration.
+fn resolver_check(config: &Effective) -> Option<Check> {
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let resolver = config.policy.resolver();
+    let level = match resolver.level {
+        DelegationLevel::None => "delegation none: every question goes to the decider".to_owned(),
+        level => format!("delegation {}", level.as_str()),
+    };
+    let passes = match resolver.passes {
+        PassLimit::Runs(runs) => format!("{runs} run(s) in a row"),
+        PassLimit::Unlimited => "unlimited runs in a row".to_owned(),
+    };
+    let ceiling = match config.policy.resolver_budget_usd {
+        Some(usd) => format!("a ceiling of {} USD per chain of runs", usd.0),
+        None => "no ceiling".to_owned(),
+    };
+    Some(Check::info(
+        Section::Project,
+        "resolver",
+        format!(
+            "{level}; {passes}, {ceiling}; security and irreversible questions always go to the \
+             decider"
+        ),
+    ))
 }
 
 /// Whether each state named under `[tracker].states` is exactly one
@@ -3149,6 +3183,11 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
 
     /// A loaded project whose `[tracker]` table is `tracker`.
     fn project_tracked_by(tracker: &str) -> (tempfile::TempDir, Effective) {
+        project_tracked_with(tracker, "")
+    }
+
+    /// [`project_tracked_by`], with `policy` added to its `[policy]` table.
+    fn project_tracked_with(tracker: &str, policy: &str) -> (tempfile::TempDir, Effective) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("owlshift.toml");
         std::fs::write(
@@ -3165,6 +3204,7 @@ plan_approval = "never"
 [models]
 [policy]
 always_human = []
+{policy}
 "#
             ),
         )
@@ -3698,6 +3738,47 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             "{}",
             named.detail
         );
+    }
+
+    /// OWL-328: the `resolver` line names the level, the pass limit and the
+    /// ceiling, as a note that blocks nothing.
+    #[test]
+    fn the_resolver_line_names_the_level_passes_and_ceiling() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let cases = [
+            (
+                "",
+                "delegation discoverable; 5 run(s) in a row, no ceiling; security and \
+                 irreversible questions always go to the decider",
+            ),
+            (
+                "resolver_delegation = \"ticket\"\nresolver_passes = 2",
+                "delegation ticket; 2 run(s) in a row, no ceiling; security and irreversible \
+                 questions always go to the decider",
+            ),
+            (
+                "resolver_delegation = \"none\"",
+                "delegation none: every question goes to the decider; 5 run(s) in a row, no \
+                 ceiling; security and irreversible questions always go to the decider",
+            ),
+            (
+                "resolver_delegation = \"all\"\nresolver_passes = \"unlimited\"\n\
+                 resolver_budget_usd = 2.5",
+                "delegation all; unlimited runs in a row, a ceiling of 2.5 USD per chain of \
+                 runs; security and irreversible questions always go to the decider",
+            ),
+        ];
+        for (policy, detail) in cases {
+            let (_dir, config) = project_tracked_with(tracker, policy);
+            let report = run(&system, &config);
+            let resolver = line(&report, "resolver");
+            assert_eq!(resolver.status, Status::Info, "{policy}");
+            assert_eq!(resolver.detail, detail, "{policy}");
+            assert!(report.ready() || resolver.status != Status::Fail);
+        }
     }
 
     /// OWL-155: delegation and a missing `admitters` warn without the

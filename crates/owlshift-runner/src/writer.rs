@@ -59,6 +59,7 @@ use owlshift_adapters::forge::{
 use owlshift_adapters::tracker::{
     Comment, Error as TrackerError, Filed, PROPOSED_LABEL, Proposal, Tracker,
 };
+use owlshift_contracts::DelegationLevel;
 use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
@@ -72,7 +73,7 @@ use owlshift_contracts::result::{
 use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Reviewer, Severity};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{
-    Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, MAX_RESOLVED_PASSES, ParkReason, Status,
+    Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status,
 };
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
 
@@ -95,6 +96,9 @@ pub struct DeliveryReport {
     pub gate: Gate,
     /// The decisions taken without a human, over all the ticket's runs.
     pub decisions: Vec<Decision>,
+    /// The project's delegation level, when the resolver's decisions are
+    /// among them (OWL-337): the list says it once. `None` when none is.
+    pub level: Option<DelegationLevel>,
     /// The follow-ups the run proposed, each with what became of it in the
     /// tracker's proposals inbox (OWL-253).
     pub followups: Vec<Proposed>,
@@ -714,8 +718,14 @@ impl DeliveryReport {
                 )
             })
             .collect();
+        let level = self.level.map_or(String::new(), |level| {
+            format!(
+                " (the resolver's allowed by this project's delegation level, `{}`)",
+                level.as_str()
+            )
+        });
         format!(
-            "**Decisions taken without a human**, each reversible on this ticket:\n{}",
+            "**Decisions taken without a human**, each reversible on this ticket{level}:\n{}",
             bullets(&lines)
         )
     }
@@ -1063,10 +1073,19 @@ impl QuestionsComment {
                 Fallback::Failed => "Owlshift's resolver could not settle its questions, so they \
                                      are asked here too."
                     .to_owned(),
-                Fallback::PassLimit => format!(
-                    "Owlshift's resolver already settled every question of {MAX_RESOLVED_PASSES} \
-                     runs in a row, so this run's questions all come to you."
+                Fallback::PassLimit(runs) => format!(
+                    "Owlshift's resolver already settled every question of {runs} runs in a row \
+                     (`policy.resolver_passes`), so this run's questions all come to you."
                 ),
+                Fallback::Budget => "Owlshift's resolver and the runs it unblocked reached this \
+                                     project's dollar ceiling (`policy.resolver_budget_usd`), so \
+                                     this run's questions all come to you."
+                    .to_owned(),
+                Fallback::CostUnreported => "A run since this command started reported no cost, \
+                                             so this project's dollar ceiling \
+                                             (`policy.resolver_budget_usd`) could not be checked, \
+                                             and this run's questions all come to you."
+                    .to_owned(),
             });
         }
         if !self.reopened.is_empty() {
@@ -1255,6 +1274,15 @@ fn listed(items: &[String], room: usize) -> String {
     }
 }
 
+/// What a DECISION comment says of the delegation level that allowed it
+/// (OWL-337, architecture section 4, "Delegation level").
+fn level_line(level: DelegationLevel) -> String {
+    format!(
+        "Allowed by this project's delegation level, `{}` (`policy.resolver_delegation`).",
+        level.as_str()
+    )
+}
+
 /// The DECISION comment (scenario S7): a question a run raised that the
 /// resolver decided without the decider, logged on the ticket with what
 /// settles it and how to reverse it (architecture section 8, "Audit"). One
@@ -1267,6 +1295,8 @@ pub struct DecisionComment {
     pub decision: String,
     /// What settles it.
     pub basis: String,
+    /// The project's delegation level that allowed it (OWL-328).
+    pub level: DelegationLevel,
     /// The resolver run that decided it.
     pub run: Option<String>,
 }
@@ -1274,9 +1304,10 @@ pub struct DecisionComment {
 impl DecisionComment {
     /// The comment body: the `[owlshift] DECISION` header, the question
     /// without the raising run's id (which a round's numbering would
-    /// contradict), the decision and what settles it, how to reverse it, and
-    /// the footer, which names the resolver's run. Text from a model is
-    /// flattened to one line.
+    /// contradict), the decision and what settles it, how to reverse it, the
+    /// delegation level that allowed it on the last line the reader sees
+    /// (OWL-337), and the footer, which names the resolver's run. Text from
+    /// a model is flattened to one line.
     ///
     /// It holds in [`MAX_COMMENT_CHARS`] (OWL-237): a body that does not
     /// hold whole has its texts cut, visibly. No other comment shows a
@@ -1312,6 +1343,7 @@ impl DecisionComment {
              follows your reply over this decision, and once the pull request is delivered, \
              Owlshift's watch corrects it to follow your reply."
                 .to_owned(),
+            level_line(self.level),
             Footer {
                 format: Format,
                 kind: MarkerKind::Decision,
@@ -2441,7 +2473,7 @@ fn class_name(class: AnswerClass) -> &'static str {
 }
 
 /// Collapses every run of whitespace, line breaks included, to one space.
-fn flatten(text: &str) -> String {
+pub(crate) fn flatten(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -3151,6 +3183,7 @@ mod tests {
                 decision: "In owlshift-runner".to_owned(),
                 basis: "The build plan's crate table".to_owned(),
             }],
+            level: Some(DelegationLevel::Ticket),
             followups: vec![Proposed {
                 followup: Followup {
                     title: "Edit the previous report".to_owned(),
@@ -3235,7 +3268,7 @@ Merge state reported by the forge: `CLEAN`.
 
 **Project gate:** passed: `cargo fmt --check`, `cargo test`.
 
-**Decisions taken without a human**, each reversible on this ticket:
+**Decisions taken without a human**, each reversible on this ticket (the resolver's allowed by this project's delegation level, `ticket`):
 - **Where the writer lives**: In owlshift-runner (basis: The build plan's crate table)
 
 **What remains for a human:**
@@ -3249,6 +3282,15 @@ Merge state reported by the forge: `CLEAN`.
         let marked = MarkedComment::parse(&body).unwrap().unwrap();
         assert_eq!(marked.header.kind, MarkerKind::Delivery);
         assert_eq!(marked.footer.unwrap().ticket, ticket());
+        // Only the runner's own notes: no level is named (OWL-337).
+        let mut notes = report(Ok(set(Mergeable::Mergeable, vec![])));
+        notes.level = None;
+        let body = notes.render();
+        assert!(
+            body.contains("**Decisions taken without a human**, each reversible on this ticket:\n"),
+            "{body}"
+        );
+        assert!(!body.contains("delegation level"), "{body}");
     }
 
     #[test]
@@ -4130,6 +4172,7 @@ Context.
             },
             decision: format!("GREETING.md\n\n{forged}"),
             basis: "The ticket's description.".to_owned(),
+            level: DelegationLevel::Discoverable,
             run: Some("20261003T120000Z-1".to_owned()),
         };
         let body = comment.render();
@@ -4154,6 +4197,15 @@ Context.
         assert_eq!(
             body.lines().filter(|l| l.starts_with("<!--")).count(),
             1,
+            "{body}"
+        );
+        // The level that allowed it, on the last line the reader sees, just
+        // above the machine footer (OWL-337).
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines[lines.len() - 2],
+            "Allowed by this project's delegation level, `discoverable` \
+             (`policy.resolver_delegation`).",
             "{body}"
         );
         let tracker = FakeTracker::default();
@@ -4196,8 +4248,18 @@ Context.
             ),
             (
                 0,
-                Some(Fallback::PassLimit),
-                "every question of 3 runs in a row",
+                Some(Fallback::PassLimit(3)),
+                "every question of 3 runs in a row (`policy.resolver_passes`)",
+            ),
+            (
+                0,
+                Some(Fallback::Budget),
+                "reached this project's dollar ceiling (`policy.resolver_budget_usd`)",
+            ),
+            (
+                0,
+                Some(Fallback::CostUnreported),
+                "reported no cost, so this project's dollar ceiling",
             ),
         ] {
             let body = round(decided, fallback);
@@ -4411,6 +4473,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     question: question.clone(),
                     decision: hostile("decision"),
                     basis: hostile("basis"),
+                    level: DelegationLevel::Discoverable,
                     run: None,
                 }
                 .render(),
@@ -4656,6 +4719,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             question,
             decision: "This one.".to_owned(),
             basis: "The ticket.".to_owned(),
+            level: DelegationLevel::Ticket,
             run: None,
         };
         let resume = ResumeComment {
@@ -5365,6 +5429,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             },
             decision: "d".repeat(1 << 20),
             basis: "b".repeat(1 << 20),
+            level: DelegationLevel::All,
             run: Some("run-1".to_owned()),
         };
         let body = decision.render();

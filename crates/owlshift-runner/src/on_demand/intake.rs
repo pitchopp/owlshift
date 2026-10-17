@@ -291,7 +291,6 @@ impl OnDemand<'_> {
         // runs is a text intake did not read, which the next pass takes in.
         let text = text_sha256(&p.found.title, &p.found.description);
         let mut attempt = 0u32;
-        let mut settled = 0u32;
         loop {
             attempt += 1;
             let comments = self.comments(&p.ticket)?;
@@ -351,14 +350,10 @@ impl OnDemand<'_> {
                     &[],
                     &rules,
                     &current,
-                    settled,
-                    &ran.run,
+                    &ran,
                     sink,
                 )? {
-                    Routing::Settled => {
-                        settled += 1;
-                        continue;
-                    }
+                    Routing::Settled => continue,
                     Routing::Ask(round) => {
                         let asked = match state.apply(PIPELINE, Event::Questions) {
                             Ok(Transition::To(asked)) => asked,
@@ -388,14 +383,10 @@ impl OnDemand<'_> {
                     &[],
                     &rules,
                     &current,
-                    settled,
-                    &ran.run,
+                    &ran,
                     sink,
                 )? {
-                    Routing::Settled => {
-                        settled += 1;
-                        continue;
-                    }
+                    Routing::Settled => continue,
                     // The verdict is kept with the round: its dependencies
                     // become relations now, and a failure is a failed run.
                     Routing::Ask(round) => match self.relate_dependencies(p, verdict, &ran, sink) {

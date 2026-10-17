@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ContractError;
-use owlshift_contracts::config::{PersonalConfig, ProjectConfig, check_requires, entries};
-use owlshift_core::floor::{FloorCategory, is_floor_category};
-use owlshift_core::gate::normalized_categories;
+use owlshift_contracts::DelegationLevel;
+use owlshift_contracts::config::{Policy, PersonalConfig, ProjectConfig, check_requires, entries};
+use owlshift_core::floor::{FloorCategory, is_human_category};
+use owlshift_core::gate::{PassLimit, ResolverPolicy, normalized_categories};
 use semver::Version;
 
 use crate::system::System;
@@ -271,27 +272,52 @@ impl fmt::Display for Effective {
         if !project && !personal {
             f.write_str("No configuration value is set.\n")?;
         }
-        self.write_always_human(f)
+        self.write_always_human(f)?;
+        self.write_resolver(f)
     }
 }
 
 impl Effective {
+    /// The project's resolver settings, as the gate reads them, and the
+    /// file they come from: the defaults without a project file.
+    fn resolver(&self) -> (ResolverPolicy, Option<(&Path, &Policy)>) {
+        match &self.project {
+            FileState::Loaded { path, config, .. } => {
+                (config.policy.resolver(), Some((path, &config.policy)))
+            }
+            _ => (ResolverPolicy::default(), None),
+        }
+    }
+
     /// The categories that always go to a human: the floor's, which no file
-    /// removes, then the project's additions with their file. An addition
-    /// the floor already covers (matching a floor token the way
-    /// [`is_floor_category`] does) is shown as such.
+    /// removes, those the project's delegation level keeps (OWL-328), then
+    /// the project's additions with their file. An addition the level
+    /// already covers (matching a token the way [`is_human_category`] does)
+    /// is shown as such.
     fn write_always_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (resolver, project) = self.resolver();
+        let level = resolver.level;
         f.write_str(
-            "\nalways-human categories (the floor's never go away; a project adds to them):\n",
+            "\nalways-human categories (the floor's never go away; the delegation level keeps \
+             others; a project adds to them):\n",
         )?;
         for category in FloorCategory::ALL {
-            writeln!(f, "  {}  (floor)", category.token())?;
+            if category.human_at(DelegationLevel::All) {
+                writeln!(f, "  {}  (floor)", category.token())?;
+            } else if category.human_at(level) {
+                writeln!(
+                    f,
+                    "  {}  (delegation level {})",
+                    category.token(),
+                    level.as_str()
+                )?;
+            }
         }
-        if let FileState::Loaded { path, config, .. } = &self.project {
+        if let Some((path, policy)) = project {
             // As the gate reads them: normalized, each once, blank ones dropped.
-            for category in normalized_categories(&config.policy.always_human) {
-                let note = if is_floor_category(&category) {
-                    "  already covered by the floor"
+            for category in normalized_categories(&policy.always_human) {
+                let note = if is_human_category(&category, level) {
+                    "  already covered by the delegation level"
                 } else {
                     ""
                 };
@@ -299,6 +325,38 @@ impl Effective {
             }
         }
         Ok(())
+    }
+
+    /// What the resolver may do (OWL-328): its delegation level, its pass
+    /// limit and its ceiling, each with the file it comes from, or
+    /// `default`.
+    fn write_resolver(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (resolver, project) = self.resolver();
+        f.write_str("\nresolver (what it decides without the decider):\n")?;
+        let source = |set: bool| match project {
+            Some((path, _)) if set => path.display().to_string(),
+            _ => "default".to_owned(),
+        };
+        let policy = project.map(|(_, policy)| policy);
+        writeln!(
+            f,
+            "  resolver_delegation = \"{}\"  ({})",
+            resolver.level.as_str(),
+            source(policy.is_some_and(|p| p.resolver_delegation.is_some()))
+        )?;
+        let passes = match resolver.passes {
+            PassLimit::Runs(runs) => runs.to_string(),
+            PassLimit::Unlimited => "\"unlimited\"".to_owned(),
+        };
+        writeln!(
+            f,
+            "  resolver_passes = {passes}  ({})",
+            source(policy.is_some_and(|p| p.resolver_passes.is_some()))
+        )?;
+        match policy.and_then(|p| p.resolver_budget_usd) {
+            Some(usd) => writeln!(f, "  resolver_budget_usd = {}  ({})", usd.0, source(true)),
+            None => writeln!(f, "  resolver_budget_usd: none, no ceiling  (default)"),
+        }
     }
 }
 
@@ -360,6 +418,58 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("not found at"), "{shown}");
+    }
+
+    /// OWL-328: `config show` prints the resolver's level, pass limit and
+    /// ceiling with their source, and the always-human categories of the
+    /// level, the floor's at every level.
+    #[test]
+    fn the_resolver_settings_are_shown_with_their_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(PROJECT_FILE);
+        let personal = dir.path().join("personal.toml");
+        let shown = |policy: &str| {
+            fs::write(
+                &file,
+                PROJECT.replace("always_human = []", policy),
+            )
+            .unwrap();
+            let effective =
+                Effective::load(&repository(dir.path()), dir.path(), Some(personal.clone()));
+            assert!(effective.is_valid(), "{effective}");
+            effective.to_string()
+        };
+        let path = file.display();
+
+        let default = shown("always_human = []");
+        for line in [
+            "  resolver_delegation = \"discoverable\"  (default)".to_owned(),
+            "  resolver_passes = 5  (default)".to_owned(),
+            "  resolver_budget_usd: none, no ceiling  (default)".to_owned(),
+            "  scope  (delegation level discoverable)".to_owned(),
+            "  money  (delegation level discoverable)".to_owned(),
+            "  security  (floor)".to_owned(),
+        ] {
+            assert!(default.contains(&line), "{line}\n---\n{default}");
+        }
+
+        let all = shown(
+            "always_human = [\"money\"]\nresolver_delegation = \"all\"\n\
+             resolver_passes = \"unlimited\"\nresolver_budget_usd = 2.5",
+        );
+        for line in [
+            format!("  resolver_delegation = \"all\"  ({path})"),
+            format!("  resolver_passes = \"unlimited\"  ({path})"),
+            format!("  resolver_budget_usd = 2.5  ({path})"),
+            "  security  (floor)".to_owned(),
+            "  irreversible  (floor)".to_owned(),
+            format!("  money  ({path})"),
+        ] {
+            assert!(all.contains(&line), "{line}\n---\n{all}");
+        }
+        for line in ["  scope  (delegation level", "  data_loss  (delegation level"] {
+            assert!(!all.contains(line), "{line}\n---\n{all}");
+        }
     }
 
     #[test]
