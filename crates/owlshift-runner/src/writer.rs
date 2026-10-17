@@ -23,10 +23,15 @@
 //! [`Writer::post_parked`]).
 //!
 //! QUESTIONS, RE-ASK and REPLY wait for the decider: a Writer made
-//! [`Writer::mentioning`] them adds a line that mentions them, so the
-//! tracker notifies them (OWL-157). A mention the tracker has but could not
-//! give is left out, and the comment returned as [`Posted`] says so, for
-//! the runner to report it (OWL-170).
+//! [`Writer::mentioning`] them ends the header line with their mention, so
+//! the tracker notifies them (OWL-157, OWL-324). A mention the tracker has
+//! but could not give is left out, and the comment returned as [`Posted`]
+//! says so, for the runner to report it (OWL-170).
+//!
+//! Every comment that shows a question shows it the same way
+//! ([`question_block`], OWL-324): a heading, its context, its options
+//! lettered A, B, C… one per bullet, the recommended one starred, and its
+//! recommendation.
 //!
 //! And a run's follow-ups, each filed in the tracker's proposals inbox
 //! ([`ProposalDescription`], [`Writer::propose`], OWL-253), which the floor
@@ -54,7 +59,7 @@ use owlshift_adapters::forge::{
 use owlshift_adapters::tracker::{
     Comment, Error as TrackerError, Filed, PROPOSED_LABEL, Proposal, Tracker,
 };
-use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
+use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
@@ -62,7 +67,7 @@ use owlshift_contracts::ids::{FindingId, QuestionId, TicketId};
 use owlshift_contracts::refs::{AnsweredReview, DeliveredPullRequest, PushKind};
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
-    Verdict as AnswerVerdict,
+    Verdict as AnswerVerdict, option_letter,
 };
 use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Reviewer, Severity};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
@@ -389,7 +394,7 @@ impl DeliveryReport {
             format!("**What remains for a human:**\n{}", bullets(&remains))
         };
         let mut texts = vec![
-            Fit::capped(flatten(&self.summary), SUMMARY_CUT, SPLIT_SUMMARY_CHARS),
+            Fit::capped(flatten(&self.summary), SUMMARY_CUT, DELIVERY_SUMMARY_CHARS),
             Fit::capped(checks, "the rest is on the pull request", 10_000),
             Fit::capped(self.gate_section(), LONGER, 2_000),
             Fit::capped(self.decisions_section(), LONGER, 20_000),
@@ -716,62 +721,120 @@ impl DeliveryReport {
     }
 }
 
-/// One question as the runner's comments show it: `**Qn** (category)
-/// text`, then its context, its options and its recommendation when it has
-/// them, one line each. Every field comes from a model, so each is flattened
-/// to one line and cannot start a Markdown block of its own or reach the
-/// comment's first or last line.
+/// One question as every comment that shows it shows it (OWL-324): a
+/// `### Qn · text` heading, its context on the next line, its options one
+/// per bullet, lettered A, B, C… in order ([`option_letter`]), the
+/// recommended one starred, then `**Recommendation: B.** why`, or
+/// `**Recommendation:** why` without options. The category is not shown.
+/// Every field comes from a model: each is flattened to one line, and the
+/// context, the one text that starts a line, cannot open a Markdown block
+/// (`inline`); none reaches the comment's first or last line. The context
+/// shows at most 1,000 characters and each option's detail 300, cut
+/// visibly.
 pub fn question_block(question: &Question) -> String {
-    let texts: Vec<String> = question_texts(question)
+    let texts: Vec<String> = question_fits(question, LONGER, usize::MAX)
         .into_iter()
         .map(|fit| fit.text)
         .collect();
-    question_lines(question, &texts)
+    question_lines(question.id.as_str(), question, &texts)
 }
 
-/// The texts of a question's block, in the order [`question_lines`] takes
-/// them: its category, text, context, options and recommendation, each
-/// flattened, and restated when a comment other than QUESTIONS shows them.
-fn question_texts(question: &Question) -> [Fit; 5] {
-    let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
-    let restated = |text: String| Fit::capped(text, RESTATED, RESTATED_TEXT_CHARS);
+/// The four texts of a question's block, in the order [`question_lines`]
+/// takes them: its text, its context, its options as bullets and its
+/// recommendation's `why`. When a comment does not hold whole, each keeps
+/// at most `cap` characters, cut for `why` (OWL-228); the context and each
+/// option's detail are cut to their own bounds first, wherever they show.
+fn question_fits(question: &Question, why: &'static str, cap: usize) -> [Fit; 4] {
+    let capped = |text: String| Fit::capped(text, why, cap);
     [
-        Fit::capped(
-            flatten(&question.category),
-            RESTATED,
-            RESTATED_CATEGORY_CHARS,
-        ),
-        restated(flatten(&question.text)),
-        restated(flatten(&question.context)),
-        restated(options.join(" / ")),
-        restated(
+        capped(heading_text(&question.text)),
+        capped(cut(&inline(&question.context), CONTEXT_CHARS, CONTEXT_CUT)),
+        capped(option_bullets(question)),
+        capped(
             question
                 .recommendation
-                .as_deref()
-                .map(flatten)
+                .as_ref()
+                .map(|r| flatten(&r.why))
                 .unwrap_or_default(),
         ),
     ]
 }
 
-/// A question's block of `texts`, as [`question_texts`] gives them, maybe
-/// cut: the options and recommendation lines are there when the question
-/// has them, the context line when it is not blank.
-fn question_lines(question: &Question, texts: &[String]) -> String {
-    let [category, text, context, options, recommendation] = texts else {
-        unreachable!("a question has five texts")
+/// The number of texts [`question_fits`] gives a question.
+const QUESTION_TEXTS: usize = 4;
+
+/// A question's block of `texts`, as [`question_fits`] gives them, maybe
+/// cut, under the heading `### label · text`: the context when it is not
+/// blank, the options when it has some, the recommendation when it has one
+/// (a question a ticket ref kept before OWL-324 may have none).
+fn question_lines(label: &str, question: &Question, texts: &[String]) -> String {
+    let [text, context, options, why] = texts else {
+        unreachable!("a question has four texts")
     };
-    let mut lines = vec![format!("**{}** ({category}) {text}", question.id)];
+    let mut head = format!("### {label} · {text}");
     if !context.is_empty() {
-        lines.push(context.clone());
+        head.push('\n');
+        head.push_str(context);
     }
-    if !question.options.is_empty() {
-        lines.push(format!("Options: {options}"));
+    let mut sections = vec![head];
+    if !options.is_empty() {
+        sections.push(options.clone());
     }
     if question.recommendation.is_some() {
-        lines.push(format!("Recommendation: {recommendation}"));
+        sections.push(match question.recommended_option() {
+            Some(index) => format!("**Recommendation: {}.** {why}", option_letter(index)),
+            None => format!("**Recommendation:** {why}"),
+        });
     }
-    lines.join("\n")
+    sections.join("\n\n")
+}
+
+/// A question's options, one bullet each: `- **A.** label`, with ` — ` and
+/// its detail, cut at [`DETAIL_CHARS`], when it has one, and `⭐ ` before
+/// the label of the option its recommendation names. Every text follows the
+/// runner's own prefix, so flattening keeps it inside its bullet.
+fn option_bullets(question: &Question) -> String {
+    let recommended = question.recommended_option();
+    question
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let star = if recommended == Some(index) {
+                "⭐ "
+            } else {
+                ""
+            };
+            let mut line = format!(
+                "- **{}.** {star}{}",
+                option_letter(index),
+                flatten(&option.label)
+            );
+            let detail = option.detail.as_deref().map(flatten).unwrap_or_default();
+            if !detail.is_empty() {
+                line.push_str(" — ");
+                line.push_str(&cut(&detail, DETAIL_CHARS, DETAIL_CUT));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The answer line that ends a round (OWL-324): an example answer, the id
+/// of the first question with options and the letter it recommends (A when
+/// it names none), then `ok` for every recommendation; `ok` alone when no
+/// question has options.
+fn answer_line(questions: &[Question]) -> String {
+    const REST: &str = "`ok` to take every recommendation, or in your own words.";
+    match questions.iter().find(|q| !q.options.is_empty()) {
+        Some(question) => format!(
+            "Reply `{}: {}`, {REST}",
+            question.id,
+            option_letter(question.recommended_option().unwrap_or(0))
+        ),
+        None => format!("Reply {REST}"),
+    }
 }
 
 /// A refused choice that a question reopens (OWL-203): a choice an earlier
@@ -812,10 +875,35 @@ fn reopened_lines(choice: &RefusedChoice) -> String {
 /// tracker gets the same bound.
 pub const MAX_COMMENT_CHARS: usize = 100_000;
 
-/// The most characters of the run's summary a QUESTIONS round split in
-/// parts shows: the summary is a recap, the questions are what the decider
+/// The most characters of the run's summary a QUESTIONS comment shows
+/// (OWL-324): the summary is a recap, the questions are what the decider
 /// needs.
-const SPLIT_SUMMARY_CHARS: usize = 8_000;
+const SUMMARY_CHARS: usize = 400;
+
+/// Why a QUESTIONS comment's summary is cut.
+const QUESTIONS_SUMMARY_CUT: &str = "a question round shows at most 400 characters of the summary";
+
+/// The most characters a question's context shows, in every comment
+/// (OWL-324): the roles write at most two sentences.
+const CONTEXT_CHARS: usize = 1_000;
+
+/// Why a question's context is cut.
+const CONTEXT_CUT: &str = "a question shows at most 1,000 characters of context";
+
+/// The most characters an option's detail shows, in every comment
+/// (OWL-324): the roles write one line.
+const DETAIL_CHARS: usize = 300;
+
+/// Why an option's detail is cut.
+const DETAIL_CUT: &str = "an option shows at most 300 characters of detail";
+
+/// The most characters of a PARKED comment's detail, when the comment does
+/// not hold whole (OWL-228).
+const PARKED_DETAIL_CHARS: usize = 8_000;
+
+/// The most characters of a DELIVERY report's summary, when the report
+/// does not hold whole (OWL-228): the pull request's body has it.
+const DELIVERY_SUMMARY_CHARS: usize = 8_000;
 
 /// The QUESTIONS comment (scenario S2): a round of numbered questions for the
 /// decider, each understandable without a transcript, in one comment when it
@@ -860,12 +948,13 @@ pub(crate) fn part_numbers(body: &str) -> Option<(usize, usize)> {
 
 impl QuestionsComment {
     /// The comment body: the `[owlshift] QUESTIONS · round N` header, the
-    /// run's summary, what the resolver decided or why it did not, that
-    /// some questions reopen refused choices when they do, each question
-    /// with the refused choices it reopens, how to answer, and the footer.
-    /// Text from a model is flattened to one line.
+    /// run's summary cut at 400 characters, what the resolver decided or
+    /// why it did not, that some questions reopen refused choices when they
+    /// do, each question ([`question_block`]) with the refused choices it
+    /// reopens, a rule and the answer line (`answer_line`), and the
+    /// footer. Text from a model is flattened to one line.
     pub fn render(&self) -> String {
-        let (head, blocks) = self.sections(flatten(&self.summary));
+        let (head, blocks) = self.sections();
         self.body(None, head.into_iter().chain(blocks), true)
     }
 
@@ -873,12 +962,10 @@ impl QuestionsComment {
     /// most `room` characters: the whole body ([`Self::render`]) when it
     /// fits, otherwise parts of the round (OWL-223). Each part is a marked
     /// QUESTIONS comment of the round that says which part it is; the first
-    /// holds what comes before the questions, the summary cut to
-    /// 8,000 characters or to the room the part leaves it, and the
-    /// parts are cut between questions
-    /// only, each question with the refused choices it reopens; the last
-    /// says how to answer. A question too long for a part alone, which the
-    /// result's bounds leave no room for, is cut, visibly.
+    /// holds what comes before the questions, and the parts are cut between
+    /// questions only, each question with the refused choices it reopens;
+    /// the last ends with the answer line. A question too long for a part
+    /// alone, which the result's bounds leave no room for, is cut, visibly.
     pub fn parts(&self, room: usize) -> Vec<String> {
         let whole = self.render();
         if chars(&whole) <= room {
@@ -887,14 +974,7 @@ impl QuestionsComment {
         let frame = chars(&self.body(Some((usize::MAX, usize::MAX)), [], true));
         // Each section adds its characters and the blank line before it.
         let room = room.saturating_sub(frame);
-        let (others, _) = self.sections(String::new());
-        let others: usize = others.iter().map(|section| chars(section) + 2).sum();
-        let summary = cut(
-            &flatten(&self.summary),
-            SPLIT_SUMMARY_CHARS.min(room.saturating_sub(others + 2)),
-            SUMMARY_CUT,
-        );
-        let (head, blocks) = self.sections(summary);
+        let (head, blocks) = self.sections();
         let mut parts = vec![head];
         for block in blocks {
             let block = cut(
@@ -919,7 +999,7 @@ impl QuestionsComment {
     }
 
     /// A body: the header, which part it is when the round is in parts,
-    /// `sections`, how to answer when `last`, and the footer.
+    /// `sections`, a rule and the answer line when `last`, and the footer.
     fn body(
         &self,
         part: Option<(usize, usize)>,
@@ -936,11 +1016,7 @@ impl QuestionsComment {
         }
         all.extend(sections);
         if last {
-            all.push(
-                "Answer here, in one comment or several: the work resumes once every question \
-                 is settled."
-                    .to_owned(),
-            );
+            all.push(format!("---\n{}", answer_line(&self.questions)));
         }
         let footer = Footer {
             format: Format,
@@ -955,13 +1031,15 @@ impl QuestionsComment {
         body
     }
 
-    /// The sections before the questions, with `summary` as the run's, and
-    /// one per question, with the refused choices it reopens.
-    fn sections(&self, summary: String) -> (Vec<String>, Vec<String>) {
+    /// The sections before the questions, the run's summary cut at
+    /// [`SUMMARY_CHARS`] among them, and one per question, with the refused
+    /// choices it reopens.
+    fn sections(&self) -> (Vec<String>, Vec<String>) {
         let mut sections = Vec::new();
         if self.premise_false {
             sections.push("The run found the ticket's premise false.".to_owned());
         }
+        let summary = cut(&inline(&self.summary), SUMMARY_CHARS, QUESTIONS_SUMMARY_CUT);
         if !summary.is_empty() {
             sections.push(summary);
         }
@@ -1009,7 +1087,7 @@ impl QuestionsComment {
                         .filter(|reopened| reopened.question == question.id)
                         .map(|reopened| reopened_lines(&reopened.choice)),
                 );
-                block.join("\n")
+                block.join("\n\n")
             })
             .collect();
         (sections, blocks)
@@ -1054,17 +1132,15 @@ const LONGER: &str = "longer than a comment holds";
 /// round's QUESTIONS comment shows it whole, and the ticket ref keeps it.
 const RESTATED: &str = "the whole question is in this round's QUESTIONS comment";
 
-/// The most characters a question's category keeps, and each of its other
-/// texts, in a RE-ASK, REPLY or PARKED comment too long to hold whole
-/// (OWL-228): they are restated, so they give way before what is not.
-const RESTATED_CATEGORY_CHARS: usize = 80;
+/// The most characters each text of a question keeps (its text, its
+/// options, its recommendation; [`question_fits`]) in a RE-ASK, REPLY,
+/// PARKED or RESUME comment too long to hold whole (OWL-228): they are
+/// restated, so they give way before what is not.
 const RESTATED_TEXT_CHARS: usize = 1_000;
 
-/// The most characters a decided question's category keeps, and each of its
-/// other texts, in a DECISION comment too long to hold whole (OWL-237). No
-/// other comment shows the question, so these caps are looser than the
-/// restated ones.
-const DECIDED_CATEGORY_CHARS: usize = 80;
+/// The most characters each text of a decided question keeps in a DECISION
+/// comment too long to hold whole (OWL-237). No other comment shows the
+/// question, so this cap is looser than the restated one.
 const DECIDED_TEXT_CHARS: usize = 5_000;
 
 /// What a RESUME comment says of an answer whose reason the ticket's record
@@ -1204,47 +1280,33 @@ impl DecisionComment {
     ///
     /// It holds in [`MAX_COMMENT_CHARS`] (OWL-237): a body that does not
     /// hold whole has its texts cut, visibly. No other comment shows a
-    /// decided question whole (a round's QUESTIONS comment leaves it out), so its
-    /// texts are capped loosely (80 characters for the category, 5,000 for
-    /// each of the others) and the decision and its basis not at all: they
-    /// are what the decider reverses, so they are cut last, only as the
-    /// longest texts, never before a shorter one.
+    /// decided question whole (a round's QUESTIONS comment leaves it out),
+    /// so its texts (`question_fits`) are capped loosely, at 5,000
+    /// characters each, and the decision and its basis not at all: they are
+    /// what the decider reverses, so they are cut last, only as the longest
+    /// texts, never before a shorter one.
     pub fn render(&self) -> String {
-        let question = &self.question;
-        let options: Vec<String> = question.options.iter().map(|o| flatten(o)).collect();
-        let texts = vec![
-            Fit::capped(flatten(&question.category), LONGER, DECIDED_CATEGORY_CHARS),
-            Fit::capped(flatten(&question.text), LONGER, DECIDED_TEXT_CHARS),
-            Fit::capped(flatten(&question.context), LONGER, DECIDED_TEXT_CHARS),
-            Fit::capped(options.join(" / "), LONGER, DECIDED_TEXT_CHARS),
-            Fit::new(flatten(&self.decision), LONGER),
-            Fit::new(flatten(&self.basis), LONGER),
-        ];
+        let mut texts: Vec<Fit> = question_fits(&self.question, LONGER, DECIDED_TEXT_CHARS).into();
+        texts.push(Fit::new(flatten(&self.decision), LONGER));
+        texts.push(Fit::new(flatten(&self.basis), LONGER));
         fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
     }
 
     /// The body of `texts`, as [`Self::render`] gives them, maybe cut.
     fn body(&self, texts: &[String]) -> String {
-        let [category, text, context, options, decision, basis] = texts else {
+        let (question, [decision, basis]) = texts.split_at(QUESTION_TEXTS) else {
             unreachable!("a decision has six texts")
         };
         let header = Header {
             kind: MarkerKind::Decision,
             round: None,
         };
-        let mut block = vec![format!("**Question** ({category}) {text}")];
-        if !context.is_empty() {
-            block.push(context.clone());
-        }
-        if !self.question.options.is_empty() {
-            block.push(format!("Options: {options}"));
-        }
         let sections = [
             header.render(),
             "Owlshift decided this question of a run without asking you: what the ticket, the \
              project's rules or the repository already settles. It is reversible."
                 .to_owned(),
-            block.join("\n"),
+            question_lines("Question", &self.question, question),
             format!("**Decision:** {decision}\n**Settled by:** {basis}"),
             "To reverse it, reply to this comment with what you want instead: the next run \
              follows your reply over this decision, and once the pull request is delivered, \
@@ -1298,7 +1360,7 @@ impl ReaskComment {
             .open
             .iter()
             .flat_map(|(question, verdict)| {
-                question_texts(question)
+                question_fits(question, RESTATED, RESTATED_TEXT_CHARS)
                     .into_iter()
                     .chain([Fit::new(flatten(&verdict.reason), LONGER)])
             })
@@ -1317,12 +1379,14 @@ impl ReaskComment {
                     self.reask
                 ),
             ];
-            for ((question, verdict), texts) in self.open.iter().zip(texts.chunks(6)) {
+            for ((question, verdict), texts) in
+                self.open.iter().zip(texts.chunks(QUESTION_TEXTS + 1))
+            {
                 sections.push(format!(
-                    "{}\nStill open ({}): {}",
-                    question_lines(question, &texts[..5]),
+                    "{}\n\n**Still open** ({}): {}",
+                    question_lines(question.id.as_str(), question, &texts[..QUESTION_TEXTS]),
                     class_name(verdict.class),
-                    texts[5]
+                    texts[QUESTION_TEXTS]
                 ));
             }
             let footer = Footer {
@@ -1370,8 +1434,9 @@ impl ReplyComment {
             .replies
             .iter()
             .flat_map(|(question, reply)| {
-                let [category, text, ..] = question_texts(question);
-                [category, text, Fit::new(flatten(reply), LONGER)]
+                question_fits(question, RESTATED, RESTATED_TEXT_CHARS)
+                    .into_iter()
+                    .chain([Fit::new(flatten(reply), LONGER)])
             })
             .collect();
         fitted(room, texts, |texts| {
@@ -1385,10 +1450,12 @@ impl ReplyComment {
                  asked again."
                     .to_owned(),
             ];
-            for ((question, _), texts) in self.replies.iter().zip(texts.chunks(3)) {
+            for ((question, _), texts) in self.replies.iter().zip(texts.chunks(QUESTION_TEXTS + 1))
+            {
                 sections.push(format!(
-                    "**{}** ({}) {}\nReply: {}",
-                    question.id, texts[0], texts[1], texts[2]
+                    "{}\n\n**Reply:** {}",
+                    question_lines(question.id.as_str(), question, &texts[..QUESTION_TEXTS]),
+                    texts[QUESTION_TEXTS]
                 ));
             }
             sections.push(format!(
@@ -1983,12 +2050,13 @@ impl ResumeComment {
             .understood
             .iter()
             .flat_map(|(question, verdict)| {
-                let [category, text, ..] = question_texts(question);
                 let understood = match verdict {
                     Some(verdict) => flatten(&verdict.reason),
                     None => NOT_KEPT.to_owned(),
                 };
-                [category, text, Fit::new(understood, LONGER)]
+                question_fits(question, RESTATED, RESTATED_TEXT_CHARS)
+                    .into_iter()
+                    .chain([Fit::new(understood, LONGER)])
             })
             .collect();
         fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
@@ -2036,10 +2104,11 @@ impl ResumeComment {
                 )
             },
         ];
-        for ((question, _), texts) in self.understood.iter().zip(texts.chunks(3)) {
+        for ((question, _), texts) in self.understood.iter().zip(texts.chunks(QUESTION_TEXTS + 1)) {
             sections.push(format!(
-                "**{}** ({}) {}\nUnderstood: {}",
-                question.id, texts[0], texts[1], texts[2]
+                "{}\n\n**Understood:** {}",
+                question_lines(question.id.as_str(), question, &texts[..QUESTION_TEXTS]),
+                texts[QUESTION_TEXTS]
             ));
         }
         let footer = Footer {
@@ -2098,8 +2167,9 @@ impl ParkedComment {
                 .open
                 .iter()
                 .flat_map(|(question, verdict)| {
-                    let [category, text, ..] = question_texts(question);
-                    [category, text, Fit::new(flatten(&verdict.reason), LONGER)]
+                    question_fits(question, RESTATED, RESTATED_TEXT_CHARS)
+                        .into_iter()
+                        .chain([Fit::new(flatten(&verdict.reason), LONGER)])
                 })
                 .collect(),
             ParkReason::IsolationBreach => Vec::new(),
@@ -2110,7 +2180,7 @@ impl ParkedComment {
             | ParkReason::Forge => vec![Fit::capped(
                 flatten(&self.detail),
                 LONGER,
-                SPLIT_SUMMARY_CHARS,
+                PARKED_DETAIL_CHARS,
             )],
         };
         fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
@@ -2134,14 +2204,14 @@ impl ParkedComment {
                     "Parked: {}, after {MAX_REASKS} re-asks. Still open{round}:",
                     park_reason(self.reason)
                 ));
-                for ((question, verdict), texts) in self.open.iter().zip(texts.chunks(3)) {
+                for ((question, verdict), texts) in
+                    self.open.iter().zip(texts.chunks(QUESTION_TEXTS + 1))
+                {
                     sections.push(format!(
-                        "**{}** ({}) {}\nStill open ({}): {}",
-                        question.id,
-                        texts[0],
-                        texts[1],
+                        "{}\n\n**Still open** ({}): {}",
+                        question_lines(question.id.as_str(), question, &texts[..QUESTION_TEXTS]),
                         class_name(verdict.class),
-                        texts[2]
+                        texts[QUESTION_TEXTS]
                     ));
                 }
             }
@@ -2375,6 +2445,38 @@ fn flatten(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `text` [`flatten`]ed for a line of its own (OWL-324): a first character
+/// that could open a Markdown block there (a heading, a quote, a list, a
+/// rule, a fence, a table, HTML, a link definition) is escaped with a
+/// backslash, and so is the `.` or `)` after leading digits, an ordered
+/// list. Markdown hides the backslash.
+fn inline(text: &str) -> String {
+    let text = flatten(text);
+    let Some(first) = text.chars().next() else {
+        return text;
+    };
+    if "#>-+*=_|<`~[".contains(first) {
+        return format!("\\{text}");
+    }
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    if (1..=9).contains(&digits) && matches!(text[digits..].chars().next(), Some('.' | ')')) {
+        return format!("{}\\{}", &text[..digits], &text[digits..]);
+    }
+    text
+}
+
+/// A question's text for its `### Qn · text` heading: [`flatten`]ed, and a
+/// final run of `#` escaped, which Markdown would take for the heading's
+/// closing sequence and hide.
+fn heading_text(text: &str) -> String {
+    let text = flatten(text);
+    let kept = text.trim_end_matches('#');
+    if kept.len() == text.len() {
+        return text;
+    }
+    format!("{kept}\\{}", &text[kept.len()..])
+}
+
 /// An inline code span. A backtick inside would close it early, so it
 /// becomes a quote.
 fn code(text: &str) -> String {
@@ -2502,12 +2604,12 @@ impl<'a> Writer<'a> {
     }
 
     /// The same Writer, mentioning the account `decider` in the comments
-    /// that wait for them: QUESTIONS, RE-ASK and REPLY (OWL-157). Right after
-    /// the header, a `Waiting for <mention>` line names them in the
-    /// tracker's own way, so a tracker that notifies on a mention tells them
-    /// even when they do not follow the ticket. A tracker with no mention
-    /// gets the comment as rendered; one that could not give the mention
-    /// too, and the [`Posted`] comment says why it was left out.
+    /// that wait for them: QUESTIONS, RE-ASK and REPLY (OWL-157). The header
+    /// line ends with ` · ` and their mention in the tracker's own way
+    /// (OWL-324), so a tracker that notifies on a mention tells them even
+    /// when they do not follow the ticket. A tracker with no mention gets
+    /// the comment as rendered; one that could not give the mention too,
+    /// and the [`Posted`] comment says why it was left out.
     pub fn mentioning(mut self, decider: &str) -> Self {
         self.decider = Some(decider.to_owned());
         self
@@ -2885,24 +2987,19 @@ impl<'a> Writer<'a> {
     }
 }
 
-/// The line that names the decider a comment waits for.
-fn waiting_line(mention: &str) -> String {
-    format!("Waiting for {mention}")
-}
-
-/// The characters a comment's body may take beside the line naming the
-/// decider, when it has one ([`with_mention`]).
+/// The characters a comment's body may take beside the decider's mention at
+/// the end of its header line, when it has one ([`with_mention`]).
 fn room_beside(mention: Option<&str>) -> usize {
-    let line = mention.map_or(0, |m| chars(&waiting_line(m)) + 2);
+    let line = mention.map_or(0, |m| chars(HEADER_SEPARATOR) + chars(m));
     MAX_COMMENT_CHARS.saturating_sub(line)
 }
 
-/// `body` with the line naming the decider as its second section, when
-/// there is a mention.
+/// `body` with the decider's mention at the end of its header line, after
+/// ` · ` (OWL-324), when there is a mention.
 fn with_mention(body: String, mention: Option<&str>) -> String {
-    match (mention, body.split_once("\n\n")) {
+    match (mention, body.split_once('\n')) {
         (Some(mention), Some((header, rest))) => {
-            format!("{header}\n\n{}\n\n{rest}", waiting_line(mention))
+            format!("{header}{HEADER_SEPARATOR}{mention}\n{rest}")
         }
         _ => body,
     }
@@ -2976,7 +3073,7 @@ mod tests {
 
     use owlshift_adapters::forge::{Check, CheckKind, CommitId, ErrorKind};
     use owlshift_adapters::tracker::{Author, Capability, ErrorKind as TrackerErrorKind, Ticket};
-    use owlshift_contracts::result::FollowupSource;
+    use owlshift_contracts::result::{FollowupSource, QuestionOption, Recommendation};
 
     use super::*;
 
@@ -2985,6 +3082,19 @@ mod tests {
 
     fn ticket() -> TicketId {
         TicketId::new("OWL-18").unwrap()
+    }
+
+    /// Options of these labels, without detail.
+    fn labels(labels: &[&str]) -> Vec<QuestionOption> {
+        labels.iter().copied().map(QuestionOption::new).collect()
+    }
+
+    /// A recommendation of the option `letter`, or of no option.
+    fn recommends(letter: Option<&str>, why: &str) -> Option<Recommendation> {
+        Some(Recommendation {
+            option: letter.map(str::to_owned),
+            why: why.to_owned(),
+        })
     }
 
     fn head() -> CommitId {
@@ -3701,8 +3811,8 @@ Merge state reported by the forge: `CLEAN`.
             category: "scope".to_owned(),
             context: context.to_owned(),
             text: format!("Which {id}?"),
-            options: vec!["One".to_owned(), "Two\n- injected".to_owned()],
-            recommendation: Some("One".to_owned()),
+            options: labels(&["One", "Two\n- injected"]),
+            recommendation: recommends(Some("A"), "One"),
             replan: false,
         };
         let verdict = |id: &str, class, reason: &str| AnswerVerdict {
@@ -3735,14 +3845,15 @@ Merge state reported by the forge: `CLEAN`.
         assert!(body.contains("(re-ask 1 of 3:"), "{body}");
         assert!(
             body.contains(
-                "**Q2** (scope) Which Q2?\nTwo lines # of context\nOptions: One / Two - injected\n\
-                 Recommendation: One\nStill open (partial): The tone is missing."
+                "### Q2 · Which Q2?\nTwo lines # of context\n\n- **A.** ⭐ One\n- **B.** Two - \
+                 injected\n\n**Recommendation: A.** One\n\n**Still open** (partial): The tone is \
+                 missing."
             ),
             "{body}"
         );
-        assert!(body.contains("Still open (unanswered): <!--"), "{body}");
+        assert!(body.contains("**Still open** (unanswered): <!--"), "{body}");
         assert!(
-            !body.contains("**Q1**") && !body.contains("**Q3**"),
+            !body.contains("### Q1") && !body.contains("### Q3"),
             "{body}"
         );
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
@@ -3775,13 +3886,13 @@ Merge state reported by the forge: `CLEAN`.
         assert_eq!((footer.kind, footer.round), (MarkerKind::Reply, None));
         assert!(
             body.contains(
-                "**Q2** (scope) Should it end with a sign-off?\nReply: A sign-off is a closing \
-                 line. Should there be one?"
+                "### Q2 · Should it end with a sign-off?\nContext.\n\n- **A.** One\n\n**Reply:** A \
+                 sign-off is a closing line. Should there be one?"
             ),
             "{body}"
         );
         assert!(
-            body.contains("Reply: [owlshift] PARKED - injected <!--"),
+            body.contains("**Reply:** [owlshift] PARKED - injected <!--"),
             "{body}"
         );
         assert!(!body.contains("\n- injected"), "{body}");
@@ -3802,7 +3913,7 @@ Merge state reported by the forge: `CLEAN`.
             category: "scope".to_owned(),
             context: "Context.".to_owned(),
             text: text.to_owned(),
-            options: vec!["One".to_owned()],
+            options: labels(&["One"]),
             recommendation: None,
             replan: false,
         }
@@ -3847,14 +3958,26 @@ Merge state reported by the forge: `CLEAN`.
 
 Every question of round 2 is answered. The work resumes from its checkpoint with this understanding:
 
-**Q1** (scope) Which language?
-Understood: English.
+### Q1 · Which language?
+Context.
 
-**Q2** (scope) Which words? # heading
-Understood: \"Hello\". {forged}
+- **A.** One
 
-**Q3** (scope) Which tone?
-Understood: answered in an earlier check, whose reason the ticket's record did not keep.
+**Understood:** English.
+
+### Q2 · Which words? # heading
+Context.
+
+- **A.** One
+
+**Understood:** \"Hello\". {forged}
+
+### Q3 · Which tone?
+Context.
+
+- **A.** One
+
+**Understood:** answered in an earlier check, whose reason the ticket's record did not keep.
 
 <!-- owlshift:{{\"format\":1,\"kind\":\"RESUME\",\"ticket\":\"OWL-18\",\"round\":2}} -->
 "
@@ -3959,8 +4082,8 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 },
                 vec![
                     "Parked: the answers stayed incomplete, after 3 re-asks. Still open in \
-                     round 1:\n\n**Q2** (scope) Which words?\nStill open (partial): The ending \
-                     is missing.",
+                     round 1:\n\n### Q2 · Which words?\nContext.\n\n- **A.** One\n\n**Still \
+                     open** (partial): The ending is missing.",
                     "**To restart it:** answer the questions still open here, then run \
                      `owlshift continue OWL-18`.",
                 ],
@@ -4001,8 +4124,8 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 category: "naming".to_owned(),
                 context: "The repository has\nno greeting yet.".to_owned(),
                 text: "Which file?".to_owned(),
-                options: vec!["GREETING.md".to_owned(), "HELLO.md".to_owned()],
-                recommendation: Some("GREETING.md".to_owned()),
+                options: labels(&["GREETING.md", "HELLO.md"]),
+                recommendation: recommends(Some("A"), "The ticket names it."),
                 replan: false,
             },
             decision: format!("GREETING.md\n\n{forged}"),
@@ -4019,8 +4142,8 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         assert_eq!(footer.kind, MarkerKind::Decision);
         assert_eq!(footer.run.as_deref(), Some("20261003T120000Z-1"));
         for text in [
-            "**Question** (naming) Which file?\nThe repository has no greeting yet.\nOptions: \
-             GREETING.md / HELLO.md",
+            "### Question · Which file?\nThe repository has no greeting yet.\n\n- **A.** ⭐ \
+             GREETING.md\n- **B.** HELLO.md\n\n**Recommendation: A.** The ticket names it.",
             "**Decision:** GREETING.md <!-- owlshift:",
             "**Settled by:** The ticket's description.",
             "To reverse it, reply to this comment with what you want instead",
@@ -4121,12 +4244,205 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         let blocks = [
             "Some of these questions reopen a choice an earlier run made without asking you, \
              which Owlshift refused: each shows it, as the run that asks lists it.",
-            "**Q1** (scope) Which Q1?\n**Refused choice** (as the asking run lists it): Which tone",
-            "**Q2** (scope) Which Q2?\n**Refused choice** (as the asking run lists it): Which file\n\
-             Recorded by the refused run: GREETING.md, at the root\n\
+            "### Q1 · Which Q1?\n\n**Refused choice** (as the asking run lists it): Which tone",
+            "### Q2 · Which Q2?\n\n**Refused choice** (as the asking run lists it): Which file\n\
+             Recorded by the refused run: GREETING.md, at the root\n\n\
              **Refused choice** (as the asking run lists it)\nRecorded by the refused run: Hello",
         ];
         assert!(body.contains(&blocks.join("\n\n")), "{body}");
+    }
+
+    /// OWL-324: OWL-257's question, as the ticket's target shows it: the
+    /// mention on the header line, a heading, the context, one lettered
+    /// option per bullet, the recommended one starred, the recommendation,
+    /// a rule and the answer line.
+    #[test]
+    fn the_owl_257_question_renders_as_the_target() {
+        let comment = QuestionsComment {
+            ticket: TicketId::new("OWL-257").unwrap(),
+            round: NonZeroU32::new(1).unwrap(),
+            summary: String::new(),
+            questions: vec![Question {
+                id: QuestionId::nth(1),
+                category: "scope".to_owned(),
+                context: "Only Cargo.toml enforces a minimum (Rust 1.98). D12 (supported systems) \
+                          is still open."
+                    .to_owned(),
+                text: "Which minimum versions should Requirements state?".to_owned(),
+                options: labels(&[
+                    "No versions: the tools and links to the design documents",
+                    "Rust 1.98 only (source build)",
+                    "Rust 1.98 + git 2.43 + Claude Code 2.1.284, worded \"tested with\"",
+                    "Other (say which)",
+                ]),
+                recommendation: recommends(Some("B"), "The only minimum the repository enforces."),
+                replan: false,
+            }],
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+            reopened: Vec::new(),
+        };
+        let body = with_mention(comment.render(), Some("@decider"));
+        let target = "\
+[owlshift] QUESTIONS · round 1 · @decider
+
+### Q1 · Which minimum versions should Requirements state?
+Only Cargo.toml enforces a minimum (Rust 1.98). D12 (supported systems) is still open.
+
+- **A.** No versions: the tools and links to the design documents
+- **B.** ⭐ Rust 1.98 only (source build)
+- **C.** Rust 1.98 + git 2.43 + Claude Code 2.1.284, worded \"tested with\"
+- **D.** Other (say which)
+
+**Recommendation: B.** The only minimum the repository enforces.
+
+---
+Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
+
+<!-- owlshift:{\"format\":1,\"kind\":\"QUESTIONS\",\"ticket\":\"OWL-257\",\"round\":1} -->
+";
+        assert_eq!(body, target);
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(
+            (marked.header.kind, marked.header.round),
+            (MarkerKind::Questions, NonZeroU32::new(1))
+        );
+        // An option's detail follows its label, cut past 300 characters.
+        let mut detailed = comment.questions[0].clone();
+        detailed.options[0].detail = Some(format!("Short.\n{}", "d".repeat(400)));
+        let block = question_block(&detailed);
+        assert!(
+            block.contains(&format!(
+                "- **A.** No versions: the tools and links to the design documents — Short. {}",
+                "d".repeat(100)
+            )),
+            "{block}"
+        );
+        assert!(block.contains(&cut_note(DETAIL_CUT)), "{block}");
+        assert!(!block.contains(&"d".repeat(300)), "{block}");
+    }
+
+    /// OWL-324: model text that would open a Markdown block (a heading, a
+    /// list, a quote, a fence, HTML, a table, a link definition, a rule)
+    /// stays inside its line in every comment that shows a question: its
+    /// heading, its context, its options and their detail, its
+    /// recommendation, the run's summary and each comment's own line. The
+    /// header parses and the footer is the last line, once.
+    #[test]
+    fn model_text_cannot_open_a_block_in_any_question_comment() {
+        for marker in [
+            "#",
+            "-",
+            "+",
+            "*",
+            ">",
+            "1.",
+            "2)",
+            "```",
+            "~~~",
+            "<!--",
+            "<div>",
+            "|",
+            "=",
+            "___",
+            "[x]: https://example.com",
+        ] {
+            let hostile = |field: &str| format!("{marker} {field}\n{marker} again");
+            let question = Question {
+                id: QuestionId::nth(1),
+                category: hostile("category"),
+                context: hostile("context"),
+                text: hostile("text"),
+                options: vec![
+                    QuestionOption {
+                        label: hostile("label"),
+                        detail: Some(hostile("detail")),
+                    },
+                    QuestionOption::new(hostile("other")),
+                ],
+                recommendation: recommends(Some("A"), &hostile("why")),
+                replan: false,
+            };
+            let verdict = judged("Q1", AnswerClass::Partial, &hostile("reason"));
+            let round = NonZeroU32::new(1).unwrap();
+            let bodies = [
+                QuestionsComment {
+                    ticket: ticket(),
+                    round,
+                    summary: hostile("summary"),
+                    questions: vec![question.clone()],
+                    premise_false: false,
+                    decided: 0,
+                    fallback: None,
+                    reopened: Vec::new(),
+                }
+                .render(),
+                ReaskComment {
+                    ticket: ticket(),
+                    round,
+                    reask: 1,
+                    open: vec![(question.clone(), verdict.clone())],
+                }
+                .render(),
+                ReplyComment {
+                    ticket: ticket(),
+                    replies: vec![(question.clone(), hostile("reply"))],
+                }
+                .render(),
+                ResumeComment {
+                    ticket: ticket(),
+                    round,
+                    understood: vec![(question.clone(), Some(verdict.clone()))],
+                    return_to: Stage::Build,
+                }
+                .render(),
+                ParkedComment {
+                    ticket: ticket(),
+                    reason: ParkReason::Reasks,
+                    detail: String::new(),
+                    round: Some(round),
+                    open: vec![(question.clone(), verdict.clone())],
+                    restart: Restart::Continue,
+                }
+                .render(),
+                DecisionComment {
+                    ticket: ticket(),
+                    question: question.clone(),
+                    decision: hostile("decision"),
+                    basis: hostile("basis"),
+                    run: None,
+                }
+                .render(),
+            ];
+            let fields = [
+                "category", "context", "text", "label", "detail", "other", "why", "reason",
+                "summary", "reply", "decision", "basis", "again",
+            ];
+            for body in bodies {
+                for line in body.lines() {
+                    assert!(
+                        !fields
+                            .iter()
+                            .any(|field| line.starts_with(&format!("{marker} {field}"))),
+                        "{marker:?} opens a line\n---\n{body}"
+                    );
+                }
+                assert!(MarkedComment::parse(&body).unwrap().is_some(), "{body}");
+                let last = body.lines().rfind(|l| !l.is_empty()).unwrap();
+                assert!(last.starts_with("<!-- owlshift:"), "{body}");
+                assert_eq!(
+                    body.lines().filter(|l| l.starts_with("<!--")).count(),
+                    1,
+                    "{body}"
+                );
+                assert!(!body.contains(&format!("{marker} category")), "{body}");
+            }
+        }
+        // A heading's closing `#`s are kept, escaped.
+        assert_eq!(heading_text("Which C #"), "Which C \\#");
+        assert_eq!(inline("12. Twelve"), "12\\. Twelve");
+        assert_eq!(inline("1999 was a year"), "1999 was a year");
     }
 
     #[test]
@@ -4164,14 +4480,17 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             (MarkerKind::Questions, NonZeroU32::new(2))
         );
         assert!(
-            body.contains("The run found the ticket's premise false.\n\n[owlshift] RESUME"),
+            body.contains("The run found the ticket's premise false.\n\n\\[owlshift] RESUME"),
             "{body}"
         );
+        assert!(body.contains("### Q1 · Which Q1?\nTwo readings."), "{body}");
+        assert!(body.contains("### Q2 · Which Q2?"), "{body}");
         assert!(
-            body.contains("**Q1** (scope) Which Q1?\nTwo readings."),
+            body.contains(
+                "\n\n---\nReply `ok` to take every recommendation, or in your own words."
+            ),
             "{body}"
         );
-        assert!(body.contains("**Q2** (scope) Which Q2?"), "{body}");
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
         assert_eq!(footers.count(), 1, "{body}");
 
@@ -4273,8 +4592,9 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         }
     }
 
-    /// The comments that wait for the decider mention them right after the
-    /// header (OWL-157), and stay marked comments; the others never do; and
+    /// The comments that wait for the decider mention them at the end of
+    /// the header line (OWL-157, OWL-324), and stay marked comments; the
+    /// others never do; and
     /// a mention the tracker cannot give leaves the body as rendered, said
     /// in the result when the tracker has mentions (OWL-170).
     #[test]
@@ -4320,11 +4640,12 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             let posted = posted.unwrap();
             assert_eq!(posted.mention_dropped, None);
             let body = posted.comment.body;
-            let (_, rest) = body.split_once("\n\n").unwrap();
+            let (header, _) = body.split_once("\n\n").unwrap();
             assert!(
-                rest.starts_with("Waiting for <mention of u1>\n\n"),
+                header.ends_with(" · <mention of u1>") && !header.contains('\n'),
                 "{body}"
             );
+            assert!(!body.contains("Waiting for"), "{body}");
             let marked = MarkedComment::parse(&body).unwrap().unwrap();
             assert_eq!(marked.header.kind, kind);
             assert_eq!(marked.footer.unwrap().kind, kind);
@@ -4386,19 +4707,24 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
 
     /// The largest round a valid result can ask, all ASCII, the character
     /// count Linear bounds being largest per byte: 64 questions of about
-    /// 2 KiB as JSON (`MAX_QUESTIONS_BYTES` together), each reopening one
-    /// of 64 refused choices of two 512-byte texts, and a long summary.
+    /// 2 KiB as JSON (`MAX_QUESTIONS_BYTES` together), each with two
+    /// options with detail, each reopening one of 64 refused choices of two
+    /// 512-byte texts, and a long summary.
     fn maximal_round() -> QuestionsComment {
         use owlshift_contracts::brief::{MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES};
         use owlshift_contracts::result::{MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES};
+        let option = |label: &str, detail: &str| QuestionOption {
+            label: label.repeat(20),
+            detail: Some(detail.repeat(100)),
+        };
         let questions: Vec<Question> = (1..=MAX_QUESTIONS)
             .map(|n| Question {
                 id: QuestionId::new(format!("Q{n}")).unwrap(),
                 category: "scope".to_owned(),
                 context: "c".repeat(980),
-                text: format!("Which {n}? {}", "t".repeat(900)),
-                options: vec!["o".repeat(20), "p".repeat(20)],
-                recommendation: Some("r".repeat(20)),
+                text: format!("Which {n}? {}", "t".repeat(600)),
+                options: vec![option("o", "d"), option("p", "e")],
+                recommendation: recommends(Some("B"), &"r".repeat(20)),
                 replan: false,
             })
             .collect();
@@ -4476,27 +4802,32 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             );
             assert!(body.contains(&format!("\n\nPart {} of {n} of this round", i + 1)));
             let last = i + 1 == n;
+            let header = body.lines().next().unwrap();
+            assert_eq!(header.ends_with(" · <mention of u1>"), last, "part {i}");
             assert_eq!(
-                body.contains("Waiting for <mention of u1>"),
+                body.contains("\n\n---\nReply `Q1: B`, `ok` to take every recommendation"),
                 last,
                 "part {i}"
             );
-            assert_eq!(body.contains("Answer here"), last, "part {i}");
             assert_eq!(body.contains(&"s".repeat(100)), i == 0, "part {i}");
             // Each question whole, with its reopened choice, in order.
             let mut at = 0;
-            while let Some(found) = body[at..].find(&format!("**Q{next}** (scope) Which {next}?")) {
+            while let Some(found) = body[at..].find(&format!("### Q{next} · Which {next}?")) {
                 at += found;
                 let recorded = format!(
                     "Recorded by the refused run: {}",
                     format!("{next:<512}").replace(' ', "b")
                 );
                 assert!(body[at..].contains(&recorded), "Q{next}");
+                assert!(body[at..].contains("- **B.** ⭐ "), "Q{next}");
                 next += 1;
             }
         }
         assert_eq!(next, 65, "every question, in order");
-        assert!(parts[0].contains(" … (cut: the run's summary is longer than a comment holds)"));
+        assert!(parts[0].contains(&format!(
+            "{} … (cut: a question round shows at most 400 characters of the summary)",
+            "s".repeat(10)
+        )));
         assert!(!parts.concat().contains("this question is longer"));
     }
 
@@ -4513,7 +4844,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         round.questions[0].text = "x".repeat(6_000);
         let parts = round.parts(MAX_COMMENT_CHARS - 200);
         assert_eq!(parts.len(), 1);
-        assert!(!parts[0].contains("(cut:"));
+        assert!(!parts[0].contains("this question is longer"));
 
         let parts = round.parts(5_000);
         assert!(parts.iter().all(|part| chars(part) <= 5_000));
@@ -4849,13 +5180,23 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
     }
 
     /// The open questions of a round at its bounds (`maximal_round`), each
-    /// with a verdict, one of them 300,000 characters long.
+    /// with a verdict, one of them 300,000 characters long; one question in
+    /// four offers no option and one in four was kept without a
+    /// recommendation, so the texts of the questions differ in shape.
     fn maximal_open() -> Vec<(Question, AnswerVerdict)> {
         maximal_round()
             .questions
             .into_iter()
             .enumerate()
-            .map(|(i, question)| {
+            .map(|(i, mut question)| {
+                match i % 4 {
+                    0 => {
+                        question.options.clear();
+                        question.recommendation = recommends(None, &"r".repeat(20));
+                    }
+                    1 => question.recommendation = None,
+                    _ => {}
+                }
                 let reason = if i == 7 { 300_000 } else { 2_000 };
                 let verdict = judged(
                     question.id.as_str(),
@@ -4873,7 +5214,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         let mut at = 0;
         for n in 1..=64 {
             let found = body[at..]
-                .find(&format!("**Q{n}** (scope) Which {n}?"))
+                .find(&format!("### Q{n} · Which {n}?"))
                 .unwrap_or_else(|| panic!("Q{n}"));
             at += found;
             let line = body[at..].find(then).unwrap_or_else(|| panic!("Q{n}"));
@@ -4907,9 +5248,13 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             (
                 writer.post_reask(&reask),
                 MarkerKind::ReAsk,
-                "\nStill open (partial): m",
+                "\n\n**Still open** (partial): m",
             ),
-            (writer.post_reply(&reply), MarkerKind::Reply, "\nReply: m"),
+            (
+                writer.post_reply(&reply),
+                MarkerKind::Reply,
+                "\n\n**Reply:** m",
+            ),
         ];
         for (posted, kind, then) in posted {
             let body = posted.unwrap().comment.body;
@@ -4918,22 +5263,36 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 "{kind:?}: {}",
                 chars(&body)
             );
+            // The common length leaves at most a character per text it cuts:
+            // five texts for each of the 64 questions.
             assert!(
-                chars(&body) > MAX_COMMENT_CHARS - 100,
-                "{kind:?}: room left unused"
+                chars(&body) > MAX_COMMENT_CHARS - 5 * 64,
+                "{kind:?}: room left unused: {}",
+                chars(&body)
             );
             let marked = MarkedComment::parse(&body).unwrap().unwrap();
             assert_eq!(marked.header.kind, kind);
             assert_eq!(marked.footer.unwrap().ticket, ticket());
-            assert!(body.contains("\n\nWaiting for <mention of u1>\n\n"));
+            assert!(body.lines().next().unwrap().ends_with(" · <mention of u1>"));
             every_question_in_order(&body, then);
             assert!(body.contains(&cut_note(RESTATED)), "{kind:?}");
             assert!(body.contains(&cut_note(LONGER)), "{kind:?}");
         }
+        let offering = reask
+            .open
+            .iter()
+            .filter(|(q, _)| !q.options.is_empty())
+            .count();
+        assert_eq!(offering, 48);
         assert_eq!(
-            reask.render().matches("\nOptions: ").count(),
-            64,
-            "the options line stays"
+            reask.render().matches("\n\n- **A.** ").count(),
+            offering,
+            "the options stay"
+        );
+        assert_eq!(
+            reask.render().matches("\n\n**Recommendation:** r").count(),
+            16,
+            "a recommendation without options shows alone"
         );
         let unmentioned = Writer::new(&tracker);
         assert_eq!(
@@ -4975,9 +5334,9 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         let marked = MarkedComment::parse(&body).unwrap().unwrap();
         assert_eq!(marked.header.kind, MarkerKind::Resume);
         assert!(marked.footer.is_some());
-        every_question_in_order(&body, "\nUnderstood: ");
+        every_question_in_order(&body, "\n\n**Understood:** ");
         assert!(body.contains(&cut_note(LONGER)));
-        assert!(body.contains("**Q4** (scope) Which 4?"));
+        assert!(body.contains("### Q4 · Which 4?"));
         assert!(body.contains(NOT_KEPT));
         // A round that holds is rendered whole.
         let small = ResumeComment {
@@ -5000,7 +5359,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 category: "c".repeat(1 << 20),
                 context: "x".repeat(1 << 20),
                 text: format!("Which?{}", "t".repeat(1 << 20)),
-                options: vec!["o".repeat(1 << 20), "p".repeat(1 << 20)],
+                options: labels(&[&"o".repeat(1 << 20), &"p".repeat(1 << 20)]),
                 recommendation: None,
                 replan: false,
             },
@@ -5015,9 +5374,8 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         assert_eq!(marked.header.kind, MarkerKind::Decision);
         assert!(marked.footer.is_some());
         for frame in [
-            "**Question** (",
-            ") Which?",
-            "\nOptions: ",
+            "### Question · Which?",
+            "\n\n- **A.** o",
             "**Decision:** d",
             "\n**Settled by:** b",
             "To reverse it, reply to this comment",
@@ -5025,11 +5383,12 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             assert!(body.contains(frame), "{frame}");
         }
         assert!(body.contains(&cut_note(LONGER)));
-        // The question's texts stop at their caps; the decision and its
-        // basis keep the most of what is left.
-        assert!(!body.contains(&"c".repeat(DECIDED_CATEGORY_CHARS + 1)));
+        // The question's texts stop at their caps, its context at its own;
+        // the decision and its basis keep the most of what is left.
+        assert!(!body.contains(&"c".repeat(10)), "no category");
         assert!(!body.contains(&"t".repeat(DECIDED_TEXT_CHARS + 1)));
-        assert!(!body.contains(&"x".repeat(DECIDED_TEXT_CHARS + 1)));
+        assert!(!body.contains(&"x".repeat(CONTEXT_CHARS + 1)));
+        assert!(body.contains(&cut_note(CONTEXT_CUT)));
         assert!(!body.contains(&"o".repeat(DECIDED_TEXT_CHARS + 1)));
         assert!(body.contains(&"d".repeat(30_000)) && body.contains(&"b".repeat(30_000)));
         // What holds whole is rendered as it is, every text in its place.
@@ -5038,7 +5397,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
                 category: "naming".to_owned(),
                 context: "Context.".to_owned(),
                 text: "Which?".to_owned(),
-                options: vec!["a".to_owned(), "b".to_owned()],
+                options: labels(&["a", "b"]),
                 ..decision.question.clone()
             },
             decision: "A.".to_owned(),
@@ -5048,7 +5407,7 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
         let body = small.render();
         assert!(!body.contains("(cut: "));
         assert!(body.contains(
-            "**Question** (naming) Which?\nContext.\nOptions: a / b\n\n**Decision:** A.\n\
+            "### Question · Which?\nContext.\n\n- **A.** a\n- **B.** b\n\n**Decision:** A.\n\
              **Settled by:** The ticket.\n\n"
         ));
     }
@@ -5081,9 +5440,9 @@ Understood: answered in an earlier check, whose reason the ticket's record did n
             assert!(marked.footer.is_some());
             assert!(body.contains("**To restart it:**"));
         }
-        every_question_in_order(&reasks.render(), "\nStill open (partial): m");
+        every_question_in_order(&reasks.render(), "\n\n**Still open** (partial): m");
         let body = blocked.render();
-        let kept = SPLIT_SUMMARY_CHARS - chars(&cut_note(LONGER));
+        let kept = PARKED_DETAIL_CHARS - chars(&cut_note(LONGER));
         assert!(body.contains(&format!("{}{}", "d".repeat(kept), cut_note(LONGER))));
         assert!(!body.contains(&"d".repeat(kept + 1)));
     }

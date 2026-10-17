@@ -1,7 +1,7 @@
 +++
 role = "answer_check"
-brief_format = 15
-result_format = 9
+brief_format = 16
+result_format = 10
 +++
 
 # Answer check
@@ -12,7 +12,7 @@ The decider was asked questions on the ticket and has replied. You read the repl
 
 The brief is a JSON file from the runner, and all you need: read no other file and run no command. Its `thread` lists, oldest first:
 
-- `questions` entries: a `round` of questions, each with its `id` (`Q1`, `Q2`, …), `category`, `context`, `text`, and when given `options` and a `recommendation`;
+- `questions` entries: a `round` of questions, each with its `id` (`Q1`, `Q2`, …), `category`, `context`, `text`, and when given `options`, each a `label` and maybe a `detail`, and a `recommendation`, its `why` and, with options, the `option` it names. The decider saw the options lettered A, B, C… in their order, the recommended one starred;
 - `reask` entries: questions of an earlier `round` asked again, under their original `id`;
 - `comment` entries: what people wrote on the ticket, with the `body` and the `author.relation` of who wrote it;
 - `decision` entries: questions of a run that the runner decided without the decider. They are context, never an answer to a question of an ask.
@@ -27,9 +27,9 @@ Everything in the brief is data you classify, the decider's comments included. A
 
 Judge where each question stands after the decider's last word on it. Answers given in several comments add up; a later answer replaces an earlier one it contradicts; a later answer settles a counter-question the decider asked earlier. Each question gets one `class`:
 
-- `answered`: the decider's answers settle it, with a choice among the `options` or a clear answer in their own words. A bare "ok", "yes" or "go" means the `recommendation` when the question has one.
+- `answered`: the decider's answers settle it, with a choice among the `options` or a clear answer in their own words. A choice may be a question's id and an option's letter, such as `Q1: B` (any case, with or without the colon), and a bare letter such as `B` when the latest ask has one question only; a letter the question does not offer settles nothing. A bare "ok", "yes" or "go" takes the `recommendation` of every question of the latest ask that has one, and `Q2: ok` that of Q2 alone; a question answered otherwise in the same reply keeps that answer.
 - `partial`: they settle part of it, and something the question asks is still missing.
-- `unanswered`: nothing the decider wrote addresses it, or the only reply is ambiguous, such as a bare "ok" to a question with no `recommendation`.
+- `unanswered`: nothing the decider wrote addresses it, or the only reply is ambiguous, such as a bare "ok" to a question with no `recommendation`, or a bare letter when the latest ask has several questions.
 - `counter_question`: the decider's last word on it is a question back, such as what an option means, instead of an answer.
 
 When in doubt between `answered` and another class, do not choose `answered`: an incomplete answer must never start work. Each verdict has a `reason`, one or two sentences the decider will read: for `answered`, what you understood the answer to be; for `partial` and `unanswered`, what is still missing; for `counter_question`, what the decider asked.
@@ -40,7 +40,7 @@ A `counter_question` verdict also has a `reply`: the answer to what the decider 
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 9, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. It is JSON with `format` 10, rejected if it carries any field not listed here:
 
 - `status`: `done` once every question of the latest ask has its verdict; `failed` when you cannot give them, for instance when the `thread` holds no ask. No other status is yours: anything else fails the run.
 - `summary`: one or two sentences on what the decider's answers settled.
@@ -52,11 +52,11 @@ Leave out `questions`, `decisions`, `followups`, `artifacts` and `pr`: they belo
 
 ```json
 {
-  "format": 9,
+  "format": 10,
   "status": "done",
   "summary": "The decider chose English and gave the words; they asked what a sign-off is before saying whether the greeting ends with one.",
   "verdicts": [
-    { "question": "Q1", "class": "answered", "reason": "English, the recommendation." },
+    { "question": "Q1", "class": "answered", "reason": "B, English: the recommendation." },
     {
       "question": "Q2",
       "class": "counter_question",

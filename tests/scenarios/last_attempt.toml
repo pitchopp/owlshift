@@ -67,5 +67,5 @@ brief_result_refusal = "question Q2 is out of order: expected Q1"
 [step.expect.last_comment]
 author = "owlshift"
 first_line = "[owlshift] QUESTIONS · round 2"
-contains = ["**Q1** (scope) Should the README link to the greeting?"]
-lacks = ["**Q2**"]
+contains = ["### Q1 · Should the README link to the greeting?"]
+lacks = ["### Q2"]

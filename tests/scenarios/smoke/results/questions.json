@@ -1,5 +1,5 @@
 {
-  "format": 9,
+  "format": 10,
   "status": "questions",
   "summary": "The greeting's language is not given.",
   "questions": [
@@ -8,8 +8,18 @@
       "category": "scope",
       "context": "The ticket asks for a greeting file but names no language.",
       "text": "Which language should the greeting use?",
-      "options": ["English", "French"],
-      "recommendation": "English"
+      "options": [
+        {
+          "label": "English"
+        },
+        {
+          "label": "French"
+        }
+      ],
+      "recommendation": {
+        "option": "A",
+        "why": "The repository is written in English."
+      }
     }
   ]
 }

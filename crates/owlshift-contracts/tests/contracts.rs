@@ -21,7 +21,8 @@ use owlshift_contracts::refs::{
 };
 use owlshift_contracts::result::{
     AnswerClass, DecisionsRefusal, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES,
-    RefusedChoice, Resolution, RunResult, Status,
+    QuestionOption, Recommendation, RefusedChoice, Resolution, RunResult, Status, option_index,
+    option_letter,
 };
 use serde_json::{Value, json};
 
@@ -255,10 +256,15 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(10);
+            v["format"] = json!(11);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 9, before a question's options were lettered",
+        parse(|v| v["format"] = json!(9)),
+        "unknown format 9",
     );
     rejects(
         "format 5, before Build's decisions were refused",
@@ -304,20 +310,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 10, "status""#),
+        RunResult::parse(r#"{"format": 11, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 9, "status""#),
+        RunResult::parse(r#"{"format": 10, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(10));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(11));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 10,
-            supported: 9,
+            found: 11,
+            supported: 10,
             ..
         })
     ));
@@ -412,6 +418,111 @@ fn result_rejections() {
     assert!(direct.to_string().contains("upgrade Owlshift"));
 }
 
+/// OWL-324: every question of a result recommends an answer, naming by its
+/// capital letter an option it offers, or none when it offers none; each
+/// option has a label. Each refusal names the question and what to write.
+#[test]
+fn questions_recommend_an_option_they_offer() {
+    let sample = |edit: fn(&mut Value)| RunResult::parse(&edited("result-sample.json", edit));
+    let result = sample(|_| {}).unwrap();
+    let asked = &result.questions[0];
+    assert_eq!(asked.recommended_option(), Some(0));
+    assert_eq!(
+        asked.options[1].detail.as_deref(),
+        Some("a second module beside Z")
+    );
+    for (what, edit, needle) in [
+        (
+            "no recommendation",
+            (|v: &mut Value| {
+                v["questions"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("recommendation");
+            }) as fn(&mut Value),
+            "Q1 has no recommendation: give every question one",
+        ),
+        (
+            "a null recommendation",
+            |v| v["questions"][0]["recommendation"] = Value::Null,
+            "Q1 has no recommendation",
+        ),
+        (
+            "a recommendation as a string",
+            |v| v["questions"][0]["recommendation"] = json!("Extend Y"),
+            "invalid type: string",
+        ),
+        (
+            "no option named",
+            |v| {
+                v["questions"][0]["recommendation"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("option");
+            },
+            "Q1 recommends no option: name one by its capital letter, A to B",
+        ),
+        (
+            "an option it does not offer",
+            |v| v["questions"][0]["recommendation"]["option"] = json!("C"),
+            "Q1 recommends option \"C\", which it does not offer",
+        ),
+        (
+            "a lowercase letter",
+            |v| v["questions"][0]["recommendation"]["option"] = json!("a"),
+            "Q1 recommends option \"a\", which it does not offer: name one by its capital letter",
+        ),
+        (
+            "an option without options",
+            |v| {
+                v["questions"][0]["options"] = json!([]);
+            },
+            "Q1 recommends option \"A\" but offers no options",
+        ),
+        (
+            "a blank why",
+            |v| v["questions"][0]["recommendation"]["why"] = json!(" \n"),
+            "Q1 has a recommendation with a blank `why`",
+        ),
+        (
+            "a blank label",
+            |v| v["questions"][0]["options"][1]["label"] = json!(" "),
+            "Q1 has a blank label on option B",
+        ),
+        (
+            "an option as a string",
+            |v| v["questions"][0]["options"][0] = json!("Extend Y"),
+            "invalid type: string",
+        ),
+    ] {
+        rejects(what, sample(edit), needle);
+    }
+    // Without options, the proposed answer alone.
+    sample(|v| {
+        v["questions"][0]["options"] = json!([]);
+        v["questions"][0]["recommendation"] = json!({ "why": "Extend Y." });
+    })
+    .unwrap();
+    // Letters run A to Z, then on as spreadsheet columns do.
+    for (index, letter) in [
+        (0, "A"),
+        (25, "Z"),
+        (26, "AA"),
+        (27, "AB"),
+        (701, "ZZ"),
+        (702, "AAA"),
+    ] {
+        assert_eq!(option_letter(index), letter);
+    }
+    let options: Vec<QuestionOption> = (0..30)
+        .map(|n| QuestionOption::new(n.to_string()))
+        .collect();
+    assert_eq!(option_index(&options, "AD"), Some(29));
+    assert_eq!(option_index(&options, "AE"), None);
+    assert_eq!(option_index(&options, ""), None);
+    assert_eq!(option_index(&options, &"Z".repeat(64)), None);
+}
+
 /// OWL-213: a result's questions weigh at most `MAX_QUESTION_BYTES` each and
 /// `MAX_QUESTIONS_BYTES` together, rendered as JSON, so one verbose result
 /// cannot fill the ticket ref's file.
@@ -419,7 +530,7 @@ fn result_rejections() {
 fn questions_are_bounded() {
     let result =
         |questions: Vec<Value>| edited("result-sample.json", |v| v["questions"] = json!(questions));
-    let question = |n: usize, context: String| json!({ "id": format!("Q{n}"), "category": "scope", "context": context, "text": "t" });
+    let question = |n: usize, context: String| json!({ "id": format!("Q{n}"), "category": "scope", "context": context, "text": "t", "recommendation": { "why": "r" } });
 
     // One question over its bound, in text and in escaped control bytes: the
     // rendering counts, not the characters.
@@ -533,7 +644,7 @@ fn intake_comes_from_the_intake_role_only() {
     result(|_| {}).unwrap().validate_against(&intake).unwrap();
     let asks = result(|v| {
         v["status"] = json!("questions");
-        v["questions"] = json!([{ "id": "Q1", "category": "scope", "context": "c", "text": "t" }]);
+        v["questions"] = json!([{ "id": "Q1", "category": "scope", "context": "c", "text": "t", "recommendation": { "why": "r" } }]);
     })
     .unwrap();
     asks.validate_against(&intake).unwrap();
@@ -823,7 +934,7 @@ fn refused_choices_asked_against_the_brief() {
         choice("Every key or only the required ones"),
         choice("Where the README lists it"),
     ]);
-    let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
+    let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t", "recommendation": { "why": "r" } });
     let named = |pairs: &[(u32, &str)]| {
         json!(
             pairs
@@ -970,7 +1081,7 @@ fn refused_choices_asked_against_the_brief() {
 /// refused.
 #[test]
 fn resolutions_against_the_brief() {
-    let question = |id: &str| json!({ "id": id, "context": "c", "text": "t" });
+    let question = |id: &str| json!({ "id": id, "context": "c", "text": "t", "recommendation": { "why": "r" } });
     let resolver = |resolve: Value| {
         Brief::parse(
             &edited("brief.json", |v| {
@@ -1029,13 +1140,15 @@ fn resolutions_against_the_brief() {
     );
     rejects(
         "a question to resolve with the raising run's category",
-        resolver(json!([{ "id": "Q1", "category": "naming", "context": "c", "text": "t" }])),
+        resolver(
+            json!([{ "id": "Q1", "category": "naming", "context": "c", "text": "t", "recommendation": { "why": "r" } }]),
+        ),
         "unknown field `category`",
     );
     rejects(
         "questions to resolve in a build brief",
         Brief::parse(&edited("brief.json", |v| {
-            v["resolve"] = json!([{ "id": "Q1", "context": "c", "text": "t" }]);
+            v["resolve"] = json!([{ "id": "Q1", "context": "c", "text": "t", "recommendation": { "why": "r" } }]);
         })),
         "questions to resolve are given but the role is build, not resolver",
     );
@@ -1182,8 +1295,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(16)),
+        parse(|v| v["format"] = json!(17)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 15, before a question's options were lettered",
+        parse(|v| v["format"] = json!(15)),
+        "unknown format 15",
     );
     rejects(
         "format 14, before the quality pipeline's fields",
@@ -1265,7 +1383,8 @@ fn brief_rejections() {
     Brief::parse(&edited("brief.json", |v| v["role"] = json!("answer_check"))).unwrap();
     Brief::parse(&edited("brief.json", |v| {
         v["role"] = json!("resolver");
-        v["resolve"] = json!([{ "id": "Q1", "context": "c", "text": "t" }]);
+        v["resolve"] =
+            json!([{ "id": "Q1", "context": "c", "text": "t", "recommendation": { "why": "r" } }]);
     }))
     .unwrap();
     rejects(
@@ -1581,7 +1700,7 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(12)),
+        asked(|v| v["format"] = json!(13)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1677,7 +1796,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 11,"));
+    assert!(read.render().starts_with("{\n  \"format\": 12,"));
     // A format-3 document, written before the resolver's decisions were
     // kept, is read with none, its verdicts kept.
     let format_3 = edited("ticket-questions.json", |v| {
@@ -1693,7 +1812,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_3).unwrap();
     assert!(read.decisions.is_empty());
     assert_eq!(read.asks[0].verdicts.len(), 2);
-    assert!(read.render().starts_with("{\n  \"format\": 11,"));
+    assert!(read.render().starts_with("{\n  \"format\": 12,"));
     // A format-4 document, written before an ask kept its check's refusal,
     // is read with none, its decisions kept.
     let format_4 = edited("ticket-questions.json", |v| {
@@ -1708,7 +1827,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_4).unwrap();
     assert!(read.asks.iter().all(|ask| ask.result_refusal.is_none()));
     assert_eq!(read.decisions.len(), 1);
-    assert!(read.render().starts_with("{\n  \"format\": 11,"));
+    assert!(read.render().starts_with("{\n  \"format\": 12,"));
     // A format-5 document, written before Build's refusal was kept
     // (OWL-192), is read with none, its asks' refusals kept.
     let format_5 = edited("ticket-questions.json", |v| {
@@ -1719,7 +1838,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_5).unwrap();
     assert_eq!(read.build_refusal, None);
     assert!(read.asks[1].result_refusal.is_some());
-    assert!(read.render().starts_with("{\n  \"format\": 11,"));
+    assert!(read.render().starts_with("{\n  \"format\": 12,"));
     // Formats 6 and 7 kept Build's refusal in their own shape (OWL-192,
     // OWL-194): the hold's first list in `decisions_reason`, the latest
     // reason, of a kind they did not keep, in `reason`. Each is read as
@@ -1738,7 +1857,7 @@ fn event_claim_and_state_rejections() {
     };
     let upgraded = |format: u64, refusal: Value| {
         let read = TicketQuestions::parse(&legacy(format, refusal)).unwrap();
-        assert!(read.render().starts_with("{\n  \"format\": 11,"));
+        assert!(read.render().starts_with("{\n  \"format\": 12,"));
         read.build_refusal.unwrap()
     };
     for format in [6, 7] {
@@ -1817,7 +1936,7 @@ fn event_claim_and_state_rejections() {
     };
     let read =
         TicketQuestions::parse(&format_8(json!({"reason": latest, "lists": [held]}))).unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 11,"));
+    assert!(read.render().starts_with("{\n  \"format\": 12,"));
     let kept = read.build_refusal.unwrap();
     assert!(kept.holds() && kept.choices.is_empty() && kept.lists == [held]);
     assert_eq!(
@@ -1839,7 +1958,7 @@ fn event_claim_and_state_rejections() {
     // reversal is refused in it. Format 10 keeps one, naming its reply.
     let read = TicketQuestions::parse(&edited("ticket-questions.json", |v| v["format"] = json!(9)))
         .unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 11,"));
+    assert!(read.render().starts_with("{\n  \"format\": 12,"));
     assert!(read.decisions[0].reversed.is_none());
     let reversal = || json!({"through": "2026-09-28T12:00:00Z", "comment": "c-reply-1"});
     rejects(
@@ -1872,6 +1991,52 @@ fn event_claim_and_state_rejections() {
         })),
         "decision 1 names no reversing reply",
     );
+    // Formats 2 to 11 kept a question's options and recommendation as
+    // strings (OWL-324): each option becomes one of that label, the
+    // recommendation its `why`, naming no option, in every ask and every
+    // decision; the next write gives format 12.
+    for format in [2, 11] {
+        let read = TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+            v["format"] = json!(format);
+            if format == 2 {
+                for field in ["build_refusal", "resolver_refusal", "decisions"] {
+                    v.as_object_mut().unwrap().remove(field);
+                }
+                for ask in v["asks"].as_array_mut().unwrap() {
+                    ask.as_object_mut().unwrap().remove("verdicts");
+                    ask.as_object_mut().unwrap().remove("result_refusal");
+                }
+            } else {
+                v["decisions"][0]["question"]["options"] = json!(["GREETING.md", "HELLO.md"]);
+                v["decisions"][0]["question"]["recommendation"] = json!("GREETING.md");
+            }
+            v["asks"][0]["questions"][0]["options"] = json!(["English", "Fr / ench"]);
+            v["asks"][0]["questions"][0]["recommendation"] = json!("English, as the code");
+        }))
+        .unwrap_or_else(|e| panic!("format {format}: {e}"));
+        assert!(read.render().starts_with("{\n  \"format\": 12,"));
+        let asked = &read.asks[0].questions[0];
+        assert_eq!(
+            asked.options,
+            [
+                QuestionOption::new("English"),
+                QuestionOption::new("Fr / ench")
+            ]
+        );
+        assert_eq!(
+            asked.recommendation,
+            Some(Recommendation {
+                option: None,
+                why: "English, as the code".to_owned()
+            })
+        );
+        assert_eq!(read.asks[0].questions[1].recommendation, None);
+        if format == 11 {
+            let decided = &read.decisions[0].question;
+            assert_eq!(decided.options.len(), 2);
+            assert_eq!(decided.recommendation.as_ref().unwrap().why, "GREETING.md");
+        }
+    }
     // A format-6 document, written before the resolver's refusal was kept
     // (OWL-191), is read with none; the field is refused in it, whatever
     // its value. A format-7 document keeps it.
@@ -2117,8 +2282,31 @@ fn comment_headers() {
     };
     assert_eq!(plan.render(), "[owlshift] PLAN");
     assert_eq!(Header::parse(&plan.render()).unwrap(), plan);
+    // A comment that waits for the decider ends its header with their
+    // mention, which is passed over (OWL-324).
+    let mention = " · https://linear.app/owlshift/profiles/ada";
+    assert_eq!(
+        Header::parse(&format!("[owlshift] QUESTIONS · round 2{mention}\r\n")).unwrap(),
+        questions
+    );
+    assert_eq!(
+        Header::parse(&format!("{}{mention}", reask.render())).unwrap(),
+        reask
+    );
+    assert_eq!(
+        Header::parse(&format!("[owlshift] REPLY{mention}")).unwrap(),
+        Header {
+            kind: MarkerKind::Reply,
+            round: None
+        }
+    );
 
     for (line, needle) in [
+        ("[owlshift] DELIVERY · @ada", "unexpected part"),
+        ("[owlshift] RESUME · round 2 · @ada", "unexpected part"),
+        ("[owlshift] QUESTIONS · round 2 · ", "invalid round"),
+        ("[owlshift] QUESTIONS · @ada", "needs a round"),
+        ("[owlshift] REPLY · round 2", "takes no round"),
         ("[owlshift] QUESTIONS", "needs a round"),
         ("[owlshift] DELIVERY · round 1", "takes no round"),
         ("[owlshift] INTAKE · round 1", "takes no round"),

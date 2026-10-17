@@ -31,7 +31,7 @@ pub(super) const FORKED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
 
 /// A design run's `done` with `plan`.
 pub(super) fn designed(plan: &str) -> String {
-    format!(r#"{{"format":9,"status":"done","summary":"Planned the greeting.","plan":{plan}}}"#)
+    format!(r#"{{"format":10,"status":"done","summary":"Planned the greeting.","plan":{plan}}}"#)
 }
 
 /// A review run's `done` with a finding per (severity, claim).
@@ -49,7 +49,7 @@ pub(super) fn reviewed(findings: &[(&str, &str)]) -> String {
             })
         })
         .collect();
-    json!({ "format": 9, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 10, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -66,13 +66,13 @@ pub(super) fn ruled(outcomes: &[&str]) -> String {
             })
         })
         .collect();
-    json!({ "format": 9, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+    json!({ "format": 10, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
 }
 
 /// A design run's answer to an approval round.
 pub(super) fn answered(approval: &str, plan: Option<&str>) -> String {
     let mut result = json!({
-        "format": 9,
+        "format": 10,
         "status": "done",
         "summary": "Read the decider's reply.",
         "approval": approval,
@@ -84,12 +84,12 @@ pub(super) fn answered(approval: &str, plan: Option<&str>) -> String {
 }
 
 /// A Build run that cannot follow its plan.
-pub(super) const REPLAN: &str = r#"{"format":9,"status":"questions",
+pub(super) const REPLAN: &str = r#"{"format":10,"status":"questions",
 "summary":"Step 1 cannot be followed as written.",
 "questions":[{"id":"Q1","category":"naming","context":"Step 1 names the file to write.",
-"text":"Which file should hold the greeting?","replan":true}]}"#;
+"text":"Which file should hold the greeting?","replan":true,"recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
 
-const FAILED: &str = r#"{"format":9,"status":"failed","summary":"Could not read the plan."}"#;
+const FAILED: &str = r#"{"format":10,"status":"failed","summary":"Could not read the plan."}"#;
 
 impl Bench {
     /// A bench whose ticket carries `variant`'s label, with Codex given
@@ -412,7 +412,7 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
     .unwrap();
     let answering = |responses: &str| {
         format!(
-            r#"{{"format":9,"status":"done","summary":"Revised.","plan":{REVISED},
+            r#"{{"format":10,"status":"done","summary":"Revised.","plan":{REVISED},
             "finding_responses":[{responses}]}}"#
         )
     };
@@ -575,7 +575,11 @@ fn a_risky_plan_is_approved_and_its_build_starts_from_the_moved_base() {
     };
     assert_eq!(questions[0].category, "plan_approval");
     assert_eq!(
-        questions[0].options,
+        questions[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect::<Vec<_>>(),
         [
             "Approve the plan as it is",
             "Fork 1: Plain text. instead of Markdown."
@@ -845,11 +849,11 @@ fn a_reviewer_failing_twice_parks_the_ticket_at_design_review() {
 #[test]
 fn a_false_premise_at_design_is_a_round_to_the_decider() {
     let bench = Bench::of("standard", false);
-    let premise = r#"{"format":9,"status":"premise_false",
+    let premise = r#"{"format":10,"status":"premise_false",
 "summary":"The greeting file the ticket extends is not in the repository.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; no such file exists.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
-"options":["Re-scope: create GREETING.md.","Close the ticket."],"recommendation":"Re-scope"}]}"#;
+"options":[{"label":"Re-scope: create GREETING.md."},{"label":"Close the ticket."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
     let (outcome, printed) = bench.run(vec![bench.read(premise)], None);
     let stop = outcome.expect_err("the premise goes to the decider");
     assert!(
@@ -879,7 +883,7 @@ fn a_false_premise_at_design_is_a_round_to_the_decider() {
 #[test]
 fn a_false_premise_at_design_without_a_question_parks_the_ticket() {
     let bench = Bench::of("standard", false);
-    let premise = r#"{"format":9,"status":"premise_false","summary":"The file is not there."}"#;
+    let premise = r#"{"format":10,"status":"premise_false","summary":"The file is not there."}"#;
     let (outcome, printed) = bench.run(vec![bench.read(premise)], None);
     assert!(
         matches!(

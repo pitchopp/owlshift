@@ -37,10 +37,10 @@ brief_always_human = ["tone"]
 author = "owlshift"
 first_line = "[owlshift] QUESTIONS · round 1"
 contains = [
-  "**Q1** (tone) Should the greeting be formal or casual?",
+  "### Q1 · Should the greeting be formal or casual?",
   "Owlshift decided one other question of this run itself",
 ]
-lacks = ["naming", "**Q2**"]
+lacks = ["naming", "### Q2"]
 
 [[step]]
 comment = { author = "maintainer", body = "Q1: casual.\n" }
@@ -73,7 +73,7 @@ brief_decisions = ["GREETING.md, at the root."]
 author = "owlshift"
 first_line = "[owlshift] DECISION"
 contains = [
-  "**Question** (docs) Should the README link to GREETING.md?",
+  "### Question · Should the README link to GREETING.md?",
   "**Decision:** Yes, in the README's list of files.",
   "**Settled by:** README.md lists every file at the root.",
 ]

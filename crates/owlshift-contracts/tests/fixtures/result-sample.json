@@ -1,5 +1,5 @@
 {
-  "format": 9,
+  "format": 10,
   "status": "questions",
   "summary": "Plan drafted; two choices need the decider.",
   "questions": [
@@ -8,8 +8,11 @@
       "category": "scope",
       "context": "The ticket asks for X; the code already does Y in module Z.",
       "text": "Extend Y, or build X separately?",
-      "options": ["Extend Y", "Build X separately"],
-      "recommendation": "Extend Y"
+      "options": [
+        { "label": "Extend Y" },
+        { "label": "Build X separately", "detail": "a second module beside Z" }
+      ],
+      "recommendation": { "option": "A", "why": "Y already does most of X." }
     }
   ],
   "decisions": [

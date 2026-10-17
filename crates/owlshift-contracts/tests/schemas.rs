@@ -114,8 +114,8 @@ fn fixtures_validate_against_the_committed_schemas() {
 #[test]
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
-    let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t" });
-    let base = |status: &str| json!({ "format": 9, "status": status, "summary": "s" });
+    let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t", "recommendation": { "why": "r" } });
+    let base = |status: &str| json!({ "format": 10, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -146,11 +146,26 @@ fn result_schema_carries_the_expressible_rules() {
     named["refused_choices_asked"][0]["choice"] = json!(0);
     assert!(!validator.is_valid(&named));
 
-    for format in [1, 2, 3, 4, 5, 6, 7, 8, 10] {
+    for format in [1, 2, 3, 4, 5, 6, 7, 8, 9, 11] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
     }
+
+    // Every question recommends, with an object (OWL-324): absent or null
+    // is refused, as `RunResult::parse` refuses it.
+    let mut unrecommended = base("questions");
+    unrecommended["questions"] = json!([question("Q1")]);
+    assert!(validator.is_valid(&unrecommended));
+    for recommendation in [Value::Null, json!("r")] {
+        unrecommended["questions"][0]["recommendation"] = recommendation;
+        assert!(!validator.is_valid(&unrecommended));
+    }
+    unrecommended["questions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("recommendation");
+    assert!(!validator.is_valid(&unrecommended));
 
     // The quality pipeline's fields go with `done` only, and an approval
     // `changed` with its plan, `approved` without one (OWL-300); schema and

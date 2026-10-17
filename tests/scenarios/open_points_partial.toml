@@ -72,14 +72,15 @@ brief_refused_choices = ["Every key or only the required ones", "Where the READM
 author = "owlshift"
 first_line = "[owlshift] QUESTIONS · round 1"
 contains = [
-  "**Q1** (scope) Should the example show every key with comments, or only the required ones?",
+  "### Q1 · Should the example show every key with comments, or only the required ones?",
   "Some of these questions reopen a choice an earlier run made without asking you",
   """
-Recommendation: Every key, commented
+**Recommendation: A.** A reader learns every key from one file.
+
 **Refused choice** (as the asking run lists it): Every key or only the required ones
 Recorded by the refused run: Every key, commented
 
-**Q2** (docs) Where should the README list the example?""",
+### Q2 · Where should the README list the example?""",
   "**Refused choice** (as the asking run lists it): Where the README lists the example",
 ]
 lacks = ["Owlshift decided"]

@@ -19,14 +19,14 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 *When an agent needs my decision, I find it on the ticket, answer there, and work resumes by itself, as many times as needed.*
 
-1. The run pushes its branch and checkpoint and returns `questions`. The writer posts numbered questions (Q1 to Qn) with context, options and a recommendation, moves the ticket to needs-input, records the stage to return to, and notifies the decider.
-2. The decider replies in one or several comments.
+1. The run pushes its branch and checkpoint and returns `questions`. The writer posts numbered questions (Q1 to Qn), each a heading, a short context, its options lettered A, B, C… one per line, and the recommended answer marked, moves the ticket to needs-input, records the stage to return to, and notifies the decider.
+2. The decider replies in one or several comments, in their own words or in a few characters: `Q1: B` picks an option, a bare `B` does when one question is asked, and `ok` takes every recommendation.
 3. The reply counts once the decider's last comment is older than the quiet window (an edit restarts it), or immediately if it ends with `go`, whether `owlshift continue` or `watch` picks it up.
 4. The answer check classifies each question, and the round has one outcome, the first that applies. A counter-question, even next to missing answers: an answer in the thread, the ticket stays, nothing is re-asked and no re-ask is counted; after the decider's next reply, the answer check classifies every question of the same ask again. Something missing: a *re-ask* comment lists only the open questions and why. All answered: a *resume* comment restates what was understood, the ticket returns to its stage, a fresh run resumes from the checkpoint.
 5. Before delivery the run re-reads the thread. A comment of the decider that the work has not seen gets one more Build run, which integrates it, or sends the ticket back to needs-input when it contradicts the work so that the run cannot follow it without the decider; a further one after that run sends the ticket back to needs-input.
 
-- Every question is understandable without any transcript; all questions of a round sit in one comment.
-- A bare "ok" means the recommendation when there is one, and is ambiguous otherwise.
+- Every question is understandable without any transcript, and readable at a glance on a phone: what is asked, the options, the one recommended; all questions of a round sit in one comment.
+- Every question comes with a recommendation; a bare "ok" means the recommendation, and is ambiguous only on a question that has none.
 - No comment from the decider is ever ignored, even one posted after the resume.
 - An incomplete answer never starts a run.
 - A resumed run never redoes a step its ledger marks done.

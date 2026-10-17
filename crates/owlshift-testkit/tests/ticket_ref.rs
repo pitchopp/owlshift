@@ -286,10 +286,10 @@ fn a_maximal_round_with_its_re_asks_fits_the_read_cap() {
     // which escape to six bytes.
     let context = "\u{1}".repeat(MAX_QUESTIONS_BYTES / MAX_QUESTIONS / 6 - 30);
     let questions: Vec<_> = (1..=MAX_QUESTIONS)
-        .map(|n| json!({ "id": format!("Q{n}"), "category": "scope", "context": context, "text": "t" }))
+        .map(|n| json!({ "id": format!("Q{n}"), "category": "scope", "context": context, "text": "t", "recommendation": { "why": "r" } }))
         .collect();
     let result =
-        json!({ "format": 9, "status": "questions", "summary": "s", "questions": questions });
+        json!({ "format": 10, "status": "questions", "summary": "s", "questions": questions });
     RunResult::parse(&result.to_string()).expect("the round is within the bound");
 
     let ask = |kind: &str, n: u32| {

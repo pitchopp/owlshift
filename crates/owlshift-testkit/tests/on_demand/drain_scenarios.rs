@@ -294,7 +294,7 @@ impl Bench {
 #[test]
 fn a_kept_branch_with_commits_of_its_own_is_dispatched_as_it_is() {
     let bench = Bench::new(true);
-    let blocked = r#"{"format":9,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":10,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], None);
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
@@ -417,7 +417,7 @@ fn scenario_s3_questions_at_intake() {
     let answer = "It is DEMO-2: it must land first.";
     let question = r#"[{"id":"Q1","category":"scope",
         "context":"The ticket waits for the billing rework, named without its identifier.",
-        "text":"Which ticket is the billing rework?"}]"#;
+        "text":"Which ticket is the billing rework?","recommendation":{"why":"The simplest reading of the ticket."}}]"#;
     let both = [("DEMO-3", prose), ("DEMO-2", answer)];
     let replies = vec![
         bench.reply(

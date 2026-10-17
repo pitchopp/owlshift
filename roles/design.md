@@ -1,7 +1,7 @@
 +++
 role = "design"
-brief_format = 15
-result_format = 9
+brief_format = 16
+result_format = 10
 +++
 
 # Design
@@ -45,7 +45,7 @@ How the work is done is yours. When two approaches would each deliver the ticket
 
 A question in these categories always goes to the decider: `security`, `data_loss`, `money`, `legal`, `irreversible`, `scope`. Write that token as the question's `category`; `scope` is any question whose answer changes what the ticket delivers. The brief's `always_human` lists the categories this project adds, possibly none: file a question about one of them under that category exactly, or under a floor token when it touches one of the six. For any other question, a short word of your own. Any other question goes first to the runner's resolver, which decides what the ticket, the rules or the repository settle; you run again with its decisions in the `thread`.
 
-To ask, end with status `questions`, every open point at once, numbered `Q1`, `Q2`, … in order, starting at `Q1` whatever ids earlier rounds used. Each question has an `id`, a `category`, a `context` that stands alone (the decider has not seen your session), a `text`, and, when useful, `options` and a `recommendation`. Keep within the runner's bounds, counted in bytes of the questions as the runner writes them in JSON: at most 64 questions, each at most 8192 bytes, all together at most 131072 bytes. Leave `decisions` out of your result: a result that lists one is refused.
+To ask, end with status `questions`, every open point at once, numbered `Q1`, `Q2`, … in order, starting at `Q1` whatever ids earlier rounds used. Each question has an `id`, a `category`, a `text` that fits on one line, and a `context` of at most two sentences giving what the decider needs and has not read on the ticket, never a restatement of the ticket. When there are answers to choose from, give them as `options`, each a short `label` and, only when the label needs it, a one-line `detail`; the runner letters them A, B, C… in their order. Always give a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; a question without one, or naming an option it does not offer, is refused. With `questions`, the `summary` says in one sentence what the run did, not what it asks. Keep within the runner's bounds, counted in bytes of the questions as the runner writes them in JSON: at most 64 questions, each at most 8192 bytes, all together at most 131072 bytes. Leave `decisions` out of your result: a result that lists one is refused.
 
 ## A revision
 
@@ -62,7 +62,7 @@ When the brief has `approval`, the plan was put to the decider and the `thread` 
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When your harness gives you no way to write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 9, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When your harness gives you no way to write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 10, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the findings are to `answer`.
 - `questions`: at least one question; you run again once they are answered or decided.
@@ -74,7 +74,7 @@ Always give `summary`, one or two sentences. Leave out `pr`, `artifacts`, `follo
 
 ```json
 {
-  "format": 9,
+  "format": 10,
   "status": "done",
   "summary": "Planned the logs command on the event store's reader, in two steps.",
   "plan": {

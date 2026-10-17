@@ -1,5 +1,5 @@
 {
-  "format": 15,
+  "format": 16,
   "role": "build",
   "project": "owlshift",
   "ticket": {
@@ -22,14 +22,18 @@
           "category": "scope",
           "context": "Events live in the local store; run logs are separate files.",
           "text": "Should `logs` include each run's full harness output?",
-          "options": ["Events only", "Events and run logs"],
-          "recommendation": "Events only"
+          "options": [
+            { "label": "Events only" },
+            { "label": "Events and run logs", "detail": "each run's harness output too" }
+          ],
+          "recommendation": { "option": "A", "why": "Run logs can hold secrets." }
         },
         {
           "id": "Q2",
           "category": "ux",
           "context": "Other commands print local times.",
-          "text": "Local time or UTC?"
+          "text": "Local time or UTC?",
+          "recommendation": { "why": "Local time, as the other commands." }
         }
       ]
     },
