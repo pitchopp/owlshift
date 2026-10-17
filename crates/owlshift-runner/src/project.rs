@@ -477,6 +477,13 @@ pub fn admitters_at(
     Ok(config_at(git, checkout, base)?.and_then(|config| config.tracker.admitters))
 }
 
+/// The `stack.gate` of the project file as the base commit holds it, read
+/// as [`zone_owners_at`] reads the owners: what `owlshift gate` runs at the
+/// commit it checks (OWL-329). `None` when the commit has no project file.
+pub fn gate_at(git: &Git, checkout: &Path, base: &Base) -> Result<Option<Vec<String>>, String> {
+    Ok(config_at(git, checkout, base)?.map(|config| config.stack.gate))
+}
+
 /// The `[forge].reviewers` of the project file as the base commit holds it
 /// (OWL-307, architecture section 5, "Review comments on the pull
 /// request"), read as [`admitters_at`] reads the admitters, for the same
