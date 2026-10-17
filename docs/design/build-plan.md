@@ -115,8 +115,10 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
     the fixtures were recorded before it, so the CLI's behaviour under it is checked by the live test
     `bundled_skills_do_not_reach_a_confined_run` in `owlshift-testkit/tests/executor_live.rs`, which passed on both levels.
     No role prompt or brief sends a slash command.
-  - What stays open: the flag is in `--help` on 2.1.284, 2.1.300 and 2.1.302; 2.1.283, the oldest in `harness/tested.rs`,
-    was not checked, and a CLI that refused the flag would fail every launch. The Codex harness already drops skills (OWL-131).
+  - Every version in `harness/tested.rs` takes the flag: it is in `--help` on 2.1.284, 2.1.300 and 2.1.302,
+    and on 2.1.283 too, run on 2026-10-17 from a scratch folder with `npx -y @anthropic-ai/claude-code@2.1.283 --help`.
+  - What stays open: the flag's effect was observed on 2.1.302 only; the older versions were checked for the flag, not run with it.
+    The Codex harness already drops skills (OWL-131).
 
 **C2 — passed, with three findings for the Codex harness (OWL-297).** Run on 2026-10-15 with codex-cli 0.154.0, on macOS 26.6 with the maintainer's ChatGPT login (Plus), and on Linux (Debian trixie in Docker, bubblewrap) logged out, by the maintainer's choice. About twenty tiny `codex exec --ephemeral --json --ignore-user-config -c model_reasoning_effort=low` runs, in a linked worktree of a scratch repository. Each run started from an environment of `HOME`, `PATH`, `USER`, `LANG`, `SSL_CERT_FILE` and `CODEX_HOME` alone. Each run had a `CODEX_HOME` of its own: no `config.toml`, no `.env`, a marker `AGENTS.md`, one execpolicy rule, and the user's login file read through a link. The confinement was the executor's own profile, built by a throwaway program from `AgentEnv::policy` and `sandbox::wrap`, with the worktree and the repository's git folder moved to read-only: the profile OWL-298 builds. The scrubbed recordings are in `crates/owlshift-adapters/tests/fixtures/codex/`, named below in parentheses. Each has a `.meta.json` beside it: command line, platform, confinement, exit status, standard error and `-o` file. `tests/codex_fixtures.rs` checks them on the three CI platforms.
 
