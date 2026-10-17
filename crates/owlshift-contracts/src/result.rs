@@ -1165,10 +1165,9 @@ fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
                     }
                 }
             }
-            Resolution::PassedOn { reason, .. } => reason
-                .trim()
-                .is_empty()
-                .then(|| "has no reason".to_owned()),
+            Resolution::PassedOn { reason, .. } => {
+                reason.trim().is_empty().then(|| "has no reason".to_owned())
+            }
         };
         if let Some(broken) = broken {
             return Err(ContractError::invalid(

@@ -95,7 +95,8 @@
 //!   (`owlshift_runner::on_demand::stage_event`), and no DELIVERY comment is
 //!   written;
 //! - no bound on the runs in a row whose questions the resolver all decided
-//!   (`owlshift_core::state::MAX_RESOLVED_PASSES`), which `owlshift do` counts
+//!   (the project's pass limit and ceiling,
+//!   `owlshift_core::gate::GatePolicy::chain_end`), which `owlshift do` counts
 //!   per command: a scenario's commands are only its `continue` steps, and
 //!   it plays each run by hand.
 

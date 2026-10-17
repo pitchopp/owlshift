@@ -180,4 +180,14 @@ mod tests {
         assert_eq!(usage_limit(&stderr), Some(reset));
         assert_eq!(usage_limit("working\n"), None);
     }
+
+    /// OWL-337: the cost a reply sets is printed and read back in dollars.
+    #[test]
+    fn the_cost_line_round_trips() {
+        let reply = Reply::parse("cost_micros = 300000\n").unwrap();
+        assert_eq!(reply.cost_micros, Some(300_000));
+        let stderr = format!("working\n{}\n", cost_line(300_000));
+        assert_eq!(cost_usd(&stderr), Some(0.3));
+        assert_eq!(cost_usd("working\n"), None);
+    }
 }

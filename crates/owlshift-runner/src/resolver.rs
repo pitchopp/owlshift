@@ -14,7 +14,9 @@
 //! category ([`unlabelled`]), and the resolver labels each one it decides
 //! itself. Of its decisions, the runner keeps only those on questions it gave
 //! the resolver whose two labels, the raising run's and the resolver's, both
-//! route there ([`settle`], OWL-144), posts each as a DECISION comment
+//! route there (OWL-144), whose basis is of a kind the project's delegation
+//! level allows and, for a `ticket` basis, quotes the ticket's text
+//! ([`Quotable`], OWL-328) ([`settle`]), posts each as a DECISION comment
 //! ([`crate::writer::DecisionComment`]) and keeps it in the ticket ref; the
 //! decider gets the rest as a round ([`left_for_decider`]).
 //! `owlshift do` and `owlshift continue` run it ([`crate::on_demand`]); the
@@ -613,7 +615,11 @@ mod tests {
         let resolutions = [
             decided("Q1", BasisKind::Fact, None),
             decided("Q2", BasisKind::Settled, None),
-            decided("Q3", BasisKind::Ticket, Some("Add GREETING.md saying Hello.")),
+            decided(
+                "Q3",
+                BasisKind::Ticket,
+                Some("Add GREETING.md saying Hello."),
+            ),
             decided("Q4", BasisKind::Settled, None),
             decided("Q5", BasisKind::Ticket, Some("Add a README too.")),
         ];
@@ -676,7 +682,11 @@ mod tests {
     fn a_chain_end_is_a_pass_limit_with_its_reason() {
         let cases = [
             (Fallback::from(ChainEnd::Passes(3)), "pass_limit", None),
-            (Fallback::from(ChainEnd::Budget), "pass_limit", Some("budget")),
+            (
+                Fallback::from(ChainEnd::Budget),
+                "pass_limit",
+                Some("budget"),
+            ),
             (
                 Fallback::from(ChainEnd::CostUnreported),
                 "pass_limit",

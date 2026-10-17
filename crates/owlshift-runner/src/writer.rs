@@ -72,9 +72,7 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Reviewer, Severity};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
-use owlshift_core::state::{
-    Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status,
-};
+use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status};
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
 
 use crate::executor::Git;

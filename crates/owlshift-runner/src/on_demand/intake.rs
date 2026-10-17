@@ -342,17 +342,7 @@ impl OnDemand<'_> {
                         sink,
                     ));
                 }
-                match self.resolve(
-                    p,
-                    &state,
-                    result,
-                    &[],
-                    &[],
-                    &rules,
-                    &current,
-                    &ran,
-                    sink,
-                )? {
+                match self.resolve(p, &state, result, &[], &[], &rules, &current, &ran, sink)? {
                     Routing::Settled => continue,
                     Routing::Ask(round) => {
                         let asked = match state.apply(PIPELINE, Event::Questions) {
@@ -375,17 +365,7 @@ impl OnDemand<'_> {
             if event == Event::Questions
                 && let (Some(result), Some(verdict)) = (result, verdict)
             {
-                match self.resolve(
-                    p,
-                    &state,
-                    result,
-                    &[],
-                    &[],
-                    &rules,
-                    &current,
-                    &ran,
-                    sink,
-                )? {
+                match self.resolve(p, &state, result, &[], &[], &rules, &current, &ran, sink)? {
                     Routing::Settled => continue,
                     // The verdict is kept with the round: its dependencies
                     // become relations now, and a failure is a failed run.

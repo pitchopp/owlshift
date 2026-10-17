@@ -653,7 +653,9 @@ impl Policy {
         if let Some(Usd(usd)) = self.resolver_budget_usd
             && !(usd.is_finite() && usd > 0.0)
         {
-            return Err("policy.resolver_budget_usd must be a positive number of dollars".to_owned());
+            return Err(
+                "policy.resolver_budget_usd must be a positive number of dollars".to_owned(),
+            );
         }
         if self.resolver_passes == Some(ResolverPasses::Unlimited)
             && self.resolver_budget_usd.is_none()
@@ -1275,11 +1277,8 @@ mod tests {
         assert_eq!(absent.gate_policy().level(), DelegationLevel::Discoverable);
 
         for level in DelegationLevel::ALL {
-            let set = project(
-                "",
-                &format!("resolver_delegation = \"{}\"", level.as_str()),
-            )
-            .unwrap();
+            let set =
+                project("", &format!("resolver_delegation = \"{}\"", level.as_str())).unwrap();
             assert_eq!(set.policy.resolver().level, level);
             assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
         }
@@ -1293,11 +1292,17 @@ mod tests {
             }
         );
         assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
-        let unlimited =
-            project("", "resolver_passes = \"unlimited\"\nresolver_budget_usd = 5").unwrap();
+        let unlimited = project(
+            "",
+            "resolver_passes = \"unlimited\"\nresolver_budget_usd = 5",
+        )
+        .unwrap();
         assert_eq!(unlimited.policy.resolver().passes, PassLimit::Unlimited);
         assert_eq!(unlimited.policy.resolver().ceiling_micros, Some(5_000_000));
-        assert_eq!(ProjectConfig::parse(&unlimited.render()).unwrap(), unlimited);
+        assert_eq!(
+            ProjectConfig::parse(&unlimited.render()).unwrap(),
+            unlimited
+        );
         assert_eq!(
             unlimited.gate_policy().resolver(),
             unlimited.policy.resolver()
@@ -1315,7 +1320,8 @@ mod tests {
         }
         let error = refused("resolver_passes = \"unlimited\"");
         assert!(
-            error.contains("policy.resolver_passes") && error.contains("policy.resolver_budget_usd"),
+            error.contains("policy.resolver_passes")
+                && error.contains("policy.resolver_budget_usd"),
             "{error}"
         );
         assert!(refused("resolver_delegation = \"most\"").contains("resolver_delegation"));

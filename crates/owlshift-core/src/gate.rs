@@ -495,10 +495,11 @@ mod tests {
     fn additions_are_told_when_the_level_does_not_keep_them() {
         let added = ["money", "scope_change", "security", "brand_voice"];
         for level in DelegationLevel::ALL {
-            let policy = GatePolicy::new(added, PlanApproval::Never).with_resolver(ResolverPolicy {
-                level,
-                ..ResolverPolicy::default()
-            });
+            let policy =
+                GatePolicy::new(added, PlanApproval::Never).with_resolver(ResolverPolicy {
+                    level,
+                    ..ResolverPolicy::default()
+                });
             let expected: &[&str] = match level {
                 DelegationLevel::All => &["money", "scope_change", "brand_voice"],
                 DelegationLevel::Ticket => &["scope_change", "brand_voice"],
@@ -506,7 +507,11 @@ mod tests {
             };
             assert_eq!(policy.additions(), expected, "{level:?}");
             for category in added {
-                assert_eq!(policy.route(category), Route::Human, "{category} at {level:?}");
+                assert_eq!(
+                    policy.route(category),
+                    Route::Human,
+                    "{category} at {level:?}"
+                );
             }
         }
     }
@@ -523,7 +528,13 @@ mod tests {
             (L::Facts, "naming", "naming", Fact, Route::Resolver),
             (L::Facts, "naming", "naming", Settled, Route::Human),
             (L::Facts, "naming", "naming", Ticket, Route::Human),
-            (L::Discoverable, "naming", "naming", Settled, Route::Resolver),
+            (
+                L::Discoverable,
+                "naming",
+                "naming",
+                Settled,
+                Route::Resolver,
+            ),
             (L::Discoverable, "naming", "naming", Ticket, Route::Human),
             (L::Discoverable, "naming", "scope", Ticket, Route::Human),
             (L::Ticket, "naming", "naming", Ticket, Route::Resolver),
@@ -590,7 +601,10 @@ mod tests {
         assert_eq!(ends(Runs(3), None, 0, &[None]), None);
         // Unlimited: the ceiling alone, reached at the ceiling.
         let some = |costs: &[f64]| costs.iter().map(|c| Some(*c)).collect::<Vec<_>>();
-        assert_eq!(ends(Unlimited, Some(1.0), 49, &some(&[0.3, 0.3, 0.3])), None);
+        assert_eq!(
+            ends(Unlimited, Some(1.0), 49, &some(&[0.3, 0.3, 0.3])),
+            None
+        );
         assert_eq!(
             ends(Unlimited, Some(1.0), 3, &some(&[0.3, 0.3, 0.4])),
             Some(ChainEnd::Budget)

@@ -1266,7 +1266,10 @@ fn resolutions_against_the_brief() {
     quoted("Add GREETING.md saying Hello.").expect("a quote on one line");
     for (quote, broken) in [
         (" ", "has a quote that is blank"),
-        ("Add\nGREETING.md", "has a quote that holds a control character"),
+        (
+            "Add\nGREETING.md",
+            "has a quote that holds a control character",
+        ),
     ] {
         let error = quoted(quote).unwrap_err().to_string();
         assert!(error.contains(broken), "{quote:?}: {error}");

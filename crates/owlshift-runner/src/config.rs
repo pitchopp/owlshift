@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ContractError;
 use owlshift_contracts::DelegationLevel;
-use owlshift_contracts::config::{Policy, PersonalConfig, ProjectConfig, check_requires, entries};
+use owlshift_contracts::config::{PersonalConfig, Policy, ProjectConfig, check_requires, entries};
 use owlshift_core::floor::{FloorCategory, is_human_category};
 use owlshift_core::gate::{PassLimit, ResolverPolicy, normalized_categories};
 use semver::Version;
@@ -429,11 +429,7 @@ mod tests {
         let file = dir.path().join(PROJECT_FILE);
         let personal = dir.path().join("personal.toml");
         let shown = |policy: &str| {
-            fs::write(
-                &file,
-                PROJECT.replace("always_human = []", policy),
-            )
-            .unwrap();
+            fs::write(&file, PROJECT.replace("always_human = []", policy)).unwrap();
             let effective =
                 Effective::load(&repository(dir.path()), dir.path(), Some(personal.clone()));
             assert!(effective.is_valid(), "{effective}");
@@ -467,7 +463,10 @@ mod tests {
         ] {
             assert!(all.contains(&line), "{line}\n---\n{all}");
         }
-        for line in ["  scope  (delegation level", "  data_loss  (delegation level"] {
+        for line in [
+            "  scope  (delegation level",
+            "  data_loss  (delegation level",
+        ] {
             assert!(!all.contains(line), "{line}\n---\n{all}");
         }
     }

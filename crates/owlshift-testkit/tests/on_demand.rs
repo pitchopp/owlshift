@@ -804,7 +804,11 @@ impl Bench {
         let text = fs::read_to_string(&path).unwrap();
         fs::write(
             &path,
-            text.replacen("always_human = []", &format!("always_human = []\n{lines}"), 1),
+            text.replacen(
+                "always_human = []",
+                &format!("always_human = []\n{lines}"),
+                1,
+            ),
         )
         .unwrap();
     }
@@ -4840,7 +4844,10 @@ fn a_quoted_scope_question_is_decided_at_ticket_and_asked_at_discoverable() {
     let (delivered, printed) = bench.run(
         vec![
             bench.reply(None, Some(SCOPE)),
-            bench.reply(None, Some(&decided_scope("Add  GREETING.md   saying Hello."))),
+            bench.reply(
+                None,
+                Some(&decided_scope("Add  GREETING.md   saying Hello.")),
+            ),
             bench.reply(Some("Hello"), Some(DONE)),
         ],
         None,
@@ -4897,7 +4904,12 @@ fn a_quoted_scope_question_is_decided_at_ticket_and_asked_at_discoverable() {
     );
     let stop = outcome.expect_err("a round");
     assert_eq!(asked_texts(&stop).len(), 1, "{printed}");
-    assert!(!bench.comments().iter().any(|c| c.contains("[owlshift] DECISION")));
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.contains("[owlshift] DECISION"))
+    );
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
     assert_eq!(resolved[0]["refused"], json!(["Q1"]));
     assert_eq!(resolved[0]["to_decider"], json!(["Q1"]));
@@ -4969,7 +4981,11 @@ fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
     let stop = outcome.expect_err("a round");
     assert_eq!(asked_texts(&stop).len(), 1, "{printed}");
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(roles, [Role::Build, Role::Resolver, Role::Build], "{printed}");
+    assert_eq!(
+        roles,
+        [Role::Build, Role::Resolver, Role::Build],
+        "{printed}"
+    );
     let round = bench.comments().pop().unwrap();
     assert!(round.contains("reported no cost"), "{round}");
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");

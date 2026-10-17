@@ -106,9 +106,7 @@ use owlshift_core::resource::Resource;
 use owlshift_core::routing::{
     PROJECT_DEFAULT, RunRouting, TicketRouting, role_routing, ticket_routing,
 };
-use owlshift_core::state::{
-    Event, MAX_REASKS, ParkReason, Status, TicketState, Transition,
-};
+use owlshift_core::state::{Event, MAX_REASKS, ParkReason, Status, TicketState, Transition};
 
 use crate::agent_env::AgentEnv;
 use crate::answer_check::{self, Readiness};
@@ -5140,8 +5138,7 @@ impl OnDemand<'_> {
             decisions,
             // The level in force for this command, said once when the
             // resolver's decisions are listed (OWL-337).
-            level: (!questions.decisions.is_empty())
-                .then(|| self.config.policy.resolver().level),
+            level: (!questions.decisions.is_empty()).then(|| self.config.policy.resolver().level),
             followups: proposals::reported(&followups, proposals),
             fix_pass,
             rebase,

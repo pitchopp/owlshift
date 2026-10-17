@@ -30,8 +30,8 @@ use owlshift_adapters::tracker::linear::{
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker, TrackerKind};
-use owlshift_contracts::{DelegationLevel, Harness};
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::{DelegationLevel, Harness};
 use owlshift_core::gate::PassLimit;
 use owlshift_core::schedule::{holds_slot, natural_cmp};
 use owlshift_core::vocab::Stage;

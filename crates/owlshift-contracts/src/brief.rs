@@ -7,7 +7,6 @@ use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{DelegationLevel, Role};
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
 use crate::ids::{QuestionId, RelativePath, TicketId, is_commit_id};
 use crate::result::{
@@ -17,6 +16,7 @@ use crate::result::{
 use crate::review::{
     Finding, FindingsMode, MAX_PASS_FINDINGS, Mandate, Plan, check_findings, check_mandates,
 };
+use crate::{DelegationLevel, Role};
 
 const CONTRACT: &str = "brief";
 
