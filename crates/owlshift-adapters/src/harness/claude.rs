@@ -52,6 +52,7 @@ pub use super::{ModelUsage, Usage};
 /// untrusted one's hook, let a read-only role run Bash and Write. The same
 /// flag keeps Claude Code from loading the worktree's `CLAUDE.md`, rules,
 /// skills, commands and agents; the brief carries the project's rules.
+/// Claude Code's bundled skills are another matter ([`SKILL_ARGS`]).
 /// `--settings` and managed settings still apply. Checked live (OWL-53,
 /// recorded under check C1 in `docs/design/build-plan.md`).
 ///
@@ -59,6 +60,17 @@ pub use super::{ModelUsage, Usage};
 /// outside Claude Code, and [`Run::mcp_servers`] lets the executor check that
 /// no server was loaded.
 const GUARDRAIL_ARGS: &[&str] = &["--setting-sources", "", "--strict-mcp-config"];
+
+/// Switches off every skill and slash command, Claude Code's bundled ones
+/// included. Under `GUARDRAIL_ARGS` alone, a confined run's `init` still
+/// listed the CLI's own skills (`dataviz`, `schedule`, `update-config` and
+/// others), offered the `Skill` tool, and a run asked to invoke `dataviz`
+/// got the skill's text: an instruction Owlshift did not put in the brief.
+/// With this flag `init` lists no skill and no slash command, and `Skill` is
+/// not offered. Removing the `Skill` tool alone would leave the listing.
+/// Checked live with Claude Code 2.1.302 (OWL-333, recorded under check C1
+/// in `docs/design/build-plan.md`).
+const SKILL_ARGS: &[&str] = &["--disable-slash-commands"];
 
 /// Refuses what the user's other Claude Code sessions send to a run. Every
 /// `claude -p` listens on a local socket, the `messaging_socket_path` of its
@@ -236,7 +248,8 @@ impl std::error::Error for CommandError {}
 /// The tools that reach beyond the run are always removed and, without network
 /// access, the web tools too, all in one `--disallowedTools` flag; Bash, when
 /// allowed, can still reach the network. No settings file is read, so nothing
-/// in the worktree grants a permission or runs a hook (`GUARDRAIL_ARGS`).
+/// in the worktree grants a permission or runs a hook (`GUARDRAIL_ARGS`), and
+/// no skill, Claude Code's own included, reaches the model (`SKILL_ARGS`).
 /// Messages from the user's other sessions are refused on every launch
 /// (`PEER_INBOX_ARGS`).
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
@@ -279,6 +292,7 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
         command.arg("--max-budget-usd").arg(budget.to_string());
     }
     command.args(GUARDRAIL_ARGS);
+    command.args(SKILL_ARGS);
     command.args(PEER_INBOX_ARGS);
     command.arg("--no-session-persistence");
     command
@@ -750,6 +764,12 @@ mod tests {
         GUARDRAIL_ARGS.join(" ")
     }
 
+    /// The skills flag as it appears on the command line; that every launch
+    /// carries it is pinned by the contract tests.
+    fn skills() -> String {
+        SKILL_ARGS.join(" ")
+    }
+
     #[test]
     fn a_read_only_run_may_write_only_its_result_file() {
         let request = request(PermissionLevel::ReadOnly);
@@ -759,9 +779,10 @@ mod tests {
                 "-p --output-format stream-json --verbose \
                  --permission-mode dontAsk --allowedTools Edit(/.owlshift/result.json) \
                  --permission-prompts none --disallowedTools {} \
-                 {} {} --no-session-persistence",
+                 {} {} {} --no-session-persistence",
                 denied(),
                 guardrail(),
+                skills(),
                 inbox()
             )
         );
@@ -784,9 +805,10 @@ mod tests {
                  --permission-mode acceptEdits --allowedTools Bash \
                  --permission-prompts none --disallowedTools {} WebFetch WebSearch \
                  --json-schema {{\"type\":\"object\"}} --max-budget-usd 2.5 \
-                 {} {} --no-session-persistence",
+                 {} {} {} --no-session-persistence",
                 denied(),
                 guardrail(),
+                skills(),
                 inbox()
             )
         );
