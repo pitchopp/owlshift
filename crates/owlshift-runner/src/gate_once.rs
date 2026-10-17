@@ -401,7 +401,14 @@ mod tests {
     impl Bench {
         fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
-            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            // Resolved on Unix, where macOS's temporary folder is a link; not
+            // on Windows, where it would take the `\\?\` form git cannot read
+            // a configuration file through.
+            let root = if cfg!(unix) {
+                std::fs::canonicalize(tmp.path()).unwrap()
+            } else {
+                tmp.path().to_owned()
+            };
             std::fs::create_dir_all(root.join("home")).unwrap();
             std::fs::write(
                 root.join("gitconfig"),
@@ -692,13 +699,23 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_gate_is_refused_on_native_windows() {
-        let bench = Bench::new();
-        let executor = bench.executor(bench.agent());
-        let refused = bench.gate(&executor, &["echo hi"], None).unwrap_err();
+        let data = tempfile::tempdir().unwrap();
+        let dirs = ProjectDirs::new(data.path(), &Repo::parse("acme/app").unwrap());
+        let executor =
+            on_demand::executor(Git::new("git"), AgentEnv::new(std::env::vars_os()).unwrap());
+        let refused = GateOnce {
+            executor: &executor,
+            dirs: &dirs,
+            remote_url: "https://github.com/acme/app.git",
+            local_gate: &["echo hi".to_owned()],
+            at: None,
+        }
+        .run(&mut |_| panic!("nothing runs"))
+        .unwrap_err();
         assert!(
             matches!(&refused, Stop::Refused(reason) if reason.contains("WSL2")),
             "{refused:?}"
         );
-        assert!(!bench.dirs.checkout().exists());
+        assert!(!dirs.checkout().exists() && !worktree(&dirs).exists());
     }
 }
