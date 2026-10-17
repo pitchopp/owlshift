@@ -642,8 +642,11 @@ impl Policy {
     }
 
     /// Checks the resolver's keys (OWL-328): a number of passes from 1 to
-    /// 50, a ceiling that is a positive number of dollars, and a ceiling
-    /// beside `"unlimited"`, which nothing else bounds.
+    /// 50, a ceiling that is a positive number of dollars, at least the
+    /// millionth of a dollar the gate counts in (a smaller one would round
+    /// to a ceiling of nothing, which ends every chain before its first
+    /// resolver run), and a ceiling beside `"unlimited"`, which nothing else
+    /// bounds.
     fn check_resolver(&self) -> Result<(), String> {
         if let Some(ResolverPasses::Runs(runs)) = self.resolver_passes
             && !RESOLVER_PASSES.contains(&runs)
@@ -651,10 +654,12 @@ impl Policy {
             return Err(RESOLVER_PASSES_SHAPE.to_owned());
         }
         if let Some(Usd(usd)) = self.resolver_budget_usd
-            && !(usd.is_finite() && usd > 0.0)
+            && !(usd > 0.0 && usd_micros(usd).is_some_and(|micros| micros >= 1))
         {
             return Err(
-                "policy.resolver_budget_usd must be a positive number of dollars".to_owned(),
+                "policy.resolver_budget_usd must be a positive number of dollars, at least \
+                 0.000001"
+                    .to_owned(),
             );
         }
         if self.resolver_passes == Some(ResolverPasses::Unlimited)
@@ -673,6 +678,7 @@ impl Policy {
     /// limit and ceiling, each the project's or its default
     /// ([`ResolverPolicy::default`]). A number of passes outside the range,
     /// possible only in a configuration built in code, is clamped into it;
+    /// so is an amount below a millionth of a dollar, to that millionth, and
     /// an amount that is not a positive number sets no ceiling.
     pub fn resolver(&self) -> ResolverPolicy {
         let passes = match self.resolver_passes {
@@ -688,7 +694,8 @@ impl Policy {
             ceiling_micros: self
                 .resolver_budget_usd
                 .filter(|usd| usd.0 > 0.0)
-                .and_then(|usd| usd_micros(usd.0)),
+                .and_then(|usd| usd_micros(usd.0))
+                .map(|micros| micros.max(1)),
         }
     }
 }
@@ -1325,6 +1332,24 @@ mod tests {
             "{error}"
         );
         assert!(refused("resolver_delegation = \"most\"").contains("resolver_delegation"));
+    }
+
+    /// A ceiling below the millionth of a dollar the gate counts in would
+    /// round to nothing and end every chain before its first resolver run:
+    /// the file is refused, naming the key; the millionth itself is kept.
+    #[test]
+    fn a_ceiling_below_a_millionth_of_a_dollar_is_refused() {
+        for tiny in ["1e-9", "0.0000004"] {
+            let error = project("", &format!("resolver_budget_usd = {tiny}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("policy.resolver_budget_usd") && error.contains("at least 0.000001"),
+                "{tiny}: {error}"
+            );
+        }
+        let smallest = project("", "resolver_budget_usd = 0.000001").unwrap();
+        assert_eq!(smallest.policy.resolver().ceiling_micros, Some(1));
     }
 
     /// A project file whose `[tracker]` admits by `admit` and adds `extra`.
