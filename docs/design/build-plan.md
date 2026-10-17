@@ -582,6 +582,7 @@ Everything runs in the foreground; `continue` arrives in P2, `watch` in P3, the 
 | `owlshift continue TICKET` | P2 | Picks a ticket up once its decider has answered, after the quiet window, or restarts a parked one (OWL-122, named by OWL-127) |
 | `owlshift watch` | P3 | Continues each ticket whose questions wait, in the foreground, once its decider's reply counts, until Ctrl-C (OWL-152); follows each pull request Owlshift delivered, with a fix run on a red check and a rebase run on a conflict (OWL-208); with `--drain` (P4), also takes admitted tickets in from the ready column, intake first, one Build at a time (OWL-244, "P4 · The drain") |
 | `owlshift logs [TICKET] [--last N] [--follow]` | P1 | Events, with the directory of each run's logs |
+| `owlshift gate [--at COMMIT]` | P5 | Runs the project's gate once as a Build's gate runs it, in a fresh worktree, and prints each command's tail, status and time (OWL-329, P5 part L) |
 
 **What `doctor` checks, as built in P0 (OWL-12).**
 
@@ -1326,6 +1327,25 @@ Designed on 2026-10-15 (OWL-296). The rules are [architecture](architecture.md) 
   - *`doctor`.* A `secrets` line names the account each tracker and forge secret is read from: a warning, which does not block, when one is shared, whose fix is `owlshift init --replace-secrets` in the repository; a failure without a GitHub token, as `do` refuses then, without a GitHub `origin`, or when the keychain cannot be read. The tracker lines name the resolved accounts, and the advice to delete the app's two entries to write through the key is given for the project's own entries only, never for shared ones another project may use.
   - *The platforms.* The account names hold `/` and `.`: the Windows store (`windows-native-keyring-store` 1.1.0) checks their length only, at most 513 characters for the user name, and the Secret Service keeps them as attribute strings; a name here is at most about 170 characters. Read on 2026-10-15 in the crates' sources; the tests use the in-memory store on the three platforms, and the round trip through the macOS Keychain on such a name is a live check (`system_keychain_round_trip`, ignored).
 - **L · Locary's adoption.** (OWL-309) After K, then check (d). Locary's `owlshift.toml` (team `LOC`, its states, `admitters`, `[forge].reviewers`, `stack.gate`, `stack.rules` naming `CLAUDE.md` and its rules), proposed to Locary through its own process; its secrets through K; the Linear app of D8 on its workspace or the key with doctor's warning; `owlshift doctor` clean on it.
+  - *`owlshift gate`* (OWL-329, 2026-10-17). Locary's gate took four Build rounds on LOC-1407 to get right.
+    `gate_once` tries a gate without a Build run: version, lock, marker and confinement as a Build's
+    preparation, then the dedicated checkout synced and a fresh worktree on `owlshift-gate/check`.
+    The commit is origin's default branch, or `--at` (a full id or `origin/<branch>`, read as a run's base).
+    The gate comes from the project file at that commit, or the operator's when it has none, as OWL-331 reads a Build's.
+    `gate_env` and `allow_gate_env` come from the loaded configuration; names that differ are noted, as a Build warns.
+    `Executor::run_gate` shares `project_gate` with a Build's gate: same `RunPaths`, temporary folder,
+    credential check, snapshot and guard. A breach writes the `unverified` marker and keeps the worktree.
+    Otherwise the worktree is removed from the file system, then pruned, and its branch is deleted.
+    *Temporary folder, as a Build's gate has it:* one run folder for every command (`RunPaths::temp`).
+    Under bwrap a folder in `/tmp` is made anew and empty for each command; on macOS commands share it.
+    Native Windows is refused (D9).
+    *Checked on Locary, 2026-10-17* (debug binary at 16e62a3, macOS):
+    - `--at 4c5d3f82` (`make lint`, `make test`): red, `make lint`: exit status 2, in 0.5 s.
+    - `--at 302a7ca5` (`ci/owlshift/gate.sh` setup, lint, test): all three pass, then red on
+      "the gate changed files: scripts/__pycache__/*.pyc". A Build there is red the same way;
+      LOC-1407 passed because its Build ignored `scripts/__pycache__` (squashed into be3b17dc).
+    - `--at be3b17dc` (the same gate with that ignore): green, 3 commands in 757.0 s, exit 0.
+      Run from a clean clone: the operator's owlshift.toml held a field this binary refuses.
 - **M · The scenarios.** (OWL-310) After F, G, H, I, J and OWL-32. S8, S9's findings and review passes, S17's routing part, each variant walked end to end, plan approval given and refused, a `replan`, and a review loop, played by the test bench on the Markdown tracker with the fake harness and the bench's fake GitHub, as acceptance.
   - *As built* (OWL-310, 2026-10-16). Played as part K played P4: in Rust, on the runner's own `owlshift watch --drain` (`Watch::run_drain`), in `owlshift-testkit/tests/on_demand/pipeline_scenarios.rs`, a module of `on_demand.rs` whose bench and helpers it shares with parts F, G and J's files. The drain dispatches, watch continues every answer, and no command is typed. Six tests, each asserting the runs of every pass:
     - *S8* (`scenario_s8_a_false_premise_at_intake_is_rescoped`, `scenario_s8_a_false_premise_at_design_is_closed`). Intake finds the premise false and asks to re-scope or close: needs input, no intake record, nothing built or pushed. Watch continues the re-scope; intake runs again with it in its thread, and the drain dispatches the ticket in that same pass, since watch's continue runs before the drain reads the column. At Design, the closure answered makes the design run end `blocked`: the ticket parks at Design, with no plan, no Build and no dispatch after the park. That pins the runner's park on `blocked`, not the closure, which is the decider's act in the tracker.

@@ -84,7 +84,7 @@ use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
 
 pub use codex::CodexHarness;
-pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport};
+pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport, GateStep};
 pub use git::{Git, GitError, MINIMUM_GIT_VERSION};
 pub(crate) use git::{git_floor_reason, git_install_advice, git_recheck_note};
 pub use harness::{
@@ -434,19 +434,13 @@ impl Executor {
             ));
         }
         worktree::prepare(&self.git, spec)?;
-        let mut paths = self.run_paths(spec)?;
+        let mut paths = self.run_paths(spec.worktree, spec.run_dir)?;
         if needs.read_only {
             read_only_clear(&needs.writable, &paths)?;
         }
         // The run's own temporary folder: private to the user, removed when
         // `run` returns, after every process of the run is stopped.
-        let temp = tempfile::Builder::new()
-            .prefix("owlshift-run-")
-            .tempdir()
-            .map_err(|source| ExecutorError::RunDir {
-                path: std::env::temp_dir(),
-                source,
-            })?;
+        let temp = run_temp()?;
         let mut brief = spec.brief.clone();
         brief.result_path =
             RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a plain relative path");
@@ -654,22 +648,8 @@ impl Executor {
         }
         let mut gate = None;
         if matches!(brief.role, Role::Build | Role::Rebase) && is_done(&outcome) {
-            // The gate runs the code the run wrote, confined as the run was,
-            // without the harness's own folders.
-            let report = gate::run(
-                &self.git,
-                &self.agent,
-                &RunPaths {
-                    readable: Vec::new(),
-                    writable: Vec::new(),
-                    read_only: false,
-                    ..paths
-                },
-                &brief.gate,
-                self.gate_timeout,
-                &spec.run_dir.join(gate::GATE_LOG),
-                &|| before.check_files(spec.worktree),
-            );
+            let report =
+                self.project_gate(&before, spec.worktree, paths, &brief.gate, spec.run_dir);
             if let Some(after_gate) = after_gate(&report, || {
                 before.check(&self.git, spec.main, spec.worktree, spec.branch)
             }) {
@@ -698,25 +678,153 @@ impl Executor {
     /// What the sandbox opens for this run: the worktree, the repository's
     /// common git folder, as the runner's git reports it; and what it
     /// closes: the run directory, which holds the logs.
-    fn run_paths(&self, spec: &RunSpec<'_>) -> Result<RunPaths, ExecutorError> {
+    fn run_paths(&self, worktree: &Path, run_dir: &Path) -> Result<RunPaths, ExecutorError> {
         let printed = self
             .git
             .run(
-                spec.worktree,
+                worktree,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )
             .map_err(|e| ExecutorError::Worktree(e.to_string()))?;
         let git_dir = PathBuf::from(String::from_utf8_lossy(&printed).trim());
         Ok(RunPaths {
-            workdir: spec.worktree.to_owned(),
+            workdir: worktree.to_owned(),
             git_dir: Some(git_dir),
             readable: Vec::new(),
             writable: Vec::new(),
-            hidden: vec![spec.run_dir.to_owned()],
+            hidden: vec![run_dir.to_owned()],
             temp: None,
             read_only: false,
         })
     }
+
+    /// The project's gate, run by the runner on the code in `worktree`,
+    /// confined as the run was (`paths`, its temporary folder included),
+    /// without a harness's own folders, the guard checking `before`'s files
+    /// before each of the gate's own git steps; its log goes to `run_dir`.
+    /// The one path a Build's gate and `owlshift gate` share (OWL-329).
+    fn project_gate(
+        &self,
+        before: &isolation::Snapshot,
+        worktree: &Path,
+        paths: RunPaths,
+        commands: &[String],
+        run_dir: &Path,
+    ) -> GateReport {
+        gate::run(
+            &self.git,
+            &self.agent,
+            &RunPaths {
+                readable: Vec::new(),
+                writable: Vec::new(),
+                read_only: false,
+                ..paths
+            },
+            commands,
+            self.gate_timeout,
+            &run_dir.join(gate::GATE_LOG),
+            &|| before.check_files(worktree),
+        )
+    }
+
+    /// Runs the project's gate once, alone, as a Build's gate runs after a
+    /// `done` (OWL-329): in a fresh worktree at `spec.base` on a new branch,
+    /// with the run's paths, its own temporary folder and the credential
+    /// check a run gets, isolation snapshotted before and checked after.
+    /// Nothing is removed afterwards: the caller discards the worktree
+    /// ([`Executor::discard_worktree`]) once it has judged the isolation.
+    ///
+    /// What goes wrong before the first command (the sandbox, the worktree,
+    /// a credential finding, the snapshot) is an [`ExecutorError`]; the
+    /// worktree may then exist.
+    pub fn run_gate(&self, spec: &GateSpec<'_>) -> Result<GateRun, ExecutorError> {
+        self.agent
+            .sandbox_ready()
+            .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
+        worktree::create(&self.git, spec.main, spec.worktree, spec.branch, spec.base)?;
+        let mut paths = self.run_paths(spec.worktree, spec.run_dir)?;
+        let temp = run_temp()?;
+        paths.temp = Some(temp.path().to_owned());
+        fs::create_dir_all(spec.run_dir).map_err(|source| ExecutorError::RunDir {
+            path: spec.run_dir.to_owned(),
+            source,
+        })?;
+        let hosts: Vec<&str> = self.forge_hosts.iter().map(String::as_str).collect();
+        let findings = self.agent.check(spec.worktree, &hosts);
+        if !findings.is_empty() {
+            return Err(ExecutorError::Credentials(findings));
+        }
+        let before = isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch)
+            .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
+        let report = self.project_gate(&before, spec.worktree, paths, spec.commands, spec.run_dir);
+        let violations = gate_violations(&report, || {
+            before.check(&self.git, spec.main, spec.worktree, spec.branch)
+        });
+        Ok(GateRun { report, violations })
+    }
+
+    /// Removes a worktree [`Executor::run_gate`] made, and its branch,
+    /// without running git in it; see `worktree::discard`.
+    pub fn discard_worktree(
+        &self,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<(), ExecutorError> {
+        worktree::discard(&self.git, main, worktree, branch)
+    }
+
+    /// The commit `base` names in `main`, read as a run's base is: a full
+    /// commit id, or a remote-tracking name such as `origin/main` looked up
+    /// as exactly `refs/remotes/<name>` ([`RunSpec::base`]).
+    pub fn resolve_commit(&self, main: &Path, base: &str) -> Result<String, ExecutorError> {
+        worktree::resolve_commit(&self.git, main, base)
+    }
+}
+
+/// One run of the project's gate alone ([`Executor::run_gate`]).
+#[derive(Clone, Copy, Debug)]
+pub struct GateSpec<'a> {
+    /// The checkout the worktree is made from, as [`RunSpec::main`].
+    pub main: &'a Path,
+    /// Where the fresh worktree goes, an absolute path where nothing is.
+    pub worktree: &'a Path,
+    /// Its new branch, which must not exist.
+    pub branch: &'a str,
+    /// What it starts from, as [`RunSpec::base`].
+    pub base: &'a str,
+    /// Where the gate log goes, outside the worktree, hidden from the gate.
+    pub run_dir: &'a Path,
+    /// The gate commands, in order.
+    pub commands: &'a [String],
+}
+
+/// What a run of the gate alone came to.
+#[derive(Debug)]
+pub struct GateRun {
+    pub report: GateReport,
+    /// What the isolation check found after the gate, the gate's own
+    /// breach included; empty when isolation held.
+    pub violations: Vec<Violation>,
+}
+
+impl GateRun {
+    /// Whether the gate passed and isolation held.
+    pub fn passed(&self) -> bool {
+        self.report.passed() && self.violations.is_empty()
+    }
+}
+
+/// The run's own temporary folder: private to the user, removed when the
+/// value is dropped. A Build run and `owlshift gate` make it alike.
+fn run_temp() -> Result<tempfile::TempDir, ExecutorError> {
+    tempfile::Builder::new()
+        .prefix("owlshift-run-")
+        .tempdir()
+        .map_err(|source| ExecutorError::RunDir {
+            path: std::env::temp_dir(),
+            source,
+        })
 }
 
 /// Refuses a read-only run whose harness would write a folder that holds,
@@ -789,10 +897,7 @@ fn is_done(outcome: &Outcome) -> bool {
 /// otherwise `check` checks isolation again, and a violation there wins over
 /// the gate's own verdict.
 fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Option<Outcome> {
-    if !report.breach.is_empty() {
-        return Some(Outcome::Quarantined(report.breach.clone()));
-    }
-    let violations = check();
+    let violations = gate_violations(report, check);
     if !violations.is_empty() {
         Some(Outcome::Quarantined(violations))
     } else {
@@ -800,6 +905,16 @@ fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Op
             .failure
             .as_ref()
             .map(|failure| Outcome::Failed(Failure::Gate(Box::new(failure.clone()))))
+    }
+}
+
+/// The isolation violations after a gate: the breach the gate found before
+/// its own git, as it is, with no more git; otherwise what `check` finds.
+fn gate_violations(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Vec<Violation> {
+    if report.breach.is_empty() {
+        check()
+    } else {
+        report.breach.clone()
     }
 }
 
@@ -1249,6 +1364,7 @@ mod tests {
             log: PathBuf::new(),
             failure,
             breach,
+            steps: Vec::new(),
         };
         let link = Violation::WorktreeLink("redirected".to_owned());
         let breached = report(vec![link.clone()], Some(failure.clone()));

@@ -1153,6 +1153,54 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
     assert!(!config_dir.path().join("data").exists());
 }
 
+/// OWL-329: `owlshift gate` is refused, before anything is cloned, without
+/// a project file, without a GitHub `origin` and, on native Windows, where
+/// a Build's gate cannot be confined (D9). What it runs is tested in the
+/// runner (`gate_once`).
+#[test]
+fn gate_refuses_what_a_build_would_before_any_clone() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let output = owlshift(repo.path(), config_dir.path(), &["gate"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("run `owlshift init`"),
+        "{}",
+        stderr(&output)
+    );
+
+    let init = ["init", "--tracker", "markdown", "--skip-secrets"];
+    assert!(
+        owlshift(repo.path(), config_dir.path(), &init)
+            .status
+            .success()
+    );
+    let bare = tempfile::tempdir().unwrap();
+    let bare = bare.path().to_string_lossy().into_owned();
+    git(repo.path(), &["remote", "add", "origin", &bare]);
+    let output = owlshift(repo.path(), config_dir.path(), &["gate"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not a github.com repository"),
+        "{}",
+        stderr(&output)
+    );
+
+    if cfg!(windows) {
+        let github = "https://github.com/owlshift/demo.git";
+        git(repo.path(), &["remote", "set-url", "origin", github]);
+        let output = owlshift(
+            repo.path(),
+            config_dir.path(),
+            &["gate", "--at", "origin/x"],
+        );
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("WSL2"), "{}", stderr(&output));
+    }
+    assert!(!config_dir.path().join("data").exists());
+}
+
 /// OWL-202: `owlshift forget` with no record kept on the ticket is refused,
 /// and makes no data directory. What it forgets is tested in the testkit
 /// (`tests/ticket_ref.rs`, `tests/on_demand.rs`).

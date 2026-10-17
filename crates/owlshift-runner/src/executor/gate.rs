@@ -93,12 +93,32 @@ pub struct GateReport {
     /// isolation and is quarantined, whatever the failure says. Empty when
     /// the guard found nothing.
     pub breach: Vec<Violation>,
+    /// Each command started, in order, the failing one last: what
+    /// `owlshift gate` prints (OWL-329). Empty when none started.
+    pub steps: Vec<GateStep>,
 }
 
 impl GateReport {
     pub fn passed(&self) -> bool {
         self.failure.is_none() && self.breach.is_empty()
     }
+}
+
+/// One gate command the runner started, and how it ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GateStep {
+    /// The command, as in the brief's `gate`.
+    pub command: String,
+    /// Why it failed the gate, which can be after an exit status 0 (an
+    /// output held open, a log that could not be written); `None` when it
+    /// passed.
+    pub failure: Option<String>,
+    /// Its time, from its start until its output closed or was abandoned.
+    pub elapsed: Duration,
+    /// The last [`OUTPUT_TAIL`] bytes of its output, as a failure keeps them.
+    pub output: String,
+    /// Whether the output was cut from the front.
+    pub truncated: bool,
 }
 
 /// The checks the gate makes before its own git runs, on the file system
@@ -139,6 +159,7 @@ pub(crate) fn run(
         log: log_path.to_owned(),
         failure: None,
         breach: Vec::new(),
+        steps: Vec::new(),
     };
     let checked = check_and_run(
         &git,
@@ -192,7 +213,15 @@ fn check_and_run(
         ))
         .into());
     }
-    run_commands(agent, paths, commands, timeout, deadline, &mut log)?;
+    run_commands(
+        agent,
+        paths,
+        commands,
+        timeout,
+        deadline,
+        &mut log,
+        &mut report.steps,
+    )?;
     // The commands wrote what the sandbox let them, the repository's git
     // folder included: nothing they planted may run in the gate's git.
     guarded(guard, &mut log)?;
@@ -372,7 +401,8 @@ fn agent_git_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     all
 }
 
-/// Runs the commands in order until the first failure, sharing one deadline.
+/// Runs the commands in order until the first failure, sharing one deadline,
+/// and records each one started in `steps`.
 fn run_commands(
     agent: &AgentEnv,
     paths: &RunPaths,
@@ -380,6 +410,7 @@ fn run_commands(
     timeout: Duration,
     deadline: Instant,
     log: &mut File,
+    steps: &mut Vec<GateStep>,
 ) -> Result<(), GateFailure> {
     for command in commands {
         let failed = |reason: String, tail: Tail| {
@@ -401,7 +432,9 @@ fn run_commands(
                 Tail::default(),
             ));
         }
+        let started = Instant::now();
         let ran = run_one(agent, paths, command, deadline, log);
+        let elapsed = started.elapsed();
         let status = match &ran.end {
             End::Exited(status) => status.to_string(),
             End::TimedOut => "stopped at the deadline".to_owned(),
@@ -422,8 +455,21 @@ fn run_commands(
                 .log_error
                 .map(|e| format!("the runner could not write the gate log: {e}")),
         };
+        let (output, truncated) = ran.tail.text();
+        steps.push(GateStep {
+            command: command.clone(),
+            failure: reason.clone(),
+            elapsed,
+            output: output.clone(),
+            truncated,
+        });
         if let Some(reason) = reason {
-            return Err(failed(reason, ran.tail));
+            return Err(GateFailure {
+                command: Some(command.clone()),
+                reason,
+                output,
+                truncated,
+            });
         }
     }
     Ok(())
@@ -676,6 +722,7 @@ mod tests {
             timeout,
             Instant::now() + timeout,
             &mut log,
+            &mut Vec::new(),
         );
         (outcome, std::fs::read_to_string(&log_path).unwrap())
     }
@@ -852,6 +899,7 @@ mod tests {
             timeout,
             Instant::now() + timeout,
             &mut log,
+            &mut Vec::new(),
         );
         let failure = outcome.unwrap_err();
         assert_eq!(
@@ -867,6 +915,7 @@ mod tests {
             timeout,
             Instant::now() + timeout,
             &mut log,
+            &mut Vec::new(),
         );
         assert_eq!(next, Ok(()));
         File::create(dir.path().join("go")).unwrap();
@@ -1043,6 +1092,7 @@ mod tests {
             timeout,
             Instant::now() + timeout,
             &mut log,
+            &mut Vec::new(),
         )
     }
 

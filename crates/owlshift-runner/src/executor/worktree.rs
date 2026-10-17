@@ -20,23 +20,105 @@ pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError
     }
 
     let head_ref = format!("refs/heads/{}", spec.branch);
-    let exists = branch_exists(git, spec.main, &head_ref)?;
-    let mut args: Vec<&OsStr> = vec!["worktree".as_ref(), "add".as_ref(), "--quiet".as_ref()];
-    let base;
-    if exists {
-        args.extend([spec.worktree.as_os_str(), spec.branch.as_ref()]);
-    } else {
-        base = resolve_base(git, spec.main, spec.base)
-            .map_err(|e| ExecutorError::Spec(format!("base {:?}: {e}", spec.base)))?;
-        args.extend([
-            "-b".as_ref(),
-            spec.branch.as_ref(),
+    if branch_exists(git, spec.main, &head_ref)? {
+        let args: [&OsStr; 5] = [
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--quiet".as_ref(),
             spec.worktree.as_os_str(),
-            base.as_ref(),
-        ]);
+            spec.branch.as_ref(),
+        ];
+        git.run(spec.main, &args).map_err(worktree_error)?;
+        Ok(())
+    } else {
+        add_new_branch(git, spec.main, spec.worktree, spec.branch, spec.base)
     }
-    git.run(spec.main, &args).map_err(worktree_error)?;
+}
+
+/// Creates a worktree at `worktree` on a new `branch` made at `base`, read
+/// as [`resolve_base`] reads it: the fresh worktree of `owlshift gate`
+/// (OWL-329). Anything already at the path, or a branch of that name, is
+/// refused: nothing is reused.
+pub(super) fn create(
+    git: &Git,
+    main: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(), ExecutorError> {
+    check_spec(git, main, worktree, branch)?;
+    if fs::symlink_metadata(worktree).is_ok() {
+        return Err(ExecutorError::Worktree(format!(
+            "{} already exists",
+            worktree.display()
+        )));
+    }
+    if branch_exists(git, main, &format!("refs/heads/{branch}"))? {
+        return Err(ExecutorError::Worktree(format!(
+            "the branch {branch} already exists"
+        )));
+    }
+    add_new_branch(git, main, worktree, branch, base)
+}
+
+/// Adds the worktree `worktree` on a new `branch` at the commit `base`
+/// names.
+fn add_new_branch(
+    git: &Git,
+    main: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(), ExecutorError> {
+    let commit = resolve_base(git, main, base)
+        .map_err(|e| ExecutorError::Spec(format!("base {base:?}: {e}")))?;
+    let args: [&OsStr; 7] = [
+        "worktree".as_ref(),
+        "add".as_ref(),
+        "--quiet".as_ref(),
+        "-b".as_ref(),
+        branch.as_ref(),
+        worktree.as_os_str(),
+        commit.as_ref(),
+    ];
+    git.run(main, &args).map_err(worktree_error)?;
     Ok(())
+}
+
+/// Removes the worktree at `worktree` and its `branch` from `main`'s
+/// repository, whatever is left of either, without running git in the
+/// worktree, whose files a run wrote: the folder goes from the file system
+/// (a link there is removed, never followed), then `git worktree prune`
+/// forgets it and the branch is deleted. For `owlshift gate`'s throwaway
+/// worktree (OWL-329).
+pub(super) fn discard(
+    git: &Git,
+    main: &Path,
+    worktree: &Path,
+    branch: &str,
+) -> Result<(), ExecutorError> {
+    let removed = match fs::symlink_metadata(worktree) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(worktree),
+        Ok(_) => fs::remove_file(worktree),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    };
+    removed.map_err(|e| ExecutorError::Worktree(format!("{}: {e}", worktree.display())))?;
+    git.run(main, &["worktree", "prune"])
+        .map_err(worktree_error)?;
+    if branch_exists(git, main, &format!("refs/heads/{branch}"))? {
+        git.run(
+            main,
+            &["branch", "--quiet", "-D", "--end-of-options", branch],
+        )
+        .map_err(worktree_error)?;
+    }
+    Ok(())
+}
+
+/// The commit `base` names, read as a run's base is ([`resolve_base`]).
+pub(super) fn resolve_commit(git: &Git, main: &Path, base: &str) -> Result<String, ExecutorError> {
+    resolve_base(git, main, base).map_err(|e| ExecutorError::Spec(format!("{base:?}: {e}")))
 }
 
 fn worktree_error(error: GitError) -> ExecutorError {

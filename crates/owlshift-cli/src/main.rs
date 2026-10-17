@@ -2,6 +2,7 @@
 
 mod do_cmd;
 mod forget_cmd;
+mod gate_cmd;
 mod init_cmd;
 mod logs_cmd;
 
@@ -77,6 +78,18 @@ enum Command {
     Forget {
         /// The ticket, such as OWL-12.
         ticket: String,
+    },
+    /// Run the project's gate once, as a Build's gate runs it: in a fresh
+    /// worktree of origin's default branch, confined, with the variables
+    /// the project declares and you allow. Prints each command's last lines,
+    /// status and time, then removes the worktree. The gate is the project
+    /// file's at that commit, or yours when it has none. Refused while
+    /// another command works the project.
+    Gate {
+        /// Check this commit instead: a full commit id, or a branch of
+        /// origin such as `origin/fix-gate`.
+        #[arg(long, value_name = "COMMIT")]
+        at: Option<String>,
     },
     /// Print the events `owlshift do`, `continue`, `watch` and `forget`
     /// recorded, oldest first.
@@ -163,6 +176,7 @@ fn main() -> ExitCode {
         Command::Watch { drain: false } => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
         Command::Watch { drain: true } => do_cmd::run(&system, &config, do_cmd::Mode::Drain),
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
+        Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
         Command::Logs {
             ticket,
             last,
