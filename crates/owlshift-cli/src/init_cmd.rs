@@ -79,7 +79,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                     path.display(),
                     if options.gate.is_empty() {
                         " Its gate is empty: list your lint, formatter and test commands in \
-                         `stack.gate`, or the build role stops with `blocked`."
+                         `stack.gate`, or `owlshift do` refuses to start a ticket."
                     } else {
                         ""
                     }

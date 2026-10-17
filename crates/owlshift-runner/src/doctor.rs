@@ -30,7 +30,7 @@ use owlshift_adapters::tracker::linear::{
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
 use owlshift_contracts::Harness;
-use owlshift_contracts::config::{Admit, States, Tracker, TrackerKind};
+use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker, TrackerKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::schedule::{holds_slot, natural_cmp};
 use owlshift_core::vocab::Stage;
@@ -47,8 +47,8 @@ use crate::executor::{
 use crate::forge::GITHUB_TOKEN_HELP;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::{
-    AppError, DataDirSource, DefaultBranch, RunError, StatesError, System, TokenTryError,
-    exact_version_of, older_than, version_of,
+    AppError, DataDirSource, DefaultBranch, DefaultBranchFile, RunError, StatesError, System,
+    TokenTryError, exact_version_of, older_than, version_of,
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
@@ -271,7 +271,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
         checks.push(codex_machine_config_check(system));
         checks.extend(codex_requirements_check(system));
     }
-    checks.push(file_check("project config", &config.project, home));
+    checks.push(project_config_check(system, &config.project, home));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
     let stored = project_secrets(system, config);
@@ -1072,6 +1072,106 @@ fn file_check<T>(subject: &str, state: &FileState<T>, home: Option<&Path>) -> Ch
             ))],
         ),
     }
+}
+
+/// The step every project config failure ends with: doctor reads the
+/// default branch as the last fetch left it (OWL-332).
+fn fetch_step() -> Step {
+    Step::run_noting(
+        "git fetch origin",
+        "doctor reads the default branch as your last fetch left it",
+    )
+}
+
+/// The project file, and the gate `owlshift do` would run (OWL-332): the
+/// `stack.gate` of the file at the default branch, as the last fetch of the
+/// person's checkout left `origin/HEAD`, or of the working tree's file when
+/// that commit has none or the default branch is unknown here, as `do`
+/// falls back to it. An empty gate fails, since `do` refuses a ticket then,
+/// and so does a file at the default branch `do` would refuse. A file that
+/// is not loaded is reported as [`file_check`] reports it.
+fn project_config_check(
+    system: &dyn System,
+    state: &FileState<ProjectConfig>,
+    home: Option<&Path>,
+) -> Check {
+    const SUBJECT: &str = "project config";
+    let FileState::Loaded { path, config, .. } = state else {
+        return file_check(SUBJECT, state, home);
+    };
+    let local = shown(path, home);
+    let read = match path.parent() {
+        Some(root) => system.default_branch_file(root),
+        None => Ok(DefaultBranchFile::Unknown(
+            "the file has no folder".to_owned(),
+        )),
+    };
+    let short = |commit: &str| commit.get(..12).unwrap_or(commit).to_owned();
+    let (gate, source) = match &read {
+        Err(error) => {
+            return Check::fail(
+                Section::Project,
+                SUBJECT,
+                format!("{local}; at the default branch: {error}"),
+                "`owlshift do` reads owlshift.toml at the default branch and does not start on \
+                 one it cannot read or accept.",
+                vec![
+                    Step::act(
+                        "Do what the error above says about owlshift.toml, then merge it to the \
+                         default branch",
+                    ),
+                    fetch_step(),
+                ],
+            );
+        }
+        Ok(DefaultBranchFile::Read {
+            base,
+            file: Some(file),
+        }) => (
+            &file.stack.gate,
+            format!(
+                "owlshift.toml at {} ({})",
+                base.remote_ref,
+                short(&base.commit)
+            ),
+        ),
+        Ok(DefaultBranchFile::Read { base, file: None }) => (
+            &config.stack.gate,
+            format!(
+                "{local}, {} ({}) holding none",
+                base.remote_ref,
+                short(&base.commit)
+            ),
+        ),
+        Ok(DefaultBranchFile::Unknown(reason)) => (
+            &config.stack.gate,
+            format!(
+                "{local}, the default branch being unknown here ({reason}; `git remote set-head \
+                 origin --auto` sets it)"
+            ),
+        ),
+    };
+    if gate.is_empty() {
+        return Check::fail(
+            Section::Project,
+            SUBJECT,
+            format!("`stack.gate` is empty in {source}"),
+            "`owlshift do` does not start a ticket when the project declares no gate: the build \
+             role would stop `blocked` after its whole plan.",
+            vec![
+                Step::act(
+                    "List the project's lint, formatter and test commands under `stack.gate` in \
+                     owlshift.toml, and merge it to the default branch",
+                ),
+                fetch_step(),
+            ],
+        );
+    }
+    Check::ok(
+        Section::Project,
+        SUBJECT,
+        format!("{local}; gate of {} command(s) from {source}", gate.len()),
+    )
 }
 
 /// The configured tracker's adapter and the capabilities it declares
@@ -2946,6 +3046,96 @@ mod tests {
         assert_eq!(run(&system, &absent).next, Next::Init);
         let (_dir, loaded) = linear_project();
         assert_eq!(run(&system, &loaded).next, Next::Do);
+    }
+
+    /// OWL-332: the project config line checks the gate `owlshift do` would
+    /// run: the default branch's, as the last fetch left it, else the
+    /// working tree's. Empty, it fails, with `git fetch` as the last step of
+    /// the fix; so does a file at the default branch `do` would refuse.
+    #[test]
+    fn an_empty_gate_where_do_reads_it_fails_the_project_config_line() {
+        let config = |gate: &str| {
+            ProjectConfig::parse(&format!(
+                "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = \"delegation\"\n\
+                 states = {{ ready = \"a\", working = \"b\", needs_input = \"c\", review = \"d\" }}\n\
+                 [stack]\ngate = {gate}\n[pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n\
+                 [models]\n[policy]\nalways_human = []\n"
+            ))
+            .unwrap()
+        };
+        let base = crate::project::Base {
+            remote_ref: "origin/main".to_owned(),
+            branch: "main".to_owned(),
+            commit: "0123456789abcdef".to_owned(),
+        };
+        let at_base = |gate: Option<&str>| {
+            Ok(DefaultBranchFile::Read {
+                base: base.clone(),
+                file: gate.map(|gate| Box::new(config(gate))),
+            })
+        };
+        let check = |answer: Result<DefaultBranchFile, String>, local: &str| {
+            let state = FileState::Loaded {
+                path: PathBuf::from("/home/ada/p/owlshift.toml"),
+                config: config(local),
+                entries: Vec::new(),
+            };
+            let system = FakeSystem::default().default_branch_file_is(answer);
+            project_config_check(&system, &state, Some(Path::new("/home/ada")))
+        };
+        const GATED: &str = r#"["cargo test"]"#;
+
+        // Empty at the default branch: a failure, whatever the working tree
+        // says, since `do` reads the commit's file.
+        let empty = check(at_base(Some("[]")), GATED);
+        assert_eq!(empty.status, Status::Fail);
+        assert_eq!(
+            empty.detail,
+            "`stack.gate` is empty in owlshift.toml at origin/main (0123456789ab)"
+        );
+        assert_well_formed(&empty);
+        assert_eq!(commands(&empty.fix), ["git fetch origin"]);
+
+        // A gate at the default branch passes over an empty working tree.
+        let gated = check(at_base(Some(GATED)), "[]");
+        assert_eq!(gated.status, Status::Ok, "{gated:?}");
+        assert!(
+            gated
+                .detail
+                .ends_with("gate of 1 command(s) from owlshift.toml at origin/main (0123456789ab)"),
+            "{gated:?}"
+        );
+
+        // No file at the default branch, or a default branch unknown here:
+        // the working tree's gate, as `do` falls back to it, said so.
+        let unknown = || {
+            Ok(DefaultBranchFile::Unknown(
+                "`origin/HEAD` is not set".into(),
+            ))
+        };
+        for (answer, says) in [
+            (at_base(None), "origin/main (0123456789ab) holding none"),
+            (unknown(), "`git remote set-head origin --auto` sets it"),
+        ] {
+            let empty = check(answer.clone(), "[]");
+            assert_eq!(empty.status, Status::Fail, "{empty:?}");
+            assert!(empty.detail.contains(says), "{empty:?}");
+            assert_eq!(check(answer, GATED).status, Status::Ok);
+        }
+
+        // A file at the default branch `do` would refuse.
+        let refused = check(
+            Err("owlshift.toml on origin/main: requires >=99".to_owned()),
+            GATED,
+        );
+        assert_eq!(refused.status, Status::Fail);
+        assert!(
+            refused
+                .detail
+                .ends_with("at the default branch: owlshift.toml on origin/main: requires >=99"),
+            "{refused:?}"
+        );
+        assert_well_formed(&refused);
     }
 
     fn linear_project() -> (tempfile::TempDir, Effective) {

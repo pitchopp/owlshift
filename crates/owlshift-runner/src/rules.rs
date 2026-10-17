@@ -42,7 +42,8 @@ pub struct ProjectRules {
 impl ProjectRules {
     /// No rule and no gate: for the brief of a role told neither, such as
     /// the answer check (architecture section 9), whose run never runs a
-    /// gate. Never for a Build or a rebase, where an empty gate passes.
+    /// gate. Never for a Build, whose dispatch refuses an empty gate
+    /// (OWL-332), or a rebase, where one passes.
     pub fn none() -> Self {
         Self {
             common: Vec::new(),

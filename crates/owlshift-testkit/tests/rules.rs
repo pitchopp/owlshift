@@ -9,7 +9,7 @@ use owlshift_contracts::brief::Rule;
 use owlshift_contracts::config::ProjectConfig;
 use owlshift_core::vocab::Role;
 use owlshift_runner::executor::Git;
-use owlshift_runner::project::Base;
+use owlshift_runner::project::{Base, DefaultBranchFile, project_file_at_origin_head};
 use owlshift_runner::rules::{ProjectRules, project_rules};
 use owlshift_testkit::git::GitEnv;
 
@@ -486,4 +486,70 @@ fn only_the_roles_a_command_briefs_are_read() {
     // ...while a command that briefs Build refuses the missing file.
     let error = repo.project_for(tail, &[Role::Build]).unwrap_err();
     assert!(error.contains("docs/missing.md"), "{error}");
+}
+
+/// OWL-332: `owlshift doctor`'s read of the project file at the default
+/// branch, as the person's checkout last fetched `origin/HEAD`: unknown
+/// when that ref is not set or does not resolve, the file or none at its
+/// commit otherwise, and an error only for a file `do` would refuse.
+#[test]
+fn the_default_branchs_project_file_is_read_at_origin_head() {
+    let repo = Repo::new();
+    let read = || project_file_at_origin_head(&repo.git, repo.root());
+    let readme = repo.blob(b"Read me.\n");
+    let commit = repo.base(&[("100644", &readme, "README.md")]);
+    assert!(
+        matches!(read(), Ok(DefaultBranchFile::Unknown(why)) if why.contains("not set")),
+        "{:?}",
+        read()
+    );
+
+    // Set, as a clone sets it: the commit has no project file.
+    repo.git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    let expected = Base {
+        remote_ref: "origin/main".to_owned(),
+        branch: "main".to_owned(),
+        commit,
+    };
+    assert_eq!(
+        read(),
+        Ok(DefaultBranchFile::Read {
+            base: expected,
+            file: None
+        })
+    );
+
+    // The file at the commit, not the working tree's.
+    let config = repo.blob(
+        b"requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = \"delegation\"\n\
+          states = { ready = \"a\", working = \"b\", needs_input = \"c\", review = \"d\" }\n\
+          [stack]\ngate = []\n[pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n\
+          [models]\n[policy]\nalways_human = []\n",
+    );
+    repo.base(&[("100644", &config, "owlshift.toml")]);
+    fs::write(repo.root().join("owlshift.toml"), "not toml").unwrap();
+    match read() {
+        Ok(DefaultBranchFile::Read {
+            file: Some(file), ..
+        }) => assert!(file.stack.gate.is_empty()),
+        other => panic!("{other:?}"),
+    }
+
+    // A file `do` would refuse is an error naming it.
+    let invalid = repo.blob(b"requires = \">=99\"\n");
+    repo.base(&[("100644", &invalid, "owlshift.toml")]);
+    let error = read().unwrap_err();
+    assert!(error.starts_with("owlshift.toml on origin/main"), "{error}");
+
+    // A default branch gone since the last fetch is unknown, not an error.
+    repo.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+    assert!(
+        matches!(read(), Ok(DefaultBranchFile::Unknown(why)) if why.contains("does not resolve")),
+        "{:?}",
+        read()
+    );
 }
