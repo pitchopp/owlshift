@@ -77,8 +77,27 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
   - Not a fix: `Write(./…)` beside the `Edit(./…)` rule, still denied after the `cd`; an absolute `Edit(//<path>)` rule, denied, since `--allowedTools` splits its value on spaces and every macOS worktree lies under `Application Support`.
   - Fixes: the documented `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`, which brings the shell back after each command, let the result be written after the `cd` and denied `sub/…`. A rule anchored with one slash, `Edit(/.owlshift/run/result.json)`, which a command-line flag anchors at the session's primary working directory (same page), did too: after the `cd` the result was written and `sub/.owlshift/run/result.json` denied, and without it the result was written.
   - Write in worktree is not affected: under `acceptEdits` plus Bash, a `Write` at the worktree's root after `cd sub` was allowed.
-  - Decision: the read-only rule is `Edit(/<result path>)`, a flag of the adapter's own, rather than the variable, which would change Build's shell too. A read-only run that still leaves no result is read from its last message (architecture section 6, "Harness contract"). The adapter's unit test pins the rule; that it refuses `sub/…` rests on the run above.
-  - What stays open: the sandbox and the run's own configuration folder with the token login were not rerun, since neither changes how a rule is anchored; native Windows was not run, agent runs being refused there (D9). No fixture was recorded: 2.1.300 is not in `harness/tested.rs`, which takes the whole contract re-recorded on it (OWL-77). The last-message fallback takes a final fenced block at its word: a run that wrote no file and ended on a quoted result, such as its prompt's example, would have that result read, still validated against its brief.
+  - Decision: the read-only rule is `Edit(/<result path>)`, a flag of the adapter's own, rather than the variable, which would change Build's shell too. A read-only run that still leaves no result is read from its last message (architecture section 6, "Harness contract"). The adapter's unit test pins the rule; that it refuses `sub/…` is recorded since OWL-327 (below).
+  - What stays open: the sandbox and the run's own configuration folder with the token login were not rerun, since neither changes how a rule is anchored; native Windows was not run, agent runs being refused there (D9). The last-message fallback takes a final fenced block at its word: a run that wrote no file and ended on a quoted result, such as its prompt's example, would have that result read, still validated against its brief.
+- **Contract on Claude Code 2.1.300 (OWL-327), recorded on 2026-10-17.**
+  The installed `claude` had updated itself to 2.1.302, and its updater prunes old binaries.
+  So the recording ran 2.1.300 through a shim:
+  a copy of `~/.local/share/claude/versions/2.1.300` in a scratch folder, linked there as `claude`,
+  that folder first on `PATH`, then OWL-77's command.
+  The recorder keeps `PATH`, so the shim is the `claude` each run starts; its version check passed on every run.
+  - Recorded as OWL-77 did, with the OWL-52 peer pair and the OWL-53 stand-in.
+    The `peer_inbox_*` pair, made by hand on 2.1.283 with no recorder, stays as it is.
+  - Two new fixtures replay OWL-323's scenario, in a folder whose path holds a space:
+    a read-only run runs `cd sub && pwd`, then writes the result, then the same name below `sub`.
+    - With the adapter's argv (`read_only_after_cd.jsonl`): the result is written, `sub/…` is denied.
+    - With the rule edited back to `Edit(./…)` (`read_only_after_cd_dot_rule.jsonl`): the result is denied, `sub/…` is written.
+    - Contract tests `the_read_only_result_survives_a_cd` and `a_dot_rule_follows_the_shell_after_a_cd` replay them.
+  - Seen while recording: the prompt first named the folder through `/var/folders`, a link to `/private/var/folders`.
+    Both writes were then denied, under either rule; with the resolved path, the runs above.
+    Likely cause, not probed further: rules are matched on resolved paths, and a write named through a link misses them.
+  - Changed, harmless to the adapter: `haiku` resolves to `claude-haiku-5-5`, and `result` gained `safety_stops`.
+    The success run's rate-limit event was a plain `allowed`; a constructed line keeps the `allowed_warning` read tested.
+  - 2.1.300 joins `harness/tested.rs`. The adapter did not change.
 
 **C2 — passed, with three findings for the Codex harness (OWL-297).** Run on 2026-10-15 with codex-cli 0.154.0, on macOS 26.6 with the maintainer's ChatGPT login (Plus), and on Linux (Debian trixie in Docker, bubblewrap) logged out, by the maintainer's choice. About twenty tiny `codex exec --ephemeral --json --ignore-user-config -c model_reasoning_effort=low` runs, in a linked worktree of a scratch repository. Each run started from an environment of `HOME`, `PATH`, `USER`, `LANG`, `SSL_CERT_FILE` and `CODEX_HOME` alone. Each run had a `CODEX_HOME` of its own: no `config.toml`, no `.env`, a marker `AGENTS.md`, one execpolicy rule, and the user's login file read through a link. The confinement was the executor's own profile, built by a throwaway program from `AgentEnv::policy` and `sandbox::wrap`, with the worktree and the repository's git folder moved to read-only: the profile OWL-298 builds. The scrubbed recordings are in `crates/owlshift-adapters/tests/fixtures/codex/`, named below in parentheses. Each has a `.meta.json` beside it: command line, platform, confinement, exit status, standard error and `-o` file. `tests/codex_fixtures.rs` checks them on the three CI platforms.
 
