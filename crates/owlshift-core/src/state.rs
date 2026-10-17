@@ -26,7 +26,9 @@ pub const MAX_REASKS: u32 = 3;
 /// ran again without a stop, before the questions of the next run go to the
 /// decider without the resolver: a stage that keeps asking what the
 /// repository settles cannot loop without bound (architecture, section 4).
-pub const MAX_RESOLVED_PASSES: u32 = 3;
+/// The default of the project's `policy.resolver_passes` since OWL-328
+/// ([`crate::gate::PassLimit`]), 3 before.
+pub const MAX_RESOLVED_PASSES: u32 = 5;
 
 /// Fix passes since the pull request was last read green: a fix pass is a
 /// fix run at Watch whose push landed, and a red read after the second one
