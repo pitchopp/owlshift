@@ -285,7 +285,10 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
   - The reset time is only in that text, as a wall-clock time of the local zone, with no date; no event field carries it. Without `--json`, the same text follows `ERROR:`.
   - Interactive Codex sessions on the same machine log `token_count` events carrying a `rate_limits` object: `primary` and `secondary` windows with `used_percent`, `window_minutes` and `resets_at` in epoch seconds, `plan_type` and `rate_limit_reached_type`. `codex exec --json` emitted none.
   - So the adapter recognises a limit by its message, `You've hit your usage limit`. The binary also holds `You're out of credits` and `Usage limit reached`.
-- **Open items.** The EEA terms are unread. The binary's other limit messages were not observed.
+  - *Wordings observed* (OWL-341). Each ends its text the same way, with a 12-hour time, an upper-case `AM` or `PM`, and a full stop; no date.
+    - 2026-10-15, live call, recording `usage_limit`: "You've hit your usage limit. Upgrade to Pro (…), visit … to purchase more credits or try again at 1:45 PM."
+    - 2026-10-18, from the ticket OWL-341, which quotes the message the design reviews of OWL-330, OWL-339 and LOC-1406 stopped on at 22:44–22:55 UTC: "You've hit your usage limit. … try again at 3:54 AM." The stored logs of those runs could not be read from the Build's sandbox, so the text between the two ellipses is as the ticket gives it. The time was 03:54 local, the next morning.
+- **Open items.** The EEA terms are unread. The weekly limit's wording, a date-qualified reset, was not captured: no limit of that kind was reached, and a Build has no network to provoke one. `You're out of credits` and `Usage limit reached` are in the binary only, not observed, and carry no time; none of them is read as a reset time.
 
 **OWL-14 — what the Claude Code adapter relies on, beyond C1 and C7.** Tiny `claude -p` runs on 2026-09-28 with Claude Code 2.1.283 on macOS, on `haiku` at effort `low`, in a scratch directory, each launched with `env -i HOME PATH USER LANG TMPDIR` and `--setting-sources project,local --strict-mcp-config --no-session-persistence --permission-prompts none`.
 
