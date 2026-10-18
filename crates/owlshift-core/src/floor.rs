@@ -210,16 +210,16 @@ impl FloorCategory {
 
 /// Whether a question's category goes to a human at `level` by the
 /// categories of [`FloorCategory`] ([`FloorCategory::human_at`]), in any
-/// spelling, as a whole-word token anywhere in it. A blank category counts
-/// at every level: a question that does not say what it is about goes to a
-/// human. A project's own additions are the gate's
-/// ([`crate::gate::GatePolicy::always_human`]).
+/// spelling, as a whole-word token anywhere in it. A blank category names
+/// none: since OWL-342 a question that does not say what it is about reaches
+/// the resolver, whose own label, a token, then routes it
+/// ([`crate::gate::GatePolicy::route_decided`]). A project's own additions
+/// are the gate's ([`crate::gate::GatePolicy::always_human`]).
 pub fn is_human_category(category: &str, level: DelegationLevel) -> bool {
     let category = normalize(category);
-    category.is_empty()
-        || FloorCategory::ALL
-            .into_iter()
-            .any(|floor| floor.human_at(level) && matches_token(&category, floor.token()))
+    FloorCategory::ALL
+        .into_iter()
+        .any(|floor| floor.human_at(level) && matches_token(&category, floor.token()))
 }
 
 /// Whether a category names one of [`FloorCategory`]'s six as a whole-word
@@ -395,10 +395,11 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_category_counts_as_human_and_others_do_not() {
+    fn a_blank_category_or_another_word_names_no_human_category() {
         for level in DelegationLevel::ALL {
+            // Since OWL-342 a blank category reaches the resolver.
             for blank in ["", "   ", "--"] {
-                assert!(is_human_category(blank, level), "{blank:?} at {level:?}");
+                assert!(!is_human_category(blank, level), "{blank:?} at {level:?}");
             }
             for other in ["testing", "naming", "securities", "scoped", "datalossy"] {
                 assert!(!is_human_category(other, level), "{other:?} at {level:?}");

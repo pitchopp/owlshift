@@ -135,6 +135,7 @@ impl Status {
 /// | A stage run returned `questions` or `premise_false` (after the resolver); the last review pass left findings for the decider; a Design review pass passed with the plan gate shut, the approval round (OWL-32) | `Questions` |
 /// | A Build run asked a `replan`, and a round opens for its questions, the `replan` asked or decided (after the resolver) | `ReplanRound` |
 /// | A Build run asked a `replan`, and the resolver decided every question of the run | `ReplanDecided` |
+/// | The resolver decided every question a Design review or Verify pass left for the decider, its findings or the approval (OWL-342) | `RoundDecided` |
 /// | A design run answered an approval round `approved`, and the runner kept the approval | `PlanApproved` |
 /// | A stage run returned `blocked` | `Blocked` |
 /// | The answer check found every question answered | `Answered` |
@@ -179,6 +180,16 @@ pub enum Event {
     /// questions, so no round opens: the ticket goes to
     /// [`Pipeline::replan`] at once. Valid only at Build.
     ReplanDecided,
+    /// The resolver decided every question a review pass at Design review
+    /// or Verify left for the decider, so no round opens (OWL-342): the
+    /// ticket goes where the round would have returned
+    /// ([`Pipeline::round_return`]), Design or Build, whose next run follows
+    /// the decisions, and the pass is ended and counted as
+    /// [`Event::Questions`] ends it. Like an answered round, it is valid at
+    /// a last pass, which it buys one more pass after; the resolver's pass
+    /// limit or dollar ceiling bounds such rounds in a row. Valid only at
+    /// Design review and Verify.
+    RoundDecided,
     /// A design run answered an approval round `approved` (OWL-32): the
     /// plan stays as it was and the ticket goes to Build. Valid only at
     /// Design after a review pass of the loop, which the approval round's
@@ -253,13 +264,14 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
         Self::Questions,
         Self::ReplanRound,
         Self::ReplanDecided,
+        Self::RoundDecided,
         Self::PlanApproved,
         Self::Blocked,
         Self::Answered,
@@ -656,6 +668,12 @@ impl TicketState {
             (Status::Active(Stage::Build), Event::ReplanDecided) => {
                 Transition::To(self.enter(Status::Active(pipeline.replan())))
             }
+            // A review round the resolver decided whole (OWL-342): where the
+            // round would have returned, the pass counted, no round opened.
+            (Status::Active(stage @ (Stage::DesignReview | Stage::Verify)), Event::RoundDecided) => {
+                let entered = self.enter(Status::Active(pipeline.round_return(stage)));
+                Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
+            }
             // The plan gate is checked on top ([`TicketState::step`]).
             (Status::Active(Stage::Design), Event::PlanApproved) if self.review_passes > 0 => {
                 Transition::To(self.enter(Status::Active(Stage::Build)))
@@ -953,7 +971,9 @@ mod tests {
 
     /// Every state reachable from admission in `pipeline`, each event
     /// applied without a gate and with each of `gates`, with question rounds
-    /// bounded at three: past that, only the round counter grows.
+    /// bounded at three and review passes at two past the last one: past
+    /// that, only the round or pass counter grows, a review round the
+    /// resolver decides counting a pass without a round (OWL-342).
     fn reachable(pipeline: Pipeline, gates: &[PlanGate]) -> HashSet<TicketState> {
         let mut seen = HashSet::from([TicketState::admitted()]);
         let mut queue = VecDeque::from([TicketState::admitted()]);
@@ -967,7 +987,10 @@ mod tests {
                         Ok(Transition::To(next) | Transition::Parked { state: next, .. }) => next,
                         Ok(Transition::Finished(_)) | Err(_) => continue,
                     };
-                    if next.round() <= 3 && seen.insert(next) {
+                    if next.round() <= 3
+                        && next.review_passes() <= MAX_REVIEW_PASSES + 2
+                        && seen.insert(next)
+                    {
                         queue.push_back(next);
                     }
                 }
@@ -1065,6 +1088,10 @@ mod tests {
                 Expect::To(Status::NeedsInput { return_to: Design })
             }
             (Status::Active(Build), Event::ReplanDecided) => Expect::To(Status::Active(Design)),
+            (Status::Active(DesignReview), Event::RoundDecided) => {
+                Expect::To(Status::Active(Design))
+            }
+            (Status::Active(Verify), Event::RoundDecided) => Expect::To(Status::Active(Build)),
             (Status::Active(stage), Event::Blocked) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::Blocked)
             }
@@ -1861,6 +1888,32 @@ mod tests {
             )
         );
         assert_eq!(round.failed_runs(), 1, "same stage: the failure counts");
+    }
+
+    /// A review round the resolver decides whole (OWL-342) goes where the
+    /// round would have returned, its pass counted and no round opened,
+    /// even at a last pass, which it buys one more pass after, as an
+    /// answered round does; it is no event at another stage.
+    #[test]
+    fn a_decided_review_round_counts_its_pass_and_opens_none() {
+        for (stage, back) in [
+            (Stage::DesignReview, Stage::Design),
+            (Stage::Verify, Stage::Build),
+        ] {
+            let last = state(Status::Active(stage), 1, 0, 1)
+                .with_review_passes(MAX_REVIEW_PASSES - 1)
+                .expect("passes in the loop");
+            assert!(is_last_review_pass(last.review_pass_due()));
+            assert!(last.apply(STANDARD, Event::LoopBack).is_err());
+            let decided = to(last.apply(STANDARD, Event::RoundDecided));
+            assert_eq!(at(decided), (Status::Active(back), MAX_REVIEW_PASSES));
+            assert_eq!((decided.round(), decided.failed_runs()), (1, 0));
+            assert_eq!(decided.review_pass_due(), MAX_REVIEW_PASSES + 1);
+        }
+        for stage in [Stage::Design, Stage::Build, Stage::Watch] {
+            let other = state(Status::Active(stage), 1, 0, 0);
+            assert!(other.apply(STANDARD, Event::RoundDecided).is_err(), "{stage:?}");
+        }
     }
 
     #[test]
