@@ -539,7 +539,10 @@ pub struct Reviewer {
 /// docs of the keys are written here too.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(rename = "Reviewer", description = "The reviewer that raised a finding.")]
+#[schemars(
+    rename = "Reviewer",
+    description = "The reviewer that raised a finding."
+)]
 struct ReviewerForm {
     /// The reviewer's role: `design_review` or `verify`, the pass's stage.
     role: Role,

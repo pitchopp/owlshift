@@ -18,8 +18,8 @@
 //!   asked a revision, the approval round after a pass that asked for it,
 //!   the answers in its thread after a residue round.
 //! - *Design review.* The roster of the variant ([`roster::roster`]) runs one
-//!   seat after the other on its seat's routing, the critic on Codex when
-//!   Codex can run it, else standing in on Claude Code; the findings are
+//!   seat after the other on Claude Code, on another model than the
+//!   author's when one is configured (OWL-347); the findings are
 //!   numbered across the seats ([`pass_findings`]), confirmed by one arbiter
 //!   run or left to the author's answers (`pipeline.findings`), and the pass
 //!   is settled by the core ([`settle_pass`]). A pass that asks a revision
@@ -54,11 +54,10 @@ use owlshift_contracts::review::{
 };
 use owlshift_core::review::{Fate, PassOutcome, PassVerdict, Standing, settle};
 use owlshift_core::roster;
-use owlshift_core::routing::seat_routing;
+use owlshift_core::routing::reviewer_routing;
 use owlshift_core::vocab::Harness as HarnessKind;
 
 use super::*;
-use crate::routing::codex_model;
 use crate::ticket_ref::text_sha256;
 use crate::writer::{PlanComment, PlanNext, PlanReviewer};
 
@@ -563,17 +562,12 @@ pub(crate) fn residue_questions(
                     category: FINDING_CATEGORY.to_owned(),
                     context: format!(
                         "Finding {} of {pass_name} pass {pass}, {}, raised by the {} reviewer \
-                         on {}{}, still stands after the passes the design allows. Evidence: \
+                         on {}, still stands after the passes the design allows. Evidence: \
                          {}. {judged}{criterion}",
                         finding.id,
                         severity_name(finding.severity),
                         mandate_names(&kept.reviewer.mandates),
                         harness_name(kept.reviewer.harness),
-                        if kept.reviewer.stand_in {
-                            ", standing in for Codex"
-                        } else {
-                            ""
-                        },
                         clip(&finding.evidence, cap),
                     ),
                     text: format!(
@@ -1070,10 +1064,9 @@ impl OnDemand<'_> {
     }
 
     /// One review pass at `stage`, Design review or Verify, shared by both
-    /// (OWL-303, OWL-304): each seat of the roster on its seat's routing,
-    /// the critic on Codex when Codex can run it, else standing in on
-    /// Claude Code with a `critic_stands_in` warning; the arbiter when the
-    /// pass has findings the project confirms so; the pass settled by the
+    /// (OWL-303, OWL-304): each seat of the roster on Claude Code, on the
+    /// reviewers' routing, another model than the author's when one is
+    /// configured (OWL-347); the arbiter when the pass has findings the project confirms so; the pass settled by the
     /// core; its `ruling`, `pass` and `residue` events, `next` naming what
     /// each outcome leads to; and the review record with the pass, checked,
     /// not kept yet. The seats read `plan` and, at Verify, `diff`.
@@ -1091,7 +1084,7 @@ impl OnDemand<'_> {
     ) -> Result<PassRun, Stop> {
         let ticket = p.ticket.clone();
         let current = person(p.current()?, &p.found);
-        let (role, reviewers) = if stage == Stage::Verify {
+        let (role, router) = if stage == Stage::Verify {
             (Role::Verify, self.verify)
         } else {
             (Role::DesignReview, self.design_review)
@@ -1099,29 +1092,14 @@ impl OnDemand<'_> {
         let stage_key = stage_name(stage);
         let pass = state.review_pass_due();
         let pass_id = NonZeroU32::new(pass).expect("a pass due counts from 1");
-        let codex = reviewers.codex.filter(|_| p.critic.is_none());
-        if let (Some(_), Some(why)) = (reviewers.codex, &p.critic) {
-            sink.emit(
-                &ticket,
-                None,
-                EventKind::Warning,
-                data([("what", json!("critic_stands_in")), ("reason", json!(why))]),
-            );
-        }
         let models = &self.config.models;
-        let seats = roster::roster(p.pipeline.variant(), stage, codex.is_some());
+        let routed = reviewer_routing(dispatched.routing, |tier| claude_model(models, tier));
+        let model = claude_model(models, routed.routing.tier);
+        let seats = roster::roster(p.pipeline.variant(), stage);
         let mut outputs: Vec<SeatOutput> = Vec::new();
-        let mut routings = Vec::new();
         let mut last_run = None;
         let mut cost = Some(0.0_f64);
         for seat in seats {
-            let routed = seat_routing(seat, dispatched.routing, |tier| claude_model(models, tier));
-            let (router, model) = match (seat.harness, codex) {
-                (HarnessKind::Codex, Some(codex)) => {
-                    (codex, codex_model(models, routed.routing.tier))
-                }
-                _ => (reviewers.claude, claude_model(models, routed.routing.tier)),
-            };
             let harness = router.harness(routed.routing);
             let comments = self.comments(&ticket)?;
             let mut brief = self.brief(p, role, &comments, &dispatched.rules, None, &current);
@@ -1134,14 +1112,12 @@ impl OnDemand<'_> {
             let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
             last_run = Some(ran.run.clone());
             cost = cost.zip(run_cost(&ran)).map(|(sum, run)| sum + run);
-            routings.push(routed);
             outputs.push(SeatOutput {
                 reviewer: Reviewer {
                     role,
                     mandates: seat.mandates.to_vec(),
-                    harness: seat.harness,
+                    harness: routed.routing.harness,
                     model: model.unwrap_or("default").to_owned(),
-                    stand_in: seat.stand_in,
                     same_model: routed.same_model,
                 },
                 model: model.map(str::to_owned),
@@ -1210,15 +1186,13 @@ impl OnDemand<'_> {
         }
         let reviewers_data: Vec<Value> = outputs
             .iter()
-            .zip(&routings)
-            .map(|(output, routed)| {
+            .map(|output| {
                 json!({
                     "mandates": output.reviewer.mandates,
                     "harness": harness_key(output.reviewer.harness),
                     "tier": routed.routing.tier,
                     "effort": routed.routing.effort,
                     "model": output.model,
-                    "stand_in": output.reviewer.stand_in,
                     "same_model": output.same_model,
                     "findings": output.findings.len(),
                 })
@@ -1389,7 +1363,6 @@ impl OnDemand<'_> {
                     mandates: output.reviewer.mandates.clone(),
                     harness: output.reviewer.harness,
                     model: output.model.clone(),
-                    stand_in: output.reviewer.stand_in,
                     same_model: output.same_model,
                 })
                 .collect(),
@@ -1600,7 +1573,6 @@ mod tests {
             mandates: mandates.to_vec(),
             harness,
             model: "default".to_owned(),
-            stand_in: false,
             same_model: false,
         }
     }

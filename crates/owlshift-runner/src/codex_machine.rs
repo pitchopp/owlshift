@@ -8,7 +8,8 @@
 //! Codex's sandbox off.
 //!
 //! This module reads text only; the caller reads the files, but for
-//! [`codex_critic`], which `owlshift do` asks once per command (OWL-303). A
+//! [`codex_critic`], which `owlshift do` asked once per command from OWL-303
+//! to OWL-347 and which is kept for an opt-in Codex reviewer (OWL-348). A
 //! value whose shape Codex's own files do not have is never guessed at: it
 //! makes the whole file [`Unreadable::Shape`], so a report says it cannot tell
 //! what the file does rather than naming a server or a mode that may not be
@@ -197,10 +198,12 @@ pub struct CodexCritic {
 }
 
 /// Whether Codex can run the critic of the review roles on this machine
-/// (architecture section 5, "Without Codex"): `codex` on the `PATH`, the
+/// (OWL-303). No command asks since OWL-347, every reviewer running on
+/// Claude Code; it is kept for an opt-in Codex reviewer (OWL-348). It
+/// looks for `codex` on the `PATH`, the
 /// login file a run copies ([`crate::executor::codex::user_login`]), and no
-/// [`REQUIREMENTS`] that refuses [`FULL_ACCESS`]. Otherwise why not, and the
-/// critic stands in on Claude Code. A requirements file that cannot be read
+/// [`REQUIREMENTS`] that refuses [`FULL_ACCESS`]; otherwise it says why not.
+/// A requirements file that cannot be read
 /// or told counts as refusing, unlike `owlshift doctor`'s warning: a run
 /// that would stop before it starts is not tried.
 pub fn codex_critic(system: &dyn System, agent: &AgentEnv) -> Result<CodexCritic, String> {

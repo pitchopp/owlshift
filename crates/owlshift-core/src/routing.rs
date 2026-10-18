@@ -227,10 +227,7 @@ mod tests {
             Tier::Standard => Some("sonnet"),
             Tier::Fast => None,
         };
-        assert_eq!(
-            reviewer_routing(routed, model),
-            reviewer(Tier::Deep, false)
-        );
+        assert_eq!(reviewer_routing(routed, model), reviewer(Tier::Deep, false));
         assert_eq!(
             reviewer_routing(routed, |_| None),
             reviewer(Tier::Standard, true)

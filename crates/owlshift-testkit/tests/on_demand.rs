@@ -47,7 +47,7 @@ use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
 };
-use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Reviewers, Stop};
+use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::routing::{ClaudeRouter, Router};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
@@ -639,9 +639,6 @@ struct Bench {
     inbox: RefCell<FakeInbox>,
     /// The routing each routed harness was asked for, in order (OWL-305).
     routed: Rc<RefCell<Vec<RunRouting>>>,
-    /// Codex can run the critic of the review roles (OWL-303): the bench's
-    /// one harness then plays it too.
-    codex: Cell<bool>,
     /// The verify seats play from the bench's reply queue, as every other
     /// run does; otherwise they review clean ([`CleanReview`], OWL-304).
     verify_plays: Cell<bool>,
@@ -766,7 +763,6 @@ impl Bench {
             waited: Cell::new(SignedDuration::from_mins(10)),
             inbox: RefCell::default(),
             routed: Rc::default(),
-            codex: Cell::new(false),
             verify_plays: Cell::new(false),
         }
     }
@@ -1106,16 +1102,10 @@ impl Bench {
             reply: clean_reply,
             readable: Vec::new(),
         });
-        let verify = if self.verify_plays.get() {
-            Reviewers {
-                claude: &harness,
-                codex: self.codex.get().then_some(&harness as &dyn Router),
-            }
+        let verify: &dyn Router = if self.verify_plays.get() {
+            &harness
         } else {
-            Reviewers {
-                claude: &clean,
-                codex: self.codex.get().then_some(&clean as &dyn Router),
-            }
+            &clean
         };
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
@@ -1154,15 +1144,11 @@ impl Bench {
             executor: &executor,
             tracker: &tracker,
             forge: &forge,
-            // One harness plays every run, a reply each, whatever its role,
-            // the Codex critic's too when the bench gives Codex.
+            // One harness plays every run, a reply each, whatever its role.
             build: &harness,
             intake: &harness,
             design: &harness,
-            design_review: Reviewers {
-                claude: &harness,
-                codex: self.codex.get().then_some(&harness as &dyn Router),
-            },
+            design_review: &harness,
             verify,
             arbiter: &harness,
             answer_check: &harness,
@@ -2350,14 +2336,8 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         build: &router,
         intake: &harness,
         design: &router,
-        design_review: Reviewers {
-            claude: &router,
-            codex: None,
-        },
-        verify: Reviewers {
-            claude: &router,
-            codex: None,
-        },
+        design_review: &router,
+        verify: &router,
         arbiter: &router,
         answer_check: &harness,
         resolver: &harness,
@@ -2434,14 +2414,8 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         build: &router,
         intake: &harness,
         design: &router,
-        design_review: Reviewers {
-            claude: &router,
-            codex: None,
-        },
-        verify: Reviewers {
-            claude: &router,
-            codex: None,
-        },
+        design_review: &router,
+        verify: &router,
         arbiter: &router,
         answer_check: &harness,
         resolver: &harness,

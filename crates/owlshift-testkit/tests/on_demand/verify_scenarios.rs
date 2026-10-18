@@ -49,12 +49,10 @@ const FAILED_REVIEW: &str =
     r#"{"format":12,"status":"failed","summary":"Could not read the diff."}"#;
 
 impl Bench {
-    /// A bench whose verify seats play from its reply queue, with Codex
-    /// given when `codex`.
-    fn verifying(codex: bool) -> Self {
+    /// A bench whose verify seats play from its reply queue.
+    fn verifying() -> Self {
         let bench = Bench::new(true);
         bench.verify_plays.set(true);
-        bench.codex.set(codex);
         bench
     }
 
@@ -90,13 +88,13 @@ impl Bench {
 }
 
 /// S9's Verify half on a `trivial` ticket: after its Build, the critic,
-/// alone so holding conformance, standing in on Claude Code, reviews the
+/// alone so holding conformance, on Claude Code (OWL-347), reviews the
 /// diff from the commit the Build started from, which the runner wrote
 /// beside the brief; the clean pass is kept with its reviewer, and the
 /// DELIVERY report names it.
 #[test]
 fn a_trivial_ticket_is_verified_before_its_pull_request_opens() {
-    let bench = Bench::verifying(false);
+    let bench = Bench::verifying();
     let replies = vec![
         bench.reply(Some("Hello"), Some(DONE)),
         bench.reviewing(&found(&[])),
@@ -143,7 +141,8 @@ fn a_trivial_ticket_is_verified_before_its_pull_request_opens() {
     assert_eq!((pass.stage, pass.pass.get()), (Stage::Verify, 1));
     assert!(pass.findings.is_empty());
     assert_eq!(pass.reviewers.len(), 1);
-    assert!(pass.reviewers[0].stand_in && pass.reviewers[0].same_model);
+    assert_eq!(pass.reviewers[0].harness, HarnessKind::Claude);
+    assert!(pass.reviewers[0].same_model);
     let passes = bench.reviews("pass");
     assert_eq!(passes.len(), 1);
     assert_eq!(
@@ -155,20 +154,17 @@ fn a_trivial_ticket_is_verified_before_its_pull_request_opens() {
         (&json!("verify"), &json!("passed"), &json!("deliver"))
     );
     let report = bench.comments().pop().unwrap();
-    for text in [
-        "**Verify, 1 pass.** Reviewers of the last pass:\n- critic and conformance on Claude \
-         Code (its default model, the Build's own model: no other is configured)",
-        "The critic ran on Claude Code, standing in for Codex",
-    ] {
-        assert!(report.contains(text), "{text}\n---\n{report}");
-    }
+    let verify = "**Verify, 1 pass.** Reviewers of the last pass:\n- critic and conformance on \
+                  Claude Code (its default model, the Build's own model: no other is configured)";
+    assert!(report.contains(verify), "{report}");
+    assert!(!report.contains("standing in"), "{report}");
 }
 
 /// OWL-321: `[roles.verify]` is accepted, and its file reaches the brief of
 /// the Verify reviewer after `stack.rules`, and no other role's.
 #[test]
 fn the_verify_roles_rules_reach_the_verify_brief_alone() {
-    let bench = Bench::verifying(false);
+    let bench = Bench::verifying();
     let checkout = &bench.remote.checkout;
     fs::create_dir_all(checkout.join("docs/roles")).unwrap();
     fs::write(
@@ -217,13 +213,14 @@ fn the_verify_roles_rules_reach_the_verify_brief_alone() {
     );
 }
 
-/// With Codex, the critic runs on it on the standard tier; the arbiter,
+/// The critic runs on Claude Code, on the standard tier when no other model
+/// is configured (OWL-347); the arbiter,
 /// given the diff, confirms one finding and rejects the other; the Verify
 /// fix run gets the confirmed one alone, without the diff, and the second
 /// pass is clean. The report lists the rejected finding with its reason.
 #[test]
 fn the_arbiter_confirms_a_finding_the_verify_fix_run_fixes_and_rejects_another() {
-    let bench = Bench::verifying(true);
+    let bench = Bench::verifying();
     let replies = vec![
         bench.reply(Some("Hello"), Some(DONE)),
         bench.reviewing(&found(&[
@@ -249,7 +246,7 @@ fn the_arbiter_confirms_a_finding_the_verify_fix_run_fixes_and_rejects_another()
     let routed = bench.routed();
     assert_eq!(
         (routed[1].harness, routed[1].tier),
-        (HarnessKind::Codex, Tier::Standard)
+        (HarnessKind::Claude, Tier::Standard)
     );
     let briefs = bench.briefs();
     let ruling = briefs[2].findings.as_ref().unwrap();
@@ -278,7 +275,7 @@ fn the_arbiter_confirms_a_finding_the_verify_fix_run_fixes_and_rejects_another()
     let first = &review.passes[0].findings;
     assert_eq!(first[0].outcome, Some(FindingOutcome::Fixed));
     assert_eq!(first[1].outcome, Some(FindingOutcome::Rejected));
-    assert_eq!(review.passes[0].reviewers[0].harness, HarnessKind::Codex);
+    assert_eq!(review.passes[0].reviewers[0].harness, HarnessKind::Claude);
     assert!(review.passes[1].findings.is_empty());
     let ruling = &bench.reviews("ruling")[0];
     assert_eq!(ruling["stage"], "verify");
@@ -294,10 +291,10 @@ fn the_arbiter_confirms_a_finding_the_verify_fix_run_fixes_and_rejects_another()
     assert_eq!(next, [json!("build"), json!("deliver")]);
     let report = bench.comments().pop().unwrap();
     for text in [
-        "**Verify, 2 passes.** Reviewers of the last pass:\n- critic and conformance on Codex \
-         (its default model)",
-        "- Pass 1, F2, major, critic and conformance on Codex: GREETING.md needs a licence \
-         header. Rejected: Checked F2 at GREETING.md:1.",
+        "**Verify, 2 passes.** Reviewers of the last pass:\n- critic and conformance on Claude \
+         Code (its default model",
+        "- Pass 1, F2, major, critic and conformance on Claude Code: GREETING.md needs a \
+         licence header. Rejected: Checked F2 at GREETING.md:1.",
     ] {
         assert!(report.contains(text), "{text}\n---\n{report}");
     }
@@ -320,7 +317,7 @@ fn the_arbiter_confirms_a_finding_the_verify_fix_run_fixes_and_rejects_another()
 /// rejection is kept with its reason and listed in the report.
 #[test]
 fn the_author_answers_every_verify_finding_and_its_rejection_is_kept() {
-    let bench = Bench::verifying(false);
+    let bench = Bench::verifying();
     let config = bench.remote.checkout.join("owlshift.toml");
     let text = fs::read_to_string(&config).unwrap();
     fs::write(
@@ -383,7 +380,7 @@ fn the_author_answers_every_verify_finding_and_its_rejection_is_kept() {
 /// with the reviewer as its source and listed in the report.
 #[test]
 fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
-    let bench = Bench::verifying(false);
+    let bench = Bench::verifying();
     bench.inbox.borrow_mut().on = true;
     let replies = vec![
         bench.reply(Some("Hello"), Some(DONE)),
@@ -483,7 +480,7 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
     for text in [
         "**Verify, 3 passes.**",
         "**Findings proposed as follow-ups,** listed in what remains:\n- Pass 2, F2, major, \
-         critic and conformance on Claude Code, standing in for Codex",
+         critic and conformance on Claude Code\n",
         &format!(
             "Proposed follow-up **GREETING.md could open with a heading.**, filed as {} for \
              triage",
@@ -499,7 +496,7 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
 /// back its follow-up, so the delivery files none.
 #[test]
 fn a_pass_run_again_after_a_failed_delivery_takes_back_its_proposals() {
-    let bench = Bench::verifying(false);
+    let bench = Bench::verifying();
     bench.inbox.borrow_mut().on = true;
     // Someone else's commit is already on the ticket's branch: the push is
     // refused.
@@ -561,7 +558,7 @@ fn a_pass_run_again_after_a_failed_delivery_takes_back_its_proposals() {
 /// commit, with no Build run (part F's rule for Design review).
 #[test]
 fn a_verify_pass_cut_short_runs_again_under_continue_and_delivers() {
-    let bench = Bench::verifying(false);
+    let bench = Bench::verifying();
     let mut limited = bench.reply(None, None);
     limited.usage_limit = Some("2026-10-02T15:00:00Z".parse().unwrap());
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE)), limited], None);
@@ -594,7 +591,7 @@ fn a_verify_pass_cut_short_runs_again_under_continue_and_delivers() {
 /// Build read the thread; each refusal keeps the park and runs nothing.
 #[test]
 fn a_ticket_parked_at_verify_is_not_resumed_on_a_moved_branch_or_a_late_comment() {
-    let bench = Bench::verifying(false);
+    let bench = Bench::verifying();
     let check = answered_round(&bench);
     let (outcome, printed) = bench.continue_ticket(vec![
         check,

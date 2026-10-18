@@ -1629,10 +1629,8 @@ pub struct PlanReviewer {
     pub harness: Harness,
     /// The model it ran on, `None` for its harness's default.
     pub model: Option<String>,
-    /// It stood in on Claude Code for the Codex critic.
-    pub stand_in: bool,
-    /// A reviewer on Claude Code that ran on the design run's own model, no
-    /// other one being configured.
+    /// A reviewer that ran on the design run's own model, no other one being
+    /// configured.
     pub same_model: bool,
 }
 
@@ -1839,7 +1837,7 @@ impl PlanComment {
             .iter()
             .map(|reviewer| reviewer_line(reviewer, "the design run's"))
             .collect();
-        let mut review = format!(
+        sections.push(format!(
             "**Design review, pass {}.** {}",
             self.pass,
             if reviewers.is_empty() {
@@ -1847,12 +1845,7 @@ impl PlanComment {
             } else {
                 format!("Reviewers:\n{}", bullets(&reviewers))
             }
-        );
-        if self.reviewers.iter().any(|reviewer| reviewer.stand_in) {
-            review.push('\n');
-            review.push_str(STAND_IN);
-        }
-        sections.push(review);
+        ));
         if !left.is_empty() {
             let lines: Vec<String> = left
                 .iter()
@@ -1925,10 +1918,6 @@ fn reviewer_line(reviewer: &PlanReviewer, author: &str) -> String {
     )
 }
 
-/// The sentence a report adds when the critic stood in on Claude Code.
-const STAND_IN: &str = "The critic ran on Claude Code, standing in for Codex, which is not usable \
-                        on the machine that ran the review.";
-
 impl From<&Reviewer> for PlanReviewer {
     /// A reviewer as `review.json` keeps it, its model `default` for its
     /// harness's own.
@@ -1937,7 +1926,6 @@ impl From<&Reviewer> for PlanReviewer {
             mandates: reviewer.mandates.clone(),
             harness: reviewer.harness,
             model: (reviewer.model != "default").then(|| reviewer.model.clone()),
-            stand_in: reviewer.stand_in,
             same_model: reviewer.same_model,
         }
     }
@@ -1945,8 +1933,8 @@ impl From<&Reviewer> for PlanReviewer {
 
 impl ReportedReview {
     /// The report's Verify section: the passes, the reviewers of the last,
-    /// the stand-in when there was one, and each finding rejected with its
-    /// pass and reason, every model text flattened to one line.
+    /// and each finding rejected with its pass and reason, every model text
+    /// flattened to one line.
     fn section(&self) -> String {
         let passes = match self.passes {
             1 => "1 pass".to_owned(),
@@ -1965,10 +1953,6 @@ impl ReportedReview {
                 format!("Reviewers of the last pass:\n{}", bullets(&reviewers))
             }
         );
-        if self.reviewers.iter().any(|reviewer| reviewer.stand_in) {
-            section.push('\n');
-            section.push_str(STAND_IN);
-        }
         if !self.rejected.is_empty() {
             let lines: Vec<String> = self
                 .rejected
@@ -2014,7 +1998,7 @@ fn finding_label(kept: &KeptFinding) -> String {
         .map(|m| mandate_name(*m))
         .collect();
     format!(
-        "{}, {}, {} on {}{}",
+        "{}, {}, {} on {}",
         kept.finding.id,
         match kept.finding.severity {
             Severity::Blocker => "blocker",
@@ -2023,11 +2007,6 @@ fn finding_label(kept: &KeptFinding) -> String {
         },
         mandates.join(" and "),
         harness_name(kept.reviewer.harness),
-        if kept.reviewer.stand_in {
-            ", standing in for Codex"
-        } else {
-            ""
-        }
     )
 }
 
@@ -3649,7 +3628,6 @@ Merge state reported by the forge: `CLEAN`.
                 mandates: vec![Mandate::Critic, Mandate::Conformance],
                 harness: Harness::Claude,
                 model: "default".to_owned(),
-                stand_in: true,
                 same_model: false,
             },
             ruling: Some(KeptRuling {
@@ -3666,8 +3644,8 @@ Merge state reported by the forge: `CLEAN`.
     }
 
     /// OWL-304: a delivery's report names its Verify passes, the reviewers
-    /// of the last with their model, the stand-in and the author's own model
-    /// when so, the findings rejected with their pass and reason, flattened,
+    /// of the last with their model and the author's own model when so,
+    /// never a stand-in (OWL-347), the findings rejected with their pass and reason, flattened,
     /// and those proposed as follow-ups; a report without them has no Verify
     /// section.
     #[test]
@@ -3682,30 +3660,21 @@ Merge state reported by the forge: `CLEAN`.
             outcome: owlshift_contracts::review::ResponseOutcome::Rejected,
             reason: "The file has\nnone.".to_owned(),
         });
-        let reviewer =
-            |mandates: Vec<Mandate>, harness, model: &str, stand_in, same_model| Reviewer {
-                role: owlshift_contracts::Role::Verify,
-                mandates,
-                harness,
-                model: model.to_owned(),
-                stand_in,
-                same_model,
-            };
+        let reviewer = |mandates: Vec<Mandate>, harness, model: &str, same_model| Reviewer {
+            role: owlshift_contracts::Role::Verify,
+            mandates,
+            harness,
+            model: model.to_owned(),
+            same_model,
+        };
         report.review = Some(ReportedReview {
             passes: 2,
             reviewers: vec![
-                reviewer(
-                    vec![Mandate::Critic],
-                    Harness::Claude,
-                    "default",
-                    true,
-                    false,
-                ),
+                reviewer(vec![Mandate::Critic], Harness::Claude, "default", false),
                 reviewer(
                     vec![Mandate::Conformance],
                     Harness::Claude,
                     "claude-x",
-                    false,
                     true,
                 ),
             ],
@@ -3720,21 +3689,21 @@ Merge state reported by the forge: `CLEAN`.
             "**Verify, 2 passes.** Reviewers of the last pass:\n\
              - critic on Claude Code (its default model)\n\
              - conformance on Claude Code (`claude-x`, the Build's own model: no other is \
-             configured)\n\
-             The critic ran on Claude Code, standing in for Codex",
-            "**Findings rejected.**\n- Pass 1, F2, major, critic and conformance on Claude Code, \
-             standing in for Codex: No [owlshift] PLAN header. Rejected: The file has none.",
+             configured)\n\n",
+            "**Findings rejected.**\n- Pass 1, F2, major, critic and conformance on Claude Code: \
+             No [owlshift] PLAN header. Rejected: The file has none.",
             "**Findings proposed as follow-ups,** listed in what remains:\n- Pass 2, F3, minor, \
-             critic and conformance on Claude Code, standing in for Codex",
+             critic and conformance on Claude Code\n",
             "Proposed follow-up, not filed: **Edit the previous report**",
         ] {
             assert!(body.contains(text), "{text}\n---\n{body}");
         }
         assert_eq!(body.matches("[owlshift] DELIVERY").count(), 1, "{body}");
+        assert!(!body.contains("standing in"), "{body}");
     }
 
-    /// OWL-303: the PLAN comment shows the plan, the reviewers with the
-    /// stand-in, the findings left with their fate and those rejected with
+    /// OWL-303: the PLAN comment shows the plan, the reviewers with their
+    /// models, never a stand-in (OWL-347), the findings left with their fate and those rejected with
     /// their reason, what follows, and one footer; the plan's text, from a
     /// model, is flattened so it forges no marker or block.
     #[test]
@@ -3749,14 +3718,12 @@ Merge state reported by the forge: `CLEAN`.
                     mandates: vec![Mandate::Critic],
                     harness: Harness::Claude,
                     model: None,
-                    stand_in: true,
                     same_model: false,
                 },
                 PlanReviewer {
                     mandates: vec![Mandate::Conformance],
                     harness: Harness::Claude,
                     model: Some("opus".to_owned()),
-                    stand_in: false,
                     same_model: true,
                 },
             ],
@@ -3796,15 +3763,12 @@ Merge state reported by the forge: `CLEAN`.
             "**Alternatives set aside.**\n- A script.: Nothing runs it.",
             "**Design review, pass 2.** Reviewers:\n- critic on Claude Code (its default model)\n\
              - conformance on Claude Code (`opus`, the design run's own model",
-            "standing in for Codex, which is not usable",
-            "- F2, minor, critic and conformance on Claude Code, standing in for Codex: Claim 2. \
-             (noted for the Build)",
-            "- F3, major, critic and conformance on Claude Code, standing in for Codex: Claim 3. \
-             (asked below)",
+            "- F2, minor, critic and conformance on Claude Code: Claim 2. (noted for the Build)",
+            "- F3, major, critic and conformance on Claude Code: Claim 3. (asked below)",
             "Claim 4. (not asked in this round",
-            "**Findings rejected.**\n- Pass 1, F1, minor, critic and conformance on Claude Code, \
-             standing in for Codex: Claim 1. Rejected: Earlier.\n- Pass 2, F1, major, critic and \
-             conformance on Claude Code, standing in for Codex: Claim 1. Rejected: Not so.",
+            "**Findings rejected.**\n- Pass 1, F1, minor, critic and conformance on Claude Code: \
+             Claim 1. Rejected: Earlier.\n- Pass 2, F1, major, critic and conformance on Claude \
+             Code: Claim 1. Rejected: Not so.",
             "**Next.** The findings left are settled by DECISION comments or by the decider's",
         ] {
             assert!(body.contains(line), "{line}\n---\n{body}");
@@ -3812,6 +3776,7 @@ Merge state reported by the forge: `CLEAN`.
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
         assert_eq!(footers.count(), 1, "{body}");
         assert!(!body.contains("**Risks.**"), "an empty list is left out");
+        assert!(!body.contains("standing in"), "{body}");
         let quiet = PlanComment {
             findings: Vec::new(),
             not_asked: Vec::new(),

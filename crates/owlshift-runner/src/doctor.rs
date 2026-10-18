@@ -720,7 +720,7 @@ fn declarations(found: &Declared) -> String {
 
 /// Whether the machine's Codex requirements let a Codex agent run start
 /// (OWL-314): one that refuses [`FULL_ACCESS`] stops every run, so Codex is
-/// not ready, which [`critic_stands_in_without_codex`] makes its warning.
+/// not ready, which [`codex_not_ready_is_a_warning`] makes its warning.
 /// `None` when the machine has no requirements file.
 fn codex_requirements_check(system: &dyn System) -> Option<Check> {
     const SUBJECT: &str = "codex requirements";
@@ -781,7 +781,7 @@ fn codex_requirements_check(system: &dyn System) -> Option<Check> {
                  `allowed_sandbox_modes` in {path}"
             ))],
         );
-        return Some(critic_stands_in_without_codex(refused, Harness::Codex));
+        return Some(codex_not_ready_is_a_warning(refused, Harness::Codex));
     }
     let allows = match required.allowed_sandbox_modes {
         Some(_) => format!("{path} allows `{FULL_ACCESS}`"),
@@ -807,17 +807,19 @@ fn codex_requirements_check(system: &dyn System) -> Option<Check> {
 const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on macOS; on Linux, \
                             start a Secret Service such as GNOME Keyring";
 
-/// The harnesses declared in the personal file, or both when it declares
-/// none (scenario S15). Codex that is not ready is only a warning: see
-/// [`critic_stands_in_without_codex`].
+/// The harnesses doctor checks (scenario S15): Claude Code, which runs every
+/// role, and Codex only when the personal file declares it (OWL-347). Codex
+/// that is not ready is only a warning: see [`codex_not_ready_is_a_warning`].
 fn required_harnesses(config: &Effective) -> Vec<Harness> {
-    if let FileState::Loaded { config, .. } = &config.personal {
-        let declared: Vec<Harness> = config.harnesses.iter().map(|(h, _)| h).collect();
-        if !declared.is_empty() {
-            return declared;
-        }
+    let codex = matches!(
+        &config.personal,
+        FileState::Loaded { config, .. } if config.harnesses.codex.is_some()
+    );
+    let mut harnesses = vec![Harness::Claude];
+    if codex {
+        harnesses.push(Harness::Codex);
     }
-    vec![Harness::Claude, Harness::Codex]
+    harnesses
 }
 
 /// Why a harness must be ready at all.
@@ -828,8 +830,8 @@ fn harness_why(harness: Harness) -> &'static str {
              Agent runs log in with the token the `claude agent login` line checks."
         }
         Harness::Codex => {
-            "Codex runs the critic of the review roles, a model of another family than the \
-             author's; without it the critic runs on Claude Code."
+            "The personal file declares Codex, yet no role runs on Codex for now: every agent, \
+             the reviewers included, runs in Claude Code."
         }
     }
 }
@@ -854,7 +856,7 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
             harness_why(harness),
             fix,
         );
-        return critic_stands_in_without_codex(missing, harness);
+        return codex_not_ready_is_a_warning(missing, harness);
     };
     let (version, exact) = match system.run(&path, &["--version"], None) {
         Ok(out) if out.code == Some(0) => (version_of(&out.stdout), exact_version_of(&out.stdout)),
@@ -870,16 +872,15 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
         result = codex_login_file_check(system, result, home);
     }
     flag_untested(&mut result, harness, exact.as_deref());
-    critic_stands_in_without_codex(result, harness)
+    codex_not_ready_is_a_warning(result, harness)
 }
 
 /// Codex that is missing, logged out, unreadable or stopped by the machine's
 /// requirements ([`codex_requirements_check`], OWL-314) is a warning, never a
-/// failure: without it, the critic of the review roles runs on Claude Code
-/// instead (architecture section 5, "Without Codex"), so it is not a problem
-/// to fix before `do` (OWL-102, OWL-299). The decision is made here and only
-/// here.
-fn critic_stands_in_without_codex(mut check: Check, harness: Harness) -> Check {
+/// failure: no role runs on Codex (architecture section 5, "Codex",
+/// OWL-347), so it is not a problem to fix before `do` (OWL-102, OWL-299).
+/// The decision is made here and only here.
+fn codex_not_ready_is_a_warning(mut check: Check, harness: Harness) -> Check {
     if harness != Harness::Codex || check.status != Status::Fail {
         return check;
     }
@@ -900,8 +901,8 @@ fn critic_stands_in_without_codex(mut check: Check, harness: Harness) -> Check {
         .collect();
     check.status = Status::Warn;
     check.why = Some(format!(
-        "{DOES_NOT_BLOCK} without Codex, the critic of the review roles runs on Claude Code \
-         instead, a model of the same family as the author's. To get it ready: {}.",
+        "{DOES_NOT_BLOCK} no role runs on Codex for now. To get the Codex the personal file \
+         declares ready: {}.",
         steps.join(", then ")
     ));
     check.fix = Vec::new();
@@ -911,7 +912,7 @@ fn critic_stands_in_without_codex(mut check: Check, harness: Harness) -> Check {
 /// A Codex logged in, but not through the file a Codex agent run copies its
 /// login from (OWL-299), such as a login kept in the system keyring: `codex
 /// login status` says logged in, yet the run is refused. Not ready, so
-/// [`critic_stands_in_without_codex`] makes it its warning.
+/// [`codex_not_ready_is_a_warning`] makes it its warning.
 fn codex_login_file_check(system: &dyn System, logged_in: Check, home: Option<&Path>) -> Check {
     let file = system.codex_login_file();
     if file.as_deref().is_some_and(|file| system.is_file(file)) {
@@ -2212,6 +2213,20 @@ mod tests {
         }
     }
 
+    /// A personal file that declares Codex, whose lines doctor then shows
+    /// (OWL-347).
+    fn declares_codex() -> Effective {
+        let text = "[harnesses.codex]\n";
+        Effective {
+            project: FileState::NotApplicable("not in a git repository".into()),
+            personal: FileState::Loaded {
+                path: PathBuf::from("/home/ada/.config/owlshift/config.toml"),
+                config: owlshift_contracts::config::PersonalConfig::parse(text).unwrap(),
+                entries: Vec::new(),
+            },
+        }
+    }
+
     fn with_git(system: FakeSystem) -> FakeSystem {
         system.install("git").answer(
             "git --version",
@@ -2257,7 +2272,7 @@ mod tests {
         let system = with_harnesses(with_git(FakeSystem::default()))
             .answer(CLAUDE_STATUS, Answer::Exit(0, CLAUDE_LOGGED_IN, ""))
             .answer(CODEX_STATUS, Answer::Exit(0, "", CODEX_API_KEY));
-        let report = run(&system, &no_config());
+        let report = run(&system, &declares_codex());
         let shown = report.to_string();
 
         assert!(report.ready(), "{shown}");
@@ -2291,7 +2306,9 @@ mod tests {
         }
     }
 
-    /// Each check sits in its section, and the sections come in order.
+    /// Each check sits in its section, and the sections come in order;
+    /// without a personal file, Codex has no line, installed or not
+    /// (OWL-347).
     #[test]
     fn checks_are_grouped_by_section_in_order() {
         let report = run(
@@ -2306,7 +2323,6 @@ mod tests {
         let mut expected = vec![
             (Section::Tools, "git"),
             (Section::Tools, "claude"),
-            (Section::Tools, "codex"),
             (Section::AgentIsolation, "sandbox"),
         ];
         if cfg!(unix) {
@@ -2315,7 +2331,6 @@ mod tests {
         }
         expected.extend([
             (Section::AgentIsolation, "claude agent login"),
-            (Section::AgentIsolation, "codex machine config"),
             (Section::Project, "project config"),
             (Section::Project, "personal config"),
             (Section::Project, "tracker"),
@@ -2718,16 +2733,13 @@ mod tests {
             (unknown, "`codex login status`"),
             (missing, "`npm install -g @openai/codex`"),
         ] {
-            let report = run(&system, &no_config());
+            let report = run(&system, &declares_codex());
             let codex = line(&report, "codex");
             assert_eq!(codex.status, Status::Warn, "{report}");
             assert_eq!(codex.fix, []);
             let why = codex.why.as_deref().unwrap();
             assert!(why.starts_with(DOES_NOT_BLOCK), "{why}");
-            assert!(
-                why.contains("the critic of the review roles runs on Claude Code"),
-                "{why}"
-            );
+            assert!(why.contains("no role runs on Codex for now"), "{why}");
             assert!(why.contains(step), "{why}");
             assert!(report.ready(), "{report}");
             assert_eq!(report.failures(), 0, "{report}");
@@ -2843,7 +2855,7 @@ mod tests {
     #[test]
     fn a_tested_version_is_quiet() {
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
-        let report = run(&system, &no_config());
+        let report = run(&system, &declares_codex());
         let claude = line(&report, "claude");
         assert_eq!(claude.status, Status::Ok, "{report}");
         assert!(!claude.detail.contains("tested"), "{report}");
@@ -2867,7 +2879,7 @@ mod tests {
     fn a_codex_login_without_its_file_is_the_warning() {
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
             .without_file("/home/ada/.codex/auth.json");
-        let report = run(&system, &no_config());
+        let report = run(&system, &declares_codex());
         let codex = line(&report, "codex");
         assert_eq!(codex.status, Status::Warn, "{report}");
         // Shown as every path under the home is: `~/…` where `/home/ada` is
@@ -2883,10 +2895,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(file, "~/.codex/auth.json");
         let why = codex.why.as_deref().unwrap();
-        assert!(
-            why.contains("the critic of the review roles runs on Claude Code"),
-            "{why}"
-        );
+        assert!(why.contains("no role runs on Codex for now"), "{why}");
         assert!(
             why.contains("`codex login`") && why.contains("auth.json"),
             "{why}"
@@ -2913,7 +2922,7 @@ mod tests {
                 Answer::Exit(0, "codex-cli 0.155.0\n", ""),
             )
             .answer(CODEX_STATUS, Answer::Exit(1, "", "Not logged in\n"));
-        let report = run(&system, &no_config());
+        let report = run(&system, &declares_codex());
         let codex = line(&report, "codex");
         assert_eq!(codex.status, Status::Warn);
         assert_eq!(
@@ -2987,6 +2996,15 @@ mod tests {
         );
     }
 
+    /// OWL-347: Claude Code runs every role, so it is checked even when the
+    /// personal file declares Codex alone, whose lines are warnings at most.
+    #[test]
+    fn claude_is_checked_whatever_the_personal_file_declares() {
+        let report = run(&with_git(FakeSystem::default()), &declares_codex());
+        assert_eq!(line(&report, "claude").status, Status::Fail, "{report}");
+        assert_eq!(line(&report, "codex").status, Status::Warn, "{report}");
+    }
+
     /// OWL-314: the MCP servers and hooks of `/etc/codex` are named as the
     /// operator's, each file read on its own; what an unreadable file holds
     /// never reaches the report, only its line.
@@ -3003,7 +3021,7 @@ mod tests {
                 Ok("[mcp_servers.tracker]\nbearer = sk-secret-value\n"),
             )
             .text_file(codex_machine::REQUIREMENTS, Err("permission denied"));
-        let report = run(&system, &no_config());
+        let report = run(&system, &declares_codex());
 
         assert!(report.ready(), "{report}");
         let config = line(&report, "codex machine config");
@@ -3026,15 +3044,15 @@ mod tests {
     }
 
     /// OWL-314: requirements refusing `danger-full-access` stop every Codex
-    /// agent run, so Codex is not ready, which is the critic's stand-in
-    /// warning; a managed hooks folder is named either way.
+    /// agent run, so a declared Codex is not ready, a warning; a managed
+    /// hooks folder is named either way.
     #[test]
     fn requirements_refusing_full_access_make_codex_not_ready() {
         let hooks = "\n[hooks]\nmanaged_dir = \"/etc/codex/hooks\"\n";
         let refusing = format!("allowed_sandbox_modes = [\"read-only\"]\n{hooks}");
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
             .text_file(codex_machine::REQUIREMENTS, Ok(refusing.as_str()));
-        let report = run(&system, &no_config());
+        let report = run(&system, &declares_codex());
 
         assert!(report.ready(), "{report}");
         assert_eq!(line(&report, "codex machine config").status, Status::Ok);
@@ -3049,17 +3067,17 @@ mod tests {
         assert_eq!(
             refused.why.as_deref(),
             Some(
-                "Does not block `owlshift do`: without Codex, the critic of the review roles runs \
-                 on Claude Code instead, a model of the same family as the author's. To get it \
-                 ready: Have the machine's administrator add \"danger-full-access\" to \
-                 `allowed_sandbox_modes` in /etc/codex/requirements.toml."
+                "Does not block `owlshift do`: no role runs on Codex for now. To get the Codex \
+                 the personal file declares ready: Have the machine's administrator add \
+                 \"danger-full-access\" to `allowed_sandbox_modes` in \
+                 /etc/codex/requirements.toml."
             )
         );
 
         let allowing = format!("allowed_sandbox_modes = [\"danger-full-access\"]\n{hooks}");
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())))
             .text_file(codex_machine::REQUIREMENTS, Ok(allowing.as_str()));
-        let allowed = run(&system, &no_config());
+        let allowed = run(&system, &declares_codex());
         let allowed = line(&allowed, "codex requirements");
         assert_eq!(allowed.status, Status::Warn);
         assert!(

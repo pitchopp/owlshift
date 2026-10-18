@@ -3,7 +3,9 @@
 //! ticket at dispatch, the model of each tier, and the [`Router`] that gives
 //! a run the harness its routing names. Since OWL-303 the `variant:` label
 //! too, which overrides intake's verdict on the ticket's pipeline
-//! ([`ticket_variant`]), and the Codex critic's router ([`CodexRouter`]).
+//! ([`ticket_variant`]), and the Codex critic's router ([`CodexRouter`]),
+//! unwired since OWL-347, when every reviewer moved to Claude Code, and kept
+//! with [`codex_model`] for an opt-in Codex reviewer (OWL-348).
 //!
 //! The rules are the core's ([`owlshift_core::routing`]): the ticket's
 //! routing from intake's verdict under the labels' values, then each role's
@@ -41,7 +43,7 @@ pub fn ticket_variant(
 /// family: the caller picks it by the routing's `harness`, which the core's
 /// `role_routing` gives as Claude Code for every authoring role in P5 (D4).
 /// The review roles of Design review and Verify go through it with
-/// `seat_routing`'s routing, on a router of their seat's harness.
+/// `reviewer_routing`'s routing, on Claude Code (OWL-347).
 pub trait Router {
     /// The harness of a run routed `routing`.
     fn harness(&self, routing: RunRouting) -> Box<dyn Harness + '_>;
@@ -109,7 +111,8 @@ pub fn codex_model(models: &Models, tier: Tier) -> Option<&str> {
 
 /// Codex, routed (OWL-303): the critic's harness, given the model of the
 /// routing's tier and its effort for each run, which the adapter maps one
-/// to one (check C2).
+/// to one (check C2). No command builds it since OWL-347; it is kept for an
+/// opt-in Codex reviewer (OWL-348).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodexRouter {
     /// The critic's harness: its program, prompt and the user's login file.

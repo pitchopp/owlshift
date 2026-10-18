@@ -519,9 +519,8 @@ mod tests {
             reviewer: Reviewer {
                 role: Role::Verify,
                 mandates: vec![Mandate::Critic, Mandate::Conformance],
-                harness: HarnessKind::Codex,
+                harness: HarnessKind::Claude,
                 model: "default".to_owned(),
-                stand_in: false,
                 same_model: false,
             },
             ruling: ruling.map(|outcome| KeptRuling {

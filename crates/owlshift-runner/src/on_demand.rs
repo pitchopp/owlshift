@@ -412,12 +412,12 @@ pub struct OnDemand<'a> {
     /// Runs the design role (`roles/design.md`) on the ticket's routing
     /// (OWL-303).
     pub design: &'a dyn Router,
-    /// Runs the reviewers of Design review (`roles/design_review.md`), each
-    /// on its seat's routing (OWL-303).
-    pub design_review: Reviewers<'a>,
-    /// Runs the reviewers of Verify (`roles/verify.md`), each on its seat's
-    /// routing (OWL-304).
-    pub verify: Reviewers<'a>,
+    /// Runs the reviewers of Design review (`roles/design_review.md`) on
+    /// Claude Code, on another model than the author's (OWL-303, OWL-347).
+    pub design_review: &'a dyn Router,
+    /// Runs the reviewers of Verify (`roles/verify.md`) on Claude Code, on
+    /// another model than the author's (OWL-304, OWL-347).
+    pub verify: &'a dyn Router,
     /// Runs the arbiter (`roles/arbiter.md`) on its role's routing: the
     /// standard tier, without an effort (OWL-303).
     pub arbiter: &'a dyn Router,
@@ -440,16 +440,6 @@ pub struct OnDemand<'a> {
     /// This machine's clock, read for the quiet window alone
     /// ([`answer_check::counts_at`]).
     pub clock: &'a dyn Fn() -> Timestamp,
-}
-
-/// The reviewers of a review stage, by harness (OWL-303): on Claude Code,
-/// and on Codex for the critic when Codex can run it on this machine
-/// ([`crate::codex_machine::codex_critic`]); without it the critic stands in
-/// on Claude Code.
-#[derive(Clone, Copy)]
-pub struct Reviewers<'a> {
-    pub claude: &'a dyn Router,
-    pub codex: Option<&'a dyn Router>,
 }
 
 /// A ticket delivered.
@@ -1051,10 +1041,6 @@ struct Prepared {
     /// resolver decided among them, by the project's pass limit and ceiling
     /// ([`GatePolicy::chain_end`]).
     chain: Chain,
-    /// Why the Codex critic cannot run in this command although Codex is
-    /// configured: its harness's check failed (OWL-303). The critic stands
-    /// in on Claude Code, and the review pass warns of it.
-    critic: Option<String>,
 }
 
 impl Prepared {
@@ -1449,8 +1435,8 @@ impl OnDemand<'_> {
         // A harness's needs do not depend on its run's tier or effort.
         let build = self.build.harness(PROJECT_DEFAULT);
         let design = self.design.harness(PROJECT_DEFAULT);
-        let reviewer = self.design_review.claude.harness(PROJECT_DEFAULT);
-        let verifier = self.verify.claude.harness(PROJECT_DEFAULT);
+        let reviewer = self.design_review.harness(PROJECT_DEFAULT);
+        let verifier = self.verify.harness(PROJECT_DEFAULT);
         let arbiter = self.arbiter.harness(PROJECT_DEFAULT);
         for harness in [
             &*build,
@@ -1466,24 +1452,6 @@ impl OnDemand<'_> {
                 .sandbox_needs(&self.executor.agent)
                 .map_err(|e| Stop::Refused(e.to_string()))?;
         }
-        // The Codex critic only stands in when its harness cannot run here
-        // (architecture section 5, "Without Codex"): nothing is refused. Both
-        // review stages run the same Codex program and login with their own
-        // prompts, whose needs do not differ: one check serves them both.
-        let critic = self
-            .design_review
-            .codex
-            .or(self.verify.codex)
-            .and_then(|codex| {
-                codex
-                    .harness(RunRouting {
-                        harness: owlshift_core::vocab::Harness::Codex,
-                        ..PROJECT_DEFAULT
-                    })
-                    .sandbox_needs(&self.executor.agent)
-                    .err()
-                    .map(|e| e.to_string())
-            });
         // The ticket ref lives in the dedicated checkout: without one,
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
@@ -1568,7 +1536,6 @@ impl OnDemand<'_> {
                 self.config.pipeline.default,
             )),
             chain: Chain::default(),
-            critic,
             stored,
             heeded: false,
             repairing: false,
