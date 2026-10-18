@@ -200,14 +200,27 @@ fn a_reversed_design_review_residue_returns_the_ticket_to_design() {
         (record.state.stage, record.state.review_passes),
         (Stage::DesignReview, 2)
     );
+    let passes = record.state.review_passes;
     let kept = &record.questions.decisions[0];
     assert_eq!(kept.asked_by, Some(Role::DesignReview));
     let decision = kept.comment.clone();
     let before = bench.roles().len();
 
     bench.reply_as("maintainer", &decision, "No: leave the test as it is.");
+    // The Design run the reply returns to, then a usage limit at the review:
+    // the return itself counts no review pass.
+    let replies = vec![bench.read(&designed(REVISED)), bench.limited()];
+    let (stopped, printed) = bench.continue_ticket(replies);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    let record = bench.record();
+    assert_eq!(
+        (record.state.stage, record.state.review_passes),
+        (Stage::DesignReview, passes)
+    );
     let replies = vec![
-        bench.read(&designed(REVISED)),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
         bench.built(),
@@ -218,6 +231,7 @@ fn a_reversed_design_review_residue_returns_the_ticket_to_design() {
         bench.roles()[before..],
         [
             Role::Design,
+            Role::DesignReview,
             Role::DesignReview,
             Role::DesignReview,
             Role::Build,
