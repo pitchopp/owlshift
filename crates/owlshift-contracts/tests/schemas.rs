@@ -130,7 +130,7 @@ fn project_config_schema_accepts_the_ready_gesture() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t", "recommendation": { "why": "r" } });
-    let base = |status: &str| json!({ "format": 11, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 12, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);
@@ -161,7 +161,7 @@ fn result_schema_carries_the_expressible_rules() {
     named["refused_choices_asked"][0]["choice"] = json!(0);
     assert!(!validator.is_valid(&named));
 
-    for format in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
+    for format in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");

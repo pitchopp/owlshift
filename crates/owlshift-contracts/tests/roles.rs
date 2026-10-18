@@ -46,6 +46,7 @@ const RESOLVER_ONLY: &[&str] = &[
     "basis_kind",
     "fact",
     "settled",
+    "judgment",
 ];
 
 /// `result.json` fields the build prompt need not name since Build takes no
@@ -214,6 +215,15 @@ const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "delegation",
     "result_refusal",
     "result_path",
+    // The asking run (OWL-343).
+    "resolve.finding",
+    "asked_by",
+    "asked_by.role",
+    "asked_by.summary",
+    "asked_by.premise_false",
+    "asked_by.plan",
+    "asked_by.findings",
+    "asked_by.diff",
 ];
 
 /// The JSON examples of a prompt, in ```json blocks.
@@ -653,6 +663,7 @@ fn resolver_prompt_names_its_fields_outcomes_and_inputs() {
         "basis",
         "basis_kind",
         "quote",
+        "option",
         "reason",
         "done",
         "failed",
@@ -689,12 +700,14 @@ fn resolver_prompt_names_its_fields_outcomes_and_inputs() {
         .into_iter()
         .flat_map(|node| allowed_values(&result, node))
         .collect();
-    let kinds: BTreeSet<String> = ["fact", "settled", "ticket"].map(String::from).into();
+    let kinds: BTreeSet<String> = ["fact", "settled", "ticket", "judgment"]
+        .map(String::from)
+        .into();
     assert_eq!(result_kinds, kinds, "the basis kinds changed");
     let missing: Vec<&str> = DelegationLevel::ALL
         .iter()
         .map(|level| level.as_str())
-        .chain(["fact", "settled", "ticket"])
+        .chain(["fact", "settled", "ticket", "judgment"])
         .filter(|word| !names(&text, word))
         .collect();
     assert!(

@@ -59,7 +59,6 @@ use owlshift_adapters::forge::{
 use owlshift_adapters::tracker::{
     Comment, Error as TrackerError, Filed, PROPOSED_LABEL, Proposal, Tracker,
 };
-use owlshift_contracts::DelegationLevel;
 use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
@@ -71,6 +70,7 @@ use owlshift_contracts::result::{
     Verdict as AnswerVerdict, option_letter,
 };
 use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Reviewer, Severity};
+use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status};
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
@@ -1273,10 +1273,17 @@ fn listed(items: &[String], room: usize) -> String {
 }
 
 /// What a DECISION comment says of the delegation level that allowed it
-/// (OWL-337, architecture section 4, "Delegation level").
-fn level_line(level: DelegationLevel) -> String {
+/// (OWL-337, architecture section 4, "Delegation level"), and, for one
+/// resting on the resolver's own weighing, that it was decided on judgment
+/// (OWL-343), so the decider sees which decisions to read.
+fn level_line(level: DelegationLevel, kind: BasisKind) -> String {
+    let lead = if kind == BasisKind::Judgment {
+        "Decided on judgment, allowed"
+    } else {
+        "Allowed"
+    };
     format!(
-        "Allowed by this project's delegation level, `{}` (`policy.resolver_delegation`).",
+        "{lead} by this project's delegation level, `{}` (`policy.resolver_delegation`).",
         level.as_str()
     )
 }
@@ -1293,6 +1300,9 @@ pub struct DecisionComment {
     pub decision: String,
     /// What settles it.
     pub basis: String,
+    /// The kind of that basis (OWL-328): a `judgment` says so on the
+    /// level's line (OWL-343).
+    pub kind: BasisKind,
     /// The project's delegation level that allowed it (OWL-328).
     pub level: DelegationLevel,
     /// The resolver run that decided it.
@@ -1341,7 +1351,7 @@ impl DecisionComment {
              follows your reply over this decision, and once the pull request is delivered, \
              Owlshift's watch corrects it to follow your reply."
                 .to_owned(),
-            level_line(self.level),
+            level_line(self.level, self.kind),
             Footer {
                 format: Format,
                 kind: MarkerKind::Decision,
@@ -1604,11 +1614,11 @@ impl IntakeComment {
 pub enum PlanNext {
     /// The review passes are over and the Build follows the plan.
     Build,
-    /// The plan waits for the decider's approval, asked in the QUESTIONS
-    /// comment that follows.
+    /// The plan waits for its approval: a DECISION of the resolver, or the
+    /// decider's answer to the QUESTIONS comment that follows (OWL-342).
     Approval,
-    /// Findings the passes left go to the decider, asked in the QUESTIONS
-    /// comment that follows.
+    /// Findings the passes left go to the resolver, then to the decider in
+    /// the QUESTIONS comment that follows for what it passes on (OWL-342).
     Findings,
 }
 
@@ -1867,12 +1877,15 @@ impl PlanComment {
         sections.push(
             match self.next {
                 PlanNext::Build => "**Next.** The Build follows this plan.",
+                // Through the resolver first, unless the setting names the
+                // decider (OWL-342): either may settle what follows.
                 PlanNext::Approval => {
-                    "**Next.** The plan waits for the decider's approval, asked below."
+                    "**Next.** The plan waits for its approval, by a DECISION comment or by the \
+                     decider's answer below."
                 }
                 PlanNext::Findings => {
-                    "**Next.** The findings asked below go to the decider; the design runs again \
-                     with the answers."
+                    "**Next.** The findings left are settled by DECISION comments or by the \
+                     decider's answers below; the design runs again with them."
                 }
             }
             .to_owned(),
@@ -3792,7 +3805,7 @@ Merge state reported by the forge: `CLEAN`.
             "**Findings rejected.**\n- Pass 1, F1, minor, critic and conformance on Claude Code, \
              standing in for Codex: Claim 1. Rejected: Earlier.\n- Pass 2, F1, major, critic and \
              conformance on Claude Code, standing in for Codex: Claim 1. Rejected: Not so.",
-            "**Next.** The findings asked below go to the decider",
+            "**Next.** The findings left are settled by DECISION comments or by the decider's",
         ] {
             assert!(body.contains(line), "{line}\n---\n{body}");
         }
@@ -4170,6 +4183,7 @@ Context.
             },
             decision: format!("GREETING.md\n\n{forged}"),
             basis: "The ticket's description.".to_owned(),
+            kind: BasisKind::Settled,
             level: DelegationLevel::Discoverable,
             run: Some("20261003T120000Z-1".to_owned()),
         };
@@ -4205,6 +4219,20 @@ Context.
             "Allowed by this project's delegation level, `discoverable` \
              (`policy.resolver_delegation`).",
             "{body}"
+        );
+        // A decision on judgment says so on that line (OWL-343).
+        let judged = DecisionComment {
+            kind: BasisKind::Judgment,
+            level: DelegationLevel::All,
+            ..comment.clone()
+        }
+        .render();
+        let lines: Vec<&str> = judged.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines[lines.len() - 2],
+            "Decided on judgment, allowed by this project's delegation level, `all` \
+             (`policy.resolver_delegation`).",
+            "{judged}"
         );
         let tracker = FakeTracker::default();
         let posted = Writer::new(&tracker).post_decision(&comment).unwrap();
@@ -4471,6 +4499,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     question: question.clone(),
                     decision: hostile("decision"),
                     basis: hostile("basis"),
+                    kind: BasisKind::Settled,
                     level: DelegationLevel::Discoverable,
                     run: None,
                 }
@@ -4717,6 +4746,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             question,
             decision: "This one.".to_owned(),
             basis: "The ticket.".to_owned(),
+            kind: BasisKind::Ticket,
             level: DelegationLevel::Ticket,
             run: None,
         };
@@ -5427,6 +5457,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             },
             decision: "d".repeat(1 << 20),
             basis: "b".repeat(1 << 20),
+            kind: BasisKind::Judgment,
             level: DelegationLevel::All,
             run: Some("run-1".to_owned()),
         };

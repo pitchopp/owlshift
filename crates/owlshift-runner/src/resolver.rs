@@ -4,10 +4,12 @@
 //!
 //! Each question is routed by the project's gate policy ([`route`]): a
 //! question of an always-human category, the floor's or one the project
-//! adds, goes to the decider and never to the resolver, and so does one that
-//! reopens a choice the runner refused (OWL-222). The rest go to a run
-//! of the `resolver` role (`roles/resolver.md`), read-only and without
-//! network, whose brief lists them in `resolve`. Its outcome ([`outcome`])
+//! adds, goes to the decider and never to the resolver, and so does the
+//! plan-approval question under `plan_approval = "always"`. Since OWL-342
+//! every other question every role raises goes to a run of the `resolver`
+//! role (`roles/resolver.md`), read-only and without network, whose brief
+//! lists them in `resolve` beside the asking run's own output. Its outcome
+//! ([`outcome`])
 //! either decides or passes on each question, or, when the run gave no usable
 //! result, sends them all to the decider ([`Fallback`]): no other harness can
 //! take over yet. The resolver's brief lists its questions without their
@@ -16,7 +18,9 @@
 //! the resolver whose two labels, the raising run's and the resolver's, both
 //! route there (OWL-144), whose basis is of a kind the project's delegation
 //! level allows and, for a `ticket` basis, quotes the ticket's text
-//! ([`Quotable`], OWL-328) ([`settle`]), posts each as a DECISION comment
+//! ([`Quotable`], OWL-328), and, on a false premise's question, which takes
+//! a re-scope under the level's `scope` rule and never the closure
+//! ([`with_closure`], OWL-343) ([`settle`]), posts each as a DECISION comment
 //! ([`crate::writer::DecisionComment`]) and keeps it in the ticket ref; the
 //! decider gets the rest as a round ([`left_for_decider`]).
 //! `owlshift do` and `owlshift continue` run it ([`crate::on_demand`]); the
@@ -26,9 +30,12 @@ use std::time::Duration;
 
 use owlshift_contracts::BasisKind;
 use owlshift_contracts::brief::{Brief, Relation, ThreadEntry, ToResolve};
-use owlshift_contracts::ids::QuestionId;
+use owlshift_contracts::ids::{FindingId, QuestionId};
 use owlshift_contracts::refs::KeptDecision;
-use owlshift_contracts::result::{Decision, Question, Resolution, Status};
+use owlshift_contracts::result::{
+    Decision, Question, QuestionOption, Resolution, Status, option_letter,
+};
+use owlshift_core::floor::FloorCategory;
 use owlshift_core::gate::{ChainEnd, GatePolicy, Route};
 
 use crate::executor::Outcome;
@@ -42,25 +49,26 @@ pub const RESOLVER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Routed {
-    /// Always-human questions, and those that reopen a refused choice: the
-    /// decider's alone.
+    /// Always-human questions, and those the caller sends to the decider
+    /// directly: the decider's alone.
     pub to_decider: Vec<Question>,
     /// The rest: the resolver's first.
     pub to_resolver: Vec<Question>,
 }
 
-/// Routes each question by its category ([`GatePolicy::route`]). The floor's
-/// categories, a blank one and the project's additions go to the decider; a
-/// category is all the runner reads, so a question filed under the wrong one
-/// is routed by that one; [`settle`] then checks the resolver's own label
-/// before any decision on it is logged. A question the run names as
-/// reopening a refused choice (`reopened`, under the run's ids) goes to the
-/// decider whatever its category (OWL-222): the runner refused that choice
-/// for being taken without a human, so no resolver settles it either.
-pub fn route(policy: &GatePolicy, questions: &[Question], reopened: &[ReopenedChoice]) -> Routed {
+/// Routes each question by the category the asking run filed it under
+/// ([`GatePolicy::route`]): the level's always-human categories and the
+/// project's additions go to the decider; every other, a blank one included,
+/// to the resolver first (OWL-342). A category is all the runner reads, so
+/// a question filed under the wrong one is routed by that one; [`settle`]
+/// then checks the resolver's own label before any decision on it is
+/// logged. The questions of `direct`, under the run's ids, go to the decider
+/// whatever their category: the plan-approval question under
+/// `plan_approval = "always"`, whose setting names a human.
+pub fn route(policy: &GatePolicy, questions: &[Question], direct: &[QuestionId]) -> Routed {
     let mut routed = Routed::default();
     for question in questions {
-        if reopened.iter().any(|choice| choice.question == question.id) {
+        if direct.contains(&question.id) {
             routed.to_decider.push(question.clone());
             continue;
         }
@@ -75,9 +83,49 @@ pub fn route(policy: &GatePolicy, questions: &[Question], reopened: &[ReopenedCh
 /// The questions as the resolver's brief lists them, without the category
 /// the raising run gave them (OWL-144): the resolver labels each question it
 /// decides from its text and context, so its label is its own reading and
-/// not a copy of the one [`decisions`] checks it against.
-pub fn unlabelled(questions: &[Question]) -> Vec<ToResolve> {
-    questions.iter().map(ToResolve::from).collect()
+/// not a copy of the one [`decisions`] checks it against. A residue
+/// question names the finding it asks about (`findings`, by the run's
+/// question ids, OWL-343).
+pub fn unlabelled(questions: &[Question], findings: &[(QuestionId, FindingId)]) -> Vec<ToResolve> {
+    questions
+        .iter()
+        .map(|question| ToResolve {
+            finding: findings
+                .iter()
+                .find(|(asked, _)| *asked == question.id)
+                .map(|(_, finding)| finding.clone()),
+            ..ToResolve::from(question)
+        })
+        .collect()
+}
+
+/// The option the runner adds to every question of a false premise
+/// (OWL-343): closing the ticket, the decider's act in the tracker, which
+/// no resolver decides.
+pub const CLOSURE: &str = "Close the ticket: its premise is false";
+
+/// The questions of a `premise_false` result as the runner asks them, each
+/// with the closure ([`CLOSURE`]) as its last option, so that the runner
+/// knows that option's letter whatever the asking run wrote; a question that
+/// already ends with it, kept from an earlier round, is left as it is.
+pub fn with_closure(questions: &[Question]) -> Vec<Question> {
+    questions
+        .iter()
+        .map(|question| {
+            let mut asked = question.clone();
+            if closure_letter(&asked).is_none() {
+                asked.options.push(QuestionOption::new(CLOSURE));
+            }
+            asked
+        })
+        .collect()
+}
+
+/// The letter of a false premise's question's closure: its last option's,
+/// when that option is [`CLOSURE`].
+fn closure_letter(question: &Question) -> Option<String> {
+    let last = question.options.len().checked_sub(1)?;
+    (question.options[last].label == CLOSURE).then(|| option_letter(last))
 }
 
 /// Why the questions meant for the resolver went to the decider; the
@@ -212,13 +260,24 @@ pub fn refusal_after(kept: Option<&str>, ran: &Outcome) -> Option<String> {
     }
 }
 
+/// A decision the runner logs: its own copy of the question, the decision,
+/// its basis and the basis's kind, and the option it takes, when it names
+/// one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Logged<'a> {
+    pub question: &'a Question,
+    pub decision: &'a str,
+    pub basis: &'a str,
+    pub kind: BasisKind,
+    pub option: Option<&'a str>,
+}
+
 /// What the runner makes of a resolver's resolutions, each list in question
 /// order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settled<'a> {
-    /// The decisions it logs: the runner's own copy of the question, the
-    /// decision and its basis.
-    pub logged: Vec<(&'a Question, &'a str, &'a str)>,
+    /// The decisions it logs.
+    pub logged: Vec<Logged<'a>>,
     /// The questions whose decision it refused, which go to the decider.
     pub refused: Vec<&'a QuestionId>,
 }
@@ -229,17 +288,21 @@ pub struct Settled<'a> {
 /// it (OWL-144) and the kind of its basis (OWL-328), and finds a `ticket`
 /// basis's quote in `quotable`. A decision is logged only when both labels
 /// route to the resolver, the label a token, the project's delegation level
-/// allows the kind, and a `ticket` basis's quote is found; otherwise it is
-/// refused, whatever the resolver decided, and its question goes to the
-/// decider. A resolution on a question not in `given` is dropped, in
-/// neither list: the executor already refuses a result that names a question
-/// its brief did not give, and this keeps the floor independent of that
-/// check.
+/// allows the kind, a `judgment` at `all` alone (OWL-343), and a `ticket`
+/// basis's quote is found. On the questions of a run that found the
+/// premise false (`premise_false`), it must also take an option other than
+/// the closure ([`with_closure`]), a re-scope, which the level's `scope`
+/// rule holds as a decision on a `scope` question. Otherwise it is refused,
+/// whatever the resolver decided, and its question goes to the decider. A
+/// resolution on a question not in `given` is dropped, in neither list: the
+/// executor already refuses a result that names a question its brief did not
+/// give, and this keeps the floor independent of that check.
 pub fn settle<'a>(
     policy: &GatePolicy,
     given: &'a [Question],
     resolutions: &'a [Resolution],
     quotable: &Quotable,
+    premise_false: bool,
 ) -> Settled<'a> {
     let mut settled = Settled::default();
     for resolution in resolutions {
@@ -250,6 +313,7 @@ pub fn settle<'a>(
             basis,
             basis_kind,
             quote,
+            option,
         } = resolution
         else {
             continue;
@@ -261,12 +325,21 @@ pub fn settle<'a>(
         // one is refused here too, so the floor does not lean on it.
         let quoted = *basis_kind != BasisKind::Ticket
             || quote.as_deref().is_some_and(|quote| quotable.holds(quote));
+        // A false premise's question: a re-scope only, held as `scope`.
+        let rescope = !premise_false
+            || (option
+                .as_deref()
+                .is_some_and(|letter| Some(letter) != closure_letter(asked).as_deref())
+                && policy.route_decided(FloorCategory::Scope.token(), category, *basis_kind)
+                    == Route::Resolver);
         match policy.route_decided(&asked.category, category, *basis_kind) {
-            Route::Resolver if quoted => {
-                settled
-                    .logged
-                    .push((asked, decision.as_str(), basis.as_str()));
-            }
+            Route::Resolver if quoted && rescope => settled.logged.push(Logged {
+                question: asked,
+                decision: decision.as_str(),
+                basis: basis.as_str(),
+                kind: *basis_kind,
+                option: option.as_deref(),
+            }),
             Route::Resolver | Route::Human => settled.refused.push(&asked.id),
         }
     }
@@ -280,8 +353,9 @@ pub fn decisions<'a>(
     given: &'a [Question],
     resolutions: &'a [Resolution],
     quotable: &Quotable,
-) -> Vec<(&'a Question, &'a str, &'a str)> {
-    settle(policy, given, resolutions, quotable).logged
+    premise_false: bool,
+) -> Vec<Logged<'a>> {
+    settle(policy, given, resolutions, quotable, premise_false).logged
 }
 
 /// The ids of the questions passed on, in question order.
@@ -317,8 +391,9 @@ pub fn left_for_decider(
 
 /// The refused choices a round reopens (OWL-203): those of `asked`, under
 /// the run's question ids, whose question the round asks, under its id in
-/// the round (`left`, from [`left_for_decider`]). Since OWL-222 the
-/// resolver is never given such a question, so each is the round's.
+/// the round (`left`, from [`left_for_decider`]). Since OWL-342 the
+/// resolver is given such a question as any other: one it decided is not in
+/// the round, and so not here.
 pub fn reopened_in(
     left: &[(QuestionId, Question)],
     asked: &[ReopenedChoice],
@@ -347,6 +422,7 @@ pub fn reported(kept: &KeptDecision) -> Decision {
 /// is among `corrected`, the questions the correction follows the replies
 /// to, says it was reversed although the ticket's ref marks it only once the
 /// push has landed (OWL-233). Nothing is written: the mark keeps its timing.
+/// A decision taken on judgment says so after its basis (OWL-343).
 pub fn reported_reversing(kept: &KeptDecision, corrected: &[String]) -> Decision {
     let reversed = kept.reversed.is_some() || corrected.contains(&kept.question.text);
     Decision {
@@ -356,16 +432,31 @@ pub fn reported_reversing(kept: &KeptDecision, corrected: &[String]) -> Decision
         } else {
             kept.decision.clone()
         },
-        basis: kept.basis.clone(),
+        basis: if kept.basis_kind == Some(BasisKind::Judgment) {
+            format!("{} (decided on judgment)", kept.basis)
+        } else {
+            kept.basis.clone()
+        },
     }
+}
+
+/// The kept decisions as the delivery report lists them
+/// ([`reported_reversing`]): those taken on judgment first, so the decider
+/// sees which ones to read (OWL-343), each group in the order kept.
+pub fn reported_all(kept: &[KeptDecision], corrected: &[String]) -> Vec<Decision> {
+    let judged = |decision: &&KeptDecision| decision.basis_kind == Some(BasisKind::Judgment);
+    kept.iter()
+        .filter(judged)
+        .chain(kept.iter().filter(|decision| !judged(decision)))
+        .map(|decision| reported_reversing(decision, corrected))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use owlshift_contracts::DelegationLevel;
     use owlshift_contracts::format::{BRIEF_FORMAT, RESULT_FORMAT};
-    use owlshift_contracts::result::{RefusedChoice, RunResult};
-    use owlshift_core::floor::FloorCategory;
+    use owlshift_contracts::result::RunResult;
     use owlshift_core::gate::ResolverPolicy;
     use owlshift_core::vocab::PlanApproval;
 
@@ -389,22 +480,37 @@ mod tests {
         questions.iter().map(|q| q.id.as_str()).collect()
     }
 
-    /// The floor's categories, in any spelling, a blank one and the
-    /// project's additions never reach the resolver.
+    fn decided(id: &str, category: &str, kind: BasisKind, option: Option<&str>) -> Resolution {
+        Resolution::Decided {
+            question: QuestionId::new(id).unwrap(),
+            category: category.into(),
+            decision: format!("decision on {id}"),
+            basis: "the ticket".into(),
+            basis_kind: kind,
+            quote: None,
+            option: option.map(str::to_owned),
+        }
+    }
+
+    fn logged_ids(settled: &Settled<'_>) -> Vec<String> {
+        settled
+            .logged
+            .iter()
+            .map(|logged| logged.question.id.as_str().to_owned())
+            .collect()
+    }
+
+    /// The floor's categories, in any spelling, and the project's additions
+    /// never reach the resolver; a blank category does (OWL-342), and so does
+    /// every other, but those the caller sends to the decider directly.
     #[test]
-    fn always_human_questions_never_reach_the_resolver() {
+    fn always_human_and_direct_questions_never_reach_the_resolver() {
         let policy = GatePolicy::new(["billing"], PlanApproval::Never);
         let mut asked: Vec<Question> = FloorCategory::ALL
             .iter()
             .map(|floor| question("Q1", floor.token()))
             .collect();
-        for category in [
-            "Scope change",
-            "risk of data loss",
-            "",
-            " ",
-            "Billing address",
-        ] {
+        for category in ["Scope change", "risk of data loss", "Billing address"] {
             asked.push(question("Q1", category));
         }
         let routed = route(&policy, &asked, &[]);
@@ -414,56 +520,98 @@ mod tests {
         let mixed = [
             question("Q1", "naming"),
             question("Q2", "security"),
-            question("Q3", "testing"),
+            question("Q3", ""),
+            question("Q4", "plan_approval"),
         ];
         let routed = route(&policy, &mixed, &[]);
-        assert_eq!(ids(&routed.to_resolver), ["Q1", "Q3"]);
+        assert_eq!(ids(&routed.to_resolver), ["Q1", "Q3", "Q4"]);
         assert_eq!(ids(&routed.to_decider), ["Q2"]);
+        let direct = [QuestionId::new("Q4").unwrap()];
+        let routed = route(&policy, &mixed, &direct);
+        assert_eq!(ids(&routed.to_resolver), ["Q1", "Q3"]);
+        assert_eq!(ids(&routed.to_decider), ["Q2", "Q4"]);
     }
 
-    /// A question the run names as reopening a refused choice goes to the
-    /// decider, even under a category the resolver may decide, the run's
-    /// other questions routed as before; a resolution on it is never logged,
-    /// since the resolver is not given it (OWL-222).
+    /// A false premise's question offers the closure last, once (OWL-343);
+    /// its decision stands only on another option, a re-scope, under the
+    /// level's `scope` rule: refused below `ticket`, on a quote at
+    /// `ticket`, on any basis at `all`; the closure, or no option, is
+    /// refused at every level.
     #[test]
-    fn a_question_that_reopens_a_refused_choice_goes_to_the_decider() {
-        let policy = GatePolicy::new(["billing"], PlanApproval::Never);
-        let asked = [
-            question("Q1", "naming"),
-            question("Q2", "testing"),
-            question("Q3", "security"),
-            question("Q4", "naming"),
+    fn a_false_premise_decides_a_rescope_under_the_scope_rule_never_the_closure() {
+        let mut asked = question("Q1", "premise");
+        asked.options = vec![QuestionOption::new("Re-scope: create GREETING.md.")];
+        let given = with_closure(std::slice::from_ref(&asked));
+        assert_eq!(given[0].options.len(), 2);
+        assert_eq!(given[0].options[1].label, CLOSURE);
+        assert_eq!(with_closure(&given), given, "added once");
+        let at = |level| {
+            GatePolicy::new(Vec::<String>::new(), PlanApproval::Never).with_resolver(
+                ResolverPolicy {
+                    level,
+                    ..ResolverPolicy::default()
+                },
+            )
+        };
+        let text = quotable("Add GREETING.md saying Hello.");
+        let quoted = Resolution::Decided {
+            question: QuestionId::new("Q1").unwrap(),
+            category: "scope".into(),
+            decision: "Create GREETING.md.".into(),
+            basis: "The ticket says so.".into(),
+            basis_kind: BasisKind::Ticket,
+            quote: Some("Add GREETING.md saying Hello.".into()),
+            option: Some("A".into()),
+        };
+        let cases = [
+            (
+                DelegationLevel::Discoverable,
+                decided("Q1", "scope", BasisKind::Settled, Some("A")),
+                false,
+            ),
+            (
+                DelegationLevel::Ticket,
+                decided("Q1", "scope", BasisKind::Settled, Some("A")),
+                false,
+            ),
+            (DelegationLevel::Ticket, quoted, true),
+            (
+                DelegationLevel::All,
+                decided("Q1", "rescope", BasisKind::Judgment, Some("A")),
+                true,
+            ),
+            (
+                DelegationLevel::All,
+                decided("Q1", "rescope", BasisKind::Judgment, Some("B")),
+                false,
+            ),
+            (
+                DelegationLevel::All,
+                decided("Q1", "rescope", BasisKind::Judgment, None),
+                false,
+            ),
         ];
-        let reopened = |place: u32, id: &str| ReopenedChoice {
-            place: std::num::NonZeroU32::new(place).unwrap(),
-            question: QuestionId::new(id).unwrap(),
-            choice: RefusedChoice {
-                question: format!("choice {place}"),
-                recorded: "recorded".into(),
-            },
-        };
-        let reopened = [reopened(1, "Q4"), reopened(2, "Q1"), reopened(3, "Q4")];
-        let routed = route(&policy, &asked, &reopened);
-        assert_eq!(ids(&routed.to_resolver), ["Q2"]);
-        assert_eq!(ids(&routed.to_decider), ["Q1", "Q3", "Q4"]);
-
-        let decided = |id: &str| Resolution::Decided {
-            question: QuestionId::new(id).unwrap(),
-            category: "naming".into(),
-            decision: format!("decision on {id}"),
-            basis: "the ticket".into(),
-            basis_kind: BasisKind::Settled,
-            quote: None,
-        };
-        let resolutions = [decided("Q1"), decided("Q2")];
-        let logged = decisions(
-            &policy,
-            &routed.to_resolver,
+        for (level, resolution, stands) in cases {
+            let resolutions = [resolution];
+            let settled = settle(&at(level), &given, &resolutions, &text, true);
+            assert_eq!(
+                settled.logged.len() == 1,
+                stands,
+                "{level:?} {resolutions:?}"
+            );
+            assert_eq!(settled.refused.len() == 1, !stands, "{level:?}");
+        }
+        // The same option on a question of another run is not held so.
+        let resolutions = [decided("Q1", "naming", BasisKind::Settled, Some("B"))];
+        let settled = settle(
+            &at(DelegationLevel::Discoverable),
+            &given,
             &resolutions,
-            &Quotable::default(),
+            &text,
+            false,
         );
-        let logged: Vec<&str> = logged.iter().map(|(q, _, _)| q.id.as_str()).collect();
-        assert_eq!(logged, ["Q2"]);
+        assert_eq!(logged_ids(&settled), ["Q1"]);
+        assert_eq!(settled.logged[0].option, Some("B"));
     }
 
     /// A decision is logged only when Build's category and the resolver's
@@ -486,14 +634,7 @@ mod tests {
             question("Q8", "naming"),
             question("Q9", "cleanup"),
         ];
-        let decided = |id: &str, category: &str| Resolution::Decided {
-            question: QuestionId::new(id).unwrap(),
-            category: category.into(),
-            decision: format!("decision on {id}"),
-            basis: "the ticket".into(),
-            basis_kind: BasisKind::Settled,
-            quote: None,
-        };
+        let decided = |id: &str, category: &str| decided(id, category, BasisKind::Settled, None);
         let resolutions = [
             decided("Q1", "naming"),
             decided("Q2", "naming"),
@@ -512,15 +653,15 @@ mod tests {
             decided("Q9", "billing"),
             decided("Q10", "naming"),
         ];
-        let settled = settle(&policy, &given, &resolutions, &Quotable::default());
+        let settled = settle(&policy, &given, &resolutions, &Quotable::default(), false);
         let found: Vec<(&str, &str)> = settled
             .logged
             .iter()
-            .map(|(question, decision, _)| (question.id.as_str(), *decision))
+            .map(|logged| (logged.question.id.as_str(), logged.decision))
             .collect();
         assert_eq!(found, [("Q1", "decision on Q1"), ("Q8", "decision on Q8")]);
         // The runner's own copy of the question, not the model's echo.
-        assert_eq!(settled.logged[0].0.text, "text of Q1");
+        assert_eq!(settled.logged[0].question.text, "text of Q1");
         let refused: Vec<&str> = settled.refused.iter().map(|id| id.as_str()).collect();
         assert_eq!(refused, ["Q2", "Q3", "Q5", "Q6", "Q7", "Q9"]);
         let passed: Vec<&str> = passed_on(&resolutions)
@@ -530,7 +671,7 @@ mod tests {
         assert_eq!(passed, ["Q4"]);
         // `decisions`, which the stand-in driver plays, logs the same.
         assert_eq!(
-            decisions(&policy, &given, &resolutions, &Quotable::default()),
+            decisions(&policy, &given, &resolutions, &Quotable::default(), false),
             settled.logged
         );
     }
@@ -546,6 +687,7 @@ mod tests {
                   {{"type":"comment","at":"2026-10-17T09:01:00Z","author":{{"name":"b","relation":"other"}},"body":"Add a README too."}}],
                 "resolve":[{{"id":"Q1","context":"c","text":"t","recommendation":{{"why":"r"}}}}],
                 "delegation":"ticket",
+                "asked_by":{{"role":"build","run":"r1","summary":"Asked."}},
                 "permissions":{{"level":"read_only","network":false,"browser":false}},
                 "gate":[],"always_human":[],"result_path":"result.json"}}"#
         ))
@@ -611,6 +753,7 @@ mod tests {
             basis: "the ticket".into(),
             basis_kind: kind,
             quote: quote.map(str::to_owned),
+            option: None,
         };
         let resolutions = [
             decided("Q1", BasisKind::Fact, None),
@@ -625,12 +768,12 @@ mod tests {
         ];
         let text = quotable("Add GREETING.md saying Hello.");
         let sorted = |level| {
-            let settled = settle(&at(level), &given, &resolutions, &text);
+            let settled = settle(&at(level), &given, &resolutions, &text, false);
             let ids = |list: Vec<&QuestionId>| -> Vec<String> {
                 list.iter().map(|id| id.as_str().to_owned()).collect()
             };
             (
-                ids(settled.logged.iter().map(|(q, _, _)| &q.id).collect()),
+                ids(settled.logged.iter().map(|l| &l.question.id).collect()),
                 ids(settled.refused),
             )
         };
@@ -796,5 +939,35 @@ mod tests {
                 assert_eq!(refusal_after(kept, &left).as_deref(), kept, "{left:?}");
             }
         }
+    }
+
+    /// The delivery report lists the decisions taken on judgment first,
+    /// each saying so, then the others, each group in the order kept
+    /// (OWL-343); a decision kept before its kind was is among the others.
+    #[test]
+    fn judgment_decisions_are_reported_first() {
+        let kept = |n: u32, kind: Option<BasisKind>| KeptDecision {
+            at: "2026-10-18T09:00:00Z".parse().unwrap(),
+            comment: format!("c{n}"),
+            question: question(&format!("Q{n}"), "naming"),
+            decision: format!("decision {n}"),
+            basis: format!("basis {n}"),
+            basis_kind: kind,
+            reversed: None,
+        };
+        let decisions = [
+            kept(1, Some(BasisKind::Settled)),
+            kept(2, Some(BasisKind::Judgment)),
+            kept(3, None),
+            kept(4, Some(BasisKind::Judgment)),
+        ];
+        let reported = reported_all(&decisions, &[]);
+        let order: Vec<&str> = reported.iter().map(|d| d.decision.as_str()).collect();
+        assert_eq!(
+            order,
+            ["decision 2", "decision 4", "decision 1", "decision 3"]
+        );
+        assert_eq!(reported[0].basis, "basis 2 (decided on judgment)");
+        assert_eq!(reported[2].basis, "basis 1");
     }
 }

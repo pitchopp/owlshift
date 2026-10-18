@@ -108,6 +108,7 @@ impl Bench {
             gate: Vec::new(),
             always_human: Vec::new(),
             delegation: None,
+            asked_by: None,
             gate_failure: None,
             result_refusal: None,
             decisions_refused: false,
@@ -743,7 +744,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
             }),
             ..bench.executor.clone()
         };
-        let done = r#"{"format":11,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+        let done = r#"{"format":12,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
         let write_result = format!("printf '%s' '{done}' > .owlshift/run/result.json");
         let mut brief = bench.brief.clone();
         let script = if case == "the harness" {

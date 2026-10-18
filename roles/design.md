@@ -1,7 +1,7 @@
 +++
 role = "design"
-brief_format = 17
-result_format = 11
+brief_format = 18
+result_format = 12
 +++
 
 # Design
@@ -58,23 +58,23 @@ When the brief has `findings`, reviewers raised them on that plan. A finding's t
 
 ## The approval round
 
-When the brief has `approval`, the plan was put to the decider and the `thread` holds their reply. Give `approval`: `approved` when they approve the plan as it is, with no `plan`; `changed`, with the revised `plan` beside it, when their reply changes it, such as a fork chosen otherwise or a step added. A reply that leaves you unsure which, ask.
+When the brief has `approval`, the plan was put to its approval and the `thread` holds the reply: the decider's comment, or a `decision` entry when the runner's resolver decided it, which you follow as you follow the decider. Give `approval`: `approved` when the reply approves the plan as it is, with no `plan`; `changed`, with the revised `plan` beside it, when it changes it, such as a fork chosen otherwise or a step added. A reply that leaves you unsure which, ask.
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 11, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 12, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the findings are to `answer`.
 - `questions`: at least one question; you run again once they are answered or decided.
 - `blocked`: something outside your reach stops you (a permission, a file you cannot read). Say what in `summary`.
-- `premise_false`: the ticket rests on something the repository contradicts (a file, a symbol, a behaviour that is not there). Give the evidence in `summary`, and ask at least one question that holds the evidence in its `context` and offers two `options`: a re-scope you propose, written out, or closing the ticket, with your `recommendation`. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, plan the ticket as re-scoped.
+- `premise_false`: the ticket rests on something the repository contradicts (a file, a symbol, a behaviour that is not there). Give the evidence in `summary`, and ask at least one question that holds the evidence in its `context` and offers as its `options` the re-scope you propose, written out, with your `recommendation`; do not offer closing the ticket: the runner adds that option itself, last. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, a decider comment or a `decision` entry alike, plan the ticket as re-scoped.
 - `failed`: you could not write the plan for a reason of your own run. Say why in `summary`.
 
 Always give `summary`, one or two sentences. Leave out `pr`, `artifacts`, `followups`, `findings` and `rulings`: they belong to other roles. An example:
 
 ```json
 {
-  "format": 11,
+  "format": 12,
   "status": "done",
   "summary": "Planned the logs command on the event store's reader, in two steps.",
   "plan": {

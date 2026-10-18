@@ -24,9 +24,12 @@
 //!   run or left to the author's answers (`pipeline.findings`), and the pass
 //!   is settled by the core ([`settle_pass`]). A pass that asks a revision
 //!   loops back to Design; one that ends posts the PLAN comment, then goes to
-//!   Build when the plan gate is open, or asks the decider: the approval
-//!   ([`approval_question`]) or the findings left ([`residue_questions`]),
-//!   without the resolver.
+//!   Build when the plan gate is open, or puts the approval
+//!   ([`approval_question`]) or the findings left ([`residue_questions`]) to
+//!   the resolver first (OWL-342), the approval the decider's alone under
+//!   `always`: an approval it decides, option A, takes the ticket to Build;
+//!   any other round it decides whole goes back to Design with the
+//!   decisions; what it leaves goes to the decider.
 //!
 //! A refused design, review or arbiter result is a failed run, as intake's
 //! is: their briefs carry no refused result to fix. A failed review seat or
@@ -60,7 +63,8 @@ use crate::ticket_ref::text_sha256;
 use crate::writer::{PlanComment, PlanNext, PlanReviewer};
 
 /// The category of the plan-approval question (architecture section 5,
-/// "Plan approval"), which goes to the decider without the resolver.
+/// "Plan approval"): through the resolver under `on-fork`, the decider's
+/// alone under `always` (OWL-342).
 pub(crate) const APPROVAL_CATEGORY: &str = "plan_approval";
 
 /// The category of a residue question: a finding two review passes left.
@@ -115,6 +119,9 @@ pub(super) struct PassRun {
     pub not_asked: Vec<FindingId>,
     /// The pass's last run, its arbiter's when one ran.
     pub last_run: Option<String>,
+    /// What the pass's runs reported they cost, summed, for the chain its
+    /// round counts (OWL-342): `None` when one did not report it.
+    pub cost: Option<f64>,
     /// The ticket's review record with the pass, checked.
     pub review: TicketReview,
 }
@@ -141,15 +148,6 @@ pub(crate) fn plan_sha256(plan: &Plan) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// Whether the kept plan is the one its decider approved.
-pub(super) fn plan_approved(p: &Prepared) -> bool {
-    p.plan.as_ref().is_some_and(|kept| {
-        kept.approval
-            .as_ref()
-            .is_some_and(|approval| approval.plan_sha256 == plan_sha256(&kept.plan))
-    })
 }
 
 /// The findings of `findings` that stand: confirmed by the arbiter's ruling,
@@ -866,8 +864,8 @@ impl OnDemand<'_> {
             )?;
             let result = ran.result();
             // A false premise that asks nothing parks the ticket
-            // (architecture section 5, "A false premise"); with questions it
-            // is a round, all to the decider.
+            // (architecture section 5, "A false premise"); its questions go
+            // through the resolver as any (OWL-342).
             if event == Event::Questions
                 && let Some(result) = result
                 && !result.asks()
@@ -885,18 +883,12 @@ impl OnDemand<'_> {
             if event == Event::Questions
                 && let Some(result) = result
             {
-                match self.resolve(
-                    p,
-                    &state,
-                    result,
-                    &[],
-                    &[],
-                    &dispatched.rules,
-                    &current,
-                    &ran,
-                    sink,
-                )? {
-                    Routing::Settled => continue,
+                let asking = Asked {
+                    plan: kept_plan(p),
+                    ..Asked::run(Role::Design, &ran, result, &[])
+                };
+                match self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)? {
+                    Routing::Settled(_) => continue,
                     Routing::Ask(round) => {
                         let asked = match state.apply(p.pipeline, Event::Questions) {
                             Ok(Transition::To(asked)) => asked,
@@ -973,20 +965,36 @@ impl OnDemand<'_> {
                 .clone()
                 .ok_or_else(|| Stop::Refused("an approval of no plan".to_owned()))?;
             let questions = p.questions();
-            let ask = questions.latest().ok_or_else(|| {
-                Stop::Refused("an approval round the ref keeps no ask of".to_owned())
-            })?;
-            let approver = person(&ask.decider, &p.found);
-            let comment =
-                answer_check::newest_decider_comment(comments, &approver).ok_or_else(|| {
-                    Stop::Refused(format!(
-                        "the plan of {ticket} is approved, but no comment of its decider holds the \
-                         approval"
-                    ))
-                })?;
+            // Whose word the run answered (OWL-342): the resolver's, when
+            // its decision on the approval is newer than any ask, kept with
+            // its DECISION comment; else the decider's newest comment.
+            let decided = questions
+                .decisions
+                .iter()
+                .rev()
+                .find(|kept| kept.question.category == APPROVAL_CATEGORY)
+                .filter(|kept| questions.latest().is_none_or(|ask| kept.at > ask.at));
+            let comment = match decided {
+                Some(decision) => decision.comment.clone(),
+                None => {
+                    let ask = questions.latest().ok_or_else(|| {
+                        Stop::Refused("an approval round the ref keeps no ask of".to_owned())
+                    })?;
+                    let approver = person(&ask.decider, &p.found);
+                    answer_check::newest_decider_comment(comments, &approver)
+                        .ok_or_else(|| {
+                            Stop::Refused(format!(
+                                "the plan of {ticket} is approved, but no comment of its decider \
+                                 holds the approval"
+                            ))
+                        })?
+                        .id
+                        .clone()
+                }
+            };
             let sha = plan_sha256(&kept.plan);
             kept.approval = Some(KeptApproval {
-                comment: comment.id.clone(),
+                comment: comment.clone(),
                 plan_sha256: sha.clone(),
             });
             let gate = self.plan_gate(p, &kept);
@@ -1004,7 +1012,15 @@ impl OnDemand<'_> {
                 EventKind::Decision,
                 data([
                     ("plan", json!("approved")),
-                    ("comment", json!(comment.id)),
+                    (
+                        "by",
+                        json!(if decided.is_some() {
+                            "resolver"
+                        } else {
+                            "decider"
+                        }),
+                    ),
+                    ("comment", json!(comment)),
                     ("plan_sha256", json!(sha)),
                 ]),
             );
@@ -1097,6 +1113,7 @@ impl OnDemand<'_> {
         let mut outputs: Vec<SeatOutput> = Vec::new();
         let mut routings = Vec::new();
         let mut last_run = None;
+        let mut cost = Some(0.0_f64);
         for seat in seats {
             let routed = seat_routing(seat, dispatched.routing, |tier| claude_model(models, tier));
             let (router, model) = match (seat.harness, codex) {
@@ -1116,6 +1133,7 @@ impl OnDemand<'_> {
             });
             let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
             last_run = Some(ran.run.clone());
+            cost = cost.zip(run_cost(&ran)).map(|(sum, run)| sum + run);
             routings.push(routed);
             outputs.push(SeatOutput {
                 reviewer: Reviewer {
@@ -1153,6 +1171,7 @@ impl OnDemand<'_> {
                 role_routing(Role::Arbiter, dispatched.routing).expect("the arbiter has its layer");
             let harness = self.arbiter.harness(routing);
             let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
+            cost = cost.zip(run_cost(&ran)).map(|(sum, run)| sum + run);
             findings = pass_findings(&outputs, Some(&result.rulings));
             let ruled = |outcome: RulingOutcome| {
                 finding_ids(findings.iter().filter(|kept| {
@@ -1293,6 +1312,7 @@ impl OnDemand<'_> {
             questions,
             not_asked,
             last_run,
+            cost,
             review,
         })
     }
@@ -1333,6 +1353,7 @@ impl OnDemand<'_> {
             questions,
             not_asked,
             last_run,
+            cost,
             review,
         } = self.run_review_pass(
             p,
@@ -1391,8 +1412,8 @@ impl OnDemand<'_> {
             EventKind::TrackerWrite,
             comment_written("PLAN", &posted),
         );
-        p.review = Some(review);
         if event == Event::Completed {
+            p.review = Some(review);
             let next = match state.apply_gated(p.pipeline, Event::Completed, gate) {
                 Ok(Transition::To(next)) => next,
                 other => return Err(core_error(other)),
@@ -1402,46 +1423,156 @@ impl OnDemand<'_> {
                 .map_err(|e| refused("keeping the review pass in the ticket's ref", e))?;
             return Ok(next);
         }
-        let (summary, round) = if verdict.outcome == PassOutcome::Passed {
+        let approving = verdict.outcome == PassOutcome::Passed;
+        let (summary, asked, asked_findings): (
+            String,
+            Vec<Question>,
+            Vec<(QuestionId, FindingId)>,
+        ) = if approving {
             (
                 format!(
-                    "The plan passed design review pass {pass} and waits for your approval: the \
-                     PLAN comment above holds it."
+                    "The plan passed design review pass {pass} and waits for your approval: \
+                         the PLAN comment above holds it."
                 ),
-                vec![(QuestionId::nth(1), approval_question(&kept.plan))],
+                vec![approval_question(&kept.plan)],
+                Vec::new(),
             )
         } else {
+            let (asked, findings) = questions
+                .into_iter()
+                .map(|(question, finding)| {
+                    let id = question.id.clone();
+                    (question, (id, finding))
+                })
+                .unzip();
             (
                 format!(
-                    "Design review pass {pass} left findings that the plan's revisions did not \
-                     settle: each is a question below, and the PLAN comment above lists them \
-                     with the plan."
+                    "Design review pass {pass} left findings that the plan's revisions did \
+                         not settle: each is a question below, and the PLAN comment above lists \
+                         them with the plan."
                 ),
-                questions
-                    .into_iter()
-                    .map(|(question, _)| (question.id.clone(), question))
-                    .collect(),
+                asked,
+                findings,
             )
         };
-        let asked = match state.apply(p.pipeline, Event::Questions) {
-            Ok(Transition::To(asked)) => asked,
+        // The approval is the decider's alone under `always` (OWL-342).
+        let direct: Vec<QuestionId> = if approving && p.policy.approval_is_human(p.pipeline) {
+            vec![QuestionId::nth(1)]
+        } else {
+            Vec::new()
+        };
+        let run = last_run
+            .clone()
+            .ok_or_else(|| Stop::Refused("a design review pass that ran no run".to_owned()))?;
+        let current = person(p.current()?, &p.found);
+        let asking = Asked {
+            role: Role::DesignReview,
+            run: &run,
+            cost,
+            status: result::Status::Questions,
+            summary: &summary,
+            questions: &asked,
+            reopened: &[],
+            direct: &direct,
+            findings: &asked_findings,
+            kept_findings: &findings,
+            plan: Some(GivenPlan {
+                base: kept.base.clone(),
+                plan: kept.plan.clone(),
+            }),
+        };
+        // Through the resolver first (OWL-342), the ref keeping the review
+        // record without this pass until the pass's outcome is kept with
+        // the state, so a command cut short runs the pass again.
+        let routing = self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)?;
+        p.review = Some(review);
+        match routing {
+            Routing::Settled(decided) => {
+                // The plan approved, option A: kept with the DECISION comment
+                // and the plan's hash, and the gate takes it to Build.
+                let approval = decided
+                    .iter()
+                    .find(|d| approving && d.option.as_deref() == Some("A"));
+                if let Some(approval) = approval {
+                    return self.approved_by_resolver(
+                        p,
+                        state,
+                        kept,
+                        &approval.comment,
+                        &run,
+                        sink,
+                    );
+                }
+                // A plan changed, or findings settled: the next design run
+                // follows the decisions, as it follows the answers to a
+                // round.
+                let next = match state.apply(p.pipeline, Event::RoundDecided) {
+                    Ok(Transition::To(next)) => next,
+                    other => return Err(core_error(other)),
+                };
+                let questions = p.questions();
+                self.store(p, &next, questions)
+                    .map_err(|e| refused("keeping the review pass in the ticket's ref", e))?;
+                Ok(next)
+            }
+            Routing::Ask(round) => {
+                let waiting = match state.apply(p.pipeline, Event::Questions) {
+                    Ok(Transition::To(waiting)) => waiting,
+                    other => return Err(core_error(other)),
+                };
+                Err(self.ask(
+                    p,
+                    &waiting,
+                    result::Status::Questions,
+                    &summary,
+                    round,
+                    &run,
+                    sink,
+                ))
+            }
+        }
+    }
+
+    /// The plan the resolver approved (OWL-342, option A of the approval
+    /// question): kept in `plan.json` with its DECISION comment and the
+    /// plan's hash, where the decider's approval keeps their comment, then
+    /// the plan gate, which holds the hash as for any approval (OWL-32),
+    /// takes the ticket to Build. One write keeps it with the state.
+    fn approved_by_resolver(
+        &self,
+        p: &mut Prepared,
+        state: TicketState,
+        mut kept: TicketPlan,
+        comment: &str,
+        run: &str,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketState, Stop> {
+        let sha = plan_sha256(&kept.plan);
+        kept.approval = Some(KeptApproval {
+            comment: comment.to_owned(),
+            plan_sha256: sha.clone(),
+        });
+        let gate = self.plan_gate(p, &kept);
+        let next = match state.apply_gated(p.pipeline, Event::Completed, gate) {
+            Ok(Transition::To(next)) => next,
             other => return Err(core_error(other)),
         };
-        let round = Round {
-            questions: round,
-            decided: 0,
-            fallback: None,
-            reopened: Vec::new(),
-        };
-        Err(self.ask(
-            p,
-            &asked,
-            result::Status::Questions,
-            &summary,
-            round,
-            last_run.as_deref().unwrap_or_default(),
-            sink,
-        ))
+        p.plan = Some(kept);
+        let questions = p.questions();
+        self.store(p, &next, questions)
+            .map_err(|e| refused("keeping the plan's approval in the ticket's ref", e))?;
+        sink.emit(
+            &p.ticket,
+            Some(run),
+            EventKind::Decision,
+            data([
+                ("plan", json!("approved")),
+                ("by", json!("resolver")),
+                ("comment", json!(comment)),
+                ("plan_sha256", json!(sha)),
+            ]),
+        );
+        Ok(next)
     }
 }
 

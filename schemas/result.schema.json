@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 11
+      "const": 12
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -541,6 +541,11 @@
           "description": "The ticket's own text, which the decision quotes.",
           "type": "string",
           "const": "ticket"
+        },
+        {
+          "description": "The resolver's own weighing where nothing settles the question: a\ntrade-off, a priority, an intent the ticket does not state\n(OWL-342). At `all` only.",
+          "type": "string",
+          "const": "judgment"
         }
       ]
     },
@@ -1006,10 +1011,10 @@
       "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
     },
     "Resolution": {
-      "description": "The resolver's outcome on one question it was given: decided, with its\nown label for the question, the decision, what settles it and the kind\nof that basis, or passed on to the decider, with why. Every text but the\nlabel is not empty and not only whitespace; a `ticket` basis has a quote,\nand no other kind has one; the runner judges the label, the kind against\nthe project's delegation level and the quote against the ticket.",
+      "description": "The resolver's outcome on one question it was given: decided, with its\nown label for the question, the decision, what settles it and the kind\nof that basis, or passed on to the decider, with why. Every text but the\nlabel is not empty and not only whitespace; a `ticket` basis has a quote,\nand no other kind has one; an `option`, when given, names an option of its\nquestion; the runner judges the label, the kind against the project's\ndelegation level and the quote against the ticket.",
       "oneOf": [
         {
-          "description": "Settled by what the ticket, the thread, the project's rules or the\nrepository already establish; the runner logs it on the ticket as a\nreversible decision.",
+          "description": "Settled by what the ticket, the thread, the project's rules or the\nrepository already establish, or at `all` by the resolver's own\njudgment (OWL-343); the runner logs it on the ticket as a reversible\ndecision.",
           "type": "object",
           "properties": {
             "basis": {
@@ -1018,7 +1023,7 @@
               "pattern": "\\S"
             },
             "basis_kind": {
-              "description": "The kind of that basis (format 11, OWL-337): `fact`, `settled` or\n`ticket`. The runner refuses a kind the project's delegation level\ndoes not allow.",
+              "description": "The kind of that basis (format 11, OWL-337): `fact`, `settled`,\n`ticket` or, since format 12, `judgment` (OWL-343), its `basis`\nthen holding the reasons and the cost of the choice. The runner\nrefuses a kind the project's delegation level does not allow.",
               "$ref": "#/$defs/BasisKind"
             },
             "category": {
@@ -1028,6 +1033,11 @@
             "decision": {
               "type": "string",
               "pattern": "\\S"
+            },
+            "option": {
+              "description": "The letter of the question's option the decision takes, as the\nrunner letters them ([`option_letter`]), when it takes one\n(format 12, OWL-343); refused when it names none of the options\nthe brief gave the question. The runner reads it where the option\ndecides what follows: the approval of a plan, and the re-scope of\na false premise, whose closure, the runner's own last option, it\nrefuses.",
+              "type": "string",
+              "pattern": "^[A-Z]+$"
             },
             "outcome": {
               "type": "string",

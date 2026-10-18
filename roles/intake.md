@@ -1,7 +1,7 @@
 +++
 role = "intake"
-brief_format = 17
-result_format = 11
+brief_format = 18
+result_format = 12
 +++
 
 # Intake
@@ -30,24 +30,24 @@ The verdict is recorded and shown on the ticket. Design, Build and their fix run
 
 Ask the decider what would stop the work or change what it delivers and that nothing settles: the ticket's intent where it reads two ways, a missing acceptance criterion, a prerequisite named without its identifier, a premise you cannot check from here. Do not ask how to build it: that is the Build's, which reads the code. Ask everything open at once, numbered `Q1`, `Q2`, … in order. Each question has an `id`, a `category`, a `text` that fits on one line, and a `context` of at most two sentences giving what the decider needs and has not read on the ticket, never a restatement of the ticket. When there are answers to choose from, give them as `options`, each a short `label` and, only when the label needs it, a one-line `detail`; the runner letters them A, B, C… in their order. Always give a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; a question without one, or naming an option it does not offer, is refused. With `questions`, the `summary` says in one sentence what you found, not what you ask.
 
-A question in these categories always goes to the decider: `security`, `data_loss`, `money`, `legal`, `irreversible`, `scope`. Write that token as the question's `category`; `scope` is any question whose answer changes what the ticket delivers. For any other question, a short word of your own, written as a token: lowercase ASCII letters and digits, words joined by `_`. A question of another category goes first to the runner's resolver, which decides what the ticket, the rules or the repository settle: you then run again, its decisions in the `thread`, and only the rest reaches the decider.
+A question in these categories is filed under its token: `security`, `data_loss`, `money`, `legal`, `irreversible`, `scope`. Write that token as the question's `category`; `scope` is any question whose answer changes what the ticket delivers. `security` and `irreversible` always go to the decider; whether the other four do depends on the project's delegation level, which the runner applies. For any other question, a short word of your own, written as a token: lowercase ASCII letters and digits, words joined by `_`. A question the level does not keep for the decider goes first to the runner's resolver, which decides what its level lets it: you then run again, its decisions in the `thread`, and only the rest reaches the decider.
 
 Keep the questions within the runner's bounds, counted in bytes of the questions as the runner writes them in JSON: at most 64 questions, each at most 8192 bytes, all together at most 131072 bytes.
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 11, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 12, rejected if it carries any field not listed here:
 
 - `status`: `done` when nothing is left to ask; `questions` when the decider must answer first; `blocked` when the ticket cannot be read for what it asks (say why in `summary`); `failed` when you cannot finish. `premise_false` when the repository or its documents contradict what the ticket rests on (a file, a symbol, a behaviour that is not there): give the evidence in `summary`. A premise only the outside world can show (a CLI flag, an external API, a price) is never `premise_false`, since you have no network: it is a question.
 - `summary`: one or two sentences on the ticket as you read it.
 - `intake`, with `done` and with `questions`: your `variant`, `routing` and `dependencies`, as above. With `questions`, record what you can tell now: once the decider has answered, you run again with their answers in the `thread`, and that run's record replaces this one.
-- `questions`, with `questions` and with `premise_false`: at least one, as above. With `premise_false`, give no `intake`, and let the question hold the evidence in its `context` and offer two `options`: a re-scope you propose, written out, or closing the ticket, with your `recommendation`. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, read the ticket as re-scoped.
+- `questions`, with `questions` and with `premise_false`: at least one, as above. With `premise_false`, give no `intake`, and let the question hold the evidence in its `context` and offer as its `options` the re-scope you propose, written out, with your `recommendation`; do not offer closing the ticket: the runner adds that option itself, last. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, a decider comment or a `decision` entry alike, read the ticket as re-scoped.
 
 Leave out `decisions`, `resolutions`, `verdicts`, `followups`, `artifacts` and `pr`: they belong to other roles. An example:
 
 ```json
 {
-  "format": 11,
+  "format": 12,
   "status": "done",
   "summary": "A small documentation change that waits for OWL-41.",
   "intake": {

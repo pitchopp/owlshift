@@ -225,7 +225,8 @@ pub enum DelegationLevel {
     /// The same, and a `scope` question the ticket's own text answers,
     /// quoted.
     Ticket,
-    /// Everything but the floor.
+    /// Everything but the floor, on its own judgment where nothing settles
+    /// a question (OWL-342).
     All,
 }
 
@@ -252,12 +253,14 @@ impl DelegationLevel {
 
     /// Whether the resolver may rest a decision on a basis of this kind at
     /// this level: `facts` allows `fact`, `discoverable` adds `settled`,
-    /// `ticket` and `all` add `ticket`; `none` allows nothing.
+    /// `ticket` adds `ticket`, and `all` adds `judgment` (OWL-342); `none`
+    /// allows nothing.
     pub fn allows(self, kind: BasisKind) -> bool {
         match kind {
             BasisKind::Fact => self >= Self::Facts,
             BasisKind::Settled => self >= Self::Discoverable,
             BasisKind::Ticket => self >= Self::Ticket,
+            BasisKind::Judgment => self == Self::All,
         }
     }
 }
@@ -277,15 +280,23 @@ pub enum BasisKind {
     Settled,
     /// The ticket's own text, which the decision quotes.
     Ticket,
+    /// The resolver's own weighing where nothing settles the question: a
+    /// trade-off, a priority, an intent the ticket does not state
+    /// (OWL-342). At `all` only.
+    Judgment,
 }
 
 impl BasisKind {
+    /// Every kind, in the order of the lowest level that allows each.
+    pub const ALL: [Self; 4] = [Self::Fact, Self::Settled, Self::Ticket, Self::Judgment];
+
     /// The name `result.json` writes.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Fact => "fact",
             Self::Settled => "settled",
             Self::Ticket => "ticket",
+            Self::Judgment => "judgment",
         }
     }
 }
@@ -360,7 +371,7 @@ mod tests {
         }
         assert!(DelegationLevel::ALL.is_sorted());
         assert_eq!(DelegationLevel::default(), DelegationLevel::Discoverable);
-        for kind in [BasisKind::Fact, BasisKind::Settled, BasisKind::Ticket] {
+        for kind in BasisKind::ALL {
             let serialized = serde_json::to_value(kind).expect("a kind always serializes");
             assert_eq!(serialized, kind.as_str(), "{kind:?}");
         }
@@ -370,16 +381,16 @@ mod tests {
     /// passes" lists them.
     #[test]
     fn each_level_allows_its_basis_kinds() {
-        use BasisKind::{Fact, Settled, Ticket};
+        use BasisKind::{Fact, Judgment, Settled, Ticket};
         let cases: [(DelegationLevel, &[BasisKind]); 5] = [
             (DelegationLevel::None, &[]),
             (DelegationLevel::Facts, &[Fact]),
             (DelegationLevel::Discoverable, &[Fact, Settled]),
             (DelegationLevel::Ticket, &[Fact, Settled, Ticket]),
-            (DelegationLevel::All, &[Fact, Settled, Ticket]),
+            (DelegationLevel::All, &[Fact, Settled, Ticket, Judgment]),
         ];
         for (level, allowed) in cases {
-            for kind in [Fact, Settled, Ticket] {
+            for kind in BasisKind::ALL {
                 assert_eq!(
                     level.allows(kind),
                     allowed.contains(&kind),

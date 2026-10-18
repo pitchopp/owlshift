@@ -10,10 +10,10 @@ why and asks, but only the first point, naming it as the one refused choice
 it asks and dropping the second: that result is refused before anything is
 posted, and the ticket parks with a PARKED comment that says which choice was
 not asked. After the restart, the Build run is told both choices and why the
-last result was refused; it asks both, naming each, and round 1 opens
-without the resolver (OWL-222's acceptance), though it would decide where the
-README lists the example from the README: round 1's QUESTIONS comment shows
-each refused choice under the question that asks it."""
+last result was refused; it asks both, naming each. Since OWL-342 both
+reach the resolver as any question does, which decides where the README
+lists the example from the README; round 1 asks the other, and its QUESTIONS
+comment shows the refused choice under the question that asks it."""
 ticket = "DEMO-5"
 start = "2026-10-08T15:00:00Z"
 
@@ -55,19 +55,28 @@ contains = [
 continue = true
 expect = { event = "restarted", stage = "build", waiting = "none", failed_runs = 0 }
 
-# Q2, under docs, would reach the resolver by its category; it reopens a
-# refused choice, so it goes to the decider with Q1 (OWL-222).
+# Q2, under docs, reaches the resolver by its category, even though it
+# reopens a refused choice (OWL-342); Q1, under scope, goes to the decider.
 [[step]]
 run = { result = "results/questions-open-points.json" }
+[step.expect]
+event = "none"
+stage = "build"
+waiting = "none"
+comments = 1
+brief_result_refusal = "A later result was refused too: invalid result.json: the refused choices are not all named as asked"
+brief_decisions_refused = true
+brief_refused_choices = ["Every key or only the required ones", "Where the README lists the example"]
+
+[[step]]
+resolve = { result = "results/resolver-decides-placement.json" }
 [step.expect]
 event = "questions"
 stage = "build"
 waiting = "needs_input"
 round = 1
-comments = 2
-brief_result_refusal = "A later result was refused too: invalid result.json: the refused choices are not all named as asked"
-brief_decisions_refused = true
-brief_refused_choices = ["Every key or only the required ones", "Where the README lists the example"]
+comments = 3
+brief_resolve = ["Q2"]
 [step.expect.last_comment]
 author = "owlshift"
 first_line = "[owlshift] QUESTIONS · round 1"
@@ -78,9 +87,7 @@ contains = [
 **Recommendation: A.** A reader learns every key from one file.
 
 **Refused choice** (as the asking run lists it): Every key or only the required ones
-Recorded by the refused run: Every key, commented
-
-### Q2 · Where should the README list the example?""",
-  "**Refused choice** (as the asking run lists it): Where the README lists the example",
+Recorded by the refused run: Every key, commented""",
+  "Owlshift decided one other question of this run itself",
 ]
-lacks = ["Owlshift decided"]
+lacks = ["### Q2", "Where the README lists the example"]

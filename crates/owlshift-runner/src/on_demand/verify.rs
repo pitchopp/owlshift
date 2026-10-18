@@ -12,8 +12,10 @@
 //!   to Build: a Verify fix run, given the findings ([`verify_input`]), the
 //!   gate, then the next pass. At most two passes.
 //! - *The residue.* After the last pass, a `blocker` or a finding on a
-//!   success criterion is asked of the decider, without the resolver, in a
-//!   round that returns to Build; any other becomes a follow-up of the
+//!   success criterion goes to the resolver first (OWL-342), with the
+//!   arbiter's ruling and the diff; decided whole, a Verify fix run follows
+//!   the decisions, else what is left is asked of the decider in a round
+//!   that returns to Build; any other becomes a follow-up of the
 //!   delivery ([`review_followups`]), filed with the DELIVERY report as P4
 //!   files them.
 //! - *What the Build gave.* The Build's delivery data is kept in
@@ -234,13 +236,36 @@ impl OnDemand<'_> {
     /// `continue` both give, to `commit`; written at [`DIFF_PATH`] in the
     /// worktree, with no external diff, text conversion or colour.
     fn review_diff(&self, p: &Prepared, commit: &str) -> Result<GivenDiff, Stop> {
-        let git = &self.executor.git;
-        // A review loop's Build started from Owlshift's last push to the
-        // pull request: Verify reviews the loop's own change (OWL-307).
+        let base = self.diff_base(p, commit)?;
+        self.written_diff(p, base, commit)
+    }
+
+    /// The branch's diff from its base, for the resolver told of the run
+    /// that asked (OWL-342): as [`Self::review_diff`] writes it for the
+    /// branch's head, or `None`, nothing written, when the branch has no
+    /// commit of its own past its base, or no head yet.
+    pub(super) fn branch_diff(&self, p: &Prepared) -> Result<Option<GivenDiff>, Stop> {
+        let Some(head) = self.branch_head(p) else {
+            return Ok(None);
+        };
+        let base = self.diff_base(p, &head)?;
+        if base == head {
+            return Ok(None);
+        }
+        self.written_diff(p, base, &head).map(Some)
+    }
+
+    /// The commit a diff of `commit` starts from: the merge base of the
+    /// base fetched by this command and `commit`, or in a review loop
+    /// Owlshift's last push to the pull request, the loop's own change
+    /// (OWL-307).
+    fn diff_base(&self, p: &Prepared, commit: &str) -> Result<String, Stop> {
         let base = match super::loop_base(p) {
             Some(pushed) => pushed.to_string(),
             None => {
-                let base = git
+                let base = self
+                    .executor
+                    .git
                     .run(&p.checkout, &["merge-base", &p.base.commit, commit])
                     .map_err(|e| refused("reading the commit the Build started from", e))?;
                 String::from_utf8_lossy(&base).trim().to_owned()
@@ -248,6 +273,12 @@ impl OnDemand<'_> {
         };
         CommitId::new(base.as_str())
             .map_err(|e| refused("reading the commit the Build started from", e))?;
+        Ok(base)
+    }
+
+    /// The diff from `base` to `commit`, written at [`DIFF_PATH`].
+    fn written_diff(&self, p: &Prepared, base: String, commit: &str) -> Result<GivenDiff, Stop> {
+        let git = &self.executor.git;
         let diff = git
             .run(
                 &p.checkout,
@@ -315,6 +346,7 @@ impl OnDemand<'_> {
             verdict,
             questions,
             last_run,
+            cost,
             mut review,
             ..
         } = self.run_review_pass(
@@ -333,10 +365,13 @@ impl OnDemand<'_> {
                 .retain(|followup| !withdrawn.contains(followup));
             gather(&mut build.followups, &review_followups(&findings));
         }
-        p.review = Some(review);
         match verdict.outcome {
-            PassOutcome::Passed => Ok(Verified::Passed(state)),
+            PassOutcome::Passed => {
+                p.review = Some(review);
+                Ok(Verified::Passed(state))
+            }
             PassOutcome::Revise => {
+                p.review = Some(review);
                 let next = match state.apply(p.pipeline, Event::LoopBack) {
                     Ok(Transition::To(next)) => next,
                     other => return Err(core_error(other)),
@@ -347,33 +382,72 @@ impl OnDemand<'_> {
                 Ok(Verified::Revise(next))
             }
             PassOutcome::Ask => {
-                let asked = match state.apply(p.pipeline, Event::Questions) {
-                    Ok(Transition::To(asked)) => asked,
-                    other => return Err(core_error(other)),
-                };
-                let round = Round {
-                    questions: questions
+                let (asked, asked_findings): (Vec<Question>, Vec<(QuestionId, FindingId)>) =
+                    questions
                         .into_iter()
-                        .map(|(question, _)| (question.id.clone(), question))
-                        .collect(),
-                    decided: 0,
-                    fallback: None,
-                    reopened: Vec::new(),
-                };
+                        .map(|(question, finding)| {
+                            let id = question.id.clone();
+                            (question, (id, finding))
+                        })
+                        .unzip();
                 let summary = format!(
                     "Verify pass {pass} left findings on the change that its fix runs did not \
                      settle: each is a question below. A fix run follows your answers, then one \
                      more verify pass."
                 );
-                Err(self.ask(
-                    p,
-                    &asked,
-                    result::Status::Questions,
-                    &summary,
-                    round,
-                    last_run.as_deref().unwrap_or_default(),
-                    sink,
-                ))
+                let run = last_run
+                    .clone()
+                    .ok_or_else(|| Stop::Refused("a verify pass that ran no run".to_owned()))?;
+                let current = person(p.current()?, &p.found);
+                let asking = Asked {
+                    role: Role::Verify,
+                    run: &run,
+                    cost,
+                    status: result::Status::Questions,
+                    summary: &summary,
+                    questions: &asked,
+                    reopened: &[],
+                    direct: &[],
+                    findings: &asked_findings,
+                    kept_findings: &findings,
+                    plan: design::given_plan(p),
+                };
+                // Through the resolver first (OWL-342), the ref keeping the
+                // review record without this pass until its outcome is kept
+                // with the state, as at Design review.
+                let routing =
+                    self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)?;
+                p.review = Some(review);
+                match routing {
+                    // Settled whole: a Verify fix run follows the decisions,
+                    // then one more pass, as after an answered round.
+                    Routing::Settled(_) => {
+                        let next = match state.apply(p.pipeline, Event::RoundDecided) {
+                            Ok(Transition::To(next)) => next,
+                            other => return Err(core_error(other)),
+                        };
+                        let questions = p.questions();
+                        self.store(p, &next, questions).map_err(|e| {
+                            refused("keeping the verify pass in the ticket's ref", e)
+                        })?;
+                        Ok(Verified::Revise(next))
+                    }
+                    Routing::Ask(round) => {
+                        let waiting = match state.apply(p.pipeline, Event::Questions) {
+                            Ok(Transition::To(waiting)) => waiting,
+                            other => return Err(core_error(other)),
+                        };
+                        Err(self.ask(
+                            p,
+                            &waiting,
+                            result::Status::Questions,
+                            &summary,
+                            round,
+                            &run,
+                            sink,
+                        ))
+                    }
+                }
             }
         }
     }

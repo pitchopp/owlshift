@@ -79,15 +79,15 @@ use owlshift_adapters::forge::{
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    Author, Brief, Checkpoint, GateFailure, PermissionLevel, Permissions, PullRequestReview,
-    RebaseBrief, Relation, ThreadEntry, TicketBrief,
+    AskedBy, Author, Brief, Checkpoint, GateFailure, GivenPlan, PermissionLevel, Permissions,
+    PullRequestReview, RebaseBrief, Relation, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
+use owlshift_contracts::ids::{FindingId, QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
     AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision,
     KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketDelivery, TicketQuestions,
@@ -97,7 +97,7 @@ use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
     Verdict as AnswerVerdict,
 };
-use owlshift_contracts::review::{KeptBuild, TicketPlan, TicketReview};
+use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::{Chain, GatePolicy};
@@ -806,12 +806,73 @@ struct Gathered {
     followups: Vec<Followup>,
 }
 
-/// Where a Build run's questions go once routed ([`OnDemand::resolve`]).
+/// Where a run's questions go once routed ([`OnDemand::resolve`]).
 enum Routing {
-    /// The resolver decided every one: Build runs again, without a stop.
-    Settled,
+    /// The resolver decided every one, each kept as listed: the asking
+    /// stage runs again, without a stop.
+    Settled(Vec<DecidedOn>),
     /// A round for the decider.
     Ask(Round),
+}
+
+/// A question the resolver decided and the runner kept: its DECISION
+/// comment, and the option it took, when it names one (OWL-343).
+struct DecidedOn {
+    question: QuestionId,
+    comment: String,
+    option: Option<String>,
+}
+
+/// The run whose questions go through the resolver (OWL-342), as
+/// [`OnDemand::resolve`] routes them and tells the resolver of it
+/// ([`owlshift_contracts::brief::AskedBy`]): a role's run, or, for the
+/// residue and approval rounds a review pass asks, the pass's last run.
+struct Asked<'a> {
+    role: Role,
+    run: &'a str,
+    /// What the asking runs reported they cost, which the command's chain
+    /// counts first (OWL-328): `None` when one did not report it.
+    cost: Option<f64>,
+    status: result::Status,
+    summary: &'a str,
+    questions: &'a [Question],
+    /// The refused choices its questions reopen (OWL-203), which the round
+    /// names.
+    reopened: &'a [ReopenedChoice],
+    /// Questions the decider answers without a resolver run: the plan's
+    /// approval under `plan_approval = "always"`.
+    direct: &'a [QuestionId],
+    /// The finding each residue question asks about, by the questions' ids.
+    findings: &'a [(QuestionId, FindingId)],
+    /// The asking review pass's findings, with their rulings.
+    kept_findings: &'a [KeptFinding],
+    /// The ticket's plan, when Design or Design review asks.
+    plan: Option<GivenPlan>,
+}
+
+impl<'a> Asked<'a> {
+    /// A role's run `ran` that ended with `result`'s questions, reopening
+    /// `reopened`.
+    fn run(
+        role: Role,
+        ran: &'a Ran,
+        result: &'a RunResult,
+        reopened: &'a [ReopenedChoice],
+    ) -> Self {
+        Self {
+            role,
+            run: &ran.run,
+            cost: run_cost(ran),
+            status: result.status,
+            summary: &result.summary,
+            questions: &result.questions,
+            reopened,
+            direct: &[],
+            findings: &[],
+            kept_findings: &[],
+            plan: None,
+        }
+    }
 }
 
 /// The round the decider gets of a Build run's questions.
@@ -1923,8 +1984,8 @@ impl OnDemand<'_> {
                 .then(|| ran.result())
                 .flatten();
             // Which refused choices its questions reopen, from the brief the
-            // run was told (OWL-203): those questions go to the decider,
-            // never to the resolver (OWL-222).
+            // run was told (OWL-203), which a round names; since OWL-342
+            // they reach the resolver as any question does.
             let asked = result
                 .map(|result| asked_choices(&brief, result))
                 .unwrap_or_default();
@@ -1938,42 +1999,18 @@ impl OnDemand<'_> {
             // Questions go through the resolver before any reaches the
             // decider: the core's `Questions` comes after it, for what is
             // left, and a run whose questions were all decided runs again.
+            // Since OWL-342 so do those of a run given late comments and a
+            // `replan` on an approved plan.
             let mut round = None;
             if event == Event::Questions
                 && let Some(result) = result
-                && integrating.is_some()
             {
-                // A run given late comments asks because it cannot follow
-                // them without the decider: the resolver never settles that
-                // in their place.
-                round = Some(Round::of(&result.questions, &[], &asked, None));
-            } else if event == Event::Questions
-                && let Some(result) = result
-            {
-                // On an approved plan a `replan` goes to the decider, never
-                // to the resolver (architecture section 5, "Plan approval").
-                let forced = if replan && design::plan_approved(p) {
-                    result
-                        .questions
-                        .iter()
-                        .filter(|q| q.replan)
-                        .map(|q| q.id.clone())
-                        .collect()
-                } else {
-                    Vec::new()
+                let asking = Asked {
+                    plan: design::given_plan(p),
+                    ..Asked::run(Role::Build, &ran, result, &asked)
                 };
-                match self.resolve(
-                    p,
-                    &state,
-                    result,
-                    &asked,
-                    &forced,
-                    &dispatched.rules,
-                    &current,
-                    &ran,
-                    sink,
-                )? {
-                    Routing::Settled => {
+                match self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)? {
+                    Routing::Settled(_) => {
                         if replan {
                             return self.replanned(p, state, &ran.run, sink);
                         }
@@ -2323,58 +2360,59 @@ impl OnDemand<'_> {
         stop(Ok(round))
     }
 
-    /// Routes the questions of a Build run before any reaches the decider
-    /// ([`crate::resolver`]), the ticket still at Build. Always-human
-    /// questions, those that reopen a refused choice (`asked`, OWL-222), and
-    /// every question of a false premise (scenario S8), go to the decider;
-    /// at the `none` delegation level, every question does (OWL-328). The
-    /// rest go to a resolver run, unless the command's chain of runs ended
-    /// ([`GatePolicy::chain_end`]): the project's pass limit reached, or,
-    /// with a ceiling, the cost of the asking runs and their resolver runs
-    /// reaching it or not reported. `asking` is the run that raised the
-    /// questions, whose cost the chain counts first. A decision the
-    /// resolver's own label, its basis kind or its quote does not let stand
-    /// is refused ([`resolver::settle`]) and its question goes to the
-    /// decider. Each other decision is posted as a DECISION comment, naming
-    /// the level, then kept in the ticket ref, one at a time: a decision
-    /// whose post failed goes to the decider, and a post whose keeping
-    /// failed stops the command, naming the comment.
-    /// Returns [`Routing::Settled`] when nothing is left for the decider,
-    /// the chain then counting one more settled pass, else the round to
-    /// ask; a resolver that broke isolation parks the ticket.
-    #[allow(clippy::too_many_arguments)]
+    /// Routes the questions a run asked before any reaches the decider
+    /// ([`crate::resolver`]), the ticket still at the stage that asked.
+    /// Since OWL-342 every question every role raises goes through the
+    /// resolver but two: one the asking run filed under an always-human
+    /// category of the project's level, and those of `asked.direct`, the
+    /// plan's approval under `plan_approval = "always"`; at the `none`
+    /// delegation level, every question goes to the decider (OWL-328). A
+    /// false premise's questions are asked with the runner's own closure as
+    /// their last option ([`resolver::with_closure`]), which no decision
+    /// takes. The rest go to a resolver run, unless the command's chain of
+    /// runs ended ([`GatePolicy::chain_end`]): the project's pass limit
+    /// reached, or, with a ceiling, the cost of the asking runs and their
+    /// resolver runs reaching it or not reported. The resolver is told of
+    /// the asking run (`asked_by`): its role, run and summary, the plan and
+    /// the findings it was about, and the branch's diff from its base,
+    /// written beside the brief when the branch has commits of its own. A
+    /// decision the resolver's own label, its basis kind, its quote or, on a
+    /// false premise, its option does not let stand is refused
+    /// ([`resolver::settle`]) and its question goes to the decider. Each
+    /// other decision is posted as a DECISION comment, naming the level, then
+    /// kept in the ticket ref with its kind, one at a time: a decision whose
+    /// post failed goes to the decider, and a post whose keeping failed
+    /// stops the command, naming the comment.
+    /// Returns [`Routing::Settled`] with the kept decisions when nothing is
+    /// left for the decider, the chain then counting one more settled pass,
+    /// else the round to ask; a resolver that broke isolation parks the
+    /// ticket.
     fn resolve(
         &self,
         p: &mut Prepared,
         state: &TicketState,
-        result: &RunResult,
-        asked: &[ReopenedChoice],
-        forced: &[QuestionId],
+        asked: &Asked<'_>,
         rules: &ProjectRules,
         current: &Person,
-        asking: &Ran,
         sink: &mut EventSink<'_>,
     ) -> Result<Routing, Stop> {
-        let raised_by = asking.run.as_str();
+        let raised_by = asked.run;
         let level = p.policy.level();
         let ticket = p.ticket.clone();
-        let mut routed = resolver::route(&p.policy, &result.questions, asked);
-        // `forced` go to the decider whatever their category, as a `replan`
-        // on an approved plan does (OWL-303).
-        let (to_decider, to_resolver): (Vec<Question>, Vec<Question>) = routed
-            .to_resolver
-            .into_iter()
-            .partition(|question| forced.contains(&question.id));
-        routed.to_resolver = to_resolver;
-        routed.to_decider.extend(to_decider);
-        let all = |fallback| Routing::Ask(Round::of(&result.questions, &[], asked, fallback));
-        if result.status == result::Status::PremiseFalse || routed.to_resolver.is_empty() {
+        let premise_false = asked.status == result::Status::PremiseFalse;
+        let raised: Vec<Question> = if premise_false {
+            resolver::with_closure(asked.questions)
+        } else {
+            asked.questions.to_vec()
+        };
+        let routed = resolver::route(&p.policy, &raised, asked.direct);
+        let all = |fallback| Routing::Ask(Round::of(&raised, &[], asked.reopened, fallback));
+        if routed.to_resolver.is_empty() {
             return Ok(all(None));
         }
         let resolved_event = |outcome: &str, run: Option<&str>, decided: &[QuestionId]| {
             let given: Vec<QuestionId> = routed.to_resolver.iter().map(|q| q.id.clone()).collect();
-            let to_decider: Vec<QuestionId> = result
-                .questions
+            let to_decider: Vec<QuestionId> = raised
                 .iter()
                 .map(|q| q.id.clone())
                 .filter(|id| !decided.contains(id))
@@ -2382,6 +2420,7 @@ impl OnDemand<'_> {
             data([
                 ("resolver", json!(outcome)),
                 ("level", json!(level.as_str())),
+                ("asked_by", json!(asked.role.as_str())),
                 ("raised_by", json!(raised_by)),
                 ("run", json!(run)),
                 ("given", question_ids(&given)),
@@ -2391,7 +2430,7 @@ impl OnDemand<'_> {
         };
         // The asking run is the chain's, then the bound is checked before
         // the resolver runs (OWL-328).
-        p.chain.ran(run_cost(asking));
+        p.chain.ran(asked.cost);
         if let Some(end) = p.policy.chain_end(p.chain) {
             let fallback = Fallback::from(end);
             let mut event = resolved_event(fallback.as_str(), None, &[]);
@@ -2402,10 +2441,20 @@ impl OnDemand<'_> {
             return Ok(all(Some(fallback)));
         }
 
+        let diff = self.branch_diff(p)?;
         let comments = self.comments(&ticket)?;
         let mut brief = self.brief(p, Role::Resolver, &comments, rules, None, current);
-        brief.resolve = resolver::unlabelled(&routed.to_resolver);
+        brief.resolve = resolver::unlabelled(&routed.to_resolver, asked.findings);
         brief.delegation = Some(level);
+        brief.asked_by = Some(AskedBy {
+            role: asked.role,
+            run: asked.run.to_owned(),
+            premise_false,
+            summary: asked.summary.to_owned(),
+            plan: asked.plan.clone(),
+            findings: asked.kept_findings.to_vec(),
+            diff,
+        });
         // Why an earlier resolver result was refused, from the ticket ref,
         // whatever command ran it: its round may not have reached the
         // decider (OWL-191).
@@ -2447,19 +2496,28 @@ impl OnDemand<'_> {
             };
         };
 
-        let mut decided: Vec<QuestionId> = Vec::new();
+        let mut decided: Vec<DecidedOn> = Vec::new();
         let mut unposted: Vec<QuestionId> = Vec::new();
         // A decision whose two labels do not both route to the resolver
         // (OWL-144), whose basis kind the level does not allow or whose
-        // quote is not in the ticket (OWL-328) is refused here, whatever the
+        // quote is not in the ticket (OWL-328), or which takes a false
+        // premise's closure (OWL-343) is refused here, whatever the
         // resolver decided.
-        let sorted = resolver::settle(&p.policy, &routed.to_resolver, resolutions, &quotable);
-        for (question, decision, basis) in sorted.logged {
+        let sorted = resolver::settle(
+            &p.policy,
+            &routed.to_resolver,
+            resolutions,
+            &quotable,
+            premise_false,
+        );
+        for logged in sorted.logged {
+            let question = logged.question;
             let comment = DecisionComment {
                 ticket: ticket.clone(),
                 question: question.clone(),
-                decision: decision.to_owned(),
-                basis: basis.to_owned(),
+                decision: logged.decision.to_owned(),
+                basis: logged.basis.to_owned(),
+                kind: logged.kind,
                 level,
                 run: Some(ran.run.clone()),
             };
@@ -2482,6 +2540,7 @@ impl OnDemand<'_> {
                 question: question.clone(),
                 decision: comment.decision,
                 basis: comment.basis,
+                basis_kind: Some(logged.kind),
                 reversed: None,
             });
             self.store(p, state, kept).map_err(|e| {
@@ -2491,9 +2550,14 @@ impl OnDemand<'_> {
                     question.id, posted.id
                 ))
             })?;
-            decided.push(question.id.clone());
+            decided.push(DecidedOn {
+                question: question.id.clone(),
+                comment: posted.id.clone(),
+                option: logged.option.map(str::to_owned),
+            });
         }
-        let mut event = resolved_event("done", Some(&ran.run), &decided);
+        let decided_ids: Vec<QuestionId> = decided.iter().map(|d| d.question.clone()).collect();
+        let mut event = resolved_event("done", Some(&ran.run), &decided_ids);
         event.insert(
             "passed_on".to_owned(),
             json!(
@@ -2515,10 +2579,10 @@ impl OnDemand<'_> {
         );
         event.insert("unposted".to_owned(), question_ids(&unposted));
         sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
-        let left = Round::of(&result.questions, &decided, asked, None);
+        let left = Round::of(&raised, &decided_ids, asked.reopened, None);
         if left.questions.is_empty() {
             p.chain.settled_once();
-            return Ok(Routing::Settled);
+            return Ok(Routing::Settled(decided));
         }
         Ok(Routing::Ask(left))
     }
@@ -3546,6 +3610,7 @@ impl OnDemand<'_> {
             },
             // The resolver's, set by `resolve` (OWL-337).
             delegation: None,
+            asked_by: None,
             gate_failure,
             result_refusal: None,
             decisions_refused: false,
@@ -4322,8 +4387,9 @@ impl OnDemand<'_> {
     /// number, briefed with the gate failure of the attempt before it. A
     /// failed run, a refused result, a usage limit, a breach or a bound go
     /// as for a Build run, a `done` whose commit `run.accept` refuses is a
-    /// failed run; questions go to the decider as a round that returns to
-    /// Watch, without the resolver (OWL-211).
+    /// failed run; questions go through the resolver (OWL-342), the run
+    /// again when it decides them all, an attempt not counted, else to the
+    /// decider as a round that returns to Watch (OWL-211).
     fn repair_runs(
         &self,
         p: &mut Prepared,
@@ -4387,9 +4453,6 @@ impl OnDemand<'_> {
                 detail = Some(why);
             }
             if event == Event::Questions {
-                // Back to the decider (OWL-211): a round that returns to
-                // Watch, without the resolver, since these are acts and
-                // arbitrations the agent cannot settle.
                 let Some(result) = ran.result() else {
                     return Err(Stop::Refused(
                         "a question round without its questions".to_owned(),
@@ -4404,24 +4467,30 @@ impl OnDemand<'_> {
                         self.park_false_premise(p, PIPELINE, &state, &what, &ran.run, result, sink)
                     );
                 }
+                // Through the resolver first (OWL-342), which passes on a
+                // prerequisite only a person can supply and may arbitrate a
+                // finding; what is left is a round that returns to Watch
+                // (OWL-211).
+                let asked = asked_choices(&brief, result);
+                let asking = Asked::run(run.role, &ran, result, &asked);
+                let round = match self.resolve(p, &state, &asking, run.rules, &current, sink)? {
+                    // Decided whole: the run again, with the decisions, an
+                    // attempt it does not count.
+                    Routing::Settled(_) => {
+                        attempt -= 1;
+                        continue;
+                    }
+                    Routing::Ask(round) => round,
+                };
                 let waiting = match state.apply(PIPELINE, Event::Questions) {
                     Ok(Transition::To(waiting)) => waiting,
                     other => return Err(core_error(other)),
                 };
-                let asked = asked_choices(&brief, result);
                 let summary = format!(
                     "The {} run of pull request #{} asks before it can go on. {}",
                     run.what, run.pull_request, result.summary
                 );
-                return Err(self.ask(
-                    p,
-                    &waiting,
-                    result.status,
-                    &summary,
-                    Round::of(&result.questions, &[], &asked, None),
-                    &ran.run,
-                    sink,
-                ));
+                return Err(self.ask(p, &waiting, result.status, &summary, round, &ran.run, sink));
             }
             match state.apply(PIPELINE, event) {
                 Ok(Transition::To(next)) => {
@@ -5111,16 +5180,11 @@ impl OnDemand<'_> {
                 (Some(pass), None, None, Some("fix_pass"))
             }
         };
-        // The resolver's decisions kept on the ticket, then the runner's own
-        // notes the first delivery kept (OWL-176, OWL-236).
-        let mut decisions: Vec<Decision> = questions
-            .decisions
-            .iter()
-            .map(|kept| {
-                let corrected = correction.as_ref().map_or(&[][..], |c| &c.questions[..]);
-                resolver::reported_reversing(kept, corrected)
-            })
-            .collect();
+        // The resolver's decisions kept on the ticket, those on judgment
+        // first (OWL-343), then the runner's own notes the first delivery
+        // kept (OWL-176, OWL-236).
+        let corrected = correction.as_ref().map_or(&[][..], |c| &c.questions[..]);
+        let mut decisions: Vec<Decision> = resolver::reported_all(&questions.decisions, corrected);
         if let Some(kept) = &owed.report {
             gather(&mut decisions, &kept.notes);
         }
@@ -6290,6 +6354,7 @@ mod tests {
             },
             decision: decided.into(),
             basis: "the ticket".into(),
+            basis_kind: None,
             reversed: None,
         };
         let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
@@ -6633,12 +6698,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":11,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":12,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t","recommendation":{{"why":"r"}}}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":11,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":12,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -6722,7 +6787,7 @@ mod tests {
         // A `premise_false` with no question asks nothing either (OWL-193).
         let unasked_premise = Outcome::Finished {
             result: Box::new(
-                RunResult::parse(r#"{"format":11,"status":"premise_false","summary":"s"}"#)
+                RunResult::parse(r#"{"format":12,"status":"premise_false","summary":"s"}"#)
                     .unwrap(),
             ),
             artifacts: crate::artifact::ArtifactContents::default(),
@@ -6822,7 +6887,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":11,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":12,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -6859,7 +6924,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":11,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":12,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());
@@ -6925,7 +6990,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 12,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 13,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),
@@ -6946,7 +7011,7 @@ mod tests {
         };
         let asking = |named: &str| {
             format!(
-                r#"{{"format":11,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":12,"status":"questions","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"Which file, and every key?",
                 "recommendation":{{"why":"r"}}}}]{named}}}"#
             )
@@ -6963,7 +7028,7 @@ mod tests {
             (true, 0, Some(held))
         );
         // Its `done` is refused, and the hold kept with the latest reason.
-        let done = validated(r#"{"format":11,"status":"done","summary":"s"}"#, &text_only);
+        let done = validated(r#"{"format":12,"status":"done","summary":"s"}"#, &text_only);
         let refused = done.unwrap_err();
         assert!(
             matches!(
@@ -6984,7 +7049,7 @@ mod tests {
 
         // Mixed with typed choices, a later refusal's: only those have a
         // place, and an ask naming them all clears the text lists too.
-        let listing = r#"{"format":11,"status":"done","summary":"s","decisions":[
+        let listing = r#"{"format":12,"status":"done","summary":"s","decisions":[
             {"question":"Where the README lists it","decision":"d","basis":"b"},
             {"question":"Which default","decision":"d","basis":"b"}]}"#;
         let refused = validated(listing, &text_only).unwrap_err();

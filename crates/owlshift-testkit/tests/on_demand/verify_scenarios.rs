@@ -25,7 +25,7 @@ fn found(findings: &[(&str, &str)]) -> String {
             })
         })
         .collect();
-    json!({ "format": 11, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 12, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -42,11 +42,11 @@ fn ruled(outcomes: &[&str]) -> String {
             })
         })
         .collect();
-    json!({ "format": 11, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+    json!({ "format": 12, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
 }
 
 const FAILED_REVIEW: &str =
-    r#"{"format":11,"status":"failed","summary":"Could not read the diff."}"#;
+    r#"{"format":12,"status":"failed","summary":"Could not read the diff."}"#;
 
 impl Bench {
     /// A bench whose verify seats play from its reply queue, with Codex
@@ -375,8 +375,9 @@ fn the_author_answers_every_verify_finding_and_its_rejection_is_kept() {
     );
 }
 
-/// The residue: after the last pass, a `blocker` goes to the decider in a
-/// round without the resolver, and a `major` off every criterion becomes a
+/// The residue: after the last pass, a `blocker` goes to the resolver first
+/// (OWL-342), told the finding, its ruling and the diff, then, passed on, to
+/// the decider in a round, and a `major` off every criterion becomes a
 /// follow-up of the delivery. After the answer, a Verify fix run with it in
 /// its thread and one more pass, a last one, clean; the follow-up is filed
 /// with the reviewer as its source and listed in the report.
@@ -394,6 +395,7 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
             ("major", "GREETING.md could open with a heading."),
         ])),
         bench.reviewing(&ruled(&["confirmed", "confirmed"])),
+        bench.reviewing(&passed_on(&["Q1"])),
     ];
     let (outcome, printed) = bench.run(replies, None);
     let stop = outcome.expect_err("the blocker goes to the decider");
@@ -419,7 +421,12 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
             .context
             .contains("Finding F1 of verify pass 2, a blocker")
     );
-    assert!(!bench.run_roles().contains(&Role::Resolver));
+    let resolver = bench.last_of(Role::Resolver);
+    let asked = resolver.asked_by.as_ref().unwrap();
+    assert_eq!(asked.role, Role::Verify);
+    let diff = asked.diff.as_ref().expect("the branch's diff");
+    assert_eq!(diff.path.as_str(), ".owlshift/run/diff.patch");
+    assert_eq!(resolver.resolve[0].finding.as_ref().unwrap().as_str(), "F1");
     let residue = &bench.reviews("residue")[0];
     assert_eq!(
         (&residue["asked"], &residue["proposed"]),

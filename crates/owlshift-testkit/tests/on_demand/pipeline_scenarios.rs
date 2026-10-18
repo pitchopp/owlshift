@@ -50,7 +50,7 @@ fn findings(found: &[(&str, &str, Option<&str>)]) -> String {
             finding
         })
         .collect();
-    json!({ "format": 11, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 12, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -112,22 +112,24 @@ impl Bench {
 }
 
 /// Scenario S8, "A false premise", at intake, under `watch --drain`: intake
-/// finds the ticket's premise false and asks the decider to re-scope or
-/// close; the ticket waits at needs input with nothing built. Watch
-/// continues the decider's re-scope: intake runs again with it in its
-/// thread, and the drain dispatches the ticket in that same pass, since the
-/// continuation ran before the drain read the column.
+/// finds the ticket's premise false and asks to re-scope, the runner adding
+/// the closure; the resolver, at the default level, passes it on (OWL-342);
+/// the ticket waits at needs input with nothing built. Watch continues the
+/// decider's re-scope: intake runs again with it in its thread, and the
+/// drain dispatches the ticket in that same pass, since the continuation
+/// ran before the drain read the column.
 #[test]
 fn scenario_s8_a_false_premise_at_intake_is_rescoped() {
     let bench = Bench::draining("maintainer");
-    let premise = r#"{"format":11,"status":"premise_false",
+    let premise = r#"{"format":12,"status":"premise_false",
 "summary":"The ticket extends a greeting file that does not exist.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; there is none.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
-"options":[{"label":"Re-scope: create GREETING.md."},{"label":"Close the ticket."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
+"options":[{"label":"Re-scope: create GREETING.md."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
     let rescope = "Re-scope: create GREETING.md.";
     let replies = vec![
         bench.reply(None, Some(premise)),
+        bench.reply(None, Some(&passed_on(&["Q1"]))),
         bench.reply(None, Some(&check(&[("Q1", "answered", rescope)]))),
         bench.reply(None, Some(&verdict("trivial"))),
         bench.greets("Hello"),
@@ -165,7 +167,7 @@ fn scenario_s8_a_false_premise_at_intake_is_rescoped() {
     assert_eq!(
         runs_by_pass(&bench.events(), &ends.borrow()),
         [
-            vec!["intake"],
+            vec!["intake", "resolver"],
             vec!["answer_check", "intake", "build", "verify"],
         ]
     );
@@ -184,24 +186,25 @@ fn scenario_s8_a_false_premise_at_intake_is_rescoped() {
 }
 
 /// Scenario S8 at Design: the design run of a drained `standard` ticket
-/// finds its premise false and asks; the decider answers with the closure,
-/// the design run that reads it ends `blocked`, and the ticket parks at
-/// Design. Nothing is planned or built, and a parked ticket is not
-/// dispatched again.
+/// finds its premise false and asks, the resolver passing it on (OWL-342);
+/// the decider answers with the closure, the runner's own last option, the
+/// design run that reads it ends `blocked`, and the ticket parks at Design.
+/// Nothing is planned or built, and a parked ticket is not dispatched again.
 #[test]
 fn scenario_s8_a_false_premise_at_design_is_closed() {
     let bench = Bench::draining("maintainer");
-    let premise = r#"{"format":11,"status":"premise_false",
+    let premise = r#"{"format":12,"status":"premise_false",
 "summary":"The greeting file the ticket extends is not in the repository.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; no such file exists.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
-"options":[{"label":"Re-scope: create GREETING.md."},{"label":"Close the ticket."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
-    let closed = r#"{"format":11,"status":"blocked",
+"options":[{"label":"Re-scope: create GREETING.md."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
+    let closed = r#"{"format":12,"status":"blocked",
 "summary":"The decider closes the ticket: its premise is false, so nothing is to be built."}"#;
-    let closure = "Close the ticket.";
+    let closure = "B: Close the ticket: its premise is false.";
     let replies = vec![
         bench.reply(None, Some(&verdict("standard"))),
         bench.read(premise),
+        bench.read(&passed_on(&["Q1"])),
         bench.read(&check(&[("Q1", "answered", closure)])),
         bench.read(closed),
     ];
@@ -236,7 +239,7 @@ fn scenario_s8_a_false_premise_at_design_is_closed() {
         runs_by_pass(&bench.events(), &ends.borrow()),
         [
             vec!["intake"],
-            vec!["design"],
+            vec!["design", "resolver"],
             vec!["answer_check", "design"],
             vec![],
         ]
@@ -301,6 +304,9 @@ fn scenario_s9_findings_and_review_passes() {
             ("minor", "The greeting does not say Hello alone.", criterion),
         ])),
         bench.read(&ruled(&["confirmed", "confirmed", "confirmed"])),
+        // The residue reaches the resolver first, which passes it on
+        // (OWL-342).
+        bench.read(&passed_on(&["Q1", "Q2"])),
         // Pass 3: the answers, a Verify fix run and the pass they buy.
         bench.read(&check(&[
             ("Q1", "answered", "Add the full stop."),
@@ -354,6 +360,7 @@ fn scenario_s9_findings_and_review_passes() {
                 "build",
                 "verify",
                 "arbiter",
+                "resolver",
             ],
             vec!["answer_check", "build", "verify"],
         ]
@@ -595,9 +602,10 @@ fn scenario_a_standard_ticket_walks_to_its_merge_through_a_review_loop() {
 /// given, and a `replan`. Its plan is reviewed by the critic, conformance
 /// and debt, then put to the decider, whose reply picks the fork's other
 /// option: the design run changes the plan, which gets one pass and is
-/// asked again, with no Build meanwhile. Approved, the Build follows it,
-/// then asks a `replan`, which goes to the decider as the plan was
-/// approved. Watch continues the answer back to Design: a new plan, its
+/// asked again, with no Build meanwhile, each approval the decider's alone
+/// with no resolver run, as `risky` forces `always` (OWL-342). Approved, the
+/// Build follows it, then asks a `replan`, which the resolver passes on to
+/// the decider. Watch continues the answer back to Design: a new plan, its
 /// pass, its approval asked and given, then the Build, `risky`'s two Verify
 /// seats, the pull request and its merge.
 #[test]
@@ -624,6 +632,7 @@ fn scenario_a_risky_plan_refused_approved_and_replanned() {
         bench.read(&check(&[("Q1", "answered", "Approved as it is.")])),
         bench.read(&answered("approved", None)),
         bench.read(REPLAN),
+        bench.read(&passed_on(&["Q1"])),
         bench.read(&check(&[("Q1", "answered", "GREETING.md, in plain text.")])),
         bench.read(&designed(REPLANNED)),
     ]);
@@ -689,7 +698,7 @@ fn scenario_a_risky_plan_refused_approved_and_replanned() {
             vec!["intake".to_owned()],
             design_and_review(&["design"]),
             design_and_review(&["answer_check", "design"]),
-            ["answer_check", "design", "build"]
+            ["answer_check", "design", "build", "resolver"]
                 .map(str::to_owned)
                 .to_vec(),
             design_and_review(&["answer_check", "design"]),
@@ -699,7 +708,8 @@ fn scenario_a_risky_plan_refused_approved_and_replanned() {
             vec![],
         ]
     );
-    assert!(!bench.roles().contains(&Role::Resolver));
+    // The replan's alone: no approval reached the resolver.
+    assert_eq!(bench.briefs_of(Role::Resolver).len(), 1);
     // Each Build follows the plan approved for it.
     let builds = bench.briefs_of(Role::Build);
     let plan = |text: &str| serde_json::from_str::<Value>(text).unwrap();

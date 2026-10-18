@@ -213,8 +213,9 @@ impl GatePolicy {
     }
 
     /// Whether a question of this category always goes to a human at the
-    /// project's level: one of the level's categories (a blank one and the
-    /// floor's at every level), or one the project added.
+    /// project's level: one of the level's categories (the floor's at every
+    /// level), or one the project added. A blank category is neither: it
+    /// reaches the resolver (OWL-342).
     pub fn always_human(&self, category: &str) -> bool {
         if is_human_category(category, self.level()) {
             return true;
@@ -225,9 +226,10 @@ impl GatePolicy {
             .any(|token| matches_token(&category, token))
     }
 
-    /// Who settles a question of this category: always-human categories go
-    /// to the decider, the rest to the resolver first. At `none` every
-    /// question goes to the decider, and no resolver run starts.
+    /// Who settles a question of this category, as the asking run filed it:
+    /// always-human categories go to the decider, the rest, a blank one
+    /// included, to the resolver first (OWL-342). At `none` every question
+    /// goes to the decider, and no resolver run starts.
     pub fn route(&self, category: &str) -> Route {
         if self.level() == DelegationLevel::None || self.always_human(category) {
             Route::Human
@@ -280,6 +282,14 @@ impl GatePolicy {
             ChainCost::Known(spent) if spent >= ceiling => Some(ChainEnd::Budget),
             ChainCost::Known(_) => None,
         }
+    }
+
+    /// Whether the plan-approval question is the decider's alone, without a
+    /// resolver run (OWL-342): under `pipeline.plan_approval = "always"`,
+    /// which the risky variant forces, the setting names a human. Under
+    /// `on-fork` the question reaches the resolver first, as any other.
+    pub fn approval_is_human(&self, pipeline: Pipeline) -> bool {
+        pipeline.variant() == Variant::Risky || self.plan_approval == PlanApproval::Always
     }
 
     /// Whether a human approves the plan before Build. The risky variant
@@ -365,7 +375,8 @@ mod tests {
         for category in FloorCategory::ALL {
             assert_eq!(bare.route(category.token()), Route::Human, "{category:?}");
         }
-        assert_eq!(bare.route(""), Route::Human);
+        // A blank category reaches the resolver (OWL-342).
+        assert_eq!(bare.route(""), Route::Resolver);
         assert_eq!(bare.route("testing"), Route::Resolver);
     }
 
@@ -417,7 +428,9 @@ mod tests {
             ("Naming", "tone2", Route::Resolver),
             // Build's own always-human category.
             ("security", "naming", Route::Human),
-            ("", "naming", Route::Human),
+            // A blank category is routed by the resolver's label (OWL-342).
+            ("", "naming", Route::Resolver),
+            ("", "security", Route::Human),
             // The resolver's label names the floor or a project addition,
             // as a whole-word token.
             ("cleanup", "data_loss", Route::Human),
@@ -452,10 +465,10 @@ mod tests {
     }
 
     /// Each category at each level, as architecture section 4's table sets
-    /// it: the floor, a blank category and the project's additions go to the
-    /// decider at every level, `all` included; `scope` reaches the resolver
-    /// from `ticket`, `data_loss`, `money` and `legal` at `all`; `none`
-    /// sends everything to the decider.
+    /// it: the floor and the project's additions go to the decider at every
+    /// level, `all` included; `scope` reaches the resolver from `ticket`,
+    /// `data_loss`, `money` and `legal` at `all`, a blank category at every
+    /// level but `none` (OWL-342); `none` sends everything to the decider.
     #[test]
     fn each_level_routes_its_categories() {
         use DelegationLevel as L;
@@ -475,10 +488,10 @@ mod tests {
         ];
         let table: [(L, [Route; 11]); 5] = [
             (L::None, [H, H, H, H, H, H, H, H, H, H, H]),
-            (L::Facts, [H, H, H, H, H, H, H, H, H, H, R]),
-            (L::Discoverable, [H, H, H, H, H, H, H, H, H, H, R]),
-            (L::Ticket, [H, H, H, H, H, R, R, H, H, H, R]),
-            (L::All, [H, H, H, H, H, R, R, R, R, R, R]),
+            (L::Facts, [H, H, R, H, H, H, H, H, H, H, R]),
+            (L::Discoverable, [H, H, R, H, H, H, H, H, H, H, R]),
+            (L::Ticket, [H, H, R, H, H, R, R, H, H, H, R]),
+            (L::All, [H, H, R, H, H, R, R, R, R, R, R]),
         ];
         for (level, routes) in table {
             let policy = at(level);
@@ -516,12 +529,12 @@ mod tests {
         }
     }
 
-    /// A decision stands only on a basis the level allows; at `ticket`, a
-    /// question either label names `scope` only on a `ticket` basis; at
-    /// `none` nothing stands.
+    /// A decision stands only on a basis the level allows, a `judgment` at
+    /// `all` alone (OWL-342); at `ticket`, a question either label names
+    /// `scope` only on a `ticket` basis; at `none` nothing stands.
     #[test]
     fn a_decision_needs_a_basis_the_level_allows() {
-        use BasisKind::{Fact, Settled, Ticket};
+        use BasisKind::{Fact, Judgment, Settled, Ticket};
         use DelegationLevel as L;
         let cases = [
             (L::None, "naming", "naming", Fact, Route::Human),
@@ -550,6 +563,12 @@ mod tests {
             (L::All, "irreversible", "naming", Ticket, Route::Human),
             (L::All, "naming", "billing", Ticket, Route::Human),
             (L::All, "naming", "Scope", Ticket, Route::Human),
+            (L::All, "naming", "naming", Judgment, Route::Resolver),
+            (L::All, "scope", "trade_off", Judgment, Route::Resolver),
+            (L::All, "naming", "security", Judgment, Route::Human),
+            (L::Ticket, "naming", "naming", Judgment, Route::Human),
+            (L::Discoverable, "naming", "naming", Judgment, Route::Human),
+            (L::Facts, "naming", "naming", Judgment, Route::Human),
         ];
         for (level, raised, labelled, kind, route) in cases {
             assert_eq!(
@@ -637,6 +656,27 @@ mod tests {
         assert_eq!(ends(Runs(2), Some(1.0), 1, &some(&[0.5])), None);
         assert_eq!(usd_micros(0.4), Some(400_000));
         assert_eq!(usd_micros(-1.0), None);
+    }
+
+    /// The approval question is the decider's alone under `always` and on
+    /// the risky variant, whatever the mode; under `on-fork` it reaches the
+    /// resolver (OWL-342).
+    #[test]
+    fn the_approval_is_human_under_always_or_risky_only() {
+        for (mode, variant, human) in [
+            (PlanApproval::Always, Variant::Standard, true),
+            (PlanApproval::OnFork, Variant::Standard, false),
+            (PlanApproval::Never, Variant::Standard, false),
+            (PlanApproval::OnFork, Variant::Risky, true),
+            (PlanApproval::Never, Variant::Risky, true),
+        ] {
+            let policy = GatePolicy::new(Vec::<String>::new(), mode);
+            assert_eq!(
+                policy.approval_is_human(Pipeline::new(variant)),
+                human,
+                "{mode:?} on {variant:?}"
+            );
+        }
     }
 
     #[test]
