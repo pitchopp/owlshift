@@ -231,7 +231,8 @@ impl std::error::Error for CommandError {}
 /// directory set, the three standard streams piped. The prompt is not on the
 /// command line; [`drive`] writes it on standard input.
 ///
-/// Permission levels map onto Claude Code's own mechanism:
+/// Permission levels map onto Claude Code's own mechanism, through
+/// [`permission_mode`]:
 ///
 /// - read-only: `--permission-mode dontAsk`, which denies every tool that
 ///   would ask (Bash, writes), plus one allow rule for the result file,
@@ -240,10 +241,17 @@ impl std::error::Error for CommandError {}
 ///   moves: the result's write was then refused, and the same name below
 ///   allowed. Checked live with Claude Code 2.1.300 (OWL-323, recorded under
 ///   check C1 in `docs/design/build-plan.md`);
-/// - write in worktree: `--permission-mode acceptEdits`, which confines the
-///   file tools to the working directory, plus Bash. Bash itself is not
-///   confined to the directory: the executor's isolation check covers its
-///   writes, and the agent environment leaves it no credential.
+/// - write in worktree: `--permission-mode bypassPermissions`, so no tool
+///   asks. What the run writes is bounded by the executor, never by the CLI:
+///   the operating system's sandbox (`AgentEnv::confine`) keeps every write
+///   in the worktree and the repository's git folder, never its hooks or
+///   configuration, and the isolation check after the run catches any other
+///   ref and the main checkout. `acceptEdits` refused the repository's
+///   `.claude/` files as sensitive, with no one to approve, so a ticket whose
+///   work included a rule file there could never finish. This presumes a
+///   confined run: `AgentEnv::from_runner`, which every agent the CLI
+///   launches gets, always confines. Checked live with Claude Code 2.1.302
+///   (OWL-346, recorded under check C1 in `docs/design/build-plan.md`).
 ///
 /// The tools that reach beyond the run are always removed and, without network
 /// access, the web tools too, all in one `--disallowedTools` flag; Bash, when
@@ -271,14 +279,11 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
     if let Some(effort) = request.effort {
         command.args(["--effort", effort.as_str()]);
     }
-    match request.permissions.level {
-        PermissionLevel::ReadOnly => {
-            command.args(["--permission-mode", "dontAsk", "--allowedTools"]);
-            command.arg(format!("Edit(/{result_path})"));
-        }
-        PermissionLevel::WriteWorktree => {
-            command.args(["--permission-mode", "acceptEdits", "--allowedTools", "Bash"]);
-        }
+    let level = request.permissions.level;
+    command.args(["--permission-mode", permission_mode(level)]);
+    if level == PermissionLevel::ReadOnly {
+        command.arg("--allowedTools");
+        command.arg(format!("Edit(/{result_path})"));
     }
     command.args(["--permission-prompts", "none"]);
     command.arg("--disallowedTools").args(BEYOND_RUN_TOOLS);
@@ -319,6 +324,16 @@ fn permission_rule_path(path: &RelativePath) -> Result<&str, CommandError> {
     }
 }
 
+/// The permission mode [`command`] asks for at `level`, as `claude
+/// --permission-mode` names it and the `init` event reports it
+/// ([`Run::permission_mode`]).
+pub fn permission_mode(level: PermissionLevel) -> &'static str {
+    match level {
+        PermissionLevel::ReadOnly => "dontAsk",
+        PermissionLevel::WriteWorktree => "bypassPermissions",
+    }
+}
+
 /// What a finished run reported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
@@ -339,6 +354,12 @@ pub struct Run {
     /// their status: a server that failed to start is listed too. C1's
     /// guardrail flags leave none; empty as well when no `init` came.
     pub mcp_servers: Vec<String>,
+    /// The permission mode the CLI ran in, as the last `init` event reports
+    /// it; `None` when no `init` came or it named none. A setting Owlshift
+    /// does not pass can change it: under managed settings that disable
+    /// bypass mode, a run asked for `bypassPermissions` reports `default`,
+    /// and says so nowhere else (OWL-346).
+    pub permission_mode: Option<String>,
     /// The tools the permission mode refused, one entry per refusal.
     pub permission_denials: Vec<String>,
     /// The final answer, when the request carried a JSON Schema.
@@ -479,6 +500,7 @@ pub struct Transcript {
     model: Option<String>,
     billing: Option<Billing>,
     mcp_servers: Vec<String>,
+    permission_mode: Option<String>,
     rate_limit: Option<RateLimit>,
     /// The latest rejection, cleared by a later report that allows again.
     rejection: Option<RateLimit>,
@@ -532,6 +554,7 @@ impl Transcript {
     fn init(&mut self, event: &Value) {
         self.harness_version = str_field(event, "claude_code_version").map(str::to_owned);
         self.model = str_field(event, "model").map(str::to_owned);
+        self.permission_mode = str_field(event, "permissionMode").map(str::to_owned);
         let billing = match event.get("apiKeySource") {
             None => Billing::Unknown,
             Some(Value::String(source)) if source == "none" => Billing::Subscription,
@@ -633,6 +656,7 @@ impl Transcript {
             model: self.model,
             billing: self.billing.unwrap_or(Billing::Unknown),
             mcp_servers: self.mcp_servers,
+            permission_mode: self.permission_mode,
             permission_denials,
             structured_output,
             malformed_lines: self.malformed_lines,
@@ -802,7 +826,7 @@ mod tests {
             joined(&request),
             format!(
                 "-p --output-format stream-json --verbose --model haiku --effort xhigh \
-                 --permission-mode acceptEdits --allowedTools Bash \
+                 --permission-mode bypassPermissions \
                  --permission-prompts none --disallowedTools {} WebFetch WebSearch \
                  --json-schema {{\"type\":\"object\"}} --max-budget-usd 2.5 \
                  {} {} {} --no-session-persistence",

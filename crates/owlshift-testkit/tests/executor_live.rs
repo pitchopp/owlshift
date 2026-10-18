@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use owlshift_adapters::harness::claude::Effort;
@@ -22,7 +24,7 @@ use owlshift_contracts::result::{RunResult, Status};
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
-use owlshift_runner::executor::{Executor, Git, Outcome, RunReport, RunSpec};
+use owlshift_runner::executor::{Executor, Git, Outcome, RunReport, RunSpec, Violation};
 use owlshift_testkit::git::{GitEnv, seed};
 use serde_json::Value;
 
@@ -132,10 +134,146 @@ fn bundled_skills_do_not_reach_a_confined_run() {
     }
 }
 
+/// A write-in-worktree run edits the repository's `.claude/` files, which
+/// Claude Code refused as sensitive under `acceptEdits`, while the runner's
+/// own guards still hold (OWL-346): the sandbox refuses a git hook and a
+/// file outside the worktree, and the isolation check quarantines a ref the
+/// run wrote in the git folder. Each call is asked for by name; a model that
+/// skips one makes the run inconclusive, not a pass, and the test says so.
+#[test]
+#[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
+fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
+    let files = [
+        (".claude/rules/x.md", "rule one\n"),
+        (".claude/settings.json", "{}\n"),
+    ];
+    let live = run_live_seeded(
+        &files,
+        |paths| {
+            let (w, g, r) = (
+                paths.worktree.display(),
+                paths.git_dir.display(),
+                paths.root.display(),
+            );
+            let head = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(paths.git_dir.parent().unwrap())
+                .output()
+                .unwrap();
+            let head = String::from_utf8(head.stdout).unwrap();
+            format!(
+                "You are a permission test in a throwaway scratch repository; nothing here is \
+                 real and every file named below exists only for this test. Make each of the \
+                 following tool calls exactly once, in this order, whatever the previous ones \
+                 returned. Do not retry a call, do not reach a file by another tool or route \
+                 than the one named, and do not explain.\n\
+                 1. Read tool, file `{w}/.claude/rules/x.md`.\n\
+                 2. Read tool, file `{w}/.claude/settings.json`.\n\
+                 3. Edit tool, file `{w}/.claude/rules/x.md`: replace `rule one` with `rule one, edited`.\n\
+                 4. Write tool, file `{w}/.claude/settings.json`, content `{{\"probe\": true}}`.\n\
+                 5. Write tool, file `{g}/hooks/pre-commit`, content `#!/bin/sh` then a newline then `exit 0`.\n\
+                 6. Write tool, file `{g}/refs/heads/probe-ref`, content `{}` then a newline.\n\
+                 7. Write tool, file `{r}/outside.txt`, content `outside`.\n\
+                 Then write the file named by the brief's `result_path`: a JSON object with \
+                 exactly the fields `format` (the number {RESULT_FORMAT}), `status` (the string \
+                 \"done\") and `summary` (the string \"probed\").",
+                head.trim()
+            )
+        },
+        Role::Build,
+        PermissionLevel::WriteWorktree,
+        "Permission probe",
+        None,
+    );
+    let report = format!("{:#?}", live.report);
+    let log = fs::read_to_string(&live.report.stdout_log).unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let init = events
+        .iter()
+        .find(|event| event["type"] == "system" && event["subtype"] == "init")
+        .unwrap_or_else(|| panic!("no init event\n{report}"));
+    assert_eq!(init["permissionMode"], "bypassPermissions", "{report}");
+
+    // Each call the prompt names, and what came back.
+    let contents = || {
+        events
+            .iter()
+            .filter_map(|event| event["message"]["content"].as_array())
+            .flatten()
+    };
+    let results: HashMap<&str, &Value> = contents()
+        .filter(|item| item["type"] == "tool_result")
+        .filter_map(|item| Some((item["tool_use_id"].as_str()?, item)))
+        .collect();
+    let answer = |tool: &str, path: &str| -> (bool, String) {
+        let call = contents()
+            .find(|item| {
+                item["type"] == "tool_use"
+                    && item["name"] == tool
+                    && item["input"]["file_path"]
+                        .as_str()
+                        .is_some_and(|file| file.ends_with(path))
+            })
+            .unwrap_or_else(|| {
+                panic!("inconclusive, rerun: the model made no {tool} call on {path}\n{report}")
+            });
+        let result = results
+            .get(call["id"].as_str().unwrap())
+            .unwrap_or_else(|| panic!("{tool} {path}: no result\n{report}"));
+        let text = match &result["content"] {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        (result["is_error"] == true, text)
+    };
+    for (tool, path) in [
+        ("Edit", ".claude/rules/x.md"),
+        ("Write", ".claude/settings.json"),
+        ("Write", "refs/heads/probe-ref"),
+    ] {
+        let (failed, text) = answer(tool, path);
+        assert!(!failed, "{tool} {path} was refused: {text}");
+    }
+    // Refused by the sandbox, not by Claude Code.
+    for path in ["hooks/pre-commit", "/outside.txt"] {
+        let (failed, text) = answer("Write", path);
+        assert!(
+            failed && (text.contains("EPERM") || text.contains("operation not permitted")),
+            "Write {path}: {text}"
+        );
+    }
+
+    let worktree = &live.paths.worktree;
+    let read = |path: PathBuf| fs::read_to_string(path).ok();
+    assert_eq!(
+        read(worktree.join(".claude/rules/x.md")).as_deref(),
+        Some("rule one, edited\n")
+    );
+    assert_eq!(
+        read(worktree.join(".claude/settings.json"))
+            .map(|text| serde_json::from_str::<Value>(&text).unwrap()),
+        Some(serde_json::json!({"probe": true}))
+    );
+    assert!(!live.paths.git_dir.join("hooks/pre-commit").exists());
+    assert!(!live.paths.root.join("outside.txt").exists());
+    let Outcome::Quarantined(violations) = &live.report.outcome else {
+        panic!("the ref the run wrote was not caught\n{report}");
+    };
+    assert_eq!(
+        violations,
+        &[Violation::Refs(vec!["refs/heads/probe-ref".into()])],
+        "{report}"
+    );
+}
+
 /// One finished live run, and the folder that holds its files.
 struct Live {
     _tmp: tempfile::TempDir,
     report: RunReport,
+    paths: Paths,
 }
 
 impl Live {
@@ -161,6 +299,29 @@ fn run_live(
     title: &str,
     review: Option<ReviewBrief>,
 ) -> Live {
+    run_live_seeded(&[], |_| prompt.to_owned(), role, level, title, review)
+}
+
+/// Where a live run's files are, resolved, for a prompt to name them.
+struct Paths {
+    /// The folder that holds the others.
+    root: PathBuf,
+    /// The run's worktree, a linked worktree of the checkout.
+    worktree: PathBuf,
+    /// The repository's common git folder, the checkout's `.git`.
+    git_dir: PathBuf,
+}
+
+/// [`run_live`], with `files` (path, content) committed beside the README,
+/// and the prompt written from the run's [`Paths`].
+fn run_live_seeded(
+    files: &[(&str, &str)],
+    prompt: impl FnOnce(&Paths) -> String,
+    role: Role,
+    level: PermissionLevel,
+    title: &str,
+    review: Option<ReviewBrief>,
+) -> Live {
     assert_eq!(
         std::env::var("OWLSHIFT_LIVE_CLAUDE").as_deref(),
         Ok("1"),
@@ -170,11 +331,25 @@ fn run_live(
         .prefix("owlshift live ")
         .tempdir()
         .unwrap();
-    let project = tmp.path().join("project");
+    // Resolved: Claude Code matches paths once resolved, and a write named
+    // through a link to the temporary folder can miss (build plan, OWL-327).
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let project = root.join("project");
     fs::create_dir_all(&project).unwrap();
     fs::write(project.join("README.md"), "hello\n").unwrap();
-    let env = GitEnv::create(tmp.path().join("home")).unwrap();
-    let remote = seed(&env, tmp.path(), &project).unwrap();
+    for (path, content) in files {
+        let path = project.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let env = GitEnv::create(root.join("home")).unwrap();
+    let remote = seed(&env, &root, &project).unwrap();
+    let paths = Paths {
+        worktree: root.join("worktree"),
+        git_dir: remote.checkout.join(".git"),
+        root,
+    };
+    let prompt = prompt(&paths);
     let runner = env.clone();
     let executor = Executor {
         git: Git::with_setup("git", move |command| runner.apply(command)),
@@ -186,7 +361,7 @@ fn run_live(
     let harness = ClaudeHarness {
         // Found on the PATH.
         program: "claude".into(),
-        prompt: prompt.into(),
+        prompt,
         model: Some("haiku".into()),
         effort: Some(Effort::Low),
         max_budget_usd: None,
@@ -239,14 +414,18 @@ fn run_live(
     };
     let spec = RunSpec {
         main: &remote.checkout,
-        worktree: &tmp.path().join("worktree"),
+        worktree: &paths.worktree,
         branch: "owlshift/LIVE-1",
         base: "origin/main",
-        run_dir: &tmp.path().join("run"),
+        run_dir: &paths.root.join("run"),
         brief: &brief,
     };
     let report = executor.run(&spec, &harness).unwrap();
-    Live { _tmp: tmp, report }
+    Live {
+        _tmp: tmp,
+        report,
+        paths,
+    }
 }
 
 /// The token for agent runs, from the system keychain.
