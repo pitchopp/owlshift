@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -138,8 +138,16 @@ fn bundled_skills_do_not_reach_a_confined_run() {
 /// Claude Code refused as sensitive under `acceptEdits`, while the runner's
 /// own guards still hold (OWL-346): the sandbox refuses a git hook and a
 /// file outside the worktree, and the isolation check quarantines a ref the
-/// run wrote in the git folder. Each call is asked for by name; a model that
-/// skips one makes the run inconclusive, not a pass, and the test says so.
+/// run wrote in the git folder. Each call is asked for by name, on its exact
+/// path; a model that skips one makes the run inconclusive, not a pass, and
+/// the test says so.
+///
+/// On Linux, bwrap gives the run a private `/tmp`, a tmpfs, and the test's
+/// folder is in `/tmp`: a write beside the worktree may land in that tmpfs
+/// and vanish with the run, so there only its absence on the host is
+/// asserted. The refusal is then probed in `OWLSHIFT_LIVE_OUTSIDE_DIR`, a
+/// folder the user can write outside every private one, which the sandbox
+/// sees through its read-only `/`: `EROFS`, where Seatbelt says `EPERM`.
 #[test]
 #[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
 fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
@@ -147,6 +155,7 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
         (".claude/rules/x.md", "rule one\n"),
         (".claude/settings.json", "{}\n"),
     ];
+    let outside = cfg!(target_os = "linux").then(outside_probe);
     let live = run_live_seeded(
         &files,
         |paths| {
@@ -155,6 +164,13 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
                 paths.git_dir.display(),
                 paths.root.display(),
             );
+            let step_8 = match &outside {
+                Some(path) => format!(
+                    "8. Write tool, file `{}`, content `outside`.\n",
+                    path.display()
+                ),
+                None => String::new(),
+            };
             let head = Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(paths.git_dir.parent().unwrap())
@@ -174,6 +190,7 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
                  5. Write tool, file `{g}/hooks/pre-commit`, content `#!/bin/sh` then a newline then `exit 0`.\n\
                  6. Write tool, file `{g}/refs/heads/probe-ref`, content `{}` then a newline.\n\
                  7. Write tool, file `{r}/outside.txt`, content `outside`.\n\
+                 {step_8}\
                  Then write the file named by the brief's `result_path`: a JSON object with \
                  exactly the fields `format` (the number {RESULT_FORMAT}), `status` (the string \
                  \"done\") and `summary` (the string \"probed\").",
@@ -208,45 +225,91 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
         .filter(|item| item["type"] == "tool_result")
         .filter_map(|item| Some((item["tool_use_id"].as_str()?, item)))
         .collect();
-    let answer = |tool: &str, path: &str| -> (bool, String) {
+    let answer = |tool: &str, path: &Path| -> (bool, String) {
         let call = contents()
             .find(|item| {
                 item["type"] == "tool_use"
                     && item["name"] == tool
                     && item["input"]["file_path"]
                         .as_str()
-                        .is_some_and(|file| file.ends_with(path))
+                        .is_some_and(|file| Path::new(file) == path)
             })
             .unwrap_or_else(|| {
-                panic!("inconclusive, rerun: the model made no {tool} call on {path}\n{report}")
+                panic!(
+                    "inconclusive, rerun: the model made no {tool} call on {}\n{report}",
+                    path.display()
+                )
             });
         let result = results
             .get(call["id"].as_str().unwrap())
-            .unwrap_or_else(|| panic!("{tool} {path}: no result\n{report}"));
+            .unwrap_or_else(|| panic!("{tool} {}: no result\n{report}", path.display()));
         let text = match &result["content"] {
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
         (result["is_error"] == true, text)
     };
+    let Paths {
+        root,
+        worktree,
+        git_dir,
+    } = &live.paths;
     for (tool, path) in [
-        ("Edit", ".claude/rules/x.md"),
-        ("Write", ".claude/settings.json"),
-        ("Write", "refs/heads/probe-ref"),
+        ("Edit", worktree.join(".claude/rules/x.md")),
+        ("Write", worktree.join(".claude/settings.json")),
+        ("Write", git_dir.join("refs/heads/probe-ref")),
     ] {
-        let (failed, text) = answer(tool, path);
-        assert!(!failed, "{tool} {path} was refused: {text}");
+        let (failed, text) = answer(tool, &path);
+        assert!(!failed, "{tool} {} was refused: {text}", path.display());
     }
-    // Refused by the sandbox, not by Claude Code.
-    for path in ["hooks/pre-commit", "/outside.txt"] {
+    // Refused by the sandbox, not by Claude Code: Seatbelt says `EPERM`, a
+    // read-only bind under bwrap `EROFS`.
+    let by_sandbox: &[&str] = if cfg!(target_os = "linux") {
+        &[
+            "EPERM",
+            "operation not permitted",
+            "EROFS",
+            "read-only file system",
+        ]
+    } else {
+        &["EPERM", "operation not permitted"]
+    };
+    let refused = |path: &Path| {
         let (failed, text) = answer("Write", path);
         assert!(
-            failed && (text.contains("EPERM") || text.contains("operation not permitted")),
-            "Write {path}: {text}"
+            failed && by_sandbox.iter().any(|shape| text.contains(shape)),
+            "Write {}: {text}",
+            path.display()
         );
+    };
+    refused(&git_dir.join("hooks/pre-commit"));
+    let beside = root.join("outside.txt");
+    if cfg!(target_os = "linux") {
+        // In the sandbox's private `/tmp`: written there, or refused by the
+        // sandbox; any other error leaves the probe unproven.
+        let (failed, text) = answer("Write", &beside);
+        assert!(
+            !failed || by_sandbox.iter().any(|shape| text.contains(shape)),
+            "inconclusive, rerun: Write {}: {text}",
+            beside.display()
+        );
+        println!(
+            "Write {}: {}",
+            beside.display(),
+            if failed {
+                "refused by the sandbox"
+            } else {
+                "written in the sandbox's private /tmp"
+            }
+        );
+    } else {
+        refused(&beside);
+    }
+    if let Some(path) = &outside {
+        refused(path);
+        assert!(!path.exists(), "{} reached the host", path.display());
     }
 
-    let worktree = &live.paths.worktree;
     let read = |path: PathBuf| fs::read_to_string(path).ok();
     assert_eq!(
         read(worktree.join(".claude/rules/x.md")).as_deref(),
@@ -257,8 +320,8 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
             .map(|text| serde_json::from_str::<Value>(&text).unwrap()),
         Some(serde_json::json!({"probe": true}))
     );
-    assert!(!live.paths.git_dir.join("hooks/pre-commit").exists());
-    assert!(!live.paths.root.join("outside.txt").exists());
+    assert!(!git_dir.join("hooks/pre-commit").exists());
+    assert!(!beside.exists());
     let Outcome::Quarantined(violations) = &live.report.outcome else {
         panic!("the ref the run wrote was not caught\n{report}");
     };
@@ -267,6 +330,37 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
         &[Violation::Refs(vec!["refs/heads/probe-ref".into()])],
         "{report}"
     );
+}
+
+/// A file the run is asked to write in `OWLSHIFT_LIVE_OUTSIDE_DIR`, which
+/// must be a folder the user can write outside the folders the Linux sandbox
+/// makes private: there a write meets the sandbox's read-only `/`, and its
+/// absence on the host proves the refusal held.
+fn outside_probe() -> PathBuf {
+    let dir = std::env::var_os("OWLSHIFT_LIVE_OUTSIDE_DIR").map(PathBuf::from);
+    let Some(dir) = dir.and_then(|dir| fs::canonicalize(dir).ok()) else {
+        panic!(
+            "set OWLSHIFT_LIVE_OUTSIDE_DIR to an existing folder you can write, outside /tmp, \
+             /var/tmp, /run/user and your home"
+        );
+    };
+    let home = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok());
+    let private = ["/tmp", "/var/tmp", "/run/user"]
+        .iter()
+        .map(PathBuf::from)
+        .chain(home)
+        .find(|private| dir.starts_with(private));
+    assert!(
+        private.is_none(),
+        "OWLSHIFT_LIVE_OUTSIDE_DIR {} is in {}, private to the sandbox",
+        dir.display(),
+        private.unwrap_or_default().display()
+    );
+    let probe = dir.join(format!("owlshift-live-outside-{}.txt", std::process::id()));
+    assert!(!probe.exists(), "{} exists already", probe.display());
+    fs::write(&probe, "").unwrap_or_else(|e| panic!("{} is not writable: {e}", dir.display()));
+    fs::remove_file(&probe).unwrap();
+    probe
 }
 
 /// One finished live run, and the folder that holds its files.
