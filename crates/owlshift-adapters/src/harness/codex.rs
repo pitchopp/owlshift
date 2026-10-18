@@ -23,6 +23,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use jiff::Timestamp;
+use jiff::tz::{AmbiguousOffset, TimeZone};
 use serde_json::{Value, json};
 
 use owlshift_contracts::Role;
@@ -488,6 +490,73 @@ fn is_limit(message: &str) -> bool {
     LIMIT_MESSAGES.iter().any(|limit| message.contains(limit))
 }
 
+/// What comes before the reset time in a usage-limit message (C7, "Wordings
+/// observed").
+const RESET_PREFIX: &str = "try again at ";
+
+/// The instant a usage-limit message says the limit resets, or `None` when
+/// the message does not say it in a form observed live.
+///
+/// Codex gives the time as wall-clock text of the machine's zone with no
+/// date: "… or try again at 3:54 AM." (C7). It resolves to the next
+/// occurrence of that time in `zone` strictly after `read_at`, the instant
+/// the message was read. Nothing is ever guessed, so the message is read
+/// only when:
+///
+/// - `try again at ` occurs once in it, and what follows it is the time and
+///   nothing else but a full stop and trailing whitespace;
+/// - the time is `H:MM` and a single space and an upper-case `AM` or `PM`:
+///   an hour from 1 to 12 without a leading zero, and a minute from 00 to
+///   59. A 24-hour clock, a lower-case meridiem, a date before the time
+///   (the weekly limit's form, which was not captured) and any other
+///   spelling give `None`.
+///
+/// A local time inside a daylight-saving gap resolves forward, as jiff's
+/// `compatible` rule does. A repeated one resolves to its earlier instant,
+/// or to the later one when the earlier is not after `read_at`.
+pub fn reset_time(message: &str, read_at: Timestamp, zone: &TimeZone) -> Option<Timestamp> {
+    let mut parts = message.split(RESET_PREFIX);
+    let (_, text, None) = (parts.next()?, parts.next()?, parts.next()) else {
+        return None;
+    };
+    let text = text.trim_end();
+    let (hour, minute) = clock(text.strip_suffix('.').unwrap_or(text))?;
+    let today = zone.to_datetime(read_at).date();
+    [Some(today), today.tomorrow().ok()]
+        .into_iter()
+        .flatten()
+        .flat_map(|date| {
+            let ambiguous = zone.to_ambiguous_timestamp(date.at(hour, minute, 0, 0));
+            match ambiguous.offset() {
+                AmbiguousOffset::Fold { .. } => vec![ambiguous.earlier(), ambiguous.later()],
+                _ => vec![ambiguous.compatible()],
+            }
+        })
+        .filter_map(Result::ok)
+        .find(|at| *at > read_at)
+}
+
+/// The 24-hour hour and the minute of `H:MM AM` or `H:MM PM`.
+fn clock(text: &str) -> Option<(i8, i8)> {
+    let (time, meridiem) = text.split_once(' ')?;
+    let (hour, minute) = time.split_once(':')?;
+    let digits = |text: &str, len: std::ops::RangeInclusive<usize>| {
+        let plain = len.contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_digit());
+        if plain { text.parse::<i8>().ok() } else { None }
+    };
+    let hour =
+        digits(hour, 1..=2).filter(|hour| (1..=12).contains(hour) && !time.starts_with('0'))?;
+    let minute = digits(minute, 2..=2).filter(|minute| (0..=59).contains(minute))?;
+    let hour = match (meridiem, hour) {
+        ("AM", 12) => 0,
+        ("AM", hour) => hour,
+        ("PM", 12) => 12,
+        ("PM", hour) => hour + 12,
+        _ => return None,
+    };
+    Some((hour, minute))
+}
+
 /// The tokens of `turn.completed`, in [`Usage`]'s terms. Codex counts the
 /// cached input inside `input_tokens` and the reasoning inside
 /// `output_tokens`, as the OpenAI API does, so the cached part is taken out
@@ -815,5 +884,227 @@ mod tests {
         );
         assert_eq!(api_status("boom"), None);
         assert_eq!(api_status(r#"{"error":"no status"}"#), None);
+    }
+
+    const OBSERVED_1_45_PM: &str = "You've hit your usage limit. Upgrade to Pro (…), visit … to purchase more credits or try again at 1:45 PM.";
+    const OBSERVED_3_54_AM: &str = "You've hit your usage limit. … try again at 3:54 AM.";
+
+    fn paris() -> TimeZone {
+        TimeZone::get("Europe/Paris").unwrap()
+    }
+
+    /// `civil` read in `zone`, as an instant.
+    fn at(zone: &TimeZone, civil: &str) -> Timestamp {
+        civil
+            .parse::<jiff::civil::DateTime>()
+            .unwrap()
+            .to_zoned(zone.clone())
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn reset_time_is_later_the_same_day() {
+        let zone = paris();
+        assert_eq!(
+            reset_time(OBSERVED_1_45_PM, at(&zone, "2026-10-15T09:00:00"), &zone),
+            Some(at(&zone, "2026-10-15T13:45:00"))
+        );
+    }
+
+    #[test]
+    fn reset_time_past_midnight_is_the_next_day() {
+        let zone = paris();
+        assert_eq!(
+            reset_time(OBSERVED_3_54_AM, at(&zone, "2026-10-17T22:44:00"), &zone),
+            Some(at(&zone, "2026-10-18T03:54:00"))
+        );
+        // The same wall-clock reset read after midnight is the same day.
+        assert_eq!(
+            reset_time(OBSERVED_3_54_AM, at(&zone, "2026-10-18T01:00:00"), &zone),
+            Some(at(&zone, "2026-10-18T03:54:00"))
+        );
+        // UTC, the zone the fake-harness scenario uses.
+        let utc = TimeZone::UTC;
+        assert_eq!(
+            reset_time(OBSERVED_3_54_AM, at(&utc, "2026-10-17T22:44:00"), &utc),
+            Some(at(&utc, "2026-10-18T03:54:00"))
+        );
+    }
+
+    #[test]
+    fn reset_time_is_strictly_after_the_read_instant() {
+        let zone = paris();
+        let message = "try again at 3:54 AM.";
+        let next_day = Some(at(&zone, "2026-10-19T03:54:00"));
+        let same_day = Some(at(&zone, "2026-10-18T03:54:00"));
+        assert_eq!(
+            reset_time(message, at(&zone, "2026-10-18T03:53:59"), &zone),
+            same_day
+        );
+        assert_eq!(
+            reset_time(message, at(&zone, "2026-10-18T03:54:00"), &zone),
+            next_day
+        );
+        assert_eq!(
+            reset_time(message, at(&zone, "2026-10-18T03:54:01"), &zone),
+            next_day
+        );
+    }
+
+    #[test]
+    fn reset_time_reads_midnight_and_noon() {
+        let zone = paris();
+        let read_at = at(&zone, "2026-10-18T10:00:00");
+        assert_eq!(
+            reset_time("try again at 12:05 AM.", read_at, &zone),
+            Some(at(&zone, "2026-10-19T00:05:00"))
+        );
+        assert_eq!(
+            reset_time("try again at 12:30 PM.", read_at, &zone),
+            Some(at(&zone, "2026-10-18T12:30:00"))
+        );
+        assert_eq!(
+            reset_time("try again at 11:59 PM.", read_at, &zone),
+            Some(at(&zone, "2026-10-18T23:59:00"))
+        );
+    }
+
+    #[test]
+    fn reset_time_reads_the_form_without_a_full_stop_or_with_trailing_space() {
+        let zone = paris();
+        let read_at = at(&zone, "2026-10-18T10:00:00");
+        let expected = Some(at(&zone, "2026-10-18T13:45:00"));
+        for message in [
+            "try again at 1:45 PM",
+            "try again at 1:45 PM.",
+            "try again at 1:45 PM. \n",
+            "try again at 1:45 PM \n",
+        ] {
+            assert_eq!(reset_time(message, read_at, &zone), expected, "{message:?}");
+        }
+    }
+
+    #[test]
+    fn reset_time_keeps_none_for_anything_not_observed() {
+        let zone = paris();
+        let read_at = at(&zone, "2026-10-18T10:00:00");
+        for message in [
+            "",
+            "try again at",
+            "try again at ",
+            "try again at .",
+            "You're out of credits",
+            "You're out of credits. Visit … to buy more.",
+            "Usage limit reached",
+            "You've hit your usage limit.",
+            // A date before the time, as a weekly reset may read.
+            "You've hit your usage limit. Try again at Oct 20th, 2026 3:54 AM.",
+            "try again at Oct 20th, 2026 3:54 AM.",
+            "try again at Oct 20 3:54 AM.",
+            "try again at 2026-10-20 3:54 AM.",
+            "try again at 3:54 AM on Oct 20.",
+            "try again at 3:54 AM. Visit the settings page.",
+            // Another spelling of the time.
+            "try again at 13:45",
+            "try again at 13:45 PM.",
+            "try again at 1:45 pm.",
+            "try again at 1:45 Pm.",
+            "try again at 1:45PM.",
+            "try again at 1:45\u{a0}PM.",
+            "try again at 1:45  PM.",
+            "try again at  1:45 PM.",
+            "try again at 1.45 PM.",
+            "try again at 1 PM.",
+            "try again at 1:5 PM.",
+            "try again at 1:045 PM.",
+            "try again at 0:30 AM.",
+            "try again at 00:30 AM.",
+            "try again at 01:45 PM.",
+            "try again at 13:00 PM.",
+            "try again at 1:60 PM.",
+            "try again at 1:61 PM.",
+            "try again at +1:45 PM.",
+            "try again at -1:45 PM.",
+            "try again at 1:45 PM.!",
+            "try again at 1:45 PM..",
+            // Capitalised: the form observed is lower-case.
+            "Try again at 1:45 PM.",
+        ] {
+            assert_eq!(reset_time(message, read_at, &zone), None, "{message:?}");
+        }
+    }
+
+    #[test]
+    fn reset_time_reads_a_message_that_says_it_once() {
+        let zone = paris();
+        let read_at = at(&zone, "2026-10-18T10:00:00");
+        // The prefix before the time may be anything; the time is what counts.
+        assert_eq!(
+            reset_time("Wait, or try again at 1:45 PM.", read_at, &zone),
+            Some(at(&zone, "2026-10-18T13:45:00"))
+        );
+        // Said twice, it is not clear which is meant: no time.
+        assert_eq!(
+            reset_time(
+                "try again at 9:00 AM, or try again at 1:45 PM.",
+                read_at,
+                &zone
+            ),
+            None
+        );
+        assert_eq!(
+            reset_time(
+                "try again at 1:45 PM. try again at 1:45 PM.",
+                read_at,
+                &zone
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_time_resolves_a_time_in_a_daylight_saving_gap_forward() {
+        // Clocks in New York jumped from 02:00 to 03:00 on 2026-03-08.
+        let zone = TimeZone::get("America/New_York").unwrap();
+        let read_at = at(&zone, "2026-03-08T00:30:00");
+        assert_eq!(
+            reset_time("try again at 2:30 AM.", read_at, &zone),
+            Some(at(&zone, "2026-03-08T03:30:00"))
+        );
+        assert_eq!(
+            reset_time("try again at 2:30 AM.", read_at, &zone),
+            Some("2026-03-08T07:30:00Z".parse().unwrap())
+        );
+        // Read after the gap, the next day's 02:30 exists and is plain.
+        assert_eq!(
+            reset_time(
+                "try again at 2:30 AM.",
+                at(&zone, "2026-03-08T04:00:00"),
+                &zone
+            ),
+            Some("2026-03-09T06:30:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn reset_time_takes_the_earlier_instant_of_a_repeated_hour_when_it_is_ahead() {
+        // Clocks in New York fell back from 02:00 to 01:00 on 2026-11-01, so
+        // 01:30 happened at 05:30Z and again at 06:30Z.
+        let zone = TimeZone::get("America/New_York").unwrap();
+        let first: Timestamp = "2026-11-01T05:30:00Z".parse().unwrap();
+        let second: Timestamp = "2026-11-01T06:30:00Z".parse().unwrap();
+        let message = "try again at 1:30 AM.";
+        let before = "2026-11-01T04:00:00Z".parse().unwrap();
+        assert_eq!(reset_time(message, before, &zone), Some(first));
+        // Read between the two, the later 01:30 is still ahead.
+        let between = "2026-11-01T06:00:00Z".parse().unwrap();
+        assert_eq!(reset_time(message, between, &zone), Some(second));
+        // Read after both, the next day's.
+        let after = "2026-11-01T06:30:00Z".parse().unwrap();
+        assert_eq!(
+            reset_time(message, after, &zone),
+            Some("2026-11-02T06:30:00Z".parse().unwrap())
+        );
     }
 }
