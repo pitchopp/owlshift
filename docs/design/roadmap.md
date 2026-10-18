@@ -71,7 +71,7 @@ The central bet, used by hand.
 - The residue past the bound becomes a proposed follow-up only once P4 files follow-ups. P3 parks the ticket instead, with a PARKED comment. P4 keeps that park for a red check (OWL-244): passing checks are the ticket's own acceptance, which S13 forbids deferring to a follow-up, so the residue S9 proposes is a confirmed finding's, from P5.
 - Human review comments on the pull request are not read before P5. Telling whose review counts also needs P10's identity map.
 - S9 and OWL-211 send these questions to needs input "returning to review". In P3 they return to Watch, whose visible stage is review, so this is the same thing.
-- OWL-211's "through the P2 question loop (… resolver …)" is narrowed: the resolver is skipped. A fix or rebase run's questions go to the decider, as a late-comment run's do, since they are acts and arbitrations the agent cannot settle. The rest of the loop is unchanged: the answer check, re-asks and replies.
+- OWL-211's "through the P2 question loop (… resolver …)" is narrowed: the resolver is skipped. A fix or rebase run's questions go to the decider, as a late-comment run's do, since they are acts and arbitrations the agent cannot settle. The rest of the loop is unchanged: the answer check, re-asks and replies. Reversed on 2026-10-18 (OWL-342): those questions go through the resolver first, as every role's do.
 
 **Exit gate.** Three Owlshift tickets run under `owlshift watch`, from `do` to a merged or parked pull request, meeting all of these:
 
