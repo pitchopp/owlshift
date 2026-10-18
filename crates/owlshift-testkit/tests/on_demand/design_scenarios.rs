@@ -7,6 +7,7 @@
 use owlshift_contracts::BasisKind;
 use owlshift_contracts::review::{FindingOutcome, FindingsMode, Mandate, ResponseOutcome};
 use owlshift_core::vocab::Harness as HarnessKind;
+use owlshift_runner::writer::MAX_POINTER_CHARS;
 
 use super::*;
 
@@ -128,6 +129,34 @@ impl Bench {
             .find(|comment| comment.starts_with(header))
             .unwrap_or_else(|| panic!("no {header} comment"))
     }
+
+    /// The plan's document, the ticket's one document (OWL-350).
+    pub(super) fn plan_document(&self) -> String {
+        let dir = self
+            .remote
+            .checkout
+            .join("tickets")
+            .join(TICKET)
+            .join("documents");
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["1.md"], "one document");
+        fs::read_to_string(dir.join("1.md")).unwrap()
+    }
+
+    /// The last PLAN comment: a pointer to the plan's document, within its
+    /// bound (OWL-350).
+    pub(super) fn plan_pointer(&self) -> String {
+        let pointer = self.marked("[owlshift] PLAN");
+        assert!(pointer.chars().count() <= MAX_POINTER_CHARS, "{pointer}");
+        assert!(
+            pointer.contains("the plan and its review log, `tickets/DEMO-1/documents/1.md`."),
+            "{pointer}"
+        );
+        pointer
+    }
 }
 
 /// S9's design half: a `standard` ticket's dispatch from Ready goes to
@@ -195,16 +224,27 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
     );
     assert!(review.passes[0].findings.is_empty());
 
-    let plan = bench.marked("[owlshift] PLAN");
+    let plan = bench.plan_document();
     for text in [
+        "# Plan · DEMO-1\n\nVersion 1, after design review pass 1.",
         "**Goal.** Add GREETING.md saying Hello.",
         "**Steps.**\n1. Add GREETING.md. Test: The gate's grep for Hello.",
+        "## Review log\n\n### Design review, pass 1",
         "- critic on Claude Code (its default model",
-        "**Next.** The Build follows this plan.",
     ] {
         assert!(plan.contains(text), "{text}\n---\n{plan}");
     }
     assert!(!plan.contains("standing in"), "{plan}");
+    let pointer = bench.plan_pointer();
+    for text in [
+        "**Plan version 1, design review pass 1:**",
+        "First version of the plan.",
+        "**Forks:** 0. **Findings open:** 0.",
+        "**Next.** The Build follows this plan.",
+    ] {
+        assert!(pointer.contains(text), "{text}\n---\n{pointer}");
+    }
+    assert!(!pointer.contains("**Goal.**"), "{pointer}");
     assert!(
         bench
             .comments()
@@ -308,14 +348,16 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
     assert_eq!(first[0].reviewer.harness, HarnessKind::Claude);
     assert!(first[0].reviewer.same_model);
     assert!(review.passes[1].findings.is_empty());
-    let plan = bench.marked("[owlshift] PLAN");
+    let plan = bench.plan_document();
     assert!(
         plan.contains(
-            "- Pass 1, F2, major, critic on Claude Code: GREETING.md needs a licence header. \
-             Rejected: Checked plan step 1 for F2."
+            "configured)\n\n**Findings rejected.**\n- F2, major, critic on Claude Code: \
+             GREETING.md needs a licence header. Rejected: Checked plan step 1 for F2.\n\n\
+             ### Design review, pass 2"
         ),
         "{plan}"
     );
+    assert!(plan.contains("### Design review, pass 1"), "{plan}");
     assert!(!plan.contains("standing in"), "{plan}");
     let ruling = &bench.decisions("review")[0];
     assert_eq!(ruling["review"], "ruling");
@@ -451,7 +493,7 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
         Some(ResponseOutcome::Rejected)
     );
     assert_eq!(kept.outcome, Some(FindingOutcome::Rejected));
-    let plan = bench.marked("[owlshift] PLAN");
+    let plan = bench.plan_document();
     assert!(
         plan.contains("Rejected: No file of the repository has one."),
         "{plan}"
@@ -507,15 +549,21 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     assert_eq!(asked.findings.len(), 2);
     assert!(asked.findings[0].ruling.is_some());
     assert_eq!(resolver.resolve[0].finding.as_ref().unwrap().as_str(), "F1");
-    let plan = bench.marked("[owlshift] PLAN");
+    let plan = bench.plan_document();
     for text in [
         "F1, major, critic on Claude Code: Step 1's test still does not check the word. (asked \
          below)",
         "F2, minor, critic on Claude Code: The goal could name the file's path. (noted for the \
          Build)",
-        "**Next.** The findings left are settled by DECISION comments or by the decider's",
     ] {
         assert!(plan.contains(text), "{text}\n---\n{plan}");
+    }
+    let pointer = bench.plan_pointer();
+    for text in [
+        "**Findings open:** 2.",
+        "**Next.** The findings left are settled by DECISION comments or by the decider's",
+    ] {
+        assert!(pointer.contains(text), "{text}\n---\n{pointer}");
     }
     assert!(
         bench
@@ -1195,4 +1243,111 @@ fn a_false_premise_rescope_is_decided_and_its_closure_refused() {
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
     assert_eq!(resolved[0]["refused"], json!(["Q1"]));
     assert!(bench.record().questions.decisions.is_empty());
+}
+
+/// OWL-350: a ticket through Design has one document, "Plan · DEMO-1",
+/// updated at each PLAN comment, and short PLAN comments that point to it:
+/// the first version, then, once the decider's reply changed the plan, the
+/// second, naming the parts that changed. The approval still binds the
+/// plan in `plan.json`.
+#[test]
+fn the_plan_lives_in_one_document_updated_at_each_pass() {
+    let bench = Bench::of("risky");
+    let replies = vec![
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    assert!(
+        matches!(outcome, Err(Stop::NeedsInput { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let first = bench.plan_pointer();
+    for text in [
+        "**Plan version 1, design review pass 1:**",
+        "First version of the plan.",
+        "**Forks:** 1. **Findings open:** 0.",
+        "**Next.** The plan waits for its approval",
+    ] {
+        assert!(first.contains(text), "{text}\n---\n{first}");
+    }
+    assert!(bench.plan_document().contains("Fork 1: Markdown."));
+
+    bench.answer("Use plain text instead.");
+    let replies = vec![
+        bench.read(&check(&[("Q1", "answered", "Plain text instead.")])),
+        bench.read(&answered("changed", Some(REVISED))),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+    ];
+    let (outcome, printed) = bench.continue_ticket(replies);
+    assert!(
+        matches!(outcome, Err(Stop::NeedsInput { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let plans: Vec<String> = bench
+        .comments()
+        .into_iter()
+        .filter(|comment| comment.starts_with("[owlshift] PLAN"))
+        .collect();
+    assert_eq!(plans.len(), 2, "{plans:?}");
+    let second = bench.plan_pointer();
+    for text in [
+        "**Plan version 2, design review pass 2:**",
+        "**Changed since version 1.**\n- The approach changed.\n- The steps changed.\n- The \
+         forks changed.",
+        "**Forks:** 0.",
+    ] {
+        assert!(second.contains(text), "{text}\n---\n{second}");
+    }
+    let document = bench.plan_document();
+    for text in [
+        "Version 2, after design review pass 2.",
+        "the word checked",
+        "### Design review, pass 1",
+        "### Design review, pass 2",
+    ] {
+        assert!(document.contains(text), "{text}\n---\n{document}");
+    }
+    assert!(!document.contains("Fork 1: Markdown."), "{document}");
+    let kept = bench.record().plan.unwrap();
+    let published = kept.published.expect("the published plan");
+    assert_eq!(
+        (published.document.as_str(), published.version.get()),
+        ("1", 2)
+    );
+    assert!(kept.approval.is_none());
+}
+
+/// OWL-350: a PLAN comment that cannot be posted once its document is made
+/// keeps the document's id in the ref, so `continue` runs the pass again
+/// and updates that same document, the first version still.
+#[test]
+fn a_plan_comment_refused_after_its_document_keeps_one_document() {
+    let bench = Bench::of("standard");
+    bench.refuse.set(Some("[owlshift] PLAN"));
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    assert!(outcome.is_err(), "{printed}");
+    bench.plan_document();
+    let published = bench.record().plan.unwrap().published;
+    assert_eq!(published.map(|p| p.document), Some("1".to_owned()));
+    bench.refuse.set(None);
+    let replies = vec![
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.continue_ticket(replies);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    bench.plan_document();
+    let pointer = bench.plan_pointer();
+    assert!(pointer.contains("First version of the plan."), "{pointer}");
 }

@@ -7,7 +7,8 @@
 //! implementations exist. It grows with the steps that need more: the
 //! visible stage came with P2 (OWL-137), listing admitted tickets and reading
 //! the admission gesture with P4 (OWL-246, architecture section 5, "The
-//! drain"), filing proposals and finding them again with P4 too (OWL-252).
+//! drain"), filing proposals and finding them again with P4 too (OWL-252),
+//! publishing a ticket's document with P5 (OWL-350).
 
 pub mod linear;
 pub mod markdown;
@@ -185,6 +186,43 @@ pub trait Tracker {
             "this tracker does not write relations",
         ))
     }
+
+    /// Publishes a document attached to ticket `id` (OWL-350, architecture
+    /// section 5, "Kept and shown"): with `document` `None`, a new one titled
+    /// `title`; otherwise the document of that identifier, its content
+    /// replaced in place (Linear keeps its title; the runner gives a
+    /// ticket's document one title). `content` is Markdown, at most
+    /// [`MAX_DOCUMENT_CHARS`] characters. A document the tracker no longer
+    /// shows on the ticket, deleted or in its trash, is
+    /// [`ErrorKind::NotFound`], so the runner creates another. An error by
+    /// default; [`Capability::Documents`] declares it.
+    fn publish_document(
+        &self,
+        _id: &TicketId,
+        _document: Option<&str>,
+        _title: &str,
+        _content: &str,
+    ) -> Result<Document, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not publish documents",
+        ))
+    }
+}
+
+/// The most characters a document's content may hold: Linear's cap, checked
+/// live on 2026-10-18 and 2026-10-19 (OWL-350), applied to every tracker as
+/// the comments' is.
+pub const MAX_DOCUMENT_CHARS: usize = 250_000;
+
+/// A document [`Tracker::publish_document`] published.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Document {
+    /// The tracker's identifier, which updates it.
+    pub id: String,
+    /// Where a person opens it: on Linear its page; on the Markdown tracker
+    /// its file, from the repository's root.
+    pub url: Option<String>,
 }
 
 /// What [`Tracker::relations`] reads of a ticket.
@@ -329,6 +367,9 @@ pub enum Capability {
     BlockedBy,
     /// A proposals inbox for follow-ups.
     ProposalsInbox,
+    /// Documents attached to a ticket, created and updated in place
+    /// (OWL-350).
+    Documents,
     /// A distinct agent identity.
     AgentIdentity,
     /// Webhooks.
@@ -337,13 +378,14 @@ pub enum Capability {
 
 impl Capability {
     /// Every row, in the table's order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::ReadTicket,
         Self::ListAdmitted,
         Self::Comments,
         Self::VisibleStage,
         Self::BlockedBy,
         Self::ProposalsInbox,
+        Self::Documents,
         Self::AgentIdentity,
         Self::Webhooks,
     ];
@@ -365,6 +407,7 @@ impl Capability {
             Self::VisibleStage => "visible stage",
             Self::BlockedBy => "blocked-by relations",
             Self::ProposalsInbox => "proposals inbox",
+            Self::Documents => "ticket documents",
             Self::AgentIdentity => "agent identity",
             Self::Webhooks => "webhooks",
         }

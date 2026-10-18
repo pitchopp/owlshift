@@ -156,6 +156,22 @@
 //! exit gate kept their `blocks` relation alone in the same way. So a
 //! proposal is given one relation.
 //!
+//! Checked live on 2026-10-19 (OWL-350; build plan, "P5 · Quality pipeline",
+//! part Q) through a client credentials token of the app on OWL-350, the
+//! personal key having passed the same calls on 2026-10-18:
+//!
+//! - `documentCreate(input: { issueId, title, content })` made a document
+//!   attached to the issue, listed in `issue.documents`, with a `url` and the
+//!   app user as its creator; 72,897 characters were accepted.
+//! - `documentUpdate(id, input: { content })` replaced its content in place,
+//!   same id; read back, Linear had stripped the final line break. 250,000
+//!   characters were accepted and 250,001 refused, `INVALID_INPUT`.
+//! - Once deleted (`documentDelete`), the document left the issue's listing,
+//!   yet `documentUpdate` on it still answered `success: true` with
+//!   `archivedAt` set; an unknown id answered `Entity not found: Document`,
+//!   `INPUT_ERROR`. So the update asks for `archivedAt`, and an archived
+//!   document is not found.
+//!
 //! Read only, for `owlshift doctor` (OWL-155, checked 2026-10-14):
 //!
 //! - `teams(filter: { key })` answers `triageEnabled` and the states with
@@ -185,8 +201,9 @@ use owlshift_contracts::ids::TicketId;
 
 pub use crate::graphql::{Response, Transport};
 use crate::tracker::{
-    Author, Blocker, Capability, Column, Comment, Error, ErrorKind, Filed, Found, Gesture, Listed,
-    PROPOSED_LABEL, Person, Proposal, Relations, StateType, Ticket, Tracker, no_delegation,
+    Author, Blocker, Capability, Column, Comment, Document, Error, ErrorKind, Filed, Found,
+    Gesture, Listed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Person, Proposal, Relations, StateType,
+    Ticket, Tracker, no_delegation,
 };
 
 /// Linear's GraphQL endpoint.
@@ -316,6 +333,7 @@ impl LinearTracker {
         Capability::VisibleStage,
         Capability::BlockedBy,
         Capability::ProposalsInbox,
+        Capability::Documents,
     ];
 
     /// The adapter over HTTPS with this key.
@@ -989,6 +1007,59 @@ impl Tracker for LinearTracker {
             )))
         }
     }
+
+    /// `documentCreate` with the issue's identifier, or `documentUpdate` of
+    /// the content alone, through the app when one is set. An update that
+    /// answers the document archived, in Linear's trash, is
+    /// [`ErrorKind::NotFound`], as an unknown id is (checked 2026-10-19,
+    /// above). Content past [`MAX_DOCUMENT_CHARS`] is refused before any
+    /// request.
+    fn publish_document(
+        &self,
+        id: &TicketId,
+        document: Option<&str>,
+        title: &str,
+        content: &str,
+    ) -> Result<Document, Error> {
+        if content.chars().count() > MAX_DOCUMENT_CHARS {
+            return Err(invalid(format!(
+                "a document of {id} holds at most {MAX_DOCUMENT_CHARS} characters"
+            )));
+        }
+        let written = match document {
+            None => {
+                let input = json!({ "issueId": id.as_str(), "title": title, "content": content });
+                let data: DocumentCreateData =
+                    self.write(DOCUMENT_CREATE_MUTATION, json!({ "input": input }))?;
+                data.document_create
+            }
+            Some(document) => {
+                let variables = json!({ "id": document, "input": { "content": content } });
+                let data: DocumentUpdateData = self.write(DOCUMENT_UPDATE_MUTATION, variables)?;
+                data.document_update
+            }
+        };
+        match written {
+            DocumentWrite {
+                success: true,
+                document:
+                    Some(LinearDocument {
+                        archived_at: Some(_),
+                        ..
+                    }),
+            } => Err(Error::new(
+                ErrorKind::NotFound,
+                format!("the document of {id} is in Linear's trash"),
+            )),
+            DocumentWrite {
+                success: true,
+                document: Some(LinearDocument { id, url, .. }),
+            } => Ok(Document { id, url }),
+            _ => Err(invalid(format!(
+                "Linear did not write the document of {id}"
+            ))),
+        }
+    }
 }
 
 impl LinearTracker {
@@ -1193,6 +1264,15 @@ const ADMISSION_USERS_QUERY: &str = "query AdmissionUsers($ids: [ID!]) { \
 
 const PROPOSE_MUTATION: &str = "mutation Propose($input: IssueCreateInput!) { \
     issueCreate(input: $input) { success issue { id identifier state { id name } } } }";
+
+/// A ticket's document, made (OWL-350).
+const DOCUMENT_CREATE_MUTATION: &str = "mutation CreateDocument($input: DocumentCreateInput!) { \
+    documentCreate(input: $input) { success document { id url archivedAt } } }";
+
+/// A ticket's document, its content replaced (OWL-350).
+const DOCUMENT_UPDATE_MUTATION: &str = "mutation UpdateDocument($id: String!, \
+    $input: DocumentUpdateInput!) { documentUpdate(id: $id, input: $input) { \
+    success document { id url archivedAt } } }";
 
 const RELATE_MUTATION: &str = "mutation Relate($input: IssueRelationCreateInput!) { \
     issueRelationCreate(input: $input) { success } }";
@@ -1698,6 +1778,32 @@ struct PostData {
 struct CommentCreate {
     success: bool,
     comment: Option<LinearComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentCreateData {
+    document_create: DocumentWrite,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentUpdateData {
+    document_update: DocumentWrite,
+}
+
+#[derive(Deserialize)]
+struct DocumentWrite {
+    success: bool,
+    document: Option<LinearDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearDocument {
+    id: String,
+    url: Option<String>,
+    archived_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2559,6 +2665,78 @@ mod tests {
 
     fn tracker(bodies: Vec<&'static str>) -> LinearTracker {
         LinearTracker::with_transport(Canned(std::sync::Mutex::new(bodies)))
+    }
+
+    /// A ticket's document is made with the issue's identifier and its
+    /// title, then its content alone is replaced by its id, both through the
+    /// app (OWL-350).
+    #[test]
+    fn a_document_is_made_then_updated_in_place_through_the_app() {
+        let key = Scripted::new(vec![(
+            "Workspace",
+            json!({ "organization": { "id": "org-1" } }),
+        )]);
+        let written = json!({ "success": true, "document": { "id": "d1",
+            "url": "https://linear.app/owlshift/document/plan-owl-1-0123abcd", "archivedAt": null } });
+        let app = Scripted::new(vec![
+            ("App", app_seen(true, "org-1", 1)),
+            ("CreateDocument", json!({ "documentCreate": written })),
+            ("UpdateDocument", json!({ "documentUpdate": written })),
+        ]);
+        let (by_app, sent) = (app.asked.clone(), app.sent.clone());
+        let (tracker, _) = LinearTracker::with_transport(key)
+            .writing_as_app(app, "owl")
+            .unwrap();
+        let id = TicketId::new("OWL-1").unwrap();
+        let made = tracker
+            .publish_document(&id, None, "Plan · OWL-1", "v1")
+            .unwrap();
+        let expected = Document {
+            id: "d1".to_owned(),
+            url: Some("https://linear.app/owlshift/document/plan-owl-1-0123abcd".to_owned()),
+        };
+        assert_eq!(made, expected);
+        let updated = tracker
+            .publish_document(&id, Some("d1"), "Plan · OWL-1", "v2")
+            .unwrap();
+        assert_eq!(updated, expected);
+        assert_eq!(
+            *by_app.lock().unwrap(),
+            ["App", "CreateDocument", "UpdateDocument"]
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent[1],
+            json!({ "input": { "issueId": "OWL-1", "title": "Plan · OWL-1", "content": "v1" } })
+        );
+        assert_eq!(sent[2], json!({ "id": "d1", "input": { "content": "v2" } }));
+    }
+
+    /// A document in Linear's trash, which an update still answers, and an
+    /// unknown one are not found, so the runner makes another; a refusal is
+    /// an error, and content past the cap is refused unsent.
+    #[test]
+    fn a_document_gone_is_not_found_and_a_refused_one_an_error() {
+        let id = TicketId::new("OWL-1").unwrap();
+        let publish = |body: &'static str| {
+            tracker(vec![body])
+                .publish_document(&id, Some("d1"), "Plan · OWL-1", "v2")
+                .unwrap_err()
+                .kind
+        };
+        let trashed = r#"{"data":{"documentUpdate":{"success":true,
+            "document":{"id":"d1","url":null,"archivedAt":"2026-10-18T23:16:49.840Z"}}}}"#;
+        assert_eq!(publish(trashed), ErrorKind::NotFound);
+        let unknown = r#"{"errors":[{"message":"Entity not found: Document",
+            "extensions":{"code":"INPUT_ERROR"}}]}"#;
+        assert_eq!(publish(unknown), ErrorKind::NotFound);
+        let refused = r#"{"data":{"documentUpdate":{"success":false,"document":null}}}"#;
+        assert_eq!(publish(refused), ErrorKind::Other);
+        let long = "y".repeat(MAX_DOCUMENT_CHARS + 1);
+        let error = tracker(Vec::new())
+            .publish_document(&id, None, "Plan · OWL-1", &long)
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Other);
     }
 
     #[test]

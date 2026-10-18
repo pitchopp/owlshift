@@ -57,7 +57,8 @@ use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
 use owlshift_adapters::tracker::{
-    Comment, Error as TrackerError, Filed, PROPOSED_LABEL, Proposal, Tracker,
+    Comment, Document, Error as TrackerError, Filed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Proposal,
+    Tracker,
 };
 use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
@@ -69,7 +70,9 @@ use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
     Verdict as AnswerVerdict, option_letter,
 };
-use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Reviewer, Severity};
+use owlshift_contracts::review::{
+    FindingOutcome, KeptFinding, Mandate, Plan, PlanChange, PlanPart, Reviewer, Severity,
+};
 use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status};
@@ -1677,48 +1680,9 @@ impl PlanComment {
     /// from a model, so each is flattened to one line; the comment is cut to
     /// hold in [`MAX_COMMENT_CHARS`], the findings first.
     pub fn render(&self) -> String {
-        let plan = &self.plan;
-        let mut texts: Vec<Fit> = Vec::new();
-        let mut push = |text: &str| texts.push(Fit::new(flatten(text), PLAN_KEPT));
-        push(&plan.goal);
-        plan.criteria.iter().for_each(|c| push(c));
-        push(&plan.approach);
-        for step in &plan.steps {
-            push(&step.what);
-            push(&step.test);
-        }
-        for fork in &plan.forks {
-            push(&fork.choice);
-            push(&fork.options.join(" / "));
-            push(&fork.reason);
-        }
-        for alternative in &plan.alternatives {
-            push(&alternative.approach);
-            push(&alternative.reason);
-        }
-        plan.files.iter().for_each(|f| push(f));
-        plan.risks.iter().for_each(|r| push(r));
-        plan.out_of_scope.iter().for_each(|o| push(o));
+        let mut texts = plan_texts(&self.plan);
         let (left, rejected) = self.sorted();
-        for (kept, _) in &left {
-            texts.push(Fit::capped(
-                flatten(&kept.finding.claim),
-                FINDING_KEPT,
-                PLAN_FINDING_CHARS,
-            ));
-        }
-        for (_, kept, reason) in &rejected {
-            texts.push(Fit::capped(
-                flatten(&kept.finding.claim),
-                FINDING_KEPT,
-                PLAN_FINDING_CHARS,
-            ));
-            texts.push(Fit::capped(
-                flatten(reason),
-                FINDING_KEPT,
-                PLAN_FINDING_CHARS,
-            ));
-        }
+        finding_texts(&mut texts, &left, &rejected);
         fitted(MAX_COMMENT_CHARS, texts, |texts| {
             self.body(texts, &left, &rejected)
         })
@@ -1727,55 +1691,25 @@ impl PlanComment {
     /// The findings left, each with what became of it, and those rejected,
     /// each with its pass and its reason, the earlier passes' first, each
     /// pass in id order.
-    #[allow(clippy::type_complexity)]
-    fn sorted(
-        &self,
-    ) -> (
-        Vec<(&KeptFinding, &'static str)>,
-        Vec<(u32, &KeptFinding, &str)>,
-    ) {
-        fn reason_of(kept: &KeptFinding) -> &str {
-            kept.ruling
-                .as_ref()
-                .map(|ruling| ruling.reason.as_str())
-                .or(kept
-                    .response
-                    .as_ref()
-                    .map(|response| response.reason.as_str()))
-                .unwrap_or_default()
-        }
-        let mut left = Vec::new();
-        let mut rejected: Vec<(u32, &KeptFinding, &str)> = self
+    fn sorted(&self) -> Sorted<'_> {
+        let (left, mut rejected) = fates(self.pass, &self.findings, &self.not_asked);
+        let mut earlier: Vec<Rejected<'_>> = self
             .earlier
             .iter()
             .filter(|(_, kept)| kept.outcome == Some(FindingOutcome::Rejected))
             .map(|(pass, kept)| (*pass, kept, reason_of(kept)))
             .collect();
-        for kept in &self.findings {
-            match kept.outcome {
-                Some(FindingOutcome::Rejected) => {
-                    rejected.push((self.pass, kept, reason_of(kept)));
-                }
-                Some(FindingOutcome::Asked) => left.push((kept, "asked below")),
-                _ if self.not_asked.contains(&kept.finding.id) => left.push((
-                    kept,
-                    "not asked in this round, past the questions one round holds: the next pass \
-                     reviews the plan again",
-                )),
-                Some(FindingOutcome::Fixed | FindingOutcome::Proposed) => {}
-                None => left.push((kept, "noted for the Build")),
-            }
-        }
-        (left, rejected)
+        earlier.append(&mut rejected);
+        (left, earlier)
+    }
+
+    /// The findings left, as [`PlanPointer::open`] counts them.
+    pub fn open_findings(&self) -> usize {
+        self.sorted().0.len()
     }
 
     /// The body of `texts`, in the order [`Self::render`] gives them.
-    fn body(
-        &self,
-        texts: &[String],
-        left: &[(&KeptFinding, &'static str)],
-        rejected: &[(u32, &KeptFinding, &str)],
-    ) -> String {
+    fn body(&self, texts: &[String], left: &[Left<'_>], rejected: &[Rejected<'_>]) -> String {
         let plan = &self.plan;
         let mut texts = texts.iter();
         let mut next = || texts.next().cloned().unwrap_or_default();
@@ -1783,55 +1717,8 @@ impl PlanComment {
             kind: MarkerKind::Plan,
             round: None,
         };
-        let mut sections = vec![header.render(), format!("**Goal.** {}", next())];
-        let criteria: Vec<String> = plan.criteria.iter().map(|_| next()).collect();
-        sections.push(format!("**Criteria.**\n{}", bullets(&criteria)));
-        sections.push(format!("**Approach.** {}", next()));
-        let steps: Vec<String> = plan
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(n, _)| format!("{}. {} Test: {}", n + 1, next(), next()))
-            .collect();
-        sections.push(format!("**Steps.**\n{}", steps.join("\n")));
-        if plan.forks.is_empty() {
-            sections.push("**Forks.** None.".to_owned());
-        } else {
-            let forks: Vec<String> = plan
-                .forks
-                .iter()
-                .enumerate()
-                .map(|(n, _)| {
-                    format!(
-                        "Fork {}: {} (options: {}). Why: {}",
-                        n + 1,
-                        next(),
-                        next(),
-                        next()
-                    )
-                })
-                .collect();
-            sections.push(format!("**Forks.**\n{}", bullets(&forks)));
-        }
-        let mut list = |title: &str, count: usize, pair: bool| {
-            if count == 0 {
-                return;
-            }
-            let lines: Vec<String> = (0..count)
-                .map(|_| {
-                    if pair {
-                        format!("{}: {}", next(), next())
-                    } else {
-                        next()
-                    }
-                })
-                .collect();
-            sections.push(format!("**{title}.**\n{}", bullets(&lines)));
-        };
-        list("Alternatives set aside", plan.alternatives.len(), true);
-        list("Files", plan.files.len(), false);
-        list("Risks", plan.risks.len(), false);
-        list("Out of scope", plan.out_of_scope.len(), false);
+        let mut sections = vec![header.render()];
+        sections.extend(plan_sections(plan, &mut next));
         let reviewers: Vec<String> = self
             .reviewers
             .iter()
@@ -1867,34 +1754,433 @@ impl PlanComment {
                 .collect();
             sections.push(format!("**Findings rejected.**\n{}", bullets(&lines)));
         }
-        sections.push(
-            match self.next {
-                PlanNext::Build => "**Next.** The Build follows this plan.",
-                // Through the resolver first, unless the setting names the
-                // decider (OWL-342): either may settle what follows.
-                PlanNext::Approval => {
-                    "**Next.** The plan waits for its approval, by a DECISION comment or by the \
-                     decider's answer below."
-                }
-                PlanNext::Findings => {
-                    "**Next.** The findings left are settled by DECISION comments or by the \
-                     decider's answers below; the design runs again with them."
-                }
-            }
-            .to_owned(),
-        );
-        sections.push(
-            Footer {
-                format: Format,
-                kind: MarkerKind::Plan,
-                ticket: self.ticket.clone(),
-                round: None,
-                run: self.run.clone(),
-            }
-            .render(),
-        );
+        sections.push(self.next.line().to_owned());
+        sections.push(plan_footer(&self.ticket, &self.run));
         sections.join("\n\n")
     }
+}
+
+impl PlanNext {
+    /// The PLAN comment's `**Next.**` line.
+    fn line(self) -> &'static str {
+        match self {
+            PlanNext::Build => "**Next.** The Build follows this plan.",
+            // Through the resolver first, unless the setting names the
+            // decider (OWL-342): either may settle what follows.
+            PlanNext::Approval => {
+                "**Next.** The plan waits for its approval, by a DECISION comment or by the \
+                 decider's answer below."
+            }
+            PlanNext::Findings => {
+                "**Next.** The findings left are settled by DECISION comments or by the \
+                 decider's answers below; the design runs again with them."
+            }
+        }
+    }
+}
+
+/// The footer of a PLAN comment.
+fn plan_footer(ticket: &TicketId, run: &Option<String>) -> String {
+    Footer {
+        format: Format,
+        kind: MarkerKind::Plan,
+        ticket: ticket.clone(),
+        round: None,
+        run: run.clone(),
+    }
+    .render()
+}
+
+/// A finding left after its pass, with what became of it.
+type Left<'a> = (&'a KeptFinding, &'static str);
+
+/// A finding rejected, with its pass and the reason.
+type Rejected<'a> = (u32, &'a KeptFinding, &'a str);
+
+/// The findings left and those rejected.
+type Sorted<'a> = (Vec<Left<'a>>, Vec<Rejected<'a>>);
+
+/// The reason a finding was ruled or answered with.
+fn reason_of(kept: &KeptFinding) -> &str {
+    kept.ruling
+        .as_ref()
+        .map(|ruling| ruling.reason.as_str())
+        .or(kept
+            .response
+            .as_ref()
+            .map(|response| response.reason.as_str()))
+        .unwrap_or_default()
+}
+
+/// The findings of pass `pass` left, each with what became of it, and
+/// those rejected, in id order; `not_asked` are those of the pass a round
+/// could not ask.
+fn fates<'a>(pass: u32, findings: &'a [KeptFinding], not_asked: &[FindingId]) -> Sorted<'a> {
+    let mut left = Vec::new();
+    let mut rejected = Vec::new();
+    for kept in findings {
+        match kept.outcome {
+            Some(FindingOutcome::Rejected) => rejected.push((pass, kept, reason_of(kept))),
+            Some(FindingOutcome::Asked) => left.push((kept, "asked below")),
+            _ if not_asked.contains(&kept.finding.id) => left.push((
+                kept,
+                "not asked in this round, past the questions one round holds: the next pass \
+                 reviews the plan again",
+            )),
+            Some(FindingOutcome::Fixed | FindingOutcome::Proposed) => {}
+            None => left.push((kept, "noted for the Build")),
+        }
+    }
+    (left, rejected)
+}
+
+/// The plan's texts, flattened, in the order [`plan_sections`] shows them.
+fn plan_texts(plan: &Plan) -> Vec<Fit> {
+    let mut texts: Vec<Fit> = Vec::new();
+    let mut push = |text: &str| texts.push(Fit::new(flatten(text), PLAN_KEPT));
+    push(&plan.goal);
+    plan.criteria.iter().for_each(|c| push(c));
+    push(&plan.approach);
+    for step in &plan.steps {
+        push(&step.what);
+        push(&step.test);
+    }
+    for fork in &plan.forks {
+        push(&fork.choice);
+        push(&fork.options.join(" / "));
+        push(&fork.reason);
+    }
+    for alternative in &plan.alternatives {
+        push(&alternative.approach);
+        push(&alternative.reason);
+    }
+    plan.files.iter().for_each(|f| push(f));
+    plan.risks.iter().for_each(|r| push(r));
+    plan.out_of_scope.iter().for_each(|o| push(o));
+    texts
+}
+
+/// The texts of findings left and rejected, after the plan's, capped so
+/// that they give way before it.
+fn finding_texts(texts: &mut Vec<Fit>, left: &[Left<'_>], rejected: &[Rejected<'_>]) {
+    let capped = |text: &str| Fit::capped(flatten(text), FINDING_KEPT, PLAN_FINDING_CHARS);
+    for (kept, _) in left {
+        texts.push(capped(&kept.finding.claim));
+    }
+    for (_, kept, reason) in rejected {
+        texts.push(capped(&kept.finding.claim));
+        texts.push(capped(reason));
+    }
+}
+
+/// The plan's sections, from its goal to what is out of scope, each text
+/// taken from `next` in [`plan_texts`]'s order: what a PLAN comment and the
+/// plan's document show alike.
+fn plan_sections(plan: &Plan, next: &mut dyn FnMut() -> String) -> Vec<String> {
+    let mut sections = vec![format!("**Goal.** {}", next())];
+    let criteria: Vec<String> = plan.criteria.iter().map(|_| next()).collect();
+    sections.push(format!("**Criteria.**\n{}", bullets(&criteria)));
+    sections.push(format!("**Approach.** {}", next()));
+    let steps: Vec<String> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(n, _)| format!("{}. {} Test: {}", n + 1, next(), next()))
+        .collect();
+    sections.push(format!("**Steps.**\n{}", steps.join("\n")));
+    if plan.forks.is_empty() {
+        sections.push("**Forks.** None.".to_owned());
+    } else {
+        let forks: Vec<String> = plan
+            .forks
+            .iter()
+            .enumerate()
+            .map(|(n, _)| {
+                format!(
+                    "Fork {}: {} (options: {}). Why: {}",
+                    n + 1,
+                    next(),
+                    next(),
+                    next()
+                )
+            })
+            .collect();
+        sections.push(format!("**Forks.**\n{}", bullets(&forks)));
+    }
+    let mut list = |title: &str, count: usize, pair: bool| {
+        if count == 0 {
+            return;
+        }
+        let lines: Vec<String> = (0..count)
+            .map(|_| {
+                if pair {
+                    format!("{}: {}", next(), next())
+                } else {
+                    next()
+                }
+            })
+            .collect();
+        sections.push(format!("**{title}.**\n{}", bullets(&lines)));
+    };
+    list("Alternatives set aside", plan.alternatives.len(), true);
+    list("Files", plan.files.len(), false);
+    list("Risks", plan.risks.len(), false);
+    list("Out of scope", plan.out_of_scope.len(), false);
+    sections
+}
+
+/// The most characters a PLAN comment that points to the plan's document
+/// takes (OWL-350, architecture section 5, "Kept and shown"), for a document
+/// link of [`MAX_POINTER_URL_CHARS`] at most.
+pub const MAX_POINTER_CHARS: usize = 800;
+
+/// The longest document link [`MAX_POINTER_CHARS`] is pinned for, beside
+/// the longest ticket id: Linear's are about 60 characters
+/// (`https://linear.app/<workspace>/document/plan-<ticket>-<hex>`, OWL-350's
+/// live check).
+pub const MAX_POINTER_URL_CHARS: usize = 120;
+
+/// Why a text is cut in the plan's document.
+const DOCUMENT_KEPT: &str = "the ticket's record keeps it whole";
+
+/// One Design review pass, as the plan's document logs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentPass {
+    /// The pass, from 1.
+    pub pass: u32,
+    pub reviewers: Vec<PlanReviewer>,
+    /// Its findings, as the ticket's review record keeps them.
+    pub findings: Vec<KeptFinding>,
+}
+
+/// The plan's document (OWL-350, architecture section 5, "Kept and shown"):
+/// the plan whole, then its review log, each Design review pass of the loop
+/// with its reviewers, the findings it left and those it rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanDocument {
+    pub ticket: TicketId,
+    pub plan: Plan,
+    /// The plan's version, from 1.
+    pub version: u32,
+    /// The passes of the loop, oldest first, the one that just ended last.
+    pub passes: Vec<DocumentPass>,
+    /// Findings of the last pass a round could not ask.
+    pub not_asked: Vec<FindingId>,
+}
+
+impl PlanDocument {
+    /// The document's title: `Plan · <ticket>`.
+    pub fn title(&self) -> String {
+        format!("Plan · {}", self.ticket)
+    }
+
+    /// The document's Markdown, within [`MAX_DOCUMENT_CHARS`]: the texts are
+    /// cut as a PLAN comment's are, the findings first; a review log whose
+    /// frame alone would not hold leaves out its oldest passes, said in a
+    /// line.
+    pub fn render(&self) -> String {
+        let mut body = String::new();
+        for skip in 0..self.passes.len().max(1) {
+            body = self.render_from(skip);
+            if chars(&body) <= MAX_DOCUMENT_CHARS {
+                break;
+            }
+        }
+        body
+    }
+
+    /// The document with the passes after the first `skip`.
+    fn render_from(&self, skip: usize) -> String {
+        let passes = &self.passes[skip.min(self.passes.len())..];
+        let last = self.passes.last().map(|pass| pass.pass);
+        let sorted: Vec<Sorted<'_>> = passes
+            .iter()
+            .map(|pass| {
+                let not_asked: &[FindingId] = if Some(pass.pass) == last {
+                    &self.not_asked
+                } else {
+                    &[]
+                };
+                fates(pass.pass, &pass.findings, not_asked)
+            })
+            .collect();
+        let mut texts = plan_texts(&self.plan);
+        for (left, rejected) in &sorted {
+            finding_texts(&mut texts, left, rejected);
+        }
+        let texts: Vec<Fit> = texts
+            .into_iter()
+            .map(|fit| Fit {
+                why: DOCUMENT_KEPT,
+                ..fit
+            })
+            .collect();
+        fitted(MAX_DOCUMENT_CHARS, texts, |texts| {
+            let mut texts = texts.iter();
+            let mut next = || texts.next().cloned().unwrap_or_default();
+            let mut sections = vec![format!(
+                "Version {}, after design review pass {}.",
+                self.version,
+                last.unwrap_or(1)
+            )];
+            sections.extend(plan_sections(&self.plan, &mut next));
+            sections.push("## Review log".to_owned());
+            if skip > 0 {
+                sections.push(format!(
+                    "Passes 1 to {} are left out, past what the document holds: the ticket's \
+                     review record keeps them.",
+                    self.passes[skip - 1].pass
+                ));
+            }
+            for (pass, (left, rejected)) in passes.iter().zip(&sorted) {
+                let reviewers: Vec<String> = pass
+                    .reviewers
+                    .iter()
+                    .map(|reviewer| reviewer_line(reviewer, "the design run's"))
+                    .collect();
+                let mut lines = vec![format!("### Design review, pass {}", pass.pass)];
+                lines.push(if reviewers.is_empty() {
+                    "No reviewer named.".to_owned()
+                } else {
+                    format!("Reviewers:\n{}", bullets(&reviewers))
+                });
+                if !left.is_empty() {
+                    let found: Vec<String> = left
+                        .iter()
+                        .map(|(kept, fate)| format!("{}: {} ({fate})", finding_label(kept), next()))
+                        .collect();
+                    lines.push(format!("**Findings left.**\n{}", bullets(&found)));
+                }
+                if !rejected.is_empty() {
+                    let found: Vec<String> = rejected
+                        .iter()
+                        .map(|(_, kept, _)| {
+                            format!("{}: {} Rejected: {}", finding_label(kept), next(), next())
+                        })
+                        .collect();
+                    lines.push(format!("**Findings rejected.**\n{}", bullets(&found)));
+                }
+                if left.is_empty() && rejected.is_empty() {
+                    lines.push("No finding left or rejected.".to_owned());
+                }
+                sections.push(lines.join("\n\n"));
+            }
+            sections.join("\n\n")
+        })
+    }
+}
+
+/// The PLAN comment on a tracker with documents (OWL-350): a pointer to the
+/// plan's document, within [`MAX_POINTER_CHARS`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanPointer {
+    pub ticket: TicketId,
+    /// The plan's version, from 1.
+    pub version: u32,
+    /// The review pass that ended, from 1.
+    pub pass: u32,
+    /// The document's link, as the tracker gave it.
+    pub url: Option<String>,
+    /// What changed since the version before.
+    pub change: PlanChange,
+    /// The plan's forks.
+    pub forks: usize,
+    /// The findings the pass left: asked, noted, or not asked.
+    pub open: usize,
+    pub next: PlanNext,
+    /// The design run that wrote the plan.
+    pub run: Option<String>,
+}
+
+impl PlanPointer {
+    /// The comment body: the `[owlshift] PLAN` header, the version and the
+    /// pass with the document's link, what changed in at most three bullets,
+    /// the forks and the findings open, what follows, and the footer. Every
+    /// text is the runner's but the link, which a person opens: an `https`
+    /// one is a link, another is shown as code beside the title.
+    pub fn render(&self) -> String {
+        const WHAT: &str = "the plan and its review log";
+        let document = match self.url.as_deref() {
+            Some(url) if safe_url(url) => link(WHAT, url),
+            Some(url) => format!("{WHAT}, {}", code(url)),
+            None => format!("{WHAT}, in the ticket's document Plan · {}", self.ticket),
+        };
+        let header = Header {
+            kind: MarkerKind::Plan,
+            round: None,
+        };
+        let change = match &self.change {
+            PlanChange::First => "First version of the plan.".to_owned(),
+            PlanChange::Unchanged => "Unchanged since the previous PLAN comment.".to_owned(),
+            PlanChange::Changed { since, parts } => format!(
+                "**Changed since version {since}.**\n{}",
+                bullets(&change_bullets(parts))
+            ),
+        };
+        [
+            header.render(),
+            format!(
+                "**Plan version {}, design review pass {}:** {document}.",
+                self.version, self.pass
+            ),
+            change,
+            format!(
+                "**Forks:** {}. **Findings open:** {}.",
+                self.forks, self.open
+            ),
+            self.next.line().to_owned(),
+            plan_footer(&self.ticket, &self.run),
+        ]
+        .join("\n\n")
+    }
+}
+
+/// A part of the plan in words, as a PLAN comment names it.
+fn part_name(part: PlanPart) -> &'static str {
+    match part {
+        PlanPart::Goal => "the goal",
+        PlanPart::Criteria => "the success criteria",
+        PlanPart::Approach => "the approach",
+        PlanPart::Steps => "the steps",
+        PlanPart::Forks => "the forks",
+        PlanPart::Alternatives => "the alternatives set aside",
+        PlanPart::Files => "the files",
+        PlanPart::Risks => "the risks",
+        PlanPart::OutOfScope => "what is out of scope",
+    }
+}
+
+/// What changed, in at most three bullets: one per part, or, past three,
+/// the first two and the others together.
+fn change_bullets(parts: &[PlanPart]) -> Vec<String> {
+    let changed = |part: PlanPart| {
+        let name = part_name(part);
+        let mut chars = name.chars();
+        let first = chars.next().map(|c| c.to_ascii_uppercase());
+        format!(
+            "{}{} changed.",
+            first.into_iter().collect::<String>(),
+            chars.as_str()
+        )
+    };
+    if parts.len() <= 3 {
+        return parts.iter().map(|part| changed(*part)).collect();
+    }
+    let rest: Vec<&str> = parts[2..]
+        .iter()
+        .map(|part| {
+            let name = part_name(*part);
+            name.strip_prefix("the ").unwrap_or(name)
+        })
+        .collect();
+    let (last, others) = rest
+        .split_last()
+        .expect("past three parts, two at least remain");
+    vec![
+        changed(parts[0]),
+        changed(parts[1]),
+        format!("Also changed: {} and {last}.", others.join(", ")),
+    ]
 }
 
 /// A reviewer as a PLAN comment or a DELIVERY report names it: its
@@ -2929,6 +3215,25 @@ impl<'a> Writer<'a> {
         self.post(&comment.ticket, &comment.render())
     }
 
+    /// Publishes the plan's document (OWL-350): a new one with `document`
+    /// `None`, else that one updated in place.
+    pub fn publish_plan(
+        &self,
+        document: Option<&str>,
+        plan: &PlanDocument,
+    ) -> Result<Document, WriteError> {
+        floor::check_action(Action::Document, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.tracker
+            .publish_document(&plan.ticket, document, &plan.title(), &plan.render())
+            .map_err(WriteError::Tracker)
+    }
+
+    /// Posts a PLAN comment that points to the plan's document and returns
+    /// it as the tracker recorded it (OWL-350).
+    pub fn post_plan_pointer(&self, comment: &PlanPointer) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
     /// Posts a RESUME comment and returns it as the tracker recorded it.
     pub fn post_resume(&self, comment: &ResumeComment) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
@@ -3818,6 +4123,219 @@ Merge state reported by the forge: `CLEAN`.
         assert!(body.contains("(cut: the ticket's review record keeps it whole)"));
         let marked = MarkedComment::parse(&body).unwrap().unwrap();
         assert_eq!(marked.footer.unwrap().kind, MarkerKind::Plan);
+    }
+
+    /// OWL-350: the PLAN comment that points to the plan's document holds in
+    /// [`MAX_POINTER_CHARS`] whatever it says: the longest ticket id, a
+    /// link of [`MAX_POINTER_URL_CHARS`], a run id longer than the runner's,
+    /// the longest change and next step; it is a marked PLAN comment.
+    #[test]
+    fn a_plan_pointer_holds_in_its_bound() {
+        let ticket = TicketId::new(format!("A{}", "B".repeat(63))).unwrap();
+        let url = format!(
+            "https://linear.app/{}",
+            "x".repeat(MAX_POINTER_URL_CHARS - 19)
+        );
+        assert_eq!(chars(&url), MAX_POINTER_URL_CHARS);
+        let pointer = PlanPointer {
+            ticket,
+            version: u32::MAX,
+            pass: u32::MAX,
+            url: Some(url.clone()),
+            change: PlanChange::Changed {
+                since: NonZeroU32::new(u32::MAX - 1).unwrap(),
+                parts: PlanPart::ALL.to_vec(),
+            },
+            forks: usize::MAX,
+            open: usize::MAX,
+            next: PlanNext::Findings,
+            run: Some("20261019T011425Z-4294967295".to_owned()),
+        };
+        let body = pointer.render();
+        assert!(
+            chars(&body) <= MAX_POINTER_CHARS,
+            "{}\n{body}",
+            chars(&body)
+        );
+        assert!(body.contains(&format!("({url})")), "{body}");
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Plan);
+        assert_eq!(marked.footer.unwrap().kind, MarkerKind::Plan);
+    }
+
+    /// OWL-350: the pointer names the parts that changed in plain words, at
+    /// most three bullets; a first version and an unchanged plan say so; a
+    /// link that is not `https` is shown as code beside the title.
+    #[test]
+    fn a_plan_pointer_says_what_changed_in_three_bullets_at_most() {
+        let pointer = |change: PlanChange, url: &str| {
+            PlanPointer {
+                ticket: TicketId::new("OWL-1").unwrap(),
+                version: 3,
+                pass: 2,
+                url: Some(url.to_owned()),
+                change,
+                forks: 1,
+                open: 2,
+                next: PlanNext::Approval,
+                run: None,
+            }
+            .render()
+        };
+        let link = "https://linear.app/owlshift/document/plan-owl-1-0123abcd";
+        let changed = |parts: &[PlanPart]| PlanChange::Changed {
+            since: NonZeroU32::new(2).unwrap(),
+            parts: parts.to_vec(),
+        };
+        let three = pointer(
+            changed(&[PlanPart::Goal, PlanPart::Steps, PlanPart::OutOfScope]),
+            link,
+        );
+        for text in [
+            "[owlshift] PLAN\n\n**Plan version 3, design review pass 2:** [the plan and its \
+             review log](https://linear.app/owlshift/document/plan-owl-1-0123abcd).",
+            "**Changed since version 2.**\n- The goal changed.\n- The steps changed.\n- What is \
+             out of scope changed.\n\n**Forks:** 1. **Findings open:** 2.\n\n**Next.** The plan \
+             waits for its approval",
+        ] {
+            assert!(three.contains(text), "{text}\n---\n{three}");
+        }
+        let many = pointer(
+            changed(&[
+                PlanPart::Approach,
+                PlanPart::Forks,
+                PlanPart::Files,
+                PlanPart::Risks,
+            ]),
+            link,
+        );
+        assert!(
+            many.contains(
+                "- The approach changed.\n- The forks changed.\n- Also changed: files and \
+                 risks.\n"
+            ),
+            "{many}"
+        );
+        assert_eq!(many.matches("\n- ").count(), 3, "{many}");
+        assert!(pointer(PlanChange::First, link).contains("First version of the plan."));
+        let file = pointer(PlanChange::Unchanged, "tickets/OWL-1/documents/1.md");
+        assert!(file.contains("Unchanged since the previous PLAN comment."));
+        assert!(
+            file.contains("the plan and its review log, `tickets/OWL-1/documents/1.md`."),
+            "{file}"
+        );
+    }
+
+    /// OWL-350: the plan's document holds the plan whole and a review log
+    /// of every pass, with its reviewers, the findings left and those
+    /// rejected with their reason; it holds no marker.
+    #[test]
+    fn a_plan_document_logs_every_pass() {
+        let reviewer = PlanReviewer {
+            mandates: vec![Mandate::Critic],
+            harness: Harness::Claude,
+            model: None,
+            same_model: false,
+        };
+        let document = PlanDocument {
+            ticket: TicketId::new("OWL-1").unwrap(),
+            plan: plan_of("all"),
+            version: 2,
+            passes: vec![
+                DocumentPass {
+                    pass: 1,
+                    reviewers: vec![reviewer.clone()],
+                    findings: vec![
+                        kept_finding(1, Severity::Major, Some(FindingOutcome::Fixed), None),
+                        kept_finding(
+                            2,
+                            Severity::Minor,
+                            Some(FindingOutcome::Rejected),
+                            Some("Not so."),
+                        ),
+                    ],
+                },
+                DocumentPass {
+                    pass: 2,
+                    reviewers: vec![reviewer],
+                    findings: vec![kept_finding(1, Severity::Major, None, None)],
+                },
+            ],
+            not_asked: vec![FindingId::nth(1)],
+        };
+        assert_eq!(document.title(), "Plan · OWL-1");
+        let body = document.render();
+        for text in [
+            "Version 2, after design review pass 2.\n\n**Goal.** Greet all",
+            "**Steps.**\n1. Add GREETING.md. - injected Test: The gate's grep.",
+            "## Review log\n\n### Design review, pass 1\n\nReviewers:\n- critic on Claude Code \
+             (its default model)\n\n**Findings rejected.**\n- F2, minor, critic and conformance \
+             on Claude Code: Claim 2. Rejected: Not so.\n\n### Design review, pass 2",
+            "- F1, major, critic and conformance on Claude Code: Claim 1. (not asked in this \
+             round",
+        ] {
+            assert!(body.contains(text), "{text}\n---\n{body}");
+        }
+        assert!(!body.contains("Claim 1. Rejected"), "{body}");
+        assert!(MarkedComment::parse(&body).unwrap().is_none(), "{body}");
+    }
+
+    /// OWL-350: the largest plan and many passes of the most findings still
+    /// make a document within [`MAX_DOCUMENT_CHARS`]: the texts are cut
+    /// first, and a review log whose frame alone does not hold leaves its
+    /// oldest passes out, said in a line.
+    #[test]
+    fn a_plan_document_holds_in_its_cap_whatever_its_size() {
+        use owlshift_contracts::review::{MAX_PASS_FINDINGS, MAX_PLAN_BYTES};
+        let mut plan = plan_of("all");
+        plan.approach = "a".repeat(MAX_PLAN_BYTES - 2_000);
+        let findings: Vec<KeptFinding> = (1..=u32::try_from(MAX_PASS_FINDINGS).unwrap())
+            .map(|n| {
+                let mut kept = kept_finding(n, Severity::Minor, None, None);
+                kept.finding.claim = "c".repeat(7_000);
+                kept
+            })
+            .collect();
+        let cut = PlanDocument {
+            ticket: TicketId::new("OWL-1").unwrap(),
+            plan: plan.clone(),
+            version: 1,
+            passes: vec![DocumentPass {
+                pass: 1,
+                reviewers: Vec::new(),
+                findings: findings.clone(),
+            }],
+            not_asked: Vec::new(),
+        }
+        .render();
+        assert!(chars(&cut) <= MAX_DOCUMENT_CHARS, "{}", chars(&cut));
+        assert!(cut.contains("(cut: the ticket's record keeps it whole)"));
+        // Short findings: their labels and fates, not their texts, fill it.
+        let short: Vec<KeptFinding> = findings
+            .into_iter()
+            .map(|mut kept| {
+                kept.finding.claim = "c".to_owned();
+                kept
+            })
+            .collect();
+        let long = PlanDocument {
+            ticket: TicketId::new("OWL-1").unwrap(),
+            plan,
+            version: 1,
+            passes: (1..=25)
+                .map(|pass| DocumentPass {
+                    pass,
+                    reviewers: Vec::new(),
+                    findings: short.clone(),
+                })
+                .collect(),
+            not_asked: Vec::new(),
+        }
+        .render();
+        assert!(chars(&long) <= MAX_DOCUMENT_CHARS, "{}", chars(&long));
+        assert!(long.contains("### Design review, pass 25"));
+        assert!(!long.contains("### Design review, pass 1\n"));
+        assert!(long.contains("are left out, past what the document holds"));
     }
 
     #[test]

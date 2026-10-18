@@ -33,6 +33,12 @@
 //! and the largest round a valid result can ask reaches it in parts through
 //! the Writer, each read back verbatim
 //! (`a_maximal_question_round_reaches_linear_in_parts`).
+//!
+//! OWL-350's check runs the same way, on an issue of its own: the plan's
+//! document is made, then updated in place, through the app and the
+//! Writer; the PLAN comment that points to it holds in its bound; once in
+//! Linear's trash, the document is not found
+//! (`a_plan_document_reaches_linear_through_the_app`).
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -41,19 +47,23 @@ use serde_json::{Value, json};
 
 use owlshift_adapters::tracker::linear::app::{ClientCredentials, HttpOAuth, OAuth};
 use owlshift_adapters::tracker::linear::{ApiKey, HttpTransport, Transport};
-use owlshift_adapters::tracker::{Author, Tracker};
+use owlshift_adapters::tracker::{Author, ErrorKind, Tracker};
 use owlshift_contracts::brief::{MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES};
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::ids::{QuestionId, TicketId};
 use owlshift_contracts::result::{
     MAX_QUESTIONS, Question, QuestionOption, Recommendation, RefusedChoice,
 };
+use owlshift_contracts::review::{Plan, PlanChange, PlanStep};
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::secrets::TrackerAccounts;
 use owlshift_runner::tracker::{
     LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, linear, read,
 };
-use owlshift_runner::writer::{MAX_COMMENT_CHARS, QuestionsComment, ReopenedChoice, Writer};
+use owlshift_runner::writer::{
+    MAX_COMMENT_CHARS, MAX_POINTER_CHARS, PlanDocument, PlanNext, PlanPointer, QuestionsComment,
+    ReopenedChoice, WriteError, Writer,
+};
 
 const TEAM: &str = "OWL";
 
@@ -493,5 +503,190 @@ fn a_maximal_question_round_reaches_linear_in_parts() {
     assert!(verbatim, "Linear did not keep a part");
     assert!(marked);
     assert!(returned);
+    drop(tracker);
+}
+
+/// Deletes a document when dropped, and says whether Linear confirms it.
+struct DocumentCleanup {
+    key: ApiKey,
+    document: Option<String>,
+}
+
+impl Drop for DocumentCleanup {
+    fn drop(&mut self) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let done = HttpTransport::new(self.key.clone())
+            .send(&json!({
+                "query": "mutation D($id: String!) { documentDelete(id: $id) { success } }",
+                "variables": { "id": document },
+            }))
+            .map(|r| r.body.contains("\"success\":true"))
+            .unwrap_or(false);
+        println!("cleanup documentDelete: {done}");
+    }
+}
+
+/// OWL-350's live acceptance: the plan's document made, then updated in
+/// place, through the app and the Writer, with the short PLAN comment that
+/// points to it; a document in Linear's trash is not found, so the runner
+/// makes another.
+#[test]
+#[ignore = "live: writes to Linear through the app; set LINEAR_ENV_FILE"]
+fn a_plan_document_reaches_linear_through_the_app() {
+    let env = env();
+    let key = ApiKey::new(env.key.clone());
+    let workspace = query(&key, "{ organization { urlKey } }", json!({}));
+    assert_eq!(
+        workspace["organization"]["urlKey"], "owlshift",
+        "the Owlshift workspace only"
+    );
+    let teams = query(
+        &key,
+        "query T($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id } } }",
+        json!({ "key": TEAM }),
+    );
+    let team = teams["teams"]["nodes"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let created = query(
+        &key,
+        "mutation C($input: IssueCreateInput!) { issueCreate(input: $input) { success \
+         issue { id identifier } } }",
+        json!({ "input": {
+            "teamId": team,
+            "title": "[owlshift] OWL-350 live check: the plan's document (deleted by the check)",
+            "description": "Created by `linear_app_live`. Safe to ignore: the check deletes it.",
+        } }),
+    );
+    let issue = &created["issueCreate"]["issue"];
+    let mut cleanup = Cleanup {
+        key: key.clone(),
+        issue: issue["id"].as_str().unwrap().to_owned(),
+        comments: Vec::new(),
+    };
+    let ticket = TicketId::new(issue["identifier"].as_str().unwrap()).unwrap();
+    println!("test issue: {ticket}");
+    let mut documents = DocumentCleanup {
+        key: key.clone(),
+        document: None,
+    };
+
+    let keychain = Keychain::in_memory();
+    for (account, value) in [
+        (LINEAR_ACCOUNT, &env.key),
+        (LINEAR_APP_ID_ACCOUNT, &env.id),
+        (LINEAR_APP_SECRET_ACCOUNT, &env.secret),
+    ] {
+        keychain
+            .store(account, &Secret::new(value.as_str()))
+            .unwrap();
+    }
+    let stored = read(&keychain, &TrackerAccounts::shared()).unwrap();
+    let tracker = linear(&stored, TEAM).unwrap_or_else(|e| panic!("{e}"));
+    let writer = Writer::new(&tracker);
+    let plan = |approach: &str| PlanDocument {
+        ticket: ticket.clone(),
+        plan: Plan {
+            goal: "Check the plan's document.".to_owned(),
+            criteria: vec!["It is made, then updated in place.".to_owned()],
+            approach: approach.to_owned(),
+            alternatives: Vec::new(),
+            files: Vec::new(),
+            steps: vec![PlanStep {
+                what: "Publish it.".to_owned(),
+                test: "Read it back.".to_owned(),
+            }],
+            risks: Vec::new(),
+            out_of_scope: Vec::new(),
+            forks: Vec::new(),
+        },
+        version: 1,
+        passes: Vec::new(),
+        not_asked: Vec::new(),
+    };
+
+    // 1. Made, through the app.
+    let made = writer
+        .publish_plan(None, &plan("The first approach."))
+        .unwrap_or_else(|e| panic!("{e}"));
+    documents.document = Some(made.id.clone());
+    let read_back = |id: &str| {
+        query(
+            &key,
+            "query R($issue: String!, $id: String!) { issue(id: $issue) { documents { nodes \
+             { id } } } document(id: $id) { title content creator { app } } }",
+            json!({ "issue": ticket.as_str(), "id": id }),
+        )
+    };
+    let first = read_back(&made.id);
+    let listed = first["issue"]["documents"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|node| node["id"] == made.id.as_str());
+    println!(
+        "document made: listed on the issue {listed}, title {}, creator.app {}, url {}",
+        first["document"]["title"],
+        first["document"]["creator"]["app"],
+        made.url.is_some()
+    );
+
+    // 2. Updated in place.
+    let updated = writer
+        .publish_plan(Some(&made.id), &plan("The second approach."))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let second = read_back(&made.id);
+    let content = second["document"]["content"].as_str().unwrap_or_default();
+    println!(
+        "document updated: same id {}, holds the second approach {}",
+        updated.id == made.id,
+        content.contains("The second approach.")
+    );
+
+    // 3. The pointer, through the Writer.
+    let pointer = PlanPointer {
+        ticket: ticket.clone(),
+        version: 1,
+        pass: 1,
+        url: updated.url.clone(),
+        change: PlanChange::First,
+        forks: 0,
+        open: 0,
+        next: PlanNext::Build,
+        run: None,
+    };
+    let posted = writer.post_plan_pointer(&pointer).unwrap();
+    cleanup.comments.push(posted.id.clone());
+    let back = tracker.comments(&ticket).unwrap();
+    let back = back.iter().find(|c| c.id == posted.id).expect("read back");
+    let size = back.body.chars().count();
+    println!(
+        "pointer: {size} characters, read back verbatim {}, links the document {}",
+        back.body == posted.body,
+        back.body.contains(updated.url.as_deref().unwrap_or("none"))
+    );
+
+    // 4. Deleted, it is not found, so the runner would make another.
+    query(
+        &key,
+        "mutation D($id: String!) { documentDelete(id: $id) { success } }",
+        json!({ "id": made.id }),
+    );
+    let gone = writer.publish_plan(Some(&made.id), &plan("The third approach."));
+    let not_found = matches!(&gone, Err(WriteError::Tracker(e)) if e.kind == ErrorKind::NotFound);
+    println!("document in the trash, then updated: not found {not_found}");
+    documents.document = None;
+
+    assert!(listed, "the document is not on the issue");
+    assert_eq!(first["document"]["creator"]["app"], true);
+    assert_eq!(first["document"]["title"], format!("Plan · {ticket}"));
+    assert_eq!(updated.id, made.id);
+    assert!(content.contains("The second approach."), "{content}");
+    assert!(size <= MAX_POINTER_CHARS);
+    assert_eq!(back.body, posted.body);
+    assert!(not_found, "{gone:?}");
     drop(tracker);
 }
