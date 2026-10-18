@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 static RUNS: Mutex<()> = Mutex::new(());
 use std::time::Duration;
 
+use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -23,6 +24,7 @@ use tempfile::TempDir;
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::{Repo, Verdict};
 use owlshift_adapters::graphql::{Response, RestAnswer, Transport};
+use owlshift_adapters::harness::codex;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{self, Capability, Comment, Ticket, Tracker};
 use owlshift_contracts::brief::{
@@ -9377,6 +9379,95 @@ fn watch_resumes_an_intake_cut_off_after_its_answered_round() {
         .collect();
     assert_eq!(resumed.len(), 1, "{resumed:?}");
     assert_eq!(resumed[0]["watch"], json!("continue"));
+}
+
+/// OWL-341: a Codex usage limit gives its reset time in the message only, as
+/// wall-clock text. The reset time the Codex adapter reads from "try again at
+/// 3:54 AM." stops the run, is the pause watch prints, and holds it: nothing
+/// runs in the pass before the reset, and a pass past it resumes the ticket.
+/// The fake harness stands for the Codex run, which the bench cannot confine:
+/// its reply carries the time the real parser read.
+#[test]
+fn watch_holds_a_pause_until_the_reset_time_read_from_a_codex_message() {
+    let bench = Bench::drained();
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"scope","context":"The ticket names no language.",
+                "text":"Which language should the greeting use?","recommendation":{"why":"The simplest reading of the ticket."}}]"#,
+        )),
+    );
+    bench
+        .intake(vec![asks], gesture("maintainer"))
+        .expect_err("questions");
+    bench.answer("English.");
+    // The message is read at the bench's clock, 09:00Z, in UTC: the next
+    // 03:54 is the next day's.
+    let parsed = codex::reset_time(
+        "You've hit your usage limit. … try again at 3:54 AM.",
+        bench.clock.get(),
+        &TimeZone::UTC,
+    );
+    assert_eq!(parsed, Some("2026-10-03T03:54:00Z".parse().unwrap()));
+    let reset = parsed.unwrap();
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some(reset);
+    let replies = vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+        limited,
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+    ];
+    let intakes = || {
+        bench
+            .briefs()
+            .iter()
+            .filter(|brief| brief.role == Role::Intake)
+            .count()
+    };
+    let mut pass = 0;
+    let (outcomes, lines, _) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        match pass {
+            // Cut off by the limit.
+            1 => assert_eq!(intakes(), 2),
+            // Paused until the reset: the pass started nothing. Past it now.
+            2 => {
+                assert_eq!(intakes(), 2);
+                assert_eq!(bench.briefs().len(), 3);
+                let past = reset.duration_since(bench.clock.get()) + SignedDuration::from_mins(1);
+                bench.waited.set(past);
+            }
+            _ => return false,
+        }
+        true
+    });
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}");
+    assert!(
+        matches!(
+            outcomes[0],
+            Err(Stop::UsageLimit {
+                resets_at: Some(at)
+            }) if at == reset
+        ),
+        "{outcomes:?}"
+    );
+    assert!(
+        matches!(outcomes[1], Err(Stop::Ready { .. })),
+        "{outcomes:?}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "no ticket is continued before the usage limit resets at {reset}"
+        )),
+        "{lines}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(
+        roles,
+        [Role::Intake, Role::AnswerCheck, Role::Intake, Role::Intake]
+    );
 }
 
 /// OWL-273: watch leaves a ticket at Intake shown in another stage than
