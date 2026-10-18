@@ -414,8 +414,7 @@ impl Harness for ClaudeHarness {
             log.stdout(line);
         })?;
         log.stderr(&ran.stderr);
-        let read_only = run.brief.permissions.level == PermissionLevel::ReadOnly;
-        Ok(claude_end(ran, read_only))
+        Ok(claude_end(ran, run.brief.permissions.level))
     }
 
     /// The folders `claude` is installed in (the one on the `PATH` and the
@@ -475,11 +474,20 @@ pub fn prompt_with_brief(prompt: &str) -> String {
     )
 }
 
-/// What a Claude Code run reported, as the executor reads it: an MCP server
-/// or an API-key source in its `init` event is a credential finding. The
-/// final message of a completed run comes along when `read_only`, and the
-/// refused tools always.
-fn claude_end(run: claude::Run, read_only: bool) -> HarnessEnd {
+/// What a Claude Code run at `level` reported, as the executor reads it: an
+/// MCP server or an API-key source in its `init` event is a credential
+/// finding. The final message of a completed read-only run comes along, and
+/// the refused tools always.
+///
+/// A run that completed in another permission mode than the one asked,
+/// as its `init` event reports it, failed (OWL-346): under managed settings
+/// that disable bypass mode, a write-in-worktree run falls back to `default`
+/// and every edit is refused, with exit status 0 and no other sign. A run
+/// that failed keeps its own reason, and a mode the run did not report is
+/// not judged. A failed write-in-worktree run that Claude Code refused to
+/// start as root says so (`ROOT_REFUSAL`).
+fn claude_end(run: claude::Run, level: PermissionLevel) -> HarnessEnd {
+    let read_only = level == PermissionLevel::ReadOnly;
     let mut permission_denials: Vec<String> = Vec::new();
     for tool in &run.permission_denials {
         if !permission_denials.contains(tool) {
@@ -490,12 +498,27 @@ fn claude_end(run: claude::Run, read_only: bool) -> HarnessEnd {
         claude::Outcome::Completed { text } if read_only => Some(text.clone()),
         _ => None,
     };
+    let asked = claude::permission_mode(level);
     let status = match &run.outcome {
-        claude::Outcome::Completed { .. } => HarnessStatus::Completed,
+        claude::Outcome::Completed { .. } => match run.permission_mode.as_deref() {
+            Some(ran) if ran != asked => HarnessStatus::Failed(mode_changed(ran, asked)),
+            _ => HarnessStatus::Completed,
+        },
         claude::Outcome::UsageLimit { resets_at, .. } => HarnessStatus::UsageLimit {
             resets_at: *resets_at,
         },
-        claude::Outcome::Failed(failure) => HarnessStatus::Failed(describe(failure)),
+        claude::Outcome::Failed(failure) => {
+            let mut reason = describe(failure);
+            if level == PermissionLevel::WriteWorktree
+                && String::from_utf8_lossy(&run.stderr).contains(ROOT_REFUSAL)
+            {
+                reason.push_str(&format!(
+                    ": Claude Code refuses the `{asked}` mode of a write-in-worktree run to a \
+                     process running as root; run Owlshift as a normal user"
+                ));
+            }
+            HarnessStatus::Failed(reason)
+        }
     };
     HarnessEnd {
         exit_code: run.exit_code,
@@ -510,6 +533,26 @@ fn claude_end(run: claude::Run, read_only: bool) -> HarnessEnd {
         message,
         permission_denials,
     }
+}
+
+/// What Claude Code prints on standard error, then exits 1 before any
+/// event, when asked for `bypassPermissions` by a process running as root
+/// outside a sandbox it recognises (read in the 2.1.302 binary, OWL-346).
+const ROOT_REFUSAL: &str = "cannot be used with root/sudo privileges";
+
+/// The reason of a run that completed in mode `ran` when `asked` was asked.
+fn mode_changed(ran: &str, asked: &str) -> String {
+    let mut reason = format!(
+        "Claude Code ran in permission mode `{ran}`, not `{asked}` as Owlshift asked: a setting \
+         outside Owlshift's command line changed it, such as the machine's managed settings"
+    );
+    if asked == claude::permission_mode(PermissionLevel::WriteWorktree) {
+        reason.push_str(
+            "; `permissions.disableBypassPermissionsMode` set to `disable` does this, and a \
+             write-in-worktree run can then edit nothing",
+        );
+    }
+    reason
 }
 
 fn describe(failure: &claude::Failure) -> String {
@@ -568,7 +611,7 @@ mod tests {
 
     #[test]
     fn a_claude_run_is_read_as_the_executor_needs_it() {
-        let end = claude_end(run(&[INIT, DONE], 0), false);
+        let end = claude_end(run(&[INIT, DONE], 0), PermissionLevel::WriteWorktree);
         assert_eq!(end.status, HarnessStatus::Completed);
         assert_eq!(end.findings, []);
         assert_eq!(end.harness_version.as_deref(), Some("2.1.283"));
@@ -577,7 +620,7 @@ mod tests {
         // OWL-323: a completed read-only run gives its final message, and
         // the tools refused, each once, in the order of their first refusal.
         let denied = r#"{"type":"result","is_error":false,"result":"ok","permission_denials":[{"tool_name":"Bash"},{"tool_name":"Write"},{"tool_name":"Bash"}]}"#;
-        let read_only = claude_end(run(&[INIT, denied], 0), true);
+        let read_only = claude_end(run(&[INIT, denied], 0), PermissionLevel::ReadOnly);
         assert_eq!(read_only.message.as_deref(), Some("ok"));
         assert_eq!(read_only.permission_denials, ["Bash", "Write"]);
 
@@ -589,7 +632,7 @@ mod tests {
                 ],
                 1,
             ),
-            true,
+            PermissionLevel::ReadOnly,
         );
         assert_eq!(failed.message, None, "a failed run gives no result");
         let HarnessStatus::Failed(reason) = failed.status else {
@@ -607,7 +650,7 @@ mod tests {
                 ],
                 1,
             ),
-            false,
+            PermissionLevel::WriteWorktree,
         );
         let HarnessStatus::Failed(reason) = refused.status else {
             panic!("{refused:?}");
@@ -623,7 +666,7 @@ mod tests {
                 ],
                 1,
             ),
-            false,
+            PermissionLevel::WriteWorktree,
         );
         assert!(
             matches!(
@@ -635,7 +678,7 @@ mod tests {
 
         // An MCP server in `init` is a finding, even on a completed run.
         let init = r#"{"type":"system","subtype":"init","mcp_servers":[{"name":"claude.ai Linear","status":"connected"}]}"#;
-        let loaded = claude_end(run(&[init, DONE], 0), false);
+        let loaded = claude_end(run(&[init, DONE], 0), PermissionLevel::WriteWorktree);
         assert_eq!(
             loaded.findings,
             [CredentialFinding::McpServers(vec![
@@ -647,7 +690,7 @@ mod tests {
         // finding too; a run that does not say has none.
         let init =
             r#"{"type":"system","subtype":"init","mcp_servers":[],"apiKeySource":"apiKeyHelper"}"#;
-        let keyed = claude_end(run(&[init, DONE], 0), false);
+        let keyed = claude_end(run(&[init, DONE], 0), PermissionLevel::WriteWorktree);
         assert_eq!(
             keyed.findings,
             [CredentialFinding::ApiKey {
@@ -660,7 +703,78 @@ mod tests {
             "{text}"
         );
         let silent = r#"{"type":"system","subtype":"init","mcp_servers":[]}"#;
-        assert_eq!(claude_end(run(&[silent, DONE], 0), false).findings, []);
+        assert_eq!(
+            claude_end(run(&[silent, DONE], 0), PermissionLevel::WriteWorktree).findings,
+            []
+        );
+    }
+
+    /// OWL-346: a run that completed in another mode than the one asked
+    /// failed, saying which setting does that; a failed run keeps its own
+    /// reason; a write-in-worktree run refused as root says so.
+    #[test]
+    fn a_run_in_another_permission_mode_than_asked_fails() {
+        let init = |mode: &str| {
+            format!(
+                r#"{{"type":"system","subtype":"init","mcp_servers":[],"apiKeySource":"none","permissionMode":"{mode}"}}"#
+            )
+        };
+        let end = |mode: &str, level| claude_end(run(&[&init(mode), DONE], 0), level);
+        let write = PermissionLevel::WriteWorktree;
+
+        // As recorded on 2026-10-18 under managed-style settings disabling
+        // bypass mode: exit status 0, `init` reporting `default`.
+        let HarnessStatus::Failed(reason) = end("default", write).status else {
+            panic!("a write run in `default` mode completed");
+        };
+        assert!(
+            reason.contains("`default`")
+                && reason.contains("`bypassPermissions`")
+                && reason.contains("disableBypassPermissionsMode"),
+            "{reason}"
+        );
+        assert_eq!(
+            end("bypassPermissions", write).status,
+            HarnessStatus::Completed
+        );
+        let HarnessStatus::Failed(reason) =
+            end("bypassPermissions", PermissionLevel::ReadOnly).status
+        else {
+            panic!("a read-only run in bypass mode completed");
+        };
+        assert!(
+            reason.contains("`dontAsk`") && !reason.contains("disableBypassPermissionsMode"),
+            "{reason}"
+        );
+
+        let refused = r#"{"type":"result","is_error":true,"api_error_status":401,"result":"x"}"#;
+        let HarnessStatus::Failed(reason) =
+            claude_end(run(&[&init("default"), refused], 1), write).status
+        else {
+            panic!("a failed run completed");
+        };
+        assert!(
+            reason.contains("API status 401") && !reason.contains("permission mode"),
+            "{reason}"
+        );
+
+        let stderr = b"--dangerously-skip-permissions cannot be used with root/sudo privileges \
+                       for security reasons\n";
+        let as_root = |level| {
+            let run = claude::Transcript::default().finish(Some(1), stderr.to_vec());
+            claude_end(run, level).status
+        };
+        let HarnessStatus::Failed(reason) = as_root(write) else {
+            panic!("a run that never started completed");
+        };
+        assert!(
+            reason.contains("as root") && reason.contains("normal user"),
+            "{reason}"
+        );
+        let HarnessStatus::Failed(reason) = as_root(PermissionLevel::ReadOnly) else {
+            panic!("a run that never started completed");
+        };
+        assert!(!reason.contains("as root"), "{reason}");
     }
 
     fn claude(login: Option<&str>) -> ClaudeHarness {
