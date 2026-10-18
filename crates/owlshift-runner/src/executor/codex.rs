@@ -311,7 +311,9 @@ fn codex_end(run: codex::Run, model: Option<&str>) -> HarnessEnd {
     });
     let (status, message) = match (run.outcome, refused) {
         (codex::Outcome::Completed { text }, None) => (HarnessStatus::Completed, Some(text)),
-        (codex::Outcome::UsageLimit, _) => (HarnessStatus::UsageLimit { resets_at: None }, None),
+        (codex::Outcome::UsageLimit { resets_at }, _) => {
+            (HarnessStatus::UsageLimit { resets_at }, None)
+        }
         // The stop ended the run: what its end looked like is the stop's.
         (codex::Outcome::Failed(_), Some(refusal)) if run.stopped => {
             (HarnessStatus::Failed(refusal), None)
@@ -604,8 +606,18 @@ mod tests {
             "{reason}"
         );
 
-        let end = codex_end(run(codex::Outcome::UsageLimit, &["wait"]), None);
+        let limit = |resets_at| codex::Outcome::UsageLimit { resets_at };
+        let end = codex_end(run(limit(None), &["wait"]), None);
         assert_eq!(end.status, HarnessStatus::UsageLimit { resets_at: None });
+        let reset = "2026-10-18T03:54:00Z".parse::<jiff::Timestamp>().unwrap();
+        let end = codex_end(run(limit(Some(reset)), &["wait"]), None);
+        assert_eq!(
+            end.status,
+            HarnessStatus::UsageLimit {
+                resets_at: Some(reset)
+            }
+        );
+        assert_eq!(end.message, None);
 
         // OWL-319: a run stopped at the call fails with the refusal alone,
         // however its end looked; a usage limit Codex reported stays one.
@@ -629,8 +641,15 @@ mod tests {
             );
             assert_eq!(end.message, None);
         }
-        let end = codex_end(stopped(codex::Outcome::UsageLimit), None);
+        let end = codex_end(stopped(limit(None)), None);
         assert_eq!(end.status, HarnessStatus::UsageLimit { resets_at: None });
+        let end = codex_end(stopped(limit(Some(reset))), None);
+        assert_eq!(
+            end.status,
+            HarnessStatus::UsageLimit {
+                resets_at: Some(reset)
+            }
+        );
     }
 
     /// The helpers act only when run alone by [`helper`].

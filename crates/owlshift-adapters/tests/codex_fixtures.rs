@@ -21,6 +21,9 @@
 
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
 use serde_json::{Value, json};
 
 use owlshift_adapters::harness::codex::{self, Failure, Outcome, Run, Transcript};
@@ -151,6 +154,17 @@ fn replay(name: &str) -> Run {
     transcript.finish(Some(i32::try_from(exit).unwrap()), Vec::new())
 }
 
+/// [`replay`] with every line read at `read_at` and the limit's time read in
+/// `zone`.
+fn replay_at(name: &str, read_at: Timestamp, zone: &TimeZone) -> Run {
+    let mut transcript = Transcript::default();
+    for line in read(&format!("{name}.jsonl")).lines() {
+        transcript.feed_at(line.as_bytes(), read_at);
+    }
+    let exit = meta(name)["exit_status"].as_i64().unwrap();
+    transcript.finish_in(Some(i32::try_from(exit).unwrap()), Vec::new(), zone)
+}
+
 /// How the adapter classifies each recording. That the exit status agrees
 /// with the stream is pinned above; this is what the runner is told.
 #[test]
@@ -211,7 +225,30 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
         );
         assert_eq!(run.usage, None, "{name}");
     }
-    assert_eq!(replay("usage_limit").outcome, Outcome::UsageLimit);
+    // The recorded message gives 1:45 PM; the replay reads it at a fixed
+    // instant, in a fixed zone.
+    let zone = TimeZone::get("Europe/Paris").unwrap();
+    let at = |civil: &str| {
+        let civil: DateTime = civil.parse().unwrap();
+        civil.to_zoned(zone.clone()).unwrap().timestamp()
+    };
+    assert_eq!(
+        replay_at("usage_limit", at("2026-10-15T09:00:00"), &zone).outcome,
+        Outcome::UsageLimit {
+            resets_at: Some(at("2026-10-15T13:45:00"))
+        }
+    );
+    assert_eq!(
+        replay_at("usage_limit", at("2026-10-15T14:00:00"), &zone).outcome,
+        Outcome::UsageLimit {
+            resets_at: Some(at("2026-10-16T13:45:00"))
+        }
+    );
+    // Fed for real, it is still a usage limit, whatever the clock and zone.
+    assert!(matches!(
+        replay("usage_limit").outcome,
+        Outcome::UsageLimit { .. }
+    ));
 
     // The live critic run of `owlshift-testkit/tests/codex_live.rs` (OWL-299):
     // the adapter's command line of then, before OWL-131's two `-c` and
