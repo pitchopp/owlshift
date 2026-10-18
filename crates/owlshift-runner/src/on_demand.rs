@@ -157,6 +157,7 @@ use design::Built;
 use review_loop::{in_review_loop, loop_base, loop_reviews};
 use verify::Verified;
 
+pub(crate) use design::FINDING_CATEGORY;
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
@@ -2080,11 +2081,22 @@ impl OnDemand<'_> {
                 // marked fixed or answered on the pass that raised them.
                 _ => {
                     let mut questions = p.questions();
-                    let reversed = reversal::reversals(
+                    let mut reversed = reversal::reversals(
                         &comments,
                         &questions,
                         reversal::Current::Known(&current),
                     );
+                    // Before delivery, a reply that returns the ticket to an
+                    // earlier stage (OWL-345) is followed by the return, not
+                    // here: one the check left settling stays unfollowed
+                    // rather than be marked followed unserved.
+                    if !in_review_loop(p) {
+                        reversed.retain(|r| {
+                            questions.decisions.get(r.decision).is_none_or(|kept| {
+                                reversal::reopens(kept, p.plan.as_ref()).is_none()
+                            })
+                        });
+                    }
                     reversal::followed(&mut questions, &reversed);
                     let built = self.kept_build(p, &ran.report, &gathered, &comments)?;
                     // A review loop's Build that committed nothing ends the
@@ -2508,6 +2520,7 @@ impl OnDemand<'_> {
                 decision: comment.decision,
                 basis: comment.basis,
                 basis_kind: Some(logged.kind),
+                asked_by: Some(asked.role),
                 reversed: None,
             });
             self.store(p, state, kept).map_err(|e| {
@@ -6322,6 +6335,7 @@ mod tests {
             decision: decided.into(),
             basis: "the ticket".into(),
             basis_kind: None,
+            asked_by: None,
             reversed: None,
         };
         let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
@@ -6957,7 +6971,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 13,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 14,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

@@ -953,6 +953,7 @@ mod tests {
             decision: format!("decision {n}"),
             basis: format!("basis {n}"),
             basis_kind: kind,
+            asked_by: None,
             reversed: None,
         };
         let decisions = [

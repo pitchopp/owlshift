@@ -16,7 +16,7 @@ pub(super) const FORGE: &str = "[forge]\nreviewers = { ann-dev = \"maintainer\",
 const AFTER: &str = "2026-10-03T09:00:00Z";
 
 /// A loop Build's `done` on a new commit.
-const RENAMED: &str = r#"{"format":12,"status":"done","summary":"Says hello in capitals, as the review asks.",
+pub(super) const RENAMED: &str = r#"{"format":12,"status":"done","summary":"Says hello in capitals, as the review asks.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Capitals."}}"#;
 
 /// A loop Build's `done` with nothing to change.
@@ -24,7 +24,7 @@ const NOTHING_TO_CHANGE: &str = r#"{"format":12,"status":"done","summary":"GREET
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Unchanged."}}"#;
 
 /// A loop Build that asks what the review leaves open.
-const ASKS_WHICH_CASE: &str = r#"{"format":12,"status":"questions",
+pub(super) const ASKS_WHICH_CASE: &str = r#"{"format":12,"status":"questions",
 "summary":"The review asks for capitals without saying which words.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The review on the pull request asks for capitals.",
@@ -61,7 +61,7 @@ impl Bench {
     }
 
     /// The pull request's reviews on GitHub from now on.
-    fn reviews_on_github(&self, reviews: Vec<Value>) {
+    pub(super) fn reviews_on_github(&self, reviews: Vec<Value>) {
         *self.github.reviews.lock().unwrap() = reviews;
     }
 

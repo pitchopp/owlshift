@@ -81,6 +81,17 @@ pub(super) enum Built {
     Replan(TicketState),
 }
 
+/// What [`OnDemand::reopened`] did before a stage ran.
+pub(super) enum Reopened {
+    /// No reply reversed a decision the ticket returns for.
+    Nothing,
+    /// A reply was followed at the stage the ticket is at: it runs, given
+    /// the reply.
+    Stayed,
+    /// The ticket returned to its author stage, in this state.
+    Moved(TicketState),
+}
+
 /// What a design run is given, beside the kept plan ([`design_input`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DesignInput {
@@ -659,6 +670,12 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         loop {
+            // The decider's replies to the resolver's approval and residue
+            // decisions come first (OWL-345): the ticket returns to its
+            // author stage, or runs on with the reply as `reversed`.
+            if let Reopened::Moved(next) = self.reopened(p, state, sink)? {
+                state = next;
+            }
             match state.status() {
                 Status::Active(Stage::Design) | Status::Active(Stage::DesignReview) => {
                     let next = match state.stage() {
@@ -729,6 +746,113 @@ impl OnDemand<'_> {
             data([("replan", json!("decided")), ("stage", json!("design"))]),
         );
         Ok(Built::Replan(next))
+    }
+
+    /// Applies the decider's replies to the resolver's plan approval and
+    /// residue decisions before a stage runs (OWL-345; architecture section
+    /// 5, "A reversed decision"): a reply to the decision kept as the plan's
+    /// approval drops the approval and returns the ticket to Design, one to
+    /// a Design review residue decision returns it to Design, one to a
+    /// Verify residue decision to Build. The reversals are marked followed
+    /// in the same write as the move, so the run that follows is given each
+    /// as `reversed`, with the decider's reply in its thread.
+    ///
+    /// Nothing for a ticket in a review loop: it is delivered, with its pull
+    /// request open, and the core has no way back from Design to Watch, so
+    /// the correction run keeps those replies. A reply still inside the
+    /// quiet window is left unfollowed.
+    pub(super) fn reopened(
+        &self,
+        p: &mut Prepared,
+        state: TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Reopened, Stop> {
+        let Status::Active(
+            stage @ (Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify),
+        ) = state.status()
+        else {
+            return Ok(Reopened::Nothing);
+        };
+        let questions = p.questions();
+        if p.stored.is_none()
+            || in_review_loop(p)
+            || !questions
+                .decisions
+                .iter()
+                .any(|kept| reversal::reopens(kept, p.plan.as_ref()).is_some())
+        {
+            return Ok(Reopened::Nothing);
+        }
+        let comments = self.comments(&p.ticket)?;
+        let current = person(p.current()?, &p.found);
+        let mut reversed =
+            reversal::reversals(&comments, &questions, reversal::Current::Known(&current));
+        reversed.retain(|r| {
+            questions
+                .decisions
+                .get(r.decision)
+                .is_some_and(|kept| reversal::reopens(kept, p.plan.as_ref()).is_some())
+        });
+        let Some(reopening) = reversal::reopening(stage, &reversed, &questions, p.plan.as_ref())
+        else {
+            return Ok(Reopened::Nothing);
+        };
+        reversed.retain(|r| reopening.served.contains(&r.decision));
+        let window = self.config.policy.quiet_window();
+        if reversal::counts_at(&reversed, (self.clock)(), window).is_some() {
+            return Ok(Reopened::Nothing);
+        }
+        let next = match reopening.event {
+            None => state,
+            // A pipeline without the destination does not return.
+            Some(event) => match state.apply(p.pipeline, event) {
+                Ok(Transition::To(next)) => next,
+                _ => return Ok(Reopened::Nothing),
+            },
+        };
+        let mut questions = questions;
+        reversal::followed(&mut questions, &reversed);
+        let kept_plan = p.plan.clone();
+        if reopening.drops_approval
+            && let Some(plan) = p.plan.as_mut()
+        {
+            plan.approval = None;
+        }
+        if let Err(e) = self.store(p, &next, questions.clone()) {
+            p.plan = kept_plan;
+            return Err(refused("keeping the reopened ticket in its ref", e));
+        }
+        let ids: Vec<QuestionId> = reversed
+            .iter()
+            .filter_map(|r| questions.decisions.get(r.decision))
+            .map(|kept| kept.question.id.clone())
+            .collect();
+        sink.emit(
+            &p.ticket,
+            None,
+            EventKind::Decision,
+            data([
+                ("reversed", json!("reopened")),
+                ("from", json!(stage)),
+                ("to", json!(reopening.to)),
+                ("approval_dropped", json!(reopening.drops_approval)),
+                ("questions", question_ids(&ids)),
+                (
+                    "replies",
+                    json!(
+                        reversed
+                            .iter()
+                            .flat_map(|r| r.replies.iter().map(|c| c.id.as_str()))
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+            ]),
+        );
+        Ok(if reopening.event.is_some() {
+            Reopened::Moved(next)
+        } else {
+            Reopened::Stayed
+        })
     }
 
     /// The plan gate of `kept` (OWL-32): whether its approval is required,
