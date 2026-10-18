@@ -891,8 +891,9 @@ impl Driver {
         let given = resolver::route(&self.policy, &result.questions, &[]).to_resolver;
         let premise_false = result.status == ResultStatus::PremiseFalse;
         self.resolving.clone_from(&given);
+        let asking_role = self.state.stage().default_role().unwrap_or(Role::Build);
         self.asking = Some(AskedBy {
-            role: self.state.stage().default_role().unwrap_or(Role::Build),
+            role: asking_role,
             run: format!("{}-run-{}", self.scenario, self.runs),
             premise_false,
             summary: result.summary.clone(),
@@ -957,6 +958,7 @@ impl Driver {
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
                         basis_kind: Some(logged.kind),
+                        asked_by: Some(asking_role),
                         reversed: None,
                     });
                     decided.push(question.id.clone());

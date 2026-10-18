@@ -2508,6 +2508,7 @@ impl OnDemand<'_> {
                 decision: comment.decision,
                 basis: comment.basis,
                 basis_kind: Some(logged.kind),
+                asked_by: Some(asked.role),
                 reversed: None,
             });
             self.store(p, state, kept).map_err(|e| {
@@ -6322,6 +6323,7 @@ mod tests {
             decision: decided.into(),
             basis: "the ticket".into(),
             basis_kind: None,
+            asked_by: None,
             reversed: None,
         };
         let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
@@ -6957,7 +6959,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 13,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 14,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

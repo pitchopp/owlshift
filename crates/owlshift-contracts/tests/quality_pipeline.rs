@@ -545,7 +545,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketQuestions::parse(&older.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 13,")
+            .starts_with("{\n  \"format\": 14,")
     );
     for path in [
         &["asks", "0", "questions", "0"][..],
@@ -573,7 +573,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
     eleven["format"] = 11.into();
     assert!(TicketQuestions::parse(&eleven.to_string()).unwrap().asks[0].questions[0].replan);
     let mut newer = questions;
-    newer["format"] = 14.into();
+    newer["format"] = 15.into();
     let error = TicketQuestions::parse(&newer.to_string())
         .unwrap_err()
         .to_string();
