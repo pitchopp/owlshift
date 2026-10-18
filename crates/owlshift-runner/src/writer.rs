@@ -61,7 +61,6 @@ use owlshift_adapters::tracker::{
 };
 use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
-use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{FindingId, QuestionId, TicketId};
@@ -71,6 +70,7 @@ use owlshift_contracts::result::{
     Verdict as AnswerVerdict, option_letter,
 };
 use owlshift_contracts::review::{FindingOutcome, KeptFinding, Mandate, Plan, Reviewer, Severity};
+use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
 use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status};
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};

@@ -4490,15 +4490,7 @@ impl OnDemand<'_> {
                     "The {} run of pull request #{} asks before it can go on. {}",
                     run.what, run.pull_request, result.summary
                 );
-                return Err(self.ask(
-                    p,
-                    &waiting,
-                    result.status,
-                    &summary,
-                    round,
-                    &ran.run,
-                    sink,
-                ));
+                return Err(self.ask(p, &waiting, result.status, &summary, round, &ran.run, sink));
             }
             match state.apply(PIPELINE, event) {
                 Ok(Transition::To(next)) => {

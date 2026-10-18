@@ -415,7 +415,8 @@ impl OnDemand<'_> {
                 // Through the resolver first (OWL-342), the ref keeping the
                 // review record without this pass until its outcome is kept
                 // with the state, as at Design review.
-                let routing = self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)?;
+                let routing =
+                    self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)?;
                 p.review = Some(review);
                 match routing {
                     // Settled whole: a Verify fix run follows the decisions,

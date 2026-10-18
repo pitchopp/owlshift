@@ -1012,7 +1012,14 @@ impl OnDemand<'_> {
                 EventKind::Decision,
                 data([
                     ("plan", json!("approved")),
-                    ("by", json!(if decided.is_some() { "resolver" } else { "decider" })),
+                    (
+                        "by",
+                        json!(if decided.is_some() {
+                            "resolver"
+                        } else {
+                            "decider"
+                        }),
+                    ),
                     ("comment", json!(comment)),
                     ("plan_sha256", json!(sha)),
                 ]),
@@ -1417,34 +1424,37 @@ impl OnDemand<'_> {
             return Ok(next);
         }
         let approving = verdict.outcome == PassOutcome::Passed;
-        let (summary, asked, asked_findings): (String, Vec<Question>, Vec<(QuestionId, FindingId)>) =
-            if approving {
-                (
-                    format!(
-                        "The plan passed design review pass {pass} and waits for your approval: \
+        let (summary, asked, asked_findings): (
+            String,
+            Vec<Question>,
+            Vec<(QuestionId, FindingId)>,
+        ) = if approving {
+            (
+                format!(
+                    "The plan passed design review pass {pass} and waits for your approval: \
                          the PLAN comment above holds it."
-                    ),
-                    vec![approval_question(&kept.plan)],
-                    Vec::new(),
-                )
-            } else {
-                let (asked, findings) = questions
-                    .into_iter()
-                    .map(|(question, finding)| {
-                        let id = question.id.clone();
-                        (question, (id, finding))
-                    })
-                    .unzip();
-                (
-                    format!(
-                        "Design review pass {pass} left findings that the plan's revisions did \
+                ),
+                vec![approval_question(&kept.plan)],
+                Vec::new(),
+            )
+        } else {
+            let (asked, findings) = questions
+                .into_iter()
+                .map(|(question, finding)| {
+                    let id = question.id.clone();
+                    (question, (id, finding))
+                })
+                .unzip();
+            (
+                format!(
+                    "Design review pass {pass} left findings that the plan's revisions did \
                          not settle: each is a question below, and the PLAN comment above lists \
                          them with the plan."
-                    ),
-                    asked,
-                    findings,
-                )
-            };
+                ),
+                asked,
+                findings,
+            )
+        };
         // The approval is the decider's alone under `always` (OWL-342).
         let direct: Vec<QuestionId> = if approving && p.policy.approval_is_human(p.pipeline) {
             vec![QuestionId::nth(1)]
@@ -1484,7 +1494,14 @@ impl OnDemand<'_> {
                     .iter()
                     .find(|d| approving && d.option.as_deref() == Some("A"));
                 if let Some(approval) = approval {
-                    return self.approved_by_resolver(p, state, kept, &approval.comment, &run, sink);
+                    return self.approved_by_resolver(
+                        p,
+                        state,
+                        kept,
+                        &approval.comment,
+                        &run,
+                        sink,
+                    );
                 }
                 // A plan changed, or findings settled: the next design run
                 // follows the decisions, as it follows the answers to a

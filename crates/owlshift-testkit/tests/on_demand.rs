@@ -6272,8 +6272,16 @@ fn a_fix_runs_question_the_resolver_decides_runs_the_fix_again() {
             .any(|e| matches!(e, ThreadEntry::Decision { .. }))
     );
     let comments = bench.comments();
-    assert!(comments.iter().any(|c| c.starts_with("[owlshift] DECISION")));
-    assert!(!comments.iter().any(|c| c.starts_with("[owlshift] QUESTIONS")));
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.starts_with("[owlshift] DECISION"))
+    );
+    assert!(
+        !comments
+            .iter()
+            .any(|c| c.starts_with("[owlshift] QUESTIONS"))
+    );
     let attempts: Vec<Value> = data_of(&bench.events(), EventKind::RunStarted, "attempt")
         .into_iter()
         .filter(|data| data["role"] == "build")
@@ -6302,17 +6310,14 @@ fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
             .count()
     };
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch(
-        variable_asked(&bench),
-        &mut |_| {
-            pass += 1;
-            // The delivery's two runs (OWL-304), then the fix run that asked
-            // and the resolver it went to first (OWL-342).
-            assert_eq!((bench.briefs().len(), asked()), (4, 1));
-            bench.waited.set(SignedDuration::from_hours(pass * 3));
-            pass < 3
-        },
-    );
+    let (outcomes, lines, printed) = bench.watch(variable_asked(&bench), &mut |_| {
+        pass += 1;
+        // The delivery's two runs (OWL-304), then the fix run that asked
+        // and the resolver it went to first (OWL-342).
+        assert_eq!((bench.briefs().len(), asked()), (4, 1));
+        bench.waited.set(SignedDuration::from_hours(pass * 3));
+        pass < 3
+    });
     match &outcomes[..] {
         [
             Err(Stop::NotKept {
@@ -8184,10 +8189,17 @@ fn a_false_premise_at_intake_is_a_round_to_the_decider() {
     let Stop::NeedsInput { questions, .. } = &stop else {
         panic!("{stop}");
     };
-    let labels: Vec<&str> = questions[0].options.iter().map(|o| o.label.as_str()).collect();
+    let labels: Vec<&str> = questions[0]
+        .options
+        .iter()
+        .map(|o| o.label.as_str())
+        .collect();
     assert_eq!(
         labels,
-        ["Re-scope: write the section.", "Close the ticket: its premise is false"]
+        [
+            "Re-scope: write the section.",
+            "Close the ticket: its premise is false"
+        ]
     );
     let told = bench.last_of(Role::Resolver);
     let asked = told.asked_by.as_ref().unwrap();

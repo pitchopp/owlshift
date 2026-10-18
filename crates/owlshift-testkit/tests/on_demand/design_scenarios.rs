@@ -1120,7 +1120,10 @@ fn the_resolver_approves_a_forked_plan_under_on_fork() {
         ]
     );
     let told = bench.last_of(Role::Resolver);
-    assert_eq!(told.resolve[0].options[0].label, "Approve the plan as it is");
+    assert_eq!(
+        told.resolve[0].options[0].label,
+        "Approve the plan as it is"
+    );
     assert!(told.asked_by.as_ref().unwrap().plan.is_some());
     let record = bench.record();
     let decision = &record.questions.decisions[0];
@@ -1175,10 +1178,7 @@ fn a_false_premise_rescope_is_decided_and_its_closure_refused() {
     );
 
     let bench = at_level("standard", "all");
-    let (outcome, printed) = bench.run(
-        vec![bench.read(premise), bench.read(&deciding("B"))],
-        None,
-    );
+    let (outcome, printed) = bench.run(vec![bench.read(premise), bench.read(&deciding("B"))], None);
     let stop = outcome.expect_err("the closure goes to the decider");
     assert!(
         matches!(

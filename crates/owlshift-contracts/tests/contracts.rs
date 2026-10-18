@@ -1232,8 +1232,10 @@ fn resolutions_against_the_brief() {
         }))
     };
     let diff = json!({ "base": "a".repeat(40), "path": ".owlshift/run/diff.patch" });
-    let given = asking(Some(json!({ "role": "verify", "run": "r9", "premise_false": false,
-        "summary": "Verify pass 2 left findings.", "diff": diff })))
+    let given = asking(Some(
+        json!({ "role": "verify", "run": "r9", "premise_false": false,
+        "summary": "Verify pass 2 left findings.", "diff": diff }),
+    ))
     .unwrap();
     let asked = given.asked_by.as_ref().unwrap();
     assert_eq!((asked.role, asked.run.as_str()), (Role::Verify, "r9"));
@@ -1375,7 +1377,10 @@ fn resolutions_against_the_brief() {
         }))
         .unwrap_err()
         .to_string();
-        assert!(error.contains("which is not an option's letter"), "{letter:?}: {error}");
+        assert!(
+            error.contains("which is not an option's letter"),
+            "{letter:?}: {error}"
+        );
     }
     rejects(
         "an option on a pass",

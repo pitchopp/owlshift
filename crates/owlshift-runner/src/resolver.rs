@@ -564,22 +564,52 @@ mod tests {
             option: Some("A".into()),
         };
         let cases = [
-            (DelegationLevel::Discoverable, decided("Q1", "scope", BasisKind::Settled, Some("A")), false),
-            (DelegationLevel::Ticket, decided("Q1", "scope", BasisKind::Settled, Some("A")), false),
+            (
+                DelegationLevel::Discoverable,
+                decided("Q1", "scope", BasisKind::Settled, Some("A")),
+                false,
+            ),
+            (
+                DelegationLevel::Ticket,
+                decided("Q1", "scope", BasisKind::Settled, Some("A")),
+                false,
+            ),
             (DelegationLevel::Ticket, quoted, true),
-            (DelegationLevel::All, decided("Q1", "rescope", BasisKind::Judgment, Some("A")), true),
-            (DelegationLevel::All, decided("Q1", "rescope", BasisKind::Judgment, Some("B")), false),
-            (DelegationLevel::All, decided("Q1", "rescope", BasisKind::Judgment, None), false),
+            (
+                DelegationLevel::All,
+                decided("Q1", "rescope", BasisKind::Judgment, Some("A")),
+                true,
+            ),
+            (
+                DelegationLevel::All,
+                decided("Q1", "rescope", BasisKind::Judgment, Some("B")),
+                false,
+            ),
+            (
+                DelegationLevel::All,
+                decided("Q1", "rescope", BasisKind::Judgment, None),
+                false,
+            ),
         ];
         for (level, resolution, stands) in cases {
             let resolutions = [resolution];
             let settled = settle(&at(level), &given, &resolutions, &text, true);
-            assert_eq!(settled.logged.len() == 1, stands, "{level:?} {resolutions:?}");
+            assert_eq!(
+                settled.logged.len() == 1,
+                stands,
+                "{level:?} {resolutions:?}"
+            );
             assert_eq!(settled.refused.len() == 1, !stands, "{level:?}");
         }
         // The same option on a question of another run is not held so.
         let resolutions = [decided("Q1", "naming", BasisKind::Settled, Some("B"))];
-        let settled = settle(&at(DelegationLevel::Discoverable), &given, &resolutions, &text, false);
+        let settled = settle(
+            &at(DelegationLevel::Discoverable),
+            &given,
+            &resolutions,
+            &text,
+            false,
+        );
         assert_eq!(logged_ids(&settled), ["Q1"]);
         assert_eq!(settled.logged[0].option, Some("B"));
     }

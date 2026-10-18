@@ -670,7 +670,10 @@ impl TicketState {
             }
             // A review round the resolver decided whole (OWL-342): where the
             // round would have returned, the pass counted, no round opened.
-            (Status::Active(stage @ (Stage::DesignReview | Stage::Verify)), Event::RoundDecided) => {
+            (
+                Status::Active(stage @ (Stage::DesignReview | Stage::Verify)),
+                Event::RoundDecided,
+            ) => {
                 let entered = self.enter(Status::Active(pipeline.round_return(stage)));
                 Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
             }
@@ -1912,7 +1915,10 @@ mod tests {
         }
         for stage in [Stage::Design, Stage::Build, Stage::Watch] {
             let other = state(Status::Active(stage), 1, 0, 0);
-            assert!(other.apply(STANDARD, Event::RoundDecided).is_err(), "{stage:?}");
+            assert!(
+                other.apply(STANDARD, Event::RoundDecided).is_err(),
+                "{stage:?}"
+            );
         }
     }
 

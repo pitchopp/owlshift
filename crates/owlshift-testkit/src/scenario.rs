@@ -892,11 +892,7 @@ impl Driver {
         let premise_false = result.status == ResultStatus::PremiseFalse;
         self.resolving.clone_from(&given);
         self.asking = Some(AskedBy {
-            role: self
-                .state
-                .stage()
-                .default_role()
-                .unwrap_or(Role::Build),
+            role: self.state.stage().default_role().unwrap_or(Role::Build),
             run: format!("{}-run-{}", self.scenario, self.runs),
             premise_false,
             summary: result.summary.clone(),
