@@ -94,7 +94,7 @@ const FAILED: &str = r#"{"format":12,"status":"failed","summary":"Could not read
 
 impl Bench {
     /// A bench whose ticket carries `variant`'s label.
-    fn of(variant: &str) -> Self {
+    pub(super) fn of(variant: &str) -> Self {
         let bench = Bench::new(true);
         bench.add_labels(&[&format!("variant:{variant}")]);
         bench
@@ -946,7 +946,7 @@ const JUDGED: &str = r#"{"format":12,"status":"done","summary":"Weighed the form
 "basis_kind":"judgment","option":"A"}]}"#;
 
 /// The bench of `variant`, the project's delegation level `level`.
-fn at_level(variant: &str, level: &str) -> Bench {
+pub(super) fn at_level(variant: &str, level: &str) -> Bench {
     let bench = Bench::of(variant);
     bench.policy(&format!("resolver_delegation = \"{level}\""));
     bench

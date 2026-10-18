@@ -11,7 +11,7 @@ use owlshift_core::vocab::Harness as HarnessKind;
 use super::*;
 
 /// A Verify run's `done` with a finding per (severity, claim).
-fn found(findings: &[(&str, &str)]) -> String {
+pub(super) fn found(findings: &[(&str, &str)]) -> String {
     let findings: Vec<Value> = findings
         .iter()
         .enumerate()
@@ -50,14 +50,14 @@ const FAILED_REVIEW: &str =
 
 impl Bench {
     /// A bench whose verify seats play from its reply queue.
-    fn verifying() -> Self {
+    pub(super) fn verifying() -> Self {
         let bench = Bench::new(true);
         bench.verify_plays.set(true);
         bench
     }
 
     /// A read-only run's reply: its result alone.
-    fn reviewing(&self, result: &str) -> Reply {
+    pub(super) fn reviewing(&self, result: &str) -> Reply {
         self.reply(None, Some(result))
     }
 

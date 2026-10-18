@@ -2081,11 +2081,22 @@ impl OnDemand<'_> {
                 // marked fixed or answered on the pass that raised them.
                 _ => {
                     let mut questions = p.questions();
-                    let reversed = reversal::reversals(
+                    let mut reversed = reversal::reversals(
                         &comments,
                         &questions,
                         reversal::Current::Known(&current),
                     );
+                    // Before delivery, a reply that returns the ticket to an
+                    // earlier stage (OWL-345) is followed by the return, not
+                    // here: one the check left settling stays unfollowed
+                    // rather than be marked followed unserved.
+                    if !in_review_loop(p) {
+                        reversed.retain(|r| {
+                            questions.decisions.get(r.decision).is_none_or(|kept| {
+                                reversal::reopens(kept, p.plan.as_ref()).is_none()
+                            })
+                        });
+                    }
                     reversal::followed(&mut questions, &reversed);
                     let built = self.kept_build(p, &ran.report, &gathered, &comments)?;
                     // A review loop's Build that committed nothing ends the
