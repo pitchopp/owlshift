@@ -6244,6 +6244,46 @@ fn a_fix_run_that_asks_goes_to_the_decider_and_the_answer_resumes_watch() {
     assert_eq!(state_of(&bench).fix_passes(), 0);
 }
 
+/// A fix run's question the resolver decides at Watch (OWL-342): no round
+/// opens, the fix run runs again with the decision in its thread, an attempt
+/// it does not count, and its push lands; the ticket stays at Watch.
+#[test]
+fn a_fix_runs_question_the_resolver_decides_runs_the_fix_again() {
+    let bench = delivered();
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let decides = r#"{"format":12,"status":"done","summary":"The workflow sets it.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"ci_config",
+"decision":"The check's workflow sets GREETING_LOCALE: read it from there.",
+"basis":"The workflow file sets GREETING_LOCALE.","basis_kind":"fact"}]}"#;
+    let (fixed, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(ASKS_FOR_A_VARIABLE)),
+        bench.reply(None, Some(decides)),
+        bench.reply(Some("Hello again"), Some(FIXED)),
+    ]);
+    fixed.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = bench.briefs();
+    let roles: Vec<Role> = briefs[briefs.len() - 3..].iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::Resolver, Role::Build]);
+    let again = briefs.last().unwrap();
+    assert!(
+        again
+            .thread
+            .iter()
+            .any(|e| matches!(e, ThreadEntry::Decision { .. }))
+    );
+    let comments = bench.comments();
+    assert!(comments.iter().any(|c| c.starts_with("[owlshift] DECISION")));
+    assert!(!comments.iter().any(|c| c.starts_with("[owlshift] QUESTIONS")));
+    let attempts: Vec<Value> = data_of(&bench.events(), EventKind::RunStarted, "attempt")
+        .into_iter()
+        .filter(|data| data["role"] == "build")
+        .map(|data| data["attempt"].clone())
+        .collect();
+    assert_eq!(attempts[attempts.len() - 2..], [json!(1), json!(1)]);
+    assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
+    assert_eq!(state_of(&bench).fix_passes(), 1);
+}
+
 /// Under `owlshift watch`, a fix run's round that reached the ticket while
 /// keeping it failed (the ticket's ref is locked) is posted once: the
 /// repair's hold stays across passes for a followed ticket, so the fix does

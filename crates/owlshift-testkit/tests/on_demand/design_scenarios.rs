@@ -4,6 +4,7 @@
 //! bench of `on_demand.rs`: the Markdown tracker, the fake harness playing
 //! every role, the fake GitHub.
 
+use owlshift_contracts::BasisKind;
 use owlshift_contracts::review::{FindingOutcome, FindingsMode, Mandate, ResponseOutcome};
 use owlshift_core::vocab::Harness as HarnessKind;
 
@@ -926,4 +927,270 @@ fn a_false_premise_at_design_without_a_question_parks_the_ticket() {
         "{parked}"
     );
     assert!(parked.contains("owlshift continue"), "{parked}");
+}
+
+/// A design run's question on a trade-off nothing settles.
+const TRADE_OFF: &str = r#"{"format":12,"status":"questions",
+"summary":"The ticket leaves the greeting's format open.",
+"questions":[{"id":"Q1","category":"approach","context":"The ticket says Hello; nothing says Markdown or plain text.",
+"text":"Should GREETING.md be Markdown or plain text?",
+"options":[{"label":"Markdown"},{"label":"Plain text"}],
+"recommendation":{"option":"A","why":"The repository's docs are Markdown."}}]}"#;
+
+/// The resolver's decision on it, on its own weighing (OWL-343).
+const JUDGED: &str = r#"{"format":12,"status":"done","summary":"Weighed the format.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"file_format","decision":"Markdown.",
+"basis":"Option A: the docs are Markdown, so a reader expects it; the cost is none, as nothing renders it.",
+"basis_kind":"judgment","option":"A"}]}"#;
+
+/// The bench of `variant`, the project's delegation level `level`.
+fn at_level(variant: &str, level: &str) -> Bench {
+    let bench = Bench::of(variant, false);
+    bench.policy(&format!("resolver_delegation = \"{level}\""));
+    bench
+}
+
+/// OWL-343's acceptance, a Design question on judgment: at `all`, the
+/// resolver decides a trade-off on its own weighing, its DECISION comment
+/// says so on its visible line, the design runs again with the decision and
+/// the delivery report lists it first. At `discoverable` the same decision
+/// is refused, the level allowing no judgment, and the question goes to the
+/// decider.
+#[test]
+fn a_design_question_is_decided_on_judgment_at_all_and_not_below() {
+    let bench = at_level("standard", "all");
+    let replies = vec![
+        bench.read(TRADE_OFF),
+        bench.read(JUDGED),
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.roles()[..3],
+        [Role::Design, Role::Resolver, Role::Design]
+    );
+    let told = bench.last_of(Role::Resolver);
+    assert_eq!(told.asked_by.as_ref().unwrap().role, Role::Design);
+    assert!(shape(&bench.briefs()[2]).contains(&"decision".to_owned()));
+    let decision = bench.marked("[owlshift] DECISION");
+    assert!(
+        decision.contains(
+            "Decided on judgment, allowed by this project's delegation level, `all` \
+             (`policy.resolver_delegation`)."
+        ),
+        "{decision}"
+    );
+    let kept = &bench.record().questions.decisions[0];
+    assert_eq!(kept.basis_kind, Some(BasisKind::Judgment));
+    let report = bench.marked("[owlshift] DELIVERY");
+    assert!(report.contains("(decided on judgment)"), "{report}");
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["asked_by"], json!("design"));
+
+    let bench = at_level("standard", "discoverable");
+    let (outcome, printed) = bench.run(vec![bench.read(TRADE_OFF), bench.read(JUDGED)], None);
+    let stop = outcome.expect_err("refused below `all`");
+    assert!(
+        matches!(&stop, Stop::NeedsInput { posted: Ok(round), .. } if round.get() == 1),
+        "{stop:?}\n{printed}"
+    );
+    assert!(bench.record().questions.decisions.is_empty());
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["refused"], json!(["Q1"]));
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] DECISION"))
+    );
+}
+
+/// OWL-343's acceptance, a residue finding decided: the finding two passes
+/// left reaches the resolver, which has its fix applied; no round opens,
+/// the next design run follows the decision, and the pass it buys is clean,
+/// so the Build follows.
+#[test]
+fn a_residue_finding_decided_is_applied_by_the_next_design_run() {
+    let bench = Bench::of("standard", false);
+    let applied = r#"{"format":12,"status":"done","summary":"The plan does not check the word.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"testing",
+"decision":"Settle it: change step 1 so its test greps for the word Hello.",
+"basis":"Plan step 1's test greps for the line, not the word, as the arbiter confirmed.",
+"basis_kind":"fact","option":"A"}]}"#;
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[(
+            "major",
+            "Step 1's test does not check the word.",
+        )])),
+        bench.read(&reviewed(&[])),
+        bench.read(&ruled(&["confirmed"])),
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[(
+            "major",
+            "Step 1's test still does not check the word.",
+        )])),
+        bench.read(&reviewed(&[])),
+        bench.read(&ruled(&["confirmed"])),
+        bench.read(applied),
+        bench.read(&designed(REVISED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let roles = bench.roles();
+    assert_eq!(roles[8..10], [Role::Resolver, Role::Design]);
+    let after = &bench.briefs()[9];
+    assert!(after.findings.is_none() && !after.approval);
+    assert!(shape(after).contains(&"decision".to_owned()));
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] QUESTIONS"))
+    );
+    let record = bench.record();
+    assert!(
+        record
+            .plan
+            .unwrap()
+            .plan
+            .approach
+            .contains("the word checked")
+    );
+    let passes: Vec<(Stage, u32)> = record
+        .review
+        .unwrap()
+        .passes
+        .iter()
+        .map(|pass| (pass.stage, pass.pass.get()))
+        .collect();
+    assert_eq!(
+        passes,
+        [
+            (Stage::DesignReview, 1),
+            (Stage::DesignReview, 2),
+            (Stage::DesignReview, 3),
+            (Stage::Verify, 1)
+        ]
+    );
+}
+
+/// Under `on-fork`, the plan's approval reaches the resolver (OWL-342): its
+/// option A approves the plan as it is, kept in `plan.json` with the
+/// DECISION comment, and the Build follows it in the same command.
+#[test]
+fn the_resolver_approves_a_forked_plan_under_on_fork() {
+    let bench = at_level("standard", "all");
+    let config = bench.remote.checkout.join("owlshift.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("plan_approval = \"never\"", "plan_approval = \"on-fork\""),
+    )
+    .unwrap();
+    let approves = r#"{"format":12,"status":"done","summary":"The fork's choice is the repository's.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"approval",
+"decision":"Approve the plan as it is.",
+"basis":"The plan's fork keeps Markdown, as the repository's docs are; plain text buys nothing.",
+"basis_kind":"judgment","option":"A"}]}"#;
+    let replies = vec![
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(approves),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.roles()[..5],
+        [
+            Role::Design,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::Resolver,
+            Role::Build
+        ]
+    );
+    let told = bench.last_of(Role::Resolver);
+    assert_eq!(told.resolve[0].options[0].label, "Approve the plan as it is");
+    assert!(told.asked_by.as_ref().unwrap().plan.is_some());
+    let record = bench.record();
+    let decision = &record.questions.decisions[0];
+    let approval = record.plan.unwrap().approval.expect("the approval is kept");
+    assert_eq!(approval.comment, decision.comment);
+    let approved = bench
+        .decisions("plan")
+        .into_iter()
+        .find(|event| event["plan"] == "approved")
+        .unwrap();
+    assert_eq!(approved["by"], json!("resolver"));
+}
+
+/// A false premise at `all` (OWL-343): the resolver may decide the re-scope,
+/// the design then planning the ticket as re-scoped; the closure, the
+/// runner's own last option, is refused and goes to the decider.
+#[test]
+fn a_false_premise_rescope_is_decided_and_its_closure_refused() {
+    let premise = r#"{"format":12,"status":"premise_false",
+"summary":"The greeting file the ticket extends is not in the repository.",
+"questions":[{"id":"Q1","category":"premise","context":"The ticket extends GREETING.md; no such file exists.",
+"text":"Re-scope to create GREETING.md, or close the ticket?",
+"options":[{"label":"Re-scope: create GREETING.md."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
+    let deciding = |option: &str| {
+        format!(
+            r#"{{"format":12,"status":"done","summary":"Weighed the premise.",
+"resolutions":[{{"question":"Q1","outcome":"decided","category":"scope","decision":"Option {option}.",
+"basis":"The ticket wants a greeting; creating the file delivers it at no extra cost.",
+"basis_kind":"judgment","option":"{option}"}}]}}"#
+        )
+    };
+    let bench = at_level("standard", "all");
+    let replies = vec![
+        bench.read(premise),
+        bench.read(&deciding("A")),
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.roles()[..3],
+        [Role::Design, Role::Resolver, Role::Design]
+    );
+    let told = bench.last_of(Role::Resolver);
+    assert!(told.asked_by.as_ref().unwrap().premise_false);
+    assert_eq!(
+        told.resolve[0].options[1].label,
+        "Close the ticket: its premise is false"
+    );
+
+    let bench = at_level("standard", "all");
+    let (outcome, printed) = bench.run(
+        vec![bench.read(premise), bench.read(&deciding("B"))],
+        None,
+    );
+    let stop = outcome.expect_err("the closure goes to the decider");
+    assert!(
+        matches!(
+            &stop,
+            Stop::NeedsInput {
+                status: owlshift_contracts::result::Status::PremiseFalse,
+                ..
+            }
+        ),
+        "{stop:?}\n{printed}"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["refused"], json!(["Q1"]));
+    assert!(bench.record().questions.decisions.is_empty());
 }
