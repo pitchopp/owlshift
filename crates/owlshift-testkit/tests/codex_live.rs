@@ -951,7 +951,7 @@ fn brief(base: String) -> Brief {
         },
         gate: Vec::new(),
         always_human: Vec::new(),
-        delegation: None,
+        delegation: None, asked_by: None,
         gate_failure: None,
         result_refusal: None,
         decisions_refused: false,

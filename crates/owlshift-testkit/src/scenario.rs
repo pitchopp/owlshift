@@ -114,7 +114,7 @@ use tempfile::TempDir;
 use owlshift_adapters::tracker::markdown::{self, MarkdownTracker};
 use owlshift_adapters::tracker::{Person, Tracker};
 use owlshift_contracts::brief::{
-    Brief, GateFailure, PermissionLevel, Permissions, Relation, ReviewBrief, ThreadEntry,
+    AskedBy, Brief, GateFailure, PermissionLevel, Permissions, Relation, ReviewBrief, ThreadEntry,
     TicketBrief,
 };
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
@@ -519,6 +519,8 @@ struct Driver {
     pending: Option<(RunResult, Vec<ReopenedChoice>)>,
     /// The questions the resolver's brief gives it.
     resolving: Vec<Question>,
+    /// The run that asked them, as the resolver's brief names it (OWL-343).
+    asking: Option<AskedBy>,
     /// Whether the tracker refuses this step's QUESTIONS comment
     /// ([`Step::tracker_refuses_questions`]).
     refuse_questions: bool,
@@ -617,6 +619,7 @@ impl Driver {
             policy,
             pending: None,
             resolving: Vec::new(),
+            asking: None,
             refuse_questions: false,
             refuse_save: false,
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
@@ -772,10 +775,16 @@ impl Driver {
         let asked = result
             .map(|result| asked_choices(brief, result))
             .unwrap_or_default();
-        let result = result.cloned();
+        // A false premise's questions are asked with the runner's own
+        // closure as their last option (OWL-343), as `owlshift do` asks them.
+        let result = result.cloned().map(|mut result| {
+            if result.status == ResultStatus::PremiseFalse {
+                result.questions = resolver::with_closure(&result.questions);
+            }
+            result
+        });
         if let (Event::Questions, Some(result)) = (event, &result)
-            && result.status != ResultStatus::PremiseFalse
-            && !resolver::route(&self.policy, &result.questions, &asked)
+            && !resolver::route(&self.policy, &result.questions, &[])
                 .to_resolver
                 .is_empty()
         {
@@ -879,10 +888,25 @@ impl Driver {
             .pending
             .take()
             .ok_or("no run's questions wait for the resolver")?;
-        let given = resolver::route(&self.policy, &result.questions, &asked).to_resolver;
+        let given = resolver::route(&self.policy, &result.questions, &[]).to_resolver;
+        let premise_false = result.status == ResultStatus::PremiseFalse;
         self.resolving.clone_from(&given);
+        self.asking = Some(AskedBy {
+            role: self
+                .state
+                .stage()
+                .default_role()
+                .unwrap_or(Role::Build),
+            run: format!("{}-run-{}", self.scenario, self.runs),
+            premise_false,
+            summary: result.summary.clone(),
+            plan: None,
+            findings: Vec::new(),
+            diff: None,
+        });
         let report = self.execute(Role::Resolver, reply);
         self.resolving.clear();
+        self.asking = None;
         let report = report?;
         // What the ticket ref keeps for the resolver run that replays these
         // questions, as `owlshift do` keeps it before posting their round
@@ -912,14 +936,17 @@ impl Driver {
                     .as_ref()
                     .map(Quotable::of)
                     .unwrap_or_default();
-                for (question, decision, basis) in
-                    resolver::decisions(&self.policy, &given, resolutions, &quotable)
+                for logged in
+                    resolver::decisions(&self.policy, &given, resolutions, &quotable, premise_false)
                 {
+                    let (question, decision, basis) =
+                        (logged.question, logged.decision, logged.basis);
                     let body = DecisionComment {
                         ticket: self.id.clone(),
                         question: question.clone(),
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
+                        kind: logged.kind,
                         level: self.policy.level(),
                         run: None,
                     }
@@ -933,6 +960,7 @@ impl Driver {
                         question: question.clone(),
                         decision: decision.to_owned(),
                         basis: basis.to_owned(),
+                        basis_kind: Some(logged.kind),
                         reversed: None,
                     });
                     decided.push(question.id.clone());
@@ -1209,7 +1237,7 @@ impl Driver {
                 &current,
             ),
             resolve: if role == Role::Resolver {
-                resolver::unlabelled(&self.resolving)
+                resolver::unlabelled(&self.resolving, &[])
             } else {
                 Vec::new()
             },
@@ -1233,6 +1261,11 @@ impl Driver {
                 Vec::new()
             },
             delegation: (role == Role::Resolver).then(|| self.policy.level()),
+            asked_by: if role == Role::Resolver {
+                self.asking.clone()
+            } else {
+                None
+            },
             gate_failure: if role == Role::Build {
                 self.gate_failure.clone()
             } else {

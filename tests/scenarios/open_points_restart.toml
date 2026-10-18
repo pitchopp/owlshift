@@ -73,15 +73,19 @@ continue = true
 expect = { event = "restarted", stage = "build", waiting = "none", failed_runs = 0, tracker_stage = "In Progress" }
 
 # Told the choices first, then the refused done. Its questions reopen both
-# choices, so round 1 opens without the resolver (OWL-222).
+# choices; since OWL-342 they reach the resolver by their categories, which
+# decides where the README lists the example, and round 1 asks the other.
 [[step]]
 run = { result = "results/questions-open-points.json" }
 [step.expect]
-event = "questions"
+event = "none"
 stage = "build"
-waiting = "needs_input"
-round = 1
-comments = 2
+waiting = "none"
+comments = 1
 brief_result_refusal = "A later result was refused too: invalid result.json: status is done"
 brief_decisions_refused = true
 brief_refused_choices = ["Every key or only the required ones", "Where the README lists the example"]
+
+[[step]]
+resolve = { result = "results/resolver-decides-placement.json" }
+expect = { event = "questions", stage = "build", waiting = "needs_input", round = 1, comments = 3, brief_resolve = ["Q2"] }

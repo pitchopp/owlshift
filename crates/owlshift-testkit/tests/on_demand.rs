@@ -1407,8 +1407,8 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
 /// after it, once the resolver settled its question, and the resolver itself
 /// are not. A refusal of the build role's own decisions also holds that run
 /// to asking (`decisions_refused`, OWL-186), and it asks: its question
-/// reopens the refused choice, so it goes to the decider without the
-/// resolver (OWL-222).
+/// reopens the refused choice, which since OWL-342 reaches the resolver,
+/// here passed on, as any question does.
 #[test]
 fn a_refused_result_is_told_to_the_next_build_run_only() {
     let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
@@ -1463,6 +1463,7 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
         vec![
             bench.reply(None, Some(&decided)),
             bench.reply(None, Some(&asking_refused(NAMING, 1))),
+            bench.reply(None, Some(&passed_on(&["Q1"]))),
         ],
         None,
     );
@@ -1472,18 +1473,25 @@ fn a_refused_result_is_told_to_the_next_build_run_only() {
     );
     assert_eq!(
         told(&bench),
-        [(Role::Build, false, false), (Role::Build, true, true)]
+        [
+            (Role::Build, false, false),
+            (Role::Build, true, true),
+            (Role::Resolver, false, false)
+        ]
     );
-    assert_eq!(flags(&bench), [false, true]);
+    assert_eq!(flags(&bench), [false, true, false]);
 }
 
-/// OWL-203 and OWL-222: a held retry asks both refused choices, Q1 for the
+/// OWL-203 and OWL-342: a held retry asks both refused choices, Q1 for the
 /// first under a category the resolver may decide and Q2 for the second,
-/// and a third question of its own. Only Q3 reaches the resolver, which
-/// decides it in a DECISION comment that shows no choice; Q1 and Q2 go to
-/// the decider, each showing its choice in the round. The events record it.
+/// filed `scope`, and a third question of its own. Since OWL-342 a question
+/// reopening a refused choice reaches the resolver as any does (OWL-222's
+/// route is gone): Q1 and Q3 do, Q2's category keeping it the decider's;
+/// the resolver decides Q3 in a DECISION comment that shows no choice and
+/// passes Q1 on; Q1 and Q2 go to the decider, each showing its choice in the
+/// round. The events record it.
 #[test]
-fn a_reopened_choice_goes_to_the_decider() {
+fn a_reopened_choice_reaches_the_resolver() {
     let bench = Bench::new(true);
     let decided = DONE.replace(
         r#""pr":"#,
@@ -1498,7 +1506,8 @@ fn a_reopened_choice_goes_to_the_decider() {
         MIXED.strip_suffix("]}").unwrap()
     );
     let decided_q3 = r#"{"format":12,"status":"done","summary":"The ticket names the heading.",
-"resolutions":[{"question":"Q3","outcome":"decided","category":"naming","decision":"Hello.",
+"resolutions":[{"question":"Q1","outcome":"passed_on","reason":"The refused run took it; nothing settles it."},
+{"question":"Q3","outcome":"decided","category":"naming","decision":"Hello.",
 "basis":"The ticket's description.","basis_kind":"settled"}]}"#;
     let (stopped, printed) = bench.run(
         vec![
@@ -1518,7 +1527,7 @@ fn a_reopened_choice_goes_to_the_decider() {
         .filter(|brief| brief.role == Role::Resolver)
         .flat_map(|brief| brief.resolve.iter().map(|q| q.id.as_str().to_owned()))
         .collect();
-    assert_eq!(resolve, ["Q3"]);
+    assert_eq!(resolve, ["Q1", "Q3"]);
 
     let comments = bench.comments();
     let [decision, round] = &comments[comments.len() - 2..] else {
@@ -1556,7 +1565,8 @@ fn a_reopened_choice_goes_to_the_decider() {
 
     let events = bench.events();
     let resolved = data_of(&events, EventKind::Gate, "resolver");
-    assert_eq!(resolved.last().unwrap()["given"], json!(["Q3"]));
+    assert_eq!(resolved.last().unwrap()["given"], json!(["Q1", "Q3"]));
+    assert_eq!(resolved.last().unwrap()["asked_by"], json!("build"));
     let opened = data_of(&events, EventKind::Gate, "opened");
     assert_eq!(
         opened.last().unwrap()["reopened"],
@@ -1638,10 +1648,13 @@ fn a_decisions_refusal_is_told_across_commands() {
     assert_eq!(bench.record().questions.build_refusal, Some(kept));
     bench.refuse.set(None);
 
-    // Its question reopens the refused choice: it goes to the decider,
-    // without the resolver (OWL-222).
+    // Its question reopens the refused choice: it goes to the decider
+    // through the resolver since OWL-342, which passes it on.
     let (asked, printed) = bench.run(
-        vec![bench.reply(None, Some(&asking_refused(NAMING, 1)))],
+        vec![
+            bench.reply(None, Some(&asking_refused(NAMING, 1))),
+            bench.reply(None, Some(&passed_on(&["Q1"]))),
+        ],
         None,
     );
     assert!(
@@ -1667,6 +1680,7 @@ fn a_decisions_refusal_is_told_across_commands() {
             (Role::Build, true, true),
             (Role::Build, true, true),
             (Role::Build, true, true),
+            (Role::Resolver, false, false),
         ]
     );
     let after_park = briefs[4].result_refusal.as_deref().unwrap();
@@ -3393,14 +3407,13 @@ fn a_late_comment_gets_one_more_build_run_and_reaches_the_pull_request() {
 }
 
 /// A late comment the integrating run cannot follow without the decider:
-/// its questions go to the decider without the resolver, in a round that
-/// names the late comment, and nothing is delivered.
+/// its questions go through the resolver first (OWL-342), which passes it
+/// on, then to the decider in a round that names the late comment, and
+/// nothing is delivered.
 #[test]
 fn a_late_comment_the_build_cannot_follow_stops_in_needs_input() {
     let bench = Bench::new(true);
     let check = answered_round(&bench);
-    // Not an always-human category: only the integration sends it to the
-    // decider without a resolver run, which would need a reply of its own.
     let asks = r#"{"format":12,"status":"questions",
         "summary":"The greeting cannot say both Hello and Goodbye.",
         "questions":[{"id":"Q1","category":"wording","context":"Q2 was answered Hello; a later comment says Goodbye.",
@@ -3410,6 +3423,7 @@ fn a_late_comment_the_build_cannot_follow_stops_in_needs_input() {
             check,
             bench.reply(Some("Hello"), Some(DONE)),
             bench.reply(None, Some(asks)),
+            bench.reply(None, Some(&passed_on(&["Q1"]))),
         ],
         vec![bench.comment_during(2, "maintainer", "Actually, make it Goodbye.")],
     );
@@ -3417,6 +3431,7 @@ fn a_late_comment_the_build_cannot_follow_stops_in_needs_input() {
         matches!(&stopped, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 2),
         "{stopped:?}\n{printed}"
     );
+    assert_eq!(bench.briefs().last().unwrap().role, Role::Resolver);
     let asked = bench.comments().pop().unwrap();
     assert!(
         asked.starts_with("[owlshift] QUESTIONS · round 2 · @maintainer\n"),
@@ -3437,7 +3452,8 @@ fn a_late_comment_the_build_cannot_follow_stops_in_needs_input() {
 
 /// One Build run per delivery integrates late comments: another comment of
 /// the decider during it opens a round of one always-human question naming
-/// it, and nothing is delivered.
+/// it, the runner's own and never the resolver's (OWL-342), and nothing is
+/// delivered.
 #[test]
 fn a_comment_after_the_integrating_run_stops_in_needs_input() {
     let bench = Bench::new(true);
@@ -3466,6 +3482,7 @@ fn a_comment_after_the_integrating_run_stops_in_needs_input() {
         other => panic!("{other:?}\n{printed}"),
     }
     assert_eq!(late_outcomes(&bench), [json!("integrate"), json!("ask")]);
+    assert!(!bench.briefs().iter().any(|b| b.role == Role::Resolver));
     let asked = bench.comments().pop().unwrap();
     assert!(
         asked.starts_with("[owlshift] QUESTIONS · round 2 · @maintainer\n"),
@@ -4254,6 +4271,20 @@ fn asking_refused(result: &str, choices: u32) -> String {
 const DECIDED_Q1: &str = r#"{"format":12,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
 "basis":"The ticket's description.","basis_kind":"settled"}]}"#;
+
+/// The resolver passes on each of `ids` (OWL-342: every question reaches
+/// it, and these stay the decider's).
+fn passed_on(ids: &[&str]) -> String {
+    let resolutions: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({ "question": id, "outcome": "passed_on",
+                "reason": "Nothing here settles it, and the level does not let me weigh it." })
+        })
+        .collect();
+    json!({ "format": 12, "status": "done", "summary": "Passed on.", "resolutions": resolutions })
+        .to_string()
+}
 
 /// The events of a kind whose data holds `key`.
 fn data_of(events: &[Event], kind: EventKind, key: &str) -> Vec<Value> {
@@ -6093,15 +6124,25 @@ const ASKS_FOR_A_VARIABLE: &str = r#"{"format":12,"status":"questions",
 "questions":[{"id":"Q1","category":"secrets","context":"CI lacks the GREETING_LOCALE variable the check reads.",
 "text":"Can someone set GREETING_LOCALE in CI and re-run the check?","recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
 
+/// The replies of a repair run that asks for a CI variable, and of the
+/// resolver it goes to first (OWL-342), which passes on a prerequisite only a
+/// person can supply.
+fn variable_asked(bench: &Bench) -> Vec<Reply> {
+    vec![
+        bench.reply(None, Some(ASKS_FOR_A_VARIABLE)),
+        bench.reply(None, Some(&passed_on(&["Q1"]))),
+    ]
+}
+
 /// A red pull request whose fix run asks, through `continue`: the round
-/// goes to the decider at once, without the resolver, and returns to Watch
-/// with the fix passes and repairs kept (OWL-211).
+/// goes through the resolver, which passes it on (OWL-342), then to the
+/// decider, and returns to Watch with the fix passes and repairs kept
+/// (OWL-211).
 fn asked_at_watch(bench: &Bench) {
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
     let before = state_of(bench);
     let from = bench.events().len();
-    let (asked, printed) =
-        bench.continue_ticket(vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))]);
+    let (asked, printed) = bench.continue_ticket(variable_asked(bench));
     assert!(
         matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
         "{asked:?}\n{printed}"
@@ -6117,7 +6158,8 @@ fn asked_at_watch(bench: &Bench) {
         (state.fix_passes(), state.repairs()),
         (before.fix_passes(), before.repairs())
     );
-    assert!(bench.briefs().iter().all(|b| b.role != Role::Resolver));
+    let resolver = bench.last_of(Role::Resolver);
+    assert_eq!(resolver.asked_by.as_ref().unwrap().role, Role::Build);
     // Working while the fix run worked, then waiting for the decider
     // (OWL-259).
     assert_eq!(stage_moves(bench, from), ["working", "needs_input"]);
@@ -6221,11 +6263,12 @@ fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
     };
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch(
-        vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))],
+        variable_asked(&bench),
         &mut |_| {
             pass += 1;
-            // The delivery's two runs (OWL-304), then the fix run that asked.
-            assert_eq!((bench.briefs().len(), asked()), (3, 1));
+            // The delivery's two runs (OWL-304), then the fix run that asked
+            // and the resolver it went to first (OWL-342).
+            assert_eq!((bench.briefs().len(), asked()), (4, 1));
             bench.waited.set(SignedDuration::from_hours(pass * 3));
             pass < 3
         },
@@ -6243,8 +6286,7 @@ fn a_round_whose_state_is_not_kept_under_a_repair_is_posted_once() {
         other => panic!("{other:?}\n{lines}\n{printed}"),
     }
     fs::remove_file(bench.ref_lock()).unwrap();
-    let (outcome, printed) =
-        bench.continue_ticket(vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))]);
+    let (outcome, printed) = bench.continue_ticket(variable_asked(&bench));
     assert!(
         matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
         "{outcome:?}\n{printed}"
@@ -6299,7 +6341,13 @@ fn an_answer_after_the_pull_request_went_green_runs_no_fix() {
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
     assert_eq!(
         roles,
-        [Role::Build, Role::Verify, Role::Build, Role::AnswerCheck]
+        [
+            Role::Build,
+            Role::Verify,
+            Role::Build,
+            Role::Resolver,
+            Role::AnswerCheck
+        ]
     );
     assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
     assert_eq!(bench.stage(), "In Review");
@@ -7526,20 +7574,22 @@ fn a_rebase_that_fails_twice_parks_the_ticket() {
     assert_eq!(state_of(&bench).repairs(), 0);
 }
 
-/// A rebase run that asks goes to the decider as a fix run's question does,
-/// the branch back at the last push (OWL-211).
+/// A rebase run that asks goes through the resolver then to the decider as a
+/// fix run's question does (OWL-342), the branch back at the last push
+/// (OWL-211).
 #[test]
 fn a_rebase_run_that_asks_goes_to_the_decider() {
     let bench = delivered_with_rules();
     let first_push = bench.remote_branch().unwrap();
     bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
     bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
-    let (outcome, printed) =
-        bench.continue_ticket(vec![bench.reply(None, Some(ASKS_FOR_A_VARIABLE))]);
+    let (outcome, printed) = bench.continue_ticket(variable_asked(&bench));
     assert!(
         matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
         "{outcome:?}\n{printed}"
     );
+    let resolver = bench.last_of(Role::Resolver);
+    assert_eq!(resolver.asked_by.as_ref().unwrap().role, Role::Rebase);
     assert_eq!(
         state_of(&bench).status(),
         Status::NeedsInput {
@@ -8073,10 +8123,11 @@ fn an_intake_round_returns_the_ticket_to_the_ready_column() {
     assert_eq!(roles, [Role::Intake, Role::AnswerCheck, Role::Intake]);
 }
 
-/// A false premise at intake (OWL-306, S8): its questions all go to the
-/// decider, with no resolver run, the round returning to Intake; the QUESTIONS
-/// comment says the premise is false; no intake record is kept; the answered
-/// round runs intake again.
+/// A false premise at intake (OWL-306, S8): its question goes through the
+/// resolver first, told the premise is false (OWL-342), with the runner's
+/// own closure as its last option; passed on, it is a round returning to
+/// Intake; the QUESTIONS comment says the premise is false; no intake record
+/// is kept; the answered round runs intake again.
 #[test]
 fn a_false_premise_at_intake_is_a_round_to_the_decider() {
     let bench = Bench::drained();
@@ -8084,11 +8135,24 @@ fn a_false_premise_at_intake_is_a_round_to_the_decider() {
 "summary":"The ticket extends a README section that does not exist.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends README.md's Usage section; there is none.",
 "text":"Re-scope to write the section, or close the ticket?",
-"options":[{"label":"Re-scope: write the section."},{"label":"Close the ticket."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
+"options":[{"label":"Re-scope: write the section."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
     let asks = bench.reply(None, Some(premise));
+    let passes = bench.reply(None, Some(&passed_on(&["Q1"])));
     let stop = bench
-        .intake(vec![asks], gesture("maintainer"))
+        .intake(vec![asks, passes], gesture("maintainer"))
         .expect_err("the premise goes to the decider");
+    let Stop::NeedsInput { questions, .. } = &stop else {
+        panic!("{stop}");
+    };
+    let labels: Vec<&str> = questions[0].options.iter().map(|o| o.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["Re-scope: write the section.", "Close the ticket: its premise is false"]
+    );
+    let told = bench.last_of(Role::Resolver);
+    let asked = told.asked_by.as_ref().unwrap();
+    assert!(asked.premise_false && asked.role == Role::Intake);
+    assert_eq!(told.resolve[0].options.len(), 2);
     assert!(
         matches!(
             &stop,
@@ -8101,7 +8165,7 @@ fn a_false_premise_at_intake_is_a_round_to_the_decider() {
         "{stop}"
     );
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(roles, [Role::Intake]);
+    assert_eq!(roles, [Role::Intake, Role::Resolver]);
     let kept = bench.record();
     assert!(kept.intake.is_none(), "a premise round has no record");
     assert_eq!(

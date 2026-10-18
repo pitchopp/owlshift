@@ -456,9 +456,11 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
 }
 
 /// The bound: a `major` still confirmed after the second pass goes to the
-/// decider, one question, without the resolver; a `minor` is noted in the
-/// PLAN comment. After the answer, the design runs with it in its thread,
-/// and the one more pass it buys is clean, so the Build follows.
+/// resolver first (OWL-342), told its finding, with the arbiter's ruling,
+/// and the plan; passed on, it goes to the decider, one question; a `minor`
+/// is noted in the PLAN comment. After the answer, the design runs with it
+/// in its thread, and the one more pass it buys is clean, so the Build
+/// follows.
 #[test]
 fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     let bench = Bench::of("standard", false);
@@ -477,6 +479,7 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
         ])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed", "confirmed"])),
+        bench.read(&passed_on(&["Q1"])),
     ];
     let (outcome, printed) = bench.run(replies, None);
     let stop = outcome.expect_err("the residue goes to the decider");
@@ -494,14 +497,20 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
             .text
             .starts_with("Step 1's test still does not check the word.")
     );
-    assert!(!bench.roles().contains(&Role::Resolver));
+    let resolver = bench.last_of(Role::Resolver);
+    let asked = resolver.asked_by.as_ref().unwrap();
+    assert_eq!(asked.role, Role::DesignReview);
+    assert!(asked.plan.is_some() && asked.diff.is_none());
+    assert_eq!(asked.findings.len(), 2);
+    assert!(asked.findings[0].ruling.is_some());
+    assert_eq!(resolver.resolve[0].finding.as_ref().unwrap().as_str(), "F1");
     let plan = bench.marked("[owlshift] PLAN");
     for text in [
         "F1, major, critic on Claude Code, standing in for Codex: Step 1's test still does not \
          check the word. (asked below)",
         "F2, minor, critic on Claude Code, standing in for Codex: The goal could name the file's \
          path. (noted for the Build)",
-        "**Next.** The findings asked below go to the decider",
+        "**Next.** The findings left are settled by DECISION comments or by the decider's",
     ] {
         assert!(plan.contains(text), "{text}\n---\n{plan}");
     }
@@ -601,8 +610,11 @@ fn a_risky_plan_is_approved_and_its_build_starts_from_the_moved_base() {
     assert!(
         bench
             .marked("[owlshift] PLAN")
-            .contains("**Next.** The plan waits for the decider's approval")
+            .contains("**Next.** The plan waits for its approval")
     );
+    // `risky` forces `always`: the approval is the decider's alone, with no
+    // resolver run (OWL-342).
+    assert!(!bench.roles().contains(&Role::Resolver));
     assert_eq!(bench.stage(), "Needs Input");
     let planned_on = bench.record().plan.unwrap().base;
 
@@ -751,8 +763,9 @@ fn a_replan_the_resolver_settles_sends_the_ticket_back_to_design() {
     assert_eq!(passes, [1, 1, 1], "a new loop of passes");
 }
 
-/// On an approved plan, a `replan` goes to the decider without the
-/// resolver, and its round returns to Design.
+/// On an approved plan, a `replan` goes through the resolver first since
+/// OWL-342; passed on, it goes to the decider, and its round returns to
+/// Design.
 #[test]
 fn a_replan_on_an_approved_plan_goes_to_the_decider_and_returns_to_design() {
     let bench = Bench::of("risky", false);
@@ -772,6 +785,7 @@ fn a_replan_on_an_approved_plan_goes_to_the_decider_and_returns_to_design() {
         bench.read(&check(&[("Q1", "answered", "Approved.")])),
         bench.read(&answered("approved", None)),
         bench.read(REPLAN),
+        bench.read(&passed_on(&["Q1"])),
     ];
     let (outcome, printed) = bench.continue_ticket(replies);
     let stop = outcome.expect_err("the replan goes to the decider");
@@ -779,7 +793,8 @@ fn a_replan_on_an_approved_plan_goes_to_the_decider_and_returns_to_design() {
         matches!(&stop, Stop::NeedsInput { posted: Ok(round), .. } if round.get() == 2),
         "{stop:?}\n{printed}"
     );
-    assert!(!bench.roles().contains(&Role::Resolver));
+    let resolver = bench.last_of(Role::Resolver);
+    assert!(resolver.asked_by.as_ref().unwrap().plan.is_some());
     let record = bench.record();
     assert_eq!(
         (record.state.stage, record.state.waiting),
@@ -843,8 +858,9 @@ fn a_reviewer_failing_twice_parks_the_ticket_at_design_review() {
     assert!(record.plan.is_some(), "the plan is kept for the restart");
 }
 
-/// A design run that finds the premise false and asks (OWL-306, S8): every
-/// question goes to the decider without the resolver, the round returns to
+/// A design run that finds the premise false and asks (OWL-306, S8): its
+/// question goes through the resolver first (OWL-342), which at the default
+/// level cannot decide a re-scope and passes it on; the round returns to
 /// Design, the QUESTIONS comment says so, and no plan is kept.
 #[test]
 fn a_false_premise_at_design_is_a_round_to_the_decider() {
@@ -853,8 +869,11 @@ fn a_false_premise_at_design_is_a_round_to_the_decider() {
 "summary":"The greeting file the ticket extends is not in the repository.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; no such file exists.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
-"options":[{"label":"Re-scope: create GREETING.md."},{"label":"Close the ticket."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
-    let (outcome, printed) = bench.run(vec![bench.read(premise)], None);
+"options":[{"label":"Re-scope: create GREETING.md."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
+    let (outcome, printed) = bench.run(
+        vec![bench.read(premise), bench.read(&passed_on(&["Q1"]))],
+        None,
+    );
     let stop = outcome.expect_err("the premise goes to the decider");
     assert!(
         matches!(
@@ -864,7 +883,7 @@ fn a_false_premise_at_design_is_a_round_to_the_decider() {
         ),
         "{stop:?}\n{printed}"
     );
-    assert_eq!(bench.roles(), [Role::Design]);
+    assert_eq!(bench.roles(), [Role::Design, Role::Resolver]);
     let record = bench.record();
     assert_eq!(
         (record.state.stage, record.state.waiting),
