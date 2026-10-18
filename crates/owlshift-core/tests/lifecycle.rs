@@ -87,13 +87,13 @@ fn a_standard_ticket_from_admission_to_merge() {
     step(&mut ticket, Event::Dispatched);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
 
-    // Design, then its review: the critic on Codex and conformance on
-    // Claude Code. The first pass's confirmed finding sends the plan back;
-    // the second, last, pass leaves a major for the decider, whose answer
-    // the design takes in before one more pass, which only notes a minor.
+    // Design, then its review: the critic and conformance. The first pass's
+    // confirmed finding sends the plan back; the second, last, pass leaves a
+    // major for the decider, whose answer the design takes in before one
+    // more pass, which only notes a minor.
     step(&mut ticket, Event::Completed);
     assert_eq!(
-        roster(ticket.variant, Stage::DesignReview, true).len(),
+        roster(ticket.variant, Stage::DesignReview).len(),
         2,
         "two reviewers"
     );

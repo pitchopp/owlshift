@@ -1,24 +1,17 @@
 //! The roster: who reviews a ticket's plan and diff, per variant
 //! (architecture, section 5, "The quality pipeline", "The roster").
 //!
-//! The critic holds S17's rule, one reviewer of another model family than
-//! the author's, on Codex, while the authoring roles run on Claude Code
-//! (D4). The reviewers on Claude Code add mandates, on another model than
-//! the author's when the configuration has one ([`other_model`]). On a
-//! machine without a usable Codex the critic stands in on Claude Code:
-//! this is routing's last layer, what the machine has (section 9).
+//! Every reviewer runs on Claude Code (OWL-347), each on another model than
+//! the author's when the configuration has one ([`other_model`]); the
+//! seats differ by their mandates.
 
-use crate::vocab::{Harness, Mandate, Stage, Tier, Variant};
+use crate::vocab::{Mandate, Stage, Tier, Variant};
 
-/// One reviewer of a review pass.
+/// One reviewer of a review pass, on Claude Code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Seat {
     /// What it looks for, at least one, each once.
     pub mandates: &'static [Mandate],
-    pub harness: Harness,
-    /// The critic on Claude Code, standing in for Codex: the PLAN comment
-    /// and the DELIVERY report name it.
-    pub stand_in: bool,
 }
 
 /// A critic alone in its pass holds conformance too.
@@ -29,16 +22,14 @@ const DEBT: &[Mandate] = &[Mandate::Debt];
 
 /// The reviewers of a pass at `stage` for a ticket of `variant`, the critic
 /// first; none at a stage that is not Design review or Verify, nor at
-/// Design review for `trivial`. Without a usable Codex (`codex_usable`
-/// false: not installed, not logged in) the critic runs on Claude Code as
-/// a stand-in.
+/// Design review for `trivial`.
 ///
 /// | Variant | Design review | Verify |
 /// | --- | --- | --- |
-/// | `trivial` | none | the critic, on Codex |
-/// | `standard` | the critic, on Codex; conformance, on Claude Code | the critic, on Codex |
-/// | `risky` | the critic, on Codex; conformance and debt, on Claude Code | the critic, on Codex; conformance, on Claude Code |
-pub fn roster(variant: Variant, stage: Stage, codex_usable: bool) -> Vec<Seat> {
+/// | `trivial` | none | the critic |
+/// | `standard` | the critic; conformance | the critic |
+/// | `risky` | the critic; conformance and debt | the critic; conformance |
+pub fn roster(variant: Variant, stage: Stage) -> Vec<Seat> {
     let others: &[&'static [Mandate]] = match (stage, variant) {
         (Stage::DesignReview, Variant::Trivial) => return Vec::new(),
         (Stage::DesignReview, Variant::Standard) | (Stage::Verify, Variant::Risky) => {
@@ -54,19 +45,9 @@ pub fn roster(variant: Variant, stage: Stage, codex_usable: bool) -> Vec<Seat> {
         } else {
             CRITIC
         },
-        harness: if codex_usable {
-            Harness::Codex
-        } else {
-            Harness::Claude
-        },
-        stand_in: !codex_usable,
     };
     std::iter::once(critic)
-        .chain(others.iter().map(|&mandates| Seat {
-            mandates,
-            harness: Harness::Claude,
-            stand_in: false,
-        }))
+        .chain(others.iter().map(|&mandates| Seat { mandates }))
         .collect()
 }
 
@@ -81,8 +62,8 @@ pub struct ReviewerModel {
     pub same_model: bool,
 }
 
-/// The model of a reviewer on Claude Code, the critic standing in
-/// included: the `deep` tier's, or the `standard` tier's when the author
+/// The model of a reviewer on Claude Code, the critic included: the
+/// `deep` tier's, or the `standard` tier's when the author
 /// ran on `deep`; when that tier names no model or the author's, the other
 /// of the two; when both do, the author's own (`same_model`). `model`
 /// gives the Claude Code model the configuration names for a tier, `None`
@@ -113,23 +94,18 @@ pub fn other_model<'a>(author: Tier, model: impl Fn(Tier) -> Option<&'a str>) ->
 mod tests {
     use super::*;
 
-    const fn seat(mandates: &'static [Mandate], harness: Harness, stand_in: bool) -> Seat {
-        Seat {
-            mandates,
-            harness,
-            stand_in,
-        }
+    const fn seat(mandates: &'static [Mandate]) -> Seat {
+        Seat { mandates }
     }
 
     #[test]
     fn the_roster_follows_the_variant_and_the_stage() {
-        use Harness::{Claude, Codex};
         use Stage::{DesignReview, Verify};
         use Variant::{Risky, Standard, Trivial};
-        let critic = seat(CRITIC, Codex, false);
-        let alone = seat(CRITIC_ALONE, Codex, false);
-        let conformance = seat(CONFORMANCE, Claude, false);
-        let debt = seat(DEBT, Claude, false);
+        let critic = seat(CRITIC);
+        let alone = seat(CRITIC_ALONE);
+        let conformance = seat(CONFORMANCE);
+        let debt = seat(DEBT);
         let cases: [(Variant, Stage, &[Seat]); 6] = [
             (Trivial, DesignReview, &[]),
             (Trivial, Verify, &[alone]),
@@ -139,31 +115,11 @@ mod tests {
             (Risky, Verify, &[critic, conformance]),
         ];
         for (variant, stage, expected) in cases {
-            assert_eq!(
-                roster(variant, stage, true),
-                expected,
-                "{variant:?} {stage:?}"
-            );
+            assert_eq!(roster(variant, stage), expected, "{variant:?} {stage:?}");
         }
         for stage in [Stage::Intake, Stage::Design, Stage::Build, Stage::Watch] {
-            assert!(roster(Risky, stage, true).is_empty(), "{stage:?}");
+            assert!(roster(Risky, stage).is_empty(), "{stage:?}");
         }
-    }
-
-    #[test]
-    fn without_codex_the_critic_stands_in_on_claude_code() {
-        assert_eq!(
-            roster(Variant::Risky, Stage::DesignReview, false),
-            [
-                seat(CRITIC, Harness::Claude, true),
-                seat(CONFORMANCE, Harness::Claude, false),
-                seat(DEBT, Harness::Claude, false),
-            ]
-        );
-        assert_eq!(
-            roster(Variant::Trivial, Stage::Verify, false),
-            [seat(CRITIC_ALONE, Harness::Claude, true)]
-        );
     }
 
     #[test]
