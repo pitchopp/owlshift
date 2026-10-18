@@ -17,8 +17,13 @@ use jiff::Timestamp;
 
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person};
 use owlshift_contracts::brief::{Correction, MAX_REPLY_BYTES, ReversedDecision};
-use owlshift_contracts::refs::{Reversal, TicketQuestions};
+use owlshift_contracts::refs::{KeptDecision, Reversal, TicketQuestions};
+use owlshift_contracts::review::TicketPlan;
+use owlshift_contracts::{Role, Stage};
 use owlshift_core::reply::{self, Reply};
+use owlshift_core::state::Event;
+
+use crate::on_demand::FINDING_CATEGORY;
 
 /// A kept decision with the decider's replies no run followed yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +136,98 @@ pub fn followed(questions: &mut TicketQuestions, reversals: &[Reversed<'_>]) -> 
         }
     }
     moved
+}
+
+/// The stage a reply to `kept` returns the ticket to before delivery
+/// (OWL-345): Design for the decision kept as the plan's approval, whatever
+/// option it took, and for a residue decision a Design review asked; Build
+/// for one a Verify asked. `None` for any other decision, and for one kept
+/// before it carried its asking role: the next run follows the reply.
+pub fn reopens(kept: &KeptDecision, plan: Option<&TicketPlan>) -> Option<Stage> {
+    if plan
+        .and_then(|plan| plan.approval.as_ref())
+        .is_some_and(|approval| approval.comment == kept.comment)
+    {
+        return Some(Stage::Design);
+    }
+    if kept.question.category != FINDING_CATEGORY {
+        return None;
+    }
+    match kept.asked_by? {
+        Role::DesignReview => Some(Stage::Design),
+        Role::Verify => Some(Stage::Build),
+        _ => None,
+    }
+}
+
+/// Where the ticket goes for the reversals it can serve now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reopening {
+    /// The stage the ticket is at after the return.
+    pub to: Stage,
+    /// The core event that moves it there, `None` when it is already there.
+    pub event: Option<Event>,
+    /// The reversed decisions this return serves, by their place in the
+    /// ticket ref's `decisions`.
+    pub served: Vec<usize>,
+    /// Whether the kept approval is among them, so the plan is no longer
+    /// approved.
+    pub drops_approval: bool,
+}
+
+/// The return `reversals` call for a ticket at `stage`, before delivery.
+/// Design is reachable from Design, Design review, Build and Verify, Build
+/// from Build and Verify; the earliest destination wins and serves only the
+/// reversals that name it, the others stay unfollowed for when the ticket
+/// reaches their stage.
+pub fn reopening(
+    stage: Stage,
+    reversals: &[Reversed<'_>],
+    questions: &TicketQuestions,
+    plan: Option<&TicketPlan>,
+) -> Option<Reopening> {
+    let reachable = |to: Stage| match to {
+        Stage::Design => matches!(
+            stage,
+            Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify
+        ),
+        Stage::Build => matches!(stage, Stage::Build | Stage::Verify),
+        _ => false,
+    };
+    let wanted: Vec<(usize, Stage)> = reversals
+        .iter()
+        .filter_map(|reversed| {
+            let kept = questions.decisions.get(reversed.decision)?;
+            Some((reversed.decision, reopens(kept, plan)?))
+        })
+        .filter(|&(_, to)| reachable(to))
+        .collect();
+    let to = wanted.iter().map(|&(_, to)| to).min()?;
+    let served: Vec<usize> = wanted
+        .iter()
+        .filter(|&&(_, wants)| wants == to)
+        .map(|&(decision, _)| decision)
+        .collect();
+    let approval = plan
+        .and_then(|plan| plan.approval.as_ref())
+        .map(|approval| approval.comment.as_str());
+    let drops_approval = served.iter().any(|&decision| {
+        questions
+            .decisions
+            .get(decision)
+            .is_some_and(|kept| Some(kept.comment.as_str()) == approval)
+    });
+    let event = match (stage == to, to) {
+        (true, _) => None,
+        (false, Stage::Design) => Some(Event::ReversedToDesign),
+        (false, _) => Some(Event::ReversedToBuild),
+    };
+    Some(Reopening {
+        to,
+        event,
+        served,
+        drops_approval,
+    })
 }
 
 /// The brief's correction for `reversals` of the decisions `questions` keeps,
@@ -311,6 +408,135 @@ mod tests {
         assert_eq!(ids(&found), [(0, vec!["before", "after-bob"])]);
         let correction = correction(&found, &questions, 7, "https://x/7", "h");
         assert_eq!(correction.reversed[0].reply, "ada: no\n\nbob: no");
+    }
+
+    /// The fixture plan, approved by the comment `c-approval-1`.
+    fn approved_plan() -> TicketPlan {
+        TicketPlan::parse(include_str!(
+            "../../owlshift-contracts/tests/fixtures/ticket-plan.json"
+        ))
+        .unwrap()
+    }
+
+    fn residue(comment: &str, asked_by: Option<Role>) -> KeptDecision {
+        let mut decision = kept(1, comment);
+        decision.question.category = FINDING_CATEGORY.into();
+        decision.asked_by = asked_by;
+        decision
+    }
+
+    fn reversed_all<'a>(decisions: &[usize], replies: &'a [Comment]) -> Vec<Reversed<'a>> {
+        decisions
+            .iter()
+            .map(|&decision| Reversed {
+                decision,
+                replies: replies.iter().collect(),
+            })
+            .collect()
+    }
+
+    /// The decision kept as the plan's approval reopens Design whatever
+    /// option it took; a residue decision returns to the author stage of the
+    /// review that asked; any other decision, and one kept without its
+    /// asking role, reopens nothing.
+    #[test]
+    fn a_decision_reopens_the_stage_that_follows_its_asker() {
+        let plan = approved_plan();
+        let approval = plan.approval.as_ref().unwrap().comment.clone();
+        let mut approving = kept(1, &approval);
+        approving.question.category = "plan_approval".into();
+        assert_eq!(reopens(&approving, Some(&plan)), Some(Stage::Design));
+        let mut other_option = kept(1, &approval);
+        other_option.question.category = "plan_approval".into();
+        other_option.decision = "Fork 1: another way".into();
+        assert_eq!(reopens(&other_option, Some(&plan)), Some(Stage::Design));
+        // An approval-question decision that is not the kept approval has
+        // none to drop.
+        let mut superseded = kept(1, "d-old");
+        superseded.question.category = "plan_approval".into();
+        assert_eq!(reopens(&superseded, Some(&plan)), None);
+        assert_eq!(reopens(&approving, None), None);
+
+        assert_eq!(
+            reopens(&residue("d1", Some(Role::DesignReview)), Some(&plan)),
+            Some(Stage::Design)
+        );
+        assert_eq!(
+            reopens(&residue("d1", Some(Role::Verify)), Some(&plan)),
+            Some(Stage::Build)
+        );
+        assert_eq!(reopens(&residue("d1", None), Some(&plan)), None);
+        assert_eq!(reopens(&residue("d1", Some(Role::Build)), None), None);
+        let mut naming = kept(1, "d1");
+        naming.asked_by = Some(Role::Build);
+        assert_eq!(reopens(&naming, Some(&plan)), None);
+    }
+
+    /// The destination is the earliest one the ticket's stage reaches, and
+    /// only the reversals that name it are served.
+    #[test]
+    fn the_earliest_reachable_destination_serves_only_its_reversals() {
+        let plan = approved_plan();
+        let approval = plan.approval.as_ref().unwrap().comment.clone();
+        let mut approving = kept(1, &approval);
+        approving.question.category = "plan_approval".into();
+        let questions = TicketQuestions {
+            decisions: vec![
+                approving,
+                residue("d-design", Some(Role::DesignReview)),
+                residue("d-verify", Some(Role::Verify)),
+            ],
+            ..TicketQuestions::default()
+        };
+        let replies = [reply("r", "ada", 5, None)];
+        let plan = Some(&plan);
+        let run = |stage, decisions: &[usize]| {
+            reopening(stage, &reversed_all(decisions, &replies), &questions, plan)
+        };
+
+        // At Build, a Verify residue is served in place.
+        assert_eq!(
+            run(Stage::Build, &[2]),
+            Some(Reopening {
+                to: Stage::Build,
+                event: None,
+                served: vec![2],
+                drops_approval: false,
+            })
+        );
+        // An approval returns it to Design, dropping the approval.
+        assert_eq!(
+            run(Stage::Build, &[0]),
+            Some(Reopening {
+                to: Stage::Design,
+                event: Some(Event::ReversedToDesign),
+                served: vec![0],
+                drops_approval: true,
+            })
+        );
+        // Both at Build: only the approval is served now.
+        assert_eq!(run(Stage::Build, &[0, 2]).unwrap().served, [0]);
+        // A Verify residue returns a Verify to Build.
+        assert_eq!(
+            run(Stage::Verify, &[2]).map(|r| (r.to, r.event)),
+            Some((Stage::Build, Some(Event::ReversedToBuild)))
+        );
+        // A Design review residue at Design review, a Verify residue not
+        // reachable from it.
+        assert_eq!(
+            run(Stage::DesignReview, &[1, 2]).map(|r| (r.to, r.event, r.served)),
+            Some((Stage::Design, Some(Event::ReversedToDesign), vec![1]))
+        );
+        assert_eq!(run(Stage::DesignReview, &[2]), None);
+        // At Design nothing moves, but the approval is still dropped.
+        assert_eq!(
+            run(Stage::Design, &[0]).map(|r| (r.event, r.drops_approval)),
+            Some((None, true))
+        );
+        // Nowhere before Design is reached, and nothing at Watch or Deliver.
+        assert_eq!(run(Stage::Intake, &[0, 1, 2]), None);
+        assert_eq!(run(Stage::Watch, &[0, 1, 2]), None);
+        assert_eq!(run(Stage::Build, &[]), None);
     }
 
     #[test]

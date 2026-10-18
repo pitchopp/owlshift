@@ -157,6 +157,7 @@ use design::Built;
 use review_loop::{in_review_loop, loop_base, loop_reviews};
 use verify::Verified;
 
+pub(crate) use design::FINDING_CATEGORY;
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
