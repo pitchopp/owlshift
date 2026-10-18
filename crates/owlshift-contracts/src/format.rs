@@ -27,8 +27,9 @@ use crate::Role;
 /// 15 the quality pipeline's `plan`, `approval`, `findings`, `review` and
 /// `pull_request_reviews`, and a question's `replan` (OWL-300); format 16 a
 /// question's lettered options and structured recommendation (OWL-324);
-/// format 17 the resolver's `delegation` (OWL-337).
-pub const BRIEF_FORMAT: u32 = 17;
+/// format 17 the resolver's `delegation` (OWL-337); format 18 the
+/// resolver's `asked_by` and a question's `finding` in `resolve` (OWL-343).
+pub const BRIEF_FORMAT: u32 = 18;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -39,8 +40,9 @@ pub const BRIEF_FORMAT: u32 = 17;
 /// intake, design and build roles only (OWL-300); format 10 a question's
 /// options as `{label, detail}` and its required `recommendation` as
 /// `{option, why}` (OWL-324); format 11 the resolver's `basis_kind` on each
-/// decision, and its `quote` on a `ticket` one (OWL-337).
-pub const RESULT_FORMAT: u32 = 11;
+/// decision, and its `quote` on a `ticket` one (OWL-337); format 12 the
+/// `judgment` basis kind and a decision's `option` (OWL-343).
+pub const RESULT_FORMAT: u32 = 12;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -60,9 +62,9 @@ pub const TICKET_STATE_FORMAT: u32 = 4;
 /// format 9 the refused choices typed in it (OWL-198); format 10 a
 /// decision's `reversed` (OWL-146); format 11 a question's `replan`
 /// (OWL-300); format 12 a question's options as `{label, detail}` and its
-/// recommendation as `{option, why}` (OWL-324); formats 2 to 11 are still
-/// read.
-pub const QUESTIONS_FORMAT: u32 = 12;
+/// recommendation as `{option, why}` (OWL-324); format 13 a decision's
+/// `basis_kind` (OWL-343); formats 2 to 12 are still read.
+pub const QUESTIONS_FORMAT: u32 = 13;
 /// The format version of a ticket's delivery (`delivery.json` on a ticket
 /// ref, OWL-209). Format 2 adds the `owed` report and the push's kept
 /// `report` (OWL-218); format 3 a correction run's push (OWL-146); format 4

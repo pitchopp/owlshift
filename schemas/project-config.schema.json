@@ -124,7 +124,7 @@
           "const": "ticket"
         },
         {
-          "description": "Everything but the floor.",
+          "description": "Everything but the floor, on its own judgment where nothing settles\na question (OWL-342).",
           "type": "string",
           "const": "all"
         }

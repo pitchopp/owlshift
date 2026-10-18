@@ -399,14 +399,16 @@ pub struct Verdict {
 /// own label for the question, the decision, what settles it and the kind
 /// of that basis, or passed on to the decider, with why. Every text but the
 /// label is not empty and not only whitespace; a `ticket` basis has a quote,
-/// and no other kind has one; the runner judges the label, the kind against
-/// the project's delegation level and the quote against the ticket.
+/// and no other kind has one; an `option`, when given, names an option of its
+/// question; the runner judges the label, the kind against the project's
+/// delegation level and the quote against the ticket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Resolution {
     /// Settled by what the ticket, the thread, the project's rules or the
-    /// repository already establish; the runner logs it on the ticket as a
-    /// reversible decision.
+    /// repository already establish, or at `all` by the resolver's own
+    /// judgment (OWL-343); the runner logs it on the ticket as a reversible
+    /// decision.
     Decided {
         question: QuestionId,
         /// The resolver's own label for the question, read from its text and
@@ -421,10 +423,25 @@ pub enum Resolution {
         /// What settles it: the ticket, a rule, a file, an earlier answer.
         #[schemars(regex(pattern = r"\S"))]
         basis: String,
-        /// The kind of that basis (format 11, OWL-337): `fact`, `settled` or
-        /// `ticket`. The runner refuses a kind the project's delegation level
-        /// does not allow.
+        /// The kind of that basis (format 11, OWL-337): `fact`, `settled`,
+        /// `ticket` or, since format 12, `judgment` (OWL-343), its `basis`
+        /// then holding the reasons and the cost of the choice. The runner
+        /// refuses a kind the project's delegation level does not allow.
         basis_kind: BasisKind,
+        /// The letter of the question's option the decision takes, as the
+        /// runner letters them ([`option_letter`]), when it takes one
+        /// (format 12, OWL-343); refused when it names none of the options
+        /// the brief gave the question. The runner reads it where the option
+        /// decides what follows: the approval of a plan, and the re-scope of
+        /// a false premise, whose closure, the runner's own last option, it
+        /// refuses.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_string"
+        )]
+        #[schemars(with = "String", regex(pattern = r"^[A-Z]+$"))]
+        option: Option<String>,
         /// With a `ticket` basis only, and then required: the words of the
         /// ticket's title, description or a comment of its decider that
         /// settle the question, on one line and at most
@@ -452,6 +469,14 @@ impl Resolution {
     pub fn question(&self) -> &QuestionId {
         match self {
             Self::Decided { question, .. } | Self::PassedOn { question, .. } => question,
+        }
+    }
+
+    /// The option letter a decision takes, when it names one.
+    pub fn option(&self) -> Option<&str> {
+        match self {
+            Self::Decided { option, .. } => option.as_deref(),
+            Self::PassedOn { .. } => None,
         }
     }
 }
@@ -1075,6 +1100,28 @@ impl RunResult {
                 format!("no resolution for {}", question.id),
             ));
         }
+        // An option letter names an option the brief gave its question
+        // (OWL-343).
+        for resolution in &self.resolutions {
+            let Some(letter) = resolution.option() else {
+                continue;
+            };
+            let given = brief
+                .resolve
+                .iter()
+                .find(|q| q.id == *resolution.question())
+                .is_some_and(|q| option_index(&q.options, letter).is_some());
+            if !given {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "the resolution of {} takes option {letter}, which its question does not \
+                         offer",
+                        resolution.question()
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1124,8 +1171,9 @@ pub struct RefusedChoice {
 }
 
 /// The rules of the resolver's resolutions: in increasing question order,
-/// each text not only whitespace; a quote with a `ticket` basis, keeping a
-/// quote's rules ([`check_quote`]), and none with another kind (OWL-337).
+/// each text not only whitespace; an option written as a letter (OWL-343);
+/// a quote with a `ticket` basis, keeping a quote's rules ([`check_quote`]),
+/// and none with another kind (OWL-337).
 fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
     if let Some(id) = first_not_ascending(resolutions.iter().map(Resolution::question)) {
         return Err(ContractError::invalid(
@@ -1141,12 +1189,20 @@ fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
                 basis,
                 basis_kind,
                 quote,
+                option,
                 ..
             } => {
+                let letters = |letter: &str| {
+                    !letter.is_empty() && letter.bytes().all(|b| b.is_ascii_uppercase())
+                };
                 if decision.trim().is_empty() {
                     Some("has no decision".to_owned())
                 } else if basis.trim().is_empty() {
                     Some("has no basis".to_owned())
+                } else if let Some(option) = option.as_deref().filter(|option| !letters(option)) {
+                    Some(format!(
+                        "takes option {option:?}, which is not an option's letter: A, B, C…"
+                    ))
                 } else {
                     match (basis_kind, quote) {
                         (BasisKind::Ticket, None) => Some(

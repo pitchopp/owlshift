@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 12
+      "const": 13
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -176,6 +176,31 @@
         }
       ]
     },
+    "BasisKind": {
+      "description": "What a resolver's decision rests on (OWL-328): the runner allows a kind\nby the project's delegation level ([`DelegationLevel::allows`]).",
+      "oneOf": [
+        {
+          "description": "Observed in the worktree, offline: a file, an existing pattern, a\ndocumented behaviour.",
+          "type": "string",
+          "const": "fact"
+        },
+        {
+          "description": "Settled by the ticket, the decider's comments, earlier decisions or\nthe project's rules.",
+          "type": "string",
+          "const": "settled"
+        },
+        {
+          "description": "The ticket's own text, which the decision quotes.",
+          "type": "string",
+          "const": "ticket"
+        },
+        {
+          "description": "The resolver's own weighing where nothing settles the question: a\ntrade-off, a priority, an intent the ticket does not state\n(OWL-342). At `all` only.",
+          "type": "string",
+          "const": "judgment"
+        }
+      ]
+    },
     "BuildRefusal": {
       "description": "A Build run's refused results, as the ticket ref keeps them for the next\nBuild run (OWL-192): every refused choice of a hold, oldest first, typed\n(format 9, OWL-198), and the latest refusal when it listed none.\n\nA refusal that lists choices adds them and drops `reason`, which holds\nno choice; any other refusal told to the next run sets `reason` and\nkeeps the choices ([`BuildRefusal::keep_choices`]).",
       "type": "object",
@@ -241,6 +266,17 @@
           "description": "What settles it.",
           "type": "string",
           "pattern": "\\S"
+        },
+        "basis_kind": {
+          "description": "The kind of that basis (format 13, OWL-343), so the delivery report\nlists the decisions taken on judgment first; absent from a decision\nkept before.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BasisKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "comment": {
           "description": "The tracker's identifier of the runner's DECISION comment.",

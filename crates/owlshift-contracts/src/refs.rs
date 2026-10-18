@@ -17,7 +17,6 @@ use owlshift_core::state::{Status, TicketState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::Stage;
 use crate::brief::{
     MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry, validate_thread,
 };
@@ -29,6 +28,7 @@ use crate::ids::{TicketId, check_name, is_commit_id};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
+use crate::{BasisKind, Stage};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -582,6 +582,11 @@ pub struct KeptDecision {
     /// What settles it.
     #[schemars(regex(pattern = r"\S"))]
     pub basis: String,
+    /// The kind of that basis (format 13, OWL-343), so the delivery report
+    /// lists the decisions taken on judgment first; absent from a decision
+    /// kept before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_kind: Option<BasisKind>,
     /// The decider reversed it by replying to its DECISION comment
     /// (format 10, OWL-146): the replies a run was given and followed, up to
     /// [`Reversal::through`]. A newer reply is one no run has followed yet.
@@ -711,9 +716,11 @@ impl TicketQuestions {
     /// and a format-8 one, written before the refused choices were typed
     /// (OWL-198), a format-9 one, written before a decision kept its
     /// reversal (OWL-146), a format-10 one, written before a question
-    /// kept its `replan` (OWL-300), and a format-11 one, written before a
-    /// question's options and recommendation were structured (OWL-324), are
-    /// read as the current format with what they lack empty, a format-6 or 7
+    /// kept its `replan` (OWL-300), a format-11 one, written before a
+    /// question's options and recommendation were structured (OWL-324), and
+    /// a format-12 one, written before a decision kept its basis kind
+    /// (OWL-343), are read as the current format with what they lack empty,
+    /// a format-6 or 7
     /// Build refusal upgraded (`LegacyBuildRefusal::upgrade`), a format-8
     /// one's lists kept as text, and every question's options and
     /// recommendation upgraded (`upgrade_question`), and the next write
@@ -727,20 +734,25 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 11 document read as the current format, or `None` for
+    /// A format-2 to 12 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
     /// in their own shape, format 9 adds the typed choices to it, format 10
-    /// a decision's reversal, format 11 a question's `replan`, and format 12
+    /// a decision's reversal, format 11 a question's `replan`, format 12
     /// reshaped a question's options and recommendation, which every older
-    /// format keeps as strings.
+    /// format keeps as strings, and format 13 adds a decision's basis kind.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=11).contains(&format) {
+        if !(2..=12).contains(&format) {
             return None;
         }
+        let kinded = document["decisions"].as_array().is_some_and(|decisions| {
+            decisions
+                .iter()
+                .any(|decision| decision.get("basis_kind").is_some())
+        });
         let asked = document["asks"]
             .as_array()
             .into_iter()
@@ -785,6 +797,8 @@ impl TicketQuestions {
             Some("typed refused choices")
         } else if format <= 9 && reversed {
             Some("reversed decision")
+        } else if kinded {
+            Some("decision's basis kind")
         } else {
             None
         };
@@ -816,14 +830,19 @@ impl TicketQuestions {
             };
             *kept = serde_json::to_value(upgraded).expect("a Build refusal serializes");
         }
-        if let Some(asks) = document.get_mut("asks").and_then(|a| a.as_array_mut()) {
+        // Format 12 keeps its questions' current shape.
+        if format <= 11
+            && let Some(asks) = document.get_mut("asks").and_then(|a| a.as_array_mut())
+        {
             for ask in asks {
                 if let Some(questions) = ask.get_mut("questions").and_then(|q| q.as_array_mut()) {
                     questions.iter_mut().for_each(upgrade_question);
                 }
             }
         }
-        if let Some(decisions) = document.get_mut("decisions").and_then(|d| d.as_array_mut()) {
+        if format <= 11
+            && let Some(decisions) = document.get_mut("decisions").and_then(|d| d.as_array_mut())
+        {
             for decision in decisions {
                 if let Some(question) = decision.get_mut("question") {
                     upgrade_question(question);

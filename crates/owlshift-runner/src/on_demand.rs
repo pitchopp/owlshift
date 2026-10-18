@@ -6633,12 +6633,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":11,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":12,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t","recommendation":{{"why":"r"}}}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":11,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":12,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -6722,7 +6722,7 @@ mod tests {
         // A `premise_false` with no question asks nothing either (OWL-193).
         let unasked_premise = Outcome::Finished {
             result: Box::new(
-                RunResult::parse(r#"{"format":11,"status":"premise_false","summary":"s"}"#)
+                RunResult::parse(r#"{"format":12,"status":"premise_false","summary":"s"}"#)
                     .unwrap(),
             ),
             artifacts: crate::artifact::ArtifactContents::default(),
@@ -6822,7 +6822,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":11,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":12,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -6859,7 +6859,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":11,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":12,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());
@@ -6925,7 +6925,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 12,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 13,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),
@@ -6946,7 +6946,7 @@ mod tests {
         };
         let asking = |named: &str| {
             format!(
-                r#"{{"format":11,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":12,"status":"questions","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"Which file, and every key?",
                 "recommendation":{{"why":"r"}}}}]{named}}}"#
             )
@@ -6963,7 +6963,7 @@ mod tests {
             (true, 0, Some(held))
         );
         // Its `done` is refused, and the hold kept with the latest reason.
-        let done = validated(r#"{"format":11,"status":"done","summary":"s"}"#, &text_only);
+        let done = validated(r#"{"format":12,"status":"done","summary":"s"}"#, &text_only);
         let refused = done.unwrap_err();
         assert!(
             matches!(
@@ -6984,7 +6984,7 @@ mod tests {
 
         // Mixed with typed choices, a later refusal's: only those have a
         // place, and an ask naming them all clears the text lists too.
-        let listing = r#"{"format":11,"status":"done","summary":"s","decisions":[
+        let listing = r#"{"format":12,"status":"done","summary":"s","decisions":[
             {"question":"Where the README lists it","decision":"d","basis":"b"},
             {"question":"Which default","decision":"d","basis":"b"}]}"#;
         let refused = validated(listing, &text_only).unwrap_err();

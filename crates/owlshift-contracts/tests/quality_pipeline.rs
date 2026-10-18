@@ -65,7 +65,7 @@ fn brief(role: &str) -> Value {
 }
 
 fn base_result(status: &str) -> Value {
-    json!({ "format": 11, "status": status, "summary": "s" })
+    json!({ "format": 12, "status": status, "summary": "s" })
 }
 
 fn question(replan: bool) -> Value {
@@ -521,7 +521,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 18.into()),
+            with(brief("build"), "format", 19.into()),
             "upgrade Owlshift",
         ),
     ] {
@@ -545,7 +545,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketQuestions::parse(&older.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 12,")
+            .starts_with("{\n  \"format\": 13,")
     );
     for path in [
         &["asks", "0", "questions", "0"][..],
@@ -573,7 +573,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
     eleven["format"] = 11.into();
     assert!(TicketQuestions::parse(&eleven.to_string()).unwrap().asks[0].questions[0].replan);
     let mut newer = questions;
-    newer["format"] = 13.into();
+    newer["format"] = 14.into();
     let error = TicketQuestions::parse(&newer.to_string())
         .unwrap_err()
         .to_string();

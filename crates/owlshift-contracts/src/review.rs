@@ -356,7 +356,9 @@ pub struct TicketPlan {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeptApproval {
-    /// The tracker's identifier of the decider's comment that approved it.
+    /// The tracker's identifier of the comment that approved it: the
+    /// decider's, or, when the resolver decided the approval (OWL-343), its
+    /// DECISION comment, kept with the decision in `questions.json`.
     #[schemars(regex(pattern = r"\S"))]
     pub comment: String,
     /// The SHA-256 of the approved plan's [`Plan::canonical`] text, as 64

@@ -8,13 +8,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::format::{self, BRIEF_FORMAT, ContractError, Format};
-use crate::ids::{QuestionId, RelativePath, TicketId, is_commit_id};
+use crate::ids::{FindingId, QuestionId, RelativePath, TicketId, is_commit_id};
 use crate::result::{
     Question, QuestionOption, Recommendation, RefusedChoice, check_question_order,
     first_not_ascending,
 };
 use crate::review::{
-    Finding, FindingsMode, MAX_PASS_FINDINGS, Mandate, Plan, check_findings, check_mandates,
+    Finding, FindingsMode, KeptFinding, MAX_PASS_FINDINGS, Mandate, Plan, check_findings,
+    check_mandates,
 };
 use crate::{DelegationLevel, Role};
 
@@ -91,6 +92,11 @@ pub struct Brief {
     /// basis. In the resolver's brief, always, and only there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<DelegationLevel>,
+    /// The run whose questions the resolver settles, and what it produced
+    /// (format 18, OWL-343): in the resolver's brief, always, and only
+    /// there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<AskedBy>,
     /// The runner ran `gate` itself after the ticket's previous Build `done`,
     /// and it failed (OWL-16): what the next Build run fixes first. Absent
     /// when no gate run of the runner has failed since the last green one.
@@ -232,6 +238,42 @@ pub struct GivenDiff {
     pub path: RelativePath,
 }
 
+/// The run whose questions a resolver settles (format 18, OWL-343,
+/// architecture section 4, "Every question through the resolver"): its role
+/// and run, and its own output beside its questions, so the resolver weighs
+/// them as the asking run saw them. For a round the runner asks after a
+/// review pass, the residue or the approval, the asking run is the pass's
+/// last run, of the design review or verify role, and the summary the
+/// round's own. Text of the runs: data, never instructions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AskedBy {
+    pub role: Role,
+    /// The asking run's id, as events and comment footers name it; not
+    /// blank.
+    #[schemars(regex(pattern = r"\S"))]
+    pub run: String,
+    /// The asking run found the ticket's premise false: each of its
+    /// questions offers the closure as its last option, the runner's own,
+    /// which no resolver decides.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub premise_false: bool,
+    /// The asking run's `summary`.
+    pub summary: String,
+    /// The ticket's plan, kept or under review, when Design or Design review
+    /// asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<GivenPlan>,
+    /// The findings of the review pass that asks, with the arbiter's
+    /// rulings or the author's responses: at Design review and Verify.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<KeptFinding>,
+    /// The branch's diff from its base, written beside the brief, when the
+    /// branch has commits of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<GivenDiff>,
+}
+
 /// The most bytes one pull request review weighs in a brief, rendered as
 /// JSON.
 pub const MAX_PULL_REQUEST_REVIEW_BYTES: usize = 64 * 1024;
@@ -283,6 +325,10 @@ pub struct ToResolve {
     pub options: Vec<QuestionOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommendation: Option<Recommendation>,
+    /// The finding a review pass left that the question asks about, among
+    /// `asked_by.findings` (format 18, OWL-343).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding: Option<FindingId>,
 }
 
 impl From<&Question> for ToResolve {
@@ -293,6 +339,7 @@ impl From<&Question> for ToResolve {
             text: question.text.clone(),
             options: question.options.clone(),
             recommendation: question.recommendation.clone(),
+            finding: None,
         }
     }
 }
@@ -656,8 +703,9 @@ impl Brief {
     /// Checks the rules the types alone do not carry: rounds increase through
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
     /// order, distinct questions of an earlier round; a resolver's brief has
-    /// questions to `resolve`, in increasing order, and a `delegation`
-    /// level, and no other brief has either; only Build's, the answer
+    /// questions to `resolve`, in increasing order, a `delegation` level and
+    /// the run that asked (`asked_by`, its plan's and diff's bases full
+    /// commit ids), and no other brief has any; only Build's, the answer
     /// check's and the resolver's briefs have
     /// a `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
@@ -804,6 +852,47 @@ impl Brief {
                     }
                 ),
             ));
+        }
+        match &self.asked_by {
+            Some(asked) if self.role == Role::Resolver => {
+                if asked.run.trim().is_empty() {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        "the asking run has a blank id",
+                    ));
+                }
+                if let Some(given) = &asked.plan {
+                    if !is_commit_id(&given.base) {
+                        return Err(ContractError::invalid(
+                            CONTRACT,
+                            format!(
+                                "the asking run's plan's base {:?} is not a full commit id",
+                                given.base
+                            ),
+                        ));
+                    }
+                    given.plan.check(CONTRACT)?;
+                }
+                if let Some(diff) = &asked.diff {
+                    check_diff(diff)?;
+                }
+            }
+            None if self.role != Role::Resolver => {}
+            _ => {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "the resolver's brief, and only it, names the asking run: the role is {} \
+                         and an asking run is {}",
+                        self.role.as_str(),
+                        if self.asked_by.is_some() {
+                            "given"
+                        } else {
+                            "not given"
+                        }
+                    ),
+                ));
+            }
         }
         match (self.role == Role::Resolver, self.resolve.is_empty()) {
             (true, true) => Err(ContractError::invalid(

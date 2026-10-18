@@ -89,7 +89,7 @@
       "type": "object",
       "properties": {
         "comment": {
-          "description": "The tracker's identifier of the decider's comment that approved it.",
+          "description": "The tracker's identifier of the comment that approved it: the\ndecider's, or, when the resolver decided the approval (OWL-343), its\nDECISION comment, kept with the decision in `questions.json`.",
           "type": "string",
           "pattern": "\\S"
         },

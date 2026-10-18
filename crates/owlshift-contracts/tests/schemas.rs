@@ -130,7 +130,7 @@ fn project_config_schema_accepts_the_ready_gesture() {
 fn result_schema_carries_the_expressible_rules() {
     let validator = validator("result");
     let question = |id: &str| json!({ "id": id, "category": "scope", "context": "c", "text": "t", "recommendation": { "why": "r" } });
-    let base = |status: &str| json!({ "format": 11, "status": status, "summary": "s" });
+    let base = |status: &str| json!({ "format": 12, "status": status, "summary": "s" });
 
     let mut no_question = base("questions");
     no_question["questions"] = json!([]);

@@ -25,7 +25,7 @@ fn found(findings: &[(&str, &str)]) -> String {
             })
         })
         .collect();
-    json!({ "format": 11, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 12, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -42,11 +42,11 @@ fn ruled(outcomes: &[&str]) -> String {
             })
         })
         .collect();
-    json!({ "format": 11, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+    json!({ "format": 12, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
 }
 
 const FAILED_REVIEW: &str =
-    r#"{"format":11,"status":"failed","summary":"Could not read the diff."}"#;
+    r#"{"format":12,"status":"failed","summary":"Could not read the diff."}"#;
 
 impl Bench {
     /// A bench whose verify seats play from its reply queue, with Codex
