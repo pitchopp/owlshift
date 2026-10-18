@@ -93,12 +93,10 @@ pub(super) const REPLAN: &str = r#"{"format":12,"status":"questions",
 const FAILED: &str = r#"{"format":12,"status":"failed","summary":"Could not read the plan."}"#;
 
 impl Bench {
-    /// A bench whose ticket carries `variant`'s label, with Codex given
-    /// when `codex`.
-    fn of(variant: &str, codex: bool) -> Self {
+    /// A bench whose ticket carries `variant`'s label.
+    fn of(variant: &str) -> Self {
         let bench = Bench::new(true);
         bench.add_labels(&[&format!("variant:{variant}")]);
-        bench.codex.set(codex);
         bench
     }
 
@@ -133,12 +131,12 @@ impl Bench {
 }
 
 /// S9's design half: a `standard` ticket's dispatch from Ready goes to
-/// Design; the plan, kept in `plan.json`, is reviewed by the critic, on
-/// Claude Code without Codex, and conformance; a clean pass posts the PLAN
+/// Design; the plan, kept in `plan.json`, is reviewed by the critic and
+/// conformance, both on Claude Code (OWL-347); a clean pass posts the PLAN
 /// comment and the Build follows the plan from its base, dispatched again.
 #[test]
 fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let replies = vec![
         bench.read(&designed(PLAN)),
         bench.read(&reviewed(&[])),
@@ -202,11 +200,11 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
         "**Goal.** Add GREETING.md saying Hello.",
         "**Steps.**\n1. Add GREETING.md. Test: The gate's grep for Hello.",
         "- critic on Claude Code (its default model",
-        "standing in for Codex",
         "**Next.** The Build follows this plan.",
     ] {
         assert!(plan.contains(text), "{text}\n---\n{plan}");
     }
+    assert!(!plan.contains("standing in"), "{plan}");
     assert!(
         bench
             .comments()
@@ -219,7 +217,9 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
     assert_eq!(passes.len(), 2, "{passes:?}");
     assert_eq!(passes[0]["outcome"], "passed");
     assert_eq!(passes[0]["next"], "build");
-    assert_eq!(passes[0]["reviewers"][0]["stand_in"], true);
+    assert_eq!(passes[0]["reviewers"][0]["harness"], "claude");
+    assert!(passes[0]["reviewers"][0].get("stand_in").is_none());
+    assert_eq!(passes[0]["reviewers"][0]["same_model"], true);
     assert_eq!(passes[0]["reviewers"][1]["same_model"], true);
     assert_eq!(
         (&passes[1]["stage"], &passes[1]["next"]),
@@ -236,13 +236,14 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
     assert_eq!(bench.stage(), "In Review");
 }
 
-/// With Codex, the critic runs on it on the standard tier; the arbiter
-/// confirms one finding and rejects the other; the design run fixes the
+/// The critic runs on Claude Code, as conformance does, on the standard
+/// tier when no other model is configured (OWL-347); the arbiter confirms
+/// one finding and rejects the other; the design run fixes the
 /// confirmed one alone; the next pass is clean, and the PLAN comment lists
 /// the rejected finding with its reason.
 #[test]
 fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
-    let bench = Bench::of("standard", true);
+    let bench = Bench::of("standard");
     let replies = vec![
         bench.read(&designed(PLAN)),
         bench.read(&reviewed(&[
@@ -273,11 +274,12 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
         ]
     );
     let routed = bench.routed();
-    assert_eq!(
-        (routed[1].harness, routed[1].tier),
-        (HarnessKind::Codex, Tier::Standard)
-    );
-    assert_eq!(routed[2].harness, HarnessKind::Claude);
+    for seat in &routed[1..3] {
+        assert_eq!(
+            (seat.harness, seat.tier),
+            (HarnessKind::Claude, Tier::Standard)
+        );
+    }
     let briefs = bench.briefs();
     let ruling = briefs[3].findings.as_ref().unwrap();
     assert_eq!(
@@ -303,13 +305,13 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
     let first = &review.passes[0].findings;
     assert_eq!(first[0].outcome, Some(FindingOutcome::Fixed));
     assert_eq!(first[1].outcome, Some(FindingOutcome::Rejected));
-    assert_eq!(first[0].reviewer.harness, HarnessKind::Codex);
-    assert!(!first[0].reviewer.stand_in);
+    assert_eq!(first[0].reviewer.harness, HarnessKind::Claude);
+    assert!(first[0].reviewer.same_model);
     assert!(review.passes[1].findings.is_empty());
     let plan = bench.marked("[owlshift] PLAN");
     assert!(
         plan.contains(
-            "- Pass 1, F2, major, critic on Codex: GREETING.md needs a licence header. \
+            "- Pass 1, F2, major, critic on Claude Code: GREETING.md needs a licence header. \
              Rejected: Checked plan step 1 for F2."
         ),
         "{plan}"
@@ -326,7 +328,7 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
 /// `stack.rules`, and no other role's.
 #[test]
 fn the_design_roles_rules_reach_their_own_briefs() {
-    let bench = Bench::of("standard", true);
+    let bench = Bench::of("standard");
     let checkout = &bench.remote.checkout;
     let files = [
         ("design", "Plan in small steps.\n"),
@@ -400,7 +402,7 @@ fn the_design_roles_rules_reach_their_own_briefs() {
 /// as a failed run, and its rejection is kept and shown.
 #[test]
 fn the_author_answers_every_finding_and_its_rejection_is_kept() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let config = bench.remote.checkout.join("owlshift.toml");
     let text = fs::read_to_string(&config).unwrap();
     fs::write(
@@ -464,7 +466,7 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
 /// follows.
 #[test]
 fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let replies = vec![
         bench.read(&designed(PLAN)),
         bench.read(&reviewed(&[(
@@ -507,10 +509,10 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     assert_eq!(resolver.resolve[0].finding.as_ref().unwrap().as_str(), "F1");
     let plan = bench.marked("[owlshift] PLAN");
     for text in [
-        "F1, major, critic on Claude Code, standing in for Codex: Step 1's test still does not \
-         check the word. (asked below)",
-        "F2, minor, critic on Claude Code, standing in for Codex: The goal could name the file's \
-         path. (noted for the Build)",
+        "F1, major, critic on Claude Code: Step 1's test still does not check the word. (asked \
+         below)",
+        "F2, minor, critic on Claude Code: The goal could name the file's path. (noted for the \
+         Build)",
         "**Next.** The findings left are settled by DECISION comments or by the decider's",
     ] {
         assert!(plan.contains(text), "{text}\n---\n{plan}");
@@ -571,7 +573,7 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
 /// hash, and the Build starts from the base fetched at its dispatch.
 #[test]
 fn a_risky_plan_is_approved_and_its_build_starts_from_the_moved_base() {
-    let bench = Bench::of("risky", false);
+    let bench = Bench::of("risky");
     let replies = vec![
         bench.read(&designed(FORKED)),
         bench.read(&reviewed(&[])),
@@ -662,7 +664,7 @@ fn a_risky_plan_is_approved_and_its_build_starts_from_the_moved_base() {
 /// gets one pass, and its approval is asked again, the plan unapproved.
 #[test]
 fn a_changed_plan_gets_one_more_pass_and_is_asked_again() {
-    let bench = Bench::of("risky", false);
+    let bench = Bench::of("risky");
     let replies = vec![
         bench.read(&designed(FORKED)),
         bench.read(&reviewed(&[])),
@@ -702,7 +704,7 @@ fn a_changed_plan_gets_one_more_pass_and_is_asked_again() {
 /// again, and the Build follows it.
 #[test]
 fn a_replan_the_resolver_settles_sends_the_ticket_back_to_design() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let replies = vec![
         bench.read(&designed(PLAN)),
         bench.read(&reviewed(&[])),
@@ -769,7 +771,7 @@ fn a_replan_the_resolver_settles_sends_the_ticket_back_to_design() {
 /// Design.
 #[test]
 fn a_replan_on_an_approved_plan_goes_to_the_decider_and_returns_to_design() {
-    let bench = Bench::of("risky", false);
+    let bench = Bench::of("risky");
     let replies = vec![
         bench.read(&designed(FORKED)),
         bench.read(&reviewed(&[])),
@@ -834,7 +836,7 @@ fn a_trivial_label_skips_design_and_an_unknown_one_is_left_out() {
 /// stage's failed-run bound.
 #[test]
 fn a_reviewer_failing_twice_parks_the_ticket_at_design_review() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let replies = vec![
         bench.read(&designed(PLAN)),
         bench.read(FAILED),
@@ -865,7 +867,7 @@ fn a_reviewer_failing_twice_parks_the_ticket_at_design_review() {
 /// Design, the QUESTIONS comment says so, and no plan is kept.
 #[test]
 fn a_false_premise_at_design_is_a_round_to_the_decider() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let premise = r#"{"format":12,"status":"premise_false",
 "summary":"The greeting file the ticket extends is not in the repository.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; no such file exists.",
@@ -902,7 +904,7 @@ fn a_false_premise_at_design_is_a_round_to_the_decider() {
 /// ticket at Design, `continue` restarting it (OWL-306).
 #[test]
 fn a_false_premise_at_design_without_a_question_parks_the_ticket() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let premise = r#"{"format":12,"status":"premise_false","summary":"The file is not there."}"#;
     let (outcome, printed) = bench.run(vec![bench.read(premise)], None);
     assert!(
@@ -945,7 +947,7 @@ const JUDGED: &str = r#"{"format":12,"status":"done","summary":"Weighed the form
 
 /// The bench of `variant`, the project's delegation level `level`.
 fn at_level(variant: &str, level: &str) -> Bench {
-    let bench = Bench::of(variant, false);
+    let bench = Bench::of(variant);
     bench.policy(&format!("resolver_delegation = \"{level}\""));
     bench
 }
@@ -1015,7 +1017,7 @@ fn a_design_question_is_decided_on_judgment_at_all_and_not_below() {
 /// so the Build follows.
 #[test]
 fn a_residue_finding_decided_is_applied_by_the_next_design_run() {
-    let bench = Bench::of("standard", false);
+    let bench = Bench::of("standard");
     let applied = r#"{"format":12,"status":"done","summary":"The plan does not check the word.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"testing",
 "decision":"Settle it: change step 1 so its test greps for the word Hello.",

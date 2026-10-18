@@ -259,8 +259,8 @@ fn scenario_s8_a_false_premise_at_design_is_closed() {
     assert_eq!(dispatches(&bench.events()), ["drain", "continue"]);
 }
 
-/// Scenario S9's findings and review passes on a drained `standard` ticket,
-/// with Codex. At Design review the arbiter confirms the critic's finding,
+/// Scenario S9's findings and review passes on a drained `standard` ticket.
+/// At Design review the arbiter confirms the critic's finding,
 /// the design run fixes it and the next pass is clean. At Verify, pass 1's
 /// confirmed finding is fixed and its rejected one listed; pass 2 leaves a
 /// `blocker` and a `minor` on a criterion, both asked, and a `minor` off
@@ -272,7 +272,6 @@ fn scenario_s8_a_false_premise_at_design_is_closed() {
 #[test]
 fn scenario_s9_findings_and_review_passes() {
     let bench = Bench::draining("maintainer");
-    bench.codex.set(true);
     bench.verify_plays.set(true);
     bench.inbox.borrow_mut().markdown = true;
     let criterion = Some("GREETING.md says Hello.");
@@ -413,8 +412,9 @@ fn scenario_s9_findings_and_review_passes() {
 /// overrides its effort, and the project names a model for `deep` and for
 /// `standard`. Design and Build run on Claude Code (D4) on the verdict's
 /// tier at the label's effort, each dispatch telling the verdict not
-/// followed; the Codex critic runs on the standard tier and conformance on
-/// the other model, both at the ticket's effort; the arbiter takes none.
+/// followed; every reviewer, the critic included, runs on Claude Code on
+/// the other model, the standard tier (OWL-347), at the ticket's effort;
+/// the arbiter takes none.
 #[test]
 fn scenario_s17_the_tickets_routing_is_followed() {
     let bench = Bench::draining_with("\"agent\", \"effort:max\"", "");
@@ -428,7 +428,6 @@ fn scenario_s17_the_tickets_routing_is_followed() {
         ),
     )
     .unwrap();
-    bench.codex.set(true);
     bench.verify_plays.set(true);
     let mut intake: Value = serde_json::from_str(&verdict("standard")).unwrap();
     intake["intake"]["routing"] = json!({ "harness": "codex", "tier": "deep", "effort": "high" });
@@ -454,16 +453,16 @@ fn scenario_s17_the_tickets_routing_is_followed() {
         tier,
         effort,
     };
-    let (claude, codex) = (HarnessKind::Claude, HarnessKind::Codex);
+    let claude = HarnessKind::Claude;
     assert_eq!(
         bench.routed(),
         [
             route(claude, Tier::Deep, Some(Effort::Max)),
-            route(codex, Tier::Standard, Some(Effort::Max)),
+            route(claude, Tier::Standard, Some(Effort::Max)),
             route(claude, Tier::Standard, Some(Effort::Max)),
             route(claude, Tier::Standard, None),
             route(claude, Tier::Deep, Some(Effort::Max)),
-            route(codex, Tier::Standard, Some(Effort::Max)),
+            route(claude, Tier::Standard, Some(Effort::Max)),
         ],
         "design, critic, conformance, arbiter, build, verify"
     );
@@ -491,8 +490,17 @@ fn scenario_s17_the_tickets_routing_is_followed() {
         .into_iter()
         .find(|data| data["review"] == "pass")
         .unwrap();
-    let conformance = &pass["reviewers"][1];
-    assert_eq!(conformance["same_model"], false, "{pass}");
+    for reviewer in pass["reviewers"].as_array().unwrap() {
+        assert_eq!(
+            (
+                &reviewer["harness"],
+                &reviewer["model"],
+                &reviewer["same_model"]
+            ),
+            (&json!("claude"), &json!("model-standard"), &json!(false)),
+            "{pass}"
+        );
+    }
     let intake_comment = bench
         .comments()
         .into_iter()

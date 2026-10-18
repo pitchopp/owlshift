@@ -3,12 +3,13 @@
 //! the project default, the role, the ticket's verdict with its labels
 //! overriding it, then what the machine has.
 //!
-//! The first three layers are here; the machine's is the roster's
-//! ([`crate::roster::roster`]), where a critic without a usable Codex
-//! stands in on Claude Code. Reading the `tier:` and `effort:` labels off
-//! the ticket is the runner's; the core takes their values.
+//! The first three layers are here; the machine's changes nothing in P5,
+//! every run being on Claude Code, the reviewers of the roster
+//! ([`crate::roster::roster`]) included (OWL-347). Reading the `tier:` and
+//! `effort:` labels off the ticket is the runner's; the core takes their
+//! values.
 
-use crate::roster::{Seat, other_model};
+use crate::roster::other_model;
 use crate::vocab::{Effort, Harness, Role, Routing, Tier};
 
 /// What a run is given: its harness, its tier, and its effort, `None` for
@@ -66,8 +67,8 @@ pub fn ticket_routing(
 /// rebase on the fast one, all without an effort (the maintainer's
 /// decision of 2026-10-15, OWL-301). A rebase's escalation to the Build's
 /// routing on a non-trivial conflict is the runner's. `None` for Design
-/// review and Verify, whose reviewers are routed per seat
-/// ([`seat_routing`]).
+/// review and Verify, whose reviewers are routed alike
+/// ([`reviewer_routing`]).
 pub fn role_routing(role: Role, ticket: TicketRouting) -> Option<RunRouting> {
     match role {
         Role::Design | Role::Build => Some(RunRouting {
@@ -86,47 +87,37 @@ pub fn role_routing(role: Role, ticket: TicketRouting) -> Option<RunRouting> {
 
 /// A reviewer's routing, and whether it runs on the author's model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SeatRouting {
+pub struct ReviewerRouting {
     pub routing: RunRouting,
-    /// A reviewer on Claude Code whose configuration names no other model
-    /// than the author's: a fresh run of the same model, which the report
-    /// says ([`other_model`]).
+    /// A reviewer whose configuration names no other model than the
+    /// author's: a fresh run of the same model, which the report says
+    /// ([`other_model`]).
     pub same_model: bool,
 }
 
-/// The routing of a reviewer of the roster on a ticket routed `ticket`,
-/// whose authoring runs ran on its tier: the critic on Codex on the
-/// standard tier; a reviewer on Claude Code, the critic standing in
-/// included, on another model than the author's ([`other_model`], `model`
+/// The routing of every reviewer of the roster on a ticket routed `ticket`,
+/// whose authoring runs ran on its tier: on Claude Code, whatever its seat
+/// (OWL-347), on another model than the author's ([`other_model`], `model`
 /// giving the Claude Code model of each tier). Every reviewer takes the
 /// ticket's effort (the maintainer's decision of 2026-10-15, OWL-301).
-pub fn seat_routing<'a>(
-    seat: Seat,
+pub fn reviewer_routing<'a>(
     ticket: TicketRouting,
     model: impl Fn(Tier) -> Option<&'a str>,
-) -> SeatRouting {
-    let (tier, same_model) = match seat.harness {
-        Harness::Codex => (Tier::Standard, false),
-        Harness::Claude => {
-            let other = other_model(ticket.tier, model);
-            (other.tier, other.same_model)
-        }
-    };
-    SeatRouting {
+) -> ReviewerRouting {
+    let other = other_model(ticket.tier, model);
+    ReviewerRouting {
         routing: RunRouting {
-            harness: seat.harness,
-            tier,
+            harness: Harness::Claude,
+            tier: other.tier,
             effort: ticket.effort,
         },
-        same_model,
+        same_model: other.same_model,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::roster::roster;
-    use crate::vocab::{Stage, Variant};
 
     const fn verdict(harness: Harness, tier: Tier, effort: Effort) -> Option<Routing> {
         Some(Routing {
@@ -217,49 +208,29 @@ mod tests {
         }
     }
 
+    /// OWL-347: every reviewer, the critic included, on Claude Code, on
+    /// another model than the author's when one is named, at the ticket's
+    /// effort; the author's own model, flagged, when none is.
     #[test]
-    fn reviewers_take_their_tier_and_the_tickets_effort() {
+    fn reviewers_run_on_claude_code_on_another_model_at_the_tickets_effort() {
         let routed = ticket(Tier::Standard, Some(Effort::Xhigh), true);
+        let reviewer = |tier, same_model| ReviewerRouting {
+            routing: RunRouting {
+                harness: Harness::Claude,
+                tier,
+                effort: Some(Effort::Xhigh),
+            },
+            same_model,
+        };
         let model = |tier| match tier {
             Tier::Deep => Some("opus"),
             Tier::Standard => Some("sonnet"),
             Tier::Fast => None,
         };
-        let routings: Vec<_> = [true, false]
-            .into_iter()
-            .flat_map(|codex| roster(Variant::Standard, Stage::DesignReview, codex))
-            .map(|seat| seat_routing(seat, routed, model))
-            .collect();
-        let seat = |harness, tier| SeatRouting {
-            routing: RunRouting {
-                harness,
-                tier,
-                effort: Some(Effort::Xhigh),
-            },
-            same_model: false,
-        };
+        assert_eq!(reviewer_routing(routed, model), reviewer(Tier::Deep, false));
         assert_eq!(
-            routings,
-            [
-                // With Codex: the critic on Codex, conformance on Claude Code.
-                seat(Harness::Codex, Tier::Standard),
-                seat(Harness::Claude, Tier::Deep),
-                // Without: the critic's stand-in on another model too.
-                seat(Harness::Claude, Tier::Deep),
-                seat(Harness::Claude, Tier::Deep),
-            ]
-        );
-        let alone = roster(Variant::Standard, Stage::Verify, false)[0];
-        assert_eq!(
-            seat_routing(alone, routed, |_| None),
-            SeatRouting {
-                routing: RunRouting {
-                    harness: Harness::Claude,
-                    tier: Tier::Standard,
-                    effort: Some(Effort::Xhigh),
-                },
-                same_model: true,
-            }
+            reviewer_routing(routed, |_| None),
+            reviewer(Tier::Standard, true)
         );
     }
 }

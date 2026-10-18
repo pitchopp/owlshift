@@ -439,9 +439,7 @@ mod tests {
                     "codex",
                     "0.154.0 (~/bin/codex), logged in (API key); no version tested with \
                      Owlshift yet",
-                    "Does not block `owlshift do`: it does not use Codex yet; the review roles \
-                     will, from P5."
-                        .to_owned(),
+                    "Does not block `owlshift do`: no role runs on Codex for now.".to_owned(),
                 ),
                 agent_login_missing(),
                 Check::info(
@@ -465,8 +463,8 @@ Tools
   ✓ git                 2.54.0 (/usr/bin/git)
   ! codex               0.154.0 (~/bin/codex), logged in (API key); no version
                         tested with Owlshift yet
-                        Does not block `owlshift do`: it does not use Codex yet;
-                        the review roles will, from P5.
+                        Does not block `owlshift do`: no role runs on Codex for
+                        now.
 
 Agent isolation
   ✗ claude agent login  no token for agent runs in the system keychain (service
@@ -675,8 +673,7 @@ Next  owlshift do TICKET    (a ticket id, such as ABC-12)
                         "subject": "codex",
                         "detail": "0.154.0 (~/bin/codex), logged in (API key); no version \
                                    tested with Owlshift yet",
-                        "why": "Does not block `owlshift do`: it does not use Codex yet; the \
-                                review roles will, from P5.",
+                        "why": "Does not block `owlshift do`: no role runs on Codex for now.",
                         "fix": [],
                     },
                     {

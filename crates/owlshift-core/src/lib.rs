@@ -21,7 +21,7 @@
 //! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
 //! | A follow-up proposal's title, for its fingerprint | [`proposal`] |
 //! | A review pass settled: each finding's fate, where the ticket goes | [`review`] |
-//! | Who reviews, per variant, and the critic's stand-in | [`roster`] |
+//! | Who reviews, per variant, and on which model | [`roster`] |
 //! | Per-ticket routing: harness, tier and effort of each run | [`routing`] |
 
 pub mod agent_env;

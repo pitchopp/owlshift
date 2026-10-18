@@ -9,7 +9,7 @@ Status: draft, 2026-09-27. Twelve steps (P0 to P11), each shippable, testable an
 | P2 | Questions on the ticket | The agent stops and asks on the ticket; you answer there; `owlshift continue` picks up from the checkpoint |
 | P3 | Watch mode | `owlshift watch` notices your answers and resumes by itself, and repairs its own red PRs |
 | P4 | The drain | Owlshift pulls admitted tickets from the ready column, in priority order, respecting blockers, one at a time |
-| P5 | Quality pipeline | Plan, review by another model family, build, verify; plan approval by policy; per-ticket routing |
+| P5 | Quality pipeline | Plan, review by another model, build, verify; plan approval by policy; per-ticket routing |
 | P6 | Parallel | Several tickets at once without collisions; usage limits pause a harness and fall back to another |
 | P7 | Background service | Starts at login, survives sleep and crashes, notifies you only when you are the blocker |
 | P8 | Local web UI | Configuration, tickets, agent and orchestrator logs in the browser |
@@ -107,7 +107,7 @@ Owlshift picks its own work, one ticket at a time.
 PR quality at least on par with the current `/parallel` workflow.
 
 - Stages design, design review, build, verify; variants `trivial`, `standard`, `risky`; plan approval policy.
-- Codex harness for review roles; the cross-family rule; per-ticket routing (harness, tier, effort); false-premise stop. Scenarios S8 and S17 (routing part).
+- Reviewers on another model than the author's, on Claude Code; per-ticket routing (harness, tier, effort); false-premise stop. Scenarios S8 and S17 (routing part).
 - The rules are [architecture](architecture.md) section 5, "The quality pipeline" (OWL-296), and the [build plan](build-plan.md), "P5 · Quality pipeline", says who builds what and how the exit gate is run.
 
 **Readings and deviations** (OWL-296, 2026-10-15).
@@ -116,7 +116,7 @@ PR quality at least on par with the current `/parallel` workflow.
 - S9's confirmed finding and its two review passes are P5's; a finding is confirmed by an arbiter run by default, or triaged by the author's own fix run when the project sets `pipeline.findings = "author"`.
 - Human review comments on the pull request, deferred by P3, are read from P5, from the forge accounts `[forge].reviewers` lists; P10's identity map replaces that list.
 - S8 stops on a premise the repository or its documents contradict. Intake stays without network: a premise only the outside world can check is a question. Recording the dated finding where the project keeps external facts waits for a key that names that place.
-- S17's rule that a reviewer runs on another family is held by one reviewer per review, the Codex critic; the others add mandates on Claude Code.
+- S17's rule that a reviewer runs on another family applies when one is available and configured. Decided by the maintainer on 2026-10-18 (OWL-347): P5's reviewers all run on Claude Code, on another model than the author's when the configuration names one, so that no second subscription is required; the Codex critic P5 first built is unwired, and a reviewer of another family comes back as an opt-in complement (OWL-348).
 - S17's routing part: the routing verdict's tier and effort are followed; the authoring roles stay on Claude Code (D4), so a verdict naming Codex for them is shown and not followed. Its fallback part, a harness at its usage limit switching to another, is P6's, as that step says.
 - Locary is in a Linear workspace of its own, while a machine keeps one Linear key and one GitHub token for every project (keychain accounts `linear` and `github`): its first tickets need secrets per project, named by the project's GitHub repository since OWL-308 ([build plan](build-plan.md), "P5 · Quality pipeline", part K).
 

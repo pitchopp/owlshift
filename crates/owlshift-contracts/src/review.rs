@@ -514,26 +514,65 @@ pub struct KeptFinding {
 }
 
 /// The reviewer that raised a finding.
+// Read through `ReviewerForm`, which still accepts the `stand_in` key a
+// file written before OWL-347 holds, so a parsed `Reviewer` never has it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "ReviewerForm")]
 pub struct Reviewer {
     /// The reviewer's role: `design_review` or `verify`, the pass's stage.
     pub role: Role,
     /// Its mandates, at least one, each once.
-    #[schemars(length(min = 1))]
     pub mandates: Vec<Mandate>,
     pub harness: Harness,
     /// The model it ran on, as the harness was given it.
-    #[schemars(regex(pattern = r"\S"))]
     pub model: String,
-    /// It stood in for a reviewer of another harness, such as the critic on
-    /// Claude Code without Codex.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stand_in: bool,
-    /// A reviewer on Claude Code that ran on the author's own model, no
-    /// other one being configured (OWL-304): the reports say so.
+    /// A reviewer that ran on the author's own model, no other one being
+    /// configured (OWL-304): the reports say so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub same_model: bool,
+}
+
+/// What a kept reviewer may say: [`Reviewer`]'s keys, and `stand_in`, which
+/// marked the critic standing in on Claude Code for Codex until OWL-347
+/// (architecture section 5, "Codex"). It is read and ignored, never written,
+/// and left out of the schema. It is also the schema of a reviewer, so the
+/// docs of the keys are written here too.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(
+    rename = "Reviewer",
+    description = "The reviewer that raised a finding."
+)]
+struct ReviewerForm {
+    /// The reviewer's role: `design_review` or `verify`, the pass's stage.
+    role: Role,
+    /// Its mandates, at least one, each once.
+    #[schemars(length(min = 1))]
+    mandates: Vec<Mandate>,
+    harness: Harness,
+    /// The model it ran on, as the harness was given it.
+    #[schemars(regex(pattern = r"\S"))]
+    model: String,
+    /// Written before OWL-347 only; ignored.
+    #[serde(default, rename = "stand_in")]
+    #[schemars(skip)]
+    _stand_in: bool,
+    /// A reviewer that ran on the author's own model, no other one being
+    /// configured (OWL-304): the reports say so.
+    #[serde(default)]
+    same_model: bool,
+}
+
+impl From<ReviewerForm> for Reviewer {
+    fn from(form: ReviewerForm) -> Self {
+        Self {
+            role: form.role,
+            mandates: form.mandates,
+            harness: form.harness,
+            model: form.model,
+            same_model: form.same_model,
+        }
+    }
 }
 
 /// The arbiter's ruling, as kept with its finding.
@@ -796,7 +835,7 @@ mod tests {
                 }],
                 "reviewers": [{
                     "role": "design_review", "mandates": ["critic", "conformance"],
-                    "harness": "claude", "model": "m", "stand_in": true, "same_model": true
+                    "harness": "claude", "model": "m", "same_model": true
                 }]
             }],
             "answered_reviews": [7, 9],
@@ -881,6 +920,9 @@ mod tests {
     fn a_ticket_review_round_trips_and_refuses_what_it_must() {
         let parsed = TicketReview::parse(&ticket_review().to_string()).unwrap();
         assert_eq!(TicketReview::parse(&parsed.render()).unwrap(), parsed);
+        // OWL-347: a reviewer written before it may say `stand_in`, read and
+        // ignored, never written again.
+        assert!(!parsed.render().contains("stand_in"), "{}", parsed.render());
         refuses(
             ticket_review,
             TicketReview::parse,
@@ -907,6 +949,10 @@ mod tests {
                 (
                     &|d| d["passes"][0]["findings"][0]["reviewer"]["model"] = "".into(),
                     "is blank",
+                ),
+                (
+                    &|d| d["passes"][0]["reviewers"][0]["standing"] = true.into(),
+                    "unknown field `standing`",
                 ),
                 (
                     &|d| {

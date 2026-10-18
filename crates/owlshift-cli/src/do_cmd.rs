@@ -20,19 +20,17 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::{Role, Tier};
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
-use owlshift_runner::codex_machine::codex_critic;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::{EventLog, EventSink, printable};
-use owlshift_runner::executor::CodexHarness;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
-use owlshift_runner::on_demand::{self, Delivered, OnDemand, Reviewers, Stop};
+use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{
     ANSWER_CHECK_ROLE, ARBITER_ROLE, BUILD_ROLE, DESIGN_REVIEW_ROLE, DESIGN_ROLE, INTAKE_ROLE,
     REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
-use owlshift_runner::routing::{ClaudeRouter, CodexRouter, Router, claude_model};
+use owlshift_runner::routing::{ClaudeRouter, claude_model};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
 use owlshift_runner::{forge, secrets, tracker};
@@ -231,8 +229,9 @@ fn run_with(
         },
         models: project.models.clone(),
     };
-    // Design on the ticket's routing, its reviewers on their seats', the
-    // arbiter on the standard tier (OWL-303).
+    // Design on the ticket's routing, its reviewers on Claude Code on
+    // another model than the author's (OWL-303, OWL-347), the arbiter on the
+    // standard tier.
     let routed = |prompt: &str| ClaudeRouter {
         harness: ClaudeHarness {
             prompt: prompt.to_owned(),
@@ -244,24 +243,6 @@ fn run_with(
     let reviewer = routed(&design_review_prompt);
     let verifier = routed(&verify_prompt);
     let arbiter = routed(&arbiter_prompt);
-    // The critic on Codex when Codex can run it here, with each review
-    // stage's prompt; otherwise it stands in on Claude Code (architecture
-    // section 5, "Without Codex").
-    let codex = codex_critic(system, &agent).ok();
-    let critic_of = |prompt: &str| {
-        codex.as_ref().map(|found| CodexRouter {
-            harness: CodexHarness {
-                program: found.program.clone(),
-                prompt: prompt.to_owned(),
-                model: None,
-                effort: None,
-                login: found.login.clone(),
-            },
-            models: project.models.clone(),
-        })
-    };
-    let critic = critic_of(&design_review_prompt);
-    let verify_critic = critic_of(&verify_prompt);
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let on_demand = OnDemand {
@@ -271,14 +252,8 @@ fn run_with(
         build: &build,
         intake: &intake,
         design: &design,
-        design_review: Reviewers {
-            claude: &reviewer,
-            codex: critic.as_ref().map(|critic| critic as &dyn Router),
-        },
-        verify: Reviewers {
-            claude: &verifier,
-            codex: verify_critic.as_ref().map(|critic| critic as &dyn Router),
-        },
+        design_review: &reviewer,
+        verify: &verifier,
         arbiter: &arbiter,
         answer_check: &check,
         resolver: &resolver,
