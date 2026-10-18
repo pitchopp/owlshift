@@ -237,11 +237,10 @@ fn a_reversed_design_review_residue_returns_the_ticket_to_design() {
     assert_eq!(reopened[0]["approval_dropped"], json!(false));
 }
 
-/// A reply that returns nothing (OWL-345): a stranger's; and the decider's
-/// still inside the quiet window, which a Build that runs to completion and
-/// delivers leaves unfollowed, so the correction run keeps it.
+/// A stranger's reply returns nothing (OWL-345): the next run is the Build the
+/// usage limit cut off, and the approval stays.
 #[test]
-fn a_stranger_or_a_settling_reply_does_not_return_the_ticket() {
+fn a_strangers_reply_does_not_return_the_ticket() {
     let bench = at_level("standard", "all");
     bench.on_fork();
     let decision = bench.approved_then_limited();
@@ -255,12 +254,24 @@ fn a_stranger_or_a_settling_reply_does_not_return_the_ticket() {
     );
     assert_eq!(bench.roles()[before..], [Role::Build]);
     assert!(bench.decisions("reversed").is_empty());
+    assert!(bench.record().plan.unwrap().approval.is_some());
+}
+
+/// The decider's reply still inside the quiet window returns nothing
+/// (OWL-345), and a Build that runs to completion and delivers leaves it
+/// unfollowed, so the correction run keeps it.
+#[test]
+fn a_reply_inside_the_quiet_window_survives_a_completed_build() {
+    let bench = at_level("standard", "all");
+    bench.on_fork();
+    let decision = bench.approved_then_limited();
+    let before = bench.roles().len();
 
     bench.reply_as("maintainer", &decision, "No: plain text.");
     bench.waited.set(SignedDuration::ZERO);
     let (outcome, printed) = bench.continue_ticket(vec![bench.built()]);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    assert_eq!(bench.roles()[before + 1..], [Role::Build, Role::Verify]);
+    assert_eq!(bench.roles()[before..], [Role::Build, Role::Verify]);
     let record = bench.record();
     assert!(record.questions.decisions[0].reversed.is_none());
     assert!(record.plan.unwrap().approval.is_some());
