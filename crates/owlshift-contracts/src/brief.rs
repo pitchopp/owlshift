@@ -260,8 +260,7 @@ pub struct AskedBy {
     pub premise_false: bool,
     /// The asking run's `summary`.
     pub summary: String,
-    /// The ticket's plan, kept or under review, when Design or Design review
-    /// asks.
+    /// The ticket's plan, kept or under review, in a pipeline with Design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<GivenPlan>,
     /// The findings of the review pass that asks, with the arbiter's

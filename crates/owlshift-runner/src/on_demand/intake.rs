@@ -325,8 +325,9 @@ impl OnDemand<'_> {
             }
             // A false premise (OWL-306, S8) carries no record: the contract
             // gives `intake` with `done` and `questions` only. Its questions
-            // all go to the decider, the round returning to Intake; with
-            // none, the ticket parks.
+            // go through the resolver, which may decide a re-scope, never the
+            // closure (OWL-342), what is left a round returning to Intake;
+            // with none, the ticket parks.
             if event == Event::Questions
                 && let Some(result) = result
                 && result.status == result::Status::PremiseFalse
@@ -342,8 +343,9 @@ impl OnDemand<'_> {
                         sink,
                     ));
                 }
-                match self.resolve(p, &state, result, &[], &[], &rules, &current, &ran, sink)? {
-                    Routing::Settled => continue,
+                let asking = Asked::run(Role::Intake, &ran, result, &[]);
+                match self.resolve(p, &state, &asking, &rules, &current, sink)? {
+                    Routing::Settled(_) => continue,
                     Routing::Ask(round) => {
                         let asked = match state.apply(PIPELINE, Event::Questions) {
                             Ok(Transition::To(asked)) => asked,
@@ -365,8 +367,9 @@ impl OnDemand<'_> {
             if event == Event::Questions
                 && let (Some(result), Some(verdict)) = (result, verdict)
             {
-                match self.resolve(p, &state, result, &[], &[], &rules, &current, &ran, sink)? {
-                    Routing::Settled => continue,
+                let asking = Asked::run(Role::Intake, &ran, result, &[]);
+                match self.resolve(p, &state, &asking, &rules, &current, sink)? {
+                    Routing::Settled(_) => continue,
                     // The verdict is kept with the round: its dependencies
                     // become relations now, and a failure is a failed run.
                     Routing::Ask(round) => match self.relate_dependencies(p, verdict, &ran, sink) {
