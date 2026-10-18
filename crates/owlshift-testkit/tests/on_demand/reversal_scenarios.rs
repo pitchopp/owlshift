@@ -278,6 +278,43 @@ fn a_reply_inside_the_quiet_window_survives_a_completed_build() {
     assert!(bench.decisions("reversed").is_empty());
 }
 
+/// The resolver's decision on a Verify residue finding.
+const SETTLED: &str = r#"{"format":12,"status":"done","summary":"The greeting has no full stop.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"style",
+"decision":"Settle it: add the full stop.",
+"basis":"Both documents of the repository end their lines with one.",
+"basis_kind":"fact","option":"A"}]}"#;
+
+impl Bench {
+    /// Runs `owlshift do` through two Verify passes and the resolver's
+    /// decision on their residue finding, then through `after`, whose last
+    /// reply is a usage limit; returns the id of the decision's DECISION
+    /// comment.
+    fn verify_residue_decided(&self, after: Vec<Reply>) -> String {
+        let mut replies = vec![
+            self.reply(Some("Hello"), Some(DONE)),
+            self.reviewing(&found(&[("major", "The greeting has no full stop.")])),
+            self.reviewing(&ruled(&["confirmed"])),
+            self.reply(Some("Hello, again"), Some(DONE)),
+            self.reviewing(&found(&[(
+                "blocker",
+                "The greeting still has no full stop.",
+            )])),
+            self.reviewing(&ruled(&["confirmed"])),
+            self.reviewing(SETTLED),
+        ];
+        replies.extend(after);
+        let (stopped, printed) = self.run(replies, None);
+        assert!(
+            matches!(&stopped, Err(Stop::UsageLimit { .. })),
+            "{stopped:?}\n{printed}"
+        );
+        let kept = &self.record().questions.decisions[0];
+        assert_eq!(kept.asked_by, Some(Role::Verify));
+        kept.comment.clone()
+    }
+}
+
 /// A Verify residue decided by the resolver and reversed by the decider
 /// (OWL-345): the Verify pass cut short by a usage limit would run again,
 /// but the ticket returns to Build first, whose fix run follows the reply,
@@ -285,35 +322,11 @@ fn a_reply_inside_the_quiet_window_survives_a_completed_build() {
 #[test]
 fn a_reversed_verify_residue_returns_the_ticket_to_build() {
     let bench = Bench::verifying();
-    let settled = r#"{"format":12,"status":"done","summary":"The greeting has no full stop.",
-"resolutions":[{"question":"Q1","outcome":"decided","category":"style",
-"decision":"Settle it: add the full stop.",
-"basis":"Both documents of the repository end their lines with one.",
-"basis_kind":"fact","option":"A"}]}"#;
-    let replies = vec![
-        bench.reply(Some("Hello"), Some(DONE)),
-        bench.reviewing(&found(&[("major", "The greeting has no full stop.")])),
-        bench.reviewing(&ruled(&["confirmed"])),
-        bench.reply(Some("Hello, again"), Some(DONE)),
-        bench.reviewing(&found(&[(
-            "blocker",
-            "The greeting still has no full stop.",
-        )])),
-        bench.reviewing(&ruled(&["confirmed"])),
-        bench.reviewing(settled),
+    let decision = bench.verify_residue_decided(vec![
         bench.reply(Some("Hello, at last"), Some(DONE)),
         bench.limited(),
-    ];
-    let (stopped, printed) = bench.run(replies, None);
-    assert!(
-        matches!(&stopped, Err(Stop::UsageLimit { .. })),
-        "{stopped:?}\n{printed}"
-    );
-    let record = bench.record();
-    assert_eq!(record.state.stage, Stage::Verify);
-    let kept = &record.questions.decisions[0];
-    assert_eq!(kept.asked_by, Some(Role::Verify));
-    let decision = kept.comment.clone();
+    ]);
+    assert_eq!(bench.record().state.stage, Stage::Verify);
     let before = bench.roles().len();
 
     bench.reply_as("maintainer", &decision, "No: leave the greeting as it is.");
@@ -333,6 +346,39 @@ fn a_reversed_verify_residue_returns_the_ticket_to_build() {
     assert_eq!(
         (&reopened[0]["from"], &reopened[0]["to"]),
         (&json!("verify"), &json!("build"))
+    );
+    assert_eq!(reopened[0]["approval_dropped"], json!(false));
+}
+
+/// The same reply while the fix Build that the decision opened is cut off by
+/// a usage limit (OWL-345): the ticket is at Build, where the reply returns
+/// it, so nothing moves. `continue` runs the Build with the decision shown
+/// as reversed in its brief, and the return is recorded from Build to Build.
+#[test]
+fn a_reversed_verify_residue_at_build_moves_nothing() {
+    let bench = Bench::verifying();
+    let decision = bench.verify_residue_decided(vec![bench.limited()]);
+    assert_eq!(bench.record().state.stage, Stage::Build);
+    let before = bench.roles().len();
+
+    bench.reply_as("maintainer", &decision, "No: leave the greeting as it is.");
+    let replies = vec![
+        bench.reply(Some("Hello, for good"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.continue_ticket(replies);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.roles()[before..], [Role::Build, Role::Verify]);
+    assert!(follows_reply(
+        &bench.briefs()[before],
+        "No: leave the greeting as it is."
+    ));
+    assert!(bench.record().questions.decisions[0].reversed.is_some());
+    let reopened = bench.decisions("reversed");
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(
+        (&reopened[0]["from"], &reopened[0]["to"]),
+        (&json!("build"), &json!("build"))
     );
     assert_eq!(reopened[0]["approval_dropped"], json!(false));
 }
