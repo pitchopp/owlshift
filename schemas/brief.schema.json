@@ -1373,12 +1373,9 @@
           "$ref": "#/$defs/Role"
         },
         "same_model": {
-          "description": "A reviewer on Claude Code that ran on the author's own model, no\nother one being configured (OWL-304): the reports say so.",
-          "type": "boolean"
-        },
-        "stand_in": {
-          "description": "It stood in for a reviewer of another harness, such as the critic on\nClaude Code without Codex.",
-          "type": "boolean"
+          "description": "A reviewer that ran on the author's own model, no other one being\nconfigured (OWL-304): the reports say so.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
