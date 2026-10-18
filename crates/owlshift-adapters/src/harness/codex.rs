@@ -14,8 +14,8 @@
 //! entry (OWL-131, OWL-132, OWL-316, OWL-317), with codex-cli 0.154.0: the
 //! flags, the stream's events, the rule that a run
 //! failed exactly when its stream ends in `turn.failed` or is empty, the
-//! usage-limit message, the effort levels, and the item a collaboration
-//! tool's call leaves. The recordings are replayed by
+//! usage-limit message and the reset time it gives (OWL-341), the effort
+//! levels, and the item a collaboration tool's call leaves. The recordings are replayed by
 //! `tests/codex_fixtures.rs`.
 
 use std::fmt;
@@ -284,9 +284,13 @@ pub enum Outcome {
         /// The last agent message: the result's JSON text.
         text: String,
     },
-    /// The subscription's usage limit stopped the run. Codex gives the
-    /// reset time only as local wall-clock text, which is not read (C7).
-    UsageLimit,
+    /// The subscription's usage limit stopped the run.
+    UsageLimit {
+        /// When the limit resets. Codex gives it only as wall-clock text of
+        /// the machine's zone, with no date, which [`reset_time`] reads;
+        /// `None` when the message gives none in a form observed (C7).
+        resets_at: Option<Timestamp>,
+    },
     Failed(Failure),
 }
 
@@ -376,8 +380,9 @@ pub struct Transcript {
     /// The last terminal event: `turn.completed` or `turn.failed`.
     end: Option<End>,
     usage: Option<Usage>,
-    /// A usage-limit message was seen in an `error` or `turn.failed` event.
-    limit: bool,
+    /// The first usage-limit message seen in an `error` or `turn.failed`
+    /// event, and the instant it was read.
+    limit: Option<(String, Timestamp)>,
     /// See [`Run::collaboration`].
     collaboration: Vec<String>,
     malformed_lines: usize,
@@ -404,7 +409,14 @@ impl Transcript {
     /// Reads one output line. Events of an unknown type are skipped; a line
     /// that is not a JSON object is counted. A [`COLLABORATION_ITEM`] is
     /// noted whichever of its started, updated or completed events comes.
+    /// The line is read now: see [`Transcript::feed_at`].
     pub fn feed(&mut self, line: &[u8]) {
+        self.feed_at(line, Timestamp::now());
+    }
+
+    /// [`Transcript::feed`] for a line read at `at`, the instant a usage
+    /// limit's reset time is resolved against ([`reset_time`]).
+    pub fn feed_at(&mut self, line: &[u8], at: Timestamp) {
         let event = match serde_json::from_slice::<Value>(line) {
             Ok(event) if event.is_object() => event,
             _ if line.iter().all(u8::is_ascii_whitespace) => return,
@@ -438,13 +450,22 @@ impl Transcript {
             }
             Some("turn.failed") => {
                 let message = str_field(&event["error"], "message");
-                self.limit |= message.is_some_and(is_limit);
+                self.note_limit(message, at);
                 self.end = Some(End::Failed(message.map(str::to_owned)));
             }
             Some("error") => {
-                self.limit |= str_field(&event, "message").is_some_and(is_limit);
+                self.note_limit(str_field(&event, "message"), at);
             }
             _ => {}
+        }
+    }
+
+    /// Keeps the first message that is a usage limit's.
+    fn note_limit(&mut self, message: Option<&str>, at: Timestamp) {
+        if let Some(message) = message.filter(|message| is_limit(message))
+            && self.limit.is_none()
+        {
+            self.limit = Some((message.to_owned(), at));
         }
     }
 
@@ -452,13 +473,25 @@ impl Transcript {
     ///
     /// A run completed only with exit status 0 and a stream ending in
     /// `turn.completed` (C2, "Failure"). Otherwise a usage-limit message
-    /// wins over the other failures.
+    /// wins over the other failures, and its reset time is read in the
+    /// system zone, the zone Codex writes it in.
     pub fn finish(self, exit_code: Option<i32>, stderr: Vec<u8>) -> Run {
+        self.finish_in(exit_code, stderr, &TimeZone::system())
+    }
+
+    /// [`Transcript::finish`] with the zone the limit message's time is
+    /// read in.
+    pub fn finish_in(self, exit_code: Option<i32>, stderr: Vec<u8>, zone: &TimeZone) -> Run {
+        // `Some` when a usage limit was seen; its time `None` when unread.
+        let limit =
+            (self.limit.as_ref()).map(|(message, read_at)| reset_time(message, *read_at, zone));
         let outcome = match (&self.end, exit_code) {
             (Some(End::Completed), Some(0)) => Outcome::Completed {
                 text: self.last_message.clone().unwrap_or_default(),
             },
-            _ if self.limit => Outcome::UsageLimit,
+            _ if limit.is_some() => Outcome::UsageLimit {
+                resets_at: limit.flatten(),
+            },
             (_, None) => Outcome::Failed(Failure::Signal),
             _ if !self.started => Outcome::Failed(Failure::NoThread),
             (None, _) => Outcome::Failed(Failure::Unfinished),
@@ -746,6 +779,15 @@ mod tests {
         transcript.finish(exit_code, Vec::new())
     }
 
+    /// [`replay`] with every line read at `read_at`, in `zone`.
+    fn replay_at(lines: &[&str], read_at: Timestamp, zone: &TimeZone) -> Run {
+        let mut transcript = Transcript::default();
+        for line in lines {
+            transcript.feed_at(line.as_bytes(), read_at);
+        }
+        transcript.finish_in(Some(1), Vec::new(), zone)
+    }
+
     const STARTED: &str = r#"{"type":"thread.started","thread_id":"t"}"#;
     const MESSAGE: &str =
         r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{}"}}"#;
@@ -798,11 +840,11 @@ mod tests {
     fn a_usage_limit_is_read_from_error_events_only() {
         for limit in LIMIT_MESSAGES {
             let failed = format!(
-                r#"{{"type":"turn.failed","error":{{"message":"{limit}. Try again at 1:45 PM."}}}}"#
+                r#"{{"type":"turn.failed","error":{{"message":"{limit}. Try again at Oct 20 1:45 PM."}}}}"#
             );
             assert_eq!(
                 replay(&[STARTED, &failed], Some(1)).outcome,
-                Outcome::UsageLimit
+                Outcome::UsageLimit { resets_at: None }
             );
         }
         let quoted = r#"{"type":"item.completed","item":{"type":"agent_message","text":"You've hit your usage limit"}}"#;
@@ -811,6 +853,87 @@ mod tests {
             replay(&[STARTED, quoted, failed], Some(1)).outcome,
             Outcome::Failed(Failure::Error { .. })
         ));
+        // A limit message quoted by the model, with a time, gives no time.
+        let quoted_time = r#"{"type":"item.completed","item":{"type":"agent_message","text":"You've hit your usage limit. … try again at 1:45 PM."}}"#;
+        assert!(matches!(
+            replay(&[STARTED, quoted_time, failed], Some(1)).outcome,
+            Outcome::Failed(Failure::Error { .. })
+        ));
+    }
+
+    fn limit_events(message: &str) -> [String; 2] {
+        let message = json!(message);
+        [
+            format!(r#"{{"type":"error","message":{message}}}"#),
+            format!(r#"{{"type":"turn.failed","error":{{"message":{message}}}}}"#),
+        ]
+    }
+
+    /// The reset time is resolved against the instant the message was read,
+    /// in the zone given, for each message observed (C7).
+    #[test]
+    fn a_usage_limit_carries_the_reset_time_of_its_message() {
+        let zone = paris();
+        for (message, read_at, expected) in [
+            (
+                OBSERVED_1_45_PM,
+                "2026-10-15T09:00:00",
+                "2026-10-15T13:45:00",
+            ),
+            (
+                OBSERVED_3_54_AM,
+                "2026-10-17T22:44:00",
+                "2026-10-18T03:54:00",
+            ),
+        ] {
+            let [error, failed] = limit_events(message);
+            let run = replay_at(&[STARTED, &error, &failed], at(&zone, read_at), &zone);
+            assert_eq!(
+                run.outcome,
+                Outcome::UsageLimit {
+                    resets_at: Some(at(&zone, expected))
+                },
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_usage_limit_without_a_time_keeps_none() {
+        let zone = paris();
+        let read_at = at(&zone, "2026-10-15T09:00:00");
+        for message in [
+            "You're out of credits",
+            "Usage limit reached",
+            "You've hit your usage limit. … try again at Oct 20th, 2026 3:54 AM.",
+        ] {
+            let [error, failed] = limit_events(message);
+            let run = replay_at(&[STARTED, &error, &failed], read_at, &zone);
+            assert_eq!(
+                run.outcome,
+                Outcome::UsageLimit { resets_at: None },
+                "{message}"
+            );
+        }
+    }
+
+    /// The first message read gives the time, at the instant it was read: the
+    /// `turn.failed` event that follows an `error` repeats it.
+    #[test]
+    fn the_first_limit_message_gives_the_reset_time() {
+        let zone = paris();
+        let [error, failed] = limit_events(OBSERVED_3_54_AM);
+        let mut transcript = Transcript::default();
+        transcript.feed_at(STARTED.as_bytes(), at(&zone, "2026-10-17T22:00:00"));
+        transcript.feed_at(error.as_bytes(), at(&zone, "2026-10-17T22:44:00"));
+        // A read after the reset's clock time would put it a day later.
+        transcript.feed_at(failed.as_bytes(), at(&zone, "2026-10-18T04:00:00"));
+        assert_eq!(
+            transcript.finish_in(Some(1), Vec::new(), &zone).outcome,
+            Outcome::UsageLimit {
+                resets_at: Some(at(&zone, "2026-10-18T03:54:00"))
+            }
+        );
     }
 
     /// OWL-317: a collaboration call is read from Codex's own items, from
