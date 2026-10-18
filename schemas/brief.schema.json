@@ -278,7 +278,7 @@
           }
         },
         "plan": {
-          "description": "The ticket's plan, kept or under review, when Design or Design review\nasks.",
+          "description": "The ticket's plan, kept or under review, in a pipeline with Design.",
           "anyOf": [
             {
               "$ref": "#/$defs/GivenPlan"

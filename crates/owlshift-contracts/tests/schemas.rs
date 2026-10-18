@@ -161,7 +161,7 @@ fn result_schema_carries_the_expressible_rules() {
     named["refused_choices_asked"][0]["choice"] = json!(0);
     assert!(!validator.is_valid(&named));
 
-    for format in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
+    for format in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13] {
         let mut other = base("done");
         other["format"] = json!(format);
         assert!(!validator.is_valid(&other), "format {format}");
