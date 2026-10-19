@@ -20,8 +20,9 @@ admit = { label = "agent" }
 # `owlshift watch --drain` refuses to start without it. The maintainer's
 # account, for the P4 exit gate (OWL-255).
 admitters = ["782fed6b-e07e-4647-9d70-961856bdf80c"]
-# The tracker states that show where a ticket stands.
-states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+# The tracker states that show where a ticket stands. A parked ticket
+# shows Parked, which only a person's `owlshift continue` restarts.
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review", parked = "Parked" }
 
 [stack]
 # The project's full gate: lint, formatter and tests, run in order from the
