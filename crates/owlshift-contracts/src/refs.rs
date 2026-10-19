@@ -480,7 +480,7 @@ pub fn cut_reason(reason: String) -> String {
 
 /// `reason` cut to at most `max` bytes on a character boundary, its
 /// beginning kept and the cut marked when there is room for the mark.
-pub(crate) fn cut_to(reason: &str, max: usize) -> String {
+pub fn cut_to(reason: &str, max: usize) -> String {
     const CUT: &str = " [cut]";
     if reason.len() <= max {
         return reason.to_owned();

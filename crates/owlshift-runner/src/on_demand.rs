@@ -91,7 +91,7 @@ use owlshift_contracts::ids::{FindingId, QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
     AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision,
     KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketDelivery, TicketQuestions,
-    cut_reason,
+    cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -2637,6 +2637,9 @@ impl OnDemand<'_> {
         brief.result_refusal = questions
             .latest()
             .and_then(|ask| ask.result_refusal.clone());
+        // The plan an approval or a finding asks about: its PLAN comments
+        // read short in the thread (OWL-357).
+        brief.plan = design::given_plan(p);
         let executor = Executor {
             timeout: ANSWER_CHECK_TIMEOUT,
             ..self.executor.clone()
@@ -5571,6 +5574,12 @@ fn push_what(kind: PushKind) -> &'static str {
 /// copies the marker, or a part of an abandoned attempt at the same round
 /// stays a comment.
 ///
+/// The runner's own comments the thread keeps show the body `brief_body`
+/// gives them (OWL-357): a PLAN, RESUME or DELIVERY its header line and
+/// where its content is, since the brief carries it from the ticket ref or
+/// no run needs it; the other kinds cut to 4,096 bytes, a REPLY whole. A
+/// person's comment is always whole.
+///
 /// The test bench's stand-in driver builds its briefs' threads with it too
 /// (`owlshift_testkit::scenario`), from the asks and decisions it keeps.
 pub fn thread(
@@ -5617,11 +5626,78 @@ pub fn thread(
         thread.push(ThreadEntry::Comment {
             at: comment.created_at,
             author: comment_author(comment, &in_force),
-            body: comment.body.clone(),
+            body: brief_body(comment),
         });
     }
     thread.extend(kept.map(|entry| entry.entry()));
     thread
+}
+
+/// The most bytes a brief's thread shows of a runner's comment that it cuts
+/// (OWL-357): a PARKED or INTAKE comment, or an ask or a decision the ticket
+/// ref no longer keeps.
+const MAX_THREAD_COMMENT_BYTES: usize = 4096;
+
+/// The body a brief's thread shows of `comment`, one its ask or decision
+/// does not replace (OWL-357; build plan, "The brief's thread"). The
+/// runner's own comment, marked from its header to its footer and never
+/// edited (the runner edits none, so an edit is a person's), shows by kind:
+///
+/// - a PLAN, RESUME or DELIVERY, whose content the brief carries or no run
+///   needs, its header line and a sentence saying what was left out and
+///   where it is, with the comment's tracker id;
+/// - a REPLY, read against the decider's next answer (OWL-128), whole;
+/// - any other kind, which the ticket ref does not carry, cut to
+///   [`MAX_THREAD_COMMENT_BYTES`], its start kept and the cut marked.
+///
+/// Every other comment is whole: a person's, a marked one without its
+/// footer or whose marker does not parse, and an edited one. A person who
+/// posts a whole copy of a runner's comment, footer included, has it shown
+/// short as well: it hides only their own copy, read as Owlshift's anyway.
+fn brief_body(comment: &Comment) -> String {
+    let marked = match MarkedComment::parse(&comment.body) {
+        Ok(Some(marked)) if marked.footer.is_some() && comment.edited_at.is_none() => marked,
+        _ => return comment.body.clone(),
+    };
+    let left_out = match marked.header.kind {
+        MarkerKind::Plan => {
+            "the plan it showed is kept in the ticket ref, and the latest is this brief's `plan`"
+        }
+        MarkerKind::Resume => {
+            "it restated the round's questions, which its `questions` entry holds, with the \
+             answer check's reading of the decider's answers, which are their own `comment` \
+             entries"
+        }
+        MarkerKind::Delivery => {
+            "it reported a push of the ticket's branch, which the pull request holds; the \
+             report itself is on the ticket only"
+        }
+        MarkerKind::Reply => return comment.body.clone(),
+        MarkerKind::Questions
+        | MarkerKind::ReAsk
+        | MarkerKind::Decision
+        | MarkerKind::Parked
+        | MarkerKind::Intake => {
+            let note = format!(
+                "\n\n(Cut to {MAX_THREAD_COMMENT_BYTES} bytes in this brief: the whole comment \
+                 is on the ticket, tracker comment `{}`.)",
+                comment.id
+            );
+            if comment.body.len() <= MAX_THREAD_COMMENT_BYTES {
+                return comment.body.clone();
+            }
+            let kept = cut_to(
+                &comment.body,
+                MAX_THREAD_COMMENT_BYTES.saturating_sub(note.len()),
+            );
+            return format!("{kept}{note}");
+        }
+    };
+    format!(
+        "{}\n\nLeft out of this brief: {left_out}. Tracker comment `{}`.",
+        marked.header.render(),
+        comment.id
+    )
 }
 
 /// The ids of the comments that are the earlier parts of the round `ask`
@@ -6521,6 +6597,152 @@ mod tests {
             assert_eq!(
                 comment_author(&comment(author, body), &decider).relation,
                 relation,
+                "{body}"
+            );
+        }
+    }
+
+    /// A comment on the ticket `OWL-1`, oldest first by `n`, from `author`.
+    fn posted(n: u32, author: TrackerAuthor, body: &str) -> Comment {
+        Comment {
+            id: format!("c{n}"),
+            author,
+            created_at: format!("2026-10-19T10:{n:02}:00Z").parse().unwrap(),
+            edited_at: None,
+            body: body.into(),
+            parent: None,
+        }
+    }
+
+    /// A runner's comment of `header` (kind and round as the footer gives
+    /// them) whose text between header and footer is `text`.
+    fn marked(header: &str, footer: &str, text: &str) -> String {
+        format!(
+            "{header}\n\n{text}\n\n<!-- owlshift:{{\"format\":1,{footer},\"ticket\":\"OWL-1\"}} -->\n"
+        )
+    }
+
+    /// The bodies a thread of `comments`, with no ask or decision kept,
+    /// shows.
+    fn shown(comments: &[Comment]) -> Vec<String> {
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        thread(comments, &[], &[], &decider)
+            .into_iter()
+            .map(|entry| match entry {
+                ThreadEntry::Comment { body, .. } => body,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// OWL-357: the runner's PLAN, RESUME and DELIVERY comments read as their
+    /// header and where their content is, with their id; a REPLY and a
+    /// person's comment, however long, read whole, and so does a marked one
+    /// without its footer. A stranger's whole copy of a runner's comment,
+    /// footer included, reads short too: the limit the design accepts.
+    #[test]
+    fn owlshifts_plan_resume_and_delivery_read_short_and_a_persons_comment_whole() {
+        let app = || TrackerAuthor::Other {
+            name: "owlshift".into(),
+        };
+        let person = |id: &str| {
+            TrackerAuthor::Account(Person {
+                id: id.into(),
+                name: format!("name of {id}"),
+            })
+        };
+        let long = "The whole plan, step by step. ".repeat(500);
+        let plan = marked("[owlshift] PLAN", "\"kind\":\"PLAN\"", &long);
+        let resume = marked(
+            "[owlshift] RESUME · round 2",
+            "\"kind\":\"RESUME\",\"round\":2",
+            &long,
+        );
+        let delivery = marked("[owlshift] DELIVERY", "\"kind\":\"DELIVERY\"", &long);
+        let reply = marked("[owlshift] REPLY", "\"kind\":\"REPLY\"", &long);
+        let answer = format!("Q1: A. {long}");
+        let unfooted = format!("[owlshift] PLAN\n\n{long}");
+        let comments = [
+            posted(1, app(), &plan),
+            posted(2, person("u1"), &answer),
+            posted(3, app(), &resume),
+            posted(4, app(), &delivery),
+            posted(5, app(), &reply),
+            posted(6, person("u2"), &unfooted),
+            posted(7, person("u2"), &plan),
+        ];
+        let bodies = shown(&comments);
+        let short = |header: &str, id: &str, says: &str| {
+            let body = bodies
+                .iter()
+                .find(|body| body.contains(&format!("Tracker comment `{id}`.")))
+                .unwrap_or_else(|| panic!("{id}: {bodies:?}"));
+            assert!(body.starts_with(&format!("{header}\n\nLeft out of this brief: ")));
+            assert!(body.contains(says), "{body}");
+            assert!(body.len() < 400 && !body.contains("step by step"), "{body}");
+        };
+        short("[owlshift] PLAN", "c1", "this brief's `plan`");
+        short("[owlshift] RESUME · round 2", "c3", "`questions` entry");
+        short("[owlshift] DELIVERY", "c4", "on the ticket only");
+        short("[owlshift] PLAN", "c7", "this brief's `plan`");
+        assert_eq!(bodies[1], answer, "the decider's comment, byte for byte");
+        assert_eq!(bodies[4], reply);
+        assert_eq!(bodies[5], unfooted);
+    }
+
+    /// OWL-357's guardrail: the runner edits no comment, so a marked comment
+    /// someone edited is a person's and reads whole, the runner's own kinds
+    /// included.
+    #[test]
+    fn an_edited_marked_comment_reads_whole() {
+        let long = "My own reading of it. ".repeat(400);
+        for (header, footer) in [
+            ("[owlshift] PLAN", "\"kind\":\"PLAN\""),
+            ("[owlshift] PARKED", "\"kind\":\"PARKED\""),
+        ] {
+            let mut edited = posted(
+                1,
+                TrackerAuthor::Account(Person {
+                    id: "u1".into(),
+                    name: "Maintainer".into(),
+                }),
+                &marked(header, footer, &long),
+            );
+            edited.edited_at = Some("2026-10-19T11:00:00Z".parse().unwrap());
+            assert_eq!(shown(&[edited.clone()]), [edited.body]);
+        }
+    }
+
+    /// OWL-357: a runner's comment the ticket ref does not carry, such as a
+    /// PARKED one, reads up to 4,096 bytes, cut on a character boundary past
+    /// that, its start kept and the cut naming the comment.
+    #[test]
+    fn a_runners_comment_the_ref_does_not_carry_is_cut_to_the_cap() {
+        let app = || TrackerAuthor::Other {
+            name: "owlshift".into(),
+        };
+        let parked = |len: usize| {
+            let frame = marked("[owlshift] PARKED", "\"kind\":\"PARKED\"", "");
+            // Two-byte characters, so a cut may land inside one.
+            let text = "é".repeat((len - frame.len()) / 2) + &"x".repeat((len - frame.len()) % 2);
+            marked("[owlshift] PARKED", "\"kind\":\"PARKED\"", &text)
+        };
+        let fits = parked(MAX_THREAD_COMMENT_BYTES);
+        assert_eq!(fits.len(), MAX_THREAD_COMMENT_BYTES);
+        assert_eq!(shown(&[posted(1, app(), &fits)]), [fits]);
+        for len in [MAX_THREAD_COMMENT_BYTES + 1, 3 * MAX_THREAD_COMMENT_BYTES] {
+            let over = parked(len);
+            assert_eq!(over.len(), len);
+            let [body] = &shown(&[posted(1, app(), &over)])[..] else {
+                panic!("one entry");
+            };
+            assert!(body.len() <= MAX_THREAD_COMMENT_BYTES, "{}", body.len());
+            assert!(body.starts_with("[owlshift] PARKED\n\néé"), "{body}");
+            assert!(
+                body.ends_with("the whole comment is on the ticket, tracker comment `c1`.)"),
                 "{body}"
             );
         }

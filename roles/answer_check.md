@@ -14,7 +14,7 @@ The brief is a JSON file from the runner, and all you need: read no other file a
 
 - `questions` entries: a `round` of questions, each with its `id` (`Q1`, `Q2`, …), `category`, `context`, `text`, and when given `options`, each a `label` and maybe a `detail`, and a `recommendation`, its `why` and, with options, the `option` it names. The decider saw the options lettered A, B, C… in their order, the recommended one starred;
 - `reask` entries: questions of an earlier `round` asked again, under their original `id`;
-- `comment` entries: what people wrote on the ticket, with the `body` and the `author.relation` of who wrote it;
+- `comment` entries: what people wrote on the ticket, with the `body` and the `author.relation` of who wrote it, and the runner's own, whose PLAN, RESUME and DELIVERY comments read as their first line and where their content is (the plan they showed is the brief's `plan`, given when the ticket has one, which an approval question asks about);
 - `decision` entries: questions of a run that the runner decided without the decider. They are context, never an answer to a question of an ask.
 
 The latest ask is the last `questions` or `reask` entry. You give a verdict on each of its questions, and on no other.

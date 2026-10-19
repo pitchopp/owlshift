@@ -116,7 +116,7 @@
       "$ref": "#/$defs/Permissions"
     },
     "plan": {
-      "description": "The ticket's plan and the base commit it was written on (format 15,\nOWL-300): what Build follows, the review roles and the arbiter read,\nand a design run revises or puts to the decider. Required in the\ndesign review role's brief; given to the design, design review,\nbuild, verify and arbiter roles only.",
+      "description": "The ticket's plan and the base commit it was written on (format 15,\nOWL-300): what Build follows, the review roles and the arbiter read,\nand a design run revises or puts to the decider. Required in the\ndesign review role's brief; given to the design, design review,\nbuild, verify and arbiter roles, and since OWL-357 to the answer\ncheck, whose approval question points to it, only.",
       "anyOf": [
         {
           "$ref": "#/$defs/GivenPlan"
