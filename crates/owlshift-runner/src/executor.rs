@@ -35,7 +35,7 @@
 //!
 //! A Build run with a project setup (`stack.setup`, OWL-330) runs it before
 //! the harness, right after the isolation snapshot, then checks isolation
-//! ([`gate::run_setup`]): a violation quarantines the run, and a red setup
+//! (`gate::run_setup`): a violation quarantines the run, and a red setup
 //! fails it, [`Failure::Setup`], with no harness spawned. Only a red setup
 //! command on a worktree holding the Build's own work lets the harness
 //! start, its brief carrying the failure as `gate_failure`, so the Build can

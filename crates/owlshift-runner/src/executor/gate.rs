@@ -48,10 +48,10 @@
 //! of the gate's ([`SETUP_SHARE`]). A failing setup command fails the gate,
 //! its reason starting `setup: `; once it passes, the guard, the clean check
 //! and HEAD are checked again, and the gate's commands get their whole
-//! deadline. [`run_setup`] runs the setup alone before a Build's harness,
+//! deadline. `run_setup` runs the setup alone before a Build's harness,
 //! where the worktree may hold a resumed Build's unfinished work: it must
 //! leave that work as it found it, which it reads before and after
-//! ([`worktree_state`]) rather than requiring a clean tree.
+//! (`worktree_state`) rather than requiring a clean tree.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -92,7 +92,7 @@ const LISTED_PATHS: usize = 10;
 pub const SETUP_SHARE: u32 = 3;
 
 /// The file of the run directory a Build's setup before its harness logs
-/// to ([`run_setup`]).
+/// to (`run_setup`).
 pub const SETUP_LOG: &str = "setup.log";
 
 /// The start of the reason of a setup command's failure.
