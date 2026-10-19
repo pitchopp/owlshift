@@ -815,37 +815,55 @@ fn files_under(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// A bare `gc` by the agent's git, with another worktree in the clone: git
-/// itself rewrites the reflogs of every entry (git 2.54.0 gave the first
-/// line of each `logs/HEAD` a trailing tab, build plan, "OWL-339 live
-/// checks"), another's included. The check reports exactly what changed in
-/// that entry: in a confined run the write is refused (the agent cannot
-/// lock the entry's `HEAD`), so nothing changes and nothing is reported,
-/// while a bare run that does rewrite it is found, a documented limit
-/// (OWL-339).
+/// A `gc` with another worktree in the clone whose reflog holds an expired
+/// line. The agent's git leaves that entry alone: its environment keeps
+/// housekeeping from expiring reflogs, as the runner's git does. A `gc`
+/// that expires them, as git's defaults do (a git outside the runner's, in
+/// a process that is not confined), rewrites the entry's `logs/HEAD`, and
+/// the check reports exactly that file (OWL-339).
 #[test]
-fn a_gc_by_the_agents_git_is_reported_exactly_where_it_rewrites_another_entry() {
+fn the_agents_gc_leaves_another_entry_alone_and_one_that_expires_reflogs_is_found() {
     let (f, other) = with_other();
+    // An old line in `other`'s reflog, which an expiring `gc` removes; no
+    // maintenance runs first.
+    let old = f
+        .env
+        .at(jiff::Timestamp::from_second(1_577_836_800).unwrap());
+    let checkout = f.main.parent().unwrap().join(OTHER);
+    old.run(
+        &checkout,
+        &[
+            "-c",
+            "maintenance.auto=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "old",
+        ],
+    )
+    .unwrap();
     let before = files_under(&other);
-    let found = f.around(|f| f.agent_git(&["gc", "--quiet"]));
-    let after = files_under(&other);
-    let changed: Vec<String> = before
-        .keys()
-        .chain(after.keys())
-        .filter(|name| before.get(*name) != after.get(*name))
-        .map(|name| format!("worktrees/{OTHER}/{name}"))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if changed.is_empty() {
-        assert_eq!(found, []);
-    } else {
-        assert_eq!(
-            found,
-            [Violation::WorktreeEntries(changed)],
-            "gc changed another entry"
-        );
-    }
+
+    assert_eq!(f.around(|f| f.agent_git(&["gc", "--quiet"])), []);
+    assert_eq!(files_under(&other), before, "the agent's gc changed it");
+
+    let found = f.around(|f| {
+        f.agent_git(&[
+            "-c",
+            "gc.reflogExpire=90.days.ago",
+            "-c",
+            "gc.reflogExpireUnreachable=30.days.ago",
+            "gc",
+            "--quiet",
+        ])
+    });
+    assert_ne!(
+        files_under(&other)["logs/HEAD"],
+        before["logs/HEAD"],
+        "the expiring gc left the reflog"
+    );
+    assert_eq!(found, [entries(&["worktrees/other/logs/HEAD"])]);
 }
 
 /// A change past the first mebibyte of a large file of another's entry is
