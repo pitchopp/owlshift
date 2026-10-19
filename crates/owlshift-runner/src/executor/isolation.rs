@@ -106,6 +106,14 @@ use crate::config::exit_text;
 /// compared by its size and the digest of the whole file.
 const SHARED_FILE_CAP: u64 = 1024 * 1024;
 
+/// The most bytes of files one read of the shared git files, or one read of
+/// the other worktrees' entries, takes in, all files together. Past it the
+/// read fails, one byte later, and the check reports that it could not run:
+/// a run that got past the sandbox cannot keep the check reading with a
+/// huge or sparse file (OWL-339). Far above what git writes there, a large
+/// repository's `index` included.
+const READ_BUDGET: u64 = 1024 * 1024 * 1024;
+
 /// The most names a violation lists before summing up the rest.
 const LISTED: usize = 10;
 
@@ -943,8 +951,9 @@ fn path_of(bytes: &[u8]) -> PathBuf {
 /// configuration (OWL-50).
 fn read_shared(common: &Path) -> Result<BTreeMap<PathBuf, Content>, SnapshotError> {
     let mut shared = BTreeMap::new();
+    let mut budget = Budget::new(READ_BUDGET);
     for name in ["commondir", "config", "config.worktree", "hooks", "info"] {
-        walk(common, Path::new(name), &mut shared, &|_| {})
+        walk(common, Path::new(name), &mut shared, &mut budget, &|_| {})
             .map_err(|e| SnapshotError(format!("{}: {e}", common.join(name).display())))?;
     }
     Ok(shared)
@@ -1056,13 +1065,16 @@ fn read_link_file(path: &Path) -> Result<String, String> {
 /// name that is not UTF-8 is a key of its own and a plant under it is seen.
 /// A path that vanishes between the listing, the metadata and the open (a
 /// concurrent run renaming a lock file) is read as absent, not as an error;
-/// any other I/O error is returned. `between` is called with the path after
-/// its metadata is read and before it is opened, which lets a test change
-/// the file at exactly that point.
+/// any other I/O error is returned. Every byte read is taken from `budget`:
+/// a file that would read past what is left of it is an error, found after
+/// one byte more and no more. `between` is called with the path after its
+/// metadata is read and before it is opened, which lets a test change the
+/// file at exactly that point.
 fn walk(
     common: &Path,
     rel: &Path,
     out: &mut BTreeMap<PathBuf, Content>,
+    budget: &mut Budget,
     between: &dyn Fn(&Path),
 ) -> io::Result<()> {
     fn present<T>(result: io::Result<T>) -> io::Result<Option<T>> {
@@ -1089,14 +1101,16 @@ fn walk(
         };
         children.sort();
         for child in children {
-            walk(common, &rel.join(child), out, between)?;
+            walk(common, &rel.join(child), out, budget, between)?;
         }
         Content::Dir
     } else if meta.is_file() {
         between(&path);
-        let Some(mut file) = present(fs::File::open(&path))? else {
+        let Some(file) = present(fs::File::open(&path))? else {
             return Ok(());
         };
+        // One byte past what is left, so that a file past it shows.
+        let mut file = file.take(budget.left.saturating_add(1));
         let mut bytes = Vec::new();
         (&mut file)
             .take(SHARED_FILE_CAP + 1)
@@ -1119,8 +1133,10 @@ fn walk(
                     Err(error) => return Err(error),
                 }
             }
+            budget.spend(&path, len)?;
             Content::Large(len, hasher.finalize().to_vec())
         } else {
+            budget.spend(&path, bytes.len() as u64)?;
             Content::File(bytes)
         }
     } else {
@@ -1128,6 +1144,31 @@ fn walk(
     };
     out.insert(rel.to_owned(), content);
     Ok(())
+}
+
+/// The bytes one read of files may still take in ([`READ_BUDGET`]).
+struct Budget {
+    limit: u64,
+    left: u64,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Self { limit, left: limit }
+    }
+
+    /// Takes the `read` bytes of `path` from what is left, or fails when
+    /// they are more.
+    fn spend(&mut self, path: &Path, read: u64) -> io::Result<()> {
+        self.left = self.left.checked_sub(read).ok_or_else(|| {
+            io::Error::other(format!(
+                "{} takes the files read past the {} bytes a check reads",
+                path.display(),
+                self.limit
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 /// The children of `<common>/worktrees` but the run's own entry, sorted; a
@@ -1157,11 +1198,13 @@ fn read_worktree_entries(
     let worktrees = common.join("worktrees");
     let fail = |e: io::Error| SnapshotError(format!("{}: {e}", worktrees.display()));
     let mut entries = BTreeMap::new();
+    let mut budget = Budget::new(READ_BUDGET);
     for name in other_entries(common, own).map_err(fail)? {
         walk(
             common,
             &Path::new("worktrees").join(name),
             &mut entries,
+            &mut budget,
             between,
         )
         .map_err(fail)?;
@@ -1505,8 +1548,48 @@ mod tests {
 
     fn walked(common: &Path, name: &str, between: &dyn Fn(&Path)) -> io::Result<Vec<PathBuf>> {
         let mut out = BTreeMap::new();
-        walk(common, Path::new(name), &mut out, between)?;
+        let mut budget = Budget::new(READ_BUDGET);
+        walk(common, Path::new(name), &mut out, &mut budget, between)?;
         Ok(out.into_keys().collect())
+    }
+
+    /// What one read takes in is bounded: past the budget, whether by many
+    /// files or one huge or sparse file, the walk fails instead of reading
+    /// on, and within it every byte is counted.
+    #[test]
+    fn a_read_past_its_budget_fails_instead_of_reading_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        fs::write(hooks.join("a"), [b'a'; 600]).unwrap();
+        fs::write(hooks.join("b"), [b'b'; 600]).unwrap();
+        let read = |limit: u64| {
+            let mut budget = Budget::new(limit);
+            let mut out = BTreeMap::new();
+            walk(
+                dir.path(),
+                Path::new("hooks"),
+                &mut out,
+                &mut budget,
+                &|_| {},
+            )
+            .map(|()| budget.left)
+        };
+        assert_eq!(read(1200).unwrap(), 0);
+        let error = read(1199).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("1199 bytes"), "{error}");
+
+        // One file past the budget and past the cap, whose bytes are
+        // never written: the read stops one byte past the budget.
+        fs::File::create(hooks.join("c"))
+            .unwrap()
+            .set_len(4 * SHARED_FILE_CAP)
+            .unwrap();
+        let limit = SHARED_FILE_CAP + 1200 + 10;
+        let error = read(limit).unwrap_err();
+        assert!(error.to_string().contains("hooks"), "{error}");
+        assert!(read(1200 + 4 * SHARED_FILE_CAP).is_ok());
     }
 
     #[test]
