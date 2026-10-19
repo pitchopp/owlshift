@@ -92,6 +92,11 @@ struct FakeGitHub {
     /// give them (OWL-307), and the reads of them so far.
     reviews: Mutex<Vec<Value>>,
     reviews_reads: Mutex<u32>,
+    /// How many of the next `OpenPullRequests` reads are answered with
+    /// HTTP 401 "Bad credentials", as a token GitHub refused for a moment
+    /// (OWL-340), and how many such reads were made, refused or not.
+    refuse_open: Mutex<u32>,
+    open_reads: Mutex<u32>,
 }
 
 /// What happens at the next read of a head's checks.
@@ -254,6 +259,18 @@ struct Shared(Arc<FakeGitHub>);
 impl Transport for Shared {
     fn send(&self, request: &Value) -> Result<Response, String> {
         let query = request["query"].as_str().unwrap_or_default();
+        if query.starts_with("query OpenPullRequests") {
+            *self.0.open_reads.lock().unwrap() += 1;
+            let mut refuse = self.0.refuse_open.lock().unwrap();
+            if *refuse > 0 {
+                *refuse -= 1;
+                return Ok(Response {
+                    status: 401,
+                    body: json!({ "message": "Bad credentials" }).to_string(),
+                    ..Default::default()
+                });
+            }
+        }
         if query.starts_with("query Checks") {
             let mut at_checks = self.0.at_checks.lock().unwrap();
             if matches!(*at_checks, Some(AtChecks::Fail)) {
@@ -418,6 +435,8 @@ struct Clocked<'a> {
     fail_reads: &'a Cell<u32>,
     /// What happens once, right after the next stage read.
     after_stage_read: &'a RefCell<Option<Box<dyn FnOnce()>>>,
+    /// How many stage reads were made (OWL-340).
+    stage_reads: &'a Cell<u32>,
     /// The proposals inbox, when it is on (OWL-253).
     inbox: &'a RefCell<FakeInbox>,
     /// Folding comments, when it is on (OWL-353).
@@ -612,6 +631,7 @@ impl Tracker for Clocked<'_> {
     }
 
     fn stage(&self, id: &TicketId) -> Result<String, tracker::Error> {
+        self.stage_reads.set(self.stage_reads.get() + 1);
         let stage = Tracker::stage(&self.inner, id);
         if let Some(after) = self.after_stage_read.borrow_mut().take() {
             after();
@@ -687,6 +707,8 @@ struct Bench {
     fail_reads: Cell<u32>,
     /// What happens once, right after the tracker's next stage read.
     after_stage_read: RefCell<Option<Box<dyn FnOnce()>>>,
+    /// How many stage reads the tracker answered (OWL-340).
+    stage_reads: Cell<u32>,
     /// How long after the time of the next comment `continue` reads this
     /// machine's clock: by default the quiet window, so the decider's
     /// latest comment, a minute older, counts.
@@ -804,6 +826,8 @@ impl Bench {
             at_checks: Mutex::new(None),
             reviews: Mutex::new(Vec::new()),
             reviews_reads: Mutex::new(0),
+            refuse_open: Mutex::new(0),
+            open_reads: Mutex::new(0),
         });
         Self {
             data: tmp.path().join("data"),
@@ -818,6 +842,7 @@ impl Bench {
             refuse_mention: Cell::new(false),
             fail_reads: Cell::new(0),
             after_stage_read: RefCell::new(None),
+            stage_reads: Cell::new(0),
             waited: Cell::new(SignedDuration::from_mins(10)),
             inbox: RefCell::default(),
             fold: RefCell::default(),
@@ -1192,6 +1217,7 @@ impl Bench {
             refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
             after_stage_read: &self.after_stage_read,
+            stage_reads: &self.stage_reads,
             inbox: &self.inbox,
             fold: &self.fold,
         };
@@ -1278,6 +1304,32 @@ fn ticket() -> TicketId {
 
 fn kinds(events: &[Event]) -> Vec<EventKind> {
     events.iter().map(|event| event.kind).collect()
+}
+
+/// OWL-340: the bench's GitHub answers the dispatch's read of the open pull
+/// requests with the 401 the live case met, through the real adapter's error
+/// mapping, a counted number of times.
+#[test]
+fn the_bench_forge_refuses_a_counted_number_of_reads_with_a_401() {
+    let bench = Bench::new(true);
+    *bench.github.refuse_open.lock().unwrap() = 1;
+    // Refused before any run starts: no reply is played.
+    let (outcome, printed) = bench.run(Vec::new(), None);
+    let Err(Stop::Refused(message)) = outcome else {
+        panic!("{outcome:?}\n{printed}");
+    };
+    for text in [
+        "GitHub (demo/project)",
+        "GitHub refused the token: HTTP 401 Bad credentials",
+    ] {
+        assert!(message.contains(text), "{text}\n{message}");
+    }
+    assert_eq!(*bench.github.open_reads.lock().unwrap(), 1);
+    assert_eq!(*bench.github.refuse_open.lock().unwrap(), 0);
+
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(*bench.github.open_reads.lock().unwrap() > 1);
 }
 
 #[test]

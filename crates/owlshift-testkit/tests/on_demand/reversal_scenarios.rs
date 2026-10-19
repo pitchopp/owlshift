@@ -39,8 +39,13 @@ impl Bench {
 
     /// A run cut off by a usage limit.
     pub(super) fn limited(&self) -> Reply {
+        self.limited_until("2026-10-02T15:00:00Z")
+    }
+
+    /// A run cut off by a usage limit that resets at `resets`.
+    pub(super) fn limited_until(&self, resets: &str) -> Reply {
         let mut limited = self.reply(None, None);
-        limited.usage_limit = Some("2026-10-02T15:00:00Z".parse().unwrap());
+        limited.usage_limit = Some(resets.parse().unwrap());
         limited
     }
 

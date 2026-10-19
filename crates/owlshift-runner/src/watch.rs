@@ -38,12 +38,23 @@
 //! is adopted; both under the project's lock.
 //!
 //! Since OWL-273, a ticket an answered intake round left at Intake
-//! (`left_at_intake`), its second intake cut off by a usage limit or a
+//! (`resumable_stage`), its second intake cut off by a usage limit or a
 //! refusal, is resumed while the tracker still shows it needs input: its
 //! intake runs again through [`OnDemand::continue_shown`], held as a
 //! continue is. One shown elsewhere, in the ready column (the drain's) or
 //! moved by a person, is left alone, its stage read again once its ref moves
 //! or after [`RETRY_AFTER`].
+//!
+//! Since OWL-340, the same holds for a ticket left at Design, Design review,
+//! Build or Verify with an answered round (round > 0) that the tracker still
+//! shows working: a refusal or a cut-off run after the RESUME left it there,
+//! shown In Progress with nothing running. It goes through `continue`'s path
+//! with no answer check and no RESUME, as the ref waits for no answer. A
+//! review loop's ticket at Build or Verify ([`outlived`]) is resumed once
+//! its pull request, read for an end, has not ended the loop. A ticket at
+//! those stages at round 0 still needs `owlshift continue`. While another
+//! command holds the project's lock, the pass ends at its snapshot, before
+//! any ticket is read.
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -95,7 +106,9 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Whether watch continues a ticket in `status`: one whose questions wait
 /// for its decider. A parked ticket waits for a person's `continue`, which
 /// alone restarts it (watch only ends a park at Watch whose pull request
-/// ended, [`outlived`]), and one at a stage waits for no answer.
+/// ended, [`outlived`]), and one at a stage waits for no answer: only one an
+/// answered round left there is resumed, by `resumable_stage` (OWL-273,
+/// OWL-340).
 pub fn watched(status: Status) -> bool {
     matches!(status, Status::NeedsInput { .. })
 }
@@ -125,12 +138,54 @@ pub fn outlived(status: Status, stored: &Stored) -> bool {
             .is_some_and(|delivery| delivery.followed())
 }
 
-/// Whether watch resumes a ticket in `state` once the tracker shows it still
-/// needs input (OWL-273): at Intake after a question round, as an answered
-/// intake round leaves it while intake runs again, and a cut-off run leaves
-/// it. A ticket at Intake that asked no round is the drain's.
-fn left_at_intake(state: &TicketState) -> bool {
-    state.status() == Status::Active(Stage::Intake) && state.round() > 0
+/// The stage the tracker must still show for watch to resume a ticket in
+/// `state`, `None` when watch does not resume it.
+///
+/// OWL-273: a ticket at Intake after a question round, as an answered intake
+/// round leaves it while intake runs again and a cut-off run leaves it, is
+/// resumed while it shows needs input. A ticket at Intake that asked no round
+/// is the drain's.
+///
+/// OWL-340: a ticket at Design, Design review, Build or Verify with an
+/// answered round (round > 0), which a refusal or a cut-off run left after
+/// the RESUME moved it to working, is resumed while it still shows working.
+/// A ticket at those stages at round 0 is not: it needs `owlshift continue`,
+/// as does one parked or waiting.
+fn resumable_stage(state: &TicketState) -> Option<VisibleStage> {
+    if state.round() == 0 {
+        return None;
+    }
+    match state.status() {
+        Status::Active(Stage::Intake) => Some(VisibleStage::NeedsInput),
+        Status::Active(Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify) => {
+            Some(VisibleStage::Working)
+        }
+        _ => None,
+    }
+}
+
+/// How the stage reads in watch's lines.
+fn stage_label(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Intake => "Intake",
+        Stage::Ready => "Ready",
+        Stage::Design => "Design",
+        Stage::DesignReview => "Design review",
+        Stage::Build => "Build",
+        Stage::Verify => "Verify",
+        Stage::Deliver => "Deliver",
+        Stage::Watch => "Watch",
+    }
+}
+
+/// The line for a resume of `ticket` at `stage` that left the ticket ref as
+/// it was, held until `until`.
+fn held_text(ticket: &TicketId, stage: Stage, until: Timestamp) -> String {
+    format!(
+        "{ticket} is at {} as it was before that resume: watch resumes it again at {until}, or \
+         sooner once a command moves its ticket ref",
+        stage_label(stage)
+    )
 }
 
 /// What a continue starts from: the ticket ref's commit and the decider's
@@ -299,9 +354,11 @@ struct Memory {
     stale: Stale,
     /// What the drain keeps (OWL-250).
     drain: drain::Memory,
-    /// The tickets left at Intake found shown in another stage than needs
-    /// input (OWL-273): the commit their ref was at, and until when their
-    /// stage is not read again unless the ref moves.
+    /// The tickets a stop left in a stage watch resumes, found shown in
+    /// another stage than that stage must show (OWL-273 at Intake, which must
+    /// show needs input; OWL-340 at Design, Design review, Build and Verify,
+    /// which must show working): the commit their ref was at, and until when
+    /// their stage is not read again unless the ref moves.
     elsewhere: HashMap<TicketId, (String, Timestamp)>,
 }
 
@@ -408,15 +465,23 @@ impl Watch<'_> {
                     if watched(state.status()) || outlived(state.status(), &stored) =>
                 {
                     let outlived = outlived(state.status(), &stored);
-                    waiting.push((ticket, stored, state.status(), outlived));
+                    // Only a review loop's ref at Build or Verify is both
+                    // outlived and resumable (OWL-340): its pull request is
+                    // read first, and a loop it did not end is resumed.
+                    let resume = if outlived {
+                        resumable_stage(&state)
+                    } else {
+                        None
+                    };
+                    waiting.push((ticket, stored, state.status(), outlived, resume));
                 }
                 Ok((stored, state)) if followed(state.status(), &stored) => {
                     memory.failing.remove(&ticket);
                     following.push((ticket, stored));
                 }
                 // Its failing read is cleared once its stage reads (OWL-273).
-                Ok((stored, state)) if left_at_intake(&state) => {
-                    resumable.push((ticket, stored));
+                Ok((stored, state)) if let Some(shown) = resumable_stage(&state) => {
+                    resumable.push((ticket, stored, shown, state.stage()));
                 }
                 Ok(_) => {
                     memory.failing.remove(&ticket);
@@ -431,18 +496,29 @@ impl Watch<'_> {
         // it.
         let ids: Vec<TicketId> = waiting
             .iter()
-            .filter(|(_, _, status, _)| watched(*status))
-            .map(|(ticket, _, _, _)| ticket.clone())
+            .filter(|(_, _, status, _, _)| watched(*status))
+            .map(|(ticket, _, _, _, _)| ticket.clone())
             .collect();
         // A waiting or parked ticket whose pull request is read keeps the
         // forge failure warned of (OWL-242, OWL-243).
         let read: Vec<TicketId> = waiting
             .iter()
-            .filter(|(_, _, _, outlived)| *outlived)
-            .map(|(ticket, _, _, _)| ticket.clone())
+            .filter(|(_, _, _, outlived, _)| *outlived)
+            .map(|(ticket, _, _, _, _)| ticket.clone())
             .collect();
         let followed: Vec<TicketId> = following.iter().map(|(ticket, _)| ticket.clone()).collect();
-        let left: Vec<TicketId> = resumable.iter().map(|(ticket, _)| ticket.clone()).collect();
+        // The tickets watch may resume: those left at a stage, and a review
+        // loop's, whose pull request is read first (OWL-340).
+        let left: Vec<TicketId> = resumable
+            .iter()
+            .map(|(ticket, _, _, _)| ticket.clone())
+            .chain(
+                waiting
+                    .iter()
+                    .filter(|(_, _, _, _, resume)| resume.is_some())
+                    .map(|(ticket, _, _, _, _)| ticket.clone()),
+            )
+            .collect();
         // A followed ticket keeps its repair's hold too: otherwise a repair
         // that left the ref as it was, or a round under it whose state was
         // not kept (OWL-211), would run again at the next pass.
@@ -475,7 +551,7 @@ impl Watch<'_> {
                 followed,
             },
         );
-        for (ticket, stored, status, outlived) in waiting {
+        for (ticket, stored, status, outlived, resume) in waiting {
             // A stage a stop left at working first (OWL-265): an end then
             // moves the stage it shows to review, which it would not do
             // from working, so the two may make two moves in one pass. A
@@ -491,10 +567,21 @@ impl Watch<'_> {
             }
             if watched(status) {
                 self.look(memory, sink, out, continued, &ticket, &stored);
+            } else if let Some(shown) = resume {
+                self.resume_stage(
+                    memory,
+                    sink,
+                    out,
+                    continued,
+                    &ticket,
+                    &stored,
+                    shown,
+                    status.stage(),
+                );
             }
         }
-        for (ticket, stored) in resumable {
-            self.resume_intake(memory, sink, out, continued, &ticket, &stored);
+        for (ticket, stored, shown, stage) in resumable {
+            self.resume_stage(memory, sink, out, continued, &ticket, &stored, shown, stage);
         }
         for (ticket, stored) in following {
             // A repair this pass decides moves the stage to working again
@@ -1235,14 +1322,17 @@ impl Watch<'_> {
         }
     }
 
-    /// A ticket left at Intake by an answered round whose second intake was
-    /// cut off (OWL-273, architecture section 5, "Intake"): resumed, its
-    /// intake run again, while the tracker still shows it needs input, held
-    /// as a continue is ([`Holds`]). The stage is read first without the
-    /// lock, so a ticket shown elsewhere costs no lock, checkout or ticket
-    /// read, and [`OnDemand::continue_shown`] reads it again under the lock,
-    /// so a person's move meanwhile is kept.
-    fn resume_intake(
+    /// A ticket left at a stage by an answered round (OWL-273 at Intake,
+    /// OWL-340 at Design, Design review, Build and Verify; architecture
+    /// section 5, "Which tickets"): resumed, its stage run again, while the
+    /// tracker still shows `shown`, held as a continue is ([`Holds`]). The
+    /// stage is read first without the lock, so a ticket shown elsewhere
+    /// costs no lock, checkout or ticket read, and
+    /// [`OnDemand::continue_shown`] reads it again under the lock, so a
+    /// person's move meanwhile is kept. From a ref that waits for no answer
+    /// `continue` runs no answer check and posts no RESUME.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_stage(
         &self,
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
@@ -1250,6 +1340,8 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         stored: &Stored,
+        shown: VisibleStage,
+        stage: Stage,
     ) {
         let on_demand = self.on_demand;
         let now = (on_demand.clock)();
@@ -1267,16 +1359,15 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
         }
-        let shown = match on_demand.tracker.stage(ticket) {
-            Ok(shown) => shown,
+        let found = match on_demand.tracker.stage(ticket) {
+            Ok(found) => found,
             Err(e) => {
                 let reason = format!("reading its stage: {e}");
                 return self.unreadable(memory, sink, ticket, reason);
             }
         };
         memory.failing.remove(ticket);
-        let needs_input = VisibleStage::NeedsInput;
-        if shown != needs_input.state(&on_demand.config.tracker.states) {
+        if found != shown.state(&on_demand.config.tracker.states) {
             let until = now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX);
             memory
                 .elsewhere
@@ -1286,9 +1377,11 @@ impl Watch<'_> {
         memory.elsewhere.remove(ticket);
         // Recorded by `continue_shown` once the ticket ref and its stage are
         // confirmed under the lock.
-        let decision = data([("watch", json!("continue")), ("stage", json!("intake"))]);
-        let Some(outcome) =
-            on_demand.continue_shown(ticket, &seen.commit, needs_input, decision, sink)
+        let decision = data([
+            ("watch", json!("continue")),
+            ("stage", json!(on_demand::stage_name(stage))),
+        ]);
+        let Some(outcome) = on_demand.continue_shown(ticket, &seen.commit, shown, decision, sink)
         else {
             // The ref moved, or the ticket was moved, since the reads: the
             // next pass reads it again.
@@ -1307,13 +1400,7 @@ impl Watch<'_> {
         {
             Some(Admit::Held {
                 until: Until::At(until),
-            }) => self.line(
-                out,
-                &format!(
-                    "{ticket} is at Intake as it was before that resume: watch resumes it again \
-                     at {until}, or sooner once a command moves its ticket ref"
-                ),
-            ),
+            }) => self.line(out, &held_text(ticket, stage, until)),
             Some(Admit::Held {
                 until: Until::Person,
             }) => self.line(
@@ -1474,6 +1561,73 @@ mod tests {
         ] {
             assert!(!watched(status), "{status:?}");
         }
+    }
+
+    fn restored(status: Status, round: u32) -> TicketState {
+        TicketState::restore(status, round, 0, 0, 0, 0).unwrap()
+    }
+
+    /// OWL-273 and OWL-340: a stage left after an answered round shows the
+    /// stage its run keeps, and one left at round 0, waiting or parked is a
+    /// person's.
+    #[test]
+    fn a_stage_left_after_an_answered_round_is_resumable() {
+        let active = |stage| Status::Active(stage);
+        assert_eq!(
+            resumable_stage(&restored(active(Stage::Intake), 1)),
+            Some(VisibleStage::NeedsInput)
+        );
+        for stage in [
+            Stage::Design,
+            Stage::DesignReview,
+            Stage::Build,
+            Stage::Verify,
+        ] {
+            assert_eq!(
+                resumable_stage(&restored(active(stage), 1)),
+                Some(VisibleStage::Working),
+                "{stage:?}"
+            );
+            assert_eq!(resumable_stage(&restored(active(stage), 0)), None);
+        }
+        assert_eq!(resumable_stage(&restored(active(Stage::Intake), 0)), None);
+        for status in [
+            active(Stage::Ready),
+            active(Stage::Deliver),
+            active(Stage::Watch),
+            Status::NeedsInput {
+                return_to: Stage::Design,
+            },
+            Status::NeedsInput {
+                return_to: Stage::Build,
+            },
+            Status::Parked {
+                at: Stage::Build,
+                awaiting_input: false,
+            },
+            Status::Parked {
+                at: Stage::Verify,
+                awaiting_input: false,
+            },
+        ] {
+            assert_eq!(resumable_stage(&restored(status, 1)), None, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn the_held_line_names_the_stage() {
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let until = Timestamp::from_second(1_792_324_800).unwrap();
+        assert_eq!(
+            held_text(&ticket, Stage::Intake, until),
+            "DEMO-1 is at Intake as it was before that resume: watch resumes it again at \
+             2026-10-18T12:00:00Z, or sooner once a command moves its ticket ref"
+        );
+        assert_eq!(
+            held_text(&ticket, Stage::DesignReview, until),
+            "DEMO-1 is at Design review as it was before that resume: watch resumes it again \
+             at 2026-10-18T12:00:00Z, or sooner once a command moves its ticket ref"
+        );
     }
 
     /// An end marks a park (OWL-243) and names a round whose questions

@@ -132,7 +132,8 @@ pub struct ReadySet<K> {
 /// stage after Ready and before Watch, whatever dispatched it. Waiting for an
 /// answer, parked, at Intake, at Ready or at Watch, it does not. A ticket
 /// left at Build by a usage limit, a failed delivery or a refused push is
-/// still working there, so it keeps the slot until a person continues it.
+/// still working there, so it keeps the slot until a person, or `owlshift
+/// watch` once a question round was answered, continues it.
 pub fn holds_slot(state: &TicketState) -> bool {
     matches!(state.status(), Status::Active(stage) if stage > Stage::Ready && stage < Stage::Watch)
 }
