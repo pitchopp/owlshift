@@ -5282,11 +5282,13 @@ fn a_quoted_scope_question_is_decided_at_ticket_and_asked_at_discoverable() {
     assert_eq!(resolved[0]["to_decider"], json!(["Q1"]));
 }
 
-/// OWL-328's ceiling, through the runner: with `"unlimited"` passes and a
-/// $1 ceiling, the asking runs' and the resolver runs' costs add up, and
-/// once they reach the ceiling the next run's questions go to the decider,
-/// the round and the `gate` event saying why; a run that reports no cost
-/// ends the chain at the next check.
+/// OWL-328's ceiling, through the runner, on the resolver runs alone since
+/// OWL-376: with `"unlimited"` passes and a $1 ceiling, Build runs costing
+/// more than the ceiling, one of them reporting no cost, keep the chain
+/// going while the resolver runs add up, and once those reach the ceiling
+/// the next run's questions go to the decider, the round and the `gate`
+/// event saying why; every `gate` event gives the resolver's spend so far.
+/// A resolver run that reports no cost ends the chain at the next check.
 #[test]
 fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
     let costing = |bench: &Bench, result: &str, micros: Option<u64>| {
@@ -5295,40 +5297,59 @@ fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
         reply
     };
     let unlimited = "resolver_passes = \"unlimited\"\nresolver_budget_usd = 1.0";
-    let cost = Some(300_000);
+    let build = Some(2_000_000);
+    let resolver = Some(300_000);
 
-    // 0.3, then 0.6 after the first resolver run, then 0.9: the second
-    // resolver runs; 1.5 once the third Build asked is past the ceiling.
+    // Four resolver runs at 0.3 each: 1.2 once the fifth Build asks, past
+    // the ceiling; the Build runs' $8 and the one without a cost do not
+    // count.
     let bench = Bench::new(true);
     bench.policy(unlimited);
     let (outcome, printed) = bench.run(
         vec![
-            costing(&bench, NAMING, cost),
-            costing(&bench, DECIDED_Q1, cost),
-            costing(&bench, NAMING, cost),
-            costing(&bench, DECIDED_Q1, cost),
-            costing(&bench, NAMING, cost),
+            costing(&bench, NAMING, build),
+            costing(&bench, DECIDED_Q1, resolver),
+            costing(&bench, NAMING, None),
+            costing(&bench, DECIDED_Q1, resolver),
+            costing(&bench, NAMING, build),
+            costing(&bench, DECIDED_Q1, resolver),
+            costing(&bench, NAMING, build),
+            costing(&bench, DECIDED_Q1, resolver),
+            costing(&bench, NAMING, build),
         ],
         None,
     );
     let stop = outcome.expect_err("a round");
     assert_eq!(asked_texts(&stop), ["Which file should hold the greeting?"]);
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    let mut expected = [Role::Build, Role::Resolver].repeat(4);
+    expected.push(Role::Build);
+    assert_eq!(roles, expected, "{printed}");
+    let round = bench.comments().pop().unwrap();
+    assert!(
+        round.contains("cost 1.20 USD, which reached this project's dollar ceiling of 1.00 USD"),
+        "{round}"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    let spent: Vec<&Value> = resolved.iter().map(|e| &e["resolver_spent_usd"]).collect();
     assert_eq!(
-        roles,
+        spent,
         [
-            Role::Build,
-            Role::Resolver,
-            Role::Build,
-            Role::Resolver,
-            Role::Build
+            &json!(0.3),
+            &json!(0.6),
+            &json!(0.9),
+            &json!(1.2),
+            &json!(1.2)
         ],
         "{printed}"
     );
-    let round = bench.comments().pop().unwrap();
-    assert!(round.contains("dollar ceiling"), "{round}");
-    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
-    let last = resolved.last().unwrap();
+    assert!(resolved.iter().all(|e| e["ceiling_usd"] == json!(1.0)));
+    let (last, settled) = resolved.split_last().unwrap();
+    assert!(
+        settled
+            .iter()
+            .all(|e| e["resolver"] == "done" && e.get("reason").is_none())
+    );
     assert_eq!(last["resolver"], "pass_limit");
     assert_eq!(last["reason"], "budget");
     assert_eq!(last["level"], "discoverable");
@@ -5339,9 +5360,9 @@ fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
     bench.policy(unlimited);
     let (outcome, printed) = bench.run(
         vec![
-            costing(&bench, NAMING, cost),
+            costing(&bench, NAMING, build),
             costing(&bench, DECIDED_Q1, None),
-            costing(&bench, NAMING, cost),
+            costing(&bench, NAMING, build),
         ],
         None,
     );
@@ -5354,8 +5375,15 @@ fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
         "{printed}"
     );
     let round = bench.comments().pop().unwrap();
-    assert!(round.contains("reported no cost"), "{round}");
+    assert!(
+        round.contains("A resolver run since this command started reported no cost"),
+        "{round}"
+    );
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert!(
+        resolved.iter().all(|e| e["resolver_spent_usd"].is_null()),
+        "{printed}"
+    );
     assert_eq!(resolved.last().unwrap()["reason"], "cost_unreported");
 }
 

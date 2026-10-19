@@ -1109,12 +1109,18 @@ impl QuestionsComment {
                     "Owlshift's resolver already settled every question of {runs} runs in a row \
                      (`policy.resolver_passes`), so this run's questions all come to you."
                 ),
-                Fallback::Budget => "Owlshift's resolver and the runs it unblocked reached this \
-                                     project's dollar ceiling (`policy.resolver_budget_usd`), so \
-                                     this run's questions all come to you."
-                    .to_owned(),
-                Fallback::CostUnreported => "A run since this command started reported no cost, \
-                                             so this project's dollar ceiling \
+                Fallback::Budget {
+                    spent_micros,
+                    ceiling_micros,
+                } => format!(
+                    "Owlshift's resolver runs since this command's last stop cost {} USD, which \
+                     reached this project's dollar ceiling of {} USD \
+                     (`policy.resolver_budget_usd`), so this run's questions all come to you.",
+                    usd(spent_micros),
+                    usd(ceiling_micros)
+                ),
+                Fallback::CostUnreported => "A resolver run since this command started reported \
+                                             no cost, so this project's dollar ceiling \
                                              (`policy.resolver_budget_usd`) could not be checked, \
                                              and this run's questions all come to you."
                     .to_owned(),
@@ -3985,6 +3991,15 @@ impl fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
+/// An amount in millionths of a dollar as a round writes it: whole cents,
+/// and the digits below a cent only when there are some (`1.20`, `0.000001`).
+fn usd(micros: u64) -> String {
+    let (dollars, below) = (micros / 1_000_000, micros % 1_000_000);
+    let digits = format!("{below:06}");
+    let kept = digits.trim_end_matches('0').len().max(2);
+    format!("{dollars}.{}", &digits[..kept])
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -5464,17 +5479,31 @@ Context.
             ),
             (
                 0,
-                Some(Fallback::Budget),
-                "reached this project's dollar ceiling (`policy.resolver_budget_usd`)",
+                Some(Fallback::Budget {
+                    spent_micros: 1_200_000,
+                    ceiling_micros: 1_000_000,
+                }),
+                "resolver runs since this command's last stop cost 1.20 USD, which reached this \
+                 project's dollar ceiling of 1.00 USD (`policy.resolver_budget_usd`)",
             ),
             (
                 0,
                 Some(Fallback::CostUnreported),
-                "reported no cost, so this project's dollar ceiling",
+                "A resolver run since this command started reported no cost, so this project's \
+                 dollar ceiling",
             ),
         ] {
             let body = round(decided, fallback);
             assert!(body.contains(says), "{says}\n---\n{body}");
+        }
+        for (micros, shown) in [
+            (0, "0.00"),
+            (1, "0.000001"),
+            (5_000_000, "5.00"),
+            (1_234_500, "1.2345"),
+            (u64::MAX, "18446744073709.551615"),
+        ] {
+            assert_eq!(usd(micros), shown);
         }
     }
 

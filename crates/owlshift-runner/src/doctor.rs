@@ -1259,9 +1259,9 @@ fn forge_reviewers_check(config: &Effective) -> Option<Check> {
 
 /// What the project lets the resolver decide without its decider (OWL-328,
 /// architecture section 4, "Delegation level" and "Resolver passes"): the
-/// level, the pass limit and the ceiling on one chain of runs, read from
-/// the project file `owlshift do` reads. A note: none blocks `do`. None
-/// without a project configuration.
+/// level, the pass limit and the ceiling on the resolver runs of one chain
+/// (OWL-376), read from the project file `owlshift do` reads. A note: none
+/// blocks `do`. None without a project configuration.
 fn resolver_check(config: &Effective) -> Option<Check> {
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
@@ -1276,7 +1276,10 @@ fn resolver_check(config: &Effective) -> Option<Check> {
         PassLimit::Unlimited => "unlimited runs in a row".to_owned(),
     };
     let ceiling = match config.policy.resolver_budget_usd {
-        Some(usd) => format!("a ceiling of {} USD per chain of runs", usd.0),
+        Some(usd) => format!(
+            "a ceiling of {} USD on the resolver runs of one chain",
+            usd.0
+        ),
         None => "no ceiling".to_owned(),
     };
     Some(Check::info(
@@ -3847,8 +3850,8 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             (
                 "resolver_delegation = \"all\"\nresolver_passes = \"unlimited\"\n\
                  resolver_budget_usd = 2.5",
-                "delegation all; unlimited runs in a row, a ceiling of 2.5 USD per chain of \
-                 runs; security and irreversible questions always go to the decider",
+                "delegation all; unlimited runs in a row, a ceiling of 2.5 USD on the resolver \
+                 runs of one chain; security and irreversible questions always go to the decider",
             ),
         ];
         for (policy, detail) in cases {

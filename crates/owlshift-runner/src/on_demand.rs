@@ -101,7 +101,7 @@ use owlshift_contracts::result::{
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
-use owlshift_core::gate::{Chain, GatePolicy};
+use owlshift_core::gate::{Chain, ChainCost, GatePolicy};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::Resource;
 use owlshift_core::routing::{
@@ -1097,10 +1097,10 @@ struct Prepared {
     pipeline: Pipeline,
     /// This command's chain of runs (OWL-328): the runs in a row whose
     /// questions the resolver all decided, across its stages, and what the
-    /// asking runs and their resolver runs cost. Never reset in a command,
-    /// it bounds Intake's, Design's and Build's re-runs, a `replan` the
-    /// resolver decided among them, by the project's pass limit and ceiling
-    /// ([`GatePolicy::chain_end`]). Under `owlshift watch` it is carried
+    /// resolver runs cost (the asking runs' left out since OWL-376). Never
+    /// reset in a command, it bounds Intake's, Design's and Build's re-runs,
+    /// a `replan` the resolver decided among them, by the project's pass
+    /// limit and ceiling ([`GatePolicy::chain_end`]). Under `owlshift watch` it is carried
     /// from one stage step to the next ([`Carried`], OWL-367).
     chain: Chain,
     /// `owlshift watch` runs this command one stage step at a time (OWL-367,
@@ -1197,6 +1197,22 @@ struct Ran {
 /// (OWL-328): `None` when it reported none.
 fn run_cost(ran: &Ran) -> Option<f64> {
     ran.report.usage.as_ref().and_then(|usage| usage.cost_usd)
+}
+
+/// Adds to a resolver `gate` event what the chain's resolver runs cost so
+/// far against the project's ceiling (OWL-376): `resolver_spent_usd`,
+/// `null` once one reported no cost, and `ceiling_usd` when a ceiling is
+/// set. The figure is the chain's: it starts again at each stop.
+fn add_spend(event: &mut Data, chain: Chain, policy: &GatePolicy) {
+    let dollars = |micros: u64| json!(micros as f64 / 1_000_000.0);
+    let spent = match chain.cost() {
+        ChainCost::Known(micros) => dollars(micros),
+        ChainCost::Unreported => json!(null),
+    };
+    event.insert("resolver_spent_usd".to_owned(), spent);
+    if let Some(ceiling) = policy.resolver().ceiling_micros {
+        event.insert("ceiling_usd".to_owned(), dollars(ceiling));
+    }
 }
 
 impl Ran {
@@ -2524,11 +2540,12 @@ impl OnDemand<'_> {
     /// their last option ([`resolver::with_closure`]), which no decision
     /// takes. The rest go to a resolver run, unless the command's chain of
     /// runs ended ([`GatePolicy::chain_end`]): the project's pass limit
-    /// reached, or, with a ceiling, the cost of the asking runs and their
-    /// resolver runs reaching it or not reported. The resolver is told of
-    /// the asking run (`asked_by`): its role, run and summary, the plan and
-    /// the findings it was about, and the branch's diff from its base,
-    /// written beside the brief when the branch has commits of its own. A
+    /// reached, or, with a ceiling, the cost of the chain's resolver runs
+    /// reaching it or not reported (OWL-376); each `gate` event says what
+    /// they cost so far. The resolver is told of the asking run
+    /// (`asked_by`): its role, run and summary, the plan and the findings it
+    /// was about, and the branch's diff from its base, written beside the
+    /// brief when the branch has commits of its own. A
     /// decision the resolver's own label, its basis kind, its quote or, on a
     /// false premise, its option does not let stand is refused
     /// ([`resolver::settle`]) and its question goes to the decider. Each
@@ -2581,12 +2598,12 @@ impl OnDemand<'_> {
                 ("to_decider", question_ids(&to_decider)),
             ])
         };
-        // The asking run is the chain's, then the bound is checked before
-        // the resolver runs (OWL-328).
-        p.chain.ran(asked.cost);
+        // The bound is checked before the resolver runs (OWL-328); the
+        // asking run's cost is not the chain's (OWL-376).
         if let Some(end) = p.policy.chain_end(p.chain) {
             let fallback = Fallback::from(end);
             let mut event = resolved_event(fallback.as_str(), None, &[]);
+            add_spend(&mut event, p.chain, &p.policy);
             if let Some(reason) = fallback.reason() {
                 event.insert("reason".to_owned(), json!(reason));
             }
@@ -2619,7 +2636,7 @@ impl OnDemand<'_> {
             ..self.executor.clone()
         };
         let ran = self.execute(p, &executor, self.resolver, &brief, 1, sink)?;
-        p.chain.ran(run_cost(&ran));
+        p.chain.resolved(run_cost(&ran));
         if ran.breaches.is_empty() {
             self.keep_resolver_refusal(p, state, &ran.report.outcome)?;
         }
@@ -2627,12 +2644,9 @@ impl OnDemand<'_> {
         let resolutions = match resolver::outcome(&ran.report.outcome) {
             Resolved::Quarantined => None,
             Resolved::Fallback(fallback) => {
-                sink.emit(
-                    &ticket,
-                    Some(&ran.run),
-                    EventKind::Gate,
-                    resolved_event(fallback.as_str(), Some(&ran.run), &[]),
-                );
+                let mut event = resolved_event(fallback.as_str(), Some(&ran.run), &[]);
+                add_spend(&mut event, p.chain, &p.policy);
+                sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
                 return Ok(all(Some(fallback)));
             }
             Resolved::Done(resolutions) => Some(resolutions),
@@ -2753,6 +2767,7 @@ impl OnDemand<'_> {
             ),
         );
         event.insert("unposted".to_owned(), question_ids(&unposted));
+        add_spend(&mut event, p.chain, &p.policy);
         sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
         let left = Round::of(&raised, &decided_ids, asked.reopened, None);
         if left.questions.is_empty() {

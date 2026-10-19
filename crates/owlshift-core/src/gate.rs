@@ -83,21 +83,23 @@ pub fn usd_micros(usd: f64) -> Option<u64> {
     Some((usd * 1_000_000.0).round() as u64)
 }
 
-/// The cost of one chain of runs so far: the asking runs and their resolver
-/// runs since the command's last stop (architecture section 4, "Resolver
-/// passes").
+/// What the resolver runs of one chain cost so far, since the command's
+/// last stop (architecture section 4, "Resolver passes"); the asking runs
+/// do not count (OWL-376).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainCost {
-    /// The sum of every run's reported cost, in millionths of a dollar.
+    /// The sum of every resolver run's reported cost, in millionths of a
+    /// dollar.
     Known(u64),
-    /// A run of the chain reported no cost: the ceiling cannot be checked.
+    /// A resolver run of the chain reported no cost: the ceiling cannot be
+    /// checked.
     Unreported,
 }
 
 /// One chain of runs as the runner counts it, for [`GatePolicy::chain_end`]:
 /// the runs in a row whose questions the resolver all decided, and what the
-/// chain's runs cost. The core does no I/O: the runner reports each run's
-/// cost.
+/// chain's resolver runs cost. The core does no I/O: the runner reports each
+/// resolver run's cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Chain {
     settled: u32,
@@ -119,15 +121,17 @@ impl Chain {
         self.settled
     }
 
-    /// What the chain's runs cost so far.
+    /// What the chain's resolver runs cost so far.
     pub const fn cost(self) -> ChainCost {
         self.cost
     }
 
-    /// One more run of the chain, an asking run or a resolver run, with its
-    /// reported cost in dollars: `None`, or a cost that is negative or not a
-    /// finite number, leaves the chain's cost unreported for good.
-    pub fn ran(&mut self, cost_usd: Option<f64>) {
+    /// One more resolver run of the chain, with its reported cost in
+    /// dollars: `None`, or a cost that is negative or not a finite number,
+    /// leaves the chain's cost unreported for good. An asking run adds
+    /// nothing: the ceiling bounds the resolver's delegation, not the work
+    /// it unblocks (OWL-376).
+    pub fn resolved(&mut self, cost_usd: Option<f64>) {
         self.cost = match (self.cost, cost_usd.and_then(usd_micros)) {
             (ChainCost::Known(sum), Some(cost)) => ChainCost::Known(sum.saturating_add(cost)),
             _ => ChainCost::Unreported,
@@ -146,10 +150,14 @@ impl Chain {
 pub enum ChainEnd {
     /// The pass limit, this many runs in a row, is reached.
     Passes(u32),
-    /// The chain's cost reached its ceiling.
-    Budget,
-    /// A run of the chain reported no cost, so its ceiling could not be
-    /// checked.
+    /// The chain's resolver runs cost this much, in millionths of a dollar,
+    /// at or above the ceiling, which is also given.
+    Budget {
+        spent_micros: u64,
+        ceiling_micros: u64,
+    },
+    /// A resolver run of the chain reported no cost, so its ceiling could
+    /// not be checked.
     CostUnreported,
 }
 
@@ -266,8 +274,8 @@ impl GatePolicy {
     }
 
     /// Whether the chain ends before its next resolver run, and why: the
-    /// pass limit reached; then, with a ceiling, a cost unreported or one
-    /// that reached it. Whichever comes first ends the chain; without a
+    /// pass limit reached; then, with a ceiling, a resolver run's cost
+    /// unreported or their sum reaching it. Whichever comes first ends the chain; without a
     /// ceiling the cost is not read. The runner asks before each resolver
     /// run.
     pub fn chain_end(&self, chain: Chain) -> Option<ChainEnd> {
@@ -279,7 +287,10 @@ impl GatePolicy {
         let ceiling = self.resolver.ceiling_micros?;
         match chain.cost {
             ChainCost::Unreported => Some(ChainEnd::CostUnreported),
-            ChainCost::Known(spent) if spent >= ceiling => Some(ChainEnd::Budget),
+            ChainCost::Known(spent) if spent >= ceiling => Some(ChainEnd::Budget {
+                spent_micros: spent,
+                ceiling_micros: ceiling,
+            }),
             ChainCost::Known(_) => None,
         }
     }
@@ -579,8 +590,8 @@ mod tests {
         }
     }
 
-    /// A chain of `settled` passes costing `cost` (in dollars, `None`
-    /// unreported) under `passes` and `ceiling`.
+    /// A chain of `settled` passes whose resolver runs cost `costs` (in
+    /// dollars, `None` unreported) under `passes` and `ceiling`.
     fn ends(
         passes: PassLimit,
         ceiling: Option<f64>,
@@ -599,14 +610,15 @@ mod tests {
             chain.settled_once();
         }
         for cost in costs {
-            chain.ran(*cost);
+            chain.resolved(*cost);
         }
         policy.chain_end(chain)
     }
 
     /// The pass limit at its default, a set value and unlimited with its
-    /// ceiling; a ceiling beside a number of passes, whichever comes first;
-    /// a run without a cost ends a chain only when a ceiling is set.
+    /// ceiling on the resolver runs' cost, which the end gives with the
+    /// spend; a ceiling beside a number of passes, whichever comes first; a
+    /// resolver run without a cost ends a chain only when a ceiling is set.
     #[test]
     fn a_chain_ends_at_its_pass_limit_or_its_ceiling() {
         use PassLimit::{Runs, Unlimited};
@@ -624,13 +636,19 @@ mod tests {
             ends(Unlimited, Some(1.0), 49, &some(&[0.3, 0.3, 0.3])),
             None
         );
+        let budget = |spent_micros| {
+            Some(ChainEnd::Budget {
+                spent_micros,
+                ceiling_micros: 1_000_000,
+            })
+        };
         assert_eq!(
             ends(Unlimited, Some(1.0), 3, &some(&[0.3, 0.3, 0.4])),
-            Some(ChainEnd::Budget)
+            budget(1_000_000)
         );
         assert_eq!(
             ends(Unlimited, Some(1.0), 3, &some(&[0.3, 0.3, 0.5])),
-            Some(ChainEnd::Budget)
+            budget(1_100_000)
         );
         assert_eq!(
             ends(Unlimited, Some(1.0), 0, &[Some(0.1), None, Some(0.1)]),
@@ -651,7 +669,7 @@ mod tests {
         );
         assert_eq!(
             ends(Runs(2), Some(1.0), 1, &some(&[1.5])),
-            Some(ChainEnd::Budget)
+            budget(1_500_000)
         );
         assert_eq!(ends(Runs(2), Some(1.0), 1, &some(&[0.5])), None);
         assert_eq!(usd_micros(0.4), Some(400_000));
