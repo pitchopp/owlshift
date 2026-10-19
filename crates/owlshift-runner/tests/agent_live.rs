@@ -36,7 +36,7 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
         .status()
         .unwrap();
     assert!(init.success());
-    let agent = AgentEnv::from_runner(&[], &[]).unwrap();
+    let agent = AgentEnv::from_runner(&[], &[], &[]).unwrap();
     assert_eq!(agent.check(workdir.path(), &["github.com"]), []);
 
     let token = Keychain::system()

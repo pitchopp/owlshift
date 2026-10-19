@@ -78,6 +78,10 @@ pub struct Plan {
     /// from those the agent environment passes, the operator's: a Build
     /// warns of it too (`gate_env_differs`).
     pub gate_env_differs: Option<Vec<String>>,
+    /// The folders the commit's `stack.caches` declares, when they differ
+    /// from those the agent environment opens, the operator's file's: a
+    /// Build warns of it too (`caches_differ`, OWL-330).
+    pub caches_differ: Option<Vec<String>>,
 }
 
 impl fmt::Display for Plan {
@@ -103,8 +107,23 @@ impl fmt::Display for Plan {
                 declared.join(", ")
             )?;
         }
+        if let Some(declared) = &self.caches_differ {
+            writeln!(
+                f,
+                "Note: the commit's stack.caches declares [{}]; the gate reads the caches \
+                 your owlshift.toml declares, as a Build's does.",
+                declared.join(", ")
+            )?;
+        }
         writeln!(f, "Its whole output goes to {}.", self.log.display())
     }
+}
+
+/// `declared`, sorted, when it differs from `passed` once both are sorted.
+fn differs(mut declared: Vec<&str>, mut passed: Vec<&str>) -> Option<Vec<String>> {
+    declared.sort_unstable();
+    passed.sort_unstable();
+    (declared != passed).then(|| declared.iter().map(|n| (*n).to_owned()).collect())
 }
 
 /// What `owlshift gate` came to.
@@ -243,6 +262,10 @@ impl GateOnce<'_> {
         passed.sort_unstable();
         let gate_env_differs =
             (declared != passed).then(|| declared.iter().map(|n| (*n).to_owned()).collect());
+        let caches_differ = differs(
+            config.stack.cache_folders(),
+            self.local.stack.cache_folders(),
+        );
         let commands = config.stack.gate.clone();
         let run_dir = run_dir(dirs);
         let plan = Plan {
@@ -252,6 +275,7 @@ impl GateOnce<'_> {
             commands,
             log: run_dir.join(GATE_LOG),
             gate_env_differs,
+            caches_differ,
         };
         let checked = |run, marker, warnings| Checked {
             plan: plan.clone(),
@@ -734,6 +758,36 @@ mod tests {
         let green = bench.gate(&executor, &[], Some("origin/fixed")).unwrap();
         assert!(green.passed(), "{}", render(&green));
         assert!(!bench.left_over());
+    }
+
+    /// OWL-330: a commit whose `stack.caches` differ from the operator's file
+    /// is noted, as a Build warns of it (`caches_differ`): the gate reads the
+    /// caches the operator's file declares.
+    #[test]
+    fn caches_that_differ_from_the_operators_file_are_noted() {
+        let bench = Bench::new();
+        bench.push(
+            "main",
+            Some(&project_file("\"true\"]\ncaches = [\"Library/pnpm\"")),
+        );
+        let executor = bench.executor(bench.agent().without_confinement());
+        let checked = bench.gate(&executor, &["true"], None).unwrap();
+        assert!(checked.passed(), "{}", render(&checked));
+        assert_eq!(
+            checked.plan.caches_differ,
+            Some(vec!["Library/pnpm".to_owned()])
+        );
+        assert!(
+            checked.plan.to_string().contains(
+                "Note: the commit's stack.caches declares [Library/pnpm]; the gate reads the \
+                 caches your owlshift.toml declares"
+            ),
+            "{}",
+            checked.plan
+        );
+        bench.push("main", Some(&project_file("\"true\"")));
+        let checked = bench.gate(&executor, &["true"], None).unwrap();
+        assert_eq!(checked.plan.caches_differ, None);
     }
 
     /// Confined as a Build's gate: the home's files and the gate log are out

@@ -84,7 +84,7 @@ impl Live {
         let mut backup = std::env::var_os("OWLSHIFT_CODEX_BACKUP")
             .expect("name a new file for the backup of auth.json in OWLSHIFT_CODEX_BACKUP");
         backup.push(suffix);
-        let agent = AgentEnv::from_runner(&[], &[]).unwrap();
+        let agent = AgentEnv::from_runner(&[], &[], &[]).unwrap();
         let login = user_login(&agent).expect("no CODEX_HOME or HOME");
         let original = fs::read(&login).expect("no Codex login: run `codex login`");
         back_up(Path::new(&backup), &original);

@@ -1988,7 +1988,8 @@ impl OnDemand<'_> {
     /// loaded, when `at` has none, as a project adopting Owlshift may not
     /// have merged it yet. The project file's `stack.gate_env` cannot follow:
     /// the agent environment is made once per command from the person's
-    /// file, so names that differ are a `warning` event (`gate_env_differs`).
+    /// file, so names that differ are a `warning` event (`gate_env_differs`);
+    /// so are cache folders that differ (`caches_differ`, OWL-330).
     fn rules_at(
         &self,
         p: &Prepared,
@@ -2017,6 +2018,23 @@ impl OnDemand<'_> {
                     ("configured_at", json!(at.commit)),
                     ("declared", json!(declared)),
                     ("passed", json!(loaded)),
+                ]),
+            );
+        }
+        let mut declared = config.stack.cache_folders();
+        let mut opened = self.config.stack.cache_folders();
+        declared.sort_unstable();
+        opened.sort_unstable();
+        if declared != opened {
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("caches_differ")),
+                    ("configured_at", json!(at.commit)),
+                    ("declared", json!(declared)),
+                    ("opened", json!(opened)),
                 ]),
             );
         }

@@ -54,6 +54,10 @@ pub struct AgentEnv {
     /// folders their values name in the home are opened, read-only
     /// ([`AgentEnv::policy`]).
     gate_env: Vec<String>,
+    /// The folders of the home the project declares as caches and the
+    /// operator allows (`stack.caches`, `allow_caches`, OWL-330), from the
+    /// home: opened read-only ([`AgentEnv::policy`]).
+    caches: Vec<String>,
     /// Whether every command spawned for the agent is confined. Always true
     /// outside the test bench.
     confined: bool,
@@ -119,6 +123,7 @@ impl AgentEnv {
         agent_environment(parent, declared, allowed).map(|vars| Self {
             vars,
             gate_env: declared.iter().map(|name| (*name).to_owned()).collect(),
+            caches: Vec::new(),
             confined: true,
         })
     }
@@ -131,12 +136,33 @@ impl AgentEnv {
     /// the sandbox closes the Keychain, where the operator's own login lives
     /// on macOS, and the login of agent runs is set by the executor on the
     /// harness command alone, never on a gate command or a probe
-    /// (`executor::harness::HarnessLogin`, OWL-94).
-    pub fn from_runner(declared: &[&str], allowed: &[&str]) -> Result<Self, AgentEnvError> {
-        let mut env = Self::for_project(std::env::vars_os(), declared, allowed)?;
+    /// (`executor::harness::HarnessLogin`, OWL-94). `caches` are the
+    /// project's cache folders the operator allows ([`AgentEnv::with_caches`]).
+    pub fn from_runner(
+        declared: &[&str],
+        allowed: &[&str],
+        caches: &[&str],
+    ) -> Result<Self, AgentEnvError> {
+        let mut env =
+            Self::for_project(std::env::vars_os(), declared, allowed)?.with_caches(caches);
         let (name, value) = claude::PEER_INBOX_ENV;
         env.set(name, value.into());
         Ok(env)
+    }
+
+    /// The same environment, with `caches`, folders of the home from the
+    /// home, opened read-only to every command (OWL-330): the folders of the
+    /// project's `stack.caches` that the operator allows in `allow_caches`,
+    /// which the configuration checked when it was loaded. Each is judged as
+    /// a folder the `PATH` names is ([`AgentEnv::policy`]).
+    pub fn with_caches(mut self, caches: &[&str]) -> Self {
+        self.caches = caches.iter().map(|cache| (*cache).to_owned()).collect();
+        self
+    }
+
+    /// The cache folders, from the home.
+    pub fn caches(&self) -> &[String] {
+        &self.caches
     }
 
     /// The same environment, with nothing confined: the test bench's way to
@@ -200,8 +226,8 @@ impl AgentEnv {
     /// The sandbox for a run: see the module documentation.
     ///
     /// Opened in the home: git's own configuration, the tool chains
-    /// (`TOOL_CHAINS`) and the folders the agent's `PATH` and declared
-    /// variables name under it, read-only, never the home itself nor a
+    /// (`TOOL_CHAINS`), the folders the agent's `PATH` and declared
+    /// variables name under it and the project's allowed caches, read-only, never the home itself nor a
     /// folder that is, lies in or holds a path the run hides, closes or
     /// writes (`named_folder`, OWL-68); then the run's own paths. Closed
     /// wherever they are: the credential files of `HIDDEN_IN_HOME` and the
@@ -287,7 +313,8 @@ impl AgentEnv {
                 .into_iter()
                 .chain(self.gate_env.iter().map(String::as_str))
                 .flat_map(|name| self.values_of(name))
-                .flat_map(std::env::split_paths);
+                .flat_map(std::env::split_paths)
+                .chain(self.caches.iter().map(|cache| home.join(cache)));
             // A folder named twice, by a name declared twice in two letter
             // cases, by `PATH` declared again, or by two variables, is
             // opened and linked once.
@@ -1134,6 +1161,73 @@ mod tests {
                 (home.join("jdk"), base.join("opt/jdk")),
             ]
         );
+    }
+
+    /// OWL-330: a project's allowed cache is read, never written, by its real
+    /// path, as a folder the `PATH` names. A missing one, the home itself,
+    /// one holding or inside a credential folder, and one inside a folder
+    /// the run writes or its temporary folder open nothing; one named twice
+    /// is opened once. Without caches nothing more is opened.
+    #[cfg(unix)]
+    #[test]
+    fn the_policy_opens_the_allowed_caches_read_only() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let home = base.join("home");
+        for dir in [
+            "Library/pnpm/store",
+            ".cache/uv",
+            ".ssh/cache",
+            ".config/tool",
+            "wt/cache",
+            "run-temp/cache",
+            "writable/cache",
+        ] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let parent = [
+            ("HOME".into(), home.clone().into_os_string()),
+            ("PATH".into(), OsString::from("/usr/bin:/bin")),
+        ];
+        let bare = AgentEnv::for_project(parent.clone(), &[], &[]).unwrap();
+        let caches = [
+            "Library/pnpm",
+            ".cache/uv",
+            "Library/pnpm",
+            "missing",
+            ".ssh/cache",
+            ".config",
+            "wt/cache",
+            "run-temp/cache",
+            "writable/cache",
+        ];
+        let agent = bare.clone().with_caches(&caches);
+        assert_eq!(agent.caches().len(), caches.len());
+        let run = RunPaths {
+            workdir: home.join("wt"),
+            writable: vec![home.join("writable")],
+            temp: Some(home.join("run-temp")),
+            ..RunPaths::default()
+        };
+        let policy = agent.policy(&run);
+        let without = bare.policy(&run);
+        let opened: Vec<&PathBuf> = policy
+            .readable
+            .iter()
+            .filter(|path| !without.readable.contains(path))
+            .collect();
+        assert_eq!(
+            opened,
+            [&home.join("Library/pnpm"), &home.join(".cache/uv")]
+        );
+        assert!(
+            !policy
+                .writable
+                .iter()
+                .any(|path| path.starts_with(home.join("Library"))),
+            "{policy:?}"
+        );
+        assert_eq!(policy.writable, without.writable);
     }
 
     /// Whether agent runs can be confined here, as `executor::gate`'s tests
