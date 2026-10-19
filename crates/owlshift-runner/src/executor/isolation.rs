@@ -66,16 +66,19 @@
 //! unseen; confining the agent is the operating system's job.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use super::git::{Git, GitError};
 use crate::config::exit_text;
 
-/// The most bytes read from one shared git file; a larger one is compared
-/// by its size and first bytes.
+/// The most bytes a shared git file is kept in memory for; a larger one is
+/// compared by its size and the digest of the whole file.
 const SHARED_FILE_CAP: u64 = 1024 * 1024;
 
 /// The most names a violation lists before summing up the rest.
@@ -112,6 +115,19 @@ pub struct Concurrent {
     pub ended: BTreeMap<String, String>,
 }
 
+impl Concurrent {
+    /// Whether `branch` is a run in flight or one that ended since the
+    /// snapshot, in this answer.
+    pub fn knows(&self, branch: &str) -> bool {
+        self.running.contains(branch) || self.ended.contains_key(branch)
+    }
+}
+
+/// Whether either of the scheduler's two answers knows `branch`.
+fn known(earlier: &Concurrent, later: &Concurrent, branch: &str) -> bool {
+    earlier.knows(branch) || later.knows(branch)
+}
+
 /// What [`Snapshot::check_among`] found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checked {
@@ -133,7 +149,7 @@ struct MainState {
     /// `git status` entries by path.
     entries: BTreeMap<Vec<u8>, Entry>,
     /// The shared git files, by path relative to the common directory.
-    shared: BTreeMap<String, Content>,
+    shared: BTreeMap<PathBuf, Content>,
     /// Every ref but the run's branch and remote-tracking refs, with its
     /// object.
     refs: BTreeMap<String, String>,
@@ -158,7 +174,8 @@ struct Entry {
 enum Content {
     /// A regular file, by its blob id or, for a shared file, its bytes.
     File(Vec<u8>),
-    /// A shared file past the cap: its size and first bytes.
+    /// A shared file past the cap: its size and the SHA-256 of the whole
+    /// file, so a change anywhere in it shows.
     Large(u64, Vec<u8>),
     Link(PathBuf),
     Dir,
@@ -366,7 +383,7 @@ impl Snapshot {
             Ok(after) => {
                 let shared: Vec<String> = changed(&self.main.shared, &after)
                     .into_iter()
-                    .cloned()
+                    .map(|path| display_path(path))
                     .collect();
                 if !shared.is_empty() {
                     violations.push(Violation::SharedGitFiles(shared));
@@ -541,7 +558,7 @@ impl MainState {
         }
         let shared: Vec<String> = changed(&self.shared, &after.shared)
             .into_iter()
-            .cloned()
+            .map(|path| display_path(path))
             .collect();
         if !shared.is_empty() {
             violations.push(Violation::SharedGitFiles(shared));
@@ -562,14 +579,13 @@ impl MainState {
     /// counts when it is not at its tip, whether it changed since the
     /// snapshot or not.
     fn changed_refs(&self, after: &Self, earlier: &Concurrent, later: &Concurrent) -> Vec<String> {
-        let known = |branch: &str| {
-            [earlier, later]
-                .iter()
-                .any(|answer| answer.running.contains(branch) || answer.ended.contains_key(branch))
-        };
         let mut refs: Vec<String> = changed(&self.refs, &after.refs)
             .into_iter()
-            .filter(|name| !name.strip_prefix("refs/heads/").is_some_and(known))
+            .filter(|name| {
+                !name
+                    .strip_prefix("refs/heads/")
+                    .is_some_and(|branch| known(earlier, later, branch))
+            })
             .cloned()
             .collect();
         for (branch, tip) in &earlier.ended {
@@ -765,10 +781,10 @@ fn path_of(bytes: &[u8]) -> PathBuf {
 /// `hooks/` and `info/` under the common directory, and `commondir`, which
 /// git follows from the main checkout's git directory to read another's
 /// configuration (OWL-50).
-fn read_shared(common: &Path) -> Result<BTreeMap<String, Content>, SnapshotError> {
+fn read_shared(common: &Path) -> Result<BTreeMap<PathBuf, Content>, SnapshotError> {
     let mut shared = BTreeMap::new();
     for name in ["commondir", "config", "config.worktree", "hooks", "info"] {
-        shared_files(common, name, &mut shared)
+        walk(common, Path::new(name), &mut shared, &|_| {})
             .map_err(|e| SnapshotError(format!("{}: {e}", common.join(name).display())))?;
     }
     Ok(shared)
@@ -872,42 +888,98 @@ fn read_link_file(path: &Path) -> Result<String, String> {
     Ok(text.to_owned())
 }
 
-/// Records `name` under `common`, and everything below it for a
-/// directory, without following links.
-fn shared_files(common: &Path, name: &str, out: &mut BTreeMap<String, Content>) -> io::Result<()> {
-    let path = common.join(name);
-    let meta = match fs::symlink_metadata(&path) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+/// Records `rel` under `common`, and everything below it for a directory,
+/// without following links: the one walker of the shared git files and of
+/// the other worktrees' entries.
+///
+/// Names stay raw ([`OsString`]) from the listing to the map's keys, so a
+/// name that is not UTF-8 is a key of its own and a plant under it is seen.
+/// A path that vanishes between the listing, the metadata and the open (a
+/// concurrent run renaming a lock file) is read as absent, not as an error;
+/// any other I/O error is returned. `between` is called with the path after
+/// its metadata is read and before it is opened, which lets a test change
+/// the file at exactly that point.
+fn walk(
+    common: &Path,
+    rel: &Path,
+    out: &mut BTreeMap<PathBuf, Content>,
+    between: &dyn Fn(&Path),
+) -> io::Result<()> {
+    fn present<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    let path = common.join(rel);
+    let Some(meta) = present(fs::symlink_metadata(&path))? else {
+        return Ok(());
     };
     let content = if meta.file_type().is_symlink() {
-        Content::Link(fs::read_link(&path)?)
+        let Some(target) = present(fs::read_link(&path))? else {
+            return Ok(());
+        };
+        Content::Link(target)
     } else if meta.is_dir() {
-        let mut children: Vec<String> = fs::read_dir(&path)?
-            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-            .collect::<io::Result<_>>()?;
+        let listing: io::Result<Vec<OsString>> = fs::read_dir(&path)
+            .and_then(|entries| entries.map(|entry| entry.map(|e| e.file_name())).collect());
+        let Some(mut children) = present(listing)? else {
+            return Ok(());
+        };
         children.sort();
         for child in children {
-            shared_files(common, &format!("{name}/{child}"), out)?;
+            walk(common, &rel.join(child), out, between)?;
         }
         Content::Dir
     } else if meta.is_file() {
+        between(&path);
+        let Some(mut file) = present(fs::File::open(&path))? else {
+            return Ok(());
+        };
         let mut bytes = Vec::new();
-        fs::File::open(&path)?
+        (&mut file)
             .take(SHARED_FILE_CAP + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > SHARED_FILE_CAP {
-            bytes.truncate(SHARED_FILE_CAP as usize);
-            Content::Large(meta.len(), bytes)
+            // Past the cap: the digest of the whole file, so a change
+            // anywhere in it shows.
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let mut len = bytes.len() as u64;
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                match file.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        hasher.update(&chunk[..read]);
+                        len += read as u64;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Content::Large(len, hasher.finalize().to_vec())
         } else {
             Content::File(bytes)
         }
     } else {
         Content::Other
     };
-    out.insert(name.to_owned(), content);
+    out.insert(rel.to_owned(), content);
     Ok(())
+}
+
+/// A path as a violation lists it: its names joined with `/` on every
+/// system, each through `to_string_lossy` (two names that differ in bytes
+/// that are not UTF-8 may print alike, which costs a diagnostic, not a
+/// detection). Not `to_string_lossy` of the whole path, which would spell
+/// `\` on Windows.
+fn display_path(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -1088,5 +1160,132 @@ mod tests {
         let before = BTreeMap::from([("a", 1), ("b", 2), ("c", 3)]);
         let after = BTreeMap::from([("a", 1), ("b", 9), ("d", 4)]);
         assert_eq!(changed(&before, &after), [&"b", &"c", &"d"]);
+    }
+
+    /// No `cfg`: it runs on every system, the Windows leg included, where
+    /// `Path::join` spells `\` and the violations must not.
+    #[test]
+    fn a_displayed_path_is_joined_with_slashes_on_every_system() {
+        assert_eq!(
+            display_path(&Path::new("hooks").join("pre-commit")),
+            "hooks/pre-commit"
+        );
+        let entry: PathBuf = ["worktrees", "other", "index"].iter().collect();
+        assert_eq!(display_path(&entry), "worktrees/other/index");
+        assert_eq!(display_path(Path::new("config")), "config");
+    }
+
+    fn walked(common: &Path, name: &str, between: &dyn Fn(&Path)) -> io::Result<Vec<PathBuf>> {
+        let mut out = BTreeMap::new();
+        walk(common, Path::new(name), &mut out, between)?;
+        Ok(out.into_keys().collect())
+    }
+
+    #[test]
+    fn a_file_that_vanishes_while_it_is_read_is_absent_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("worktrees").join("other");
+        fs::create_dir_all(&entry).unwrap();
+        fs::write(entry.join("index"), "i").unwrap();
+        fs::write(entry.join("index.lock"), "l").unwrap();
+        let remove_lock = |path: &Path| {
+            if path.file_name().is_some_and(|name| name == "index.lock") {
+                fs::remove_file(path).unwrap();
+            }
+        };
+        let keys = walked(dir.path(), "worktrees", &remove_lock).unwrap();
+        assert_eq!(
+            keys,
+            [
+                PathBuf::from("worktrees"),
+                ["worktrees", "other"].iter().collect(),
+                ["worktrees", "other", "index"].iter().collect(),
+            ]
+        );
+        // A missing root is empty too.
+        assert!(walked(dir.path(), "nothing", &|_| {}).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_an_error_not_an_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        fs::write(&file, "x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        // A user who can read it anyway (root) cannot show the error.
+        if fs::File::open(&file).is_err() {
+            let error = walked(dir.path(), "config", &|_| {}).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn a_change_past_the_first_mebibyte_of_a_shared_file_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = vec![b'a'; SHARED_FILE_CAP as usize + 10];
+        fs::write(dir.path().join("config"), &bytes).unwrap();
+        let before = read_shared(dir.path()).unwrap();
+        assert!(matches!(
+            before.get(Path::new("config")),
+            Some(Content::Large(len, _)) if *len == SHARED_FILE_CAP + 10
+        ));
+        assert_eq!(read_shared(dir.path()).unwrap(), before);
+        *bytes.last_mut().unwrap() = b'b';
+        fs::write(dir.path().join("config"), &bytes).unwrap();
+        let after = read_shared(dir.path()).unwrap();
+        assert_eq!(changed(&before, &after), [&PathBuf::from("config")]);
+        // Within the cap, the bytes themselves are kept.
+        fs::write(dir.path().join("config"), b"small").unwrap();
+        assert_eq!(
+            read_shared(dir.path()).unwrap().get(Path::new("config")),
+            Some(&Content::File(b"small".to_vec()))
+        );
+    }
+
+    /// Only Linux can make these names: APFS refuses what is not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn names_that_are_not_utf8_are_keys_of_their_own() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let odd = |bytes: &[u8]| OsStr::from_bytes(bytes).to_owned();
+        fs::write(hooks.join(odd(b"x\xff")), "1").unwrap();
+        let before = read_shared(dir.path()).unwrap();
+        assert!(before.contains_key(&Path::new("hooks").join(odd(b"x\xff"))));
+        // The lossy names of the two would collide.
+        fs::write(hooks.join(odd(b"x\xfe")), "1").unwrap();
+        let after = read_shared(dir.path()).unwrap();
+        assert!(after.contains_key(&Path::new("hooks").join(odd(b"x\xfe"))));
+        assert_eq!(changed(&before, &after).len(), 1);
+        // Removing one shows as a changed key, never as an unchanged `Dir`.
+        fs::remove_file(hooks.join(odd(b"x\xff"))).unwrap();
+        let removed = read_shared(dir.path()).unwrap();
+        assert_eq!(
+            changed(&after, &removed),
+            [&Path::new("hooks").join(odd(b"x\xff"))]
+        );
+    }
+
+    #[test]
+    fn a_branch_is_known_in_either_answer() {
+        let running = Concurrent {
+            running: BTreeSet::from(["a".to_owned()]),
+            ended: BTreeMap::new(),
+        };
+        let ended = Concurrent {
+            running: BTreeSet::new(),
+            ended: BTreeMap::from([("b".to_owned(), "tip".to_owned())]),
+        };
+        assert!(running.knows("a") && !running.knows("b"));
+        assert!(ended.knows("b") && !ended.knows("a"));
+        let none = Concurrent::default();
+        assert!(known(&running, &none, "a"));
+        assert!(known(&none, &ended, "b"));
+        assert!(!known(&running, &ended, "c"));
     }
 }
