@@ -457,7 +457,7 @@ fn build_brief_fields_exist() {
             &["decider", "owlshift", "other"][..],
         ),
         ("permissions.level", &["write_worktree"][..]),
-        ("findings.mode", &["answer", "fix"][..]),
+        ("findings.mode", &["answer", "fix", "note"][..]),
     ] {
         let path: Vec<&str> = field.split('.').collect();
         let allowed: BTreeSet<String> = resolve(&brief, &brief, &path)
@@ -1110,6 +1110,12 @@ fn design_review_prompt_matches_the_contracts() {
             "plan.base",
             "review.mandates",
             "review.pass",
+            "review.earlier.pass",
+            "review.earlier.kept",
+            "review.since.pass",
+            "review.since.parts",
+            "review.since.steps",
+            "review.since.removed",
             "result_path",
         ],
     );
@@ -1136,6 +1142,11 @@ fn verify_prompt_matches_the_contracts() {
             "review.pass",
             "review.diff.base",
             "review.diff.path",
+            "review.earlier.pass",
+            "review.earlier.kept",
+            "review.since.pass",
+            "review.since.diff.base",
+            "review.since.diff.path",
             "result_path",
         ],
     );

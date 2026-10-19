@@ -1305,6 +1305,8 @@ impl Driver {
                 mandates: vec![Mandate::Critic],
                 pass: NonZeroU32::MIN,
                 diff: None,
+                since: None,
+                earlier: Vec::new(),
             }),
             pull_request_reviews: Vec::new(),
         };

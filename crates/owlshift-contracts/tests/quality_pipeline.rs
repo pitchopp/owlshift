@@ -529,7 +529,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 21.into()),
+            with(brief("build"), "format", 22.into()),
             "upgrade Owlshift",
         ),
     ] {
@@ -800,6 +800,153 @@ fn a_review_loop_keeps_its_start_its_report_and_its_reviews() {
         let error = TicketReview::parse(&document.to_string())
             .unwrap_err()
             .to_string();
+        assert!(error.contains(reason), "{case}: {error}");
+    }
+}
+
+/// A pass after a revision (OWL-356): the brief tells it what changed and
+/// the earlier findings, each at its own stage; the review record keeps
+/// what each pass reviewed and the last fix under way; a Build alone is
+/// given notes, and answers none.
+#[test]
+fn a_later_pass_is_told_what_changed_and_the_last_fix_is_kept() {
+    let kept = json_fixture("ticket-review.json")["passes"][0]["findings"][0].clone();
+    let at_pass = |role: &str, since: Value, earlier: Value| {
+        let mut brief = brief(role);
+        brief["review"]["pass"] = 2.into();
+        brief["review"]["since"] = since;
+        brief["review"]["earlier"] = earlier;
+        if role == "verify" {
+            brief["review"]["diff"] = json!({ "base": "b".repeat(40), "path": "d.patch" });
+        }
+        Brief::parse(&brief.to_string()).map_err(|e| e.to_string())
+    };
+    let earlier = json!([{ "pass": 1, "kept": kept }]);
+    let since_diff = json!({ "pass": 1, "diff": { "base": "c".repeat(40), "path": "s.patch" } });
+    let since_steps =
+        json!({ "pass": 1, "parts": ["approach", "steps"], "steps": [1], "removed": 1 });
+    at_pass("verify", since_diff.clone(), earlier.clone()).unwrap();
+    at_pass("design_review", since_steps.clone(), earlier.clone()).unwrap();
+    let notes = json!({ "mode": "note", "findings": [finding("F1")] });
+    let mut build = brief("build");
+    build["findings"] = notes.clone();
+    let parsed = Brief::parse(&build.to_string()).unwrap();
+    let done = json!({ "format": 12, "status": "done", "summary": "s",
+        "finding_responses": [{ "finding": "F1", "outcome": "fixed", "reason": "r" }] });
+    assert!(
+        RunResult::parse_against(&done.to_string(), &parsed).is_err(),
+        "notes are answered by no response"
+    );
+    let mut design = brief("design");
+    design["findings"] = notes;
+    for (case, error, reason) in [
+        (
+            "notes for design",
+            Brief::parse(&design.to_string()).unwrap_err().to_string(),
+            "findings: the role is design",
+        ),
+        (
+            "plan steps at verify",
+            at_pass("verify", since_steps.clone(), json!([])).unwrap_err(),
+            "verify's since names plan parts or steps",
+        ),
+        (
+            "a diff at design review",
+            at_pass("design_review", since_diff.clone(), json!([])).unwrap_err(),
+            "design review's since names a diff",
+        ),
+        (
+            "a step past the plan's",
+            at_pass(
+                "design_review",
+                json!({ "pass": 1, "steps": [9] }),
+                json!([]),
+            )
+            .unwrap_err(),
+            "do not increase within the plan's",
+        ),
+        (
+            "parts out of order",
+            at_pass(
+                "design_review",
+                json!({ "pass": 1, "parts": ["steps", "goal"] }),
+                json!([]),
+            )
+            .unwrap_err(),
+            "out of the plan's order",
+        ),
+        (
+            "since the pass itself",
+            at_pass("verify", json!({ "pass": 2 }), json!([])).unwrap_err(),
+            "since pass 2, not before pass 2",
+        ),
+        (
+            "an earlier finding of this pass",
+            at_pass("verify", Value::Null, json!([{ "pass": 2, "kept": kept }])).unwrap_err(),
+            "an earlier finding of pass 2",
+        ),
+    ] {
+        assert!(error.contains(reason), "{case}: {error}");
+    }
+
+    let review = json_fixture("ticket-review.json");
+    let verify_pass = |head: &str| {
+        let mut pass = review["passes"][0].clone();
+        pass["stage"] = "verify".into();
+        for finding in pass["findings"].as_array_mut().unwrap() {
+            finding["reviewer"]["role"] = "verify".into();
+        }
+        pass["head"] = head.into();
+        pass
+    };
+    let print = json!({ "parts": vec!["e".repeat(64); 9], "steps": ["f".repeat(64)] });
+    let mut kept_review = review.clone();
+    kept_review["passes"][0]["plan"] = print.clone();
+    kept_review["passes"]
+        .as_array_mut()
+        .unwrap()
+        .push(verify_pass(&"a".repeat(40)));
+    kept_review["last_fix"] = 1.into();
+    let parsed = TicketReview::parse(&kept_review.to_string()).unwrap();
+    assert_eq!(parsed.last_fix.map(|n| n.get()), Some(1));
+    assert_eq!(
+        parsed.passes[1].head.as_deref(),
+        Some("a".repeat(40).as_str())
+    );
+    let refused = |edit: &dyn Fn(&mut Value)| {
+        let mut document = kept_review.clone();
+        edit(&mut document);
+        TicketReview::parse(&document.to_string())
+            .unwrap_err()
+            .to_string()
+    };
+    for (case, error, reason) in [
+        (
+            "a commit at design review",
+            refused(&|d| d["passes"][0]["head"] = "a".repeat(40).into()),
+            "keeps a reviewed commit",
+        ),
+        (
+            "a branch for a commit",
+            refused(&|d| d["passes"][1]["head"] = "main".into()),
+            "not a full commit id",
+        ),
+        (
+            "a print at verify",
+            refused(&|d| d["passes"][1]["plan"] = print.clone()),
+            "keeps a plan's print",
+        ),
+        (
+            "a print short of a part",
+            refused(&|d| d["passes"][0]["plan"]["parts"] = json!(["e".repeat(64)])),
+            "9 part hashes",
+        ),
+        (
+            "a last fix of another pass",
+            refused(&|d| d["last_fix"] = 2.into()),
+            "not the record's last pass",
+        ),
+    ] {
         assert!(error.contains(reason), "{case}: {error}");
     }
 }

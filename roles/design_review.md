@@ -1,6 +1,6 @@
 +++
 role = "design_review"
-brief_format = 20
+brief_format = 21
 result_format = 12
 +++
 
@@ -30,7 +30,7 @@ You read the repository in this worktree, at the plan's base commit, and may run
 - `conformance`: the plan against the ticket's success criteria, the decider's answers, the `decision` entries and the `rules`. A criterion of the ticket the plan drops or rewrites; one no step delivers or no `test` checks; an answer or a decision the plan ignores; work the ticket did not ask for; a rule it breaks.
 - `debt`: what the change does to the code around it. An existing function, type or helper the plan duplicates instead of using (name it); a pattern of the codebase it bypasses; a second path beside one that exists; a test that tests nothing or tests again what another test pins (name it).
 
-`review.pass` is the review pass. Above 1, the plan was revised after an earlier pass: review it whole, as it is now.
+`review.pass` is the review pass. Above 1, the plan was revised after an earlier pass, and `review.earlier` holds the findings of the earlier passes, each with its `pass` and, in `kept`, the finding, the arbiter's `ruling` or the author's `response`, and its `outcome`: `fixed`, `rejected`, `asked`, `proposed`, or none when it was noted for the Build or is still open. With `review.since`, review only what changed since pass `review.since.pass`: the parts of the plan named in `review.since.parts`, the steps numbered in `review.since.steps`, whose text is new (a step only renumbered is not), and, when `review.since.removed` is above 0, whether each criterion still has a step and a `test`; what that change breaks elsewhere in the plan counts as changed. Check too that each finding `fixed` since is settled. Do not raise again a finding `rejected` or one noted for the Build (a `minor` with no `outcome`), unless the change gives new evidence; a `blocker` or `major` with no `outcome` was left by a round that could not ask it: it is still open, check it again. Without `review.since`, review the plan whole.
 
 ## Findings
 

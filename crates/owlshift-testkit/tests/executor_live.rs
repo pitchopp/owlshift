@@ -44,6 +44,8 @@ fn a_real_role_runs_through_the_executor() {
         mandates: vec![owlshift_contracts::review::Mandate::Critic],
         pass: std::num::NonZeroU32::MIN,
         diff: None,
+        since: None,
+        earlier: Vec::new(),
     };
     let live = run_live(
         &role,
