@@ -98,6 +98,18 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
   - Changed, harmless to the adapter: `haiku` resolves to `claude-haiku-5-5`, and `result` gained `safety_stops`.
     The success run's rate-limit event was a plain `allowed`; a constructed line keeps the `allowed_warning` read tested.
   - 2.1.300 joins `harness/tested.rs`. The adapter did not change.
+- **Contract on Claude Code 2.1.302 (OWL-338), recorded on 2026-10-19.**
+  The installed `claude` had updated itself to 2.1.302 two days before, the day OWL-327 recorded 2.1.300, so doctor flagged it as untested and `tests/claude_live.rs` failed on it.
+  The maintainer re-recorded every fixture the recorder writes with `OWLSHIFT_RECORD_CLAUDE=1 cargo test -p owlshift-adapters --test claude_record -- --ignored` on the installed 2.1.302, no shim needed: all eight recordings passed their checks, the two read-only `cd` ones included (`read_only_after_cd.jsonl`: the result written, `sub/…` denied; `read_only_after_cd_dot_rule.jsonl`: the reverse).
+  `peer_inbox_*` (2.1.283, by hand) and `usage_limit.jsonl` (constructed) stay as they are.
+  - Drift from 2.1.300, found by diffing the fixtures' event kinds and fields:
+    `init` gained `original_cwd` and `additional_directories`.
+    The `thinking_tokens` system event and the `thinking_display` and `thinking_duration_ms` fields of `assistant` events no longer appear in `beyond_run_tools_denied.jsonl`.
+    A few recordings differ in their count of events (the model's own steps), not in their kinds.
+    The denials are the same in number and place, the `cd` ones included.
+    The exact values of `success` (tokens, cost, duration, rate-limit utilization) moved with the new run; its rate-limit event is again a plain `allowed`.
+    None of it touches what the adapter reads.
+  - 2.1.302 joins `harness/tested.rs`. The adapter did not change.
 - **Skills in an agent run (OWL-333), checked on 2026-10-17 with Claude Code 2.1.302.**
   Found on Locary's LOC-1407 (2.1.300): every run's `init` listed 19 skills and offered `Skill` under `--setting-sources ""`; none called it.
   Runs through the executor, confined, on the token for agent runs and an empty `CLAUDE_CONFIG_DIR`, on `haiku` at effort `low`,
