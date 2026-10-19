@@ -7,6 +7,10 @@
 //! 2026-10-03 (OWL-127): `owlshift continue` applies it as `watch` will. The
 //! caller measures how long the comment has been left alone; the core reads
 //! no clock.
+//!
+//! Which decisions a reply under a DECISION comment names (OWL-351): that
+//! comment holds a resolver run's decisions, D1..Dn, and a reply reverses
+//! those it names ([`named_decisions`]).
 
 use std::time::Duration;
 
@@ -48,9 +52,46 @@ pub fn ends_with_go(body: &str) -> bool {
         .is_some_and(|word| word.eq_ignore_ascii_case("go"))
 }
 
+/// The numbers of the decisions `body` names among `count`, ascending, each
+/// once (OWL-351): a word `Dn`, or `Qn` taken as `Dn`, in any ASCII case,
+/// anywhere in it, with `n` from 1 to `count`. A word is a run of ASCII
+/// letters and digits, so `**D2**` and `D2:` name D2 and `AD2` or `D2a` do
+/// not. Empty when it names none: the reply then concerns every decision.
+pub fn named_decisions(body: &str, count: usize) -> Vec<usize> {
+    let mut named: Vec<usize> = body
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|word| {
+            let digits = word.strip_prefix(['D', 'd', 'Q', 'q']).filter(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })?;
+            digits.parse::<usize>().ok()
+        })
+        .filter(|n| (1..=count).contains(n))
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    named
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_names_the_decisions_it_numbers() {
+        for (body, named) in [
+            ("D2: keep the README as it is", &[2][..]),
+            ("**d2** no", &[2]),
+            ("Q3: B instead", &[3]),
+            ("I disagree with D1 and D3, not D1 again", &[1, 3]),
+            ("No, use English.", &[]),
+            ("D12 and D0", &[]),
+            ("AD2, D2a, D-2", &[]),
+            ("D02", &[2]),
+        ] {
+            assert_eq!(named_decisions(body, 3), named, "{body:?}");
+        }
+    }
 
     #[test]
     fn a_reply_counts_once_the_window_has_passed_or_with_go() {

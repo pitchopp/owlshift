@@ -1966,7 +1966,8 @@ fn event_claim_and_state_rejections() {
         v["format"] = json!(14);
         v["decisions"][0]["asked_by"] = json!("verify");
         v["decisions"][0]["basis_kind"] = json!("fact");
-        v["decisions"][0]["reversed"] = json!({ "through": "2026-10-19T10:00:00Z", "comment": "r1" });
+        v["decisions"][0]["reversed"] =
+            json!({ "through": "2026-10-19T10:00:00Z", "comment": "r1" });
     })
     .unwrap();
     assert_eq!(older.decisions[0].asked_by, Some(Role::Verify));

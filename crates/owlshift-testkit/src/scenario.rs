@@ -137,8 +137,8 @@ use owlshift_runner::on_demand::{
 };
 use owlshift_runner::resolver::{self, Fallback, Quotable, Resolved};
 use owlshift_runner::writer::{
-    DecisionComment, ParkedComment, QuestionsComment, ReaskComment, ReopenedChoice, ReplyComment,
-    Restart, ResumeComment, VisibleStage, Writer,
+    Decided, DecisionComment, ParkedComment, QuestionsComment, ReaskComment, Reasoning,
+    ReopenedChoice, ReplyComment, Restart, ResumeComment, VisibleStage, Writer,
 };
 
 use crate::git::{GitEnv, Remote, seed};
@@ -939,35 +939,40 @@ impl Driver {
                     .as_ref()
                     .map(Quotable::of)
                     .unwrap_or_default();
-                for logged in
-                    resolver::decisions(&self.policy, &given, resolutions, &quotable, premise_false)
-                {
-                    let (question, decision, basis) =
-                        (logged.question, logged.decision, logged.basis);
-                    let body = DecisionComment {
+                let logged = resolver::decisions(
+                    &self.policy,
+                    &given,
+                    resolutions,
+                    &quotable,
+                    premise_false,
+                );
+                // One DECISION comment for the run's decisions (OWL-351),
+                // their reasoning folded in it.
+                if !logged.is_empty() {
+                    let comment = DecisionComment {
                         ticket: self.id.clone(),
-                        question: question.clone(),
-                        decision: decision.to_owned(),
-                        basis: basis.to_owned(),
-                        kind: logged.kind,
+                        decisions: Decided::of_run(&logged),
                         level: self.policy.level(),
+                        reasoning: Reasoning::Folded,
                         run: None,
-                    }
-                    .render();
-                    let posted = self.post(&body)?;
+                    };
+                    let posted = self.post(&comment.render())?;
                     self.has_ref = true;
                     self.questions.build_refusal = None;
-                    self.questions.decisions.push(KeptDecision {
-                        at: posted.at,
-                        comment: posted.id,
-                        question: question.clone(),
-                        decision: decision.to_owned(),
-                        basis: basis.to_owned(),
-                        basis_kind: Some(logged.kind),
-                        asked_by: Some(asking_role),
-                        reversed: None,
-                    });
-                    decided.push(question.id.clone());
+                    for (n, shown) in comment.decisions.into_iter().enumerate() {
+                        decided.push(shown.question.id.clone());
+                        self.questions.decisions.push(KeptDecision {
+                            at: posted.at,
+                            comment: posted.id.clone(),
+                            question: shown.question,
+                            decision: shown.decision,
+                            basis: shown.basis,
+                            basis_kind: shown.kind,
+                            asked_by: Some(asking_role),
+                            number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
+                            reversed: None,
+                        });
+                    }
                 }
                 (decided, None)
             }

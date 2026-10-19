@@ -49,6 +49,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::path::Path;
 
+use jiff::Timestamp;
 use owlshift_adapters::forge::github::{GitHubForge, NewPullRequest};
 use owlshift_adapters::forge::push::{
     PushError, Pushed, leased_push_command, push_command, read_forced_push_parts, read_push_parts,
@@ -57,7 +58,7 @@ use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
 use owlshift_adapters::tracker::{
-    Capability, Comment, Document, Error as TrackerError, Filed, MAX_DOCUMENT_CHARS,
+    Capability, Comment, Document, Error as TrackerError, ErrorKind, Filed, MAX_DOCUMENT_CHARS,
     PROPOSED_LABEL, Proposal, Tracker,
 };
 use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
@@ -65,10 +66,10 @@ use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{FindingId, QuestionId, TicketId};
-use owlshift_contracts::refs::{AnsweredReview, DeliveredPullRequest, PushKind};
+use owlshift_contracts::refs::{AnsweredReview, DeliveredPullRequest, KeptDecision, PushKind};
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
-    Verdict as AnswerVerdict, option_letter,
+    Verdict as AnswerVerdict, option_index, option_letter,
 };
 use owlshift_contracts::review::{
     FindingOutcome, KeptFinding, Mandate, Plan, PlanChange, PlanPart, Reviewer, RulingOutcome,
@@ -80,7 +81,7 @@ use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkR
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
 
 use crate::executor::Git;
-use crate::resolver::Fallback;
+use crate::resolver::{Fallback, Logged};
 
 /// What the delivery report says about one ticket.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1307,86 +1308,221 @@ fn listed(items: &[String], room: usize) -> String {
     }
 }
 
-/// What a DECISION comment says of the delegation level that allowed it
-/// (OWL-337, architecture section 4, "Delegation level"), and, for one
-/// resting on the resolver's own weighing, that it was decided on judgment
-/// (OWL-343), so the decider sees which decisions to read.
-fn level_line(level: DelegationLevel, kind: BasisKind) -> String {
-    let lead = if kind == BasisKind::Judgment {
-        "Decided on judgment, allowed"
-    } else {
-        "Allowed"
-    };
-    format!(
-        "{lead} by this project's delegation level, `{}` (`policy.resolver_delegation`).",
-        level.as_str()
-    )
-}
+/// The most characters a DECISION comment's line keeps of its question's
+/// text (OWL-351).
+const LINE_QUESTION_CHARS: usize = 60;
 
-/// The DECISION comment (scenario S7): a question a run raised that the
-/// resolver decided without the decider, logged on the ticket with what
-/// settles it and how to reverse it (architecture section 8, "Audit"). One
-/// per decision, so the decider answers the one they disagree with.
+/// The most characters a DECISION comment's line keeps of its choice.
+const LINE_CHOICE_CHARS: usize = 80;
+
+/// The most characters a DECISION comment's line keeps of its reason, which
+/// the resolver's prompt asks to open its basis.
+const LINE_REASON_CHARS: usize = 150;
+
+/// Why a text is cut in a DECISION comment's fold, which nothing else on the
+/// tracker shows.
+const FOLD_KEPT: &str = "the ticket's record keeps it whole";
+
+/// One decision of a resolver run, as its DECISION comment and the ticket's
+/// decisions document show it (OWL-351).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecisionComment {
-    pub ticket: TicketId,
+pub struct Decided {
     /// The question as the raising run asked it.
     pub question: Question,
     pub decision: String,
     /// What settles it.
     pub basis: String,
-    /// The kind of that basis (OWL-328): a `judgment` says so on the
-    /// level's line (OWL-343).
-    pub kind: BasisKind,
-    /// The project's delegation level that allowed it (OWL-328).
+    /// The kind of that basis (OWL-328): a `judgment` is marked (OWL-343).
+    /// `None` for a decision kept before OWL-343.
+    pub kind: Option<BasisKind>,
+    /// The letter of the question's option it takes, when it takes one.
+    pub option: Option<String>,
+}
+
+impl Decided {
+    /// The decisions `logged` of a resolver run, D1..Dn in this order: what
+    /// its DECISION comment shows and the ticket ref then keeps.
+    pub fn of_run(logged: &[Logged<'_>]) -> Vec<Self> {
+        logged
+            .iter()
+            .map(|logged| Self {
+                question: logged.question.clone(),
+                decision: logged.decision.to_owned(),
+                basis: logged.basis.to_owned(),
+                kind: Some(logged.kind),
+                option: logged.option.map(str::to_owned),
+            })
+            .collect()
+    }
+
+    /// A decision the ticket ref keeps, as the decisions document shows it:
+    /// the ref keeps no option letter, so its choice is its decision.
+    pub fn kept(kept: &KeptDecision) -> Self {
+        Self {
+            question: kept.question.clone(),
+            decision: kept.decision.clone(),
+            basis: kept.basis.clone(),
+            kind: kept.basis_kind,
+            option: None,
+        }
+    }
+
+    /// Its line in a DECISION comment, as decision `number`:
+    /// `- **Dn · question** — choice. reason`, each text cut on a word
+    /// boundary, `(on judgment)` after a `judgment` basis.
+    fn line(&self, number: usize) -> String {
+        let question = clip(&heading_text(&self.question.text), LINE_QUESTION_CHARS);
+        let label = self.option.as_deref().and_then(|letter| {
+            option_index(&self.question.options, letter)
+                .map(|index| format!("{letter}. {}", flatten(&self.question.options[index].label)))
+        });
+        let choice = clip(
+            &label.unwrap_or_else(|| flatten(&self.decision)),
+            LINE_CHOICE_CHARS,
+        );
+        let reason = clip(&flatten(&self.basis), LINE_REASON_CHARS);
+        let judged = if self.kind == Some(BasisKind::Judgment) {
+            " *(on judgment)*"
+        } else {
+            ""
+        };
+        // A choice cut ends with its ellipsis, not a full stop.
+        let choice = choice.trim_end_matches('.');
+        let stop = if choice.ends_with('…') { "" } else { "." };
+        format!("- **D{number} · {question}** — {choice}{stop} {reason}{judged}")
+    }
+
+    /// Its six texts in a fold or a document: the question's four
+    /// ([`question_fits`]), the decision and the basis.
+    fn texts(&self, why: &'static str) -> Vec<Fit> {
+        let mut texts: Vec<Fit> = question_fits(&self.question, why, DECIDED_TEXT_CHARS).into();
+        texts.push(Fit::new(flatten(&self.decision), why));
+        texts.push(Fit::new(flatten(&self.basis), why));
+        texts
+    }
+
+    /// Its block in a fold or a document, as decision `number`, of `texts`
+    /// as [`Self::texts`] gives them, maybe cut, its heading `heading` deep.
+    fn block(&self, number: usize, texts: &[String], heading: &str) -> String {
+        let (question, [decision, basis]) = texts.split_at(QUESTION_TEXTS) else {
+            unreachable!("a decision has six texts")
+        };
+        let lines = question_lines(&format!("D{number}"), &self.question, question);
+        // `question_lines` heads its block `### `.
+        let lines = format!("{heading}{}", lines.trim_start_matches("### "));
+        let kind = self
+            .kind
+            .map(|kind| format!(" (a `{}` basis)", kind.as_str()))
+            .unwrap_or_default();
+        format!("{lines}\n\n**Decision:** {decision}\n**Settled by:** {basis}{kind}")
+    }
+}
+
+/// Where a DECISION comment's reasoning is (OWL-351).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reasoning {
+    /// In the ticket's decisions document, at this link when the tracker
+    /// gave one.
+    Document { url: Option<String> },
+    /// In the comment, folded: the tracker holds no document, or publishing
+    /// it failed.
+    Folded,
+}
+
+/// The DECISION comment (scenario S7, OWL-351): the questions a resolver run
+/// decided without the decider, one short line each, numbered D1..Dn, so the
+/// decider scans them and replies naming the one they disagree with
+/// (architecture section 8, "Audit"). The reasoning is in the ticket's
+/// decisions document, or folded in the comment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionComment {
+    pub ticket: TicketId,
+    /// The run's decisions, D1..Dn in this order; at least one.
+    pub decisions: Vec<Decided>,
+    /// The project's delegation level that allowed them (OWL-328).
     pub level: DelegationLevel,
-    /// The resolver run that decided it.
+    pub reasoning: Reasoning,
+    /// The resolver run that decided them.
     pub run: Option<String>,
 }
 
 impl DecisionComment {
-    /// The comment body: the `[owlshift] DECISION` header, the question
-    /// without the raising run's id (which a round's numbering would
-    /// contradict), the decision and what settles it, how to reverse it, the
-    /// delegation level that allowed it on the last line the reader sees
-    /// (OWL-337), and the footer, which names the resolver's run. Text from
-    /// a model is flattened to one line.
+    /// The comment body: the `[owlshift] DECISION` header; a lead line
+    /// saying how many questions were decided, the delegation level that
+    /// allowed them (OWL-337) and where the reasoning is; one line per
+    /// decision; with [`Reasoning::Folded`], the reasoning in a collapsible
+    /// section (Linear's `+++`, checked live on 2026-10-19); one sentence on
+    /// how to reverse; and the footer, which names the resolver's run. Text
+    /// from a model is flattened to one line.
     ///
-    /// It holds in [`MAX_COMMENT_CHARS`] (OWL-237): a body that does not
-    /// hold whole has its texts cut, visibly. No other comment shows a
-    /// decided question whole (a round's QUESTIONS comment leaves it out),
-    /// so its texts (`question_fits`) are capped loosely, at 5,000
-    /// characters each, and the decision and its basis not at all: they are
-    /// what the decider reverses, so they are cut last, only as the longest
-    /// texts, never before a shorter one.
+    /// It holds in [`MAX_COMMENT_CHARS`]: the lines are cut to their bounds,
+    /// and a fold that does not hold whole has its texts cut, visibly.
     pub fn render(&self) -> String {
-        let mut texts: Vec<Fit> = question_fits(&self.question, LONGER, DECIDED_TEXT_CHARS).into();
-        texts.push(Fit::new(flatten(&self.decision), LONGER));
-        texts.push(Fit::new(flatten(&self.basis), LONGER));
+        let texts = match self.reasoning {
+            Reasoning::Folded => self
+                .decisions
+                .iter()
+                .flat_map(|decided| decided.texts(FOLD_KEPT))
+                .collect(),
+            Reasoning::Document { .. } => Vec::new(),
+        };
         fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
     }
 
-    /// The body of `texts`, as [`Self::render`] gives them, maybe cut.
+    /// The body of the fold's `texts`, as [`Self::render`] gives them, maybe
+    /// cut.
     fn body(&self, texts: &[String]) -> String {
-        let (question, [decision, basis]) = texts.split_at(QUESTION_TEXTS) else {
-            unreachable!("a decision has six texts")
-        };
         let header = Header {
             kind: MarkerKind::Decision,
             round: None,
         };
-        let sections = [
+        let count = self.decisions.len();
+        let decided = if count == 1 {
+            "this question".to_owned()
+        } else {
+            format!("these {count} questions")
+        };
+        let level = format!("as delegation level `{}` allows", self.level.as_str());
+        let reasoning = match &self.reasoning {
+            Reasoning::Document { url } => format!(
+                "Why: {}.",
+                titled_link(
+                    "the decisions document",
+                    url.as_deref(),
+                    &decisions_title(&self.ticket)
+                )
+            ),
+            Reasoning::Folded => "Why: below, folded.".to_owned(),
+        };
+        let lines: Vec<String> = self
+            .decisions
+            .iter()
+            .enumerate()
+            .map(|(i, decided)| decided.line(i + 1))
+            .collect();
+        let mut sections = vec![
             header.render(),
-            "Owlshift decided this question of a run without asking you: what the ticket, the \
-             project's rules or the repository already settles. It is reversible."
-                .to_owned(),
-            question_lines("Question", &self.question, question),
-            format!("**Decision:** {decision}\n**Settled by:** {basis}"),
-            "To reverse it, reply to this comment with what you want instead: the next run \
-             follows your reply over this decision, and once the pull request is delivered, \
-             Owlshift's watch corrects it to follow your reply."
-                .to_owned(),
-            level_line(self.level, self.kind),
+            format!("Owlshift decided {decided} without asking you, {level}. {reasoning}"),
+            lines.join("\n"),
+        ];
+        if self.reasoning == Reasoning::Folded {
+            let blocks: Vec<String> = self
+                .decisions
+                .iter()
+                .zip(texts.chunks(QUESTION_TEXTS + 2))
+                .enumerate()
+                .map(|(i, (decided, texts))| decided.block(i + 1, texts, "### "))
+                .collect();
+            sections.push(format!("+++ Reasoning\n\n{}\n\n+++", blocks.join("\n\n")));
+        }
+        sections.push(if count == 1 {
+            "To reverse it, reply to this comment with what you want instead.".to_owned()
+        } else {
+            "To reverse one, reply to this comment naming it, as `D2: what you want instead`; a \
+             reply naming none reverses them all."
+                .to_owned()
+        });
+        sections.push(
             Footer {
                 format: Format,
                 kind: MarkerKind::Decision,
@@ -1395,10 +1531,81 @@ impl DecisionComment {
                 run: self.run.clone(),
             }
             .render(),
-        ];
+        );
         let mut body = sections.join("\n\n");
         body.push('\n');
         body
+    }
+}
+
+/// The title of a ticket's decisions document (OWL-351).
+fn decisions_title(ticket: &TicketId) -> String {
+    format!("Decisions · {ticket}")
+}
+
+/// The decisions of one DECISION comment, as the ticket's decisions
+/// document shows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionGroup {
+    /// When the comment was posted, or is about to be.
+    pub at: Timestamp,
+    /// Its decisions, D1..Dn in this order.
+    pub decisions: Vec<Decided>,
+}
+
+/// The ticket's decisions document (OWL-351): the reasoning of every
+/// decision the ticket ref keeps, one group per DECISION comment, the
+/// decisions as taken (a reversal is on the thread).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionsDocument {
+    pub ticket: TicketId,
+    /// The project's delegation level now, as the delivery report names it.
+    pub level: DelegationLevel,
+    /// Oldest first.
+    pub groups: Vec<DecisionGroup>,
+}
+
+impl DecisionsDocument {
+    /// The document's title: `Decisions · <ticket>`.
+    pub fn title(&self) -> String {
+        decisions_title(&self.ticket)
+    }
+
+    /// The document's Markdown, within [`MAX_DOCUMENT_CHARS`], its texts cut
+    /// visibly when it would not hold: under `## Decisions`, each group
+    /// headed by its time, each decision `#### Dn · question` with its
+    /// context, options and recommendation, the decision, what settles it
+    /// and its kind.
+    pub fn render(&self) -> String {
+        let texts: Vec<Fit> = self
+            .groups
+            .iter()
+            .flat_map(|group| &group.decisions)
+            .flat_map(|decided| decided.texts(DOCUMENT_KEPT))
+            .collect();
+        fitted(MAX_DOCUMENT_CHARS, texts, |texts| {
+            let mut texts = texts.chunks(QUESTION_TEXTS + 2);
+            let mut sections = vec![
+                "## Decisions".to_owned(),
+                format!(
+                    "The questions Owlshift decided on this ticket without asking its decider, \
+                     as this project's delegation level, `{}`, allows \
+                     (`policy.resolver_delegation`). Each group is one DECISION comment on the \
+                     ticket: to reverse a decision, reply to that comment naming it, as `D2: \
+                     what you want instead`. The decisions are shown as taken; a reversal is on \
+                     the ticket's thread.",
+                    self.level.as_str()
+                ),
+            ];
+            for group in &self.groups {
+                sections.push(format!("### {}", group.at.strftime("%Y-%m-%d %H:%M UTC")));
+                for (i, decided) in group.decisions.iter().enumerate() {
+                    let texts = texts.next().expect("six texts per decision");
+                    sections.push(decided.block(i + 1, texts, "#### "));
+                }
+            }
+            sections.join("\n\n")
+        })
     }
 }
 
@@ -2172,11 +2379,34 @@ fn ruling_name(outcome: RulingOutcome) -> &'static str {
 /// the tracker's link is `https`, otherwise the link as code beside it, or
 /// the document's title when the tracker gave none.
 pub(crate) fn document_link(what: &str, url: Option<&str>, ticket: &TicketId) -> String {
+    titled_link(what, url, &format!("Plan · {ticket}"))
+}
+
+/// A link to the ticket's document titled `title`, as [`document_link`]
+/// gives one to the plan's (OWL-351).
+fn titled_link(what: &str, url: Option<&str>, title: &str) -> String {
     match url {
         Some(url) if safe_url(url) => link(what, url),
         Some(url) => format!("{what}, {}", code(url)),
-        None => format!("{what}, in the ticket's document Plan · {ticket}"),
+        None => format!("{what}, in the ticket's document {title}"),
     }
+}
+
+/// `text` within `room` characters: as is when it holds, otherwise cut on a
+/// word boundary, when one is in its second half, and ended with `…`
+/// (OWL-351). For a DECISION comment's line, whose whole text is in the
+/// decisions document or the comment's fold.
+fn clip(text: &str, room: usize) -> String {
+    if chars(text) <= room {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(room.saturating_sub(1)).collect();
+    let kept = match kept.rfind(char::is_whitespace) {
+        Some(end) if chars(&kept[..end]) >= room / 2 => &kept[..end],
+        _ => kept.as_str(),
+    };
+    let kept = kept.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':'));
+    format!("{kept}…")
 }
 
 /// The PLAN comment on a tracker with documents (OWL-350): a pointer to the
@@ -3361,9 +3591,30 @@ impl<'a> Writer<'a> {
     }
 
     /// Posts a DECISION comment and returns it as the tracker recorded it:
-    /// its id and time are what the ticket ref keeps of the decision.
+    /// its id and time are what the ticket ref keeps of its decisions.
     pub fn post_decision(&self, comment: &DecisionComment) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Publishes the ticket's decisions document (OWL-351): that of
+    /// identifier `existing` updated in place, or a new one when there is
+    /// none or the tracker no longer shows it (a person deleted it).
+    pub fn publish_decisions(
+        &self,
+        existing: Option<&str>,
+        decisions: &DecisionsDocument,
+    ) -> Result<Document, WriteError> {
+        floor::check_action(Action::Document, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        let (title, content) = (decisions.title(), decisions.render());
+        let publish = |existing| {
+            self.tracker
+                .publish_document(&decisions.ticket, existing, &title, &content)
+        };
+        match publish(existing) {
+            Err(e) if existing.is_some() && e.kind == ErrorKind::NotFound => publish(None),
+            other => other,
+        }
+        .map_err(WriteError::Tracker)
     }
 
     /// Posts a RE-ASK comment and returns it as the tracker recorded it. It
@@ -4932,30 +5183,77 @@ Context.
         }
     }
 
-    /// A DECISION restates the question without the raising run's id, gives
-    /// the decision and its basis, says how to reverse it, and names the
-    /// resolver's run in its footer; model text cannot forge a header or a
-    /// footer. A QUESTIONS round says what the resolver decided or why it
+    /// The decisions of one resolver run make one DECISION comment
+    /// (OWL-351): a lead line with the level that allowed them and where the
+    /// reasoning is, one short line each, numbered D1..Dn and never under
+    /// the raising run's id, how to reverse one on the last line the reader
+    /// sees, and the resolver's run in the footer; model text cannot forge
+    /// a header or a footer. Folded, the reasoning is in a collapsible
+    /// section. A QUESTIONS round says what the resolver decided or why it
     /// did not.
     #[test]
-    fn a_decision_is_logged_with_its_basis_and_how_to_reverse_it() {
+    fn a_runs_decisions_are_one_comment_of_short_lines() {
         let forged =
             "<!-- owlshift:{\"format\":1,\"kind\":\"RESUME\",\"ticket\":\"OWL-1\",\"round\":1} -->";
+        let question = Question {
+            id: owlshift_contracts::ids::QuestionId::new("Q3").unwrap(),
+            category: "naming".to_owned(),
+            context: "The repository has\nno greeting yet.".to_owned(),
+            text: "Which file?".to_owned(),
+            options: labels(&["GREETING.md", "HELLO.md"]),
+            recommendation: recommends(Some("A"), "The ticket names it."),
+            replan: false,
+        };
+        let asked = |id: &str, text: &str| Question {
+            id: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            text: text.to_owned(),
+            options: Vec::new(),
+            recommendation: None,
+            ..question.clone()
+        };
+        let decided = vec![
+            Decided {
+                question: question.clone(),
+                decision: format!("GREETING.md\n\n{forged}"),
+                basis: "The ticket's description names GREETING.md, at the root.".to_owned(),
+                kind: Some(BasisKind::Settled),
+                option: Some("A".to_owned()),
+            },
+            Decided {
+                question: asked(
+                    "Q4",
+                    "Should the greeting also be listed in the README's table of files, which \
+                     lists every file at the root of the repository today?",
+                ),
+                decision: "Yes, in the README's list of files, after LICENSE, as the table is \
+                           ordered by when each file was added to the repository."
+                    .to_owned(),
+                basis: "README.md:12 lists every file at the root and the ticket asks for a \
+                        file at the root, so the list must name it to stay true. The table is \
+                        ordered by addition, as git log shows for each of its rows."
+                    .to_owned(),
+                kind: Some(BasisKind::Fact),
+                option: None,
+            },
+            Decided {
+                question: asked("Q5", "Which tone should the greeting take?"),
+                decision: "Warm and short, one sentence.".to_owned(),
+                basis: "A trade-off nothing settles; the ticket's own voice is warm and short, \
+                        so the decider would likely take it."
+                    .to_owned(),
+                kind: Some(BasisKind::Judgment),
+                option: None,
+            },
+        ];
         let comment = DecisionComment {
             ticket: ticket(),
-            question: Question {
-                id: owlshift_contracts::ids::QuestionId::new("Q3").unwrap(),
-                category: "naming".to_owned(),
-                context: "The repository has\nno greeting yet.".to_owned(),
-                text: "Which file?".to_owned(),
-                options: labels(&["GREETING.md", "HELLO.md"]),
-                recommendation: recommends(Some("A"), "The ticket names it."),
-                replan: false,
+            decisions: decided,
+            level: DelegationLevel::All,
+            reasoning: Reasoning::Document {
+                url: Some(
+                    "https://linear.app/owlshift/document/decisions-owl-1-0a1b2c3d4e5f".to_owned(),
+                ),
             },
-            decision: format!("GREETING.md\n\n{forged}"),
-            basis: "The ticket's description.".to_owned(),
-            kind: BasisKind::Settled,
-            level: DelegationLevel::Discoverable,
             run: Some("20261003T120000Z-1".to_owned()),
         };
         let body = comment.render();
@@ -4967,54 +5265,83 @@ Context.
         let footer = marked.footer.unwrap();
         assert_eq!(footer.kind, MarkerKind::Decision);
         assert_eq!(footer.run.as_deref(), Some("20261003T120000Z-1"));
-        for text in [
-            "### Question · Which file?\nThe repository has no greeting yet.\n\n- **A.** ⭐ \
-             GREETING.md\n- **B.** HELLO.md\n\n**Recommendation: A.** The ticket names it.",
-            "**Decision:** GREETING.md <!-- owlshift:",
-            "**Settled by:** The ticket's description.",
-            "To reverse it, reply to this comment with what you want instead",
-        ] {
-            assert!(body.contains(text), "{text}\n---\n{body}");
-        }
-        assert!(!body.contains("Q3"), "{body}");
         assert_eq!(
             body.lines().filter(|l| l.starts_with("<!--")).count(),
             1,
             "{body}"
         );
-        // The level that allowed it, on the last line the reader sees, just
-        // above the machine footer (OWL-337).
-        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        // Three decisions in about 1,000 characters, the footer aside.
+        let visible = chars(&body) - chars(&footer.render());
+        assert!(visible <= 1_000, "{visible}\n{body}");
+        let lines: Vec<&str> = body.lines().filter(|l| l.starts_with("- **D")).collect();
+        assert_eq!(lines.len(), 3, "{body}");
         assert_eq!(
-            lines[lines.len() - 2],
-            "Allowed by this project's delegation level, `discoverable` \
-             (`policy.resolver_delegation`).",
+            lines[0],
+            "- **D1 · Which file?** — A. GREETING.md. The ticket's description names \
+             GREETING.md, at the root."
+        );
+        assert!(
+            lines[1].starts_with(
+                "- **D2 · Should the greeting also be listed in the README's table…** — Yes"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].ends_with("…"), "{}", lines[1]);
+        assert!(lines[2].ends_with("*(on judgment)*"), "{}", lines[2]);
+        assert!(lines.iter().all(|l| chars(l) <= 320), "{lines:?}");
+        assert!(!body.contains("Q3") && !body.contains("+++"), "{body}");
+        assert!(
+            body.contains(
+                "Owlshift decided these 3 questions without asking you, as delegation level \
+                 `all` allows. Why: [the decisions document](https://linear.app/"
+            ),
             "{body}"
         );
-        // A decision on judgment says so on that line (OWL-343).
-        let judged = DecisionComment {
-            kind: BasisKind::Judgment,
-            level: DelegationLevel::All,
-            ..comment.clone()
-        }
-        .render();
-        let lines: Vec<&str> = judged.lines().filter(|l| !l.is_empty()).collect();
+        // How to reverse one, on the last line the reader sees.
+        let shown: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
-            lines[lines.len() - 2],
-            "Decided on judgment, allowed by this project's delegation level, `all` \
-             (`policy.resolver_delegation`).",
-            "{judged}"
+            shown[shown.len() - 2],
+            "To reverse one, reply to this comment naming it, as `D2: what you want instead`; \
+             a reply naming none reverses them all.",
+            "{body}"
         );
         let tracker = FakeTracker::default();
         let posted = Writer::new(&tracker).post_decision(&comment).unwrap();
         assert_eq!(posted.body, body);
+
+        // Folded, the reasoning is whole in the comment, under the lines.
+        let folded = DecisionComment {
+            decisions: comment.decisions[..1].to_vec(),
+            reasoning: Reasoning::Folded,
+            ..comment.clone()
+        }
+        .render();
+        for text in [
+            "Owlshift decided this question without asking you",
+            "Why: below, folded.",
+            "+++ Reasoning\n\n### D1 · Which file?\nThe repository has no greeting yet.\n\n- \
+             **A.** ⭐ GREETING.md\n- **B.** HELLO.md\n\n**Recommendation: A.** The ticket \
+             names it.",
+            "**Decision:** GREETING.md <!-- owlshift:",
+            "**Settled by:** The ticket's description names GREETING.md, at the root. (a \
+             `settled` basis)\n\n+++",
+            "To reverse it, reply to this comment with what you want instead.",
+        ] {
+            assert!(folded.contains(text), "{text}\n---\n{folded}");
+        }
+        assert_eq!(
+            folded.lines().filter(|l| l.starts_with("<!--")).count(),
+            1,
+            "{folded}"
+        );
 
         let round = |decided, fallback| {
             QuestionsComment {
                 ticket: ticket(),
                 round: NonZeroU32::new(1).unwrap(),
                 summary: "s".to_owned(),
-                questions: vec![comment.question.clone()],
+                questions: vec![question.clone()],
                 premise_false: false,
                 decided,
                 fallback,
@@ -5271,11 +5598,15 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 .render(),
                 DecisionComment {
                     ticket: ticket(),
-                    question: question.clone(),
-                    decision: hostile("decision"),
-                    basis: hostile("basis"),
-                    kind: BasisKind::Settled,
+                    decisions: vec![Decided {
+                        question: question.clone(),
+                        decision: hostile("decision"),
+                        basis: hostile("basis"),
+                        kind: Some(BasisKind::Settled),
+                        option: None,
+                    }],
                     level: DelegationLevel::Discoverable,
+                    reasoning: Reasoning::Folded,
                     run: None,
                 }
                 .render(),
@@ -5520,11 +5851,15 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
 
         let decision = DecisionComment {
             ticket: ticket(),
-            question,
-            decision: "This one.".to_owned(),
-            basis: "The ticket.".to_owned(),
-            kind: BasisKind::Ticket,
+            decisions: vec![Decided {
+                question,
+                decision: "This one.".to_owned(),
+                basis: "The ticket.".to_owned(),
+                kind: Some(BasisKind::Ticket),
+                option: None,
+            }],
             level: DelegationLevel::Ticket,
+            reasoning: Reasoning::Folded,
             run: None,
         };
         let resume = ResumeComment {
@@ -6219,16 +6554,15 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         assert!(!small.render().contains("(cut: "));
     }
 
-    /// OWL-237: a DECISION comment whose question, decision and basis are
-    /// each far past a comment holds in one comment; its frame stays, the
-    /// question's texts are cut to their caps first and the decision and its
-    /// basis share what is left.
+    /// OWL-237, OWL-351: a folded DECISION comment whose decisions' questions,
+    /// decisions and bases are each far past a comment holds in one comment;
+    /// its frame and lines stay, the questions' texts are cut to their caps
+    /// first and the decisions and bases share what is left.
     #[test]
     fn a_maximal_decision_comment_holds_in_one_comment() {
-        let decision = DecisionComment {
-            ticket: ticket(),
+        let huge = |n: usize| Decided {
             question: Question {
-                id: QuestionId::new("Q1").unwrap(),
+                id: QuestionId::new(&format!("Q{n}")).unwrap(),
                 category: "c".repeat(1 << 20),
                 context: "x".repeat(1 << 20),
                 text: format!("Which?{}", "t".repeat(1 << 20)),
@@ -6238,8 +6572,14 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             },
             decision: "d".repeat(1 << 20),
             basis: "b".repeat(1 << 20),
-            kind: BasisKind::Judgment,
+            kind: Some(BasisKind::Judgment),
+            option: None,
+        };
+        let decision = DecisionComment {
+            ticket: ticket(),
+            decisions: (1..=3).map(huge).collect(),
             level: DelegationLevel::All,
+            reasoning: Reasoning::Folded,
             run: Some("run-1".to_owned()),
         };
         let body = decision.render();
@@ -6249,44 +6589,116 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         assert_eq!(marked.header.kind, MarkerKind::Decision);
         assert!(marked.footer.is_some());
         for frame in [
-            "### Question · Which?",
+            "- **D1 · Which?ttt",
+            "- **D3 · Which?ttt",
+            "+++ Reasoning\n\n### D1 · Which?",
+            "### D3 · Which?",
             "\n\n- **A.** o",
             "**Decision:** d",
             "\n**Settled by:** b",
-            "To reverse it, reply to this comment",
+            "To reverse one, reply to this comment naming it",
         ] {
             assert!(body.contains(frame), "{frame}");
         }
-        assert!(body.contains(&cut_note(LONGER)));
-        // The question's texts stop at their caps, its context at its own;
-        // the decision and its basis keep the most of what is left.
+        assert!(body.contains(&cut_note(FOLD_KEPT)));
         assert!(!body.contains(&"c".repeat(10)), "no category");
         assert!(!body.contains(&"t".repeat(DECIDED_TEXT_CHARS + 1)));
         assert!(!body.contains(&"x".repeat(CONTEXT_CHARS + 1)));
-        assert!(body.contains(&cut_note(CONTEXT_CUT)));
         assert!(!body.contains(&"o".repeat(DECIDED_TEXT_CHARS + 1)));
-        assert!(body.contains(&"d".repeat(30_000)) && body.contains(&"b".repeat(30_000)));
+        assert!(body.contains(&"d".repeat(10_000)) && body.contains(&"b".repeat(10_000)));
         // What holds whole is rendered as it is, every text in its place.
         let small = DecisionComment {
-            question: Question {
-                category: "naming".to_owned(),
-                context: "Context.".to_owned(),
-                text: "Which?".to_owned(),
-                options: labels(&["a", "b"]),
-                ..decision.question.clone()
-            },
-            decision: "A.".to_owned(),
-            basis: "The ticket.".to_owned(),
+            decisions: vec![Decided {
+                question: Question {
+                    category: "naming".to_owned(),
+                    context: "Context.".to_owned(),
+                    text: "Which?".to_owned(),
+                    options: labels(&["a", "b"]),
+                    ..decision.decisions[0].question.clone()
+                },
+                decision: "A.".to_owned(),
+                basis: "The ticket.".to_owned(),
+                kind: Some(BasisKind::Ticket),
+                option: Some("A".to_owned()),
+            }],
             ..decision
         };
         let body = small.render();
         assert!(!body.contains("(cut: "));
-        assert!(body.contains(
-            "### Question · Which?\nContext.\n\n- **A.** a\n- **B.** b\n\n**Decision:** A.\n\
-             **Settled by:** The ticket.\n\n"
-        ));
+        for text in [
+            "- **D1 · Which?** — A. a. The ticket.\n",
+            "### D1 · Which?\nContext.\n\n- **A.** a\n- **B.** b\n\n**Decision:** A.\n\
+             **Settled by:** The ticket. (a `ticket` basis)\n\n+++",
+        ] {
+            assert!(body.contains(text), "{text}\n---\n{body}");
+        }
     }
 
+    /// OWL-351: the decisions document holds every kept decision, one group
+    /// per DECISION comment headed by its time, each decision numbered in
+    /// its comment, its question, decision and basis whole; it holds in a
+    /// document whatever its size.
+    #[test]
+    fn the_decisions_document_groups_the_decisions_by_comment() {
+        let decided = |text: &str, decision: &str| Decided {
+            question: Question {
+                id: QuestionId::new("Q1").unwrap(),
+                category: "naming".to_owned(),
+                context: String::new(),
+                text: text.to_owned(),
+                options: Vec::new(),
+                recommendation: None,
+                replan: false,
+            },
+            decision: decision.to_owned(),
+            basis: "The ticket.".to_owned(),
+            kind: None,
+            option: None,
+        };
+        let at = |minute: i64| Timestamp::from_second(1_790_000_000 + minute * 60).unwrap();
+        let document = DecisionsDocument {
+            ticket: ticket(),
+            level: DelegationLevel::Discoverable,
+            groups: vec![
+                DecisionGroup {
+                    at: at(0),
+                    decisions: vec![decided("Which file?", "GREETING.md")],
+                },
+                DecisionGroup {
+                    at: at(5),
+                    decisions: vec![decided("Which tone?", "Warm."), decided("Listed?", "Yes.")],
+                },
+            ],
+        };
+        assert_eq!(document.title(), format!("Decisions · {}", ticket()));
+        let body = document.render();
+        assert!(body.starts_with("## Decisions\n\n"), "{body}");
+        assert!(body.contains("`discoverable`"), "{body}");
+        let headings: Vec<&str> = body.lines().filter(|l| l.starts_with("###")).collect();
+        assert_eq!(
+            headings,
+            [
+                "### 2026-09-21 14:13 UTC",
+                "#### D1 · Which file?",
+                "### 2026-09-21 14:18 UTC",
+                "#### D1 · Which tone?",
+                "#### D2 · Listed?",
+            ],
+            "{body}"
+        );
+        assert!(
+            body.contains("**Decision:** Yes.\n**Settled by:** The ticket."),
+            "{body}"
+        );
+        let long = DecisionsDocument {
+            groups: vec![DecisionGroup {
+                at: at(0),
+                decisions: vec![decided(&"t".repeat(1 << 18), &"d".repeat(1 << 19))],
+            }],
+            ..document
+        };
+        assert!(chars(&long.render()) <= MAX_DOCUMENT_CHARS);
+    }
     /// OWL-228: a PARKED comment at the re-ask limit of a round at its
     /// bounds, or with a detail of a whole result, holds in one comment;
     /// the detail is cut to 8,000 characters.
