@@ -57,8 +57,8 @@ use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
 use owlshift_adapters::tracker::{
-    Comment, Document, Error as TrackerError, Filed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Proposal,
-    Tracker,
+    Capability, Comment, Document, Error as TrackerError, Filed, MAX_DOCUMENT_CHARS,
+    PROPOSED_LABEL, Proposal, Tracker,
 };
 use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::States;
@@ -3075,6 +3075,11 @@ impl<'a> Writer<'a> {
     /// or before a ticket ref that a restore rewound, is thus never posted
     /// again, and a later try never posts a newer body of the same push.
     pub fn post_delivery_report(&self, report: &DeliveryReport) -> Result<Comment, WriteError> {
+        self.report_once(report).map(|reported| reported.comment)
+    }
+
+    /// [`Self::post_delivery_report`], saying whether it posted.
+    fn report_once(&self, report: &DeliveryReport) -> Result<Reported, WriteError> {
         floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
         let (lead, pull_request) = report.lead_lines();
         let second = report.second_line();
@@ -3105,12 +3110,17 @@ impl<'a> Writer<'a> {
             .map_err(WriteError::Tracker)?
             .into_iter()
             .find(|comment| is_delivery(&comment.body) && names(&comment.body));
-        if let Some(posted) = posted {
-            return Ok(posted);
+        if let Some(comment) = posted {
+            return Ok(Reported {
+                comment,
+                new: false,
+            });
         }
-        self.tracker
+        let comment = self
+            .tracker
             .post_comment(&report.ticket, &report.render())
-            .map_err(WriteError::Tracker)
+            .map_err(WriteError::Tracker)?;
+        Ok(Reported { comment, new: true })
     }
 
     /// Files a follow-up in the tracker's proposals inbox (OWL-253), after
@@ -3141,9 +3151,65 @@ impl<'a> Writer<'a> {
 
     /// Posts a fix, rebase or correction run's delivery report once: the
     /// rule of [`Writer::post_delivery_report`], kept under this name for
-    /// its callers.
-    pub fn post_repair_report(&self, report: &DeliveryReport) -> Result<Comment, WriteError> {
-        self.post_delivery_report(report)
+    /// its callers, saying whether it posted, since only a report newly
+    /// posted folds the PLAN it supersedes (OWL-353).
+    pub fn post_repair_report(&self, report: &DeliveryReport) -> Result<Reported, WriteError> {
+        self.report_once(report)
+    }
+
+    /// Resolves, so the tracker shows them folded, the runner's own comments
+    /// that `posted`, the comment it just posted on `ticket`, supersedes
+    /// (OWL-353, architecture section 5, "Folded when superseded"): those
+    /// [`superseded`] picks from the ticket's comments read once. A tracker
+    /// without [`Capability::FoldComments`] is asked nothing. Never an
+    /// error: what could not be folded is in [`Folded::failed`], for the
+    /// caller to warn of, and the command goes on.
+    pub fn fold(&self, ticket: &TicketId, posted: &Comment) -> Folded {
+        let mut folded = Folded::default();
+        if !self
+            .tracker
+            .capabilities()
+            .contains(&Capability::FoldComments)
+        {
+            return folded;
+        }
+        let mut fail = |comment: Option<String>, reason: String| {
+            folded.failed.push(Unfolded { comment, reason });
+        };
+        if let Err(violation) = floor::check_action(Action::Comment, HumanApproval::Absent) {
+            fail(None, format!("refused by the policy floor: {violation}"));
+            return folded;
+        }
+        let comments = match self.tracker.comments(ticket) {
+            Ok(comments) => comments,
+            Err(error) => {
+                fail(
+                    None,
+                    format!("the ticket's comments could not be read: {error}"),
+                );
+                return folded;
+            }
+        };
+        let Some(ids) = superseded(&comments, ticket, posted) else {
+            fail(
+                None,
+                format!(
+                    "comment {} is not among the ticket's comments read after it was posted",
+                    posted.id
+                ),
+            );
+            return folded;
+        };
+        for id in ids {
+            match self.tracker.resolve_comment(&id) {
+                Ok(()) => folded.resolved.push(id),
+                Err(error) => folded.failed.push(Unfolded {
+                    comment: Some(id),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        folded
     }
 
     /// Posts a round's QUESTIONS comment and returns it as the tracker
@@ -3339,6 +3405,114 @@ fn is_delivery(body: &str) -> bool {
         MarkedComment::parse(body),
         Ok(Some(MarkedComment { header, .. })) if header.kind == MarkerKind::Delivery
     )
+}
+
+/// The identifiers of the runner's own comments on `ticket` that `posted`
+/// supersedes, oldest first (OWL-353, architecture section 5, "Folded when
+/// superseded"), from `comments`, the ticket's comments oldest first, read
+/// after `posted` was posted; `None` when `posted` is not among them.
+///
+/// Of the comments listed before `posted`, those the runner wrote (`own`)
+/// that `posted` folds by kind and round (`folds`), less each one that a
+/// comment of the runner's posted between them already folds, since that
+/// comment folded it when it was posted: so a comment is resolved once,
+/// and one a person unfolded stays open. A QUESTIONS part other than the
+/// last of its round counts as no such comment: its round's fold runs once
+/// the whole round is posted, from its last part, so the parts of one
+/// round fold together.
+pub fn superseded(
+    comments: &[Comment],
+    ticket: &TicketId,
+    posted: &Comment,
+) -> Option<Vec<String>> {
+    let at = comments.iter().position(|c| c.id == posted.id)?;
+    let Some(new) = own(posted, ticket) else {
+        return Some(Vec::new());
+    };
+    let earlier: Vec<(Header, &Comment)> = comments[..at]
+        .iter()
+        .filter_map(|c| own(c, ticket).map(|header| (header, c)))
+        .collect();
+    let completes = |header: Header, comment: &Comment| {
+        header.kind != MarkerKind::Questions
+            || part_numbers(&comment.body).is_none_or(|(k, n)| k == n)
+    };
+    Some(
+        earlier
+            .iter()
+            .enumerate()
+            .filter(|&(i, &(old, _))| {
+                folds(new, old)
+                    && !earlier[i + 1..].iter().any(|&(between, comment)| {
+                        completes(between, comment) && folds(between, old)
+                    })
+            })
+            .map(|(_, (_, comment))| comment.id.clone())
+            .collect(),
+    )
+}
+
+/// The header of `comment` when the runner wrote it for `ticket`: marked
+/// from its header to its footer, the footer naming `ticket` and agreeing
+/// with the header ([`MarkedComment::parse`] refuses a footer that does
+/// not), never edited, the runner editing none, and top-level, since Linear
+/// resolves no reply. The rule of `on_demand::brief_body` (OWL-357), with the
+/// ticket and the thread added: a person's whole unedited copy of one counts
+/// as the runner's there too.
+fn own(comment: &Comment, ticket: &TicketId) -> Option<Header> {
+    if comment.edited_at.is_some() || comment.parent.is_some() {
+        return None;
+    }
+    match MarkedComment::parse(&comment.body) {
+        Ok(Some(MarkedComment {
+            header,
+            footer: Some(footer),
+        })) if footer.ticket == *ticket => Some(header),
+        _ => None,
+    }
+}
+
+/// Whether the runner's comment `new` folds its earlier comment `old`: a
+/// PLAN by a later PLAN or a DELIVERY; a QUESTIONS or RE-ASK of a round by
+/// that round's RESUME or another round's QUESTIONS; a RESUME by another
+/// round's QUESTIONS or RESUME. Nothing else: never a DECISION, which a
+/// threaded reply reverses, nor a REPLY, INTAKE, PARKED or DELIVERY.
+fn folds(new: Header, old: Header) -> bool {
+    use MarkerKind::{Delivery, Plan, Questions, ReAsk, Resume};
+    let same_round = new.round == old.round;
+    match (new.kind, old.kind) {
+        (Plan | Delivery, Plan) => true,
+        (Resume, Questions | ReAsk) => same_round,
+        (Questions, Questions | ReAsk | Resume) | (Resume, Resume) => !same_round,
+        _ => false,
+    }
+}
+
+/// What [`Writer::fold`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Folded {
+    /// The comments resolved, oldest first.
+    pub resolved: Vec<String>,
+    /// What could not be folded.
+    pub failed: Vec<Unfolded>,
+}
+
+/// A fold that failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unfolded {
+    /// The comment left expanded; `None` when no comment could be picked:
+    /// the comments could not be read, or the new one was not among them.
+    pub comment: Option<String>,
+    pub reason: String,
+}
+
+/// A DELIVERY report [`Writer::post_repair_report`] posted or found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reported {
+    pub comment: Comment,
+    /// `false` when a DELIVERY comment already on the ticket stood for it
+    /// and nothing was posted.
+    pub new: bool,
 }
 
 /// A comment that waits for a person, as the tracker recorded it.
@@ -5530,7 +5704,10 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             assert_eq!(first.body, green.render());
             assert_eq!(tracker.posts.get(), 2);
             // Nor the first report for the repair's, posted once.
-            assert_ne!(writer.post_repair_report(repair).unwrap(), first);
+            // Found, not posted: it folds nothing again (OWL-353).
+            let again = writer.post_repair_report(repair).unwrap();
+            assert!(!again.new);
+            assert_ne!(again.comment, first);
             assert_eq!(tracker.posts.get(), 2);
         }
 
@@ -5700,10 +5877,10 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             Mergeable::Mergeable,
             vec![check("ci", CheckState::Passed, "SUCCESS", false)],
         )));
-        assert_eq!(
-            writer.post_repair_report(&fix(green.clone(), 1)).unwrap(),
-            posted
-        );
+        let again = writer.post_repair_report(&fix(green.clone(), 1)).unwrap();
+        assert_eq!(again.comment, posted.comment);
+        // Found, not posted again (OWL-353).
+        assert!(posted.new && !again.new);
         assert_eq!(tracker.posts.get(), 2);
         // The delivery's own report, or another pass, is another push's.
         writer.post_delivery_report(&green).unwrap();
@@ -6134,5 +6311,211 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         assert!(corrected.lead_lines().0.unwrap().contains(" and 60 more."));
         let lead = one.lead_lines().0.unwrap();
         assert!(lead.contains(&cut_note(LONGER)), "{lead}");
+    }
+
+    /// A marked comment of `ticket`, with `text` after its header line.
+    fn runners(kind: MarkerKind, round: Option<u32>, ticket: &str, text: &str) -> String {
+        let round = round.map(|r| NonZeroU32::new(r).unwrap());
+        let footer = Footer {
+            format: Format,
+            kind,
+            ticket: TicketId::new(ticket).unwrap(),
+            round,
+            run: None,
+        };
+        format!(
+            "{}\n\n{text}\n\n{}\n",
+            Header { kind, round }.render(),
+            footer.render()
+        )
+    }
+
+    fn listed(id: &str, body: String) -> Comment {
+        Comment {
+            id: id.to_owned(),
+            author: Author::Other {
+                name: "owlshift".to_owned(),
+            },
+            created_at: "2026-10-19T12:00:00Z".parse().unwrap(),
+            edited_at: None,
+            body,
+            parent: None,
+        }
+    }
+
+    /// Which of the runner's comments a newer one folds, by kind and round
+    /// (OWL-353).
+    #[test]
+    fn a_comment_folds_the_runners_comments_it_supersedes_and_no_other_kind() {
+        use MarkerKind::*;
+        let h = |kind, round: Option<u32>| Header {
+            kind,
+            round: round.map(|r| NonZeroU32::new(r).unwrap()),
+        };
+        let folding = [
+            (h(Plan, None), h(Plan, None)),
+            (h(Delivery, None), h(Plan, None)),
+            (h(Resume, Some(1)), h(Questions, Some(1))),
+            (h(Resume, Some(1)), h(ReAsk, Some(1))),
+            (h(Questions, Some(2)), h(Questions, Some(1))),
+            (h(Questions, Some(2)), h(ReAsk, Some(1))),
+            (h(Questions, Some(2)), h(Resume, Some(1))),
+            (h(Resume, Some(2)), h(Resume, Some(1))),
+        ];
+        for (new, old) in folding {
+            assert!(folds(new, old), "{new:?} folds {old:?}");
+        }
+        let keeping = [
+            (h(Resume, Some(2)), h(Questions, Some(1))),
+            (h(Questions, Some(1)), h(Questions, Some(1))),
+            (h(ReAsk, Some(1)), h(Questions, Some(1))),
+            (h(Plan, None), h(Questions, Some(1))),
+            (h(Delivery, None), h(Delivery, None)),
+            (h(Plan, None), h(Decision, None)),
+            (h(Questions, Some(2)), h(Decision, None)),
+            (h(Questions, Some(2)), h(Reply, None)),
+            (h(Questions, Some(2)), h(Intake, None)),
+            (h(Delivery, None), h(Parked, None)),
+        ];
+        for (new, old) in keeping {
+            assert!(!folds(new, old), "{new:?} keeps {old:?}");
+        }
+    }
+
+    /// The comments a newer one supersedes are the runner's own for this
+    /// ticket, never edited and top-level, less those a comment between
+    /// already folded; a round split in parts folds together, from its last
+    /// part (OWL-353).
+    #[test]
+    fn only_the_runners_comments_not_folded_yet_are_superseded() {
+        use MarkerKind::*;
+        let part = |k, n| format!("{}{PART_NOTE}", part_line(k, n));
+        let mine = |kind, round, text: &str| runners(kind, round, "OWL-18", text);
+        let mut edited = listed("p-edited", mine(Plan, None, "Plan, edited by a person."));
+        edited.edited_at = Some("2026-10-19T12:30:00Z".parse().unwrap());
+        let mut reply = listed("p-reply", mine(Plan, None, "A reply."));
+        reply.parent = Some("p1".to_owned());
+        let thread = vec![
+            listed("p1", mine(Plan, None, "Plan 1.")),
+            listed("q1a", mine(Questions, Some(1), &part(1, 2))),
+            listed("q1b", mine(Questions, Some(1), &part(2, 2))),
+            listed("person", "Q1: A".to_owned()),
+            listed("re1", mine(ReAsk, Some(1), "Asked again.")),
+            listed("d1", mine(Decision, None, "Decided.")),
+            listed("r1", mine(Resume, Some(1), "Understood.")),
+            edited,
+            reply,
+            listed("other", runners(Plan, None, "OWL-19", "Another ticket's.")),
+            listed("p2", mine(Plan, None, "Plan 2.")),
+            listed("q2a", mine(Questions, Some(2), &part(1, 2))),
+            listed("q2b", mine(Questions, Some(2), &part(2, 2))),
+        ];
+        let at = |id: &str| {
+            let end = thread.iter().position(|c| c.id == id).unwrap();
+            superseded(&thread[..=end], &ticket(), &thread[end]).unwrap()
+        };
+        assert_eq!(at("q1b"), Vec::<String>::new());
+        assert_eq!(at("r1"), ["q1a", "q1b", "re1"]);
+        // Plan 1 only: the edited one is a person's, the reply cannot be
+        // resolved, the last is another ticket's.
+        assert_eq!(at("p2"), ["p1"]);
+        // Round 1's QUESTIONS and RE-ASK were folded by its RESUME; round
+        // 2's first part, posted with it, counts for nothing.
+        assert_eq!(at("q2b"), ["r1"]);
+        let unlisted = listed("gone", mine(Plan, None, "Plan 3."));
+        assert_eq!(superseded(&thread, &ticket(), &unlisted), None);
+    }
+
+    /// A tracker that resolves comments, or not, and refuses one.
+    struct Resolving {
+        capabilities: &'static [Capability],
+        comments: Result<Vec<Comment>, ()>,
+        refuse: &'static str,
+        reads: Cell<usize>,
+        resolved: RefCell<Vec<String>>,
+    }
+
+    impl Tracker for Resolving {
+        fn capabilities(&self) -> &'static [Capability] {
+            self.capabilities
+        }
+
+        fn ticket(&self, _: &TicketId) -> Result<Ticket, TrackerError> {
+            unreachable!("folding reads no ticket")
+        }
+
+        fn comments(&self, _: &TicketId) -> Result<Vec<Comment>, TrackerError> {
+            self.reads.set(self.reads.get() + 1);
+            self.comments
+                .clone()
+                .map_err(|()| TrackerError::new(TrackerErrorKind::Other, "tracker down"))
+        }
+
+        fn post_comment(&self, _: &TicketId, _: &str) -> Result<Comment, TrackerError> {
+            unreachable!("folding posts nothing")
+        }
+
+        fn set_stage(&self, _: &TicketId, _: &str) -> Result<(), TrackerError> {
+            unreachable!("folding moves no stage")
+        }
+
+        fn resolve_comment(&self, comment: &str) -> Result<(), TrackerError> {
+            if comment == self.refuse {
+                return Err(TrackerError::new(TrackerErrorKind::Other, "refused"));
+            }
+            self.resolved.borrow_mut().push(comment.to_owned());
+            Ok(())
+        }
+    }
+
+    /// A tracker without the capability is asked nothing; with it, a
+    /// refused resolve leaves the others resolved, and a thread that cannot
+    /// be read, or misses the new comment, folds nothing: each failure is
+    /// returned, never an error (OWL-353).
+    #[test]
+    fn folding_asks_nothing_without_the_capability_and_returns_what_failed() {
+        use MarkerKind::*;
+        let thread = vec![
+            listed("q1", runners(Questions, Some(1), "OWL-18", "Q1?")),
+            listed("re1", runners(ReAsk, Some(1), "OWL-18", "Q1 again?")),
+            listed("r1", runners(Resume, Some(1), "OWL-18", "Understood.")),
+        ];
+        let tracker = |capabilities, comments| Resolving {
+            capabilities,
+            comments,
+            refuse: "q1",
+            reads: Cell::new(0),
+            resolved: RefCell::default(),
+        };
+        let posted = &thread[2];
+        let plain = tracker(&[Capability::Comments], Ok(thread.clone()));
+        assert_eq!(
+            Writer::new(&plain).fold(&ticket(), posted),
+            Folded::default()
+        );
+        assert_eq!(plain.reads.get(), 0);
+
+        let folding: &'static [Capability] = &[Capability::Comments, Capability::FoldComments];
+        let resolving = tracker(folding, Ok(thread.clone()));
+        let folded = Writer::new(&resolving).fold(&ticket(), posted);
+        assert_eq!(folded.resolved, ["re1"]);
+        assert_eq!(
+            folded.failed,
+            [Unfolded {
+                comment: Some("q1".to_owned()),
+                reason: "refused".to_owned()
+            }]
+        );
+        let down = tracker(folding, Err(()));
+        let folded = Writer::new(&down).fold(&ticket(), posted);
+        assert!(folded.resolved.is_empty());
+        assert_eq!(folded.failed[0].comment, None);
+        assert!(folded.failed[0].reason.contains("tracker down"));
+        let lagging = tracker(folding, Ok(thread[..2].to_vec()));
+        let folded = Writer::new(&lagging).fold(&ticket(), posted);
+        assert!(
+            folded.failed[0].reason.contains("is not among"),
+            "{folded:?}"
+        );
     }
 }

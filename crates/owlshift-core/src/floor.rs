@@ -11,7 +11,8 @@ use crate::vocab::DelegationLevel;
 /// asks [`check_action`] before each one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
-    /// Post or edit a marked comment on the ticket.
+    /// Post or edit a marked comment on the ticket, or resolve one the
+    /// runner posted so it shows folded (OWL-353).
     Comment,
     /// Create or update a document attached to the ticket: its plan
     /// (OWL-350, architecture section 5, "Kept and shown").

@@ -420,7 +420,31 @@ struct Clocked<'a> {
     after_stage_read: &'a RefCell<Option<Box<dyn FnOnce()>>>,
     /// The proposals inbox, when it is on (OWL-253).
     inbox: &'a RefCell<FakeInbox>,
+    /// Folding comments, when it is on (OWL-353).
+    fold: &'a RefCell<FakeFold>,
 }
+
+/// A tracker that resolves comments, which the Markdown tracker does not
+/// (OWL-353): off unless a test turns it on, with the inbox off.
+#[derive(Default)]
+struct FakeFold {
+    on: bool,
+    /// The comments resolved, in order.
+    resolved: Vec<String>,
+    /// The comment whose resolve is refused.
+    refuse: Option<String>,
+}
+
+/// [`WITHOUT_INBOX`] with comments folded.
+const FOLDING: &[Capability] = &[
+    Capability::ReadTicket,
+    Capability::ListAdmitted,
+    Capability::Comments,
+    Capability::VisibleStage,
+    Capability::BlockedBy,
+    Capability::Documents,
+    Capability::FoldComments,
+];
 
 /// A proposals inbox in place of the Markdown tracker's own (OWL-253,
 /// OWL-267), so a test can read what was filed and make the filing fail:
@@ -446,12 +470,16 @@ const WITHOUT_INBOX: &[Capability] = &[
     Capability::Documents,
 ];
 
-/// [`WITHOUT_INBOX`] is the Markdown tracker's list less the inbox alone.
+/// [`WITHOUT_INBOX`] is the Markdown tracker's list less the inbox alone,
+/// and [`FOLDING`] that list with the folding the Markdown tracker lacks.
 #[test]
 fn the_bench_without_an_inbox_keeps_every_other_capability() {
     let mut expected = MarkdownTracker::CAPABILITIES.to_vec();
     expected.retain(|c| *c != Capability::ProposalsInbox);
     assert_eq!(WITHOUT_INBOX, expected);
+    assert!(!expected.contains(&Capability::FoldComments));
+    expected.push(Capability::FoldComments);
+    assert_eq!(FOLDING, expected);
 }
 
 /// The clock's time, then a minute later.
@@ -464,11 +492,26 @@ fn tick(clock: &Cell<Timestamp>) -> Timestamp {
 impl Tracker for Clocked<'_> {
     fn capabilities(&self) -> &'static [Capability] {
         let inbox = self.inbox.borrow();
-        if inbox.on || inbox.markdown {
+        if self.fold.borrow().on {
+            assert!(!inbox.on && !inbox.markdown, "no bench folds with an inbox");
+            FOLDING
+        } else if inbox.on || inbox.markdown {
             Tracker::capabilities(&self.inner)
         } else {
             WITHOUT_INBOX
         }
+    }
+
+    fn resolve_comment(&self, comment: &str) -> Result<(), tracker::Error> {
+        let mut fold = self.fold.borrow_mut();
+        if fold.refuse.as_deref() == Some(comment) {
+            return Err(tracker::Error::new(
+                tracker::ErrorKind::Other,
+                "the tracker refused the resolve",
+            ));
+        }
+        fold.resolved.push(comment.to_owned());
+        Ok(())
     }
 
     fn propose(&self, proposal: &tracker::Proposal<'_>) -> Result<tracker::Filed, tracker::Error> {
@@ -650,6 +693,8 @@ struct Bench {
     waited: Cell<SignedDuration>,
     /// The tracker's proposals inbox (OWL-253).
     inbox: RefCell<FakeInbox>,
+    /// The tracker's folding of comments (OWL-353).
+    fold: RefCell<FakeFold>,
     /// The routing each routed harness was asked for, in order (OWL-305).
     routed: Rc<RefCell<Vec<RunRouting>>>,
     /// The verify seats play from the bench's reply queue, as every other
@@ -775,6 +820,7 @@ impl Bench {
             after_stage_read: RefCell::new(None),
             waited: Cell::new(SignedDuration::from_mins(10)),
             inbox: RefCell::default(),
+            fold: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
         }
@@ -1147,6 +1193,7 @@ impl Bench {
             fail_reads: &self.fail_reads,
             after_stage_read: &self.after_stage_read,
             inbox: &self.inbox,
+            fold: &self.fold,
         };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());

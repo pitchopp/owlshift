@@ -5,6 +5,7 @@
 //! every role, the fake GitHub.
 
 use owlshift_contracts::BasisKind;
+use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::review::{FindingOutcome, FindingsMode, Mandate, ResponseOutcome};
 use owlshift_core::vocab::Harness as HarnessKind;
 use owlshift_runner::writer::MAX_POINTER_CHARS;
@@ -744,6 +745,112 @@ fn a_changed_plan_gets_one_more_pass_and_is_asked_again() {
     assert!(kept.approval.is_none());
     assert_eq!(record.review.unwrap().passes.len(), 2);
     assert_eq!(record.state.review_passes, 2);
+    // The Markdown tracker folds nothing, and says nothing of it (OWL-353).
+    let events = bench.events();
+    assert!(
+        data_of(&events, EventKind::TrackerWrite, "action")
+            .iter()
+            .all(|write| write["action"] != "resolve")
+    );
+    assert!(
+        data_of(&events, EventKind::Warning, "what")
+            .iter()
+            .all(|warning| warning["what"] != "comment_not_folded")
+    );
+}
+
+/// OWL-353's acceptance on a tracker that resolves comments: after the two
+/// rounds above, only round 2's QUESTIONS and the live PLAN stay unfolded.
+/// The first plan, round 1's QUESTIONS and its RESUME are each folded once
+/// by the comment that supersedes them; a refused fold is a warning, and
+/// the command goes on as on the Markdown tracker.
+#[test]
+fn superseded_comments_fold_where_the_tracker_resolves_them() {
+    let bench = Bench::of("risky");
+    bench.fold.borrow_mut().on = true;
+    let replies = vec![
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+    ];
+    let (outcome, _) = bench.run(replies, None);
+    assert!(
+        matches!(outcome, Err(Stop::NeedsInput { .. })),
+        "{outcome:?}"
+    );
+    // Nothing earlier to fold.
+    assert!(bench.fold.borrow().resolved.is_empty());
+    let kinds = || -> Vec<(String, String)> {
+        MarkdownTracker::new(&bench.remote.checkout)
+            .comments(&ticket())
+            .unwrap()
+            .into_iter()
+            .filter_map(|c| {
+                let header = MarkedComment::parse(&c.body).ok()??.header;
+                Some((c.id, header.render()))
+            })
+            .collect()
+    };
+    let first_plan = kinds()
+        .into_iter()
+        .find(|(_, header)| header == "[owlshift] PLAN")
+        .unwrap()
+        .0;
+    bench.fold.borrow_mut().refuse = Some(first_plan.clone());
+    bench.answer("Use plain text instead.");
+    let replies = vec![
+        bench.read(&check(&[("Q1", "answered", "Plain text instead.")])),
+        bench.read(&answered("changed", Some(REVISED))),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+    ];
+    let (outcome, printed) = bench.continue_ticket(replies);
+    assert!(
+        matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 2),
+        "{outcome:?}\n{printed}"
+    );
+    let marked = kinds();
+    let id = |header: &str| -> Vec<String> {
+        marked
+            .iter()
+            .filter(|(_, h)| h == header)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let (plans, round_1, resume) = (
+        id("[owlshift] PLAN"),
+        id("[owlshift] QUESTIONS · round 1"),
+        id("[owlshift] RESUME · round 1"),
+    );
+    assert_eq!(
+        (plans.len(), round_1.len(), resume.len()),
+        (2, 1, 1),
+        "{marked:?}"
+    );
+    // Round 1's QUESTIONS by its RESUME, the first PLAN (refused) by the
+    // second, the RESUME by round 2's QUESTIONS.
+    assert_eq!(
+        bench.fold.borrow().resolved,
+        [round_1[0].clone(), resume[0].clone()]
+    );
+    let events = bench.events();
+    let resolved: Vec<Value> = data_of(&events, EventKind::TrackerWrite, "action")
+        .into_iter()
+        .filter(|write| write["action"] == "resolve")
+        .collect();
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(resolved[0]["comment"], json!(round_1[0]));
+    assert_eq!(resolved[0]["by"], json!(resume[0]));
+    let warnings: Vec<Value> = data_of(&events, EventKind::Warning, "what")
+        .into_iter()
+        .filter(|warning| warning["what"] == "comment_not_folded")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0]["comment"], json!(first_plan));
+    assert_eq!(warnings[0]["by"], json!(plans[1]));
+    assert!(bench.record().plan.unwrap().approval.is_none());
 }
 
 /// A Build that cannot follow its plan asks a `replan`; the resolver

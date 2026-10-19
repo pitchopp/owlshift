@@ -8,7 +8,8 @@
 //! visible stage came with P2 (OWL-137), listing admitted tickets and reading
 //! the admission gesture with P4 (OWL-246, architecture section 5, "The
 //! drain"), filing proposals and finding them again with P4 too (OWL-252),
-//! publishing a ticket's document with P5 (OWL-350).
+//! publishing a ticket's document with P5 (OWL-350), resolving a comment
+//! with P5 too (OWL-353).
 
 pub mod linear;
 pub mod markdown;
@@ -208,6 +209,21 @@ pub trait Tracker {
             "this tracker does not publish documents",
         ))
     }
+
+    /// Resolves the top-level comment of identifier `comment`, which the
+    /// tracker then shows folded (OWL-353, architecture section 5, "Folded
+    /// when superseded"): the runner's own comment that a newer one of its
+    /// own supersedes. The comment is still listed by
+    /// [`comments`](Self::comments), unedited. Resolving names no resolving
+    /// comment: Linear answered an internal error to every one tried
+    /// (checked 2026-10-19). An error by default;
+    /// [`Capability::FoldComments`] declares it.
+    fn resolve_comment(&self, _comment: &str) -> Result<(), Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not resolve comments",
+        ))
+    }
 }
 
 /// The most characters a document's content may hold: Linear's cap, checked
@@ -370,6 +386,9 @@ pub enum Capability {
     /// Documents attached to a ticket, created and updated in place
     /// (OWL-350).
     Documents,
+    /// Resolving a comment, so the runner's superseded comments show folded
+    /// (OWL-353).
+    FoldComments,
     /// A distinct agent identity.
     AgentIdentity,
     /// Webhooks.
@@ -378,7 +397,7 @@ pub enum Capability {
 
 impl Capability {
     /// Every row, in the table's order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::ReadTicket,
         Self::ListAdmitted,
         Self::Comments,
@@ -386,6 +405,7 @@ impl Capability {
         Self::BlockedBy,
         Self::ProposalsInbox,
         Self::Documents,
+        Self::FoldComments,
         Self::AgentIdentity,
         Self::Webhooks,
     ];
@@ -408,6 +428,7 @@ impl Capability {
             Self::BlockedBy => "blocked-by relations",
             Self::ProposalsInbox => "proposals inbox",
             Self::Documents => "ticket documents",
+            Self::FoldComments => "fold superseded comments",
             Self::AgentIdentity => "agent identity",
             Self::Webhooks => "webhooks",
         }

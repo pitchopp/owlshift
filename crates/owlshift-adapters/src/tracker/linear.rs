@@ -334,6 +334,7 @@ impl LinearTracker {
         Capability::BlockedBy,
         Capability::ProposalsInbox,
         Capability::Documents,
+        Capability::FoldComments,
     ];
 
     /// The adapter over HTTPS with this key.
@@ -1060,6 +1061,22 @@ impl Tracker for LinearTracker {
             ))),
         }
     }
+
+    /// `commentResolve(id)` through the app when one is set, without
+    /// `resolvingCommentId`, which Linear answered `INTERNAL_SERVER_ERROR`
+    /// whatever comment it named; a reply is refused (`Cannot resolve a
+    /// child comment`) and an unknown id is [`ErrorKind::NotFound`] (all
+    /// checked 2026-10-19, build plan "P5 · Quality pipeline", part R).
+    fn resolve_comment(&self, comment: &str) -> Result<(), Error> {
+        let data: ResolveData = self.write(RESOLVE_MUTATION, json!({ "id": comment }))?;
+        if data.comment_resolve.success {
+            Ok(())
+        } else {
+            Err(invalid(format!(
+                "Linear did not resolve the comment {comment}"
+            )))
+        }
+    }
 }
 
 impl LinearTracker {
@@ -1273,6 +1290,10 @@ const DOCUMENT_CREATE_MUTATION: &str = "mutation CreateDocument($input: Document
 const DOCUMENT_UPDATE_MUTATION: &str = "mutation UpdateDocument($id: String!, \
     $input: DocumentUpdateInput!) { documentUpdate(id: $id, input: $input) { \
     success document { id url archivedAt } } }";
+
+/// A comment resolved, so Linear shows it folded (OWL-353).
+const RESOLVE_MUTATION: &str =
+    "mutation Resolve($id: String!) { commentResolve(id: $id) { success } }";
 
 const RELATE_MUTATION: &str = "mutation Relate($input: IssueRelationCreateInput!) { \
     issueRelationCreate(input: $input) { success } }";
@@ -2043,6 +2064,12 @@ struct RelateData {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveData {
+    comment_resolve: Success,
+}
+
+#[derive(Deserialize)]
 struct Success {
     success: bool,
 }
@@ -2737,6 +2764,33 @@ mod tests {
             .publish_document(&id, None, "Plan · OWL-1", &long)
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::Other);
+    }
+
+    /// A comment is resolved by its id alone, through the app; an unknown
+    /// one is not found, and a refusal is an error (OWL-353).
+    #[test]
+    fn a_comment_is_resolved_through_the_app_by_its_id_alone() {
+        let key = Scripted::new(vec![(
+            "Workspace",
+            json!({ "organization": { "id": "org-1" } }),
+        )]);
+        let app = Scripted::new(vec![
+            ("App", app_seen(true, "org-1", 1)),
+            ("Resolve", json!({ "commentResolve": { "success": true } })),
+        ]);
+        let (by_app, sent) = (app.asked.clone(), app.sent.clone());
+        let (linear, _) = LinearTracker::with_transport(key)
+            .writing_as_app(app, "owl")
+            .unwrap();
+        linear.resolve_comment("c1").unwrap();
+        assert_eq!(*by_app.lock().unwrap(), ["App", "Resolve"]);
+        assert_eq!(sent.lock().unwrap()[1], json!({ "id": "c1" }));
+        let unknown = r#"{"errors":[{"message":"Entity not found: Comment",
+            "extensions":{"code":"INPUT_ERROR"}}]}"#;
+        let refused = r#"{"data":{"commentResolve":{"success":false}}}"#;
+        let resolve = |body| tracker(vec![body]).resolve_comment("c1").unwrap_err().kind;
+        assert_eq!(resolve(unknown), ErrorKind::NotFound);
+        assert_eq!(resolve(refused), ErrorKind::Other);
     }
 
     #[test]
