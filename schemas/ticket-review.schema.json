@@ -37,6 +37,15 @@
       "type": "integer",
       "const": 1
     },
+    "last_fix": {
+      "description": "The Verify pass, the record's last, whose `minor` findings one last\nBuild fixes (OWL-356): that Build is delivered with no Verify pass\nafter it. Kept with the pass; dropped when that Build asks, takes\nlate comments or follows a decider's reply to a DECISION comment,\nwhen another pass is kept, and at the delivery.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
     "passes": {
       "description": "Every review pass, oldest first.",
       "type": "array",
@@ -380,6 +389,32 @@
         }
       ]
     },
+    "PlanPrint": {
+      "description": "A plan's print (OWL-356): the SHA-256 of each part's\n[`Plan::part_canonical`] text, in [`PlanPart::ALL`]'s order, and of each\nstep's, in the plan's order, as lowercase hex.",
+      "type": "object",
+      "properties": {
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 9,
+          "minItems": 9
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parts",
+        "steps"
+      ]
+    },
     "PullRequest": {
       "description": "The pull request the runner opens for a finished ticket.",
       "type": "object",
@@ -490,11 +525,29 @@
           },
           "maxItems": 192
         },
+        "head": {
+          "description": "At Verify, the commit the pass reviewed, a full commit id (OWL-356):\nthe next pass of the loop reviews the diff since.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "pass": {
           "description": "The pass at its stage, from 1.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1
+        },
+        "plan": {
+          "description": "At Design review, the print of the plan the pass reviewed (OWL-356):\nthe next pass of the loop reviews what changed since, `plan.json`\nkeeping only the current plan.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanPrint"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "reviewers": {
           "description": "The reviewers that ran the pass, in seat order, those that found\nnothing included (OWL-304): what the DELIVERY report names.",

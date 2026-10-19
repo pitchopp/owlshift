@@ -31,8 +31,9 @@ use crate::Role;
 /// resolver's `asked_by` and a question's `finding` in `resolve` (OWL-343);
 /// format 19 the thread's `answered` entries and a decision's short
 /// question (OWL-359); format 20 leaves the plan's `forks` and
-/// `alternatives` out of Build's brief (OWL-365).
-pub const BRIEF_FORMAT: u32 = 20;
+/// `alternatives` out of Build's brief (OWL-365); format 21 adds a review
+/// run's `since` and `earlier` and Build's findings to `note` (OWL-356).
+pub const BRIEF_FORMAT: u32 = 21;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role

@@ -489,6 +489,154 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
     }
 }
 
+/// OWL-160's run of 2026-10-18, replayed (OWL-356): Verify raises four
+/// `minor` findings and the arbiter confirms them; one more Build fixes
+/// them, the runner's gate passes, and the delivery follows with no second
+/// Verify pass. The DELIVERY report names the four as given to that last
+/// Build, and the review record keeps the commit the pass reviewed.
+#[test]
+fn verify_minors_get_one_last_build_and_no_second_pass() {
+    let bench = Bench::verifying();
+    let claims = [
+        "The greeting has no full stop.",
+        "No test covers an empty greeting.",
+        "GREETING.md could open with a heading.",
+        "The greeting could name the reader.",
+    ];
+    let minors: Vec<(&str, &str)> = claims.iter().map(|claim| ("minor", *claim)).collect();
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&minors)),
+        bench.reviewing(&ruled(&["confirmed"; 4])),
+        bench.reply(Some("Hello, again"), Some(DONE)),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    // At most one Build after the first Verify, and no Verify after it.
+    assert_eq!(
+        bench.run_roles(),
+        [Role::Build, Role::Verify, Role::Arbiter, Role::Build]
+    );
+    let last = bench.last_of(Role::Build);
+    let given = last.findings.as_ref().expect("the minors to fix");
+    let ids: Vec<&str> = given.findings.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(
+        (given.mode, ids),
+        (FindingsMode::Fix, vec!["F1", "F2", "F3", "F4"])
+    );
+    let pass = &bench.reviews("pass")[0];
+    assert_eq!(
+        (&pass["outcome"], &pass["next"]),
+        (&json!("last_fix"), &json!("build"))
+    );
+    assert_eq!(
+        bench.reviews("residue")[0]["last_fix"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let skipped = &bench.reviews("last_fix")[0];
+    assert_eq!(
+        (&skipped["pass"], &skipped["next"]),
+        (&json!(1), &json!("deliver"))
+    );
+    let review = bench.record().review.unwrap();
+    assert_eq!(review.passes.len(), 1);
+    assert!(
+        review.passes[0]
+            .findings
+            .iter()
+            .all(|kept| kept.outcome == Some(FindingOutcome::Fixed))
+    );
+    assert_eq!(review.passes[0].head.as_ref().map(String::len), Some(40));
+    assert!(
+        review.last_fix.is_none() && review.build.is_none(),
+        "delivered"
+    );
+    let report = bench.comments().pop().unwrap();
+    assert!(report.contains("**Verify, 1 pass.**"), "{report}");
+    assert!(
+        report.contains(
+            "**Findings given to the last Build,** which the runner's gate checked, with no \
+             Verify pass after it:\n- Pass 1, F1, minor, critic and conformance on Claude Code: \
+             The greeting has no full stop."
+        ),
+        "{report}"
+    );
+    for (n, claim) in claims.iter().enumerate() {
+        assert!(
+            report.contains(&format!("F{}, minor", n + 1)),
+            "{claim}\n{report}"
+        );
+    }
+    let pushed = bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["show", &format!("{BRANCH}:GREETING.md")],
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(pushed).unwrap(),
+        "Hello, again, reader.\n"
+    );
+}
+
+/// A last fix whose Build asks is no longer the last fix alone (OWL-356):
+/// once the resolver decides its question, the Build runs again, and a
+/// Verify pass reviews it, told the diff since the commit pass 1 reviewed
+/// and pass 1's finding, fixed.
+#[test]
+fn a_last_fix_that_asks_is_reviewed_on_what_changed_since() {
+    let bench = Bench::verifying();
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[("minor", "The greeting has no full stop.")])),
+        bench.reviewing(&ruled(&["confirmed"])),
+        bench.reply(None, Some(NAMING)),
+        bench.reviewing(DECIDED_Q1),
+        bench.reply(Some("Hello, again"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.run_roles(),
+        [
+            Role::Build,
+            Role::Verify,
+            Role::Arbiter,
+            Role::Build,
+            Role::Resolver,
+            Role::Build,
+            Role::Verify
+        ]
+    );
+    assert!(bench.reviews("last_fix").is_empty(), "no pass skipped");
+    let review = bench.record().review.unwrap();
+    let first_head = review.passes[0].head.clone().expect("the commit reviewed");
+    let second = bench.last_of(Role::Verify).review.expect("a review");
+    assert_eq!(second.pass.get(), 2);
+    let since = second.since.expect("what changed since pass 1");
+    assert_eq!(since.pass.get(), 1);
+    let diff = since.diff.expect("the diff since");
+    assert_eq!(diff.base, first_head);
+    assert_eq!(diff.path.as_str(), ".owlshift/run/since.patch");
+    let written = fs::read_to_string(bench.worktree().join(diff.path.as_str())).unwrap();
+    assert!(written.contains("+Hello, again, reader."), "{written}");
+    assert!(!written.contains("+Hello, reader."), "{written}");
+    let earlier: Vec<(u32, &str, Option<FindingOutcome>)> = second
+        .earlier
+        .iter()
+        .map(|e| (e.pass.get(), e.kept.finding.id.as_str(), e.kept.outcome))
+        .collect();
+    assert_eq!(earlier, [(1, "F1", Some(FindingOutcome::Fixed))]);
+    let report = bench.comments().pop().unwrap();
+    assert!(report.contains("**Verify, 2 passes.**"), "{report}");
+    assert!(!report.contains("given to the last Build"), "{report}");
+}
+
 /// A last pass proposes a follow-up, then the push is refused. `continue`
 /// runs that pass again in place of its record; clean this time, it takes
 /// back its follow-up, so the delivery files none.

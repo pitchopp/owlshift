@@ -265,10 +265,11 @@ fn scenario_s8_a_false_premise_at_design_is_closed() {
 /// At Design review the arbiter confirms the critic's finding,
 /// the design run fixes it and the next pass is clean. At Verify, pass 1's
 /// confirmed finding is fixed and its rejected one listed; pass 2 leaves a
-/// `blocker` and a `minor` on a criterion, both asked, and a `minor` off
-/// every criterion, proposed. Watch continues the decider's answers: a
-/// Verify fix run, the pass the round buys, the delivery, and the proposal
-/// filed at `Triage` in the Markdown tracker's inbox. The texts each part
+/// `blocker`, asked, a `major` off every criterion, proposed, and a `minor`
+/// on a criterion, never asked (OWL-356). Watch continues the decider's
+/// answer: a Verify fix run given the minor, the pass the round buys, the
+/// delivery, and the proposal filed at `Triage` in the Markdown tracker's
+/// inbox. The texts each part
 /// writes are pinned part by part (`design_scenarios.rs`,
 /// `verify_scenarios.rs`); this plays their composition.
 #[test]
@@ -301,18 +302,15 @@ fn scenario_s9_findings_and_review_passes() {
         bench.greets("Hello, again"),
         bench.read(&findings(&[
             ("blocker", "The greeting still has no full stop.", None),
-            ("minor", "GREETING.md could open with a heading.", None),
+            ("major", "GREETING.md could open with a heading.", None),
             ("minor", "The greeting does not say Hello alone.", criterion),
         ])),
         bench.read(&ruled(&["confirmed", "confirmed", "confirmed"])),
         // The residue reaches the resolver first, which passes it on
         // (OWL-342).
-        bench.read(&passed_on(&["Q1", "Q2"])),
-        // Pass 3: the answers, a Verify fix run and the pass they buy.
-        bench.read(&check(&[
-            ("Q1", "answered", "Add the full stop."),
-            ("Q2", "answered", "Keep it as it is."),
-        ])),
+        bench.read(&passed_on(&["Q1"])),
+        // Pass 3: the answer, a Verify fix run and the pass it buys.
+        bench.read(&check(&[("Q1", "answered", "Add the full stop.")])),
         bench.greets("Hello, at last."),
         bench.read(&findings(&[])),
     ];
@@ -326,7 +324,7 @@ fn scenario_s9_findings_and_review_passes() {
                     return_to: Stage::Build
                 }
             );
-            bench.answer("Q1: add the full stop. Q2: keep it as it is.");
+            bench.answer("Q1: add the full stop.");
         }
     });
     let Some(Err(Stop::NeedsInput { questions, .. })) = outcomes
@@ -336,9 +334,18 @@ fn scenario_s9_findings_and_review_passes() {
         panic!("{outcomes:?}\n{lines}\n{printed}");
     };
     let asked: Vec<&str> = questions.iter().map(|q| q.text.as_str()).collect();
-    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked.len(), 1, "a minor is never asked: {asked:?}");
     assert!(asked[0].starts_with("The greeting still has no full stop."));
-    assert!(asked[1].starts_with("The greeting does not say Hello alone."));
+    // The fix run after the round is given the minor on the criterion.
+    let fix = bench
+        .briefs()
+        .into_iter()
+        .rev()
+        .find(|brief| brief.role == Role::Build)
+        .and_then(|brief| brief.findings)
+        .expect("the minor to fix");
+    let ids: Vec<&str> = fix.findings.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(ids, ["F3"]);
     assert!(
         matches!(outcomes.last(), Some(Ok(_))),
         "{outcomes:?}\n{lines}\n{printed}"
@@ -388,7 +395,7 @@ fn scenario_s9_findings_and_review_passes() {
             (json!("verify"), json!(3), json!("deliver")),
         ]
     );
-    // The off-criterion minor alone is filed, at Triage, by the reviewer.
+    // The off-criterion major alone is filed, at Triage, by the reviewer.
     let proposal = bench.shown("DEMO-2");
     assert_eq!(proposal.title, "GREETING.md could open with a heading.");
     assert_eq!(

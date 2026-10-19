@@ -147,6 +147,10 @@ pub struct ReportedReview {
     pub rejected: Vec<(u32, KeptFinding)>,
     /// The findings proposed as follow-ups, each with its pass.
     pub proposed: Vec<(u32, KeptFinding)>,
+    /// The `minor` findings of the last pass given to the last Build,
+    /// which the runner's gate checked and no Verify pass reviewed after it
+    /// (OWL-356), each with its pass.
+    pub last_fixed: Vec<(u32, KeptFinding)>,
 }
 
 /// A follow-up a DELIVERY report names, with what became of it (OWL-253,
@@ -1889,12 +1893,13 @@ pub struct PlanComment {
     pub reviewers: Vec<PlanReviewer>,
     /// The findings of that pass, as the ticket's review record keeps them.
     pub findings: Vec<KeptFinding>,
-    /// The findings the loop's earlier passes rejected, each with its pass:
-    /// the arbiter's or the author's rejections, listed with their reasons.
+    /// The findings of the loop's earlier passes still listed, each with its
+    /// pass: the arbiter's or the author's rejections, listed with their
+    /// reasons, and the `minor` ones noted for the Build (OWL-356).
     pub earlier: Vec<(u32, KeptFinding)>,
     /// Findings of the pass that stand but a round could not ask, past
     /// [`owlshift_contracts::result::MAX_QUESTIONS`]: the pass after the round
-    /// reviews the plan whole.
+    /// is told them, still open, and checks them again (OWL-356).
     pub not_asked: Vec<FindingId>,
     pub next: PlanNext,
     /// The design run that wrote the plan.
@@ -1929,9 +1934,10 @@ impl PlanComment {
 
     /// The findings left, each with what became of it, and those rejected,
     /// each with its pass and its reason, the earlier passes' first, each
-    /// pass in id order.
+    /// pass in id order; an earlier pass's note for the Build is left too
+    /// (OWL-356).
     fn sorted(&self) -> Sorted<'_> {
-        let (left, mut rejected) = fates(self.pass, &self.findings, &self.not_asked);
+        let (mut last, mut rejected) = fates(self.pass, &self.findings, &self.not_asked);
         let mut earlier: Vec<Rejected<'_>> = self
             .earlier
             .iter()
@@ -1939,6 +1945,13 @@ impl PlanComment {
             .map(|(pass, kept)| (*pass, kept, reason_of(kept)))
             .collect();
         earlier.append(&mut rejected);
+        let mut left: Vec<Left<'_>> = self
+            .earlier
+            .iter()
+            .filter(|(_, kept)| kept.outcome.is_none())
+            .map(|(_, kept)| (kept, "noted for the Build at an earlier pass"))
+            .collect();
+        left.append(&mut last);
         (left, earlier)
     }
 
@@ -2064,7 +2077,7 @@ fn fates<'a>(pass: u32, findings: &'a [KeptFinding], not_asked: &[FindingId]) ->
             _ if not_asked.contains(&kept.finding.id) => left.push((
                 kept,
                 "not asked in this round, past the questions one round holds: the next pass \
-                 reviews the plan again",
+                 checks it again",
             )),
             Some(FindingOutcome::Fixed | FindingOutcome::Proposed) => {}
             None => left.push((kept, "noted for the Build")),
@@ -2597,6 +2610,24 @@ impl ReportedReview {
                 })
                 .collect();
             section.push_str(&format!("\n\n**Findings rejected.**\n{}", bullets(&lines)));
+        }
+        if !self.last_fixed.is_empty() {
+            let lines: Vec<String> = self
+                .last_fixed
+                .iter()
+                .map(|(pass, kept)| {
+                    format!(
+                        "Pass {pass}, {}: {}",
+                        finding_label(kept),
+                        flatten(&kept.finding.claim)
+                    )
+                })
+                .collect();
+            section.push_str(&format!(
+                "\n\n**Findings given to the last Build,** which the runner's gate checked, with \
+                 no Verify pass after it:\n{}",
+                bullets(&lines)
+            ));
         }
         if !self.proposed.is_empty() {
             let labels: Vec<String> = self
@@ -4521,6 +4552,10 @@ Merge state reported by the forge: `CLEAN`.
                 2,
                 kept_finding(3, Severity::Minor, Some(FindingOutcome::Proposed), None),
             )],
+            last_fixed: vec![(
+                2,
+                kept_finding(4, Severity::Minor, Some(FindingOutcome::Fixed), None),
+            )],
         });
         let body = report.render();
         for text in [
@@ -4530,6 +4565,8 @@ Merge state reported by the forge: `CLEAN`.
              configured)\n\n",
             "**Findings rejected.**\n- Pass 1, F2, major, critic and conformance on Claude Code: \
              No [owlshift] PLAN header. Rejected: The file has none.",
+            "**Findings given to the last Build,** which the runner's gate checked, with no \
+             Verify pass after it:\n- Pass 2, F4, minor, critic and conformance on Claude Code: ",
             "**Findings proposed as follow-ups,** listed in what remains:\n- Pass 2, F3, minor, \
              critic and conformance on Claude Code\n",
             "Proposed follow-up, not filed: **Edit the previous report**",
@@ -6779,6 +6816,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     )
                 })
                 .collect(),
+            last_fixed: Vec::new(),
         });
         report
     }

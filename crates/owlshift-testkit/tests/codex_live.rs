@@ -971,6 +971,8 @@ fn brief(base: String) -> Brief {
                 base,
                 path: RelativePath::new("change.diff").unwrap(),
             }),
+            since: None,
+            earlier: Vec::new(),
         }),
         pull_request_reviews: Vec::new(),
     }

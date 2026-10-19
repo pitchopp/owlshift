@@ -14,7 +14,7 @@ use crate::result::{
     first_not_ascending,
 };
 use crate::review::{
-    Finding, FindingsMode, KeptFinding, MAX_PASS_FINDINGS, Mandate, Plan, check_findings,
+    Finding, FindingsMode, KeptFinding, MAX_PASS_FINDINGS, Mandate, Plan, PlanPart, check_findings,
     check_mandates,
 };
 use crate::{DelegationLevel, Role};
@@ -228,6 +228,58 @@ pub struct ReviewBrief {
     /// where the runner gives it at every pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<GivenDiff>,
+    /// What changed since the loop's previous pass (format 21, OWL-356):
+    /// from pass 2, what the pass reviews, when the previous pass kept what
+    /// it reviewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<ReviewSince>,
+    /// The findings of the loop's earlier passes, oldest pass first, as the
+    /// review record keeps them (format 21, OWL-356): what was fixed,
+    /// rejected, noted, asked or proposed, so that no point is raised
+    /// again. At most [`MAX_PASS_FINDINGS`], the latest kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = MAX_PASS_FINDINGS))]
+    pub earlier: Vec<EarlierFinding>,
+}
+
+/// What changed since the loop's previous review pass (OWL-356,
+/// architecture section 5, "A pass after a revision").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSince {
+    /// The previous pass, below this one.
+    pub pass: NonZeroU32,
+    /// At Verify: the diff from the commit the previous pass reviewed,
+    /// `base`, to this worktree's head, written beside the brief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<GivenDiff>,
+    /// At Design review: the plan's parts whose text changed, in the plan's
+    /// order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<PlanPart>,
+    /// At Design review: the plan's steps whose text is new, numbered from
+    /// 1 in the plan as it is now, increasing; a step only renumbered is
+    /// not new.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<NonZeroU32>,
+    /// At Design review: how many steps of the previous plan have a text
+    /// the plan no longer holds, changed or dropped.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub removed: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// A finding of an earlier pass of the loop (OWL-356), with its pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EarlierFinding {
+    pub pass: NonZeroU32,
+    /// The finding, its reviewer, the arbiter's ruling or the author's
+    /// response, and its outcome once settled.
+    pub kept: KeptFinding,
 }
 
 /// The diff a Verify pass reviews (OWL-302, architecture section 5,
@@ -992,10 +1044,12 @@ impl Brief {
     /// design, design review, build, verify and arbiter roles, always for
     /// design review, its base a full commit id and the plan keeping its own
     /// rules; `approval` only for design, with a plan; findings to rule on
-    /// for the arbiter, always, and to answer or fix for design or build
-    /// only, ids increasing and each keeping a result's rules; `review` for
-    /// design review and verify, always, and only them, with distinct
-    /// mandates; a diff (OWL-302) only in a verify run's review and with
+    /// for the arbiter, always, to answer or fix for design or build only,
+    /// and to note for build only (OWL-356), ids increasing and each keeping
+    /// a result's rules; `review` for design review and verify, always, and
+    /// only them, with distinct mandates and its `since` and `earlier` as
+    /// [`Brief::check_since`] has them; a diff (OWL-302) only in a verify
+    /// run's review and with
     /// findings to rule on, its base a full commit id; pull request reviews
     /// for build only, each with a body or a comment, every comment naming
     /// a path and saying something, and at most
@@ -1051,11 +1105,13 @@ impl Brief {
                     FindingsMode::Answer | FindingsMode::Fix => {
                         matches!(role, Role::Design | Role::Build)
                     }
+                    FindingsMode::Note => role == Role::Build,
                 };
                 if !allowed {
                     return mismatch(
                         "findings",
-                        "the arbiter to rule on, and design or build to answer or fix",
+                        "the arbiter to rule on, design or build to answer or fix, and build \
+                         to note",
                     );
                 }
                 if given.findings.is_empty() {
@@ -1087,6 +1143,7 @@ impl Brief {
                     }
                     check_diff(diff)?;
                 }
+                self.check_since(review)?;
             }
             None if !reviews => {}
             _ => return mismatch("a review", "the design review and verify roles, always"),
@@ -1101,6 +1158,74 @@ impl Brief {
                     format!("pull request review {} {broken}", review.id),
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+impl Brief {
+    /// The rules of format 21's `since` and `earlier` (OWL-356): the
+    /// previous pass and every earlier finding's pass below the pass
+    /// reviewed, at most [`MAX_PASS_FINDINGS`] earlier findings; a diff
+    /// since for verify, always, and only for it, its base a full commit
+    /// id, a pass with nothing to compare with having no `since`; changed
+    /// parts,
+    /// steps and removed steps only for design review, the parts once each
+    /// in the plan's order, the steps increasing within the plan's.
+    fn check_since(&self, review: &ReviewBrief) -> Result<(), ContractError> {
+        let invalid = |reason: String| Err(ContractError::invalid(CONTRACT, reason));
+        if review.earlier.len() > MAX_PASS_FINDINGS {
+            return invalid(format!(
+                "{} earlier findings, at most {MAX_PASS_FINDINGS}",
+                review.earlier.len()
+            ));
+        }
+        if let Some(earlier) = review.earlier.iter().find(|e| e.pass >= review.pass) {
+            return invalid(format!(
+                "an earlier finding of pass {}, not before pass {}",
+                earlier.pass, review.pass
+            ));
+        }
+        let Some(since) = &review.since else {
+            return Ok(());
+        };
+        if since.pass >= review.pass {
+            return invalid(format!(
+                "since pass {}, not before pass {}",
+                since.pass, review.pass
+            ));
+        }
+        let names_plan = !since.parts.is_empty() || !since.steps.is_empty() || since.removed > 0;
+        if self.role == Role::Verify && names_plan {
+            return invalid("verify's since names plan parts or steps".to_owned());
+        }
+        if self.role == Role::Verify && since.diff.is_none() {
+            return invalid("verify's since names no diff".to_owned());
+        }
+        if self.role == Role::DesignReview && since.diff.is_some() {
+            return invalid("design review's since names a diff".to_owned());
+        }
+        if let Some(diff) = &since.diff {
+            check_diff(diff)?;
+        }
+        let place = |part: &PlanPart| PlanPart::ALL.iter().position(|p| p == part);
+        if !since
+            .parts
+            .windows(2)
+            .all(|pair| place(&pair[0]) < place(&pair[1]))
+        {
+            return invalid("since names plan parts twice or out of the plan's order".to_owned());
+        }
+        let steps = self.plan.as_ref().map_or(0, |given| given.plan.steps.len());
+        let increasing = since.steps.windows(2).all(|pair| pair[0] < pair[1]);
+        let within = since
+            .steps
+            .last()
+            .is_none_or(|last| usize::try_from(last.get()).is_ok_and(|n| n <= steps));
+        if !increasing || !within {
+            return invalid(format!(
+                "since names steps that do not increase within the plan's {steps}"
+            ));
         }
         Ok(())
     }

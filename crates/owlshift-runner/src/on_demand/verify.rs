@@ -24,17 +24,17 @@
 //!   delivers, as it does at Design review (part F). A pass that passed
 //!   leads to the delivery in the same command.
 
-use owlshift_contracts::brief::{GivenDiff, GivenFindings};
+use owlshift_contracts::brief::{GivenDiff, GivenFindings, ReviewSince};
 use owlshift_contracts::config::FindingsConfirmation;
 use owlshift_contracts::result::FollowupSource;
 use owlshift_contracts::review::{
-    Finding, FindingOutcome, FindingsMode, KeptBuild, KeptFinding, ReviewPass, TicketReview,
+    FindingOutcome, KeptBuild, KeptFinding, ReviewPass, TicketReview,
 };
-use owlshift_core::review::PassOutcome;
+use owlshift_core::review::{Fate, PassOutcome};
 
-use super::design::{self, PassRun, settle_pass, standing};
+use super::design::{self, PassRun, loop_passes, settle_pass};
 use super::*;
-use crate::executor::{DIFF_PATH, write_diff};
+use crate::executor::{DIFF_PATH, SINCE_PATH, write_run_diff};
 use crate::writer::ReportedReview;
 
 /// What a Verify pass came to, when it does not ask the decider.
@@ -54,9 +54,11 @@ const FOLLOWUP_TITLE_CHARS: usize = 120;
 /// ([`design::design_input`]): nothing before a Verify pass ended in this
 /// loop; after a pass that asked a revision, its findings, settled again
 /// under `confirmation`, the standing ones to fix when the arbiter confirms
-/// them, every one to answer when the author does; after a pass that asked
-/// the decider, nothing, the answers being in the thread. A review record
-/// whose latest Verify pass is not the state's latest is an error.
+/// them, every one to answer when the author does; after a pass that gave
+/// the last fix, or one that asked the decider, its `minor` findings left
+/// for that fix (OWL-356), the answers being in the thread, and nothing
+/// when it left none. A review record whose latest Verify pass is not the
+/// state's latest is an error.
 pub(crate) fn verify_input(
     state: &TicketState,
     review: Option<&TicketReview>,
@@ -84,30 +86,28 @@ pub(crate) fn verify_input(
     let mut findings = last.findings.clone();
     let verdict =
         settle_pass(Stage::Verify, passes, &mut findings, confirmation).expect("verify settles");
-    if verdict.outcome != PassOutcome::Revise {
-        return Ok(None);
-    }
-    let (mode, given): (FindingsMode, Vec<Finding>) = match confirmation {
-        FindingsConfirmation::Arbiter => (
-            FindingsMode::Fix,
-            standing(&last.findings, confirmation)
-                .iter()
-                .map(|(n, _)| last.findings[*n].finding.clone())
-                .collect(),
-        ),
-        FindingsConfirmation::Author => (
-            FindingsMode::Answer,
-            last.findings
-                .iter()
-                .map(|kept| kept.finding.clone())
-                .collect(),
-        ),
+    let fates: &[Fate] = match verdict.outcome {
+        PassOutcome::Revise => &[Fate::Fix],
+        PassOutcome::LastFix | PassOutcome::Ask => &[Fate::LastFix],
+        PassOutcome::Passed => return Ok(None),
     };
-    Ok(Some(GivenFindings {
-        mode,
-        findings: given,
-        diff: None,
-    }))
+    Ok(design::given_to_author(
+        &last.findings,
+        &verdict,
+        confirmation,
+        fates,
+    ))
+}
+
+/// Whether the Build that brought the ticket to Verify in `state` was the
+/// last fix of `review`'s last pass (OWL-356): its delivery follows with no
+/// Verify pass. The mark is the review record's, kept with the pass and
+/// dropped as soon as anything else reaches that Build.
+pub(crate) fn last_fix_done(state: &TicketState, review: Option<&TicketReview>) -> bool {
+    state.status() == Status::Active(Stage::Verify)
+        && review
+            .and_then(|review| review.last_fix)
+            .is_some_and(|pass| pass.get() == state.review_passes())
 }
 
 /// The follow-ups of the findings a Verify pass proposed (architecture
@@ -151,26 +151,16 @@ pub(crate) fn review_followups(findings: &[KeptFinding]) -> Vec<Followup> {
 /// dispatched again or reviewed on its pull request, so an earlier loop's
 /// passes are never counted with it (OWL-304).
 pub(crate) fn verify_loop(review: &TicketReview) -> Vec<&ReviewPass> {
-    let mut passes: Vec<&ReviewPass> = Vec::new();
-    let mut expected: Option<u32> = None;
-    for kept in review.passes.iter().rev() {
-        if kept.stage != Stage::Verify || expected.is_some_and(|n| kept.pass.get() != n) {
-            break;
-        }
-        passes.push(kept);
-        if kept.pass.get() == 1 {
-            break;
-        }
-        expected = Some(kept.pass.get() - 1);
-    }
-    passes.reverse();
-    passes
+    review.passes.last().map_or_else(Vec::new, |last| {
+        loop_passes(review, Stage::Verify, last.pass.get())
+    })
 }
 
 /// What the DELIVERY report says of the review loop `review` ends with at
 /// Verify ([`verify_loop`]): its passes, the reviewers of the last, the
-/// findings rejected and those proposed over them; none when it ends with
-/// no Verify pass.
+/// findings rejected and those proposed over them, and those of the last
+/// pass given to the last Build, which no pass reviewed (OWL-356); none
+/// when it ends with no Verify pass.
 pub(crate) fn reported_review(review: &TicketReview) -> Option<ReportedReview> {
     let passes = verify_loop(review);
     let last = passes.last()?;
@@ -185,11 +175,20 @@ pub(crate) fn reported_review(review: &TicketReview) -> Option<ReportedReview> {
             })
             .collect()
     };
+    // A finding of the last pass fixed since was fixed by a Build no pass
+    // followed: its last fix.
+    let last_fixed = last
+        .findings
+        .iter()
+        .filter(|kept| kept.outcome == Some(FindingOutcome::Fixed))
+        .map(|kept| (last.pass.get(), kept.clone()))
+        .collect();
     Some(ReportedReview {
         passes: u32::try_from(passes.len()).unwrap_or(u32::MAX),
         reviewers: last.reviewers.clone(),
         rejected: of(FindingOutcome::Rejected),
         proposed: of(FindingOutcome::Proposed),
+        last_fixed,
     })
 }
 
@@ -237,7 +236,42 @@ impl OnDemand<'_> {
     /// worktree, with no external diff, text conversion or colour.
     fn review_diff(&self, p: &Prepared, commit: &str) -> Result<GivenDiff, Stop> {
         let base = self.diff_base(p, commit)?;
-        self.written_diff(p, base, commit)
+        self.written_diff(p, base, commit, DIFF_PATH)
+    }
+
+    /// What changed since the loop's pass before pass `pass` (OWL-356): the
+    /// diff from the commit that pass reviewed to `commit`, written at
+    /// [`SINCE_PATH`]; none when it kept no commit, a record written before
+    /// OWL-356, or when that commit is not an ancestor of `commit`, so the
+    /// pass reviews the whole diff.
+    fn since_diff(
+        &self,
+        p: &Prepared,
+        pass: u32,
+        commit: &str,
+    ) -> Result<Option<ReviewSince>, Stop> {
+        let Some((previous, head)) = p.review.as_ref().and_then(|review| {
+            let previous = *loop_passes(review, Stage::Verify, pass.saturating_sub(1)).last()?;
+            Some((previous.pass, previous.head.clone()?))
+        }) else {
+            return Ok(None);
+        };
+        let ancestor = self
+            .executor
+            .git
+            .run(&p.checkout, &["merge-base", "--is-ancestor", &head, commit])
+            .is_ok();
+        if !ancestor {
+            return Ok(None);
+        }
+        let diff = self.written_diff(p, head, commit, SINCE_PATH)?;
+        Ok(Some(ReviewSince {
+            pass: previous,
+            diff: Some(diff),
+            parts: Vec::new(),
+            steps: Vec::new(),
+            removed: 0,
+        }))
     }
 
     /// The branch's diff from its base, for the resolver told of the run
@@ -252,7 +286,7 @@ impl OnDemand<'_> {
         if base == head {
             return Ok(None);
         }
-        self.written_diff(p, base, &head).map(Some)
+        self.written_diff(p, base, &head, DIFF_PATH).map(Some)
     }
 
     /// The commit a diff of `commit` starts from: the merge base of the
@@ -276,8 +310,15 @@ impl OnDemand<'_> {
         Ok(base)
     }
 
-    /// The diff from `base` to `commit`, written at [`DIFF_PATH`].
-    fn written_diff(&self, p: &Prepared, base: String, commit: &str) -> Result<GivenDiff, Stop> {
+    /// The diff from `base` to `commit`, written at `path` in the worktree,
+    /// [`DIFF_PATH`] or [`SINCE_PATH`].
+    fn written_diff(
+        &self,
+        p: &Prepared,
+        base: String,
+        commit: &str,
+        path: &str,
+    ) -> Result<GivenDiff, Stop> {
         let git = &self.executor.git;
         let diff = git
             .run(
@@ -292,11 +333,11 @@ impl OnDemand<'_> {
                 ],
             )
             .map_err(|e| refused("writing the diff Verify reviews", e))?;
-        write_diff(&p.worktree, &diff)
+        write_run_diff(&p.worktree, path, &diff)
             .map_err(|e| refused("writing the diff Verify reviews", e))?;
         Ok(GivenDiff {
             base,
-            path: RelativePath::new(DIFF_PATH).expect("DIFF_PATH is a relative path"),
+            path: RelativePath::new(path).expect("a run file's path is relative"),
         })
     }
 
@@ -305,7 +346,10 @@ impl OnDemand<'_> {
     /// added to the delivery's. A pass that asks a revision loops back to
     /// Build, kept; one that leaves findings for the decider asks them,
     /// which stops the command; one that passes leads to the delivery,
-    /// which keeps it with its push.
+    /// which keeps it with its push. One that leaves only `minor` findings
+    /// sends the ticket to Build for their last fix, the mark kept with
+    /// the pass, and the Build that follows it is delivered with no pass
+    /// (OWL-356, [`last_fix_done`]).
     pub(super) fn verify_pass(
         &self,
         p: &mut Prepared,
@@ -324,7 +368,35 @@ impl OnDemand<'_> {
                      {ticket}` builds it again"
                 ))
             })?;
+        if last_fix_done(&state, p.review.as_ref()) {
+            let given = p
+                .review
+                .as_ref()
+                .and_then(|review| review.passes.last())
+                .map(|last| {
+                    design::finding_ids(
+                        last.findings
+                            .iter()
+                            .filter(|kept| kept.outcome == Some(FindingOutcome::Fixed)),
+                    )
+                })
+                .unwrap_or_default();
+            sink.emit(
+                &ticket,
+                None,
+                EventKind::Decision,
+                data([
+                    ("review", json!("last_fix")),
+                    ("stage", json!("verify")),
+                    ("pass", json!(state.review_passes())),
+                    ("fixed", given),
+                    ("next", json!("deliver")),
+                ]),
+            );
+            return Ok(Verified::Passed(state));
+        }
         let diff = self.review_diff(p, &built.commit)?;
+        let since = self.since_diff(p, state.review_pass_due(), &built.commit)?;
         // A pass run again in place of its own record, after its delivery
         // failed, takes back the follow-ups that record proposed.
         let withdrawn = p
@@ -337,7 +409,7 @@ impl OnDemand<'_> {
             .unwrap_or_default();
         let next = |outcome: PassOutcome| match outcome {
             PassOutcome::Passed => "deliver",
-            PassOutcome::Revise => "build",
+            PassOutcome::Revise | PassOutcome::LastFix => "build",
             PassOutcome::Ask => "questions",
         };
         let PassRun {
@@ -355,6 +427,8 @@ impl OnDemand<'_> {
             Stage::Verify,
             design::given_plan(p),
             Some(diff),
+            since,
+            Some(built.commit.clone()),
             &next,
             sink,
         )?;
@@ -372,6 +446,19 @@ impl OnDemand<'_> {
             PassOutcome::Revise => {
                 p.review = Some(review);
                 let next = match state.apply(p.pipeline, Event::LoopBack) {
+                    Ok(Transition::To(next)) => next,
+                    other => return Err(core_error(other)),
+                };
+                let questions = p.questions();
+                self.store(p, &next, questions)
+                    .map_err(|e| refused("keeping the verify pass in the ticket's ref", e))?;
+                Ok(Verified::Revise(next))
+            }
+            // Minors alone (OWL-356): one last Build, marked with the pass.
+            PassOutcome::LastFix => {
+                review.last_fix = NonZeroU32::new(pass);
+                p.review = Some(review);
+                let next = match state.apply(p.pipeline, Event::LastFix) {
                     Ok(Transition::To(next)) => next,
                     other => return Err(core_error(other)),
                 };
@@ -498,7 +585,8 @@ mod tests {
 
     use owlshift_contracts::ids::FindingId;
     use owlshift_contracts::review::{
-        KeptResponse, KeptRuling, Mandate, ResponseOutcome, Reviewer, RulingOutcome, Severity,
+        Finding, FindingsMode, KeptResponse, KeptRuling, Mandate, ResponseOutcome, Reviewer,
+        RulingOutcome, Severity,
     };
     use owlshift_core::state::{Status, TicketState};
     use owlshift_core::vocab::Harness as HarnessKind;
@@ -537,16 +625,15 @@ mod tests {
             pass: NonZeroU32::new(n).unwrap(),
             findings,
             reviewers: Vec::new(),
+            head: None,
+            plan: None,
         }
     }
 
     fn review(passes: Vec<ReviewPass>) -> TicketReview {
         TicketReview {
-            format: Format,
             passes,
-            answered_reviews: Vec::new(),
-            answering: Vec::new(),
-            build: None,
+            ..TicketReview::new()
         }
     }
 
@@ -598,7 +685,8 @@ mod tests {
             (answer.mode, answer.findings.len()),
             (FindingsMode::Answer, 2)
         );
-        // After the last pass's round, the answers are in the thread.
+        // After the last pass's round, the answers are in the thread, and
+        // its minors are the Build's to fix (OWL-356).
         let asked = review(vec![
             pass(Stage::Verify, 1, Vec::new()),
             pass(
@@ -608,8 +696,61 @@ mod tests {
             ),
         ]);
         assert_eq!(verify_input(&at_build(2), Some(&asked), arbiter), Ok(None));
+        let mut with_minor = asked.clone();
+        with_minor.passes[1].findings.push(kept(
+            2,
+            Severity::Minor,
+            Some(RulingOutcome::Confirmed),
+        ));
+        let ids = |given: Option<GivenFindings>| -> Vec<String> {
+            given
+                .unwrap()
+                .findings
+                .iter()
+                .map(|f| f.id.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            ids(verify_input(&at_build(2), Some(&with_minor), arbiter).unwrap()),
+            ["F2"]
+        );
+        // A pass with minors alone gives them to the last fix, at any pass.
+        let minors = review(vec![pass(
+            Stage::Verify,
+            1,
+            vec![
+                kept(1, Severity::Minor, Some(RulingOutcome::Confirmed)),
+                kept(2, Severity::Minor, Some(RulingOutcome::Rejected)),
+            ],
+        )]);
+        let last = verify_input(&at_build(1), Some(&minors), arbiter).unwrap();
+        assert_eq!(
+            last.as_ref().map(|given| given.mode),
+            Some(FindingsMode::Fix)
+        );
+        assert_eq!(ids(last), ["F1"]);
         assert!(verify_input(&at_build(2), Some(&ruled), arbiter).is_err());
         assert!(verify_input(&at_build(1), None, arbiter).is_err());
+    }
+
+    /// The Build that brought the ticket to Verify was its last fix while
+    /// the record's mark names the state's last pass, and only at Verify
+    /// (OWL-356).
+    #[test]
+    fn the_last_fix_is_read_from_the_records_mark() {
+        let at_verify = |passes: u32| {
+            TicketState::restore(Status::Active(Stage::Verify), 0, 0, 0, 0, 0)
+                .unwrap()
+                .with_review_passes(passes)
+                .unwrap()
+        };
+        let mut record = review(vec![pass(Stage::Verify, 1, Vec::new())]);
+        assert!(!last_fix_done(&at_verify(1), Some(&record)));
+        record.last_fix = NonZeroU32::new(1);
+        assert!(last_fix_done(&at_verify(1), Some(&record)));
+        assert!(!last_fix_done(&at_build(1), Some(&record)));
+        assert!(!last_fix_done(&at_verify(0), Some(&record)));
+        assert!(!last_fix_done(&at_verify(1), None));
     }
 
     /// A proposed finding becomes a follow-up from the reviewer; the others

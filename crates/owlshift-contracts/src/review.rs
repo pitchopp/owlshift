@@ -248,6 +248,9 @@ pub enum FindingsMode {
     /// The author fixes each, as confirmed by the arbiter: a design or
     /// build run.
     Fix,
+    /// The Build weighs each, `minor` findings the plan's review noted for
+    /// it (format 21, OWL-356), and answers none.
+    Note,
 }
 
 /// The arbiter's ruling on one finding it was given.
@@ -591,6 +594,13 @@ pub struct TicketReview {
     /// ticket is delivered or dispatched again from Ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<KeptBuild>,
+    /// The Verify pass, the record's last, whose `minor` findings one last
+    /// Build fixes (OWL-356): that Build is delivered with no Verify pass
+    /// after it. Kept with the pass; dropped when that Build asks, takes
+    /// late comments or follows a decider's reply to a DECISION comment,
+    /// when another pass is kept, and at the delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fix: Option<NonZeroU32>,
 }
 
 /// One review pass: the roster's findings on the plan or the diff.
@@ -610,6 +620,27 @@ pub struct ReviewPass {
     /// nothing included (OWL-304): what the DELIVERY report names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviewers: Vec<Reviewer>,
+    /// At Verify, the commit the pass reviewed, a full commit id (OWL-356):
+    /// the next pass of the loop reviews the diff since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// At Design review, the print of the plan the pass reviewed (OWL-356):
+    /// the next pass of the loop reviews what changed since, `plan.json`
+    /// keeping only the current plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanPrint>,
+}
+
+/// A plan's print (OWL-356): the SHA-256 of each part's
+/// [`Plan::part_canonical`] text, in [`PlanPart::ALL`]'s order, and of each
+/// step's, in the plan's order, as lowercase hex.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanPrint {
+    #[schemars(length(min = 9, max = 9))]
+    pub parts: Vec<String>,
+    #[schemars(length(min = 1))]
+    pub steps: Vec<String>,
 }
 
 /// What a Build gave for its delivery, kept while Verify reviews it
@@ -774,6 +805,7 @@ impl TicketReview {
             answered_reviews: Vec::new(),
             answering: Vec::new(),
             build: None,
+            last_fix: None,
         }
     }
 
@@ -798,7 +830,10 @@ impl TicketReview {
     /// with its mandates distinct and a model named; each answered review is
     /// named once; each review under way once, not answered, with a body or
     /// a comment, each comment with a path and a body, within the bytes a
-    /// brief gives it; and the kept build's commit is a full commit id.
+    /// brief gives it; the kept build's commit is a full commit id; a pass's
+    /// `head` only at Verify, a full commit id, and its plan print only at
+    /// Design review, 9 part hashes and a hash per step in lowercase hex;
+    /// and `last_fix` names the record's last pass, at Verify (OWL-356).
     ///
     /// Passes are numbered from 1 in each run of consecutive passes at one
     /// stage, each pass the one before it plus 1, or 1 again: a review loop
@@ -834,6 +869,31 @@ impl TicketReview {
                 }
             };
             let at = format!("{:?} pass {}", pass.stage, pass.pass);
+            match (&pass.head, pass.stage) {
+                (Some(_), Stage::DesignReview) => {
+                    return invalid(format!("{at} keeps a reviewed commit"));
+                }
+                (Some(head), _) if !is_commit_id(head) => {
+                    return invalid(format!("{at} keeps {head:?}, not a full commit id"));
+                }
+                _ => {}
+            }
+            if let Some(print) = &pass.plan {
+                if pass.stage != Stage::DesignReview {
+                    return invalid(format!("{at} keeps a plan's print"));
+                }
+                let hex = |hashes: &[String]| hashes.iter().all(|h| is_lower_hex(h, 64));
+                if print.parts.len() != PlanPart::ALL.len()
+                    || print.steps.is_empty()
+                    || !hex(&print.parts)
+                    || !hex(&print.steps)
+                {
+                    return invalid(format!(
+                        "{at} keeps a plan's print that is not {} part hashes and a hash per step",
+                        PlanPart::ALL.len()
+                    ));
+                }
+            }
             for reviewer in &pass.reviewers {
                 if reviewer.role != role {
                     return invalid(format!(
@@ -925,6 +985,16 @@ impl TicketReview {
             return invalid(format!(
                 "the kept build's commit {:?} is not a full commit id",
                 build.commit
+            ));
+        }
+        if let Some(pass) = self.last_fix
+            && !self
+                .passes
+                .last()
+                .is_some_and(|last| last.stage == Stage::Verify && last.pass == pass)
+        {
+            return invalid(format!(
+                "the last fix names verify pass {pass}, which is not the record's last pass"
             ));
         }
         Ok(())

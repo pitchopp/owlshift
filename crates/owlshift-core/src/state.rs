@@ -136,6 +136,7 @@ impl Status {
 /// | A Build run asked a `replan`, and a round opens for its questions, the `replan` asked or decided (after the resolver) | `ReplanRound` |
 /// | A Build run asked a `replan`, and the resolver decided every question of the run | `ReplanDecided` |
 /// | The resolver decided every question a Design review or Verify pass left for the decider, its findings or the approval (OWL-342) | `RoundDecided` |
+/// | A Verify pass left only `minor` findings to fix, for one last Build (OWL-356, [`crate::review::PassOutcome::LastFix`]) | `LastFix` |
 /// | Before delivery, the decider reversed a resolver's plan approval or its decision on a Design review residue finding (OWL-345) | `ReversedToDesign` |
 /// | Before delivery, the decider reversed a resolver's decision on a Verify residue finding (OWL-345) | `ReversedToBuild` |
 /// | A design run answered an approval round `approved`, and the runner kept the approval | `PlanApproved` |
@@ -192,6 +193,13 @@ pub enum Event {
     /// limit or dollar ceiling bounds such rounds in a row. Valid only at
     /// Design review and Verify.
     RoundDecided,
+    /// A Verify pass left only `minor` findings to fix (OWL-356): the ticket
+    /// goes to Build for one last fix, the pass ended and counted as
+    /// [`Event::LoopBack`] ends one. Unlike a loop back, it is valid at a
+    /// last pass: no Verify pass follows that Build, which the runner reads
+    /// from the review record's mark of the last fix, dropped when anything
+    /// else reaches the Build. Valid only at Verify.
+    LastFix,
     /// The decider reversed, by replying to its DECISION comment, a decision
     /// the resolver took on the plan's approval or on a Design review
     /// residue finding (OWL-345), before delivery: the ticket goes back to
@@ -280,7 +288,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -288,6 +296,7 @@ impl Event {
         Self::ReplanRound,
         Self::ReplanDecided,
         Self::RoundDecided,
+        Self::LastFix,
         Self::ReversedToDesign,
         Self::ReversedToBuild,
         Self::PlanApproved,
@@ -694,6 +703,16 @@ impl TicketState {
             ) => {
                 let entered = self.enter(Status::Active(pipeline.round_return(stage)));
                 Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
+            }
+            // Minors alone left at Verify (OWL-356): one last Build, the pass
+            // counted, at a last pass too.
+            (Status::Active(Stage::Verify), Event::LastFix) => {
+                let target = pipeline.loop_back(Stage::Verify).ok_or(invalid)?;
+                let entered = self.enter(Status::Active(target));
+                Transition::To(
+                    self.end_review_pass(Stage::Verify, entered)
+                        .ok_or(invalid)?,
+                )
             }
             // A decider's reply reversed a resolver's approval or residue
             // decision before delivery (OWL-345): back to the author stage,
@@ -1126,7 +1145,9 @@ mod tests {
             (Status::Active(DesignReview), Event::RoundDecided) => {
                 Expect::To(Status::Active(Design))
             }
-            (Status::Active(Verify), Event::RoundDecided) => Expect::To(Status::Active(Build)),
+            (Status::Active(Verify), Event::RoundDecided | Event::LastFix) => {
+                Expect::To(Status::Active(Build))
+            }
             (Status::Active(DesignReview | Build | Verify), Event::ReversedToDesign) => {
                 Expect::To(Status::Active(Design))
             }
@@ -1872,6 +1893,12 @@ mod tests {
         );
         assert_eq!(at(second), (Status::Active(Stage::Verify), 1));
         assert!(second.apply(STANDARD, LoopBack).is_err());
+        // Minors alone at the last pass get one last Build, the pass
+        // counted (OWL-356).
+        assert_eq!(
+            at(walk(second, STANDARD, &[Event::LastFix])),
+            (Status::Active(Stage::Build), 2)
+        );
         let asked = walk(second, STANDARD, &[Questions]);
         assert_eq!(
             at(asked),

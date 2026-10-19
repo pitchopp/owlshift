@@ -43,7 +43,9 @@ use sha2::{Digest, Sha256};
 
 use owlshift_adapters::tracker;
 
-use owlshift_contracts::brief::{GivenDiff, GivenFindings, GivenPlan, ReviewBrief};
+use owlshift_contracts::brief::{
+    EarlierFinding, GivenDiff, GivenFindings, GivenPlan, ReviewBrief, ReviewSince,
+};
 use owlshift_contracts::config::FindingsConfirmation;
 use owlshift_contracts::ids::FindingId;
 use owlshift_contracts::result::{
@@ -52,8 +54,8 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{
     Finding, FindingOutcome, FindingsMode, KeptApproval, KeptFinding, KeptResponse, KeptRuling,
-    Plan, PlanChange, PlanPart, PublishedPlan, ResponseOutcome, ReviewPass, Reviewer,
-    RulingOutcome, Severity, TicketPlan, TicketReview,
+    MAX_PASS_FINDINGS, Plan, PlanChange, PlanPart, PlanPrint, PublishedPlan, ResponseOutcome,
+    ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan, TicketReview,
 };
 use owlshift_core::review::{Fate, PassOutcome, PassVerdict, Standing, settle};
 use owlshift_core::roster;
@@ -237,10 +239,37 @@ pub(crate) fn settle_pass(
         match fate {
             Fate::Ask => findings[*n].outcome = Some(FindingOutcome::Asked),
             Fate::Propose => findings[*n].outcome = Some(FindingOutcome::Proposed),
-            Fate::Fix | Fate::Note => {}
+            Fate::Fix | Fate::Note | Fate::LastFix => {}
         }
     }
     Some(verdict)
+}
+
+/// The findings of `findings` whose fate in `verdict`, their pass's, is
+/// one of `fates`, given to their author: to fix when the arbiter confirms
+/// them, to answer when the author does (OWL-356, a `minor` at Design
+/// review never given).
+pub(crate) fn given_to_author(
+    findings: &[KeptFinding],
+    verdict: &PassVerdict,
+    confirmation: FindingsConfirmation,
+    fates: &[Fate],
+) -> Option<GivenFindings> {
+    let given: Vec<Finding> = standing(findings, confirmation)
+        .iter()
+        .zip(&verdict.fates)
+        .filter(|(_, fate)| fates.contains(fate))
+        .map(|((n, _), _)| findings[*n].finding.clone())
+        .collect();
+    let mode = match confirmation {
+        FindingsConfirmation::Arbiter => FindingsMode::Fix,
+        FindingsConfirmation::Author => FindingsMode::Answer,
+    };
+    (!given.is_empty()).then_some(GivenFindings {
+        mode,
+        findings: given,
+        diff: None,
+    })
 }
 
 /// The last pass of `review` when pass `pass` at `stage` runs again in its
@@ -255,12 +284,14 @@ pub(crate) fn replaced_pass(review: &TicketReview, stage: Stage, pass: u32) -> O
 }
 
 /// Keeps `kept` as the latest pass of `review`: in place of the pass it
-/// runs again ([`replaced_pass`]), else appended.
+/// runs again ([`replaced_pass`]), else appended. A last fix under way ends
+/// with it (OWL-356).
 pub(crate) fn push_pass(review: &mut TicketReview, kept: ReviewPass) {
     if replaced_pass(review, kept.stage, kept.pass.get()).is_some() {
         review.passes.pop();
     }
     review.passes.push(kept);
+    review.last_fix = None;
 }
 
 /// Records what the run given `given`, the latest pass's findings at
@@ -304,6 +335,8 @@ pub(crate) fn mark_answered(
             FindingsMode::Fix | FindingsMode::Rule => {
                 kept.outcome = Some(FindingOutcome::Fixed);
             }
+            // Notes are answered by nothing (OWL-356).
+            FindingsMode::Note => {}
         }
     }
 }
@@ -341,17 +374,24 @@ pub(crate) fn pass_findings(
     kept
 }
 
-/// The findings the loop's Design review passes before `pass` rejected,
-/// oldest pass first, each with its pass: the passes that end `review`
-/// before its last one, `pass` itself, back to the loop's pass 1.
-/// The Design review passes of the loop that `pass` ends, oldest first, as
-/// the review record keeps them, `pass` included: the plan's document logs
-/// them (OWL-350).
-fn loop_passes(review: &TicketReview, pass: u32) -> Vec<&ReviewPass> {
+/// The passes at `stage` of the review loop the record ends with, oldest
+/// first, from the loop's pass 1 up to pass `upto`; a pass numbered above
+/// it at the record's end, the one being run or run again in place, is
+/// left out; none when the record does not end with that loop. The one
+/// walker of a loop's passes (OWL-356): the plan's document logs them
+/// (OWL-350), a later pass is told their findings and what changed since
+/// the last of them, and the DELIVERY report counts them.
+pub(crate) fn loop_passes(review: &TicketReview, stage: Stage, upto: u32) -> Vec<&ReviewPass> {
     let mut passes: Vec<&ReviewPass> = Vec::new();
-    let mut expected = pass;
+    let mut expected = upto;
     for kept in review.passes.iter().rev() {
-        if expected == 0 || kept.stage != Stage::DesignReview || kept.pass.get() != expected {
+        if kept.stage != stage {
+            break;
+        }
+        if passes.is_empty() && kept.pass.get() > upto {
+            continue;
+        }
+        if expected == 0 || kept.pass.get() != expected {
             break;
         }
         passes.push(kept);
@@ -369,34 +409,156 @@ fn sha256_hex(text: &str) -> String {
         .collect()
 }
 
-pub(crate) fn earlier_rejected(review: &TicketReview, pass: u32) -> Vec<(u32, KeptFinding)> {
-    let mut passes: Vec<&ReviewPass> = Vec::new();
-    let mut expected = pass;
-    for kept in review.passes.iter().rev() {
-        if expected == 0 || kept.stage != Stage::DesignReview || kept.pass.get() != expected {
-            break;
-        }
-        if expected < pass {
-            passes.push(kept);
-        }
-        expected -= 1;
-    }
-    passes
+/// The findings of the loop's Design review passes before `pass` that the
+/// PLAN comment still lists, oldest pass first, each with its pass: those
+/// rejected, with their reasons, and the `minor` ones noted for the Build
+/// (OWL-356), which nothing settles.
+pub(crate) fn earlier_left(review: &TicketReview, pass: u32) -> Vec<(u32, KeptFinding)> {
+    loop_passes(review, Stage::DesignReview, pass.saturating_sub(1))
         .into_iter()
-        .rev()
         .flat_map(|kept| {
             kept.findings
                 .iter()
-                .filter(|finding| finding.outcome == Some(FindingOutcome::Rejected))
+                .filter(|finding| match finding.outcome {
+                    Some(outcome) => outcome == FindingOutcome::Rejected,
+                    None => finding.finding.severity == Severity::Minor,
+                })
                 .map(|finding| (kept.pass.get(), finding.clone()))
         })
         .collect()
 }
 
+/// The findings of the loop's passes at `stage` before `pass`, as a review
+/// brief gives them (OWL-356): each as the record keeps it, with its pass,
+/// oldest first, at most [`MAX_PASS_FINDINGS`], the latest kept.
+pub(crate) fn earlier_findings(
+    review: Option<&TicketReview>,
+    stage: Stage,
+    pass: u32,
+) -> Vec<EarlierFinding> {
+    let Some(review) = review else {
+        return Vec::new();
+    };
+    let mut earlier: Vec<EarlierFinding> = loop_passes(review, stage, pass.saturating_sub(1))
+        .into_iter()
+        .flat_map(|kept| {
+            kept.findings.iter().map(|finding| EarlierFinding {
+                pass: kept.pass,
+                kept: finding.clone(),
+            })
+        })
+        .collect();
+    let over = earlier.len().saturating_sub(MAX_PASS_FINDINGS);
+    earlier.drain(..over);
+    earlier
+}
+
+/// The hash of each part of `plan`, in [`PlanPart::ALL`]'s order.
+fn part_hashes(plan: &Plan) -> Vec<String> {
+    PlanPart::ALL
+        .iter()
+        .map(|part| sha256_hex(&plan.part_canonical(*part)))
+        .collect()
+}
+
+/// The print of `plan` a Design review pass keeps (OWL-356): its parts'
+/// hashes and its steps', so the next pass is told what changed.
+pub(crate) fn plan_print(plan: &Plan) -> PlanPrint {
+    PlanPrint {
+        parts: part_hashes(plan),
+        steps: plan
+            .steps
+            .iter()
+            .map(|step| sha256_hex(&serde_json::to_string(step).expect("a step serializes")))
+            .collect(),
+    }
+}
+
+/// What changed from the plan printed `before` to `plan` (OWL-356), for
+/// the pass after `pass`: the parts whose hash differs, the steps of `plan`
+/// whose text `before` did not hold, matched by content so that a step an
+/// insertion renumbers is not new, and how many of `before`'s steps `plan`
+/// no longer holds. Steps are matched as a multiset: each step of `before`
+/// matches one step of `plan` at most, so two steps of one text count as
+/// two.
+pub(crate) fn plan_since(pass: NonZeroU32, before: &PlanPrint, plan: &Plan) -> ReviewSince {
+    let now = plan_print(plan);
+    let parts = PlanPart::ALL
+        .iter()
+        .zip(&now.parts)
+        .zip(&before.parts)
+        .filter(|((_, now), then)| now != then)
+        .map(|((part, _), _)| *part)
+        .collect();
+    // The previous steps not matched yet, each consumed by its first match.
+    let mut unmatched: Vec<&String> = before.steps.iter().collect();
+    let mut steps = Vec::new();
+    for (n, hash) in now.steps.iter().enumerate() {
+        match unmatched.iter().position(|then| *then == hash) {
+            Some(at) => {
+                unmatched.swap_remove(at);
+            }
+            None => steps.extend(u32::try_from(n + 1).ok().and_then(NonZeroU32::new)),
+        }
+    }
+    let removed = unmatched.len();
+    ReviewSince {
+        pass,
+        diff: None,
+        parts,
+        steps,
+        removed: u32::try_from(removed).unwrap_or(u32::MAX),
+    }
+}
+
+/// The notes the Build after Design review is given (OWL-356): at Build
+/// before any Verify pass, outside a review loop, the `minor` findings that
+/// stand in the Design review passes the record ends with and that nothing
+/// settled, oldest pass first, numbered again F1..Fn, at most
+/// [`MAX_PASS_FINDINGS`], the latest kept.
+pub(crate) fn design_notes(
+    state: &TicketState,
+    review: Option<&TicketReview>,
+    confirmation: FindingsConfirmation,
+) -> Option<GivenFindings> {
+    let review = review?;
+    let last = review.passes.last()?;
+    if state.stage() != Stage::Build
+        || state.review_passes() != 0
+        || last.stage != Stage::DesignReview
+    {
+        return None;
+    }
+    let mut notes: Vec<Finding> = loop_passes(review, Stage::DesignReview, last.pass.get())
+        .into_iter()
+        .flat_map(|kept| {
+            standing(&kept.findings, confirmation)
+                .into_iter()
+                .map(|(n, _)| &kept.findings[n])
+                .filter(|finding| {
+                    finding.finding.severity == Severity::Minor && finding.outcome.is_none()
+                })
+                .map(|finding| finding.finding.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let over = notes.len().saturating_sub(MAX_PASS_FINDINGS);
+    notes.drain(..over);
+    for (n, note) in notes.iter_mut().enumerate() {
+        note.id = FindingId::nth(u32::try_from(n + 1).unwrap_or(u32::MAX));
+    }
+    (!notes.is_empty()).then_some(GivenFindings {
+        mode: FindingsMode::Note,
+        findings: notes,
+        diff: None,
+    })
+}
+
 /// What the design run due at Design in `state` is given (assumption A4 of
 /// OWL-303): nothing before a review pass ended in this loop; else, by the
 /// latest Design review pass of `review`, settled again under
-/// `confirmation`: a pass that asked a revision gives its findings, the
+/// `confirmation`: a pass that asked a revision gives its `blocker` and
+/// `major` findings, a `minor` being a note for the Build (OWL-356), the
 /// standing ones to fix when the arbiter confirms them, every one to answer
 /// when the author does; a pass that passed was followed by the approval
 /// round, given while `approval_required` still holds; a pass that asked the
@@ -431,33 +593,14 @@ pub(crate) fn design_input(
     let verdict = settle_pass(Stage::DesignReview, passes, &mut findings, confirmation)
         .expect("design review settles");
     Ok(match verdict.outcome {
-        PassOutcome::Revise => {
-            let (mode, given): (FindingsMode, Vec<Finding>) = match confirmation {
-                FindingsConfirmation::Arbiter => (
-                    FindingsMode::Fix,
-                    standing(&last.findings, confirmation)
-                        .iter()
-                        .map(|(n, _)| last.findings[*n].finding.clone())
-                        .collect(),
-                ),
-                FindingsConfirmation::Author => (
-                    FindingsMode::Answer,
-                    last.findings
-                        .iter()
-                        .map(|kept| kept.finding.clone())
-                        .collect(),
-                ),
-            };
-            DesignInput {
-                findings: Some(GivenFindings {
-                    mode,
-                    findings: given,
-                    diff: None,
-                }),
-                approval: false,
-            }
-        }
-        PassOutcome::Passed => DesignInput {
+        // The findings it fixes, never a `minor`, noted for the Build
+        // (OWL-356).
+        PassOutcome::Revise => DesignInput {
+            findings: given_to_author(&last.findings, &verdict, confirmation, &[Fate::Fix]),
+            approval: false,
+        },
+        // A Design review pass never gives the last fix.
+        PassOutcome::Passed | PassOutcome::LastFix => DesignInput {
             findings: None,
             approval: approval_required,
         },
@@ -833,10 +976,11 @@ fn outcome_name(outcome: PassOutcome) -> &'static str {
         PassOutcome::Passed => "passed",
         PassOutcome::Revise => "revise",
         PassOutcome::Ask => "ask",
+        PassOutcome::LastFix => "last_fix",
     }
 }
 
-fn finding_ids<'k>(findings: impl IntoIterator<Item = &'k KeptFinding>) -> Value {
+pub(crate) fn finding_ids<'k>(findings: impl IntoIterator<Item = &'k KeptFinding>) -> Value {
     json!(
         findings
             .into_iter()
@@ -1002,6 +1146,11 @@ impl OnDemand<'_> {
         };
         let mut questions = questions;
         reversal::followed(&mut questions, &reversed);
+        // A Build that follows the reply is no longer a last fix alone: a
+        // Verify pass follows it (OWL-356).
+        if let Some(review) = p.review.as_mut() {
+            review.last_fix = None;
+        }
         let kept_plan = p.plan.clone();
         if reopening.drops_approval
             && let Some(plan) = p.plan.as_mut()
@@ -1385,7 +1534,10 @@ impl OnDemand<'_> {
     /// configured (OWL-347); the arbiter when the pass has findings the project confirms so; the pass settled by the
     /// core; its `ruling`, `pass` and `residue` events, `next` naming what
     /// each outcome leads to; and the review record with the pass, checked,
-    /// not kept yet. The seats read `plan` and, at Verify, `diff`.
+    /// not kept yet. The seats read `plan` and, at Verify, `diff`; from pass
+    /// 2, what changed `since` the previous pass and the loop's earlier
+    /// findings (OWL-356). The pass keeps what it reviewed: `head` at
+    /// Verify, the plan's print at Design review.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_review_pass(
         &self,
@@ -1395,6 +1547,8 @@ impl OnDemand<'_> {
         stage: Stage,
         plan: Option<GivenPlan>,
         diff: Option<GivenDiff>,
+        since: Option<ReviewSince>,
+        head: Option<String>,
         next: &dyn Fn(PassOutcome) -> &'static str,
         sink: &mut EventSink<'_>,
     ) -> Result<PassRun, Stop> {
@@ -1412,6 +1566,7 @@ impl OnDemand<'_> {
         let routed = reviewer_routing(dispatched.routing, |tier| claude_model(models, tier));
         let model = claude_model(models, routed.routing.tier);
         let seats = roster::roster(p.pipeline.variant(), stage);
+        let earlier = earlier_findings(p.review.as_ref(), stage, pass);
         let mut outputs: Vec<SeatOutput> = Vec::new();
         let mut last_run = None;
         let mut cost = Some(0.0_f64);
@@ -1424,6 +1579,8 @@ impl OnDemand<'_> {
                 mandates: seat.mandates.to_vec(),
                 pass: pass_id,
                 diff: diff.clone(),
+                since: since.clone(),
+                earlier: earlier.clone(),
             });
             let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
             last_run = Some(ran.run.clone());
@@ -1531,51 +1688,48 @@ impl OnDemand<'_> {
         );
         if verdict.outcome != PassOutcome::Revise {
             // Design review notes a `minor` for the Build; Verify proposes
-            // what it does not ask as a follow-up (OWL-304).
-            let (label, fate) = if stage == Stage::Verify {
-                ("proposed", Fate::Propose)
+            // what it does not ask as a follow-up (OWL-304) and gives a
+            // `minor` the last fix (OWL-356).
+            let lists: &[(&str, Fate)] = if stage == Stage::Verify {
+                &[("proposed", Fate::Propose), ("last_fix", Fate::LastFix)]
             } else {
-                ("noted", Fate::Note)
+                &[("noted", Fate::Note)]
             };
-            let left: Vec<&KeptFinding> = standing(&findings, confirmation)
-                .iter()
-                .zip(&verdict.fates)
-                .filter(|(_, f)| **f == fate)
-                .map(|((n, _), _)| &findings[*n])
-                .collect();
-            if verdict.outcome == PassOutcome::Ask || !left.is_empty() {
-                sink.emit(
-                    &ticket,
-                    last_run.as_deref(),
-                    EventKind::Decision,
-                    data([
-                        ("review", json!("residue")),
-                        ("stage", json!(stage_key)),
-                        ("pass", json!(pass)),
-                        (
-                            "asked",
-                            finding_ids(
-                                findings
-                                    .iter()
-                                    .filter(|kept| kept.outcome == Some(FindingOutcome::Asked)),
-                            ),
+            let standing = standing(&findings, confirmation);
+            let left = |fate: Fate| -> Vec<&KeptFinding> {
+                standing
+                    .iter()
+                    .zip(&verdict.fates)
+                    .filter(|(_, f)| **f == fate)
+                    .map(|((n, _), _)| &findings[*n])
+                    .collect()
+            };
+            let any_left = lists.iter().any(|(_, fate)| !left(*fate).is_empty());
+            if verdict.outcome == PassOutcome::Ask || any_left {
+                let mut residue = data([
+                    ("review", json!("residue")),
+                    ("stage", json!(stage_key)),
+                    ("pass", json!(pass)),
+                    (
+                        "asked",
+                        finding_ids(
+                            findings
+                                .iter()
+                                .filter(|kept| kept.outcome == Some(FindingOutcome::Asked)),
                         ),
-                        (label, finding_ids(left)),
-                        (
-                            "not_asked",
-                            json!(not_asked.iter().map(FindingId::as_str).collect::<Vec<_>>()),
-                        ),
-                    ]),
-                );
+                    ),
+                    (
+                        "not_asked",
+                        json!(not_asked.iter().map(FindingId::as_str).collect::<Vec<_>>()),
+                    ),
+                ]);
+                for (label, fate) in lists {
+                    residue.insert((*label).to_owned(), finding_ids(left(*fate)));
+                }
+                sink.emit(&ticket, last_run.as_deref(), EventKind::Decision, residue);
             }
         }
-        let mut review = p.review.clone().unwrap_or_else(|| TicketReview {
-            format: Format,
-            passes: Vec::new(),
-            answered_reviews: Vec::new(),
-            answering: Vec::new(),
-            build: None,
-        });
+        let mut review = p.review.clone().unwrap_or_default();
         push_pass(
             &mut review,
             ReviewPass {
@@ -1586,6 +1740,11 @@ impl OnDemand<'_> {
                     .iter()
                     .map(|output| output.reviewer.clone())
                     .collect(),
+                head,
+                plan: plan
+                    .as_ref()
+                    .filter(|_| stage == Stage::DesignReview)
+                    .map(|given| plan_print(&given.plan)),
             },
         );
         review.validate().map_err(|e| {
@@ -1634,6 +1793,24 @@ impl OnDemand<'_> {
             _ if outcome == PassOutcome::Passed => "approval",
             _ => "questions",
         };
+        // What changed since the loop's previous pass, by the print it kept
+        // (OWL-356).
+        let since = p
+            .review
+            .as_ref()
+            .and_then(|review| {
+                loop_passes(
+                    review,
+                    Stage::DesignReview,
+                    state.review_pass_due().saturating_sub(1),
+                )
+                .last()
+                .copied()
+            })
+            .and_then(|previous| {
+                let print = previous.plan.as_ref()?;
+                Some(plan_since(previous.pass, print, &kept.plan))
+            });
         let PassRun {
             pass,
             outputs,
@@ -1649,6 +1826,8 @@ impl OnDemand<'_> {
             &mut state,
             Stage::DesignReview,
             Some(given),
+            None,
+            since,
             None,
             &next,
             sink,
@@ -1682,7 +1861,7 @@ impl OnDemand<'_> {
                 .collect(),
             findings: findings.clone(),
             not_asked: not_asked.clone(),
-            earlier: earlier_rejected(&review, pass),
+            earlier: earlier_left(&review, pass),
             next: match (event, verdict.outcome) {
                 (Event::Completed, _) => PlanNext::Build,
                 (_, PassOutcome::Passed) => PlanNext::Approval,
@@ -1863,10 +2042,7 @@ impl OnDemand<'_> {
         let pass = NonZeroU32::new(comment.pass)
             .ok_or_else(|| Stop::Refused("a review pass numbered 0".to_owned()))?;
         let plan_sha256 = plan_sha256(&kept.plan);
-        let parts: Vec<String> = PlanPart::ALL
-            .iter()
-            .map(|part| sha256_hex(&kept.plan.part_canonical(*part)))
-            .collect();
+        let parts = part_hashes(&kept.plan);
         let prior = kept.published.clone();
         let (version, change) = match &prior {
             None => (NonZeroU32::MIN, PlanChange::First),
@@ -1902,7 +2078,7 @@ impl OnDemand<'_> {
             ticket: ticket.clone(),
             plan: kept.plan.clone(),
             version: version.get(),
-            passes: loop_passes(review, comment.pass)
+            passes: loop_passes(review, Stage::DesignReview, comment.pass)
                 .into_iter()
                 .map(|kept| DocumentPass {
                     pass: kept.pass.get(),
@@ -2116,7 +2292,8 @@ mod tests {
             ruling(2, RulingOutcome::Rejected),
             ruling(3, RulingOutcome::Confirmed),
         ];
-        // Before the last pass: the confirmed ones are fixed, a revision.
+        // Before the last pass: the confirmed major is fixed, a revision,
+        // and the minor noted (OWL-356).
         let mut first = pass_findings(&seats, Some(&rulings));
         let verdict = settle_pass(
             Stage::DesignReview,
@@ -2126,7 +2303,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verdict.outcome, PassOutcome::Revise);
-        assert_eq!(verdict.fates, [Fate::Fix, Fate::Fix]);
+        assert_eq!(verdict.fates, [Fate::Fix, Fate::Note]);
         let outcomes: Vec<_> = first.iter().map(|k| k.outcome).collect();
         assert_eq!(outcomes, [None, Some(FindingOutcome::Rejected), None]);
         // The last pass: the major is asked, the minor noted.
@@ -2180,11 +2357,11 @@ mod tests {
                     pass: NonZeroU32::new(*pass).unwrap(),
                     findings: findings.clone(),
                     reviewers: Vec::new(),
+                    head: None,
+                    plan: None,
                 })
                 .collect(),
-            answered_reviews: Vec::new(),
-            answering: Vec::new(),
-            build: None,
+            ..TicketReview::new()
         }
     }
 
@@ -2218,13 +2395,26 @@ mod tests {
         assert_eq!(given.findings.len(), 1);
         assert_eq!(given.findings[0].id, FindingId::nth(1));
         assert!(!fix.approval);
-        // The author answers every one.
+        // The author answers every one it fixes, never a minor, a note for
+        // the Build (OWL-356).
         let unjudged = review(&[(1, pass_findings(&seats, None))]);
         let answer = design_input(&after_one, Some(&unjudged), author, true).unwrap();
         let given = answer.findings.unwrap();
         assert_eq!(
             (given.mode, given.findings.len()),
-            (FindingsMode::Answer, 2)
+            (FindingsMode::Answer, 1)
+        );
+        assert_eq!(given.findings[0].id, FindingId::nth(1));
+        // A pass with minors alone asks no revision (OWL-356).
+        let minors = [seat(
+            &[Mandate::Critic],
+            HarnessKind::Codex,
+            vec![finding(1, Severity::Minor)],
+        )];
+        let noted = review(&[(1, pass_findings(&minors, None))]);
+        assert_eq!(
+            design_input(&after_one, Some(&noted), arbiter, false),
+            Ok(DesignInput::default())
         );
         // A clean pass was followed by the approval round, while it is still
         // required (the variant may have changed since).
@@ -2256,32 +2446,135 @@ mod tests {
         assert!(design_input(&after_one, None, arbiter, true).is_err());
     }
 
-    /// The PLAN comment lists the rejections of the loop's earlier passes,
-    /// never those of an earlier loop.
+    /// The PLAN comment lists the rejections and the notes of the loop's
+    /// earlier passes, never those of an earlier loop; a later pass is told
+    /// every earlier finding of its loop, a pass run again in place left
+    /// out; the Build is given the loop's notes, numbered again (OWL-356).
     #[test]
-    fn the_earlier_rejections_are_the_loops_own() {
+    fn the_earlier_findings_are_the_loops_own() {
         let seats = [seat(
             &[Mandate::Critic],
             HarnessKind::Codex,
-            vec![finding(1, Severity::Major)],
+            vec![finding(1, Severity::Major), finding(2, Severity::Minor)],
         )];
-        let mut rejected = pass_findings(&seats, Some(&[ruling(1, RulingOutcome::Rejected)]));
+        let rulings = [
+            ruling(1, RulingOutcome::Rejected),
+            ruling(2, RulingOutcome::Confirmed),
+        ];
+        let mut first = pass_findings(&seats, Some(&rulings));
         settle_pass(
             Stage::DesignReview,
             1,
-            &mut rejected,
+            &mut first,
             FindingsConfirmation::Arbiter,
         );
+        let noted = |n: u32| {
+            let mut found = pass_findings(
+                &[seat(
+                    &[Mandate::Critic],
+                    HarnessKind::Codex,
+                    vec![finding(n, Severity::Minor)],
+                )],
+                None,
+            );
+            found[0].finding.id = FindingId::nth(1);
+            found
+        };
         let record = review(&[
-            (1, rejected.clone()),
-            (1, rejected.clone()),
-            (2, Vec::new()),
+            (1, first.clone()),
+            (1, first.clone()),
+            (2, noted(7)),
             (3, Vec::new()),
         ]);
-        let earlier = earlier_rejected(&record, 3);
-        assert_eq!(earlier.len(), 1, "the first loop's pass is left out");
-        assert_eq!(earlier[0].0, 1);
-        assert!(earlier_rejected(&record, 1).is_empty());
+        let left = earlier_left(&record, 3);
+        let passes: Vec<u32> = left.iter().map(|(pass, _)| *pass).collect();
+        assert_eq!(passes, [1, 1, 2], "the first loop's pass is left out");
+        assert!(earlier_left(&record, 1).is_empty());
+        let told = earlier_findings(Some(&record), Stage::DesignReview, 3);
+        assert_eq!(told.len(), 3);
+        // Pass 3 run again in place is told passes 1 and 2 alone.
+        assert_eq!(
+            earlier_findings(Some(&record), Stage::DesignReview, 3),
+            earlier_findings(
+                Some(&review(&record_passes(&record)[..3])),
+                Stage::DesignReview,
+                3
+            )
+        );
+        assert!(earlier_findings(Some(&record), Stage::Verify, 2).is_empty());
+        // The Build's notes: the confirmed minor of pass 1 and the minor of
+        // pass 2, F1 and F2 again; the rejected major is none.
+        let at_build = state(Stage::Build, false, 0);
+        let notes =
+            design_notes(&at_build, Some(&record), FindingsConfirmation::Arbiter).expect("notes");
+        assert_eq!(notes.mode, FindingsMode::Note);
+        let ids: Vec<&str> = notes.findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["F1", "F2"]);
+        assert!(notes.findings[1].claim.contains('7'));
+        assert!(
+            design_notes(
+                &state(Stage::Build, false, 1),
+                Some(&record),
+                FindingsConfirmation::Arbiter
+            )
+            .is_none(),
+            "a Verify fix run is given Verify's findings"
+        );
+    }
+
+    fn record_passes(record: &TicketReview) -> Vec<(u32, Vec<KeptFinding>)> {
+        record
+            .passes
+            .iter()
+            .map(|pass| (pass.pass.get(), pass.findings.clone()))
+            .collect()
+    }
+
+    /// What changed in a plan, matched by content: a step inserted is new,
+    /// the steps it renumbers are not, a changed step is new and its old
+    /// text removed, and the parts whose text changed are named (OWL-356).
+    #[test]
+    fn a_later_pass_is_told_the_new_steps_and_parts() {
+        let step = |text: &str| PlanStep {
+            what: text.to_owned(),
+            test: format!("{text} tested."),
+        };
+        let mut before = plan(Vec::new());
+        before.steps = vec![step("A"), step("B")];
+        let print = plan_print(&before);
+        assert_eq!((print.parts.len(), print.steps.len()), (9, 2));
+        let mut after = before.clone();
+        after.steps.insert(0, step("Z"));
+        after.steps[2] = step("B, revised");
+        after.approach = "Another approach.".to_owned();
+        let since = plan_since(NonZeroU32::MIN, &print, &after);
+        assert_eq!(since.parts, [PlanPart::Approach, PlanPart::Steps]);
+        let steps: Vec<u32> = since.steps.iter().map(|n| n.get()).collect();
+        assert_eq!(steps, [1, 3]);
+        assert_eq!(since.removed, 1);
+        assert!(since.diff.is_none());
+        let same = plan_since(NonZeroU32::MIN, &print, &before);
+        assert!(same.parts.is_empty() && same.steps.is_empty() && same.removed == 0);
+    }
+
+    /// Two steps of one text count as two: a duplicate dropped is removed,
+    /// a duplicate added is new (OWL-356).
+    #[test]
+    fn duplicated_steps_are_matched_one_for_one() {
+        let step = |text: &str| PlanStep {
+            what: text.to_owned(),
+            test: format!("{text} tested."),
+        };
+        let mut twice = plan(Vec::new());
+        twice.steps = vec![step("A"), step("A"), step("B")];
+        let mut once = twice.clone();
+        once.steps.remove(1);
+        let dropped = plan_since(NonZeroU32::MIN, &plan_print(&twice), &once);
+        assert!(dropped.steps.is_empty());
+        assert_eq!(dropped.removed, 1);
+        let added = plan_since(NonZeroU32::MIN, &plan_print(&once), &twice);
+        let steps: Vec<u32> = added.steps.iter().map(|n| n.get()).collect();
+        assert_eq!((steps, added.removed), (vec![2], 0));
     }
 
     fn plan(forks: Vec<Fork>) -> Plan {

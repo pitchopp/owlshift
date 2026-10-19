@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 20
+      "const": 21
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -526,6 +526,26 @@
         }
       ]
     },
+    "EarlierFinding": {
+      "description": "A finding of an earlier pass of the loop (OWL-356), with its pass.",
+      "type": "object",
+      "properties": {
+        "kept": {
+          "description": "The finding, its reviewer, the arbiter's ruling or the author's\nresponse, and its outcome once settled.",
+          "$ref": "#/$defs/KeptFinding"
+        },
+        "pass": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pass",
+        "kept"
+      ]
+    },
     "FailedCheck": {
       "description": "One failed check of a [`CheckFailure`].",
       "type": "object",
@@ -709,6 +729,11 @@
           "description": "The author fixes each, as confirmed by the arbiter: a design or\nbuild run.",
           "type": "string",
           "const": "fix"
+        },
+        {
+          "description": "The Build weighs each, `minor` findings the plan's review noted for\nit (format 21, OWL-356), and answers none.",
+          "type": "string",
+          "const": "note"
         }
       ]
     },
@@ -1057,6 +1082,21 @@
         "steps"
       ]
     },
+    "PlanPart": {
+      "description": "A part of a [`Plan`], in the plan's order (OWL-350): what the PLAN\ncomment names when it says what changed since the previous version.",
+      "type": "string",
+      "enum": [
+        "goal",
+        "criteria",
+        "approach",
+        "steps",
+        "forks",
+        "alternatives",
+        "files",
+        "risks",
+        "out_of_scope"
+      ]
+    },
     "PlanStep": {
       "description": "One step of a plan.",
       "type": "object",
@@ -1337,6 +1377,14 @@
             }
           ]
         },
+        "earlier": {
+          "description": "The findings of the loop's earlier passes, oldest pass first, as the\nreview record keeps them (format 21, OWL-356): what was fixed,\nrejected, noted, asked or proposed, so that no point is raised\nagain. At most [`MAX_PASS_FINDINGS`], the latest kept.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EarlierFinding"
+          },
+          "maxItems": 192
+        },
         "mandates": {
           "description": "The run's mandates, at least one, each once: a critic alone in its\npass holds conformance too.",
           "type": "array",
@@ -1350,6 +1398,17 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 1
+        },
+        "since": {
+          "description": "What changed since the loop's previous pass (format 21, OWL-356):\nfrom pass 2, what the pass reviews, when the previous pass kept what\nit reviewed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewSince"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -1383,6 +1442,55 @@
       "required": [
         "path",
         "body"
+      ]
+    },
+    "ReviewSince": {
+      "description": "What changed since the loop's previous review pass (OWL-356,\narchitecture section 5, \"A pass after a revision\").",
+      "type": "object",
+      "properties": {
+        "diff": {
+          "description": "At Verify: the diff from the commit the previous pass reviewed,\n`base`, to this worktree's head, written beside the brief.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GivenDiff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parts": {
+          "description": "At Design review: the plan's parts whose text changed, in the plan's\norder.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlanPart"
+          }
+        },
+        "pass": {
+          "description": "The previous pass, below this one.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "removed": {
+          "description": "At Design review: how many steps of the previous plan have a text\nthe plan no longer holds, changed or dropped.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "steps": {
+          "description": "At Design review: the plan's steps whose text is new, numbered from\n1 in the plan as it is now, increasing; a step only renumbered is\nnot new.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 1
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pass"
       ]
     },
     "Reviewer": {

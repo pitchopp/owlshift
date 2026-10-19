@@ -1186,9 +1186,10 @@ impl OnDemand<'_> {
             other => return Err(core_error(other)),
         };
         // A new delivery: what an earlier one's Build gave Verify goes, kept
-        // with the next write (OWL-304).
+        // with the next write (OWL-304), and its last fix (OWL-356).
         if let Some(review) = p.review.as_mut() {
             review.build = None;
+            review.last_fix = None;
         }
         // The branch starts from the base this command fetched (OWL-274):
         // one an earlier run, such as the ticket's intake, made at an older
@@ -1943,16 +1944,25 @@ impl OnDemand<'_> {
             // In a review loop, the reviews it answers (OWL-307).
             brief.pull_request_reviews = loop_reviews(p);
             // The findings of the latest Verify pass, to fix or answer
-            // (OWL-304).
+            // (OWL-304); before any, the notes of Design review (OWL-356).
             brief.findings = verify::verify_input(&state, p.review.as_ref(), confirmation)
                 .map_err(|e| {
                     Stop::Refused(format!(
                         "{e}: `owlshift forget {}` starts its record over",
                         p.ticket
                     ))
-                })?;
+                })?
+                .or_else(|| {
+                    design::design_notes(&state, p.review.as_ref(), confirmation)
+                        .filter(|_| !in_review_loop(p))
+                });
             let (ran, event) =
                 self.run_role_once(p, &*harness, &state, &brief, attempt, &mut gathered, sink)?;
+            // A last fix that asks is no longer the last fix alone: a Verify
+            // pass follows it (OWL-356).
+            if event == Event::Questions && drop_last_fix(p) {
+                self.keep(p, &state)?;
+            }
             let result = (event != Event::ResultRefused)
                 .then(|| ran.result())
                 .flatten();
@@ -2012,6 +2022,10 @@ impl OnDemand<'_> {
                     if integrating.is_none() {
                         gather(&mut gathered.decisions, &[late_decision(&late)]);
                         integrating = Some(late);
+                        // Nor is one that takes late comments (OWL-356).
+                        if drop_last_fix(p) {
+                            self.keep(p, &state)?;
+                        }
                         continue;
                     }
                     let asked = match state.apply(p.pipeline, Event::Questions) {
@@ -2103,6 +2117,10 @@ impl OnDemand<'_> {
                         });
                     }
                     reversal::followed(&mut questions, &reversed);
+                    // Nor one that follows a decider's reply (OWL-356).
+                    if !reversed.is_empty() {
+                        drop_last_fix(p);
+                    }
                     let built = self.kept_build(p, &ran.report, &gathered, &comments)?;
                     // A review loop's Build that committed nothing ends the
                     // loop, with no Verify pass and no push (OWL-307).
@@ -2111,13 +2129,7 @@ impl OnDemand<'_> {
                             .review_unchanged(p, state, questions, built, sink)
                             .map(Built::Delivered);
                     }
-                    let review = p.review.get_or_insert_with(|| TicketReview {
-                        format: Format,
-                        passes: Vec::new(),
-                        answered_reviews: Vec::new(),
-                        answering: Vec::new(),
-                        build: None,
-                    });
+                    let review = p.review.get_or_insert_with(TicketReview::new);
                     if let (Some(given), Some(result)) = (&brief.findings, ran.result()) {
                         design::mark_answered(review, Stage::Verify, given, result);
                     }
@@ -2130,10 +2142,18 @@ impl OnDemand<'_> {
                             state = verified;
                             break;
                         }
-                        // A Verify fix run follows, its findings given.
+                        // A Verify fix run follows, its findings given, and
+                        // what the pass proposed kept for the delivery (a
+                        // last pass's, before its last fix, OWL-356).
                         Verified::Revise(next) => {
                             state = next;
                             attempt = 0;
+                            if let Some(kept) =
+                                p.review.as_ref().and_then(|review| review.build.as_ref())
+                            {
+                                gather(&mut gathered.decisions, &kept.notes);
+                                gather(&mut gathered.followups, &kept.followups);
+                            }
                         }
                     }
                 }
@@ -3897,9 +3917,11 @@ impl OnDemand<'_> {
             }),
             unchanged: false,
         });
-        // Delivered: the Build Verify reviewed is no longer kept.
+        // Delivered: the Build Verify reviewed is no longer kept, nor its
+        // last fix (OWL-356).
         if let Some(review) = p.review.as_mut() {
             review.build = None;
+            review.last_fix = None;
         }
         // Its follow-ups are owed in the same write (OWL-253).
         let owed = self.owe(p, kept.owed.iter());
@@ -6237,6 +6259,16 @@ fn new_run_dir(runs: &Path) -> io::Result<(String, PathBuf)> {
 }
 
 /// Adds the items not already in `into`.
+/// Drops the review record's mark of a last fix under way (OWL-356): the
+/// Build it marks was given more than its `minor` findings, so a Verify
+/// pass follows it. Whether there was one; the next write keeps it.
+fn drop_last_fix(p: &mut Prepared) -> bool {
+    p.review
+        .as_mut()
+        .and_then(|review| review.last_fix.take())
+        .is_some()
+}
+
 fn gather<T: Clone + PartialEq>(into: &mut Vec<T>, items: &[T]) {
     for item in items {
         if !into.contains(item) {
