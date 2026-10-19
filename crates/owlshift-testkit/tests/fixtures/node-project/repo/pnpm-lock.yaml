@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      owlshift-fixture-dep:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  owlshift-fixture-dep@1.0.0:
+    resolution: {integrity: sha512-0AiUrSAVq9J4Fdt7ZqHIibvn7xPP5GDnmWmVHM691CrpNk1gZI8aSHQAdP6NgVNnIOJ6+sl8mcsEK3SZxQmrpw==}
+
+snapshots:
+
+  owlshift-fixture-dep@1.0.0: {}

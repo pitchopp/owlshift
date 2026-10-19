@@ -1,0 +1,7 @@
+{
+  "name": "owlshift-node-fixture",
+  "private": true,
+  "dependencies": {
+    "owlshift-fixture-dep": "1.0.0"
+  }
+}

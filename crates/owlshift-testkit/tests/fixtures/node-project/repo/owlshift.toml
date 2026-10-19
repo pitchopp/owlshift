@@ -1,0 +1,22 @@
+requires = ">=0.0"
+
+[tracker]
+kind = "markdown"
+admit = { label = "owlshift" }
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+
+[stack]
+# Fails unless the setup installed the dependency, from the cache alone.
+gate = ["node -e \"require('owlshift-fixture-dep')\""]
+# OWL-330: installs from the pnpm store the operator allows, read-only.
+setup = ["sh ci/owlshift/setup.sh"]
+caches = ["Library/pnpm"]
+
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+
+[models]
+
+[policy]
+always_human = []
