@@ -5287,7 +5287,8 @@ fn a_quoted_scope_question_is_decided_at_ticket_and_asked_at_discoverable() {
 /// more than the ceiling, one of them reporting no cost, keep the chain
 /// going while the resolver runs add up, and once those reach the ceiling
 /// the next run's questions go to the decider, the round and the `gate`
-/// event saying why; every `gate` event gives the resolver's spend so far.
+/// event saying why; every `gate` event gives the resolver's spend so far,
+/// and the asking runs', measured only.
 /// A resolver run that reports no cost ends the chain at the next check.
 #[test]
 fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
@@ -5344,6 +5345,20 @@ fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
         "{printed}"
     );
     assert!(resolved.iter().all(|e| e["ceiling_usd"] == json!(1.0)));
+    // The asking runs are measured: $2, then unreported once a Build
+    // reported no cost.
+    let asking: Vec<&Value> = resolved.iter().map(|e| &e["asking_spent_usd"]).collect();
+    assert_eq!(
+        asking,
+        [
+            &json!(2.0),
+            &Value::Null,
+            &Value::Null,
+            &Value::Null,
+            &Value::Null
+        ],
+        "{printed}"
+    );
     let (last, settled) = resolved.split_last().unwrap();
     assert!(
         settled
@@ -5384,6 +5399,8 @@ fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
         resolved.iter().all(|e| e["resolver_spent_usd"].is_null()),
         "{printed}"
     );
+    let asking: Vec<&Value> = resolved.iter().map(|e| &e["asking_spent_usd"]).collect();
+    assert_eq!(asking, [&json!(2.0), &json!(4.0)], "{printed}");
     assert_eq!(resolved.last().unwrap()["reason"], "cost_unreported");
 }
 

@@ -97,13 +97,15 @@ pub enum ChainCost {
 }
 
 /// One chain of runs as the runner counts it, for [`GatePolicy::chain_end`]:
-/// the runs in a row whose questions the resolver all decided, and what the
-/// chain's resolver runs cost. The core does no I/O: the runner reports each
-/// resolver run's cost.
+/// the runs in a row whose questions the resolver all decided, what the
+/// chain's resolver runs cost, which the ceiling bounds, and what its asking
+/// runs cost, which is only measured (OWL-376). The core does no I/O: the
+/// runner reports each run's cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Chain {
     settled: u32,
     cost: ChainCost,
+    asking: ChainCost,
 }
 
 impl Default for Chain {
@@ -111,7 +113,17 @@ impl Default for Chain {
         Self {
             settled: 0,
             cost: ChainCost::Known(0),
+            asking: ChainCost::Known(0),
         }
+    }
+}
+
+/// `sum` with one more reported cost in dollars: unreported for good once a
+/// cost is `None`, negative or not a finite number.
+fn add_cost(sum: ChainCost, cost_usd: Option<f64>) -> ChainCost {
+    match (sum, cost_usd.and_then(usd_micros)) {
+        (ChainCost::Known(sum), Some(cost)) => ChainCost::Known(sum.saturating_add(cost)),
+        _ => ChainCost::Unreported,
     }
 }
 
@@ -126,16 +138,26 @@ impl Chain {
         self.cost
     }
 
+    /// What the chain's asking runs whose questions reached the resolver
+    /// cost so far: not every run of the chain, since a run that asked
+    /// nothing is not counted. Measured, never bounded (OWL-376).
+    pub const fn asking_cost(self) -> ChainCost {
+        self.asking
+    }
+
     /// One more resolver run of the chain, with its reported cost in
     /// dollars: `None`, or a cost that is negative or not a finite number,
-    /// leaves the chain's cost unreported for good. An asking run adds
-    /// nothing: the ceiling bounds the resolver's delegation, not the work
-    /// it unblocks (OWL-376).
+    /// leaves the chain's cost unreported for good.
     pub fn resolved(&mut self, cost_usd: Option<f64>) {
-        self.cost = match (self.cost, cost_usd.and_then(usd_micros)) {
-            (ChainCost::Known(sum), Some(cost)) => ChainCost::Known(sum.saturating_add(cost)),
-            _ => ChainCost::Unreported,
-        };
+        self.cost = add_cost(self.cost, cost_usd);
+    }
+
+    /// One more asking run whose questions reach the resolver, with its
+    /// reported cost in dollars, which [`Chain::asking_cost`] sums: the
+    /// ceiling does not read it, since it bounds the resolver's delegation,
+    /// not the work it unblocks (OWL-376).
+    pub fn asked(&mut self, cost_usd: Option<f64>) {
+        self.asking = add_cost(self.asking, cost_usd);
     }
 
     /// The resolver decided every question of the chain's latest asking run.
@@ -674,6 +696,25 @@ mod tests {
         assert_eq!(ends(Runs(2), Some(1.0), 1, &some(&[0.5])), None);
         assert_eq!(usd_micros(0.4), Some(400_000));
         assert_eq!(usd_micros(-1.0), None);
+        // The asking runs are measured, never bounded (OWL-376): $11.70 of
+        // them, one unreported, beside a resolver run of $0.30 under a $1
+        // ceiling end nothing.
+        let policy = GatePolicy::new(Vec::<String>::new(), PlanApproval::Never).with_resolver(
+            ResolverPolicy {
+                passes: Unlimited,
+                ceiling_micros: usd_micros(1.0),
+                ..ResolverPolicy::default()
+            },
+        );
+        let mut chain = Chain::default();
+        chain.asked(Some(9.7));
+        chain.asked(Some(2.0));
+        assert_eq!(chain.asking_cost(), ChainCost::Known(11_700_000));
+        chain.resolved(Some(0.3));
+        chain.asked(None);
+        assert_eq!(chain.asking_cost(), ChainCost::Unreported);
+        assert_eq!(chain.cost(), ChainCost::Known(300_000));
+        assert_eq!(policy.chain_end(chain), None);
     }
 
     /// The approval question is the decider's alone under `always` and on
