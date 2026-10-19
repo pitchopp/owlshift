@@ -343,6 +343,7 @@ mod tests {
             edited_at: None,
             body: format!("{by}: no"),
             parent: parent.map(str::to_owned),
+            reactions: Vec::new(),
         }
     }
 

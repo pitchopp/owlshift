@@ -896,7 +896,8 @@ fn shared_ticket(ticket: Ticket) -> shared::Ticket {
 }
 
 /// A comment file as a shared comment. Comment files are never edited (build
-/// plan, "The test tracker"), so the last edit is the creation time.
+/// plan, "The test tracker"), so the last edit is the creation time; the
+/// file format has no reactions (OWL-371).
 fn shared_comment(comment: Comment) -> shared::Comment {
     shared::Comment {
         id: comment.id,
@@ -905,6 +906,7 @@ fn shared_comment(comment: Comment) -> shared::Comment {
         edited_at: None,
         body: comment.body,
         parent: comment.reply_to,
+        reactions: Vec::new(),
     }
 }
 

@@ -172,6 +172,17 @@
 //!   `INPUT_ERROR`. So the update asks for `archivedAt`, and an archived
 //!   document is not found.
 //!
+//! Checked live on 2026-10-19 (OWL-371; build plan, "Reactions as OWL-371
+//! reads them") through the personal key, for a comment's reactions:
+//! `Reaction` has `emoji`, `createdAt`, `user` and `externalUser`, and no
+//! `botActor`; `Comment.reactions` is a non-null list. A `+1` made through
+//! the key read back as emoji `+1`, its `user` the key's account by `id`
+//! and `app` false, through `comment(id)` and `issue.comments` alike; once
+//! deleted, neither listed it. The reaction left the comment's `editedAt`
+//! as it was and changed its `updatedAt`, which the adapter does not read.
+//! Nesting the reactions in a page of 50 comments took its complexity from
+//! 9 points to 12.
+//!
 //! Read only, for `owlshift doctor` (OWL-155, checked 2026-10-14):
 //!
 //! - `teams(filter: { key })` answers `triageEnabled` and the states with
@@ -202,8 +213,8 @@ use owlshift_contracts::ids::TicketId;
 pub use crate::graphql::{Response, Transport};
 use crate::tracker::{
     Author, Blocker, Capability, Column, Comment, Document, Error, ErrorKind, Filed, Found,
-    Gesture, Listed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Person, Proposal, Relations, StateType,
-    Ticket, Tracker, no_delegation,
+    Gesture, Listed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Person, Proposal, Reaction, Relations,
+    StateType, Ticket, Tracker, no_delegation,
 };
 
 /// Linear's GraphQL endpoint.
@@ -335,6 +346,7 @@ impl LinearTracker {
         Capability::ProposalsInbox,
         Capability::Documents,
         Capability::FoldComments,
+        Capability::Reactions,
     ];
 
     /// The adapter over HTTPS with this key.
@@ -1225,10 +1237,13 @@ const GESTURE_QUERY: &str = concat!(
      pageInfo { hasNextPage endCursor } } } }"
 );
 
+/// A ticket's comments, each with its reactions (OWL-371): a comment just
+/// posted has none, so the post's mutation does not ask for them.
 const COMMENTS_QUERY: &str = concat!(
     "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { \
      comments(first: $first, after: $after) { nodes { ",
     comment_fields!(),
+    " reactions { emoji createdAt user { id displayName app } externalUser { name } }",
     " } pageInfo { hasNextPage endCursor } } } }"
 );
 
@@ -1769,11 +1784,26 @@ struct LinearComment {
     /// Absent from recordings made before OWL-146.
     #[serde(default)]
     parent: Option<Parent>,
+    /// Absent from a posted comment's answer, which asks for none, and from
+    /// recordings made before OWL-371.
+    #[serde(default)]
+    reactions: Vec<LinearReaction>,
 }
 
 #[derive(Deserialize)]
 struct Parent {
     id: String,
+}
+
+/// A reaction as the comments query reads it (OWL-371). Linear's
+/// `Reaction` has no `botActor` (checked 2026-10-19).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearReaction {
+    emoji: String,
+    created_at: Timestamp,
+    user: Option<User>,
+    external_user: Option<Named>,
 }
 
 impl LinearComment {
@@ -1785,6 +1815,17 @@ impl LinearComment {
             edited_at: self.edited_at,
             body: self.body,
             parent: self.parent.map(|parent| parent.id),
+            reactions: self
+                .reactions
+                .into_iter()
+                .map(|reaction| Reaction {
+                    emoji: reaction.emoji,
+                    // By the rule of comments: an app user's reaction is
+                    // never an account's.
+                    author: author(reaction.user, None, reaction.external_user),
+                    created_at: reaction.created_at,
+                })
+                .collect(),
         }
     }
 }
@@ -2107,6 +2148,65 @@ mod tests {
         decode::<Value>(&answer(status, body)).unwrap_err().kind
     }
 
+    /// OWL-371: a comment's reactions, shaped as Linear answered them on
+    /// 2026-10-19, each author by the rule of comments: a person's account,
+    /// an app user's (Owlshift's own or another's) never an account, an
+    /// external user's neither; a posted comment's answer has none.
+    #[test]
+    fn reactions_are_read_with_their_authors() {
+        let comment: LinearComment = serde_json::from_value(json!({
+            "id": "c1", "body": "[owlshift] QUESTIONS · round 1", "createdAt": "2026-10-19T20:07:00.000Z",
+            "editedAt": null, "botActor": null, "externalUser": null, "parent": null,
+            "user": { "id": "app-1", "displayName": "Owlshift", "app": true },
+            "reactions": [
+                { "emoji": "+1", "createdAt": "2026-10-19T20:07:35.000Z", "externalUser": null,
+                  "user": { "id": "u1", "displayName": "person-1", "app": false } },
+                { "emoji": "+1", "createdAt": "2026-10-19T20:08:00.000Z", "externalUser": null,
+                  "user": { "id": "app-2", "displayName": "Other app", "app": true } },
+                { "emoji": "heart", "createdAt": "2026-10-19T20:09:00.000Z", "user": null,
+                  "externalUser": { "name": "Slack user" } }
+            ]
+        }))
+        .unwrap();
+        let comment = comment.into_comment();
+        let at = |s: &str| -> Timestamp { s.parse().unwrap() };
+        assert_eq!(
+            comment.reactions,
+            [
+                Reaction {
+                    emoji: "+1".into(),
+                    author: Author::Account(Person {
+                        id: "u1".into(),
+                        name: "person-1".into(),
+                    }),
+                    created_at: at("2026-10-19T20:07:35Z"),
+                },
+                Reaction {
+                    emoji: "+1".into(),
+                    author: Author::Other {
+                        name: "Other app".into(),
+                    },
+                    created_at: at("2026-10-19T20:08:00Z"),
+                },
+                Reaction {
+                    emoji: "heart".into(),
+                    author: Author::Other {
+                        name: "Slack user".into(),
+                    },
+                    created_at: at("2026-10-19T20:09:00Z"),
+                },
+            ]
+        );
+        assert!(comment.reactions[0].is_thumbs_up() && !comment.reactions[2].is_thumbs_up());
+        let posted: LinearComment = serde_json::from_value(json!({
+            "id": "c2", "body": "b", "createdAt": "2026-10-19T20:10:00.000Z", "editedAt": null,
+            "botActor": null, "externalUser": null, "parent": null,
+            "user": { "id": "app-1", "displayName": "Owlshift", "app": true }
+        }))
+        .unwrap();
+        assert!(posted.into_comment().reactions.is_empty());
+    }
+
     #[test]
     fn graphql_errors_are_classified_by_code() {
         let other_input = r#"{"errors":[{"message":"Argument Validation Error","extensions":{"code":"INVALID_INPUT"}}],"data":null}"#;
@@ -2158,6 +2258,7 @@ mod tests {
                 name: Some(n.to_owned()),
             }),
             parent: None,
+            reactions: Vec::new(),
         };
         let other = |name: &str| Author::Other {
             name: name.to_owned(),

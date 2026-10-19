@@ -5885,6 +5885,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 edited_at: None,
                 body: body.to_owned(),
                 parent: None,
+                reactions: Vec::new(),
             };
             self.comments.borrow_mut().push(comment.clone());
             Ok(comment)
@@ -6993,6 +6994,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             edited_at: None,
             body,
             parent: None,
+            reactions: Vec::new(),
         }
     }
 

@@ -6868,6 +6868,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         };
         let ask = |kind, round, minute, id: &str| Ask {
             kind,
@@ -6990,6 +6991,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         };
         let question = |id: &str| Question {
             id: QuestionId::new(id).unwrap(),
@@ -7221,6 +7223,7 @@ mod tests {
             edited_at: None,
             body: format!("{by} at {minute}"),
             parent: None,
+            reactions: Vec::new(),
         };
         let ask = |round: u32, minute: u32, by: &str| Ask {
             kind: AskKind::Questions,
@@ -7291,6 +7294,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         };
         let marked = "[owlshift] DELIVERY\n\nDone.\n\n<!-- owlshift:{\"format\":1,\"kind\":\"DELIVERY\",\"ticket\":\"OWL-1\"} -->\n";
         let cases = [
@@ -7344,6 +7348,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         }
     }
 

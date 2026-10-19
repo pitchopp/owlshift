@@ -9,7 +9,7 @@
 //! the admission gesture with P4 (OWL-246, architecture section 5, "The
 //! drain"), filing proposals and finding them again with P4 too (OWL-252),
 //! publishing a ticket's document with P5 (OWL-350), resolving a comment
-//! with P5 too (OWL-353).
+//! with P5 too (OWL-353), a comment's reactions with P5 too (OWL-371).
 
 pub mod linear;
 pub mod markdown;
@@ -389,6 +389,9 @@ pub enum Capability {
     /// Resolving a comment, so the runner's superseded comments show folded
     /// (OWL-353).
     FoldComments,
+    /// Reading a comment's reactions, so a thumbs-up answers a question
+    /// asked alone (OWL-371).
+    Reactions,
     /// A distinct agent identity.
     AgentIdentity,
     /// Webhooks.
@@ -397,7 +400,7 @@ pub enum Capability {
 
 impl Capability {
     /// Every row, in the table's order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::ReadTicket,
         Self::ListAdmitted,
         Self::Comments,
@@ -406,6 +409,7 @@ impl Capability {
         Self::ProposalsInbox,
         Self::Documents,
         Self::FoldComments,
+        Self::Reactions,
         Self::AgentIdentity,
         Self::Webhooks,
     ];
@@ -429,6 +433,7 @@ impl Capability {
             Self::ProposalsInbox => "proposals inbox",
             Self::Documents => "ticket documents",
             Self::FoldComments => "fold superseded comments",
+            Self::Reactions => "comment reactions",
             Self::AgentIdentity => "agent identity",
             Self::Webhooks => "webhooks",
         }
@@ -489,6 +494,36 @@ pub struct Comment {
     /// The comment it replies to, in a tracker that threads replies: how the
     /// decider reverses a DECISION (OWL-146); `None` for a top-level one.
     pub parent: Option<String>,
+    /// The reactions on it, in the tracker's order (OWL-371): how the
+    /// decider answers a question asked alone with a thumbs-up. Empty on a
+    /// tracker that reads none ([`Capability::Reactions`]).
+    pub reactions: Vec<Reaction>,
+}
+
+/// A reaction on a comment (OWL-371).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    /// The tracker's name for the emoji, as Linear names it:
+    /// [`Reaction::THUMBS_UP`] for a thumbs-up.
+    pub emoji: String,
+    /// Who reacted, by the rule of a comment's author: an
+    /// [`Author::Account`] only when the tracker names a person's account
+    /// and nothing else, so an app user's reaction, Owlshift's own
+    /// included, is never an account's.
+    pub author: Author,
+    /// When the tracker recorded it.
+    pub created_at: Timestamp,
+}
+
+impl Reaction {
+    /// Linear's name for the thumbs-up, checked live on 2026-10-19
+    /// (OWL-354, OWL-371).
+    pub const THUMBS_UP: &'static str = "+1";
+
+    /// Whether it is a thumbs-up, and no other emoji.
+    pub fn is_thumbs_up(&self) -> bool {
+        self.emoji == Self::THUMBS_UP
+    }
 }
 
 impl Author {
