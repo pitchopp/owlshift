@@ -59,7 +59,16 @@ jobs:
           sudo apt-get install -y -qq bubblewrap
           sudo install -m 0644 .github/apparmor/bwrap /etc/apparmor.d/bwrap
           sudo apparmor_parser -r /etc/apparmor.d/bwrap
-          echo "OWLSHIFT_REQUIRE_CONFINEMENT=1" >> "$GITHUB_ENV"
+      # OWL-339: the confinement tests must run, not skip, on macOS too, so
+      # that the Seatbelt rules the new tests rely on (the other worktrees'
+      # git entries closed, the run's own written again) are proved by the
+      # CI leg. Every confinement-aware test then fails rather than skips
+      # when the sandbox is unusable, on both unix legs. Approved on OWL-339
+      # on 2026-10-18 (round 2, Q2, answer A), as the CI-settings floor of
+      # architecture section 8 requires.
+      - name: Require confinement
+        if: runner.os != 'Windows'
+        run: echo "OWLSHIFT_REQUIRE_CONFINEMENT=1" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint

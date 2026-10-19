@@ -1454,3 +1454,36 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
         );
     }
 }
+
+/// OWL-339: the confinement tests must run, not skip, on both unix legs, so
+/// the variable that makes them fail instead of skipping is set by a step of
+/// its own for every OS but Windows, not by the Linux-only bwrap step.
+#[test]
+fn ci_requires_confinement_on_every_unix_leg() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let lines: Vec<&str> = ci.lines().map(str::trim).collect();
+    let sets: Vec<usize> = (0..lines.len())
+        .filter(|i| lines[*i].contains("OWLSHIFT_REQUIRE_CONFINEMENT=1"))
+        .collect();
+    assert_eq!(sets.len(), 1, "the variable is set once: {sets:?}");
+    // The step the line belongs to: from its `- name:` to the next step's.
+    let start = (0..=sets[0])
+        .rev()
+        .find(|i| lines[*i].starts_with("- name:"))
+        .expect("the line sits in a step");
+    let end = (sets[0]..lines.len())
+        .find(|i| lines[*i].starts_with("- name:") && *i > start)
+        .unwrap_or(lines.len());
+    let step = &lines[start..end];
+    assert!(
+        step.contains(&"if: runner.os != 'Windows'"),
+        "the step is not for every unix leg: {step:?}"
+    );
+    assert!(
+        !step
+            .iter()
+            .any(|line| line.contains("runner.os == 'Linux'")),
+        "{step:?}"
+    );
+}
