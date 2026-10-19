@@ -58,8 +58,7 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join(HARNESS_CONFIG_DIR);
     std::fs::create_dir(&config).unwrap();
-    // Bound read and written, as the executor binds it: under bwrap the
-    // temporary folder is made anew, empty.
+    // Bound read and written, as the executor binds it.
     let run = RunPaths {
         workdir: workdir.path().to_path_buf(),
         readable: needs.readable,

@@ -738,9 +738,9 @@ mod tests {
 
     /// Confined as a Build's gate: the home's files and the gate log are out
     /// of reach, `TMPDIR` is the run's own folder, and what one command
-    /// leaves there is seen by the next exactly as in a Build: not under
-    /// bwrap, which makes a folder in `/tmp` anew for each command, but on
-    /// macOS, where the folder itself is opened.
+    /// leaves there is seen by the next exactly as in a Build, on Linux as on
+    /// macOS: bwrap binds the folder itself, even inside its private `/tmp`
+    /// (OWL-330).
     #[cfg(unix)]
     #[test]
     fn the_gate_is_confined_as_a_builds() {
@@ -777,16 +777,7 @@ mod tests {
             "{}",
             steps[0].output
         );
-        let under_bwrap_tmp = cfg!(target_os = "linux")
-            && std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .starts_with("/tmp");
-        assert_eq!(
-            steps[1].output.contains("probe"),
-            !under_bwrap_tmp,
-            "{}",
-            steps[1].output
-        );
+        assert!(steps[1].output.contains("probe"), "{}", steps[1].output);
     }
 
     /// Native Windows has no sandbox (D9): refused before anything is made.

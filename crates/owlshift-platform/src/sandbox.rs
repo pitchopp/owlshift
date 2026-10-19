@@ -65,9 +65,9 @@ pub struct Policy {
     /// runner's own run folder.
     pub hidden: Vec<PathBuf>,
     /// Where temporary files go, read and written: the run's own folder, made
-    /// by the runner, never a folder the user shares. On Linux `/tmp` is
-    /// private to the sandbox, and a folder named here inside it is created
-    /// empty there.
+    /// by the runner, never a folder the user shares. Every command confined
+    /// with it shares it: on Linux it is bound into the sandbox like a
+    /// writable folder, even inside the private `/tmp` (OWL-330).
     pub temp: Vec<PathBuf>,
     /// Symbolic links recreated where the home or a closed folder hides
     /// them, as `(at, target)`: a folder named through a link, such as
@@ -373,12 +373,11 @@ pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<
             add(path, 0, vec![os("--tmpfs"), path.into()]);
         }
     }
+    // The run's own temporary folder is bound wherever it is, inside the
+    // private `/tmp` too, so what one command of the run leaves there the
+    // next finds (OWL-330).
     for path in &policy.temp {
-        if path.starts_with(tmp) {
-            add(path, 1, vec![os("--dir"), path.into()]);
-        } else {
-            add(path, 3, vec![os("--bind-try"), path.into(), path.into()]);
-        }
+        add(path, 3, vec![os("--bind-try"), path.into(), path.into()]);
     }
     for path in &policy.readable {
         add(path, 2, vec![os("--ro-bind-try"), path.into(), path.into()]);
@@ -397,6 +396,7 @@ pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<
             .readable
             .iter()
             .chain(&policy.writable)
+            .chain(&policy.temp)
             .any(|root| path.starts_with(root))
     };
     let private = |path: &Path| {
@@ -840,7 +840,8 @@ mod tests {
             "/home/op",
             "--tmpfs",
             "/srv/shared-tmp",
-            "--dir",
+            "--bind-try",
+            "/tmp/agent",
             "/tmp/agent",
             "--tmpfs",
             "/srv/run",
@@ -866,6 +867,75 @@ mod tests {
             "/home/op/wt",
         ];
         assert_eq!(args, expected);
+    }
+
+    /// The pairs of `args` from `flag` on: each flag with the path it
+    /// mounts last.
+    fn mounted(args: &[OsString]) -> Vec<(String, String)> {
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        let mut pairs = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            if arg.starts_with("--") && i + 1 < args.len() {
+                let last = if matches!(arg.as_str(), "--tmpfs" | "--dir" | "--chdir") {
+                    &args[i + 1]
+                } else {
+                    &args[(i + 2).min(args.len() - 1)]
+                };
+                pairs.push((arg.clone(), last.clone()));
+            }
+        }
+        pairs
+    }
+
+    /// OWL-330: the run's own temporary folder is bound wherever it lies, so
+    /// every command of the run shares it; inside the private `/tmp` it was
+    /// made anew, empty, for each command. A hidden path beneath it keeps
+    /// its hiding mount, after the bind; one beneath another folder of the
+    /// private `/tmp` stays out of sight with no mount.
+    #[test]
+    fn the_run_temporary_folder_is_bound_and_hides_what_it_must() {
+        let kind = |path: &Path| match path.to_str() {
+            Some("/tmp/agent/secret" | "/tmp/other/secret") => Some(Kind::Directory),
+            Some("/tmp/agent/key") => Some(Kind::File),
+            _ => None,
+        };
+        let mut policy = Policy {
+            temp: vec!["/tmp/agent".into()],
+            hidden: vec![
+                "/tmp/agent/secret".into(),
+                "/tmp/agent/key".into(),
+                "/tmp/other/secret".into(),
+            ],
+            workdir: "/srv/wt".into(),
+            ..Policy::default()
+        };
+        let args = bwrap_args(&policy, kind);
+        assert!(!args.iter().any(|arg| arg == "--dir"), "{args:?}");
+        let pairs = mounted(&args);
+        let at = |flag: &str, path: &str| {
+            pairs
+                .iter()
+                .position(|(f, p)| f == flag && p == path)
+                .unwrap_or_else(|| panic!("no {flag} {path} in {args:?}"))
+        };
+        let tmp = at("--tmpfs", "/tmp");
+        let bind = at("--bind-try", "/tmp/agent");
+        assert!(tmp < bind);
+        assert!(bind < at("--tmpfs", "/tmp/agent/secret"));
+        assert!(bind < at("--ro-bind", "/tmp/agent/key"));
+        assert!(
+            !pairs.iter().any(|(_, path)| path == "/tmp/other/secret"),
+            "{args:?}"
+        );
+
+        // Outside `/tmp`, the folder is bound as before.
+        policy.temp = vec!["/srv/run-temp".into()];
+        policy.hidden.clear();
+        let pairs = mounted(&bwrap_args(&policy, kind));
+        assert!(pairs.contains(&("--bind-try".into(), "/srv/run-temp".into())));
     }
 
     #[test]

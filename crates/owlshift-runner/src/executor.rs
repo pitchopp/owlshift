@@ -538,10 +538,10 @@ impl Executor {
         paths.read_only = needs.read_only;
         // An empty configuration folder of the run's own, in its temporary
         // folder: no other login is found there, and nothing the harness
-        // writes outlives the run (OWL-94). It is bound read and written:
-        // under bwrap the temporary folder is made anew, empty, inside the
-        // sandbox's private `/tmp`, so a folder the runner made there would
-        // not be seen.
+        // writes outlives the run (OWL-94). It is bound read and written, as
+        // it was when bwrap made the temporary folder anew, empty, for each
+        // command; since OWL-330 the temporary folder is bound whole, so the
+        // folder is seen either way.
         let config = match &login {
             Some(_) => {
                 let config = temp.path().join(HARNESS_CONFIG_DIR);
