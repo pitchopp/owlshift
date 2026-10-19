@@ -130,6 +130,7 @@ use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, ParkReason, Status, TicketState, Transition};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::answer_check::{self, Readiness};
+use owlshift_runner::executor::gate::GATE_LOG;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::{
     account_author, asked_choices, build_refusal_after, stage_event, tell_build, thread,
@@ -290,6 +291,10 @@ pub struct Expect {
     pub brief_refused_choices: Option<Vec<String>>,
     /// The commands of the gate the step's run passed.
     pub gate_passed: Option<Vec<String>>,
+    /// The commands the runner's gate ran after the step's run, in order, as
+    /// its `gate.log` heads them (`$ <command>`), each line once per command
+    /// started: `[]` when no gate ran (OWL-355).
+    pub gate_log: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1566,6 +1571,27 @@ impl Driver {
                 format!("{expected:?}"),
                 format!("{:?}", gate.commands),
             )?;
+        }
+        if let Some(expected) = &expect.gate_log {
+            let report = self
+                .last_run
+                .as_ref()
+                .ok_or("expected a run, found none")?;
+            let dir = report
+                .stdout_log
+                .parent()
+                .ok_or("the run's log has no directory")?;
+            let path = dir.join(GATE_LOG);
+            let log = match fs::read_to_string(&path) {
+                Ok(log) => log,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            let found: Vec<&str> = log
+                .lines()
+                .filter_map(|line| line.strip_prefix("$ "))
+                .collect();
+            same("gate_log", format!("{expected:?}"), format!("{found:?}"))?;
         }
         Ok(())
     }

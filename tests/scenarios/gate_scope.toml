@@ -1,0 +1,53 @@
+# OWL-355's acceptance scenario, played by crates/owlshift-testkit/tests/scenarios.rs.
+# It plays on the gate/ fixture folder (the project in repo/, prepared results in
+# results/), with a gate of two commands standing for two crates' tests: the
+# first is the check of GREETING.md's own part, the second the check of another
+# part that relies on it (the greeting names its reader). Both run the same under
+# sh and cmd. The second command is the gate's last, so a red one still leaves
+# every command in gate.log once.
+
+description = """
+DEMO-2: the build changes GREETING.md only and runs the check covering it, which
+passes; its result says so. The runner runs the whole gate once: the other part's
+check fails on that change, a failed run, still at Build, nothing pushed. The next
+Build brief names the failing command in its gate failure; the fix run commits a
+greeting both checks accept, the runner's gate passes once, and the ticket moves to
+Verify with the branch pushed."""
+fixture = "gate"
+ticket = "DEMO-2"
+start = "2026-10-19T09:00:00Z"
+gate = ["git grep -q Hello -- GREETING.md", "git grep -q reader -- GREETING.md"]
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+[step.run]
+files = { "GREETING.md" = "Hello, world.\n" }
+commit = "Add a greeting"
+result = "results/build-scoped.json"
+[step.expect]
+event = "run_failed"
+stage = "build"
+failed_runs = 1
+gate_failure = "git grep -q reader -- GREETING.md"
+brief_gate_failure = "none"
+gate_log = ["git grep -q Hello -- GREETING.md", "git grep -q reader -- GREETING.md"]
+branch_pushed = false
+
+[[step]]
+[step.run]
+files = { "GREETING.md" = "Hello, reader.\n" }
+commit = "Greet the reader"
+result = "results/build-scoped.json"
+[step.expect]
+event = "completed"
+stage = "verify"
+failed_runs = 0
+brief_gate_failure = "git grep -q reader -- GREETING.md"
+gate_failure = "none"
+gate_passed = ["git grep -q Hello -- GREETING.md", "git grep -q reader -- GREETING.md"]
+gate_log = ["git grep -q Hello -- GREETING.md", "git grep -q reader -- GREETING.md"]
+branch_pushed = true
+branch_files = { "GREETING.md" = "Hello, reader.\n" }
