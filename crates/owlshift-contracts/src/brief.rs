@@ -608,6 +608,19 @@ pub enum ThreadEntry {
         #[schemars(length(min = 1))]
         questions: Vec<Question>,
     },
+    /// A round the decider answered (format 19, OWL-359): every question's
+    /// latest verdict is `answered`. It takes the place of the round's
+    /// `questions` entry, and its re-asks are folded into it. Each question
+    /// shows what was asked and what the answer check understood of the
+    /// decider's answer, which the RESUME comment told them; the options the
+    /// decider chose among are on the ticket, in the round's QUESTIONS
+    /// comment. An answer check never judges such a round: it is not an ask.
+    Answered {
+        round: NonZeroU32,
+        at: Timestamp,
+        #[schemars(length(min = 1))]
+        questions: Vec<AnsweredQuestion>,
+    },
     /// A comment on the ticket.
     Comment {
         at: Timestamp,
@@ -621,8 +634,11 @@ pub enum ThreadEntry {
     /// settles that question and nothing else, and yields to the decider.
     Decision {
         at: Timestamp,
-        /// The question as the raising run asked it, under that run's id.
-        question: Question,
+        /// The question as the raising run asked it, under that run's id:
+        /// its id and text since format 19 (OWL-359), the decision saying
+        /// what was chosen, and whole when the decider replied to the
+        /// DECISION comment, whose reply may name an option.
+        question: DecidedQuestion,
         decision: String,
         /// What settles it: the ticket, a rule, a file, an earlier answer.
         basis: String,
@@ -632,6 +648,54 @@ pub enum ThreadEntry {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         reversed: bool,
     },
+}
+
+/// A question of an [`ThreadEntry::Answered`] round (OWL-359).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnsweredQuestion {
+    /// Its id in the round.
+    pub id: QuestionId,
+    /// The question, as asked.
+    pub text: String,
+    /// The reason of its latest `answered` verdict: what the answer check
+    /// understood the decider's answer to be.
+    pub understood: String,
+}
+
+/// The question of a [`ThreadEntry::Decision`] (format 19, OWL-359): whole,
+/// or its id and text only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum DecidedQuestion {
+    /// As the raising run asked it, its context and options included.
+    Whole(Question),
+    /// Its id and text: the decision says what was chosen.
+    Short(ShortQuestion),
+}
+
+impl DecidedQuestion {
+    pub fn id(&self) -> &QuestionId {
+        match self {
+            Self::Whole(question) => &question.id,
+            Self::Short(question) => &question.id,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Whole(question) => &question.text,
+            Self::Short(question) => &question.text,
+        }
+    }
+}
+
+/// A question shown by its id and text alone (OWL-359).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShortQuestion {
+    pub id: QuestionId,
+    pub text: String,
 }
 
 /// Where the ticket starts again: paths relative to the worktree.
@@ -697,7 +761,9 @@ impl Brief {
             | ThreadEntry::Reask {
                 round, questions, ..
             } => Some((*round, questions.as_slice())),
-            ThreadEntry::Comment { .. } | ThreadEntry::Decision { .. } => None,
+            ThreadEntry::Answered { .. }
+            | ThreadEntry::Comment { .. }
+            | ThreadEntry::Decision { .. } => None,
         })
     }
 
@@ -1101,6 +1167,40 @@ pub(crate) fn validate_thread<'a>(
                     ));
                 }
                 check_question_order(contract, questions)?;
+                rounds.insert(*round, questions.len());
+            }
+            ThreadEntry::Answered {
+                round, questions, ..
+            } => {
+                if questions.is_empty() {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!("answered round {round} has no question"),
+                    ));
+                }
+                if let Some((last, _)) = rounds.last_key_value()
+                    && last >= round
+                {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!("round {round} comes after round {last}"),
+                    ));
+                }
+                for (index, question) in questions.iter().enumerate() {
+                    let expected = QuestionId::nth(u32::try_from(index + 1).unwrap_or(u32::MAX));
+                    if question.id != expected {
+                        return Err(ContractError::invalid(
+                            contract,
+                            format!(
+                                "answered round {round}: question {} is out of order: expected \
+                                 {expected}",
+                                question.id
+                            ),
+                        ));
+                    }
+                }
+                // A re-ask of an answered round is folded into it, so none
+                // follows; one would still name a question of the round.
                 rounds.insert(*round, questions.len());
             }
             ThreadEntry::Reask {

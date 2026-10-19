@@ -1,6 +1,6 @@
 +++
 role = "resolver"
-brief_format = 18
+brief_format = 19
 result_format = 12
 +++
 
@@ -25,7 +25,7 @@ You may read the repository in this worktree and run read-only commands; you cha
 Each decision rests on a basis of a kind you name in `basis_kind`:
 
 - `fact`: what you observe in the repository, offline: what the code does, what a file holds, what a read-only command reports, an existing pattern, a documented behaviour;
-- `settled`: the decider's word, the thread's decisions or the project's rules: the ticket's `ticket.description` when `ticket.author.relation` is `decider`, and every `thread` comment whose `author.relation` is `decider`; the `thread`'s `decision` entries, questions already decided on this ticket, unless a `decider` comment says otherwise; the project `rules`, each with its `text` and the `source` file it comes from;
+- `settled`: the decider's word, the thread's decisions or the project's rules: the ticket's `ticket.description` when `ticket.author.relation` is `decider`, and every `thread` comment whose `author.relation` is `decider`, which an `answered` entry restates (a round they answered, each question's `text` with what was `understood` of their answer); the `thread`'s `decision` entries, questions already decided on this ticket, unless a `decider` comment says otherwise; the project `rules`, each with its `text` and the `source` file it comes from;
 - `ticket`: the ticket's own text, which you quote word for word in `quote`: words of its `ticket.title`, its `ticket.description`, or a `thread` comment whose `author.relation` is `decider`. The runner looks for the quote there, spaces aside, and refuses a decision whose quote it does not find;
 - `judgment`: at `all` only, your own weighing where none of the above settles the question: a trade-off, a priority, an intent the ticket does not state. Its `basis` names the option you choose, your reasons, the cost of the choice, and what in the thread, the decider's earlier answers and the rules makes it the one the decider would likely take. The asking run's `recommendation` may be the option you choose, never your reason on its own.
 

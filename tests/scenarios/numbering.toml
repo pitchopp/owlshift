@@ -40,7 +40,8 @@ comment = { author = "maintainer", body = "Q2: no sign-off, just \"Hello, reader
 answer = { result = "results/check-round1-q2-answered.json" }
 expect = { event = "answered", stage = "build", waiting = "none", round = 1, comments = 5 }
 
-# The thread's latest ask is the re-ask of Q2: the run goes on from it.
+# Round 1 is answered: the thread shows it as one `answered` entry, its re-ask
+# of Q2 folded into it (OWL-359), and no ask is open. The run goes on from it.
 [[step]]
 run = { result = "results/questions-round2-continued.json" }
 [step.expect]
@@ -51,7 +52,8 @@ round = 1
 failed_runs = 1
 tracker_stage = "In Progress"
 comments = 5
-brief_latest_ask = ["Q2"]
+brief_latest_ask = []
+brief_entries = ["answered", "decider", "decider", "owlshift"]
 brief_result_refusal = "none"
 
 [[step]]

@@ -28,8 +28,10 @@ use crate::Role;
 /// `pull_request_reviews`, and a question's `replan` (OWL-300); format 16 a
 /// question's lettered options and structured recommendation (OWL-324);
 /// format 17 the resolver's `delegation` (OWL-337); format 18 the
-/// resolver's `asked_by` and a question's `finding` in `resolve` (OWL-343).
-pub const BRIEF_FORMAT: u32 = 18;
+/// resolver's `asked_by` and a question's `finding` in `resolve` (OWL-343);
+/// format 19 the thread's `answered` entries and a decision's short
+/// question (OWL-359).
+pub const BRIEF_FORMAT: u32 = 19;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role

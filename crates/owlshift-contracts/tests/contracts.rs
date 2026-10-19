@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use owlshift_contracts::ContractError;
 use owlshift_contracts::brief::{
-    Brief, MAX_CHOICE_BYTES, MAX_EXCERPT_BYTES, MAX_REFUSED_CHOICES, MAX_REPLY_BYTES,
-    MAX_RESULT_REFUSAL_BYTES, ThreadEntry,
+    Brief, DecidedQuestion, MAX_CHOICE_BYTES, MAX_EXCERPT_BYTES, MAX_REFUSED_CHOICES,
+    MAX_REPLY_BYTES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry,
 };
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
@@ -136,11 +136,24 @@ fn every_contract_round_trips() {
     assert_eq!(resolved.resolutions[1].question().as_str(), "Q3");
 
     let brief = round_trip("brief.json", Brief::parse, Brief::render);
+    // A decision the decider replied to keeps its question whole, another
+    // shows its id and text, and an answered round shows its readings
+    // (OWL-359): neither is an ask.
     assert!(matches!(
         brief.thread.last(),
-        Some(ThreadEntry::Decision { question, .. }) if question.category == "naming"
+        Some(ThreadEntry::Decision { question: DecidedQuestion::Whole(question), .. })
+            if question.category == "naming"
     ));
-    // A decision is not an ask: the latest ask is still the re-ask of Q2.
+    assert!(matches!(
+        &brief.thread[1],
+        ThreadEntry::Decision { question: DecidedQuestion::Short(question), .. }
+            if question.text == "Which module holds the command?"
+    ));
+    assert!(matches!(
+        &brief.thread[0],
+        ThreadEntry::Answered { questions, .. } if questions[0].understood.starts_with("A, the event log")
+    ));
+    // The latest ask is still the re-ask of Q2.
     assert_eq!(brief.latest_ask().map(|(_, q)| q.len()), Some(1));
     let event = round_trip("event.json", Event::parse, Event::render);
     // One line of the event log reads back as the same event.
@@ -742,24 +755,24 @@ fn result_against_the_brief() {
             v["verdicts"].as_array_mut().unwrap().insert(0, q1);
         })
         .validate_against(&answer_check),
-        "the verdict for Q1 names a question the latest ask of round 1 did not ask",
+        "the verdict for Q1 names a question the latest ask of round 2 did not ask",
     );
     rejects(
         "a done answer check without verdicts",
         checked(|v| v["verdicts"] = json!([])).validate_against(&answer_check),
-        "no verdict for Q2 of round 1",
+        "no verdict for Q2 of round 2",
     );
-    // A later round is the latest ask, whole: Q1 and Q2 of round 2.
+    // A later round is the latest ask, whole: Q1 and Q2 of round 3.
     let round_two = brief(|v| {
         v["role"] = json!("answer_check");
-        let mut round = v["thread"][0].clone();
-        round["round"] = json!(2);
+        let mut round = v["thread"][2].clone();
+        round["round"] = json!(3);
         v["thread"].as_array_mut().unwrap().push(round);
     });
     rejects(
         "a verdict missing for the latest round",
         checked(|_| {}).validate_against(&round_two),
-        "no verdict for Q1 of round 2",
+        "no verdict for Q1 of round 3",
     );
     rejects(
         "an answer check on a thread that asks nothing",
@@ -1404,12 +1417,12 @@ fn brief_rejections() {
     let parse = |edit: fn(&mut Value)| Brief::parse(&edited("brief.json", edit));
     rejects(
         "unknown field in a tagged thread entry",
-        parse(|v| v["thread"][1]["extra"] = json!(1)),
+        parse(|v| v["thread"][3]["extra"] = json!(1)),
         "unknown field `extra`",
     );
     rejects(
         "unknown thread entry type",
-        parse(|v| v["thread"][1]["type"] = json!("note")),
+        parse(|v| v["thread"][3]["type"] = json!("note")),
         "unknown variant `note`",
     );
     rejects(
@@ -1435,7 +1448,7 @@ fn brief_rejections() {
     rejects(
         "questions of a round not starting at Q1",
         parse(|v| {
-            v["thread"][0]["questions"]
+            v["thread"][2]["questions"]
                 .as_array_mut()
                 .unwrap()
                 .remove(0);
@@ -1445,26 +1458,26 @@ fn brief_rejections() {
     rejects(
         "re-ask naming a question twice",
         parse(|v| {
-            let q = v["thread"][2]["questions"][0].clone();
-            v["thread"][2]["questions"].as_array_mut().unwrap().push(q);
+            let q = v["thread"][4]["questions"][0].clone();
+            v["thread"][4]["questions"].as_array_mut().unwrap().push(q);
         }),
         "repeated or out of order",
     );
     rejects(
         "re-ask of a question the round did not ask",
-        parse(|v| v["thread"][2]["questions"][0]["id"] = json!("Q3")),
+        parse(|v| v["thread"][4]["questions"][0]["id"] = json!("Q3")),
         "was not asked in that round",
     );
     rejects(
         "re-ask of a round that does not exist",
-        parse(|v| v["thread"][2]["round"] = json!(2)),
+        parse(|v| v["thread"][4]["round"] = json!(3)),
         "not earlier in the thread",
     );
     rejects(
         "re-ask before its round",
         parse(|v| {
             let thread = v["thread"].as_array_mut().unwrap();
-            let reask = thread.remove(2);
+            let reask = thread.remove(4);
             thread.insert(0, reask);
         }),
         "not earlier in the thread",
@@ -1475,11 +1488,40 @@ fn brief_rejections() {
             let round = v["thread"][0].clone();
             v["thread"].as_array_mut().unwrap().push(round);
         }),
-        "round 1 comes after round 1",
+        "round 1 comes after round 2",
+    );
+    rejects(
+        "an answered round with no question",
+        parse(|v| v["thread"][0]["questions"] = json!([])),
+        "answered round 1 has no question",
+    );
+    rejects(
+        "an answered round not starting at Q1",
+        parse(|v| v["thread"][0]["questions"][0]["id"] = json!("Q2")),
+        "answered round 1: question Q2 is out of order",
+    );
+    rejects(
+        "an answered question with its options",
+        parse(|v| v["thread"][0]["questions"][0]["options"] = json!([])),
+        "unknown field `options`",
+    );
+    rejects(
+        "a re-ask of a round not answered in this thread",
+        parse(|v| {
+            let thread = v["thread"].as_array_mut().unwrap();
+            thread.remove(0);
+            thread[3]["round"] = json!(1);
+        }),
+        "not earlier in the thread",
+    );
+    rejects(
+        "a short decision question with one field of a whole one",
+        parse(|v| v["thread"][1]["question"]["category"] = json!("naming")),
+        "did not match any variant",
     );
     rejects(
         "bad relation",
-        parse(|v| v["thread"][3]["author"]["relation"] = json!("admin")),
+        parse(|v| v["thread"][5]["author"]["relation"] = json!("admin")),
         "unknown variant `admin`",
     );
     rejects(
@@ -1489,7 +1531,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(19)),
+        parse(|v| v["format"] = json!(20)),
         "upgrade Owlshift",
     );
     rejects(

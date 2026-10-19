@@ -1,5 +1,5 @@
 {
-  "format": 18,
+  "format": 19,
   "role": "build",
   "project": "owlshift",
   "ticket": {
@@ -13,8 +13,27 @@
   "decider": "Ada",
   "thread": [
     {
-      "type": "questions",
+      "type": "answered",
       "round": 1,
+      "at": "2026-09-28T08:00:00Z",
+      "questions": [
+        {
+          "id": "Q1",
+          "text": "Which store do the logs read?",
+          "understood": "A, the event log: the recommendation."
+        }
+      ]
+    },
+    {
+      "type": "decision",
+      "at": "2026-09-28T08:30:00Z",
+      "question": { "id": "Q1", "text": "Which module holds the command?" },
+      "decision": "`crates/owlshift-cli/src/logs.rs`, as the other commands.",
+      "basis": "The CLI's other commands each have a module."
+    },
+    {
+      "type": "questions",
+      "round": 2,
       "at": "2026-09-28T09:00:00Z",
       "questions": [
         {
@@ -45,7 +64,7 @@
     },
     {
       "type": "reask",
-      "round": 1,
+      "round": 2,
       "at": "2026-09-28T10:30:00Z",
       "questions": [
         {

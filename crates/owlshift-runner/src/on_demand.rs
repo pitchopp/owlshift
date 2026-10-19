@@ -58,7 +58,7 @@
 //! branch, then through Verify to a push to the same pull request (OWL-307);
 //! see the `review_loop` module.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -79,8 +79,8 @@ use owlshift_adapters::forge::{
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    AskedBy, Author, Brief, Checkpoint, GateFailure, GivenPlan, PermissionLevel, Permissions,
-    PullRequestReview, RebaseBrief, Relation, ThreadEntry, TicketBrief,
+    AnsweredQuestion, AskedBy, Author, Brief, Checkpoint, GateFailure, GivenPlan, PermissionLevel,
+    Permissions, PullRequestReview, RebaseBrief, Relation, ThreadEntry, TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
@@ -5635,6 +5635,16 @@ fn push_what(kind: PushKind) -> &'static str {
 /// no run needs it; the other kinds cut to 4,096 bytes, a REPLY whole. A
 /// person's comment is always whole.
 ///
+/// What was settled shows short (OWL-359; build plan, "The brief's
+/// thread"): a round whose every question's latest verdict is `answered`
+/// is one `answered` entry in the place of its first ask, its re-asks
+/// folded into it, each question its text and what the answer check
+/// understood, as the RESUME comment told it; any other ask is whole, the
+/// latest one an answer check judges among them. A decision shows its
+/// question's id and text, but whole when it was reversed or a comment
+/// replies directly to its DECISION comment, a reply that may name an
+/// option.
+///
 /// The test bench's stand-in driver builds its briefs' threads with it too
 /// (`owlshift_testkit::scenario`), from the asks and decisions it keeps.
 pub fn thread(
@@ -5643,6 +5653,7 @@ pub fn thread(
     decisions: &[KeptDecision],
     current: &Person,
 ) -> Vec<ThreadEntry> {
+    let shown = Shown::new(comments, asks);
     let posted: HashSet<&str> = asks
         .iter()
         .map(|ask| ask.comment.as_str())
@@ -5676,7 +5687,7 @@ pub fn thread(
                     name: String::new(),
                 };
             }
-            thread.push(entry.entry());
+            thread.extend(entry.entry(&shown));
         }
         thread.push(ThreadEntry::Comment {
             at: comment.created_at,
@@ -5684,8 +5695,54 @@ pub fn thread(
             body: brief_body(comment),
         });
     }
-    thread.extend(kept.map(|entry| entry.entry()));
+    thread.extend(kept.filter_map(|entry| entry.entry(&shown)));
     thread
+}
+
+/// What a brief's thread shows short (OWL-359): the questions of each
+/// answered round, and the DECISION comments a comment replies to.
+struct Shown<'a> {
+    answered: HashMap<NonZeroU32, Vec<AnsweredQuestion>>,
+    replied: HashSet<&'a str>,
+}
+
+impl<'a> Shown<'a> {
+    fn new(comments: &'a [Comment], asks: &[Ask]) -> Self {
+        // A round shows as `answered` in the place of its first ask: one kept
+        // with no such ask stays as its asks.
+        let rounds: BTreeSet<NonZeroU32> = asks
+            .iter()
+            .filter(|ask| ask.kind == AskKind::Questions)
+            .map(|ask| ask.round)
+            .collect();
+        let answered = rounds
+            .into_iter()
+            .filter_map(|round| {
+                let understood = answer_check::understood(
+                    asks.iter()
+                        .filter(|ask| ask.round == round)
+                        .map(|ask| (&ask.questions[..], &ask.verdicts[..])),
+                );
+                let questions = understood
+                    .into_iter()
+                    .map(|(question, verdict)| {
+                        let verdict = verdict.filter(|v| v.class == AnswerClass::Answered)?;
+                        Some(AnsweredQuestion {
+                            id: question.id,
+                            text: question.text,
+                            understood: verdict.reason,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                (!questions.is_empty()).then_some((round, questions))
+            })
+            .collect();
+        let replied = comments
+            .iter()
+            .filter_map(|comment| comment.parent.as_deref())
+            .collect();
+        Self { answered, replied }
+    }
 }
 
 /// The most bytes a brief's thread shows of a runner's comment that it cuts
@@ -5719,9 +5776,10 @@ fn brief_body(comment: &Comment) -> String {
             "the plan it showed is kept in the ticket ref, and the latest is this brief's `plan`"
         }
         MarkerKind::Resume => {
-            "it restated the round's questions, which its `questions` entry holds, with the \
-             answer check's reading of the decider's answers, which are their own `comment` \
-             entries"
+            "it restated the round's questions with the answer check's reading of the \
+             decider's answers, which its `answered` entry holds (its `questions` entry when \
+             the ticket's record kept no reading), the answers themselves being their own \
+             `comment` entries"
         }
         MarkerKind::Delivery => {
             "it reported a push of the ticket's branch, which the pull request holds; the \
@@ -5817,10 +5875,27 @@ impl Kept<'_> {
         }
     }
 
-    fn entry(&self) -> ThreadEntry {
+    /// The entry a thread shows, `None` for the re-ask of an answered round,
+    /// folded into its round's `answered` entry.
+    fn entry(&self, shown: &Shown<'_>) -> Option<ThreadEntry> {
         match self {
-            Self::Ask(ask) => ask.entry(),
-            Self::Decision(kept) => kept.entry(),
+            Self::Ask(ask) => match shown.answered.get(&ask.round) {
+                Some(questions) => {
+                    (ask.kind == AskKind::Questions).then(|| ThreadEntry::Answered {
+                        round: ask.round,
+                        at: ask.at,
+                        questions: questions.clone(),
+                    })
+                }
+                None => Some(ask.entry()),
+            },
+            Self::Decision(kept) => Some(
+                if kept.reversed.is_some() || shown.replied.contains(kept.comment.as_str()) {
+                    kept.entry()
+                } else {
+                    kept.short_entry()
+                },
+            ),
         }
     }
 }
@@ -6240,7 +6315,8 @@ fn path(path: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use owlshift_contracts::brief::{
-        MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES,
+        DecidedQuestion, MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES,
+        ShortQuestion,
     };
     use owlshift_contracts::result::RefusedChoice;
     use owlshift_core::decider::DeciderRule;
@@ -6502,6 +6578,7 @@ mod tests {
             .map(|entry| match entry {
                 ThreadEntry::Questions { round, .. } => format!("questions {round}"),
                 ThreadEntry::Reask { round, .. } => format!("reask {round}"),
+                ThreadEntry::Answered { round, .. } => format!("answered {round}"),
                 ThreadEntry::Decision { decision, .. } => format!("decision {decision}"),
                 ThreadEntry::Comment { author, body, .. } => {
                     format!("{:?}: {}", author.relation, body.lines().next().unwrap())
@@ -6522,6 +6599,242 @@ mod tests {
                 "Owlshift: [owlshift] DECISION",
                 "Owlshift: [owlshift] DELIVERY",
             ]
+        );
+    }
+
+    /// A settled thread for the OWL-359 tests: round 1 asks Q1 and Q2, the
+    /// decider answers Q1, Q2 is asked again and answered; round 2 asks Q1.
+    /// `round_one` and `reasked` are the verdicts kept on round 1's asks,
+    /// `round_two` those on round 2's.
+    fn settled_thread(
+        round_one: &[(&str, AnswerClass, &str)],
+        reasked: &[(&str, AnswerClass, &str)],
+        round_two: &[(&str, AnswerClass, &str)],
+        decision_reply: bool,
+    ) -> Vec<ThreadEntry> {
+        let decider = Person {
+            id: "u1".into(),
+            name: "Maintainer".into(),
+        };
+        let at = |minute: u32| -> Timestamp {
+            format!("2026-10-02T10:{minute:02}:00Z").parse().unwrap()
+        };
+        let comment = |id: &str, minute: u32, body: &str| Comment {
+            id: id.into(),
+            author: TrackerAuthor::Account(decider.clone()),
+            created_at: at(minute),
+            edited_at: None,
+            body: body.into(),
+            parent: None,
+        };
+        let question = |id: &str| Question {
+            id: QuestionId::new(id).unwrap(),
+            category: "scope".into(),
+            context: format!("The context of {id}."),
+            text: format!("The text of {id}?"),
+            options: vec![
+                result::QuestionOption::new("Yes"),
+                result::QuestionOption::new("No"),
+            ],
+            recommendation: None,
+            replan: false,
+        };
+        let verdicts = |given: &[(&str, AnswerClass, &str)]| -> Vec<AnswerVerdict> {
+            given
+                .iter()
+                .map(|(id, class, reason)| AnswerVerdict {
+                    question: QuestionId::new(*id).unwrap(),
+                    class: *class,
+                    reason: (*reason).into(),
+                    reply: None,
+                })
+                .collect()
+        };
+        let ask = |kind, round, minute, id: &str, questions: Vec<Question>, kept: Vec<_>| Ask {
+            kind,
+            round: NonZeroU32::new(round).unwrap(),
+            at: at(minute),
+            comment: id.into(),
+            questions,
+            decider: AskDecider {
+                account: "u1".into(),
+                by: DeciderRule::Assignee,
+            },
+            verdicts: kept,
+            result_refusal: None,
+        };
+        let asks = [
+            ask(
+                AskKind::Questions,
+                1,
+                10,
+                "q1",
+                vec![question("Q1"), question("Q2")],
+                verdicts(round_one),
+            ),
+            ask(
+                AskKind::Reask,
+                1,
+                12,
+                "r1",
+                vec![question("Q2")],
+                verdicts(reasked),
+            ),
+            ask(
+                AskKind::Questions,
+                2,
+                20,
+                "q2",
+                vec![question("Q1")],
+                verdicts(round_two),
+            ),
+        ];
+        let decision = KeptDecision {
+            at: at(15),
+            comment: "dec1".into(),
+            question: question("Q1"),
+            decision: "Yes, as the ticket says.".into(),
+            basis: "The ticket.".into(),
+            basis_kind: None,
+            asked_by: None,
+            reversed: None,
+        };
+        let mut reply = comment("re1", 16, "B instead.");
+        reply.parent = Some("dec1".into());
+        let mut comments = vec![
+            comment(
+                "q1",
+                10,
+                "[owlshift] QUESTIONS · round 1\n\nThe questions.\n",
+            ),
+            comment("a1", 11, "Q1: A"),
+            comment("r1", 12, "[owlshift] RE-ASK · round 1\n\nAgain.\n"),
+            comment("a2", 13, "Q2: B"),
+            comment("dec1", 15, "[owlshift] DECISION\n\nA decision.\n"),
+            comment("q2", 20, "[owlshift] QUESTIONS · round 2\n\nMore.\n"),
+            comment("a3", 21, "ok"),
+        ];
+        if decision_reply {
+            comments.insert(5, reply);
+        }
+        thread(&comments, &asks, &[decision], &decider)
+    }
+
+    /// The `type` of each entry, a comment's body's first line in its place.
+    fn kinds(thread: &[ThreadEntry]) -> Vec<String> {
+        thread
+            .iter()
+            .map(|entry| match entry {
+                ThreadEntry::Questions { round, .. } => format!("questions {round}"),
+                ThreadEntry::Reask { round, .. } => format!("reask {round}"),
+                ThreadEntry::Answered { round, .. } => format!("answered {round}"),
+                ThreadEntry::Decision { .. } => "decision".to_owned(),
+                ThreadEntry::Comment { body, .. } => body.lines().next().unwrap().to_owned(),
+            })
+            .collect()
+    }
+
+    const ANSWERED: AnswerClass = AnswerClass::Answered;
+
+    /// A round every question of which is answered reads as its readings, in
+    /// its first ask's place, its re-ask folded into it; the open round, the
+    /// one an answer check judges, stays whole (OWL-359).
+    #[test]
+    fn an_answered_round_reads_as_its_readings_and_folds_its_reasks() {
+        let thread = settled_thread(
+            &[
+                ("Q1", ANSWERED, "A: yes."),
+                ("Q2", AnswerClass::Unanswered, "Nothing on Q2."),
+            ],
+            &[("Q2", ANSWERED, "B: no.")],
+            &[],
+            false,
+        );
+        assert_eq!(
+            kinds(&thread),
+            [
+                "answered 1",
+                "Q1: A",
+                "Q2: B",
+                "decision",
+                "questions 2",
+                "ok"
+            ]
+        );
+        let ThreadEntry::Answered { at, questions, .. } = &thread[0] else {
+            unreachable!()
+        };
+        assert_eq!(at.to_string(), "2026-10-02T10:10:00Z");
+        assert_eq!(
+            questions,
+            &[
+                AnsweredQuestion {
+                    id: QuestionId::new("Q1").unwrap(),
+                    text: "The text of Q1?".into(),
+                    understood: "A: yes.".into(),
+                },
+                AnsweredQuestion {
+                    id: QuestionId::new("Q2").unwrap(),
+                    text: "The text of Q2?".into(),
+                    understood: "B: no.".into(),
+                },
+            ]
+        );
+        // The open round keeps its options for the answer check.
+        let ThreadEntry::Questions { questions, .. } = &thread[4] else {
+            unreachable!()
+        };
+        assert_eq!(questions[0].options.len(), 2);
+    }
+
+    /// A round with a question not answered, or with no verdict kept (an ask
+    /// read from format 2), reads whole, its re-ask too (OWL-359).
+    #[test]
+    fn a_round_not_all_answered_reads_whole() {
+        let partly = settled_thread(
+            &[
+                ("Q1", ANSWERED, "A: yes."),
+                ("Q2", AnswerClass::Partial, "Which part?"),
+            ],
+            &[("Q2", AnswerClass::CounterQuestion, "What is B?")],
+            &[("Q1", ANSWERED, "Yes.")],
+            false,
+        );
+        assert_eq!(
+            kinds(&partly)[..5],
+            ["questions 1", "Q1: A", "reask 1", "Q2: B", "decision"]
+        );
+        // Round 2 is answered, and reads short after the whole round 1.
+        assert_eq!(kinds(&partly)[5], "answered 2");
+        let unread = settled_thread(&[], &[], &[], false);
+        assert_eq!(kinds(&unread)[..3], ["questions 1", "Q1: A", "reask 1"]);
+    }
+
+    /// A decision shows its question's id and text, whole when the decider
+    /// replied to its DECISION comment or it was reversed (OWL-359).
+    #[test]
+    fn a_decision_reads_short_unless_the_decider_replied_to_it() {
+        let question = |thread: &[ThreadEntry]| {
+            thread
+                .iter()
+                .find_map(|entry| match entry {
+                    ThreadEntry::Decision { question, .. } => Some(question.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let short = question(&settled_thread(&[], &[], &[], false));
+        assert_eq!(
+            short,
+            DecidedQuestion::Short(ShortQuestion {
+                id: QuestionId::new("Q1").unwrap(),
+                text: "The text of Q1?".into(),
+            })
+        );
+        let replied = question(&settled_thread(&[], &[], &[], true));
+        assert!(
+            matches!(&replied, DecidedQuestion::Whole(q) if q.options.len() == 2),
+            "{replied:?}"
         );
     }
 
