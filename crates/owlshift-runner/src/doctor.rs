@@ -48,8 +48,8 @@ use crate::executor::{
 use crate::forge::GITHUB_TOKEN_HELP;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::{
-    AppError, DataDirSource, DefaultBranch, DefaultBranchFile, RunError, StatesError, System,
-    TokenTryError, exact_version_of, older_than, version_of,
+    AppError, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError, StatesError,
+    System, TokenTryError, exact_version_of, older_than, version_of,
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
@@ -294,6 +294,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
     checks.extend(drain_slot_check(system, config));
+    checks.extend(quarantine_check(system, config, home));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
@@ -2114,6 +2115,62 @@ fn drain_slot_check(system: &dyn System, config: &Effective) -> Option<Check> {
             clear.join("; ")
         ),
     ))
+}
+
+/// Whether a run's isolation check left the project quarantined (OWL-368):
+/// a failure while its `unverified` marker stands and no command holds the
+/// project's lock, since every command then refuses the project; with the
+/// lock held, information, since every run writes the marker as it starts.
+/// Read for a project file that loads or is invalid: the quarantine does
+/// not depend on it.
+fn quarantine_check(system: &dyn System, config: &Effective, home: Option<&Path>) -> Option<Check> {
+    const SUBJECT: &str = "quarantine";
+    let (FileState::Loaded { path, .. } | FileState::Invalid { path, .. }) = &config.project else {
+        return None;
+    };
+    let root = path.parent()?;
+    Some(match system.quarantine(root) {
+        Ok(MarkerState::Clear) => Check::ok(Section::Project, SUBJECT, "not quarantined"),
+        Ok(MarkerState::InFlight) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "a command is working the project, and a run writes the marker as it starts: run \
+             `owlshift doctor` again once it ends",
+        ),
+        Ok(MarkerState::Marked { path, text }) => {
+            let said: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            let folder = path.parent().map_or_else(String::new, |p| shown(p, home));
+            Check::fail(
+                Section::Project,
+                SUBJECT,
+                format!("{} says: {}", shown(&path, home), said.join(" ")),
+                "A run's isolation check did not pass, or did not finish, so the project's \
+                 dedicated checkout may hold what it changed outside its worktree. Until a \
+                 person clears the quarantine, Owlshift refuses the whole project on this \
+                 machine: no ticket of it is run, continued, taken in or built.",
+                vec![
+                    Step::act(format!(
+                        "Look at what the marker names, in the project's folder {folder}"
+                    )),
+                    Step::run_noting(
+                        "owlshift unquarantine",
+                        "in the project's repository: it shows the marker, then clears it once \
+                         you type the project's name",
+                    ),
+                    Step::act(
+                        "Or, to start from a fresh clone, delete the `checkout` and `worktrees` \
+                         folders there first, which loses the ticket refs, then run `owlshift \
+                         unquarantine`",
+                    ),
+                ],
+            )
+        }
+        Err(why) => Check::info(
+            Section::Project,
+            SUBJECT,
+            format!("the marker was not read: {why}"),
+        ),
+    })
 }
 
 fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
@@ -3990,6 +4047,45 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         }
         let report = run(&ready(), &no_config());
         assert!(report.checks.iter().all(|c| c.subject != "drain slot"));
+    }
+
+    /// OWL-368: a marker that stands with the project's lock free fails the
+    /// report, showing what it says and how to clear it; one while a command
+    /// works the project, or one that cannot be read, is information; none
+    /// is ok.
+    #[test]
+    fn a_quarantine_fails_with_its_marker_and_how_to_clear_it() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = markdown_project();
+        let marked = MarkerState::Marked {
+            path: PathBuf::from("/home/ada/.local/share/owlshift/projects/github.com/o/r/unverified"),
+            text: "Run r1 of OWL-160 broke isolation:\n- the main checkout's HEAD moved\n"
+                .to_owned(),
+        };
+        let report = run(&ready().quarantine_is(Ok(marked)), &config);
+        assert!(!report.ready(), "{report}");
+        let failed = line(&report, "quarantine");
+        assert_eq!(failed.status, Status::Fail);
+        assert_eq!(
+            failed.detail,
+            "~/.local/share/owlshift/projects/github.com/o/r/unverified says: Run r1 of OWL-160 \
+             broke isolation: - the main checkout's HEAD moved"
+        );
+        assert!(
+            failed
+                .fix
+                .iter()
+                .any(|step| matches!(step, Step::Run { command, .. } if command == "owlshift unquarantine")),
+            "{failed:?}"
+        );
+        for (system, status) in [
+            (ready(), Status::Ok),
+            (ready().quarantine_is(Ok(MarkerState::InFlight)), Status::Info),
+            (ready().quarantine_is(Err("no remote".to_owned())), Status::Info),
+        ] {
+            let report = run(&system, &config);
+            assert_eq!(line(&report, "quarantine").status, status, "{report}");
+        }
     }
 
     /// OWL-308: the `secrets` line names the account each tracker and forge

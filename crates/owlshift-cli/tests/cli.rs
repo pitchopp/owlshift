@@ -131,6 +131,30 @@ always_human = []
     assert!(stdout(&output).contains("upgrade Owlshift"));
 }
 
+/// OWL-368: `owlshift unquarantine` lifts a security marker only for a
+/// person at a terminal. Run from a script, its standard input no terminal,
+/// it is refused and the marker stays, whatever the project file says: here
+/// there is none.
+#[test]
+fn unquarantine_is_refused_without_a_terminal() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "https://github.com/acme/app.git"],
+    );
+    let project = config_dir.path().join("data/projects/github.com/acme/app");
+    fs::create_dir_all(&project).unwrap();
+    let marker = project.join("unverified");
+    fs::write(&marker, "Run r1 of OWL-7 broke isolation:\n- the main checkout's HEAD moved\n").unwrap();
+
+    let output = owlshift(repo.path(), config_dir.path(), &["unquarantine"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("confirms it at a terminal"), "{}", stderr(&output));
+    assert!(marker.exists());
+}
+
 #[test]
 fn config_show_lists_the_always_human_categories_with_their_origin() {
     let config_dir = tempfile::tempdir().unwrap();

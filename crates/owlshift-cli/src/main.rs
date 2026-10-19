@@ -5,6 +5,7 @@ mod forget_cmd;
 mod gate_cmd;
 mod init_cmd;
 mod logs_cmd;
+mod unquarantine_cmd;
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -94,6 +95,13 @@ enum Command {
         #[arg(long, value_name = "COMMIT")]
         at: Option<String>,
     },
+    /// Clear this project's quarantine: the marker a run whose isolation
+    /// check did not pass leaves, which makes every command refuse the
+    /// project. Shows what the marker says, then clears it once you type the
+    /// project's name (owner/repo) at a terminal. The dedicated checkout and
+    /// the worktrees stay as they are. Refused while another command works
+    /// the project.
+    Unquarantine,
     /// Print the events `owlshift do`, `continue`, `watch` and `forget`
     /// recorded, oldest first.
     Logs {
@@ -180,6 +188,7 @@ fn main() -> ExitCode {
         Command::Watch { drain: true } => do_cmd::run(&system, &config, do_cmd::Mode::Drain),
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
         Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
+        Command::Unquarantine => unquarantine_cmd::run(&config),
         Command::Logs {
             ticket,
             last,
