@@ -1727,7 +1727,7 @@ impl OnDemand<'_> {
                 sink.emit(&ticket, last_run.as_deref(), EventKind::Decision, residue);
             }
         }
-        let mut review = p.review.clone().unwrap_or_else(TicketReview::new);
+        let mut review = p.review.clone().unwrap_or_default();
         push_pass(
             &mut review,
             ReviewPass {
