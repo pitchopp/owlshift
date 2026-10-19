@@ -35,7 +35,7 @@ use owlshift_contracts::ids::RelativePath;
 use serde_json::{Value, json};
 
 /// The release these fixtures are recorded with: a run on another one fails.
-const VERSION: &str = "2.1.300";
+const VERSION: &str = "2.1.302";
 
 const UUID: &str = "00000000-0000-4000-8000-000000000000";
 const TIMESTAMP: &str = "2026-09-29T12:00:00.000Z";

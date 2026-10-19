@@ -19,7 +19,7 @@
 use owlshift_contracts::Harness;
 
 /// Claude Code releases the contract fixtures were recorded with.
-const CLAUDE: &[&str] = &["2.1.283", "2.1.284", "2.1.300"];
+const CLAUDE: &[&str] = &["2.1.283", "2.1.284", "2.1.300", "2.1.302"];
 
 /// Codex releases the recordings of checks C2 and C7 were made with, which
 /// the adapter's contract tests replay (OWL-299).
@@ -47,6 +47,7 @@ mod tests {
         assert!(is_tested(Harness::Claude, "2.1.283"));
         assert!(is_tested(Harness::Claude, "2.1.284"));
         assert!(is_tested(Harness::Claude, "2.1.300"));
+        assert!(is_tested(Harness::Claude, "2.1.302"));
         for other in ["2.1.285", "2.1", "2.1.2830", "2.1.283-beta.1", ""] {
             assert!(!is_tested(Harness::Claude, other), "{other}");
         }

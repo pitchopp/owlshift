@@ -98,6 +98,23 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
   - Changed, harmless to the adapter: `haiku` resolves to `claude-haiku-5-5`, and `result` gained `safety_stops`.
     The success run's rate-limit event was a plain `allowed`; a constructed line keeps the `allowed_warning` read tested.
   - 2.1.300 joins `harness/tested.rs`. The adapter did not change.
+- **Contract on Claude Code 2.1.302 (OWL-338), recorded on 2026-10-19.**
+  The installed `claude` had updated itself to 2.1.302 two days before, the day OWL-327 recorded 2.1.300, so doctor flagged it as untested and `tests/claude_live.rs` failed on it.
+  The maintainer re-recorded every fixture the recorder writes with `OWLSHIFT_RECORD_CLAUDE=1 cargo test -p owlshift-adapters --test claude_record -- --ignored` on the installed 2.1.302, no shim needed: all eight recordings passed their checks, the two read-only `cd` ones included (`read_only_after_cd.jsonl`: the result written, `sub/…` denied; `read_only_after_cd_dot_rule.jsonl`: the reverse).
+  `peer_inbox_*` (2.1.283, by hand) and `usage_limit.jsonl` (constructed) stay as they are.
+  - Drift from 2.1.300, found by diffing the fixtures' event kinds and fields:
+    `init` gained `original_cwd` and `additional_directories`.
+    The recordings were made with the adapter's current command line, `--disable-slash-commands` included (OWL-333): their `init` offers no `Skill` and lists no skill, where the 2.1.300 ones offered `Skill`.
+    A few recordings differ in their count of events and in their thinking events (`beyond_run_tools_denied.jsonl` has none beyond the result's token detail, while four others still carry them): the model's own steps, not a change of the CLI.
+    Every `init` gained the capability `mcp_call_result_not_for_model_v1`, a change of the CLI itself.
+    `beyond_run_tools_denied.jsonl` and `peer_message_refused.jsonl`, the two write-in-worktree recordings, now carry the OWL-346 command line: `permissionMode` is `bypassPermissions` where it was `acceptEdits`, and their `tool_result_meta` `reason_type` is `mode` (`rule` in the 2.1.300 `peer_message_refused.jsonl`, absent in the other).
+    That is the argv change the OWL-346 entry announced (the recorder takes the new argv at its next run), not a change of the CLI.
+    The denials are the same in number and place, the `cd` ones included.
+    The exact values of `success` (tokens, cost, duration, rate-limit utilization) moved with the new run; its rate-limit event is again a plain `allowed`.
+    On the OWL-346 item that the peer inbox was not rerun in the bypass class: `peer_message_refused.jsonl` is now a recording in that class. It shows the receiver, refuse flag set, ending with `NONE` under `bypassPermissions` while the sender got the `Cross-session message refused` notice, both of which the recorder asserts.
+    It is one macOS run on `haiku`: it does not settle the item for other roles, platforms or models, and `peer_inbox_open.jsonl` and `peer_inbox_switched_off.jsonl` were not rerun.
+    None of it touches what the adapter reads.
+  - 2.1.302 joins `harness/tested.rs`. The adapter did not change.
 - **Skills in an agent run (OWL-333), checked on 2026-10-17 with Claude Code 2.1.302.**
   Found on Locary's LOC-1407 (2.1.300): every run's `init` listed 19 skills and offered `Skill` under `--setting-sources ""`; none called it.
   Runs through the executor, confined, on the token for agent runs and an empty `CLAUDE_CONFIG_DIR`, on `haiku` at effort `low`,
