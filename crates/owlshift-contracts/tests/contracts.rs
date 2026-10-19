@@ -1376,6 +1376,12 @@ fn resolutions_against_the_brief() {
             ..
         }
     ));
+    // OWL-375: `recommendation` is the runner's own kind at the bound.
+    rejects(
+        "a resolver giving the runner's kind",
+        parse(|v| v["resolutions"][0]["basis_kind"] = json!("recommendation")),
+        "the resolution of Q1 has a `recommendation` basis",
+    );
     rejects(
         "a quote on a judgment",
         parse(|v| {
@@ -1956,7 +1962,7 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(16)),
+        asked(|v| v["format"] = json!(17)),
         "upgrade Owlshift",
     );
     // Format 14, before a decision kept its number and the ticket its
@@ -1975,7 +1981,7 @@ fn event_claim_and_state_rejections() {
     assert!(older.decisions[0].reversed.is_some());
     assert_eq!(older.decisions[0].number, None);
     assert_eq!(older.decisions[0].place().get(), 1);
-    assert!(older.render().starts_with("{\n  \"format\": 15,"));
+    assert!(older.render().starts_with("{\n  \"format\": 16,"));
     rejects(
         "a format-14 decision with a number",
         asked(|v| {
@@ -2002,6 +2008,36 @@ fn event_claim_and_state_rejections() {
         kept.decisions_document.as_ref().map(|d| d.id.as_str()),
         Some("doc-1")
     );
+    // Format 15, before a decision could be taken on the asking run's
+    // recommendation (OWL-375): read as the current format, its number,
+    // document, kind and reversal kept; the runner's kind refused.
+    let fifteen = asked(|v| {
+        v["format"] = json!(15);
+        v["decisions"][0]["number"] = json!(2);
+        v["decisions"][0]["basis_kind"] = json!("judgment");
+        v["decisions"][0]["reversed"] =
+            json!({ "through": "2026-10-19T10:00:00Z", "comment": "r1" });
+        v["decisions_document"] = json!({ "id": "doc-1" });
+    })
+    .unwrap();
+    assert_eq!(fifteen.decisions[0].place().get(), 2);
+    assert_eq!(fifteen.decisions[0].basis_kind, Some(BasisKind::Judgment));
+    assert!(fifteen.decisions[0].reversed.is_some());
+    assert!(fifteen.decisions_document.is_some());
+    assert!(fifteen.render().starts_with("{\n  \"format\": 16,"));
+    rejects(
+        "a format-15 decision taken on a recommendation",
+        asked(|v| {
+            v["format"] = json!(15);
+            v["decisions"][0]["basis_kind"] = json!("recommendation");
+        }),
+        "format 15 keeps no decision taken on a recommendation",
+    );
+    let recommended = asked(|v| v["decisions"][0]["basis_kind"] = json!("recommendation")).unwrap();
+    assert_eq!(
+        recommended.decisions[0].basis_kind,
+        Some(BasisKind::Recommendation)
+    );
     assert_eq!(TicketQuestions::parse(&kept.render()).unwrap(), kept);
     rejects(
         "a decision numbered 0",
@@ -2013,7 +2049,7 @@ fn event_claim_and_state_rejections() {
     let older = asked(|v| v["format"] = json!(13)).unwrap();
     assert!(!older.decisions.is_empty());
     assert!(older.decisions.iter().all(|d| d.asked_by.is_none()));
-    assert!(older.render().starts_with("{\n  \"format\": 15,"));
+    assert!(older.render().starts_with("{\n  \"format\": 16,"));
     rejects(
         "a format-13 decision with an asking role",
         asked(|v| {
@@ -2138,7 +2174,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 15,"));
+    assert!(read.render().starts_with("{\n  \"format\": 16,"));
     // A format-3 document, written before the resolver's decisions were
     // kept, is read with none, its verdicts kept.
     let format_3 = edited("ticket-questions.json", |v| {
@@ -2154,7 +2190,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_3).unwrap();
     assert!(read.decisions.is_empty());
     assert_eq!(read.asks[0].verdicts.len(), 2);
-    assert!(read.render().starts_with("{\n  \"format\": 15,"));
+    assert!(read.render().starts_with("{\n  \"format\": 16,"));
     // A format-4 document, written before an ask kept its check's refusal,
     // is read with none, its decisions kept.
     let format_4 = edited("ticket-questions.json", |v| {
@@ -2169,7 +2205,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_4).unwrap();
     assert!(read.asks.iter().all(|ask| ask.result_refusal.is_none()));
     assert_eq!(read.decisions.len(), 1);
-    assert!(read.render().starts_with("{\n  \"format\": 15,"));
+    assert!(read.render().starts_with("{\n  \"format\": 16,"));
     // A format-5 document, written before Build's refusal was kept
     // (OWL-192), is read with none, its asks' refusals kept.
     let format_5 = edited("ticket-questions.json", |v| {
@@ -2180,7 +2216,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_5).unwrap();
     assert_eq!(read.build_refusal, None);
     assert!(read.asks[1].result_refusal.is_some());
-    assert!(read.render().starts_with("{\n  \"format\": 15,"));
+    assert!(read.render().starts_with("{\n  \"format\": 16,"));
     // Formats 6 and 7 kept Build's refusal in their own shape (OWL-192,
     // OWL-194): the hold's first list in `decisions_reason`, the latest
     // reason, of a kind they did not keep, in `reason`. Each is read as
@@ -2199,7 +2235,7 @@ fn event_claim_and_state_rejections() {
     };
     let upgraded = |format: u64, refusal: Value| {
         let read = TicketQuestions::parse(&legacy(format, refusal)).unwrap();
-        assert!(read.render().starts_with("{\n  \"format\": 15,"));
+        assert!(read.render().starts_with("{\n  \"format\": 16,"));
         read.build_refusal.unwrap()
     };
     for format in [6, 7] {
@@ -2278,7 +2314,7 @@ fn event_claim_and_state_rejections() {
     };
     let read =
         TicketQuestions::parse(&format_8(json!({"reason": latest, "lists": [held]}))).unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 15,"));
+    assert!(read.render().starts_with("{\n  \"format\": 16,"));
     let kept = read.build_refusal.unwrap();
     assert!(kept.holds() && kept.choices.is_empty() && kept.lists == [held]);
     assert_eq!(
@@ -2300,7 +2336,7 @@ fn event_claim_and_state_rejections() {
     // reversal is refused in it. Format 10 keeps one, naming its reply.
     let read = TicketQuestions::parse(&edited("ticket-questions.json", |v| v["format"] = json!(9)))
         .unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 15,"));
+    assert!(read.render().starts_with("{\n  \"format\": 16,"));
     assert!(read.decisions[0].reversed.is_none());
     let reversal = || json!({"through": "2026-09-28T12:00:00Z", "comment": "c-reply-1"});
     rejects(
@@ -2356,7 +2392,7 @@ fn event_claim_and_state_rejections() {
             v["asks"][0]["questions"][0]["recommendation"] = json!("English, as the code");
         }))
         .unwrap_or_else(|e| panic!("format {format}: {e}"));
-        assert!(read.render().starts_with("{\n  \"format\": 15,"));
+        assert!(read.render().starts_with("{\n  \"format\": 16,"));
         let asked = &read.asks[0].questions[0];
         assert_eq!(
             asked.options,

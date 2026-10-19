@@ -427,7 +427,10 @@ pub enum Resolution {
         /// The kind of that basis (format 11, OWL-337): `fact`, `settled`,
         /// `ticket` or, since format 12, `judgment` (OWL-343), its `basis`
         /// then holding the reasons and the cost of the choice. The runner
-        /// refuses a kind the project's delegation level does not allow.
+        /// refuses a kind the project's delegation level does not allow, and
+        /// `recommendation`, its own kind at the resolver's bound (OWL-375),
+        /// always, which the schema leaves out.
+        #[schemars(schema_with = "resolver_basis_kind")]
         basis_kind: BasisKind,
         /// The letter of the question's option the decision takes, as the
         /// runner letters them ([`option_letter`]), when it takes one
@@ -1197,6 +1200,17 @@ pub struct RefusedChoice {
 /// each text not only whitespace; an option written as a letter (OWL-343);
 /// a quote with a `ticket` basis, keeping a quote's rules ([`check_quote`]),
 /// and none with another kind (OWL-337).
+/// The basis kinds a resolver may give (OWL-375): every [`BasisKind`] but
+/// the runner's own `recommendation`.
+fn resolver_basis_kind(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let kinds: Vec<&str> = BasisKind::ALL
+        .iter()
+        .filter(|kind| **kind != BasisKind::Recommendation)
+        .map(|kind| kind.as_str())
+        .collect();
+    schemars::json_schema!({ "type": "string", "enum": kinds })
+}
+
 fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
     if let Some(id) = first_not_ascending(resolutions.iter().map(Resolution::question)) {
         return Err(ContractError::invalid(
@@ -1226,6 +1240,12 @@ fn check_resolutions(resolutions: &[Resolution]) -> Result<(), ContractError> {
                     Some(format!(
                         "takes option {option:?}, which is not an option's letter: A, B, C…"
                     ))
+                } else if *basis_kind == BasisKind::Recommendation {
+                    Some(
+                        "has a `recommendation` basis, the runner's own kind at the resolver's \
+                         bound (OWL-375): give `fact`, `settled`, `ticket` or `judgment`"
+                            .to_owned(),
+                    )
                 } else {
                     match (basis_kind, quote) {
                         (BasisKind::Ticket, None) => Some(

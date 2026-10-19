@@ -2563,3 +2563,288 @@ fn a_plan_approved_by_a_thumbs_up_reaches_build() {
     assert_eq!(approval.comment, ask.comment);
     assert!(bench.roles().contains(&Role::Build));
 }
+
+/// A design run's question the resolver settles, on the `approach`.
+const APPROACH: &str = r#"{"format":13,"status":"questions",
+"summary":"The ticket leaves the greeting's approach open.",
+"questions":[{"id":"Q1","category":"approach","context":"The ticket says Hello.",
+"text":"Should the greeting be a file of its own?",
+"recommendation":{"why":"The ticket names GREETING.md."}}]}"#;
+
+/// The resolver's decision on it, on what the ticket settles.
+const SETTLES_APPROACH: &str = r#"{"format":13,"status":"done","summary":"The ticket names the file.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"approach","decision":"A file of its own.",
+"basis":"The ticket's description names GREETING.md.","basis_kind":"settled"}]}"#;
+
+/// A design run's two questions, each with a recommendation, after the
+/// resolver settled its first (OWL-375).
+const TWO_ASKED: &str = r#"{"format":13,"status":"questions",
+"summary":"Two points the ticket leaves open.",
+"questions":[
+ {"id":"Q1","category":"naming","context":"The ticket says Hello.","text":"Which file holds the greeting?",
+  "options":[{"label":"GREETING.md"},{"label":"HELLO.md"}],
+  "recommendation":{"option":"A","why":"The ticket names GREETING.md."}},
+ {"id":"Q2","category":"layout","context":"The repository's root holds its docs.","text":"Where does the file go?",
+  "recommendation":{"why":"One file at the root."}}]}"#;
+
+/// A design run's two questions, the first filed under the floor.
+const FLOOR_ASKED: &str = r#"{"format":13,"status":"questions",
+"summary":"Two points the ticket leaves open.",
+"questions":[
+ {"id":"Q1","category":"security","context":"The greeting could load a remote font.","text":"May the greeting load a remote font?",
+  "recommendation":{"why":"No: nothing remote."}},
+ {"id":"Q2","category":"layout","context":"The repository's root holds its docs.","text":"Where does the file go?",
+  "recommendation":{"why":"One file at the root."}}]}"#;
+
+/// A bench at `level` whose chain's resolver runs are bounded by a $0.50
+/// ceiling, with no pass limit, and the replies that spend it: Design asks,
+/// the resolver settles it for $0.60, and Design asks `asked`.
+fn spent_mid_chain(level: &str, asked: &str) -> (Bench, Vec<Reply>) {
+    let bench = at_level("standard", level);
+    bench.on_fork();
+    bench.policy("resolver_passes = \"unlimited\"\nresolver_budget_usd = 0.5");
+    let mut settles = bench.read(SETTLES_APPROACH);
+    settles.cost_micros = Some(600_000);
+    let replies = vec![bench.read(APPROACH), settles, bench.read(asked)];
+    (bench, replies)
+}
+
+/// OWL-375's acceptance at `all`: the ceiling is spent mid-chain, Design's
+/// next two questions are taken on their recommendations in one DECISION
+/// comment that names the bound, no resolver runs and no round reaches the
+/// decider; the plan's approval at the bound is taken on its
+/// recommendation too, and the chain goes on to Build. A reply naming `D2`
+/// reverses that decision alone, the next Build following it, and the
+/// delivery report lists the taken decisions under their own heading.
+#[test]
+fn at_all_the_bound_takes_the_recommendations_and_goes_on_to_build() {
+    let (bench, mut replies) = spent_mid_chain("all", TWO_ASKED);
+    replies.extend([
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.limited(),
+    ]);
+    let (stopped, printed) = bench.run(replies, None);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    assert_eq!(
+        bench.roles(),
+        [
+            Role::Design,
+            Role::Resolver,
+            Role::Design,
+            Role::Design,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::Build
+        ]
+    );
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] QUESTIONS")),
+        "no round"
+    );
+    let record = bench.record();
+    let kept = &record.questions.decisions;
+    let kinds: Vec<Option<BasisKind>> = kept.iter().map(|d| d.basis_kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            Some(BasisKind::Settled),
+            Some(BasisKind::Recommendation),
+            Some(BasisKind::Recommendation),
+            Some(BasisKind::Recommendation)
+        ]
+    );
+    let taken = kept[1].comment.clone();
+    assert_eq!(kept[2].comment, taken, "one DECISION comment for the run");
+    assert_eq!(
+        (kept[1].decision.as_str(), kept[2].decision.as_str()),
+        ("GREETING.md", "One file at the root.")
+    );
+    let approval = record
+        .plan
+        .unwrap()
+        .approval
+        .expect("approved at the bound");
+    assert_eq!(approval.comment, kept[3].comment);
+    let decision = bench
+        .comments()
+        .into_iter()
+        .find(|c| c.starts_with("[owlshift] DECISION") && c.contains("these 2 questions"))
+        .expect("the DECISION of Design's two questions");
+    assert!(
+        decision.contains(
+            "cost 0.60 USD, which reached this project's dollar ceiling of 0.50 USD \
+             (`policy.resolver_budget_usd`). Owlshift took the asking run's recommendation on \
+             these 2 questions without asking you, as delegation level `all` allows."
+        ),
+        "{decision}"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    let bound: Vec<(&Value, &Value, &Value)> = resolved
+        .iter()
+        .map(|e| (&e["resolver"], &e["reason"], &e["recommended"]))
+        .collect();
+    assert_eq!(
+        bound,
+        [
+            (&json!("done"), &Value::Null, &Value::Null),
+            (&json!("pass_limit"), &json!("budget"), &json!(["Q1", "Q2"])),
+            (&json!("pass_limit"), &json!("budget"), &json!(["Q1"])),
+        ],
+        "{printed}"
+    );
+    let approved = bench
+        .decisions("plan")
+        .into_iter()
+        .find(|event| event["plan"] == "approved")
+        .unwrap();
+    assert_eq!(approved["by"], json!("recommendation"));
+
+    // The decider reverses D2 alone (OWL-146): the Build that delivers is
+    // given the reply, keeps it, and the report says so of D2 only.
+    let reply = "D2: in docs/, beside the others. go";
+    bench.reply_as("maintainer", &taken, reply);
+    let (outcome, printed) = bench.continue_ticket(vec![bench.built()]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let build = bench.last_of(Role::Build);
+    assert!(
+        build
+            .thread
+            .iter()
+            .any(|entry| matches!(entry, ThreadEntry::Comment { body, .. } if body == reply)),
+        "{:?}",
+        build.thread
+    );
+    let kept = bench.record().questions.decisions;
+    assert!(kept[2].reversed.is_some(), "D2 reversed");
+    assert!(kept[1].reversed.is_none(), "D1 stands");
+    let report = bench.marked("[owlshift] DELIVERY");
+    assert!(
+        report.contains("**Taken on the asking run's recommendation**")
+            && report.contains("**Which file holds the greeting?**: GREETING.md (basis")
+            && report.contains("One file at the root. (reversed by the decider's reply)"),
+        "{report}"
+    );
+}
+
+/// OWL-375 below `all` and on the floor: at `discoverable`, the same spent
+/// chain sends Design's two questions to the decider, unchanged; at `all`,
+/// a `security` question reaches the decider while the run's other one is
+/// taken on its recommendation, the round saying so.
+#[test]
+fn below_all_or_on_the_floor_the_bound_still_asks() {
+    let (bench, replies) = spent_mid_chain("discoverable", TWO_ASKED);
+    let (outcome, printed) = bench.run(replies, None);
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop).len(), 2, "{printed}");
+    assert_eq!(
+        bench.record().questions.decisions.len(),
+        1,
+        "the resolver's"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    let last = resolved.last().unwrap();
+    assert_eq!(
+        (&last["resolver"], &last["reason"]),
+        (&json!("pass_limit"), &json!("budget"))
+    );
+    assert!(last.get("recommended").is_none(), "{last}");
+
+    let (bench, replies) = spent_mid_chain("all", FLOOR_ASKED);
+    let (outcome, printed) = bench.run(replies, None);
+    let stop = outcome.expect_err("the floor's question");
+    let Stop::NeedsInput { questions, .. } = &stop else {
+        panic!("{stop:?}\n{printed}");
+    };
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].category, "security");
+    let kept = &bench.record().questions.decisions;
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[1].basis_kind, Some(BasisKind::Recommendation));
+    assert_eq!(kept[1].decision, "One file at the root.");
+    let round = bench.marked("[owlshift] QUESTIONS");
+    assert!(
+        round.contains("Owlshift decided one other question of this run itself")
+            && round.contains("so the rest of this run's questions come to you."),
+        "{round}"
+    );
+}
+
+/// OWL-375's loop stop across watch's steps: a Build step handed a chain at
+/// its pass limit takes its question on the recommendation and runs again;
+/// handed one whose Build already took recommendations, it asks the
+/// decider, with no resolver run either way.
+#[test]
+fn a_role_that_took_recommendations_asks_at_its_next_step() {
+    use owlshift_core::gate::Chain;
+    use owlshift_runner::on_demand::Carried;
+    use owlshift_runner::writer::VisibleStage;
+
+    let resume = |carried: Carried, again: bool| {
+        let (bench, _) = cut_off_at(Stage::Build, LONG_PAST);
+        bench.policy("resolver_delegation = \"all\"\nresolver_passes = 1");
+        let before = bench.roles().len();
+        let seen = bench.ref_commit();
+        let mut replies = vec![bench.read(NAMING)];
+        if again {
+            replies.push(bench.built());
+        }
+        let (outcome, printed) =
+            bench.with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+                let shown = VisibleStage::Working;
+                on_demand.continue_shown(&ticket(), &seen, shown, carried, Data::new(), sink)
+            });
+        let outcome = outcome.expect("the ref is the one seen");
+        let ran = bench.roles()[before..].to_vec();
+        (bench, outcome, printed, ran)
+    };
+    let mut chain = Chain::default();
+    chain.settled_once();
+
+    let (bench, outcome, printed, ran) = resume(
+        Carried {
+            chain,
+            integrated: false,
+        },
+        true,
+    );
+    assert!(outcome.is_ok(), "{outcome:?}\n{printed}");
+    assert_eq!(ran[..2], [Role::Build, Role::Build], "{ran:?}");
+    let decision = bench.marked("[owlshift] DECISION");
+    assert!(
+        decision.contains("Owlshift took the asking run's recommendation on this question"),
+        "{decision}"
+    );
+
+    chain.took_recommendations(Role::Build);
+    let (bench, outcome, printed, ran) = resume(
+        Carried {
+            chain,
+            integrated: false,
+        },
+        false,
+    );
+    assert!(
+        matches!(outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(ran, [Role::Build]);
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] DECISION"))
+    );
+    let round = bench.marked("[owlshift] QUESTIONS");
+    assert!(
+        round.contains("already settled every question of 1 run"),
+        "{round}"
+    );
+}

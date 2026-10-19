@@ -10,7 +10,7 @@ use crate::floor::{
 };
 use crate::pipeline::Pipeline;
 use crate::state::MAX_RESOLVED_PASSES;
-use crate::vocab::{BasisKind, DelegationLevel, PlanApproval, Variant};
+use crate::vocab::{BasisKind, DelegationLevel, PlanApproval, Role, Variant};
 
 /// Who settles a question a role raised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -98,14 +98,17 @@ pub enum ChainCost {
 
 /// One chain of runs as the runner counts it, for [`GatePolicy::chain_end`]:
 /// the runs in a row whose questions the resolver all decided, what the
-/// chain's resolver runs cost, which the ceiling bounds, and what its asking
-/// runs cost, which is only measured (OWL-376). The core does no I/O: the
-/// runner reports each run's cost.
+/// chain's resolver runs cost, which the ceiling bounds, what its asking
+/// runs cost, which is only measured (OWL-376), and the asking roles that
+/// took recommendations once the chain reached its bound (OWL-375). The core
+/// does no I/O: the runner reports each run's cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Chain {
     settled: u32,
     cost: ChainCost,
     asking: ChainCost,
+    /// One bit per asking role ([`role_bit`]).
+    recommended: u16,
 }
 
 impl Default for Chain {
@@ -114,7 +117,23 @@ impl Default for Chain {
             settled: 0,
             cost: ChainCost::Known(0),
             asking: ChainCost::Known(0),
+            recommended: 0,
         }
+    }
+}
+
+/// The bit of `role` in [`Chain`]'s set of roles that took recommendations.
+const fn role_bit(role: Role) -> u16 {
+    match role {
+        Role::Intake => 1,
+        Role::Resolver => 1 << 1,
+        Role::AnswerCheck => 1 << 2,
+        Role::Design => 1 << 3,
+        Role::DesignReview => 1 << 4,
+        Role::Build => 1 << 5,
+        Role::Verify => 1 << 6,
+        Role::Rebase => 1 << 7,
+        Role::Arbiter => 1 << 8,
     }
 }
 
@@ -163,6 +182,19 @@ impl Chain {
     /// The resolver decided every question of the chain's latest asking run.
     pub fn settled_once(&mut self) {
         self.settled = self.settled.saturating_add(1);
+    }
+
+    /// A run of `role` had questions taken on its recommendation once the
+    /// chain reached its bound (OWL-375).
+    pub fn took_recommendations(&mut self, role: Role) {
+        self.recommended |= role_bit(role);
+    }
+
+    /// Whether a run of `role` already had questions taken on its
+    /// recommendation in this chain: the loop that reached the bound then
+    /// stops, the role's next questions going to the decider (OWL-375).
+    pub const fn recommendations_taken(self, role: Role) -> bool {
+        self.recommended & role_bit(role) != 0
     }
 }
 
@@ -567,7 +599,7 @@ mod tests {
     /// `scope` only on a `ticket` basis; at `none` nothing stands.
     #[test]
     fn a_decision_needs_a_basis_the_level_allows() {
-        use BasisKind::{Fact, Judgment, Settled, Ticket};
+        use BasisKind::{Fact, Judgment, Recommendation, Settled, Ticket};
         use DelegationLevel as L;
         let cases = [
             (L::None, "naming", "naming", Fact, Route::Human),
@@ -597,6 +629,29 @@ mod tests {
             (L::All, "naming", "billing", Ticket, Route::Human),
             (L::All, "naming", "Scope", Ticket, Route::Human),
             (L::All, "naming", "naming", Judgment, Route::Resolver),
+            // The runner's recommendation at the bound (OWL-375), labelled
+            // with the asking run's category: `all` alone, a token outside
+            // the level's set and the project's additions.
+            (L::All, "naming", "naming", Recommendation, Route::Resolver),
+            (L::All, "money", "money", Recommendation, Route::Resolver),
+            (L::All, "security", "security", Recommendation, Route::Human),
+            (L::All, "billing", "billing", Recommendation, Route::Human),
+            (
+                L::All,
+                "file layout",
+                "file layout",
+                Recommendation,
+                Route::Human,
+            ),
+            (L::All, "", "", Recommendation, Route::Human),
+            (L::Ticket, "naming", "naming", Recommendation, Route::Human),
+            (
+                L::Discoverable,
+                "naming",
+                "naming",
+                Recommendation,
+                Route::Human,
+            ),
             (L::All, "scope", "trade_off", Judgment, Route::Resolver),
             (L::All, "naming", "security", Judgment, Route::Human),
             (L::Ticket, "naming", "naming", Judgment, Route::Human),
@@ -715,6 +770,22 @@ mod tests {
         assert_eq!(chain.asking_cost(), ChainCost::Unreported);
         assert_eq!(chain.cost(), ChainCost::Known(300_000));
         assert_eq!(policy.chain_end(chain), None);
+    }
+
+    /// The roles that took recommendations at the bound, each once and on
+    /// its own (OWL-375).
+    #[test]
+    fn a_chain_keeps_the_roles_that_took_recommendations() {
+        let mut chain = Chain::default();
+        assert!(!chain.recommendations_taken(Role::Design));
+        chain.took_recommendations(Role::Design);
+        chain.took_recommendations(Role::Design);
+        assert!(chain.recommendations_taken(Role::Design));
+        assert!(!chain.recommendations_taken(Role::DesignReview));
+        assert!(!chain.recommendations_taken(Role::Build));
+        chain.took_recommendations(Role::Arbiter);
+        assert!(chain.recommendations_taken(Role::Arbiter));
+        assert_ne!(chain, Chain::default());
     }
 
     /// The approval question is the decider's alone under `always` and on

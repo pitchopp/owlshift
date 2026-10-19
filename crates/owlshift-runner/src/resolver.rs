@@ -369,6 +369,41 @@ pub fn decisions<'a>(
     settle(policy, given, resolutions, quotable, premise_false).logged
 }
 
+/// The decisions the runner takes on the asking run's recommendations once
+/// the chain reached its bound at `all` and no resolver runs (OWL-375), as
+/// resolutions for [`settle`], which holds them to the rules it holds the
+/// resolver's to: one `decided` resolution for each question of `given` (the
+/// questions the resolver would have been given) that reopens no refused
+/// choice of `reopened` and carries a recommendation, labelled with the
+/// asking run's own category, so that [`GatePolicy::route_decided`] holds
+/// that category to the level's set and to the token rule; its decision the
+/// recommended option's label, or the recommendation's `why` without one,
+/// its basis that `why`, its option the recommended letter, its kind
+/// [`BasisKind::Recommendation`]. A recommendation naming no option the
+/// question offers names none.
+pub fn recommended(given: &[Question], reopened: &[ReopenedChoice]) -> Vec<Resolution> {
+    given
+        .iter()
+        .filter(|question| !reopened.iter().any(|choice| choice.question == question.id))
+        .filter_map(|question| {
+            let recommendation = question.recommendation.as_ref()?;
+            let chosen = question.recommended_option();
+            Some(Resolution::Decided {
+                question: question.id.clone(),
+                category: question.category.clone(),
+                decision: chosen.map_or_else(
+                    || recommendation.why.clone(),
+                    |index| question.options[index].label.clone(),
+                ),
+                basis: recommendation.why.clone(),
+                basis_kind: BasisKind::Recommendation,
+                quote: None,
+                option: chosen.map(option_letter),
+            })
+        })
+        .collect()
+}
+
 /// The ids of the questions passed on, in question order.
 pub fn passed_on(resolutions: &[Resolution]) -> Vec<&QuestionId> {
     resolutions
@@ -452,22 +487,40 @@ pub fn reported_reversing(kept: &KeptDecision, corrected: &[String]) -> Decision
 }
 
 /// The kept decisions as the delivery report lists them
-/// ([`reported_reversing`]): those taken on judgment first, so the decider
-/// sees which ones to read (OWL-343), each group in the order kept.
+/// ([`reported_reversing`]), but those taken on a recommendation, which
+/// [`reported_recommended`] lists under their own heading (OWL-375): those
+/// taken on judgment first, so the decider sees which ones to read
+/// (OWL-343), each group in the order kept.
 pub fn reported_all(kept: &[KeptDecision], corrected: &[String]) -> Vec<Decision> {
     let judged = |decision: &&KeptDecision| decision.basis_kind == Some(BasisKind::Judgment);
+    let others = |decision: &&KeptDecision| !judged(decision) && !recommended_kind(decision);
     kept.iter()
         .filter(judged)
-        .chain(kept.iter().filter(|decision| !judged(decision)))
+        .chain(kept.iter().filter(others))
         .map(|decision| reported_reversing(decision, corrected))
         .collect()
+}
+
+/// The kept decisions taken on the asking run's recommendation at the
+/// resolver's bound (OWL-375), as the delivery report lists them under
+/// their own heading, in the order kept.
+pub fn reported_recommended(kept: &[KeptDecision], corrected: &[String]) -> Vec<Decision> {
+    kept.iter()
+        .filter(recommended_kind)
+        .map(|decision| reported_reversing(decision, corrected))
+        .collect()
+}
+
+/// Whether a kept decision was taken on a recommendation (OWL-375).
+fn recommended_kind(decision: &&KeptDecision) -> bool {
+    decision.basis_kind == Some(BasisKind::Recommendation)
 }
 
 #[cfg(test)]
 mod tests {
     use owlshift_contracts::DelegationLevel;
     use owlshift_contracts::format::{BRIEF_FORMAT, RESULT_FORMAT};
-    use owlshift_contracts::result::RunResult;
+    use owlshift_contracts::result::{Recommendation, RunResult};
     use owlshift_core::gate::ResolverPolicy;
     use owlshift_core::vocab::PlanApproval;
 
@@ -995,5 +1048,114 @@ mod tests {
         );
         assert_eq!(reported[0].basis, "basis 2 (decided on judgment)");
         assert_eq!(reported[2].basis, "basis 1");
+
+        // Those taken on a recommendation have a heading of their own
+        // (OWL-375).
+        let mut decisions = decisions.to_vec();
+        decisions.push(kept(5, Some(BasisKind::Recommendation)));
+        let reported = reported_all(&decisions, &[]);
+        assert!(reported.iter().all(|d| d.decision != "decision 5"));
+        let recommended = reported_recommended(&decisions, &[]);
+        let order: Vec<&str> = recommended.iter().map(|d| d.decision.as_str()).collect();
+        assert_eq!(order, ["decision 5"]);
+    }
+
+    /// OWL-375: at the bound, a decision on each question's recommendation,
+    /// the recommended option's label or the proposed answer, held by
+    /// `settle` to the level's set and the token rule; a question reopening a
+    /// refused choice or without a recommendation is left to the decider.
+    #[test]
+    fn recommendations_are_taken_as_settle_holds_them() {
+        let recommend = |mut q: Question, option: Option<&str>, why: &str| {
+            q.recommendation = Some(Recommendation {
+                option: option.map(str::to_owned),
+                why: why.to_owned(),
+            });
+            q
+        };
+        let mut naming = question("Q1", "naming");
+        naming.options = vec![QuestionOption::new("Short"), QuestionOption::new("Long")];
+        let given = vec![
+            recommend(naming, Some("B"), "Long names read better."),
+            recommend(question("Q2", "layout"), None, "One file."),
+            question("Q3", "naming"),
+            recommend(question("Q4", "billing"), None, "Free."),
+            recommend(question("Q5", "file layout"), None, "Flat."),
+            recommend(question("Q6", "naming"), None, "Reopened."),
+        ];
+        let reopened = [ReopenedChoice {
+            place: std::num::NonZeroU32::MIN,
+            question: QuestionId::new("Q6").unwrap(),
+            choice: owlshift_contracts::result::RefusedChoice {
+                question: "Which name?".into(),
+                recorded: "short".into(),
+            },
+        }];
+        let built = recommended(&given, &reopened);
+        let made: Vec<&str> = built.iter().map(|r| r.question().as_str()).collect();
+        assert_eq!(made, ["Q1", "Q2", "Q4", "Q5"]);
+        let Resolution::Decided {
+            decision,
+            basis,
+            basis_kind,
+            option,
+            category,
+            ..
+        } = &built[0]
+        else {
+            panic!("{:?}", built[0]);
+        };
+        assert_eq!(
+            (
+                decision.as_str(),
+                basis.as_str(),
+                *basis_kind,
+                option.as_deref()
+            ),
+            (
+                "Long",
+                "Long names read better.",
+                BasisKind::Recommendation,
+                Some("B")
+            )
+        );
+        assert_eq!(category, "naming");
+        assert!(
+            matches!(&built[1], Resolution::Decided { decision, option: None, .. } if decision == "One file.")
+        );
+
+        let at = |level| {
+            GatePolicy::new(["billing"], PlanApproval::Never).with_resolver(ResolverPolicy {
+                level,
+                ..ResolverPolicy::default()
+            })
+        };
+        let sorted = settle(
+            &at(DelegationLevel::All),
+            &given,
+            &built,
+            &Quotable::default(),
+            false,
+        );
+        let logged: Vec<&str> = sorted
+            .logged
+            .iter()
+            .map(|l| l.question.id.as_str())
+            .collect();
+        assert_eq!(logged, ["Q1", "Q2"]);
+        let refused: Vec<&str> = sorted.refused.iter().map(|id| id.as_str()).collect();
+        assert_eq!(
+            refused,
+            ["Q4", "Q5"],
+            "the project's addition, a malformed category"
+        );
+        let below = settle(
+            &at(DelegationLevel::Ticket),
+            &given,
+            &built,
+            &Quotable::default(),
+            false,
+        );
+        assert!(below.logged.is_empty(), "the kind is `all`'s alone");
     }
 }

@@ -52,7 +52,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 15
+      "const": 16
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -209,6 +209,11 @@
           "description": "The resolver's own weighing where nothing settles the question: a\ntrade-off, a priority, an intent the ticket does not state\n(OWL-342). At `all` only.",
           "type": "string",
           "const": "judgment"
+        },
+        {
+          "description": "The asking run's own recommendation, which the runner takes once the\nresolver's chain reached its bound and no resolver runs (OWL-375): the\nrunner's kind, never a resolver's. At `all` only.",
+          "type": "string",
+          "const": "recommendation"
         }
       ]
     },

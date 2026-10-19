@@ -1985,14 +1985,7 @@ impl OnDemand<'_> {
                 // and the plan's hash, and the gate takes it to Build.
                 let approval = decided.iter().find(|d| d.option.as_deref() == Some("A"));
                 if let Some(approval) = approval {
-                    return self.approved_by_resolver(
-                        p,
-                        state,
-                        kept,
-                        &approval.comment,
-                        &run,
-                        sink,
-                    );
+                    return self.approved_by_resolver(p, state, kept, approval, &run, sink);
                 }
                 // A plan changed: the next design run follows the decision,
                 // as it follows the answer to a round.
@@ -2156,17 +2149,26 @@ impl OnDemand<'_> {
     /// question): kept in `plan.json` with its DECISION comment and the
     /// plan's hash, where the decider's approval keeps their comment, then
     /// the plan gate, which holds the hash as for any approval (OWL-32),
-    /// takes the ticket to Build. One write keeps it with the state.
+    /// takes the ticket to Build. One write keeps it with the state. At the
+    /// resolver's bound at `all`, the runner approves it the same way on the
+    /// approval question's recommendation (OWL-375), which its `plan` event
+    /// says.
     fn approved_by_resolver(
         &self,
         p: &mut Prepared,
         state: TicketState,
         mut kept: TicketPlan,
-        comment: &str,
+        approval: &DecidedOn,
         run: &str,
         sink: &mut EventSink<'_>,
     ) -> Result<TicketState, Stop> {
         let sha = plan_sha256(&kept.plan);
+        let comment = approval.comment.as_str();
+        let by = if approval.kind == BasisKind::Recommendation {
+            "recommendation"
+        } else {
+            "resolver"
+        };
         kept.approval = Some(KeptApproval {
             comment: comment.to_owned(),
             plan_sha256: sha.clone(),
@@ -2186,7 +2188,7 @@ impl OnDemand<'_> {
             EventKind::Decision,
             data([
                 ("plan", json!("approved")),
-                ("by", json!("resolver")),
+                ("by", json!(by)),
                 ("comment", json!(comment)),
                 ("plan_sha256", json!(sha)),
             ]),

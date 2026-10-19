@@ -97,8 +97,12 @@ pub struct DeliveryReport {
     pub checks: Result<CheckSet, forge::Error>,
     /// The project's own gate, run before delivery.
     pub gate: Gate,
-    /// The decisions taken without a human, over all the ticket's runs.
+    /// The decisions taken without a human, over all the ticket's runs, but
+    /// those of `recommended`.
     pub decisions: Vec<Decision>,
+    /// The decisions taken on the asking run's recommendation at the
+    /// resolver's bound (OWL-375), listed first under their own heading.
+    pub recommended: Vec<Decision>,
     /// The project's delegation level, when the resolver's decisions are
     /// among them (OWL-337): the list says it once. `None` when none is.
     pub level: Option<DelegationLevel>,
@@ -714,32 +718,48 @@ impl DeliveryReport {
         }
     }
 
+    /// The decisions taken on a recommendation at the resolver's bound, under
+    /// their own heading saying how to reverse one (OWL-375), then the
+    /// others; `none` when there is neither.
     fn decisions_section(&self) -> String {
-        if self.decisions.is_empty() {
+        if self.decisions.is_empty() && self.recommended.is_empty() {
             return "**Decisions taken without a human:** none.".to_owned();
         }
-        let lines: Vec<String> = self
-            .decisions
-            .iter()
-            .map(|d| {
+        let lines = |decisions: &[Decision]| -> Vec<String> {
+            decisions
+                .iter()
+                .map(|d| {
+                    format!(
+                        "**{}**: {} (basis: {})",
+                        flatten(&d.question),
+                        flatten(&d.decision),
+                        flatten(&d.basis)
+                    )
+                })
+                .collect()
+        };
+        let mut sections = Vec::new();
+        if !self.recommended.is_empty() {
+            sections.push(format!(
+                "**Taken on the asking run's recommendation**, the resolver's bound being \
+                 reached; to reverse one, reply to its DECISION comment naming it, as `D2: what \
+                 you want instead`:\n{}",
+                bullets(&lines(&self.recommended))
+            ));
+        }
+        if !self.decisions.is_empty() {
+            let level = self.level.map_or(String::new(), |level| {
                 format!(
-                    "**{}**: {} (basis: {})",
-                    flatten(&d.question),
-                    flatten(&d.decision),
-                    flatten(&d.basis)
+                    " (the resolver's allowed by this project's delegation level, `{}`)",
+                    level.as_str()
                 )
-            })
-            .collect();
-        let level = self.level.map_or(String::new(), |level| {
-            format!(
-                " (the resolver's allowed by this project's delegation level, `{}`)",
-                level.as_str()
-            )
-        });
-        format!(
-            "**Decisions taken without a human**, each reversible on this ticket{level}:\n{}",
-            bullets(&lines)
-        )
+            });
+            sections.push(format!(
+                "**Decisions taken without a human**, each reversible on this ticket{level}:\n{}",
+                bullets(&lines(&self.decisions))
+            ));
+        }
+        sections.join("\n\n")
     }
 }
 
@@ -1128,32 +1148,24 @@ impl QuestionsComment {
             )),
         }
         if let Some(fallback) = self.fallback {
-            sections.push(match fallback {
-                Fallback::UsageLimit => "Owlshift's resolver reached its usage limit, so the \
-                                         questions it would have settled are asked here too."
+            // At the bound at `all`, the run's other questions may have been
+            // taken on its recommendations (OWL-375).
+            let left = if self.decided > 0 {
+                "the rest of this run's questions come to you"
+            } else {
+                "this run's questions all come to you"
+            };
+            sections.push(match (fallback, bound_clause(fallback)) {
+                (Fallback::UsageLimit, _) => "Owlshift's resolver reached its usage limit, so \
+                                              the questions it would have settled are asked here \
+                                              too."
                     .to_owned(),
-                Fallback::Failed => "Owlshift's resolver could not settle its questions, so they \
-                                     are asked here too."
+                (Fallback::Failed, _) => "Owlshift's resolver could not settle its questions, so \
+                                          they are asked here too."
                     .to_owned(),
-                Fallback::PassLimit(runs) => format!(
-                    "Owlshift's resolver already settled every question of {runs} runs in a row \
-                     (`policy.resolver_passes`), so this run's questions all come to you."
-                ),
-                Fallback::Budget {
-                    spent_micros,
-                    ceiling_micros,
-                } => format!(
-                    "Owlshift's resolver runs since this command's last stop cost {} USD, which \
-                     reached this project's dollar ceiling of {} USD \
-                     (`policy.resolver_budget_usd`), so this run's questions all come to you.",
-                    usd(spent_micros),
-                    usd(ceiling_micros)
-                ),
-                Fallback::CostUnreported => "A resolver run since this command started reported \
-                                             no cost, so this project's dollar ceiling \
-                                             (`policy.resolver_budget_usd`) could not be checked, \
-                                             and this run's questions all come to you."
-                    .to_owned(),
+                (Fallback::CostUnreported, Some(clause)) => format!("{clause}, and {left}."),
+                (_, Some(clause)) => format!("{clause}, so {left}."),
+                (_, None) => format!("Owlshift's resolver stopped, so {left}."),
             });
         }
         if !self.reopened.is_empty() {
@@ -1379,6 +1391,42 @@ pub struct Decided {
     pub option: Option<String>,
 }
 
+/// Why a chain's bound was reached (OWL-328, OWL-376), as a round and a
+/// DECISION comment say it; `None` for a fallback that is no bound.
+fn bound_clause(fallback: Fallback) -> Option<String> {
+    match fallback {
+        Fallback::UsageLimit | Fallback::Failed => None,
+        Fallback::PassLimit(runs) => Some(format!(
+            "Owlshift's resolver already settled every question of {runs} runs in a row \
+             (`policy.resolver_passes`)"
+        )),
+        Fallback::Budget {
+            spent_micros,
+            ceiling_micros,
+        } => Some(format!(
+            "Owlshift's resolver runs since this command's last stop cost {} USD, which reached \
+             this project's dollar ceiling of {} USD (`policy.resolver_budget_usd`)",
+            usd(spent_micros),
+            usd(ceiling_micros)
+        )),
+        Fallback::CostUnreported => Some(
+            "A resolver run since this command started reported no cost, so this project's \
+             dollar ceiling (`policy.resolver_budget_usd`) could not be checked"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Who took the decisions of a DECISION comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// A resolver run.
+    Resolver,
+    /// The runner, on the asking run's recommendations, once the chain
+    /// reached this bound at `all` and no resolver ran (OWL-375).
+    Recommendation(Fallback),
+}
+
 impl Decided {
     /// The decisions `logged` of a resolver run, D1..Dn in this order: what
     /// its DECISION comment shows and the ticket ref then keeps.
@@ -1482,14 +1530,19 @@ pub struct DecisionComment {
     /// The project's delegation level that allowed them (OWL-328).
     pub level: DelegationLevel,
     pub reasoning: Reasoning,
-    /// The resolver run that decided them.
+    /// The resolver run that decided them, or the asking run whose
+    /// recommendations the runner took (OWL-375).
     pub run: Option<String>,
+    /// Who decided them: the resolver, or the runner at the resolver's bound.
+    pub by: DecidedBy,
 }
 
 impl DecisionComment {
     /// The comment body: the `[owlshift] DECISION` header; a lead line
     /// saying how many questions were decided, the delegation level that
-    /// allowed them (OWL-337) and where the reasoning is; one line per
+    /// allowed them (OWL-337) and where the reasoning is, and, for those
+    /// taken on the asking run's recommendations, the bound that stopped the
+    /// resolver (OWL-375); one line per
     /// decision; with [`Reasoning::Folded`], the reasoning in a collapsible
     /// section (Linear's `+++`, checked live on 2026-10-19); one sentence on
     /// how to reverse; and the footer, which names the resolver's run. Text
@@ -1540,11 +1593,21 @@ impl DecisionComment {
             .enumerate()
             .map(|(i, decided)| decided.line(i + 1))
             .collect();
-        let mut sections = vec![
-            header.render(),
-            format!("Owlshift decided {decided} without asking you, {level}. {reasoning}"),
-            lines.join("\n"),
-        ];
+        let lead = match self.by {
+            DecidedBy::Resolver => {
+                format!("Owlshift decided {decided} without asking you, {level}. {reasoning}")
+            }
+            DecidedBy::Recommendation(bound) => {
+                let why = bound_clause(bound)
+                    .map(|clause| format!("{clause}. "))
+                    .unwrap_or_default();
+                format!(
+                    "{why}Owlshift took the asking run's recommendation on {decided} without \
+                     asking you, {level}. {reasoning}"
+                )
+            }
+        };
+        let mut sections = vec![header.render(), lead, lines.join("\n")];
         if self.reasoning == Reasoning::Folded {
             let blocks: Vec<String> = self
                 .decisions
@@ -4264,6 +4327,7 @@ mod tests {
             correction: None,
             review: None,
             reviewed: None,
+            recommended: Vec::new(),
         }
     }
 
@@ -4446,6 +4510,24 @@ Merge state reported by the forge: `CLEAN`.
             assert!(body.contains(line), "{line}\n---\n{body}");
         }
         assert!(!body.contains("Review and merge"), "{body}");
+
+        // Decisions taken on a recommendation at the bound only (OWL-375):
+        // their heading with how to reverse one, and no `none` beside it.
+        quiet.recommended = vec![Decision {
+            question: "Which name?".to_owned(),
+            decision: "Long".to_owned(),
+            basis: "Long names read better.".to_owned(),
+        }];
+        let body = quiet.render();
+        assert!(
+            body.contains(
+                "**Taken on the asking run's recommendation**, the resolver's bound being \
+                 reached; to reverse one, reply to its DECISION comment naming it, as `D2: what \
+                 you want instead`:\n- **Which name?**: Long (basis: Long names read better.)"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("Decisions taken without a human"), "{body}");
     }
 
     #[test]
@@ -5588,6 +5670,7 @@ Context.
                 ),
             },
             run: Some("20261003T120000Z-1".to_owned()),
+            by: DecidedBy::Resolver,
         };
         let body = comment.render();
         let marked = MarkedComment::parse(&body).unwrap().unwrap();
@@ -5669,6 +5752,38 @@ Context.
             "{folded}"
         );
 
+        // Taken on the asking run's recommendations at the bound (OWL-375):
+        // the lead names the bound, then what Owlshift took.
+        let budget = Fallback::Budget {
+            spent_micros: 600_000,
+            ceiling_micros: 500_000,
+        };
+        for (bound, says) in [
+            (
+                budget,
+                "Owlshift's resolver runs since this command's last stop cost 0.60 USD, which \
+                 reached this project's dollar ceiling of 0.50 USD (`policy.resolver_budget_usd`). \
+                 Owlshift took the asking run's recommendation on these 3 questions without asking \
+                 you, as delegation level `all` allows.",
+            ),
+            (
+                Fallback::PassLimit(5),
+                "every question of 5 runs in a row (`policy.resolver_passes`). Owlshift took",
+            ),
+            (
+                Fallback::CostUnreported,
+                "could not be checked. Owlshift took the asking run's recommendation",
+            ),
+        ] {
+            let body = DecisionComment {
+                by: DecidedBy::Recommendation(bound),
+                ..comment.clone()
+            }
+            .render();
+            assert!(body.contains(says), "{says}\n---\n{body}");
+            assert!(!body.contains("Owlshift decided"), "{body}");
+        }
+
         let round = |decided, fallback| {
             QuestionsComment {
                 ticket: ticket(),
@@ -5707,7 +5822,19 @@ Context.
             (
                 0,
                 Some(Fallback::PassLimit(3)),
-                "every question of 3 runs in a row (`policy.resolver_passes`)",
+                "every question of 3 runs in a row (`policy.resolver_passes`), so this run's \
+                 questions all come to you.",
+            ),
+            // Some taken on their recommendations at the bound (OWL-375).
+            (
+                2,
+                Some(Fallback::PassLimit(3)),
+                "(`policy.resolver_passes`), so the rest of this run's questions come to you.",
+            ),
+            (
+                1,
+                Some(Fallback::CostUnreported),
+                "could not be checked, and the rest of this run's questions come to you.",
             ),
             (
                 0,
@@ -5956,6 +6083,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     level: DelegationLevel::Discoverable,
                     reasoning: Reasoning::Folded,
                     run: None,
+                    by: DecidedBy::Resolver,
                 }
                 .render(),
             ];
@@ -6276,6 +6404,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             level: DelegationLevel::Ticket,
             reasoning: Reasoning::Folded,
             run: None,
+            by: DecidedBy::Resolver,
         };
         let resume = ResumeComment {
             ticket: ticket(),
@@ -6998,6 +7127,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             level: DelegationLevel::All,
             reasoning: Reasoning::Folded,
             run: Some("run-1".to_owned()),
+            by: DecidedBy::Resolver,
         };
         let body = decision.render();
         assert!(chars(&body) <= MAX_COMMENT_CHARS, "{}", chars(&body));

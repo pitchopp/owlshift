@@ -788,7 +788,7 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 14 document read as the current format, or `None` for
+    /// A format-2 to 15 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
@@ -797,11 +797,12 @@ impl TicketQuestions {
     /// reshaped a question's options and recommendation, which every older
     /// format keeps as strings, format 13 adds a decision's basis kind and
     /// format 14 its asking role, format 15 its number and the decisions
-    /// document.
+    /// document, format 16 the runner's `recommendation` basis kind
+    /// (OWL-375).
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=14).contains(&format) {
+        if !(2..=15).contains(&format) {
             return None;
         }
         let kinded = format <= 12
@@ -816,7 +817,12 @@ impl TicketQuestions {
                 .is_some_and(|decisions| decisions.iter().any(|d| d.get(field).is_some()))
         };
         let asker = format <= 13 && in_a_decision("asked_by");
-        let numbered = in_a_decision("number");
+        let numbered = format <= 14 && in_a_decision("number");
+        let recommended = document["decisions"].as_array().is_some_and(|decisions| {
+            decisions
+                .iter()
+                .any(|decision| decision["basis_kind"] == "recommendation")
+        });
         let asked = document["asks"]
             .as_array()
             .into_iter()
@@ -867,8 +873,10 @@ impl TicketQuestions {
             Some("decision's asking role")
         } else if numbered {
             Some("decision's number")
-        } else if document.get("decisions_document").is_some() {
+        } else if format <= 14 && document.get("decisions_document").is_some() {
             Some("decisions document")
+        } else if recommended {
+            Some("decision taken on a recommendation")
         } else {
             None
         };

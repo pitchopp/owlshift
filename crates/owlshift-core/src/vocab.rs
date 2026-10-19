@@ -253,14 +253,14 @@ impl DelegationLevel {
 
     /// Whether the resolver may rest a decision on a basis of this kind at
     /// this level: `facts` allows `fact`, `discoverable` adds `settled`,
-    /// `ticket` adds `ticket`, and `all` adds `judgment` (OWL-342); `none`
-    /// allows nothing.
+    /// `ticket` adds `ticket`, and `all` adds `judgment` (OWL-342) and the
+    /// runner's own `recommendation` (OWL-375); `none` allows nothing.
     pub fn allows(self, kind: BasisKind) -> bool {
         match kind {
             BasisKind::Fact => self >= Self::Facts,
             BasisKind::Settled => self >= Self::Discoverable,
             BasisKind::Ticket => self >= Self::Ticket,
-            BasisKind::Judgment => self == Self::All,
+            BasisKind::Judgment | BasisKind::Recommendation => self == Self::All,
         }
     }
 }
@@ -284,19 +284,30 @@ pub enum BasisKind {
     /// trade-off, a priority, an intent the ticket does not state
     /// (OWL-342). At `all` only.
     Judgment,
+    /// The asking run's own recommendation, which the runner takes once the
+    /// resolver's chain reached its bound and no resolver runs (OWL-375): the
+    /// runner's kind, never a resolver's. At `all` only.
+    Recommendation,
 }
 
 impl BasisKind {
     /// Every kind, in the order of the lowest level that allows each.
-    pub const ALL: [Self; 4] = [Self::Fact, Self::Settled, Self::Ticket, Self::Judgment];
+    pub const ALL: [Self; 5] = [
+        Self::Fact,
+        Self::Settled,
+        Self::Ticket,
+        Self::Judgment,
+        Self::Recommendation,
+    ];
 
-    /// The name `result.json` writes.
+    /// The name `result.json` and the ticket ref write.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Fact => "fact",
             Self::Settled => "settled",
             Self::Ticket => "ticket",
             Self::Judgment => "judgment",
+            Self::Recommendation => "recommendation",
         }
     }
 }
@@ -381,13 +392,16 @@ mod tests {
     /// passes" lists them.
     #[test]
     fn each_level_allows_its_basis_kinds() {
-        use BasisKind::{Fact, Judgment, Settled, Ticket};
+        use BasisKind::{Fact, Judgment, Recommendation, Settled, Ticket};
         let cases: [(DelegationLevel, &[BasisKind]); 5] = [
             (DelegationLevel::None, &[]),
             (DelegationLevel::Facts, &[Fact]),
             (DelegationLevel::Discoverable, &[Fact, Settled]),
             (DelegationLevel::Ticket, &[Fact, Settled, Ticket]),
-            (DelegationLevel::All, &[Fact, Settled, Ticket, Judgment]),
+            (
+                DelegationLevel::All,
+                &[Fact, Settled, Ticket, Judgment, Recommendation],
+            ),
         ];
         for (level, allowed) in cases {
             for kind in BasisKind::ALL {
