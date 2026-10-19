@@ -841,18 +841,28 @@ fn option_bullets(question: &Question) -> String {
 /// The answer line that ends a round (OWL-324): an example answer, the id
 /// of the first question with options and the letter it recommends (A when
 /// it names none), then `ok` for every recommendation; `ok` alone when no
-/// question has options.
-fn answer_line(questions: &[Question]) -> String {
+/// question has options. With `thumbs_up`, a round a thumbs-up can answer
+/// on a tracker that reads it (OWL-371), the line says so, in words: the
+/// owl writes no emoji (visual identity).
+fn answer_line(questions: &[Question], thumbs_up: bool) -> String {
     const REST: &str = "`ok` to take every recommendation, or in your own words.";
-    match questions.iter().find(|q| !q.options.is_empty()) {
+    let line = match questions.iter().find(|q| !q.options.is_empty()) {
         Some(question) => format!(
             "Reply `{}: {}`, {REST}",
             question.id,
             option_letter(question.recommended_option().unwrap_or(0))
         ),
         None => format!("Reply {REST}"),
+    };
+    if thumbs_up {
+        format!("{line} {THUMBS_UP_LINE}")
+    } else {
+        line
     }
 }
+
+/// What the answer line adds where a thumbs-up answers (OWL-371).
+pub(crate) const THUMBS_UP_LINE: &str = "A thumbs-up on this comment counts as `ok`.";
 
 /// A refused choice that a question reopens (OWL-203): a choice an earlier
 /// Build run made without the decider, which the runner refused, named by
@@ -996,8 +1006,14 @@ impl QuestionsComment {
     /// reopens, a rule and the answer line (`answer_line`), and the
     /// footer. Text from a model is flattened to one line.
     pub fn render(&self) -> String {
+        self.rendered(false)
+    }
+
+    /// The comment body, its answer line saying that a thumbs-up counts
+    /// when `thumbs_up` (OWL-371).
+    fn rendered(&self, thumbs_up: bool) -> String {
         let (head, blocks) = self.sections();
-        self.body(None, head.into_iter().chain(blocks), true)
+        self.body(None, head.into_iter().chain(blocks), true, thumbs_up)
     }
 
     /// The round as the comments that hold it, in posting order, each of at
@@ -1009,11 +1025,18 @@ impl QuestionsComment {
     /// the last ends with the answer line. A question too long for a part
     /// alone, which the result's bounds leave no room for, is cut, visibly.
     pub fn parts(&self, room: usize) -> Vec<String> {
-        let whole = self.render();
+        self.parts_for(room, false)
+    }
+
+    /// The round's parts as [`Self::parts`] cuts them, as posted on a
+    /// tracker where a thumbs-up answers the round when `thumbs_up`
+    /// (OWL-371): its answer line then says so.
+    pub fn parts_for(&self, room: usize, thumbs_up: bool) -> Vec<String> {
+        let whole = self.rendered(thumbs_up);
         if chars(&whole) <= room {
             return vec![whole];
         }
-        let frame = chars(&self.body(Some((usize::MAX, usize::MAX)), [], true));
+        let frame = chars(&self.body(Some((usize::MAX, usize::MAX)), [], true, thumbs_up));
         // Each section adds its characters and the blank line before it.
         let room = room.saturating_sub(frame);
         let (head, blocks) = self.sections();
@@ -1036,17 +1059,19 @@ impl QuestionsComment {
         parts
             .into_iter()
             .enumerate()
-            .map(|(i, sections)| self.body(Some((i + 1, n)), sections, i + 1 == n))
+            .map(|(i, sections)| self.body(Some((i + 1, n)), sections, i + 1 == n, thumbs_up))
             .collect()
     }
 
     /// A body: the header, which part it is when the round is in parts,
-    /// `sections`, a rule and the answer line when `last`, and the footer.
+    /// `sections`, a rule and the answer line when `last`, saying that a
+    /// thumbs-up counts when `thumbs_up`, and the footer.
     fn body(
         &self,
         part: Option<(usize, usize)>,
         sections: impl IntoIterator<Item = String>,
         last: bool,
+        thumbs_up: bool,
     ) -> String {
         let header = Header {
             kind: MarkerKind::Questions,
@@ -1058,7 +1083,7 @@ impl QuestionsComment {
         }
         all.extend(sections);
         if last {
-            all.push(format!("---\n{}", answer_line(&self.questions)));
+            all.push(format!("---\n{}", answer_line(&self.questions, thumbs_up)));
         }
         let footer = Footer {
             format: Format,
@@ -3614,9 +3639,13 @@ impl<'a> Writer<'a> {
     /// counts once the whole round is on the ticket, and that part alone
     /// mentions the decider, so they are told then. A part refused stops
     /// the round there; the error says how many parts reached the ticket.
+    /// On a tracker that reads reactions ([`Capability::Reactions`]), a
+    /// round a thumbs-up answers says so in its answer line (OWL-371).
     pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Posted, WriteError> {
         let (mention, mention_dropped) = self.mention();
-        let parts = comment.parts(room_beside(mention.as_deref()));
+        let thumbs_up = self.tracker.capabilities().contains(&Capability::Reactions)
+            && crate::answer_check::answerable_by_thumbs_up(&comment.questions);
+        let parts = comment.parts_for(room_beside(mention.as_deref()), thumbs_up);
         let n = parts.len();
         let mut posted = None;
         for (i, body) in parts.into_iter().enumerate() {
@@ -5853,11 +5882,17 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         /// The post, from 1, the tracker refuses.
         fail_post: Cell<Option<usize>>,
         stages: RefCell<Vec<String>>,
+        /// It reads reactions (OWL-371).
+        reacting: Cell<bool>,
     }
 
     impl Tracker for FakeTracker {
         fn capabilities(&self) -> &'static [Capability] {
-            &[Capability::Comments]
+            if self.reacting.get() {
+                &[Capability::Comments, Capability::Reactions]
+            } else {
+                &[Capability::Comments]
+            }
         }
 
         fn ticket(&self, _: &TicketId) -> Result<Ticket, TrackerError> {
@@ -5905,6 +5940,65 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 _ => Ok(Some(format!("<mention of {account}>"))),
             }
         }
+    }
+
+    /// OWL-371: on a tracker that reads reactions, a round of one question
+    /// carrying a recommendation says in its answer line that a thumbs-up
+    /// counts, in words; a round of two, one without a recommendation, and
+    /// any round on a tracker without reactions do not, nor the body
+    /// rendered for print.
+    #[test]
+    fn a_question_asked_alone_says_a_thumbs_up_counts() {
+        let question = |id: &str, recommended: bool| Question {
+            id: owlshift_contracts::ids::QuestionId::new(id).unwrap(),
+            category: "scope".to_owned(),
+            context: String::new(),
+            text: "Should the README link to the greeting?".to_owned(),
+            options: vec![QuestionOption::new("Yes"), QuestionOption::new("No")],
+            recommendation: recommended.then(|| Recommendation {
+                option: Some("B".to_owned()),
+                why: "The README lists code only.".to_owned(),
+            }),
+            replan: false,
+        };
+        let round = |questions| QuestionsComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(1).unwrap(),
+            summary: String::new(),
+            questions,
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+            reopened: Vec::new(),
+            notes: Vec::new(),
+        };
+        let line = format!(
+            "---\nReply `Q1: B`, `ok` to take every recommendation, or in your own words. \
+             {THUMBS_UP_LINE}\n"
+        );
+        let tracker = FakeTracker::default();
+        tracker.reacting.set(true);
+        let alone = round(vec![question("Q1", true)]);
+        let posted = Writer::new(&tracker).post_questions(&alone).unwrap();
+        assert!(
+            posted.comment.body.contains(&line),
+            "{}",
+            posted.comment.body
+        );
+        assert!(!THUMBS_UP_LINE.contains('\u{1F44D}'));
+        assert!(!alone.render().contains(THUMBS_UP_LINE));
+        for questions in [
+            vec![question("Q1", true), question("Q2", true)],
+            vec![question("Q1", false)],
+        ] {
+            let posted = Writer::new(&tracker)
+                .post_questions(&round(questions))
+                .unwrap();
+            assert!(!posted.comment.body.contains(THUMBS_UP_LINE));
+        }
+        tracker.reacting.set(false);
+        let posted = Writer::new(&tracker).post_questions(&alone).unwrap();
+        assert_eq!(posted.comment.body, alone.render());
     }
 
     /// The comments that wait for the decider mention them at the end of
