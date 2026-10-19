@@ -2354,3 +2354,61 @@ fn watch_resumes_a_new_cycle_started_after_its_pull_request_closed() {
     );
     assert_eq!(bench.watch_resumes(), ["build"]);
 }
+
+/// OWL-371: a risky plan's approval, a question asked alone, answered by the
+/// decider's thumbs-up on its round. No answer check runs; the approving
+/// design run reads the round as answered on its recommendation, the plan
+/// is kept approved with the round's comment, and the Build starts.
+#[test]
+fn a_plan_approved_by_a_thumbs_up_reaches_build() {
+    let bench = Bench::of("risky");
+    bench.reactions.borrow_mut().on = true;
+    let replies = vec![
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    let stop = outcome.expect_err("the approval goes to the decider");
+    assert!(
+        matches!(&stop, Stop::NeedsInput { .. }),
+        "{stop:?}\n{printed}"
+    );
+    let ask = bench.record().questions.asks.last().unwrap().clone();
+    assert_eq!(ask.questions[0].category, "plan_approval");
+    assert!(
+        bench
+            .marked("[owlshift] QUESTIONS")
+            .contains(THUMBS_UP_LINE)
+    );
+
+    bench.react("maintainer", false, &ask.comment, "+1");
+    let replies = vec![bench.read(&answered("approved", None)), bench.built()];
+    let (outcome, printed) = bench.continue_ticket(replies);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(!bench.roles().contains(&Role::AnswerCheck), "no check ran");
+    let approving = bench
+        .briefs()
+        .into_iter()
+        .find(|brief| brief.role == Role::Design && brief.approval)
+        .expect("the approving design run");
+    assert!(
+        approving.thread.iter().any(|entry| matches!(
+            entry,
+            ThreadEntry::Answered { questions, .. } if questions.iter().any(|q| q.understood
+                == "The decider's thumbs-up on the question: its recommendation, A, Approve \
+                    the plan as it is.")
+        )),
+        "{:?}",
+        approving.thread
+    );
+    let approval = bench
+        .record()
+        .plan
+        .unwrap()
+        .approval
+        .expect("the approval is kept");
+    assert_eq!(approval.comment, ask.comment);
+    assert!(bench.roles().contains(&Role::Build));
+}

@@ -589,6 +589,7 @@ mod tests {
                 decider: "d".to_owned(),
                 window: std::time::Duration::from_secs(600),
                 counts_at: at(),
+                thumbs_up: false,
             }),
             Err(Stop::CheckFailed {
                 ticket: owl_7(),

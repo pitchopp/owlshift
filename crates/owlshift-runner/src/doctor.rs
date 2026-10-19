@@ -3362,7 +3362,7 @@ always_human = []
             tracker.detail,
             "`linear`: read a ticket, list admitted tickets, read and post comments, \
              visible stage, blocked-by relations, proposals inbox, ticket documents, fold \
-             superseded comments"
+             superseded comments, comment reactions"
         );
     }
 

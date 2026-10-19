@@ -100,7 +100,7 @@
       "type": "object",
       "properties": {
         "comment": {
-          "description": "The tracker's identifier of the comment that approved it: the\ndecider's, or, when the resolver decided the approval (OWL-343), its\nDECISION comment, kept with the decision in `questions.json`.",
+          "description": "The tracker's identifier of the comment that approved it: the\ndecider's, or the approval round's own when the decider answered it\nwith a thumbs-up (OWL-371), or, when the resolver decided the\napproval (OWL-343), its DECISION comment, kept with the decision in\n`questions.json`.",
           "type": "string",
           "pattern": "\\S"
         },

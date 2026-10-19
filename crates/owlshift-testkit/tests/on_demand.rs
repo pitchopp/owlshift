@@ -443,7 +443,30 @@ struct Clocked<'a> {
     inbox: &'a RefCell<FakeInbox>,
     /// Folding comments, when it is on (OWL-353).
     fold: &'a RefCell<FakeFold>,
+    /// Reactions on comments, when they are read (OWL-371).
+    reactions: &'a RefCell<FakeReactions>,
 }
+
+/// Reactions on the tracker's comments, which the Markdown tracker's files
+/// do not hold (OWL-371): read with the comments, each on the comment of
+/// its id, and declared only when a test turns them on.
+#[derive(Default)]
+struct FakeReactions {
+    on: bool,
+    /// Each reaction with the id of the comment it is on.
+    on_comments: Vec<(String, tracker::Reaction)>,
+}
+
+/// [`WITHOUT_INBOX`] with reactions read.
+const REACTING: &[Capability] = &[
+    Capability::ReadTicket,
+    Capability::ListAdmitted,
+    Capability::Comments,
+    Capability::VisibleStage,
+    Capability::BlockedBy,
+    Capability::Documents,
+    Capability::Reactions,
+];
 
 /// A tracker that resolves comments, which the Markdown tracker does not
 /// (OWL-353): off unless a test turns it on, with the inbox off.
@@ -501,6 +524,10 @@ fn the_bench_without_an_inbox_keeps_every_other_capability() {
     assert!(!expected.contains(&Capability::FoldComments));
     expected.push(Capability::FoldComments);
     assert_eq!(FOLDING, expected);
+    assert!(!expected.contains(&Capability::Reactions));
+    expected.pop();
+    expected.push(Capability::Reactions);
+    assert_eq!(REACTING, expected);
 }
 
 /// The clock's time, then a minute later.
@@ -513,7 +540,13 @@ fn tick(clock: &Cell<Timestamp>) -> Timestamp {
 impl Tracker for Clocked<'_> {
     fn capabilities(&self) -> &'static [Capability] {
         let inbox = self.inbox.borrow();
-        if self.fold.borrow().on {
+        if self.reactions.borrow().on {
+            assert!(
+                !inbox.on && !inbox.markdown && !self.fold.borrow().on,
+                "no bench reads reactions with an inbox or folding"
+            );
+            REACTING
+        } else if self.fold.borrow().on {
             assert!(!inbox.on && !inbox.markdown, "no bench folds with an inbox");
             FOLDING
         } else if inbox.on || inbox.markdown {
@@ -600,7 +633,13 @@ impl Tracker for Clocked<'_> {
                 "the tracker is down",
             ));
         }
-        Tracker::comments(&self.inner, id)
+        let mut comments = Tracker::comments(&self.inner, id)?;
+        for (on, reaction) in &self.reactions.borrow().on_comments {
+            if let Some(comment) = comments.iter_mut().find(|comment| comment.id == *on) {
+                comment.reactions.push(reaction.clone());
+            }
+        }
+        Ok(comments)
     }
 
     fn post_comment(&self, id: &TicketId, body: &str) -> Result<Comment, tracker::Error> {
@@ -746,6 +785,8 @@ struct Bench {
     inbox: RefCell<FakeInbox>,
     /// The tracker's folding of comments (OWL-353).
     fold: RefCell<FakeFold>,
+    /// The reactions on the tracker's comments (OWL-371).
+    reactions: RefCell<FakeReactions>,
     /// The routing each routed harness was asked for, in order (OWL-305).
     routed: Rc<RefCell<Vec<RunRouting>>>,
     /// The verify seats play from the bench's reply queue, as every other
@@ -888,6 +929,7 @@ impl Bench {
             waited: Cell::new(SignedDuration::from_mins(10)),
             inbox: RefCell::default(),
             fold: RefCell::default(),
+            reactions: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
             notified: Notified::default(),
@@ -1002,6 +1044,37 @@ impl Bench {
         MarkdownTracker::new(&self.remote.checkout)
             .post_comment(&ticket(), author, tick(&self.clock), body)
             .unwrap();
+    }
+
+    /// `author`, an account's name or, with `app`, an app user's, puts
+    /// `emoji` on the comment `on`, at the next minute (OWL-371).
+    fn react(&self, author: &str, app: bool, on: &str, emoji: &str) {
+        let author = if app {
+            tracker::Author::Other {
+                name: author.to_owned(),
+            }
+        } else {
+            tracker::Author::Account(tracker::Person {
+                id: author.to_owned(),
+                name: author.to_owned(),
+            })
+        };
+        self.reactions.borrow_mut().on_comments.push((
+            on.to_owned(),
+            tracker::Reaction {
+                emoji: emoji.to_owned(),
+                author,
+                created_at: tick(&self.clock),
+            },
+        ));
+    }
+
+    /// Takes back every reaction on the comment `on`.
+    fn unreact(&self, on: &str) {
+        self.reactions
+            .borrow_mut()
+            .on_comments
+            .retain(|(comment, _)| comment != on);
     }
 
     /// `author` replies to the comment `parent`, at the next minute
@@ -1277,6 +1350,7 @@ impl Bench {
             stage_reads: &self.stage_reads,
             inbox: &self.inbox,
             fold: &self.fold,
+            reactions: &self.reactions,
         };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
@@ -3188,6 +3262,154 @@ fn a_two_character_answer_reaches_the_check_and_resumes() {
         "{resume}"
     );
     assert!(comments.last().unwrap().starts_with("[owlshift] DELIVERY"));
+}
+
+/// What a round of one question says on a tracker that reads reactions
+/// (OWL-371).
+const THUMBS_UP_LINE: &str = "A thumbs-up on this comment counts as `ok`.";
+
+/// What the runner understood of the decider's thumbs-up on
+/// [`LETTERED_NEXT`] (OWL-371).
+const THUMBS_UP_READ: &str = "The decider's thumbs-up on the question: its recommendation, B, No.";
+
+/// OWL-371's acceptance: on a tracker that reads reactions, a round of one
+/// question says a thumbs-up counts. An app user's thumbs-up, Owlshift's
+/// own, answers nothing. The decider's settles through the quiet window,
+/// whose stop offers no `go`; taken back before it counts, it answers
+/// nothing. Put again, it counts: the round resumes on the recommendation
+/// as `ok` would, with no answer check, and the work delivers. The rule's
+/// other cases (another account, another emoji or comment, a round of two)
+/// are `answer_check`'s unit tests.
+#[test]
+fn a_thumbs_up_of_the_decider_answers_a_question_asked_alone() {
+    let bench = Bench::new(true);
+    bench.reactions.borrow_mut().on = true;
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(LETTERED_NEXT))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    let round = bench.comments().pop().unwrap();
+    assert!(
+        round.contains(&format!(
+            "Reply `Q1: B`, `ok` to take every recommendation, or in your own words. \
+             {THUMBS_UP_LINE}"
+        )),
+        "{round}"
+    );
+    let on = bench.record().questions.asks[0].comment.clone();
+
+    bench.react("owlshift", true, &on, "+1");
+    let (waiting, _) = bench.continue_ticket(Vec::new());
+    assert!(matches!(&waiting, Err(Stop::Waiting { .. })), "{waiting:?}");
+
+    let waited = bench.waited.get();
+    bench.waited.set(SignedDuration::ZERO);
+    let reacted_at = bench.clock.get();
+    bench.react("maintainer", false, &on, "+1");
+    let (settling, _) = bench.continue_ticket(Vec::new());
+    match &settling {
+        Err(
+            stop @ Stop::Settling {
+                thumbs_up: true,
+                counts_at,
+                ..
+            },
+        ) => {
+            assert_eq!(
+                *counts_at,
+                reacted_at
+                    .checked_add(SignedDuration::from_mins(10))
+                    .unwrap()
+            );
+            let printed = stop.to_string();
+            assert!(
+                printed.contains("answered with a thumbs-up") && !printed.contains("`go`"),
+                "{printed}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    bench.unreact(&on);
+    bench.waited.set(waited);
+    let (withdrawn, _) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&withdrawn, Err(Stop::Waiting { .. })),
+        "{withdrawn:?}"
+    );
+
+    bench.react("maintainer", false, &on, "+1");
+    let (delivered, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(!bench.roles().contains(&Role::AnswerCheck), "no check ran");
+    let comments = bench.comments();
+    let resume = &comments[comments.len() - 2];
+    assert!(
+        resume.starts_with("[owlshift] RESUME · round 1")
+            && resume.contains(&format!("**Understood:** {THUMBS_UP_READ}")),
+        "{resume}"
+    );
+    assert!(comments.last().unwrap().starts_with("[owlshift] DELIVERY"));
+    // The Build read the round as answered, as after a typed `ok`.
+    let build = bench.last_of(Role::Build);
+    assert!(
+        build.thread.iter().any(|entry| matches!(
+            entry,
+            ThreadEntry::Answered { questions, .. }
+                if questions.iter().any(|q| q.understood == THUMBS_UP_READ)
+        )),
+        "{:?}",
+        build.thread
+    );
+    let gate: Vec<Event> = bench
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.kind == EventKind::Gate && event.data.get("answer") == Some(&json!("reaction"))
+        })
+        .collect();
+    assert_eq!(gate.len(), 1, "{gate:?}");
+    assert_eq!(gate[0].data["answer_check"], json!("answered"));
+    assert_eq!(gate[0].run, None, "no run gave it");
+}
+
+/// OWL-371: words win. A thumbs-up older than the decider's typed answer is
+/// read with it: the answer check runs on the words, and the round resumes
+/// on what it understood of them.
+#[test]
+fn words_win_over_a_thumbs_up() {
+    let bench = Bench::new(true);
+    bench.reactions.borrow_mut().on = true;
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(LETTERED_NEXT))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let on = bench.record().questions.asks[0].comment.clone();
+    bench.react("maintainer", false, &on, "+1");
+    bench.answer("Q1: A");
+    let taken = check(&[("Q1", "answered", "A, a link.")]);
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&taken)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let check = bench.last_of(Role::AnswerCheck);
+    assert!(
+        check.thread.iter().any(|entry| matches!(
+            entry,
+            ThreadEntry::Comment { author, body, .. }
+                if author.relation == Relation::Decider && body == "Q1: A"
+        )),
+        "{:?}",
+        check.thread
+    );
+    let comments = bench.comments();
+    let resume = &comments[comments.len() - 2];
+    assert!(
+        resume.contains("**Understood:** A, a link.") && !resume.contains(THUMBS_UP_READ),
+        "{resume}"
+    );
 }
 
 /// OWL-136: the comments of one second read in the order they were posted.

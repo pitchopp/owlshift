@@ -570,6 +570,9 @@ pub enum Stop {
         /// The project's quiet window.
         window: Duration,
         counts_at: Timestamp,
+        /// The answer is the decider's thumbs-up, which cannot end with
+        /// `go` (OWL-371).
+        thumbs_up: bool,
     },
     /// The answers left questions open: they were asked again on the ticket.
     Reasked {
@@ -695,16 +698,28 @@ impl fmt::Display for Stop {
                 decider,
                 window,
                 counts_at,
-            } => write!(
-                f,
-                "Waiting: {decider} may still be writing. Their latest comment counts as their \
-                 answer once left unedited for {minutes}, at {counts_at}, or at once if it ends \
-                 with `go`. Run `owlshift continue {ticket}` then.",
-                minutes = match window.as_secs() / 60 {
+                thumbs_up,
+            } => {
+                let minutes = match window.as_secs() / 60 {
                     1 => "1 minute".to_owned(),
                     n => format!("{n} minutes"),
+                };
+                if *thumbs_up {
+                    write!(
+                        f,
+                        "Waiting: {decider} answered with a thumbs-up, which counts as their \
+                         answer once it has stood for {minutes}, at {counts_at}. Run \
+                         `owlshift continue {ticket}` then."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Waiting: {decider} may still be writing. Their latest comment counts as \
+                         their answer once left unedited for {minutes}, at {counts_at}, or at \
+                         once if it ends with `go`. Run `owlshift continue {ticket}` then."
+                    )
                 }
-            ),
+            }
             Self::Reasked {
                 ticket,
                 round,
@@ -2790,7 +2805,9 @@ impl OnDemand<'_> {
     /// questions are asked again, the counter-question gets the check's
     /// reply and the ticket keeps waiting, or
     /// it parks (a stop). A failed or interrupted check moves nothing the
-    /// next one reads, so it is retried on the same answers.
+    /// next one reads, so it is retried on the same answers. A thumbs-up of
+    /// the decider that counts runs no check: the ticket resumes on the
+    /// question's recommendation (OWL-371).
     fn check_answers(
         &self,
         p: &mut Prepared,
@@ -2824,17 +2841,38 @@ impl OnDemand<'_> {
                     since,
                 });
             }
-            Some(Readiness::Settling { counts_at }) => {
+            Some(Readiness::Settling {
+                counts_at,
+                thumbs_up,
+            }) => {
                 return Err(Stop::Settling {
                     ticket,
                     decider: name_of(&asked, &p.found),
                     window,
                     counts_at,
+                    thumbs_up,
                 });
             }
             Some(Readiness::Counts) => {}
         }
-        let read_through = answer_check::newest_decider_edit(&comments, &asked_of);
+        let answer = answer_check::answer(&comments, &asked_of, &questions);
+        // What the check reads through: the words it reads, or the
+        // thumbs-up. A thumbs-up newer than the words is left for later.
+        let read_through = answer.map(|answer| answer.at());
+        if let Some(answer_check::Answer::ThumbsUp(_)) = answer {
+            // A thumbs-up has one reading: the question's recommendation,
+            // as `ok` takes it. No check runs, so none can fail or park.
+            let verdicts = answer_check::thumbs_up_verdicts(&latest.questions);
+            questions.keep_check(read_through, &verdicts);
+            questions.keep_refusal(None);
+            let next = match state.apply(p.pipeline, Event::Answered) {
+                Ok(Transition::To(next)) => next,
+                other => return Err(core_error(other)),
+            };
+            let mut checked = checked_data("answered", &next, &verdicts);
+            checked.insert("answer".to_owned(), json!("reaction"));
+            return self.resumed(p, next, questions, None, checked, sink);
+        }
         // The ticket's author is judged against the decider now, or the
         // asked one when the ticket has none now: the description is
         // context for the answer check either way.
@@ -2888,68 +2926,11 @@ impl OnDemand<'_> {
             }
             other => return Err(core_error(other)),
         };
-        let checked = |outcome: &str| {
-            data([
-                ("answer_check", json!(outcome)),
-                ("round", json!(next.round())),
-                ("reasks", json!(next.reasks())),
-                ("verdicts", verdict_classes(&verdicts)),
-            ])
-        };
+        let checked = |outcome: &str| checked_data(outcome, &next, &verdicts);
         match event {
             Event::Answered => {
-                // RESUME before the state is kept, as a RE-ASK: when the
-                // post fails, nothing of this check is kept and the next
-                // `continue` checks the same answers again.
-                let round = NonZeroU32::new(next.round())
-                    .ok_or_else(|| Stop::Refused("no question round is open".to_owned()))?;
-                let resume = ResumeComment {
-                    ticket: ticket.clone(),
-                    round,
-                    understood: answer_check::understood(questions.round_asks(round)),
-                    return_to: next.stage(),
-                    // Under watch, the ticket whose turn the slot is while
-                    // another holds it (OWL-367); the comment names it for
-                    // a stage that needs the slot.
-                    slot_held_by: p.slot_held_by.clone().filter(|holder| *holder != ticket),
-                };
-                let posted = Writer::new(self.tracker)
-                    .post_resume(&resume)
-                    .map_err(|e| refused("posting the resume on the ticket", e))?;
-                sink.emit(
-                    &ticket,
-                    Some(&ran.run),
-                    EventKind::TrackerWrite,
-                    comment_written("RESUME", &posted),
-                );
-                self.fold(&ticket, Some(&ran.run), &posted, sink);
-                // The ref still waits for answers: nothing resumes Build but
-                // a person, so the stop says the RESUME landed (OWL-169).
-                self.store(p, &next, questions).map_err(|e| Stop::NotKept {
-                    landed: Landed::Resume,
-                    message: format!(
-                        "the resume is on the ticket (comment {}), but keeping the answered \
-                         state in the ticket's ref failed: {e}",
-                        posted.id
-                    ),
-                })?;
-                // Working at Build; review at Watch, where the pull request
-                // is open (OWL-211). At Intake, the ticket keeps needs input
-                // while intake runs again (OWL-269): `back_to_ready` moves it
-                // to the ready column once the record is kept, and only from
-                // needs input or parked, never from working.
-                if next.stage() != Stage::Intake
-                    && let Some(stage) = VisibleStage::of(next.status())
-                {
-                    self.show(&ticket, Some(&ran.run), stage, sink);
-                }
-                sink.emit(
-                    &ticket,
-                    Some(&ran.run),
-                    EventKind::Gate,
-                    checked("answered"),
-                );
-                Ok(next)
+                let checked = checked("answered");
+                self.resumed(p, next, questions, Some(&ran.run), checked, sink)
             }
             Event::Incomplete => {
                 let round = NonZeroU32::new(next.round())
@@ -3098,6 +3079,68 @@ impl OnDemand<'_> {
             },
             other => Err(core_error(other)),
         }
+    }
+
+    /// Resumes a ticket whose round is answered, by the answer check's run
+    /// `run` or by the decider's thumbs-up (no run, OWL-371): posts the
+    /// RESUME, keeps the answered state `next` with `questions`, shows the
+    /// stage, and records the `gate` event `checked`. The RESUME goes before
+    /// the state is kept, as a RE-ASK: when the post fails, nothing is kept
+    /// and the next `continue` reads the same answers again.
+    fn resumed(
+        &self,
+        p: &mut Prepared,
+        next: TicketState,
+        questions: TicketQuestions,
+        run: Option<&str>,
+        checked: Data,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketState, Stop> {
+        let ticket = p.ticket.clone();
+        let round = NonZeroU32::new(next.round())
+            .ok_or_else(|| Stop::Refused("no question round is open".to_owned()))?;
+        let resume = ResumeComment {
+            ticket: ticket.clone(),
+            round,
+            understood: answer_check::understood(questions.round_asks(round)),
+            return_to: next.stage(),
+            // Under watch, the ticket whose turn the slot is while
+            // another holds it (OWL-367); the comment names it for
+            // a stage that needs the slot.
+            slot_held_by: p.slot_held_by.clone().filter(|holder| *holder != ticket),
+        };
+        let posted = Writer::new(self.tracker)
+            .post_resume(&resume)
+            .map_err(|e| refused("posting the resume on the ticket", e))?;
+        sink.emit(
+            &ticket,
+            run,
+            EventKind::TrackerWrite,
+            comment_written("RESUME", &posted),
+        );
+        self.fold(&ticket, run, &posted, sink);
+        // The ref still waits for answers: nothing resumes Build but
+        // a person, so the stop says the RESUME landed (OWL-169).
+        self.store(p, &next, questions).map_err(|e| Stop::NotKept {
+            landed: Landed::Resume,
+            message: format!(
+                "the resume is on the ticket (comment {}), but keeping the answered \
+                 state in the ticket's ref failed: {e}",
+                posted.id
+            ),
+        })?;
+        // Working at Build; review at Watch, where the pull request
+        // is open (OWL-211). At Intake, the ticket keeps needs input
+        // while intake runs again (OWL-269): `back_to_ready` moves it
+        // to the ready column once the record is kept, and only from
+        // needs input or parked, never from working.
+        if next.stage() != Stage::Intake
+            && let Some(stage) = VisibleStage::of(next.status())
+        {
+            self.show(&ticket, run, stage, sink);
+        }
+        sink.emit(&ticket, run, EventKind::Gate, checked);
+        Ok(next)
     }
 
     /// Parks the ticket: keeps its parked state when it has a ticket ref,
@@ -6387,6 +6430,17 @@ fn verdict_classes(verdicts: &[AnswerVerdict]) -> Value {
     )
 }
 
+/// The `gate` event of an answer check's `outcome`, the ticket's state
+/// `next` and the check's verdicts.
+fn checked_data(outcome: &str, next: &TicketState, verdicts: &[AnswerVerdict]) -> Data {
+    data([
+        ("answer_check", json!(outcome)),
+        ("round", json!(next.round())),
+        ("reasks", json!(next.reasks())),
+        ("verdicts", verdict_classes(verdicts)),
+    ])
+}
+
 /// A stage's name as the contracts write it, such as `build`.
 pub(crate) fn stage_name(stage: Stage) -> String {
     serde_json::to_value(stage)
@@ -6868,6 +6922,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         };
         let ask = |kind, round, minute, id: &str| Ask {
             kind,
@@ -6990,6 +7045,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         };
         let question = |id: &str| Question {
             id: QuestionId::new(id).unwrap(),
@@ -7221,6 +7277,7 @@ mod tests {
             edited_at: None,
             body: format!("{by} at {minute}"),
             parent: None,
+            reactions: Vec::new(),
         };
         let ask = |round: u32, minute: u32, by: &str| Ask {
             kind: AskKind::Questions,
@@ -7291,6 +7348,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         };
         let marked = "[owlshift] DELIVERY\n\nDone.\n\n<!-- owlshift:{\"format\":1,\"kind\":\"DELIVERY\",\"ticket\":\"OWL-1\"} -->\n";
         let cases = [
@@ -7344,6 +7402,7 @@ mod tests {
             edited_at: None,
             body: body.into(),
             parent: None,
+            reactions: Vec::new(),
         }
     }
 

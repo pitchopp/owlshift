@@ -461,8 +461,10 @@ pub enum PlanChange {
 #[serde(deny_unknown_fields)]
 pub struct KeptApproval {
     /// The tracker's identifier of the comment that approved it: the
-    /// decider's, or, when the resolver decided the approval (OWL-343), its
-    /// DECISION comment, kept with the decision in `questions.json`.
+    /// decider's, or the approval round's own when the decider answered it
+    /// with a thumbs-up (OWL-371), or, when the resolver decided the
+    /// approval (OWL-343), its DECISION comment, kept with the decision in
+    /// `questions.json`.
     #[schemars(regex(pattern = r"\S"))]
     pub comment: String,
     /// The SHA-256 of the approved plan's [`Plan::canonical`] text, as 64
