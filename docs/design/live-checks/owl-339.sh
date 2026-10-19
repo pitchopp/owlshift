@@ -1,6 +1,7 @@
 #!/bin/sh
-# OWL-339 live checks (a) and (d), quoted by the "OWL-339 live checks" bullet of docs/design/build-plan.md.
-# Usage: sh docs/design/live-checks/owl-339.sh   (no argument; scratch repositories under ${TMPDIR:-/tmp})
+# OWL-339 live checks (a), (d) and (e), quoted by the "OWL-339 live checks" bullet of docs/design/build-plan.md.
+# Usage: sh docs/design/live-checks/owl-339.sh [e]   (no argument: every check; e: (e) alone; scratch repositories
+# under ${TMPDIR:-/tmp})
 # Every command prints `status=<exit status>` after it. A root user is not bound by chmod: (d) is then not run.
 set -u
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
@@ -36,6 +37,50 @@ repo() {
   echo main > c; git commit -q -am "main c"
 }
 
+# (e) The maintenance a fetch of the runner's git starts in the background, and another entry's logs/HEAD. Each case:
+# an origin with one commit; its clone with worktrees own, other, stale1 and stale2 (the last two expired, as in (d));
+# a new commit on origin; then the fetch the runner runs (`project::sync_checkout`), with the runner's -c settings
+# (`executor::git::hardening`, its hooks folder named here without spaces) and the case's own, under trace2. The
+# detached maintenance is given 4 s, then: whether other's logs/HEAD changed, the entries left, and the children the
+# fetch and its maintenance started (the fetch's own transfer left out).
+check_e() {
+  echo "== (e) the maintenance a fetch of the runner's git starts, and another entry's logs/HEAD"
+  R="-c core.hooksPath=/var/empty/owl339-no-hooks -c core.fsmonitor=false -c repack.updateServerInfo=false"
+  N="-c gc.reflogExpire=never -c gc.reflogExpireUnreachable=never -c gc.worktreePruneExpire=never -c maintenance.worktree-prune.auto=0"
+  # e <label> <old|loose> <extra -c...>: old, 120 commits dated 2020 in the clone (made without maintenance), so its
+  # HEAD reflog holds 120 expired entries; loose, 2000 loose blobs, past gc.auto=1.
+  e() {
+    l=$1; f=$2; shift 2
+    mkdir "$root/$l" && cd "$root/$l" || exit 1
+    git init -q -b main origin && git -C origin commit -q --allow-empty -m first
+    git clone -q origin clone && cd clone || exit 1
+    for w in own other stale1 stale2; do git worktree add -q -b $w "../$w"; done
+    rm -rf ../stale1 ../stale2; touch -t 202001010000 .git/worktrees/stale1/gitdir .git/worktrees/stale2/gitdir
+    if [ "$f" = old ]; then i=0; while [ $i -lt 120 ]; do
+      GIT_COMMITTER_DATE=2020-01-01T00:00:00Z git -c maintenance.auto=false commit -q --allow-empty -m "old $i"; i=$((i+1)); done; fi
+    if [ "$f" = loose ]; then i=0; while [ $i -lt 2000 ]; do
+      echo $i > "$root/$l.blob"; git hash-object -w "$root/$l.blob" >/dev/null; i=$((i+1)); done; fi
+    git -C ../origin commit -q --allow-empty -m second
+    cp .git/worktrees/other/logs/HEAD "$root/$l.before"
+    # shellcheck disable=SC2086
+    GIT_TRACE2_EVENT="$root/$l.trace" git $R "$@" fetch --quiet --prune origin; st
+    perl -e 'select(undef, undef, undef, 4)'
+    echo "  other logs/HEAD: $(cmp "$root/$l.before" .git/worktrees/other/logs/HEAD 2>&1 | sed 's/.*differ/differs/' | grep . || echo unchanged)"
+    echo "  entries: $(ls .git/worktrees | tr '\n' ' ')"
+    grep -o '"child_start".*"argv":\[[^]]*\]' "$root/$l.trace" | sed 's/.*"argv":/  child: /' |
+      grep -v -e upload-pack -e pack-objects -e unpack-objects -e rev-list | cut -c1-90
+  }
+  echo "-- e1 old: git \$R fetch --quiet --prune origin"; e e1 old
+  echo "-- e2 old: git \$R -c maintenance.auto=false fetch --quiet --prune origin"; e e2 old -c maintenance.auto=false
+  echo "-- e3 old: git \$R \$N fetch --quiet --prune origin"; e e3 old $N
+  echo "-- e4 loose: git \$R -c gc.auto=1 fetch --quiet --prune origin"; e e4 loose -c gc.auto=1
+  echo "-- e5 loose: git \$R -c maintenance.strategy=gc -c gc.auto=1 fetch --quiet --prune origin"
+  e e5 loose -c maintenance.strategy=gc -c gc.auto=1
+  echo "-- e6 loose: git \$R -c maintenance.strategy=gc -c gc.auto=1 \$N fetch --quiet --prune origin"
+  e e6 loose -c maintenance.strategy=gc -c gc.auto=1 $N
+}
+if [ "${1:-}" = e ]; then check_e; exit 0; fi
+
 echo "== (a) git worktree add -b x ../x, entry worktrees/x polled with refs/heads/x"
 repo "$root/a1"; mkdir -p .git/worktrees
 watch .git/worktrees/x 3 "$root/a1.log" "$root/a1/.git/refs/heads/x" & w=$!; sleep 0.3
@@ -59,7 +104,7 @@ echo "== (a) --apply backend, stops on a conflict: git rebase --apply main (on c
 rebase a5 clash git rebase --apply main
 
 echo "== (d) prune and gc with an expired entry under a read-only worktrees folder"
-if [ "$(id -u)" = 0 ]; then echo "not run: root"; exit 0; fi
+if [ "$(id -u)" = 0 ]; then echo "not run: root"; check_e; exit 0; fi
 # fixture <name>: repository <name>/repo with worktrees own, other and stale; the folder of stale removed and
 # the gitdir file of its entry dated 2020-01-01, so that prune and gc find it expired.
 fixture() {
@@ -107,3 +152,6 @@ cd "$root/r1/repo" && git gc --quiet; echo "second gc status=$?, logs/HEAD $(wc 
 git commit -q --allow-empty -m second
 git -c gc.auto=1 gc --auto --quiet; echo "-c gc.auto=1 gc --auto status=$?, $(shasum -a 256 <.git/worktrees/o3/logs/HEAD | cut -c1-8)"
 git -c gc.auto=1 maintenance run --auto; echo "-c gc.auto=1 maintenance run --auto status=$?, $(shasum -a 256 <.git/worktrees/o3/logs/HEAD | cut -c1-8)"
+
+# (e), above, last.
+check_e
