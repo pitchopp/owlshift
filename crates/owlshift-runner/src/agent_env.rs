@@ -15,7 +15,8 @@
 //!
 //! The sandbox leaves the home unreadable but for the folders a run needs
 //! ([`AgentEnv::policy`]), writes nowhere but the worktree, the repository's
-//! git folder (not its hooks or configuration) and the run's own temporary
+//! git folder (not its hooks, configuration or the other worktrees' entries,
+//! its own entry being written) and the run's own temporary
 //! folder, which holds the harness's configuration, closes the temporary folders
 //! the user's other processes share, and closes the system credential store.
 //! Under the read-only profile ([`RunPaths::read_only`], OWL-298) the
@@ -41,6 +42,7 @@ use owlshift_core::floor::FloorViolation;
 use owlshift_platform::process::{Captured, OUTPUT_CAP, find_executable_in, run_command};
 use owlshift_platform::sandbox::{self, Policy, SandboxError};
 
+use crate::executor::own_entry;
 use crate::system::PROBE_TIMEOUT;
 
 /// The environment an agent process gets, and the sandbox it runs in: see
@@ -65,6 +67,10 @@ pub struct RunPaths {
     /// The repository's common git folder, read and written, but for its
     /// hooks and configuration: a commit writes objects and refs there.
     pub git_dir: Option<PathBuf>,
+    /// The worktree's own entry in `git_dir` (`worktrees/<name>`), which a
+    /// commit, an `add` or a rebase writes: the one entry of `worktrees` the
+    /// run may write (OWL-339). `None`: `worktrees` is closed whole.
+    pub worktree_git_dir: Option<PathBuf>,
     /// More folders read, such as the harness's install folder.
     pub readable: Vec<PathBuf>,
     /// More folders read and written.
@@ -255,6 +261,7 @@ impl AgentEnv {
 
         let mut writable = Vec::new();
         let mut protected = Vec::new();
+        let mut reopened = Vec::new();
         if run.read_only {
             // Read, never written: nothing in them needs protecting.
             readable.push(run.workdir.clone());
@@ -268,6 +275,11 @@ impl AgentEnv {
                         .iter()
                         .map(|name| git_dir.join(name)),
                 );
+                // The other worktrees' entries (OWL-339): their `index` and
+                // `HEAD` are what another ticket's worktree stages and sees.
+                // The run's own entry is written again inside the folder.
+                protected.push(git_dir.join("worktrees"));
+                reopened.extend(run.worktree_git_dir.iter().cloned());
             }
         }
         writable.extend(run.writable.iter().cloned());
@@ -327,7 +339,7 @@ impl AgentEnv {
             readable,
             writable,
             protected,
-            reopened: Vec::new(),
+            reopened,
             hidden,
             temp: run.temp.iter().cloned().collect(),
             links,
@@ -445,6 +457,7 @@ impl AgentEnv {
         };
         let run = RunPaths {
             workdir: workdir.to_owned(),
+            worktree_git_dir: own_entry(&git_dir, workdir).ok(),
             git_dir: Some(git_dir),
             ..RunPaths::default()
         };
@@ -914,6 +927,7 @@ mod tests {
         let run = RunPaths {
             workdir: "/srv/wt".into(),
             git_dir: Some("/srv/repo/.git".into()),
+            worktree_git_dir: Some("/srv/repo/.git/worktrees/wt".into()),
             readable: vec!["/opt/claude".into()],
             writable: vec!["/home/op/login".into()],
             hidden: vec!["/srv/run".into()],
@@ -943,12 +957,18 @@ mod tests {
                 "/home/op/login".into()
             ]
         );
-        for name in ["hooks", "config", "config.worktree", "info"] {
+        for name in ["hooks", "config", "config.worktree", "info", "worktrees"] {
             assert!(
                 has(&policy.protected, &format!("/srv/repo/.git/{name}")),
                 "{name}"
             );
         }
+        // The other worktrees' entries are closed with `worktrees`; the
+        // run's own is written again inside it (OWL-339).
+        assert_eq!(
+            policy.reopened,
+            [PathBuf::from("/srv/repo/.git/worktrees/wt")]
+        );
         for path in [
             "/home/op/.ssh",
             "/home/op/.config/gh",
@@ -967,6 +987,29 @@ mod tests {
         assert_eq!(policy.workdir, Path::new("/srv/wt"));
     }
 
+    /// A hand-built `RunPaths` that does not name the run's own entry closes
+    /// `worktrees` whole and reopens nothing: the safe default (OWL-339).
+    #[cfg(unix)]
+    #[test]
+    fn without_its_own_entry_worktrees_is_closed_whole() {
+        let agent = env(&[("HOME", "/home/op"), ("PATH", "/usr/bin")]);
+        let run = RunPaths {
+            workdir: "/srv/wt".into(),
+            git_dir: Some("/srv/repo/.git".into()),
+            ..RunPaths::default()
+        };
+        let policy = agent.policy(&run);
+        assert!(
+            policy
+                .protected
+                .iter()
+                .any(|p| p == Path::new("/srv/repo/.git/worktrees")),
+            "{:?}",
+            policy.protected
+        );
+        assert!(policy.reopened.is_empty(), "{:?}", policy.reopened);
+    }
+
     /// OWL-298: under the read-only profile the worktree and the git folder
     /// are read, never written, and the run's other folders are as before.
     #[cfg(unix)]
@@ -976,6 +1019,7 @@ mod tests {
         let run = RunPaths {
             workdir: "/srv/wt".into(),
             git_dir: Some("/srv/repo/.git".into()),
+            worktree_git_dir: Some("/srv/repo/.git/worktrees/wt".into()),
             writable: vec!["/srv/run-temp/run-files".into()],
             hidden: vec!["/srv/run".into()],
             temp: Some("/srv/run-temp".into()),
@@ -992,6 +1036,7 @@ mod tests {
             );
         }
         assert!(policy.protected.is_empty(), "{:?}", policy.protected);
+        assert!(policy.reopened.is_empty(), "{:?}", policy.reopened);
         assert_eq!(policy.temp, [PathBuf::from("/srv/run-temp")]);
         assert!(policy.hidden.iter().any(|p| p == Path::new("/srv/run")));
         assert_eq!(policy.workdir, Path::new("/srv/wt"));

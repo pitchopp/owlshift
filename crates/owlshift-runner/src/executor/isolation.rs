@@ -789,36 +789,12 @@ fn read_shared(common: &Path) -> Result<BTreeMap<String, Content>, SnapshotError
 /// here as it does for git; a file past a few kilobytes is refused. Paths
 /// are compared once resolved, links included. No git command runs here.
 pub fn check_worktree_link(common: &Path, worktree: &Path) -> Result<(), String> {
-    let breach = |what: String| format!("the worktree's .git link was changed: {what}");
+    let admin = own_entry(common, worktree)?;
     let common =
         fs::canonicalize(common).map_err(|e| breach(format!("{}: {e}", common.display())))?;
-    let worktrees = common.join("worktrees");
-    let link = worktree.join(".git");
-    let text = read_link_file(&link).map_err(breach)?;
-    let target = text
-        .strip_prefix("gitdir: ")
-        .filter(|target| !target.is_empty())
-        .ok_or_else(|| breach(format!("{} does not name a gitdir", link.display())))?;
-    let resolve = |from: &Path, path: &str| {
-        let path = Path::new(path);
-        let path = if path.is_absolute() {
-            path.to_owned()
-        } else {
-            from.join(path)
-        };
-        fs::canonicalize(&path).map_err(|e| breach(format!("{}: {e}", path.display())))
-    };
-    let admin = resolve(worktree, target)?;
-    if admin.parent() != Some(worktrees.as_path()) {
-        return Err(breach(format!(
-            "it leads to {}, outside {}",
-            admin.display(),
-            worktrees.display()
-        )));
-    }
     let commondir = admin.join("commondir");
     let named = read_link_file(&commondir).map_err(breach)?;
-    if resolve(&admin, &named)? != common {
+    if resolve_link(&admin, &named)? != common {
         return Err(breach(format!(
             "{} leads away from {}",
             commondir.display(),
@@ -830,6 +806,48 @@ pub fn check_worktree_link(common: &Path, worktree: &Path) -> Result<(), String>
         return Err(breach(format!("{} appeared", own_config.display())));
     }
     Ok(())
+}
+
+/// The worktree's own entry in the common git directory
+/// (`<common>/worktrees/<name>`), as the worktree's `.git` names it, resolved:
+/// the first half of [`check_worktree_link`], and the one place the entry is
+/// derived, so that the folder the sandbox leaves writable and the one the
+/// isolation check exempts cannot differ. The entry must be a direct child of
+/// the canonical `<common>/worktrees`. No git command runs here.
+pub(crate) fn own_entry(common: &Path, worktree: &Path) -> Result<PathBuf, String> {
+    let common =
+        fs::canonicalize(common).map_err(|e| breach(format!("{}: {e}", common.display())))?;
+    let worktrees = common.join("worktrees");
+    let link = worktree.join(".git");
+    let text = read_link_file(&link).map_err(breach)?;
+    let target = text
+        .strip_prefix("gitdir: ")
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| breach(format!("{} does not name a gitdir", link.display())))?;
+    let admin = resolve_link(worktree, target)?;
+    if admin.parent() != Some(worktrees.as_path()) {
+        return Err(breach(format!(
+            "it leads to {}, outside {}",
+            admin.display(),
+            worktrees.display()
+        )));
+    }
+    Ok(admin)
+}
+
+fn breach(what: String) -> String {
+    format!("the worktree's .git link was changed: {what}")
+}
+
+/// `path`, relative to `from` unless absolute, resolved with its links.
+fn resolve_link(from: &Path, path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        from.join(path)
+    };
+    fs::canonicalize(&path).map_err(|e| breach(format!("{}: {e}", path.display())))
 }
 
 /// A git link file (`.git`, `commondir`), as git reads it: a plain file,
@@ -1032,6 +1050,37 @@ mod tests {
                 "{case}: {error}"
             );
         }
+    }
+
+    /// The own entry is the canonical folder `.git` names, a direct child of
+    /// `<common>/worktrees`. The refusals of the link test come through the
+    /// same function.
+    #[test]
+    fn the_own_entry_is_the_canonical_folder_the_link_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (common, admin, worktree) = linked(dir.path());
+        let expected = fs::canonicalize(&admin).unwrap();
+        assert_eq!(own_entry(&common, &worktree), Ok(expected.clone()));
+
+        // Named through `..` and a relative path, the same entry.
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../checkout/.git/worktrees/../worktrees/owl-1\n",
+        )
+        .unwrap();
+        assert_eq!(own_entry(&common, &worktree), Ok(expected));
+
+        // The common folder itself is no entry, and a worktree with no
+        // `.git` has none.
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", common.display()),
+        )
+        .unwrap();
+        let error = own_entry(&common, &worktree).unwrap_err();
+        assert!(error.contains("outside"), "{error}");
+        fs::remove_file(worktree.join(".git")).unwrap();
+        assert!(own_entry(&common, &worktree).is_err());
     }
 
     #[test]
