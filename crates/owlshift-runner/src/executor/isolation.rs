@@ -17,6 +17,15 @@
 //!   so a planted hook or `core.hooksPath` cannot run code in the user's
 //!   checkout later, and no `commondir` there, which would point git in the
 //!   main checkout at another repository's configuration.
+//! - **Other worktrees' entries untouched** (OWL-339): the files of every
+//!   other `worktrees/<name>` of the common directory, which hold what
+//!   another ticket's worktree stages (`index`) and sees (`HEAD`), but the
+//!   run's own entry (`own_entry`), which its commits, `add`s and rebases
+//!   write. The sandbox closes them to a confined run; this is the check for
+//!   a run that got past it, or that ran bare. A file whose name is not
+//!   UTF-8 is a key of its own, a file is compared whole (a digest past the
+//!   first MiB), and a path that vanishes while it is read (a lock file) is
+//!   absent, not an error.
 //! - **Diff inside the worktree**: no ref of the repository was created,
 //!   moved or deleted but the run's branch (tags, other branches,
 //!   `refs/stash`); remote-tracking refs are left out, a fetch being
@@ -36,7 +45,22 @@
 //! verified ([`Checked::tip`]). Everything else is checked as for
 //! a run alone, and a breach there quarantines every run that sees it: the
 //! check cannot tell which run did it. [`Snapshot::check`] is the check of a
-//! run alone, told of no other run.
+//! run alone, told of no other run: it has no exemption.
+//!
+//! The entry of a run in flight is left out the same way, by the branch the
+//! entry belonged to when the snapshot was taken (`owner`, read in rounds
+//! while that run rewrites the entry's files), never by a later `HEAD` of an
+//! existing entry, which a run could forge. An entry the snapshot did not see,
+//! or caught while `git worktree add` was building it, is judged by its owner
+//! read after the run and after the second answer, which is what lets a run
+//! that registered between the two answers pass. Two limits: a brand-new
+//! entry planted whole with a `HEAD` naming a running branch (which needs a
+//! write the sandbox refuses), and the exemption itself, which hides every
+//! write to the entry of a run in flight, a FIFO, link or oversized file
+//! planted as its `HEAD` after the snapshot included, so that the sandbox
+//! alone guards that entry; and an entry in the middle of an `--apply`
+//! rebase reads as on no branch, since that backend detaches `HEAD` before
+//! it writes any state.
 //!
 //! Before any git runs, two checks read the file system alone (OWL-59):
 //!
@@ -49,7 +73,8 @@
 //!   run, is caught before the runner's git reads them.
 //!
 //! A violation there ends the check: no git runs, and the other checks are
-//! not made. The runner's git runs no hook and no file-system monitor
+//! not made (the other worktrees' entries are compared with the refs, after
+//! those two checks, so a hook that changed ends the check before they are). The runner's git runs no hook and no file-system monitor
 //! either way (`executor::Git`), and the main checkout's status starts no
 //! git in a submodule (`--ignore-submodules=dirty`; it still reads the
 //! submodule's HEAD itself), so no git runs with a configuration nothing
@@ -66,7 +91,7 @@
 //! unseen; confining the agent is the operating system's job.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -93,6 +118,9 @@ pub struct Snapshot {
     /// The repository's common git directory, resolved before the run, so
     /// that the checks made before any git know where it is.
     common: PathBuf,
+    /// The name of the run's own entry in `<common>/worktrees`: the one
+    /// entry of another's the run may change.
+    own: OsString,
     main: MainState,
     /// The worktree's commit when the run started.
     start: String,
@@ -116,6 +144,11 @@ pub struct Concurrent {
 }
 
 impl Concurrent {
+    /// Whether no run is known: what a run alone is told.
+    pub fn is_empty(&self) -> bool {
+        self.running.is_empty() && self.ended.is_empty()
+    }
+
     /// Whether `branch` is a run in flight or one that ended since the
     /// snapshot, in this answer.
     pub fn knows(&self, branch: &str) -> bool {
@@ -140,7 +173,7 @@ pub struct Checked {
     pub tip: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct MainState {
     /// The main checkout's HEAD commit; `None` on an unborn branch.
     head: Option<String>,
@@ -150,6 +183,12 @@ struct MainState {
     entries: BTreeMap<Vec<u8>, Entry>,
     /// The shared git files, by path relative to the common directory.
     shared: BTreeMap<PathBuf, Content>,
+    /// The other worktrees' entries of the common directory (`worktrees/
+    /// <name>/...`, the run's own left out), by path relative to it.
+    worktree_entries: BTreeMap<PathBuf, Content>,
+    /// Who each of those entries belonged to when the snapshot was taken,
+    /// by entry name; empty after the run (see [`owner`]).
+    owners: BTreeMap<String, Owner>,
     /// Every ref but the run's branch and remote-tracking refs, with its
     /// object.
     refs: BTreeMap<String, String>,
@@ -184,6 +223,17 @@ enum Content {
     Other,
 }
 
+/// The run a worktree's entry belongs to, as [`owner`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Owner {
+    /// The entry is on this branch, or in a rebase of it.
+    Branch(String),
+    /// The entry has no `HEAD` yet: `git worktree add` builds it.
+    Creating,
+    /// On no branch, or a `HEAD` that could not be read plainly.
+    Detached,
+}
+
 /// Something the run changed that it had to leave alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Violation {
@@ -195,6 +245,10 @@ pub enum Violation {
     MainFiles(Vec<String>),
     /// Shared git files that changed, relative to the common directory.
     SharedGitFiles(Vec<String>),
+    /// Files of other worktrees' entries in the common directory
+    /// (`worktrees/<name>/...`) that changed, relative to it, outside the
+    /// entries of runs in flight.
+    WorktreeEntries(Vec<String>),
     /// Refs other than the run's branch that were created, moved or
     /// deleted, outside what concurrent runs may change.
     Refs(Vec<String>),
@@ -240,6 +294,9 @@ impl fmt::Display for Violation {
                     "the repository's shared git files changed: {}",
                     names(paths)
                 )
+            }
+            Self::WorktreeEntries(paths) => {
+                write!(f, "other worktrees' git entries changed: {}", names(paths))
             }
             Self::Refs(refs) => write!(f, "refs changed outside the run's branch: {}", names(refs)),
             Self::Branch { expected, found } => write!(
@@ -350,7 +407,13 @@ impl Snapshot {
         let common = PathBuf::from(trimmed(&printed));
         let common = fs::canonicalize(&common)
             .map_err(|e| SnapshotError(format!("{}: {e}", common.display())))?;
-        let main = MainState::read(git, main, branch, &common)?;
+        let own = own_entry(&common, worktree)
+            .map_err(SnapshotError)?
+            .file_name()
+            .map(OsString::from)
+            .ok_or_else(|| SnapshotError(format!("{}: no entry name", worktree.display())))?;
+        let mut main = MainState::read(git, main, branch, &common, &own)?;
+        main.owners = read_owners(&common, &own, &|_| {})?;
         let start = trimmed(&git.run(worktree, &["rev-parse", "--verify", "HEAD"])?);
         let onto = onto
             .map(|onto| {
@@ -365,6 +428,7 @@ impl Snapshot {
             .transpose()?;
         Ok(Self {
             common,
+            own,
             main,
             start,
             onto,
@@ -427,8 +491,14 @@ impl Snapshot {
             };
         }
         let earlier = concurrent();
-        let mut violations = match MainState::read(git, main, branch, &self.common) {
-            Ok(after) => self.main.compare(&after, &earlier, &concurrent()),
+        let mut violations = match MainState::read(git, main, branch, &self.common, &self.own) {
+            Ok(after) => {
+                let later = concurrent();
+                // After the second answer, which knows a run registered
+                // before it made its entry.
+                let owners = self.owners_after(&after, &earlier, &later, &|_| {});
+                self.main.compare(&after, &earlier, &later, &owners)
+            }
             Err(error) => vec![Violation::CheckFailed(error.to_string())],
         };
         let tip = self
@@ -438,6 +508,36 @@ impl Snapshot {
                 None
             });
         Checked { violations, tip }
+    }
+
+    /// The owners, read after the run, of the entries the snapshot cannot
+    /// speak for: those present now that were absent or still being made
+    /// then. Read only when a run is known, and after the second answer, so
+    /// that a run that registered between the two answers, with its entry
+    /// made before the second one, is not flagged.
+    fn owners_after(
+        &self,
+        after: &MainState,
+        earlier: &Concurrent,
+        later: &Concurrent,
+        between: &dyn Fn(&Path),
+    ) -> BTreeMap<String, Owner> {
+        if earlier.is_empty() && later.is_empty() {
+            return BTreeMap::new();
+        }
+        let names: BTreeSet<&str> = after
+            .worktree_entries
+            .keys()
+            .filter_map(|path| path.components().nth(1)?.as_os_str().to_str())
+            .filter(|name| matches!(self.main.owners.get(*name), None | Some(Owner::Creating)))
+            .collect();
+        names
+            .into_iter()
+            .map(|name| {
+                let entry = self.common.join("worktrees").join(name);
+                (name.to_owned(), owner(&entry, between))
+            })
+            .collect()
     }
 
     /// Checks that the worktree is on the run's branch and that its history
@@ -486,7 +586,13 @@ impl Snapshot {
 }
 
 impl MainState {
-    fn read(git: &Git, main: &Path, branch: &str, common: &Path) -> Result<Self, SnapshotError> {
+    fn read(
+        git: &Git,
+        main: &Path,
+        branch: &str,
+        common: &Path,
+        own: &OsStr,
+    ) -> Result<Self, SnapshotError> {
         let head = git.output(main, &["rev-parse", "-q", "--verify", "HEAD"], None)?;
         let head = match head.code {
             Some(0) => Some(trimmed(&head.stdout)),
@@ -522,6 +628,7 @@ impl MainState {
         let entries = contents(git, main, records)?;
 
         let shared = read_shared(common)?;
+        let worktree_entries = read_worktree_entries(common, own, &|_| {})?;
 
         let own = format!("refs/heads/{branch}");
         let listed = git.run(main, &["for-each-ref", "--format=%(objectname) %(refname)"])?;
@@ -537,11 +644,19 @@ impl MainState {
             branch: branch_now,
             entries,
             shared,
+            worktree_entries,
+            owners: BTreeMap::new(),
             refs,
         })
     }
 
-    fn compare(&self, after: &Self, earlier: &Concurrent, later: &Concurrent) -> Vec<Violation> {
+    fn compare(
+        &self,
+        after: &Self,
+        earlier: &Concurrent,
+        later: &Concurrent,
+        owners_after: &BTreeMap<String, Owner>,
+    ) -> Vec<Violation> {
         let mut violations = Vec::new();
         if self.head != after.head {
             violations.push(Violation::MainHead);
@@ -563,11 +678,56 @@ impl MainState {
         if !shared.is_empty() {
             violations.push(Violation::SharedGitFiles(shared));
         }
+        let entries = self.changed_entries(after, earlier, later, owners_after);
+        if !entries.is_empty() {
+            violations.push(Violation::WorktreeEntries(entries));
+        }
         let refs = self.changed_refs(after, earlier, later);
         if !refs.is_empty() {
             violations.push(Violation::Refs(refs));
         }
         violations
+    }
+
+    /// The files of other worktrees' entries that changed, but the entries
+    /// of concurrent runs. An entry is a concurrent run's by the branch it
+    /// belonged to when the snapshot was taken (`owners`), never by a later
+    /// `HEAD` of an existing entry, which a run could forge; an entry the
+    /// snapshot did not see, or caught while it was being made, is judged by
+    /// the owner read after the run (`owners_after`). A branch is a
+    /// concurrent run's when either answer knows it; an entry on no branch
+    /// is never exempt.
+    fn changed_entries(
+        &self,
+        after: &Self,
+        earlier: &Concurrent,
+        later: &Concurrent,
+        owners_after: &BTreeMap<String, Owner>,
+    ) -> Vec<String> {
+        let exempt = |name: &OsStr| {
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let branch_of = |owner: Option<&Owner>| match owner {
+                Some(Owner::Branch(branch)) => Some(branch.clone()),
+                _ => None,
+            };
+            let owner = match self.owners.get(name) {
+                Some(Owner::Creating) | None => owners_after.get(name),
+                owner => owner,
+            };
+            branch_of(owner).is_some_and(|branch| known(earlier, later, &branch))
+        };
+        changed(&self.worktree_entries, &after.worktree_entries)
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .components()
+                    .nth(1)
+                    .is_some_and(|name| exempt(name.as_os_str()))
+            })
+            .map(|path| display_path(path))
+            .collect()
     }
 
     /// The refs that changed, but concurrent runs' branches, known from the
@@ -970,6 +1130,174 @@ fn walk(
     Ok(())
 }
 
+/// The children of `<common>/worktrees` but the run's own entry, sorted; a
+/// repository with no linked worktree has none.
+fn other_entries(common: &Path, own: &OsStr) -> io::Result<Vec<OsString>> {
+    let listing: io::Result<Vec<OsString>> = fs::read_dir(common.join("worktrees"))
+        .and_then(|entries| entries.map(|entry| entry.map(|e| e.file_name())).collect());
+    let mut names = match listing {
+        Ok(names) => names,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    names.retain(|name| name != own);
+    names.sort();
+    Ok(names)
+}
+
+/// The files of the other worktrees' entries under `<common>/worktrees`,
+/// the run's own (`own`) left out, by path relative to `common`. A run that
+/// got past the sandbox could change another ticket's `index` or `HEAD`
+/// there, and with it what that worktree stages and sees (OWL-339).
+fn read_worktree_entries(
+    common: &Path,
+    own: &OsStr,
+    between: &dyn Fn(&Path),
+) -> Result<BTreeMap<PathBuf, Content>, SnapshotError> {
+    let worktrees = common.join("worktrees");
+    let fail = |e: io::Error| SnapshotError(format!("{}: {e}", worktrees.display()));
+    let mut entries = BTreeMap::new();
+    for name in other_entries(common, own).map_err(fail)? {
+        walk(
+            common,
+            &Path::new("worktrees").join(name),
+            &mut entries,
+            between,
+        )
+        .map_err(fail)?;
+    }
+    Ok(entries)
+}
+
+/// The owner of each other entry, by name, as [`owner`] reads it; an entry
+/// whose name is not UTF-8 has none, so it is never exempt.
+fn read_owners(
+    common: &Path,
+    own: &OsStr,
+    between: &dyn Fn(&Path),
+) -> Result<BTreeMap<String, Owner>, SnapshotError> {
+    let worktrees = common.join("worktrees");
+    let names = other_entries(common, own)
+        .map_err(|e| SnapshotError(format!("{}: {e}", worktrees.display())))?;
+    Ok(names
+        .into_iter()
+        .filter_map(|name| {
+            let name = name.into_string().ok()?;
+            let found = owner(&worktrees.join(&name), between);
+            Some((name, found))
+        })
+        .collect())
+}
+
+/// How many times [`owner`] repeats its reads before it gives up.
+const OWNER_ROUNDS: usize = 3;
+
+/// What [`read_guarded`] found at a path.
+enum Guarded {
+    Missing,
+    /// There, but not a plain file of one short UTF-8 line.
+    Odd,
+    Text(String),
+}
+
+/// Reads a file a run could have written as [`read_link_file`] does: a plain
+/// file (a FIFO, a link or a folder is refused before any `open`, so
+/// nothing blocks and nothing is followed), at most [`LINK_FILE_CAP`]
+/// bytes of UTF-8 on one line, less its trailing line breaks.
+fn read_guarded(path: &Path) -> Guarded {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Guarded::Odd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Guarded::Missing,
+        Err(_) => return Guarded::Odd,
+    }
+    let mut bytes = Vec::new();
+    match fs::File::open(path) {
+        Ok(file) => {
+            if file
+                .take(LINK_FILE_CAP + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+            {
+                return Guarded::Odd;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Guarded::Missing,
+        Err(_) => return Guarded::Odd,
+    }
+    if bytes.len() as u64 > LINK_FILE_CAP {
+        return Guarded::Odd;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => {
+            let text = text.trim_end_matches(['\n', '\r']);
+            if text.contains(['\n', '\r', '\0']) {
+                Guarded::Odd
+            } else {
+                Guarded::Text(text.to_owned())
+            }
+        }
+        Err(_) => Guarded::Odd,
+    }
+}
+
+/// The branch a rebase in the entry is rebasing, from its `head-name`
+/// (`refs/heads/<branch>`): the merge backend's, then the apply backend's.
+fn rebasing_branch(entry: &Path, between: &dyn Fn(&Path)) -> Option<String> {
+    ["rebase-merge", "rebase-apply"].iter().find_map(|folder| {
+        let path = entry.join(folder).join("head-name");
+        let read = read_guarded(&path);
+        between(&path);
+        match read {
+            Guarded::Text(text) => text.strip_prefix("refs/heads/").map(str::to_owned),
+            _ => None,
+        }
+    })
+}
+
+/// The run an entry of `worktrees` belongs to, read while that run, if one
+/// is in flight, rewrites the entry's files. The reads rest on the order git
+/// writes and removes an entry's state (checked live on 2026-10-19, build
+/// plan, "OWL-339 live checks"): `git worktree add` writes `HEAD` last, and
+/// a merge-backend rebase writes `rebase-merge/head-name` before it detaches
+/// `HEAD`, and restores `HEAD` before it removes the folder. Up to
+/// [`OWNER_ROUNDS`] rounds of: the `head-name` files, `HEAD`, the
+/// `head-name` files again. A missing `HEAD` is [`Owner::Creating`]; a
+/// symbolic `HEAD` names its branch; a detached one belongs to the branch a
+/// `head-name` names, in either read of it; a detached `HEAD` with none is
+/// a rebase finishing between the reads, so the round is repeated, and after
+/// the last round the entry is [`Owner::Detached`]. The `--apply` backend
+/// detaches `HEAD` before it writes any state, so an entry in the middle of
+/// one reads as `Detached`. A `HEAD` that exists but is not a plain short
+/// line is `Detached` too, never `Creating`, so that a planted anomaly
+/// cannot pass for an entry under creation; none of these gives an
+/// exemption. `between` is called after each read.
+fn owner(entry: &Path, between: &dyn Fn(&Path)) -> Owner {
+    let head_path = entry.join("HEAD");
+    for _ in 0..OWNER_ROUNDS {
+        let before = rebasing_branch(entry, between);
+        let head = read_guarded(&head_path);
+        between(&head_path);
+        let after = rebasing_branch(entry, between);
+        match head {
+            Guarded::Missing => return Owner::Creating,
+            Guarded::Odd => return Owner::Detached,
+            Guarded::Text(text) => {
+                if let Some(target) = text.strip_prefix("ref: ") {
+                    return match target.strip_prefix("refs/heads/") {
+                        Some(branch) => Owner::Branch(branch.to_owned()),
+                        None => Owner::Detached,
+                    };
+                }
+                if let Some(branch) = before.or(after) {
+                    return Owner::Branch(branch);
+                }
+            }
+        }
+    }
+    Owner::Detached
+}
+
 /// A path as a violation lists it: its names joined with `/` on every
 /// system, each through `to_string_lossy` (two names that differ in bytes
 /// that are not UTF-8 may print alike, which costs a diagnostic, not a
@@ -1287,5 +1615,469 @@ mod tests {
         assert!(known(&running, &none, "a"));
         assert!(known(&none, &ended, "b"));
         assert!(!known(&running, &ended, "c"));
+    }
+
+    const RUNNING: &str = "owlshift/running";
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567\n";
+
+    /// What `git worktree add` leaves for a worktree `name` on `branch`, as
+    /// far as the check reads it, in a fake common folder.
+    fn fake_entry(common: &Path, name: &str, branch: &str) -> PathBuf {
+        let entry = common.join("worktrees").join(name);
+        fs::create_dir_all(&entry).unwrap();
+        fs::write(entry.join("gitdir"), format!("/elsewhere/{name}/.git\n")).unwrap();
+        fs::write(entry.join("commondir"), "../..\n").unwrap();
+        fs::write(entry.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+        fs::write(entry.join("index"), "index\n").unwrap();
+        entry
+    }
+
+    /// A merge-backend rebase of `branch` under way: `head-name` written,
+    /// then `HEAD` detached.
+    fn start_rebase(entry: &Path, branch: &str) {
+        fs::create_dir_all(entry.join("rebase-merge")).unwrap();
+        fs::write(
+            entry.join("rebase-merge/head-name"),
+            format!("refs/heads/{branch}\n"),
+        )
+        .unwrap();
+        fs::write(entry.join("HEAD"), SHA).unwrap();
+    }
+
+    /// The same rebase finished: `HEAD` back on the branch, then the state
+    /// folder removed.
+    fn finish_rebase(entry: &Path, branch: &str) {
+        fs::write(entry.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+        let _ = fs::remove_dir_all(entry.join("rebase-merge"));
+    }
+
+    #[test]
+    fn a_rebase_finishing_between_the_reads_still_belongs_to_its_branch() {
+        // (1) `head-name` read, then the rebase finishes before `HEAD` is.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = fake_entry(dir.path(), "other", "topic");
+        start_rebase(&entry, "topic");
+        let fired = std::cell::Cell::new(false);
+        let found = owner(&entry, &|path| {
+            if path.ends_with("HEAD") && !fired.replace(true) {
+                finish_rebase(&entry, "topic");
+            }
+        });
+        assert_eq!(found, Owner::Branch("topic".into()));
+
+        // (2) No `head-name` at first; the rebase starts before `HEAD` is
+        // read: the second read of `head-name` finds it.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = fake_entry(dir.path(), "other", "topic");
+        let fired = std::cell::Cell::new(false);
+        let found = owner(&entry, &|_| {
+            if !fired.replace(true) {
+                start_rebase(&entry, "topic");
+            }
+        });
+        assert_eq!(found, Owner::Branch("topic".into()));
+
+        // (3) A detached `HEAD` and nothing else in the first round, and a
+        // whole rebase between the reads: the second round reads `HEAD` on
+        // its branch.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = fake_entry(dir.path(), "other", "topic");
+        fs::write(entry.join("HEAD"), SHA).unwrap();
+        let fired = std::cell::Cell::new(false);
+        let found = owner(&entry, &|path| {
+            if path.ends_with("HEAD") && !fired.replace(true) {
+                finish_rebase(&entry, "topic");
+            }
+        });
+        assert_eq!(found, Owner::Branch("topic".into()));
+
+        // (4) A detached `HEAD` that stays without a `head-name`: three
+        // rounds of five reads, then no branch.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = fake_entry(dir.path(), "other", "topic");
+        fs::write(entry.join("HEAD"), SHA).unwrap();
+        let reads = std::cell::Cell::new(0);
+        let found = owner(&entry, &|_| reads.set(reads.get() + 1));
+        assert_eq!(found, Owner::Detached);
+        assert_eq!(reads.get(), 3 * 5);
+
+        // A `head-name` of the apply backend counts as the merge backend's;
+        // one that names no branch gives none.
+        fs::create_dir(entry.join("rebase-apply")).unwrap();
+        fs::write(entry.join("rebase-apply/head-name"), "refs/heads/applied\n").unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Branch("applied".into()));
+        fs::write(entry.join("rebase-apply/head-name"), "detached HEAD\n").unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Detached);
+    }
+
+    #[test]
+    fn an_entry_without_a_head_is_being_made_and_a_head_that_is_odd_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = fake_entry(dir.path(), "other", "topic");
+        fs::remove_file(entry.join("HEAD")).unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Creating);
+        // A `HEAD` of several lines, or a folder, is something else.
+        fs::write(entry.join("HEAD"), "ref: refs/heads/a\nmore\n").unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Detached);
+        fs::remove_file(entry.join("HEAD")).unwrap();
+        fs::create_dir(entry.join("HEAD")).unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Detached);
+        // Symbolic, but not to a branch.
+        fs::remove_dir(entry.join("HEAD")).unwrap();
+        fs::write(entry.join("HEAD"), "ref: refs/tags/v1\n").unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Detached);
+    }
+
+    /// A snapshot of `common` as taken before the run, by hand: the entries
+    /// and their owners, with a run whose entry is `own`.
+    fn snapshot_of(common: &Path) -> Snapshot {
+        let own = OsString::from("own");
+        let main = MainState {
+            worktree_entries: read_worktree_entries(common, &own, &|_| {}).unwrap(),
+            owners: read_owners(common, &own, &|_| {}).unwrap(),
+            ..MainState::default()
+        };
+        Snapshot {
+            common: common.to_owned(),
+            own,
+            main,
+            start: String::new(),
+            onto: None,
+        }
+    }
+
+    fn concurrent(running: &[&str]) -> Concurrent {
+        Concurrent {
+            running: running.iter().map(|branch| (*branch).to_owned()).collect(),
+            ended: BTreeMap::new(),
+        }
+    }
+
+    /// The violations of the entries between `before` and the folder as it
+    /// is now, as `check_among` judges them (no git).
+    fn judged(before: &Snapshot, earlier: &Concurrent, later: &Concurrent) -> Vec<String> {
+        let after = MainState {
+            worktree_entries: read_worktree_entries(&before.common, &before.own, &|_| {}).unwrap(),
+            ..MainState::default()
+        };
+        let owners = before.owners_after(&after, earlier, later, &|_| {});
+        before.main.changed_entries(&after, earlier, later, &owners)
+    }
+
+    #[test]
+    fn the_entries_of_other_worktrees_are_checked_but_not_the_runs_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        let own = fake_entry(common, "own", "owlshift/own");
+        let other = fake_entry(common, "other", "owlshift/other");
+        let before = snapshot_of(common);
+        let alone = Concurrent::default();
+        assert_eq!(judged(&before, &alone, &alone), Vec::<String>::new());
+
+        // The run's own entry is its to change.
+        fs::write(own.join("index"), "staged\n").unwrap();
+        fs::write(own.join("index.lock"), "").unwrap();
+        assert_eq!(judged(&before, &alone, &alone), Vec::<String>::new());
+
+        // Another's: an edit, a new file, a removal, a new entry.
+        fs::write(other.join("index"), "tampered\n").unwrap();
+        fs::write(other.join("planted"), "x").unwrap();
+        fs::remove_file(other.join("gitdir")).unwrap();
+        fake_entry(common, "evil", "owlshift/evil");
+        let found = judged(&before, &alone, &alone);
+        assert_eq!(
+            found,
+            [
+                "worktrees/evil",
+                "worktrees/evil/HEAD",
+                "worktrees/evil/commondir",
+                "worktrees/evil/gitdir",
+                "worktrees/evil/index",
+                "worktrees/other/gitdir",
+                "worktrees/other/index",
+                "worktrees/other/planted",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_concurrent_runs_entry_is_exempt_by_the_branch_it_had_at_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        fake_entry(common, "own", "owlshift/own");
+        let other = fake_entry(common, "other", "owlshift/other");
+        let before = snapshot_of(common);
+        let alone = Concurrent::default();
+        assert_eq!(
+            before.main.owners.get("other"),
+            Some(&Owner::Branch("owlshift/other".into()))
+        );
+
+        // Told of that run, in either answer, whatever its files become.
+        fs::write(other.join("index"), "its own work\n").unwrap();
+        fs::write(other.join("planted"), "x").unwrap();
+        let other_run = concurrent(&["owlshift/other"]);
+        assert!(judged(&before, &other_run, &alone).is_empty());
+        assert!(judged(&before, &alone, &other_run).is_empty());
+        // Told of another run, or of none, it is a breach.
+        let unrelated = concurrent(&["owlshift/unrelated"]);
+        assert_eq!(judged(&before, &unrelated, &unrelated).len(), 2);
+        assert_eq!(judged(&before, &alone, &alone).len(), 2);
+
+        // A rewritten `HEAD` forges nothing: the entry was another
+        // branch's, so naming a running branch now does not exempt it.
+        fs::write(other.join("HEAD"), format!("ref: refs/heads/{RUNNING}\n")).unwrap();
+        let running = concurrent(&[RUNNING]);
+        assert_eq!(
+            judged(&before, &running, &running),
+            [
+                "worktrees/other/HEAD",
+                "worktrees/other/index",
+                "worktrees/other/planted"
+            ]
+        );
+
+        // An entry on no branch is never exempt, whoever is told.
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        fake_entry(common, "own", "owlshift/own");
+        let parked = fake_entry(common, "parked", "x");
+        fs::write(parked.join("HEAD"), SHA).unwrap();
+        let before = snapshot_of(common);
+        assert_eq!(before.main.owners.get("parked"), Some(&Owner::Detached));
+        fs::write(parked.join("index"), "tampered\n").unwrap();
+        fs::write(parked.join("HEAD"), format!("ref: refs/heads/{RUNNING}\n")).unwrap();
+        assert_eq!(judged(&before, &running, &running).len(), 2);
+    }
+
+    #[test]
+    fn an_entry_made_during_the_check_is_judged_by_its_owner_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        fake_entry(common, "own", "owlshift/own");
+        let running = concurrent(&[RUNNING]);
+        let alone = Concurrent::default();
+
+        // Absent from the snapshot, made before the second answer: the run
+        // registered between the two answers, `earlier` empty.
+        let before = snapshot_of(common);
+        fake_entry(common, "new", RUNNING);
+        assert!(judged(&before, &alone, &running).is_empty());
+        assert!(!judged(&before, &alone, &alone).is_empty());
+        fake_entry(common, "stranger", "owlshift/stranger");
+        assert!(
+            judged(&before, &alone, &running)
+                .iter()
+                .all(|p| p.starts_with("worktrees/stranger"))
+        );
+
+        // Caught while it was being made: no `HEAD` yet at the snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        fake_entry(common, "own", "owlshift/own");
+        let making = fake_entry(common, "making", RUNNING);
+        fs::remove_file(making.join("HEAD")).unwrap();
+        let before = snapshot_of(common);
+        assert_eq!(before.main.owners.get("making"), Some(&Owner::Creating));
+        fs::write(making.join("HEAD"), format!("ref: refs/heads/{RUNNING}\n")).unwrap();
+        assert!(judged(&before, &running, &running).is_empty());
+        // ... naming an unknown branch it is a breach.
+        fs::write(making.join("HEAD"), "ref: refs/heads/owlshift/unknown\n").unwrap();
+        assert!(!judged(&before, &running, &running).is_empty());
+    }
+
+    #[test]
+    fn a_run_alone_reads_no_owner_after_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        fake_entry(common, "own", "owlshift/own");
+        let before = snapshot_of(common);
+        fake_entry(common, "new", RUNNING);
+        let after = MainState {
+            worktree_entries: read_worktree_entries(common, &before.own, &|_| {}).unwrap(),
+            ..MainState::default()
+        };
+        let alone = Concurrent::default();
+        let owners = before.owners_after(&after, &alone, &alone, &|_| {
+            panic!("an owner was read for a run alone")
+        });
+        assert!(owners.is_empty());
+        // With a run known it is read: once the hook is called, it panics.
+        let read = std::cell::Cell::new(false);
+        let owners =
+            before.owners_after(&after, &alone, &concurrent(&[RUNNING]), &|_| read.set(true));
+        assert!(read.get());
+        assert_eq!(owners.get("new"), Some(&Owner::Branch(RUNNING.into())));
+    }
+
+    #[test]
+    fn a_file_that_vanishes_while_the_entries_are_read_is_no_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        fake_entry(common, "own", "owlshift/own");
+        let other = fake_entry(common, "other", "owlshift/other");
+        fs::write(other.join("index.lock"), "").unwrap();
+        let before = snapshot_of(common);
+        // The lock goes while the entries are read, and `index` really changes
+        // in the same pass.
+        fs::write(other.join("index.lock"), "").unwrap();
+        let gone = |path: &Path| {
+            if path.ends_with("index.lock") {
+                fs::remove_file(path).unwrap();
+            }
+        };
+        let read = read_worktree_entries(common, &before.own, &gone).unwrap();
+        assert!(!read.contains_key(&Path::new("worktrees/other/index.lock").to_owned()));
+        fs::write(other.join("index"), "tampered\n").unwrap();
+        let after = MainState {
+            worktree_entries: read_worktree_entries(common, &before.own, &gone).unwrap(),
+            ..MainState::default()
+        };
+        let alone = Concurrent::default();
+        // The lock was in the snapshot, so its removal shows with the real change.
+        assert_eq!(
+            before
+                .main
+                .changed_entries(&after, &alone, &alone, &BTreeMap::new()),
+            ["worktrees/other/index", "worktrees/other/index.lock"]
+        );
+    }
+
+    /// A FIFO, a link or a file past the cap where `name` is, in `entry`.
+    #[cfg(unix)]
+    fn plant(entry: &Path, name: &str, kind: &str) {
+        let path = entry.join(name);
+        let _ = fs::remove_file(&path);
+        match kind {
+            "fifo" => {
+                let status = Command::new("mkfifo").arg(&path).status().unwrap();
+                assert!(status.success());
+            }
+            "link to a fifo" => {
+                let fifo = entry.join("fifo");
+                let _ = fs::remove_file(&fifo);
+                let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+                assert!(status.success());
+                std::os::unix::fs::symlink(&fifo, &path).unwrap();
+            }
+            _ => fs::write(&path, vec![b'x'; LINK_FILE_CAP as usize * 2]).unwrap(),
+        }
+    }
+
+    #[cfg(unix)]
+    use std::process::Command;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_a_link_or_a_huge_file_as_head_never_blocks_the_check_or_gives_an_exemption() {
+        let kinds = ["fifo", "link to a fifo", "a file past the cap"];
+        for kind in kinds {
+            for name in ["HEAD", "rebase-merge/head-name"] {
+                let dir = tempfile::tempdir().unwrap();
+                let entry = fake_entry(dir.path(), "other", "owlshift/other");
+                fs::create_dir_all(entry.join("rebase-merge")).unwrap();
+                plant(&entry, name, kind);
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let path = entry.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(owner(&path, &|_| {}));
+                });
+                let found = receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("{kind} as {name}: owner blocked"));
+                let expected = if name == "HEAD" {
+                    Owner::Detached
+                } else {
+                    // The plain `HEAD`'s answer: the planted file adds nothing.
+                    Owner::Branch("owlshift/other".into())
+                };
+                assert_eq!(found, expected, "{kind} as {name}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plant_as_head_is_judged_by_when_it_lands() {
+        let running = concurrent(&[RUNNING]);
+        let alone = Concurrent::default();
+        for kind in ["fifo", "link to a fifo", "a file past the cap"] {
+            // (i) Planted before the snapshot: the owner reads `Detached`, so
+            // a later edit of `index` is a violation, a running branch told
+            // or not.
+            let dir = tempfile::tempdir().unwrap();
+            let common = dir.path();
+            fake_entry(common, "own", "owlshift/own");
+            let other = fake_entry(common, "other", RUNNING);
+            plant(&other, "HEAD", kind);
+            let before = snapshot_of(common);
+            assert_eq!(before.main.owners.get("other"), Some(&Owner::Detached));
+            fs::write(other.join("index"), "tampered\n").unwrap();
+            assert_eq!(
+                judged(&before, &running, &running),
+                ["worktrees/other/index"]
+            );
+
+            // (ii) With an empty `Concurrent`, as production passes it, an
+            // entry whose `HEAD` was replaced after the snapshot is reported.
+            let dir = tempfile::tempdir().unwrap();
+            let common = dir.path();
+            fake_entry(common, "own", "owlshift/own");
+            let other = fake_entry(common, "other", "owlshift/other");
+            let before = snapshot_of(common);
+            plant(&other, "HEAD", kind);
+            assert!(judged(&before, &alone, &alone).contains(&"worktrees/other/HEAD".to_owned()));
+
+            // (iii) An entry absent from the snapshot, or still being made,
+            // with the plant as its `HEAD`: not exempt, a run known or not.
+            for making in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let common = dir.path();
+                fake_entry(common, "own", "owlshift/own");
+                let new = if making {
+                    let entry = fake_entry(common, "new", RUNNING);
+                    fs::remove_file(entry.join("HEAD")).unwrap();
+                    Some(entry)
+                } else {
+                    None
+                };
+                let before = snapshot_of(common);
+                let new = new.unwrap_or_else(|| fake_entry(common, "new", RUNNING));
+                plant(&new, "HEAD", kind);
+                let found = judged(&before, &running, &running);
+                assert!(
+                    found.contains(&"worktrees/new/HEAD".to_owned()),
+                    "{kind}: {found:?}"
+                );
+            }
+
+            // (iv) An existing entry whose snapshot owner is a running
+            // branch stays exempt whatever is planted after the snapshot:
+            // the documented limit, that the sandbox alone guards the entry
+            // of a run in flight. Asserted as the limit, not as a detection.
+            let dir = tempfile::tempdir().unwrap();
+            let common = dir.path();
+            fake_entry(common, "own", "owlshift/own");
+            let other = fake_entry(common, "other", RUNNING);
+            let before = snapshot_of(common);
+            plant(&other, "HEAD", kind);
+            fs::create_dir_all(other.join("rebase-merge")).unwrap();
+            plant(&other, "rebase-merge/head-name", kind);
+            fs::write(other.join("index"), "tampered\n").unwrap();
+            assert!(judged(&before, &running, &running).is_empty(), "{kind}");
+
+            // A plain `HEAD` forged to name a running branch beside a bad
+            // `head-name`, on an entry that was another branch's, is still a
+            // violation.
+            let dir = tempfile::tempdir().unwrap();
+            let common = dir.path();
+            fake_entry(common, "own", "owlshift/own");
+            let other = fake_entry(common, "other", "owlshift/other");
+            let before = snapshot_of(common);
+            fs::write(other.join("HEAD"), format!("ref: refs/heads/{RUNNING}\n")).unwrap();
+            fs::create_dir_all(other.join("rebase-merge")).unwrap();
+            plant(&other, "rebase-merge/head-name", kind);
+            assert!(!judged(&before, &running, &running).is_empty(), "{kind}");
+        }
     }
 }
