@@ -296,9 +296,15 @@ impl Git {
 /// writes no `info/refs`: the isolation check guards that file, and a run
 /// during which it changed would be quarantined for nothing (OWL-197). The
 /// agent environment carries the same setting
-/// (`owlshift_core::agent_env::OVERRIDES`). Given with `-c`, they win over
-/// every configuration file, and reach the git commands git starts itself.
-fn hardening() -> [OsString; 6] {
+/// (`owlshift_core::agent_env::OVERRIDES`). The same maintenance, once its
+/// reflog step runs, rewrites the `logs/HEAD` of every worktree entry, which
+/// the isolation check guards too (OWL-339, live check (e)): so reflogs never
+/// expire (`gc.reflogExpire`, `gc.reflogExpireUnreachable`), nor do worktree
+/// entries in housekeeping (`gc.worktreePruneExpire`,
+/// `maintenance.worktree-prune.auto`); an explicit `git worktree prune`
+/// still removes a stale entry. Given with `-c`, they win over every
+/// configuration file, and reach the git commands git starts itself.
+fn hardening() -> [OsString; 14] {
     [
         "-c".into(),
         hooks_nowhere().into(),
@@ -306,6 +312,14 @@ fn hardening() -> [OsString; 6] {
         "core.fsmonitor=false".into(),
         "-c".into(),
         "repack.updateServerInfo=false".into(),
+        "-c".into(),
+        "gc.reflogExpire=never".into(),
+        "-c".into(),
+        "gc.reflogExpireUnreachable=never".into(),
+        "-c".into(),
+        "gc.worktreePruneExpire=never".into(),
+        "-c".into(),
+        "maintenance.worktree-prune.auto=0".into(),
     ]
 }
 
@@ -393,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn every_command_turns_hooks_the_monitor_and_the_server_info_off() {
+    fn every_command_turns_hooks_the_monitor_the_server_info_and_expiry_off() {
         let args = hardening();
         let settings: Vec<&str> = args
             .chunks(2)
@@ -402,12 +416,17 @@ mod tests {
                 pair[1].to_str().unwrap()
             })
             .collect();
-        assert_eq!(settings.len(), 3, "{settings:?}");
-        assert!(settings.contains(&"core.fsmonitor=false"), "{settings:?}");
-        assert!(
-            settings.contains(&"repack.updateServerInfo=false"),
-            "{settings:?}"
-        );
+        assert_eq!(settings.len(), 7, "{settings:?}");
+        for setting in [
+            "core.fsmonitor=false",
+            "repack.updateServerInfo=false",
+            "gc.reflogExpire=never",
+            "gc.reflogExpireUnreachable=never",
+            "gc.worktreePruneExpire=never",
+            "maintenance.worktree-prune.auto=0",
+        ] {
+            assert!(settings.contains(&setting), "{setting}: {settings:?}");
+        }
         let folder = settings
             .iter()
             .find_map(|setting| setting.strip_prefix("core.hooksPath="))
@@ -423,34 +442,8 @@ mod tests {
     #[test]
     fn the_runners_git_leaves_the_server_info_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        let global = tmp.path().join("gitconfig");
-        fs::write(
-            &global,
-            "[user]\n\tname = Owlshift Test\n\temail = test@owlshift.invalid\n\
-             [commit]\n\tgpgsign = false\n",
-        )
-        .unwrap();
-        let hermetic = move |command: &mut Command| {
-            for (name, _) in std::env::vars_os() {
-                if name
-                    .to_string_lossy()
-                    .to_ascii_uppercase()
-                    .starts_with("GIT_")
-                {
-                    command.env_remove(name);
-                }
-            }
-            command
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", &global);
-        };
-        let plain = |dir: &Path, args: &[&str]| {
-            let mut command = Command::new("git");
-            command.args(args).current_dir(dir);
-            hermetic(&mut command);
-            let out = command.output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        };
+        let hermetic = hermetic(tmp.path());
+        let plain = |dir: &Path, args: &[&str]| plain_git(&hermetic, dir, args, &[]);
         let repo = tmp.path().join("repo");
         fs::create_dir(&repo).unwrap();
         plain(&repo, &["init", "--quiet"]);
@@ -467,6 +460,115 @@ mod tests {
         // The control: plain git's `gc` writes it.
         plain(&repo, &["gc", "--quiet"]);
         assert!(refs.exists(), "plain git's gc wrote no {}", refs.display());
+    }
+
+    /// OWL-339: git's own housekeeping, started by a command of the runner's
+    /// git, leaves another worktree entry's `logs/HEAD` and an expired entry
+    /// alone, both of which the isolation check guards (live check (e)): a
+    /// `gc` stands in for the maintenance a `fetch` starts, whose reflog and
+    /// worktree steps are the same. Plain git's `gc` expires the entry's old
+    /// reflog lines. An explicit `worktree prune` still removes the expired
+    /// entry, which `worktree::prepare` relies on.
+    #[test]
+    fn the_runners_git_leaves_other_worktree_entries_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hermetic = hermetic(tmp.path());
+        let plain = |dir: &Path, args: &[&str]| plain_git(&hermetic, dir, args, &[]);
+        let repo = tmp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        plain(&repo, &["init", "--quiet"]);
+        plain(&repo, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+        for name in ["other", "stale"] {
+            let folder = tmp.path().join(name);
+            let folder = folder.to_str().unwrap();
+            plain(&repo, &["worktree", "add", "--quiet", "-b", name, folder]);
+        }
+        // An old line in `other`'s reflog, which plain git's `gc` expires; no
+        // maintenance runs first.
+        plain_git(
+            &hermetic,
+            &tmp.path().join("other"),
+            &[
+                "-c",
+                "maintenance.auto=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "old",
+            ],
+            &[("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")],
+        );
+        // `stale` expired: its folder gone, its entry's `gitdir` from 2020.
+        fs::remove_dir_all(tmp.path().join("stale")).unwrap();
+        let entries = repo.join(".git").join("worktrees");
+        fs::File::options()
+            .write(true)
+            .open(entries.join("stale").join("gitdir"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_577_836_800))
+            .unwrap();
+        let reflog = entries.join("other").join("logs").join("HEAD");
+        let before = fs::read(&reflog).unwrap();
+
+        let git = Git::with_setup("git", hermetic.clone());
+        git.run(&repo, &["gc", "--quiet"]).unwrap();
+        assert_eq!(
+            fs::read(&reflog).unwrap(),
+            before,
+            "the runner's git rewrote {}",
+            reflog.display()
+        );
+        assert!(entries.join("stale").exists(), "the runner's gc pruned it");
+
+        git.run(&repo, &["worktree", "prune"]).unwrap();
+        assert!(!entries.join("stale").exists(), "worktree prune kept it");
+
+        // The control: plain git's `gc` rewrites the reflog.
+        plain(&repo, &["gc", "--quiet"]);
+        assert_ne!(
+            fs::read(&reflog).unwrap(),
+            before,
+            "plain git's gc left {}",
+            reflog.display()
+        );
+    }
+
+    /// The setup of a hermetic git: no inherited `GIT_*` variable, no system
+    /// configuration, and a user configuration in `dir` naming a committer.
+    fn hermetic(dir: &Path) -> impl Fn(&mut Command) + Clone + Send + Sync + 'static {
+        let global = dir.join("gitconfig");
+        fs::write(
+            &global,
+            "[user]\n\tname = Owlshift Test\n\temail = test@owlshift.invalid\n\
+             [commit]\n\tgpgsign = false\n",
+        )
+        .unwrap();
+        move |command: &mut Command| {
+            for (name, _) in std::env::vars_os() {
+                if name
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("GIT_")
+                {
+                    command.env_remove(name);
+                }
+            }
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &global);
+        }
+    }
+
+    /// Plain git, without the runner's settings, set up by `setup` and given
+    /// `envs`; it must succeed.
+    fn plain_git(setup: &impl Fn(&mut Command), dir: &Path, args: &[&str], envs: &[(&str, &str)]) {
+        let mut command = Command::new("git");
+        command.args(args).current_dir(dir);
+        setup(&mut command);
+        command.envs(envs.iter().copied());
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
     }
 
     /// OWL-130: git started for the agent, outside the sandbox, runs no
