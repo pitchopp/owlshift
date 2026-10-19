@@ -1470,3 +1470,246 @@ fn a_plan_comment_refused_after_its_document_keeps_one_document() {
     let pointer = bench.plan_pointer();
     assert!(pointer.contains("First version of the plan."), "{pointer}");
 }
+
+/// A `standard` ticket whose design asked a question the decider answered:
+/// the ref waits at Design in round 1, and the answer is posted.
+fn answered_design() -> Bench {
+    let bench = Bench::of("standard");
+    let (outcome, printed) = bench.run(
+        vec![bench.read(TRADE_OFF), bench.read(&passed_on(&["Q1"]))],
+        None,
+    );
+    let stop = outcome.expect_err("the question goes to the decider");
+    assert!(
+        matches!(stop, Stop::NeedsInput { .. }),
+        "{stop:?}\n{printed}"
+    );
+    bench.answer("Q1: Markdown.");
+    bench
+}
+
+/// The replies of a design round's answer check, the design, its two
+/// reviews and the Build.
+fn design_replies(bench: &Bench, check_first: bool) -> Vec<Reply> {
+    let mut replies = Vec::new();
+    if check_first {
+        replies.push(bench.read(&check(&[("Q1", "answered", "Markdown.")])));
+    }
+    replies.extend([
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ]);
+    replies
+}
+
+impl Bench {
+    /// Moves the bench's clock `minutes` on, for the next watch pass.
+    fn wait(&self, minutes: i64) {
+        self.waited
+            .set(self.waited.get() + SignedDuration::from_mins(minutes));
+    }
+
+    /// The ticket ref's state: its status and its round.
+    fn state(&self) -> (Status, u32) {
+        let state = TicketState::try_from(&self.record().state).unwrap();
+        (state.status(), state.round())
+    }
+
+    fn open_reads(&self) -> u32 {
+        *self.github.open_reads.lock().unwrap()
+    }
+
+    fn resumes(&self) -> usize {
+        self.comments()
+            .iter()
+            .filter(|comment| comment.starts_with("[owlshift] RESUME"))
+            .count()
+    }
+
+    fn answer_checks(&self) -> usize {
+        self.roles()
+            .iter()
+            .filter(|role| **role == Role::AnswerCheck)
+            .count()
+    }
+
+    /// The `stage` of each `watch: continue` decision that names one, the
+    /// resumes of a stage left (OWL-273, OWL-340), oldest first.
+    fn watch_resumes(&self) -> Vec<String> {
+        self.decisions("watch")
+            .iter()
+            .filter(|event| event["watch"] == "continue")
+            .filter_map(|event| event["stage"].as_str().map(str::to_owned))
+            .collect()
+    }
+}
+
+/// OWL-340's acceptance, the gap: the decider answers, the answer check
+/// resumes the ticket and posts the RESUME, and the dispatch's forge read is
+/// refused once (LOC-1406's transient 401). The ref stays at Design, round 1,
+/// shown In Progress with no run, and a later watch pass starts the Design
+/// run with no `continue` typed, without a second answer check or RESUME.
+#[test]
+fn watch_resumes_a_stage_a_refusal_stopped_right_after_its_answer_check() {
+    let bench = answered_design();
+    *bench.github.refuse_open.lock().unwrap() = 1;
+    let reads = bench.open_reads();
+    let mut pass = 0;
+    let mut sleep = |_: Duration| {
+        pass += 1;
+        match pass {
+            1 => {
+                assert_eq!(bench.stage(), "In Progress");
+                assert_eq!(bench.state(), (Status::Active(Stage::Design), 1));
+                let record = bench.record();
+                assert!(record.questions.checked_through.is_some());
+                assert_eq!(bench.resumes(), 1);
+                assert_eq!(bench.answer_checks(), 1);
+                assert_eq!(bench.open_reads(), reads + 1);
+                let dispatches = bench
+                    .events()
+                    .iter()
+                    .filter(|event| event.kind == EventKind::Dispatch)
+                    .count();
+                assert_eq!(dispatches, 1, "the first design's only");
+                bench.wait(1);
+                true
+            }
+            _ => false,
+        }
+    };
+    let (outcomes, lines, printed) = bench.watch(design_replies(&bench, true), &mut sleep);
+    // Pass 1 ends on the refusal, pass 2 runs the stages on to Build.
+    assert!(
+        matches!(&outcomes[0], Err(Stop::Refused(m)) if m.contains("GitHub (demo/project)")
+            && m.contains("HTTP 401 Bad credentials")),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(
+        outcomes[1..].iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.watch_resumes(), ["design"]);
+    assert_eq!(bench.answer_checks(), 1);
+    assert_eq!(bench.resumes(), 1);
+    assert_eq!(
+        bench.roles(),
+        [
+            Role::Design,
+            Role::Resolver,
+            Role::AnswerCheck,
+            Role::Design,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::Build,
+            Role::Verify
+        ]
+    );
+    assert_eq!(bench.stage(), "In Review");
+}
+
+/// OWL-340: a forge that keeps refusing costs no answer check and no RESUME
+/// at a pass. The resume is refused with the ref as it was, so it is held
+/// ten minutes: the pass inside the hold reads neither the stage nor the
+/// forge, and the one after it tries again.
+#[test]
+fn a_forge_that_keeps_refusing_costs_neither_an_answer_check_nor_a_resume() {
+    let bench = answered_design();
+    *bench.github.refuse_open.lock().unwrap() = 100;
+    let mut pass = 0;
+    let seen = Cell::new((0, 0));
+    let mut sleep = |_: Duration| {
+        pass += 1;
+        let now = (bench.open_reads(), bench.stage_reads.get());
+        match pass {
+            // The answer check, the RESUME, the refusal.
+            1 => {
+                assert_eq!((bench.answer_checks(), bench.resumes()), (1, 1));
+                bench.wait(1);
+            }
+            // Resumed, refused again, held.
+            2 => {
+                assert!(now.0 > seen.get().0 && now.1 > seen.get().1);
+                bench.wait(9);
+            }
+            // Nine minutes on, inside the hold: nothing read, nothing run.
+            3 => {
+                assert_eq!(now, seen.get());
+                bench.wait(2);
+            }
+            // Eleven minutes after pass 2: tried again, refused again.
+            4 => {
+                assert!(now.0 > seen.get().0, "{now:?} {:?}", seen.get());
+                return false;
+            }
+            _ => unreachable!(),
+        }
+        seen.set(now);
+        true
+    };
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.read(&check(&[("Q1", "answered", "Markdown.")]))],
+        &mut sleep,
+    );
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Err(Stop::Refused(_)))),
+        "{outcomes:?}"
+    );
+    assert_eq!((bench.answer_checks(), bench.resumes()), (1, 1));
+    assert_eq!(bench.state(), (Status::Active(Stage::Design), 1));
+    assert!(
+        lines.contains("DEMO-1 is at Design as it was before that resume: watch resumes it again"),
+        "{lines}"
+    );
+    assert_eq!(bench.stage(), "In Progress");
+}
+
+/// OWL-340: a ticket the tracker shows in another stage than working, such
+/// as a person's move to review, is left alone, and its stage is not read
+/// again for ten minutes while its ref does not move.
+#[test]
+fn a_stage_left_shown_elsewhere_is_left_alone_and_its_stage_read_rarely() {
+    let bench = answered_design();
+    *bench.github.refuse_open.lock().unwrap() = 1;
+    let mut pass = 0;
+    let reads = Cell::new(0);
+    let mut sleep = |_: Duration| {
+        pass += 1;
+        match pass {
+            1 => {
+                // The refusal left it working; a person moves it.
+                assert_eq!(bench.state(), (Status::Active(Stage::Design), 1));
+                MarkdownTracker::new(&bench.remote.checkout)
+                    .set_stage(&ticket(), "In Review")
+                    .unwrap();
+                bench.wait(1);
+            }
+            // Read once, found elsewhere.
+            2 => {
+                reads.set(bench.stage_reads.get());
+                bench.wait(1);
+            }
+            // Not read again, nothing run.
+            3 => {
+                assert_eq!(bench.stage_reads.get(), reads.get());
+                return false;
+            }
+            _ => unreachable!(),
+        }
+        true
+    };
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.read(&check(&[("Q1", "answered", "Markdown.")]))],
+        &mut sleep,
+    );
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(bench.watch_resumes().is_empty());
+    assert_eq!(bench.answer_checks(), 1);
+    assert_eq!(bench.stage(), "In Review");
+    assert_eq!(bench.state(), (Status::Active(Stage::Design), 1));
+}
