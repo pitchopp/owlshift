@@ -142,6 +142,7 @@ impl OnDemand<'_> {
                 decider: current.name.clone(),
                 window,
                 counts_at,
+                thumbs_up: false,
             });
         }
         let correction = reversal::correction(&reversed, &questions, pr.number, &pr.url, &pushed);

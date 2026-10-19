@@ -1509,9 +1509,11 @@ impl Watch<'_> {
         if quarantined {
             return self.tell(memory, sink, out, ticket, Held::Answer);
         }
+        // The answer's time: a new comment or a thumbs-up (OWL-371) lifts a
+        // hold alike.
         let seen = Seen {
             commit: stored.commit.clone(),
-            answer: answer_check::newest_decider_edit(&comments, &decider),
+            answer: answer_check::new_answer(&comments, &decider, questions),
         };
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;

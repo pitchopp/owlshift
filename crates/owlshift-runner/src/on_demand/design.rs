@@ -1431,7 +1431,9 @@ impl OnDemand<'_> {
             let questions = p.questions();
             // Whose word the run answered (OWL-342): the resolver's, when
             // its decision on the approval is newer than any ask, kept with
-            // its DECISION comment; else the decider's newest comment.
+            // its DECISION comment; else the decider's answer: their newest
+            // comment, or the round's comment their thumbs-up answered
+            // (OWL-371).
             let decided = questions
                 .decisions
                 .iter()
@@ -1445,7 +1447,7 @@ impl OnDemand<'_> {
                         Stop::Refused("an approval round the ref keeps no ask of".to_owned())
                     })?;
                     let approver = person(&ask.decider, &p.found);
-                    answer_check::newest_decider_comment(comments, &approver)
+                    answer_check::answering_comment(comments, &approver, &questions)
                         .ok_or_else(|| {
                             Stop::Refused(format!(
                                 "the plan of {ticket} is approved, but no comment of its decider \

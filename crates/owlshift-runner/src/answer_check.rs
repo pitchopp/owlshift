@@ -14,35 +14,164 @@
 //! a Build run did not see are its late comments ([`late_comments`]).
 //! `owlshift continue` runs it ([`crate::on_demand`]); the test
 //! bench's stand-in driver plays the same pieces in the scenarios.
+//!
+//! A thumbs-up (OWL-371) answers a question asked alone without the check:
+//! the decider's `+1` on the latest ask's comment ([`thumbs_up`]) is their
+//! answer when they typed none ([`answer`]), it waits through the quiet
+//! window as a typed answer does, and once it counts the question is
+//! answered on its recommendation ([`thumbs_up_verdicts`]).
 
 use std::time::Duration;
 
 use jiff::Timestamp;
-use owlshift_adapters::tracker::{Comment, Person};
+use owlshift_adapters::tracker::{Comment, Person, Reaction};
 use owlshift_contracts::brief::{Brief, Relation};
 use owlshift_contracts::refs::TicketQuestions;
-use owlshift_contracts::result::{self, AnswerClass, Question, RunResult, Verdict};
+use owlshift_contracts::result::{self, AnswerClass, Question, RunResult, Verdict, option_letter};
 use owlshift_core::reply::{self, Reply};
 use owlshift_core::state::Event;
 
 use crate::executor::Outcome;
-use crate::on_demand::{comment_author, core_event, freed_refusal, result_refusal};
+use crate::on_demand::{account_author, comment_author, core_event, freed_refusal, result_refusal};
 
-/// Whether answers arrived: the newest last edit among the decider's
-/// comments when it is later than the latest ask and than what the last
-/// answer check to give its verdicts read
-/// ([`TicketQuestions::answers_after`]), `None` otherwise. Only the tracker's
-/// times are compared, at their own precision, never this machine's clock:
-/// they order the comments of one second (OWL-136), so an answer posted in
-/// its ask's second is newer. A comment is the decider's as the brief marks
-/// it: their account's, and not a marked comment.
+/// Whether answers arrived: the time of the decider's new answer
+/// ([`answer`]), `None` otherwise. Only the tracker's times are compared, at
+/// their own precision, never this machine's clock: they order the comments
+/// of one second (OWL-136), so an answer posted in its ask's second is
+/// newer. A comment is the decider's as the brief marks it: their account's,
+/// and not a marked comment.
 pub fn new_answer(
     comments: &[Comment],
     decider: &Person,
     asked: &TicketQuestions,
 ) -> Option<Timestamp> {
+    answer(comments, decider, asked).map(|answer| answer.at())
+}
+
+/// The decider's new answer to the latest ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer<'c> {
+    /// Their comments, the newest last edited at this time.
+    Typed(Timestamp),
+    /// Their thumbs-up on the ask's comment (OWL-371).
+    ThumbsUp(&'c Reaction),
+}
+
+impl Answer<'_> {
+    /// When it was given: what the check that reads it reads through.
+    pub fn at(&self) -> Timestamp {
+        match self {
+            Self::Typed(at) => *at,
+            Self::ThumbsUp(reaction) => reaction.created_at,
+        }
+    }
+}
+
+/// The decider's new answer to the latest ask: their comments when the
+/// newest last edit among them is later than the latest ask and than what
+/// the last answer check to give its verdicts read
+/// ([`TicketQuestions::answers_after`]); else, when it came after that,
+/// their thumbs-up on the ask's comment ([`thumbs_up`], OWL-371). Words win:
+/// a thumbs-up newer than them is not read with them, and stays an answer
+/// of its own once they are judged. `None` when neither is new.
+pub fn answer<'c>(
+    comments: &'c [Comment],
+    decider: &Person,
+    asked: &TicketQuestions,
+) -> Option<Answer<'c>> {
     let after = asked.answers_after()?;
-    newest_decider_edit(comments, decider).filter(|newest| *newest > after)
+    if let Some(typed) = newest_decider_edit(comments, decider).filter(|newest| *newest > after) {
+        return Some(Answer::Typed(typed));
+    }
+    thumbs_up(comments, decider, asked)
+        .map(|(_, reaction)| reaction)
+        .filter(|reaction| reaction.created_at > after)
+        .map(Answer::ThumbsUp)
+}
+
+/// Whether a thumbs-up can answer an ask of `questions` (OWL-371): one
+/// question, carrying a recommendation, which the thumbs-up takes as `ok`
+/// does. An ask of several questions needs words, since a thumbs-up meaning
+/// "seen" would take every recommendation at once.
+pub fn answerable_by_thumbs_up(questions: &[Question]) -> bool {
+    matches!(questions, [question] if question.recommendation.is_some())
+}
+
+/// The decider's thumbs-up on the latest ask (OWL-371), with the ask's
+/// comment it is on: a [`Reaction::THUMBS_UP`] put after the ask on the
+/// comment the ask keeps (its round's QUESTIONS comment, the last part when
+/// in parts, or the RE-ASK), by `decider`'s account, matched by identifier
+/// as their comments are, an app user's never; the newest when there are
+/// several. `None` when the ask cannot be answered so
+/// ([`answerable_by_thumbs_up`]) or its comment is not among `comments`.
+pub fn thumbs_up<'c>(
+    comments: &'c [Comment],
+    decider: &Person,
+    asked: &TicketQuestions,
+) -> Option<(&'c Comment, &'c Reaction)> {
+    let ask = asked.latest()?;
+    if !answerable_by_thumbs_up(&ask.questions) {
+        return None;
+    }
+    let comment = comments.iter().find(|comment| comment.id == ask.comment)?;
+    let reaction = comment
+        .reactions
+        .iter()
+        .filter(|reaction| {
+            reaction.is_thumbs_up()
+                && reaction.created_at > ask.at
+                && account_author(&reaction.author, decider).relation == Relation::Decider
+        })
+        .max_by_key(|reaction| reaction.created_at)?;
+    Some((comment, reaction))
+}
+
+/// The verdicts a thumbs-up gives (OWL-371): each question of the ask
+/// `answered` on its recommendation, as `ok` takes it, the reason saying so
+/// in the RESUME and in the round's `answered` entry of later briefs.
+pub fn thumbs_up_verdicts(questions: &[Question]) -> Vec<Verdict> {
+    questions
+        .iter()
+        .map(|question| Verdict {
+            question: question.id.clone(),
+            class: AnswerClass::Answered,
+            reason: thumbs_up_reading(question),
+            reply: None,
+        })
+        .collect()
+}
+
+/// What a thumbs-up on `question` was understood to answer.
+fn thumbs_up_reading(question: &Question) -> String {
+    const LEAD: &str = "The decider's thumbs-up on the question: its recommendation";
+    match (question.recommended_option(), &question.recommendation) {
+        (Some(index), _) => format!(
+            "{LEAD}, {}, {}.",
+            option_letter(index),
+            question.options[index].label.trim_end_matches('.')
+        ),
+        (None, Some(recommendation)) => format!("{LEAD}: {}", recommendation.why),
+        (None, None) => format!("{LEAD}."),
+    }
+}
+
+/// The comment that holds the decider's answer to the latest ask, which a
+/// plan's approval keeps (OWL-32): the ask's own comment when their
+/// thumbs-up on it resumed the ticket (OWL-371), its time then being the
+/// `checked_through` that resume kept; else their newest comment, as
+/// before; else the ask's comment when their thumbs-up is on it.
+pub fn answering_comment<'c>(
+    comments: &'c [Comment],
+    decider: &Person,
+    asked: &TicketQuestions,
+) -> Option<&'c Comment> {
+    let thumbs_up = thumbs_up(comments, decider, asked);
+    if let Some((comment, reaction)) = thumbs_up
+        && asked.checked_through == Some(reaction.created_at)
+    {
+        return Some(comment);
+    }
+    newest_decider_comment(comments, decider).or(thumbs_up.map(|(comment, _)| comment))
 }
 
 /// The newest last edit among the decider's comments, if they wrote any.
@@ -111,11 +240,22 @@ pub fn counts_at(
     window: Duration,
 ) -> Option<Timestamp> {
     let newest = newest_decider_comment(comments, decider)?;
-    let last_edit = newest.last_edit();
-    let quiet_for = Duration::try_from(now.duration_since(last_edit)).unwrap_or(Duration::ZERO);
-    match reply::counts(quiet_for, reply::ends_with_go(&newest.body), window) {
+    settles_until(
+        newest.last_edit(),
+        reply::ends_with_go(&newest.body),
+        now,
+        window,
+    )
+}
+
+/// When an answer given at `at` counts, if it does not yet at `now`: the
+/// quiet `window` after `at`, unless it ended with `go`. A time after `now`
+/// counts as left for no time at all.
+fn settles_until(at: Timestamp, go: bool, now: Timestamp, window: Duration) -> Option<Timestamp> {
+    let quiet_for = Duration::try_from(now.duration_since(at)).unwrap_or(Duration::ZERO);
+    match reply::counts(quiet_for, go, window) {
         Reply::Counts => None,
-        Reply::Settling => Some(last_edit.checked_add(window).unwrap_or(Timestamp::MAX)),
+        Reply::Settling => Some(at.checked_add(window).unwrap_or(Timestamp::MAX)),
     }
 }
 
@@ -123,12 +263,18 @@ pub fn counts_at(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Readiness {
     /// No comment of the decider is newer than `since`, the latest ask or
-    /// what the last answer check read ([`new_answer`]).
+    /// what the last answer check read, and no thumbs-up of theirs
+    /// ([`new_answer`]).
     Waiting { since: Timestamp },
     /// The decider answered, but may still be writing: the reply counts at
-    /// `counts_at` ([`counts_at`]).
-    Settling { counts_at: Timestamp },
-    /// The answer check may read the reply.
+    /// `counts_at` ([`counts_at`]). A thumbs-up waits the same way, from
+    /// its own time, and can never end with `go` (`thumbs_up`, OWL-371).
+    Settling {
+        counts_at: Timestamp,
+        thumbs_up: bool,
+    },
+    /// The answer check may read the reply, or the thumbs-up resumes the
+    /// ticket ([`answer`] tells which).
     Counts,
 }
 
@@ -144,12 +290,19 @@ pub fn readiness(
     window: Duration,
 ) -> Option<Readiness> {
     let since = asked.answers_after()?;
-    Some(if new_answer(comments, decider, asked).is_none() {
-        Readiness::Waiting { since }
-    } else if let Some(counts_at) = counts_at(comments, decider, now, window) {
-        Readiness::Settling { counts_at }
-    } else {
-        Readiness::Counts
+    let (settling, thumbs_up) = match answer(comments, decider, asked) {
+        None => return Some(Readiness::Waiting { since }),
+        Some(Answer::Typed(_)) => (counts_at(comments, decider, now, window), false),
+        Some(Answer::ThumbsUp(reaction)) => {
+            (settles_until(reaction.created_at, false, now, window), true)
+        }
+    };
+    Some(match settling {
+        Some(counts_at) => Readiness::Settling {
+            counts_at,
+            thumbs_up,
+        },
+        None => Readiness::Counts,
     })
 }
 
@@ -774,6 +927,332 @@ mod tests {
         );
         let two = Duration::from_secs(2 * 60);
         assert_eq!(counts_at(&comments, &decider, at(12), two), None);
+    }
+
+    /// OWL-371: the decider, a moment of the bench's day, and an ask of
+    /// `questions` posted at 10:10 as comment `c10`, kept with the checks
+    /// read through `checked`.
+    mod thumbs {
+        use std::num::NonZeroU32;
+
+        use owlshift_adapters::tracker::{Author, Reaction};
+        use owlshift_contracts::ids::QuestionId;
+        use owlshift_contracts::refs::{Ask, AskDecider, AskKind};
+        use owlshift_contracts::result::{QuestionOption, Recommendation};
+        use owlshift_core::decider::DeciderRule;
+
+        use super::*;
+
+        pub fn decider() -> Person {
+            Person {
+                id: "u1".into(),
+                name: "Maintainer".into(),
+            }
+        }
+
+        pub fn at(minute: u32) -> Timestamp {
+            format!("2026-10-19T10:{minute:02}:00Z").parse().unwrap()
+        }
+
+        /// One question, B recommended among Yes and No.
+        pub fn lettered(id: &str) -> Question {
+            Question {
+                id: QuestionId::new(id).unwrap(),
+                category: "scope".into(),
+                context: String::new(),
+                text: "Should the README link to the greeting?".into(),
+                options: vec![QuestionOption::new("Yes"), QuestionOption::new("No.")],
+                recommendation: Some(Recommendation {
+                    option: Some("B".into()),
+                    why: "The README lists code only.".into(),
+                }),
+                replan: false,
+            }
+        }
+
+        pub fn asked(questions: Vec<Question>, checked: Option<u32>) -> TicketQuestions {
+            let mut asked = TicketQuestions::new();
+            asked.asks.push(Ask {
+                kind: AskKind::Questions,
+                round: NonZeroU32::new(1).unwrap(),
+                at: at(10),
+                comment: "c10".into(),
+                questions,
+                decider: AskDecider {
+                    account: "u1".into(),
+                    by: DeciderRule::Assignee,
+                },
+                verdicts: Vec::new(),
+                result_refusal: None,
+            });
+            asked.checked_through = checked.map(at);
+            asked
+        }
+
+        pub fn account(id: &str) -> Author {
+            Author::Account(Person {
+                id: id.into(),
+                name: "someone".into(),
+            })
+        }
+
+        pub fn reaction(author: Author, emoji: &str, minute: u32) -> Reaction {
+            Reaction {
+                emoji: emoji.into(),
+                author,
+                created_at: at(minute),
+            }
+        }
+
+        /// A comment `c<minute>` by `author`, with `reactions`.
+        pub fn comment(author: Author, minute: u32, reactions: Vec<Reaction>) -> Comment {
+            Comment {
+                id: format!("c{minute}"),
+                author,
+                created_at: at(minute),
+                edited_at: None,
+                body: format!("Comment of minute {minute}."),
+                parent: None,
+                reactions,
+            }
+        }
+
+        /// The ask's comment, Owlshift's, with `reactions`.
+        pub fn round(reactions: Vec<Reaction>) -> Comment {
+            Comment {
+                body: "[owlshift] QUESTIONS · round 1".into(),
+                ..comment(
+                    Author::Other {
+                        name: "Owlshift".into(),
+                    },
+                    10,
+                    reactions,
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn a_thumbs_up_answers_only_as_the_rule_says() {
+        use thumbs::*;
+        let up = |minute| reaction(account("u1"), "+1", minute);
+        let two = vec![lettered("Q1"), lettered("Q2")];
+        let unrecommended = Question {
+            recommendation: None,
+            ..lettered("Q1")
+        };
+        // A thumbs-up's answer, or a typed one, at a minute.
+        const UP: bool = true;
+        const TYPED: bool = false;
+        // (comments, ask's questions, checked through, expected answer)
+        type Case = (
+            Vec<Comment>,
+            Vec<Question>,
+            Option<u32>,
+            Option<(bool, u32)>,
+        );
+        let cases: Vec<Case> = vec![
+            (vec![round(vec![])], vec![lettered("Q1")], None, None),
+            (
+                vec![round(vec![up(11)])],
+                vec![lettered("Q1")],
+                None,
+                Some((UP, 11)),
+            ),
+            // Nobody else's: another account, an app user, an external one.
+            (
+                vec![round(vec![reaction(account("u2"), "+1", 11)])],
+                vec![lettered("Q1")],
+                None,
+                None,
+            ),
+            (
+                vec![round(vec![reaction(
+                    Author::Other {
+                        name: "Owlshift".into(),
+                    },
+                    "+1",
+                    11,
+                )])],
+                vec![lettered("Q1")],
+                None,
+                None,
+            ),
+            // No other emoji, no other comment (an earlier part or round).
+            (
+                vec![round(vec![reaction(account("u1"), "heart", 11)])],
+                vec![lettered("Q1")],
+                None,
+                None,
+            ),
+            (
+                vec![comment(account("u2"), 9, vec![up(11)]), round(vec![])],
+                vec![lettered("Q1")],
+                None,
+                None,
+            ),
+            // No ask of several questions, nor one without a
+            // recommendation (a ref kept before format 10).
+            (vec![round(vec![up(11)])], two, None, None),
+            (vec![round(vec![up(11)])], vec![unrecommended], None, None),
+            // Not before what the last check read.
+            (
+                vec![round(vec![up(11)])],
+                vec![lettered("Q1")],
+                Some(12),
+                None,
+            ),
+            (
+                vec![round(vec![up(13)])],
+                vec![lettered("Q1")],
+                Some(12),
+                Some((UP, 13)),
+            ),
+            // Words win, older or newer than the thumbs-up.
+            (
+                vec![round(vec![up(11)]), comment(account("u1"), 12, vec![])],
+                vec![lettered("Q1")],
+                None,
+                Some((TYPED, 12)),
+            ),
+            (
+                vec![round(vec![up(13)]), comment(account("u1"), 11, vec![])],
+                vec![lettered("Q1")],
+                None,
+                Some((TYPED, 11)),
+            ),
+        ];
+        for (comments, questions, checked, expected) in &cases {
+            let asked = asked(questions.clone(), *checked);
+            let found = answer(comments, &decider(), &asked).map(|answer| {
+                (
+                    matches!(answer, Answer::ThumbsUp(reaction) if reaction.is_thumbs_up()),
+                    answer.at(),
+                )
+            });
+            let expected = expected.map(|(up, minute)| (up, at(minute)));
+            assert_eq!(found, expected, "{comments:?} {questions:?}");
+            assert_eq!(
+                new_answer(comments, &decider(), &asked),
+                expected.map(|(_, at)| at)
+            );
+        }
+    }
+
+    #[test]
+    fn a_thumbs_up_settles_through_the_quiet_window() {
+        use thumbs::*;
+        let window = reply::DEFAULT_QUIET_WINDOW;
+        let asked = asked(vec![lettered("Q1")], None);
+        let up = |minute| vec![round(vec![reaction(account("u1"), "+1", minute)])];
+        let readiness_at = |comments: &[Comment], now| {
+            readiness(comments, &decider(), &asked, at(now), window).unwrap()
+        };
+        assert_eq!(
+            readiness_at(&up(11), 15),
+            Readiness::Settling {
+                counts_at: at(21),
+                thumbs_up: true
+            }
+        );
+        assert_eq!(readiness_at(&up(11), 21), Readiness::Counts);
+        // Removed within the window: nothing to wait for.
+        assert_eq!(
+            readiness_at(&[round(vec![])], 15),
+            Readiness::Waiting { since: at(10) }
+        );
+        // Put back later, or seen ahead of this machine's clock: the whole
+        // window from its own time.
+        assert_eq!(
+            readiness_at(&up(30), 25),
+            Readiness::Settling {
+                counts_at: at(40),
+                thumbs_up: true
+            }
+        );
+        // A typed answer settles as before, and is no thumbs-up.
+        let typed = [round(vec![]), thumbs::comment(account("u1"), 11, vec![])];
+        assert_eq!(
+            readiness_at(&typed, 15),
+            Readiness::Settling {
+                counts_at: at(21),
+                thumbs_up: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_thumbs_up_takes_the_recommendation() {
+        use thumbs::*;
+        let unlettered = Question {
+            options: Vec::new(),
+            recommendation: Some(owlshift_contracts::result::Recommendation {
+                option: None,
+                why: "GREETING.md, the simplest reading.".into(),
+            }),
+            ..lettered("Q1")
+        };
+        let verdicts = thumbs_up_verdicts(&[lettered("Q1"), unlettered]);
+        let read: Vec<(&str, AnswerClass, &str)> = verdicts
+            .iter()
+            .map(|v| (v.question.as_str(), v.class, v.reason.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (
+                    "Q1",
+                    AnswerClass::Answered,
+                    "The decider's thumbs-up on the question: its recommendation, B, No."
+                ),
+                (
+                    "Q1",
+                    AnswerClass::Answered,
+                    "The decider's thumbs-up on the question: its recommendation: GREETING.md, \
+                     the simplest reading."
+                ),
+            ]
+        );
+        assert!(verdicts.iter().all(|v| v.reply.is_none()));
+    }
+
+    #[test]
+    fn the_approval_names_the_comment_that_answered() {
+        use thumbs::*;
+        let named = |comments: &[Comment], checked| {
+            answering_comment(comments, &decider(), &asked(vec![lettered("Q1")], checked))
+                .map(|c| c.id.clone())
+        };
+        let earlier = comment(account("u1"), 5, vec![]);
+        let up = |minute| reaction(account("u1"), "+1", minute);
+        // Resumed by the thumbs-up, the decider having spoken in an
+        // earlier round: the round's comment.
+        assert_eq!(
+            named(&[earlier.clone(), round(vec![up(11)])], Some(11)).as_deref(),
+            Some("c10")
+        );
+        // The words judged, a thumbs-up after them: the words.
+        let words = comment(account("u1"), 12, vec![]);
+        assert_eq!(
+            named(&[round(vec![up(13)]), words.clone()], Some(12)).as_deref(),
+            Some("c12")
+        );
+        // A counter-question replied to, then the thumbs-up resumed it.
+        assert_eq!(
+            named(&[round(vec![up(13)]), words], Some(13)).as_deref(),
+            Some("c10")
+        );
+        // A thumbs-up put back after the resume, and no comment of the
+        // decider at all: still the round's comment.
+        assert_eq!(
+            named(&[round(vec![up(14)])], Some(11)).as_deref(),
+            Some("c10")
+        );
+        // No thumbs-up: their newest comment, as before.
+        assert_eq!(
+            named(&[earlier, round(vec![])], Some(11)).as_deref(),
+            Some("c5")
+        );
     }
 
     #[test]

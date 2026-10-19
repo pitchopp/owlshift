@@ -1127,7 +1127,9 @@ impl Driver {
             Some(Readiness::Waiting { since }) => Err(format!(
                 "no comment from the decider since {since}: the answer check runs once answers arrive"
             )),
-            Some(Readiness::Settling { counts_at }) => Err(format!(
+            // The Markdown tracker reads no reactions, so no thumbs-up
+            // settles here (OWL-371).
+            Some(Readiness::Settling { counts_at, .. }) => Err(format!(
                 "the decider's reply counts at {counts_at}, with no quiet window"
             )),
             Some(Readiness::Counts) => Ok(answer_check::newest_decider_edit(&comments, &decider)),
