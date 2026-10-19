@@ -41,9 +41,11 @@ use owlshift_core::gate::{ChainEnd, GatePolicy, Route};
 use crate::executor::Outcome;
 use crate::writer::{ReopenedChoice, flatten};
 
-/// The executor's deadline for a resolver run: a short role, like the answer
-/// check, that reads what it needs and decides.
-pub const RESOLVER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// The executor's deadline for a resolver run, the ticket's
+/// `resolver::DEADLINE` (OWL-344): longer than the answer check's, since the
+/// resolver reads the code and its history with Bash and, at delegation
+/// level `all`, weighs a trade-off on the deep tier.
+pub const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// The questions of a run, split by who settles them, each list in the run's
 /// order.
@@ -527,6 +529,12 @@ mod tests {
     use super::*;
     use crate::artifact::ArtifactContents;
     use crate::executor::Failure;
+
+    /// OWL-344: half an hour, which `OnDemand::resolve` gives the executor.
+    #[test]
+    fn a_resolver_run_has_half_an_hour() {
+        assert_eq!(RESOLVER_TIMEOUT, Duration::from_secs(30 * 60));
+    }
 
     fn question(id: &str, category: &str) -> Question {
         Question {
