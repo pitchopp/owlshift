@@ -266,7 +266,7 @@
           "minimum": 1
         },
         "resolver_budget_usd": {
-          "description": "A ceiling, in dollars, on what one chain of runs costs: the asking\nruns and their resolver runs since the command's last stop, past\nwhich the next run's questions go to the decider. A positive number;\nrequired with `resolver_passes = \"unlimited\"` (OWL-328). A file using\nit requires an Owlshift that reads it.",
+          "description": "A ceiling, in dollars, on what the resolver runs of one chain cost\nsince the command's last stop, past which the next run's questions\ngo to the decider; the asking runs do not count (OWL-376). A positive\nnumber; required with `resolver_passes = \"unlimited\"` (OWL-328). A\nfile using it requires an Owlshift that reads it.",
           "anyOf": [
             {
               "$ref": "#/$defs/Usd"

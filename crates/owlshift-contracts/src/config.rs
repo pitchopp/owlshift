@@ -496,11 +496,11 @@ pub struct Policy {
     /// an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolver_passes: Option<ResolverPasses>,
-    /// A ceiling, in dollars, on what one chain of runs costs: the asking
-    /// runs and their resolver runs since the command's last stop, past
-    /// which the next run's questions go to the decider. A positive number;
-    /// required with `resolver_passes = "unlimited"` (OWL-328). A file using
-    /// it requires an Owlshift that reads it.
+    /// A ceiling, in dollars, on what the resolver runs of one chain cost
+    /// since the command's last stop, past which the next run's questions
+    /// go to the decider; the asking runs do not count (OWL-376). A positive
+    /// number; required with `resolver_passes = "unlimited"` (OWL-328). A
+    /// file using it requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolver_budget_usd: Option<Usd>,
 }

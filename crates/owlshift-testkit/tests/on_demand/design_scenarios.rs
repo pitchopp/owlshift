@@ -2189,7 +2189,7 @@ fn a_stage_step_goes_on_from_the_chain_its_last_step_left() {
     };
 
     let mut chain = Chain::default();
-    chain.ran(Some(0.0));
+    chain.resolved(Some(0.0));
     chain.settled_once();
     let at_limit = Carried {
         chain,

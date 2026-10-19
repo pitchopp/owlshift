@@ -140,11 +140,16 @@ pub enum Fallback {
     /// The resolver already settled every question of this many runs in a
     /// row, the project's pass limit (`policy.resolver_passes`, OWL-328).
     PassLimit(u32),
-    /// The chain's cost reached the project's ceiling
-    /// (`policy.resolver_budget_usd`, OWL-328).
-    Budget,
-    /// A run of the chain reported no cost, so the project's ceiling could
-    /// not be checked (OWL-337).
+    /// The chain's resolver runs cost this much, in millionths of a dollar,
+    /// reaching the project's ceiling, also given
+    /// (`policy.resolver_budget_usd`, OWL-328; the resolver runs alone since
+    /// OWL-376).
+    Budget {
+        spent_micros: u64,
+        ceiling_micros: u64,
+    },
+    /// A resolver run of the chain reported no cost, so the project's
+    /// ceiling could not be checked (OWL-337).
     CostUnreported,
 }
 
@@ -155,7 +160,7 @@ impl Fallback {
         match self {
             Self::UsageLimit => "usage_limit",
             Self::Failed => "failed",
-            Self::PassLimit(_) | Self::Budget | Self::CostUnreported => "pass_limit",
+            Self::PassLimit(_) | Self::Budget { .. } | Self::CostUnreported => "pass_limit",
         }
     }
 
@@ -165,7 +170,7 @@ impl Fallback {
     /// every other fallback, a pass limit reached included.
     pub fn reason(self) -> Option<&'static str> {
         match self {
-            Self::Budget => Some("budget"),
+            Self::Budget { .. } => Some("budget"),
             Self::CostUnreported => Some("cost_unreported"),
             Self::UsageLimit | Self::Failed | Self::PassLimit(_) => None,
         }
@@ -176,7 +181,13 @@ impl From<ChainEnd> for Fallback {
     fn from(end: ChainEnd) -> Self {
         match end {
             ChainEnd::Passes(limit) => Self::PassLimit(limit),
-            ChainEnd::Budget => Self::Budget,
+            ChainEnd::Budget {
+                spent_micros,
+                ceiling_micros,
+            } => Self::Budget {
+                spent_micros,
+                ceiling_micros,
+            },
             ChainEnd::CostUnreported => Self::CostUnreported,
         }
     }
@@ -826,7 +837,10 @@ mod tests {
         let cases = [
             (Fallback::from(ChainEnd::Passes(3)), "pass_limit", None),
             (
-                Fallback::from(ChainEnd::Budget),
+                Fallback::from(ChainEnd::Budget {
+                    spent_micros: 2,
+                    ceiling_micros: 1,
+                }),
                 "pass_limit",
                 Some("budget"),
             ),
@@ -843,6 +857,16 @@ mod tests {
             assert_eq!(fallback.reason(), reason, "{fallback:?}");
         }
         assert_eq!(Fallback::from(ChainEnd::Passes(3)), Fallback::PassLimit(3));
+        assert_eq!(
+            Fallback::from(ChainEnd::Budget {
+                spent_micros: 2,
+                ceiling_micros: 1
+            }),
+            Fallback::Budget {
+                spent_micros: 2,
+                ceiling_micros: 1
+            }
+        );
     }
 
     #[test]

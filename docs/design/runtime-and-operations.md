@@ -168,7 +168,7 @@ fast     = { claude = "claude-haiku-4-5" }
 always_human = ["billing", "auth"]   # always human, at every delegation level
 resolver_delegation = "discoverable" # none | facts | discoverable | ticket | all; security and irreversible always go to a human
 resolver_passes = 5                  # optional, 1 to 50 or "unlimited": runs in a row the resolver unblocks in one command
-# resolver_budget_usd = 5.0          # required with "unlimited": dollar ceiling on one chain of runs
+# resolver_budget_usd = 5.0          # required with "unlimited": dollar ceiling on the resolver runs of one chain
 quiet_window_minutes = 10            # optional, 1 to 1440: how long a decider's last edit must rest before the answer counts
 max_open_prs = 3                     # optional, 1 to 20: open pull requests at which the drain starts no new Build
 

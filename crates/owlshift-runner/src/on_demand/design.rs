@@ -2926,7 +2926,10 @@ Reply `Q1: A`, `ok` to take every recommendation, or in your own words.
             Fallback::UsageLimit,
             Fallback::Failed,
             Fallback::PassLimit(u32::MAX),
-            Fallback::Budget,
+            Fallback::Budget {
+                spent_micros: u64::MAX,
+                ceiling_micros: u64::MAX,
+            },
             Fallback::CostUnreported,
         ] {
             let (body, total) = round(
