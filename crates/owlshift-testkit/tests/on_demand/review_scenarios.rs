@@ -369,20 +369,7 @@ fn assert_left_at_build(bench: &Bench, dispatches: usize) {
     assert!(bench.record().delivery.unwrap().followed());
     assert_eq!(bench.stage(), "In Progress");
     assert_eq!(bench.resumes(), 1);
-    let now = bench
-        .events()
-        .iter()
-        .filter(|event| event.kind == EventKind::Dispatch)
-        .count();
-    assert_eq!(now, dispatches, "no run was dispatched");
-}
-
-fn dispatches(bench: &Bench) -> usize {
-    bench
-        .events()
-        .iter()
-        .filter(|event| event.kind == EventKind::Dispatch)
-        .count()
+    assert_eq!(bench.dispatches(), dispatches, "no run was dispatched");
 }
 
 /// OWL-340, a review loop (OWL-307): the decider answers the loop Build's
@@ -394,7 +381,7 @@ fn dispatches(bench: &Bench) -> usize {
 #[test]
 fn watch_resumes_a_review_loop_a_refusal_stopped_after_its_answer_check() {
     let bench = answered_loop();
-    let before = dispatches(&bench);
+    let before = bench.dispatches();
     let mut pass = 0;
     let replies = vec![
         bench.reply(None, Some(&check(&[("Q1", "answered", "First word.")]))),
@@ -432,7 +419,7 @@ fn watch_resumes_a_review_loop_a_refusal_stopped_after_its_answer_check() {
 #[test]
 fn a_review_loop_a_merge_ended_is_not_resumed() {
     let bench = answered_loop();
-    let before = dispatches(&bench);
+    let before = bench.dispatches();
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch(
         vec![bench.reply(None, Some(&check(&[("Q1", "answered", "First word.")])))],
@@ -454,7 +441,7 @@ fn a_review_loop_a_merge_ended_is_not_resumed() {
         EndedWhy::Merged
     );
     assert!(bench.watch_resumes().is_empty());
-    assert_eq!(dispatches(&bench), before);
+    assert_eq!(bench.dispatches(), before);
     assert!(lines.contains("its review loop ends"), "{lines}");
 }
 

@@ -1528,6 +1528,14 @@ impl Bench {
             .count()
     }
 
+    /// The `dispatch` events of the event log so far.
+    pub(super) fn dispatches(&self) -> usize {
+        self.events()
+            .iter()
+            .filter(|event| event.kind == EventKind::Dispatch)
+            .count()
+    }
+
     pub(super) fn answer_checks(&self) -> usize {
         self.roles()
             .iter()
@@ -1568,12 +1576,7 @@ fn watch_resumes_a_stage_a_refusal_stopped_right_after_its_answer_check() {
                 assert_eq!(bench.resumes(), 1);
                 assert_eq!(bench.answer_checks(), 1);
                 assert_eq!(bench.open_reads(), reads + 1);
-                let dispatches = bench
-                    .events()
-                    .iter()
-                    .filter(|event| event.kind == EventKind::Dispatch)
-                    .count();
-                assert_eq!(dispatches, 1, "the first design's only");
+                assert_eq!(bench.dispatches(), 1, "the first design's only");
                 bench.wait(1);
                 true
             }
@@ -1714,13 +1717,6 @@ fn a_stage_left_shown_elsewhere_is_left_alone_and_its_stage_read_rarely() {
     assert_eq!(bench.state(), (Status::Active(Stage::Design), 1));
 }
 
-/// A run's reply that meets the harness's usage limit, reset at `resets`.
-pub(super) fn limited(bench: &Bench, resets: &str) -> Reply {
-    let mut reply = bench.reply(None, None);
-    reply.usage_limit = Some(resets.parse().unwrap());
-    reply
-}
-
 /// A reset long past at the bench's clock.
 const LONG_PAST: &str = "2026-10-01T00:00:00Z";
 /// A reset ahead of the bench's clock for the whole test.
@@ -1744,7 +1740,7 @@ fn cut_off_at(stage: Stage, resets: &str) -> (Bench, Vec<Reply>) {
             cut(vec![
                 check,
                 bench.read(&designed(PLAN)),
-                limited(&bench, resets),
+                bench.limited_until(resets),
             ]);
             vec![
                 bench.read(&reviewed(&[])),
@@ -1758,7 +1754,7 @@ fn cut_off_at(stage: Stage, resets: &str) -> (Bench, Vec<Reply>) {
                 bench.read(&designed(PLAN)),
                 bench.read(&reviewed(&[])),
                 bench.read(&reviewed(&[])),
-                limited(&bench, resets),
+                bench.limited_until(resets),
             ]);
             vec![bench.built()]
         }
@@ -1770,7 +1766,7 @@ fn cut_off_at(stage: Stage, resets: &str) -> (Bench, Vec<Reply>) {
                 bench.read(&reviewed(&[])),
                 bench.read(&reviewed(&[])),
                 bench.built(),
-                limited(&bench, resets),
+                bench.limited_until(resets),
             ]);
             vec![bench.read(&verify_scenarios::found(&[]))]
         }
@@ -1814,7 +1810,7 @@ fn watch_resumes_design_review_build_and_verify_cut_off_after_a_round() {
 fn a_resume_meeting_the_usage_limit_again_waits_for_its_reset_or_ten_minutes() {
     // A reset ahead.
     let (bench, mut replies) = cut_off_at(Stage::Build, FAR_AHEAD);
-    replies.insert(0, limited(&bench, FAR_AHEAD));
+    replies.insert(0, bench.limited_until(FAR_AHEAD));
     let (mut ran, mut reads) = (0, 0);
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
@@ -1845,7 +1841,7 @@ fn a_resume_meeting_the_usage_limit_again_waits_for_its_reset_or_ten_minutes() {
 
     // A reset already past.
     let (bench, mut replies) = cut_off_at(Stage::Build, LONG_PAST);
-    replies.insert(0, limited(&bench, LONG_PAST));
+    replies.insert(0, bench.limited_until(LONG_PAST));
     let (mut ran, mut reads) = (0, 0);
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
@@ -1886,7 +1882,7 @@ fn a_resumed_build_that_fails_twice_is_parked_and_not_resumed_again() {
     // its failed run is the second.
     let replies = vec![
         bench.read(FAILED),
-        limited(&bench, LONG_PAST),
+        bench.limited_until(LONG_PAST),
         bench.read(FAILED),
     ];
     let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
@@ -2040,7 +2036,7 @@ fn watch_resumes_a_new_cycle_started_after_its_pull_request_closed() {
             bench.read(&designed(PLAN)),
             bench.read(&reviewed(&[])),
             bench.read(&reviewed(&[])),
-            limited(&bench, LONG_PAST),
+            bench.limited_until(LONG_PAST),
         ],
         None,
     );
