@@ -1506,6 +1506,14 @@ fn brief_rejections() {
         "unknown field `options`",
     );
     rejects(
+        "a re-ask of an answered round, shown both settled and open",
+        parse(|v| {
+            v["thread"][4]["round"] = json!(1);
+            v["thread"][4]["questions"][0]["id"] = json!("Q1");
+        }),
+        "re-ask of round 1, which the thread shows answered",
+    );
+    rejects(
         "a re-ask of a round not answered in this thread",
         parse(|v| {
             let thread = v["thread"].as_array_mut().unwrap();

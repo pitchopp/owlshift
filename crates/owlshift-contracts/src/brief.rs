@@ -1,6 +1,6 @@
 //! The brief: everything the runner hands a role for one run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use jiff::Timestamp;
@@ -1147,6 +1147,8 @@ pub(crate) fn validate_thread<'a>(
 ) -> Result<(), ContractError> {
     // The number of questions of each round seen so far.
     let mut rounds: BTreeMap<NonZeroU32, usize> = BTreeMap::new();
+    // The rounds shown as `answered` (OWL-359): settled, never asked again.
+    let mut answered: BTreeSet<NonZeroU32> = BTreeSet::new();
     for entry in thread {
         match entry {
             ThreadEntry::Questions {
@@ -1199,9 +1201,10 @@ pub(crate) fn validate_thread<'a>(
                         ));
                     }
                 }
-                // A re-ask of an answered round is folded into it, so none
-                // follows; one would still name a question of the round.
+                // A re-ask of an answered round is folded into it: one after
+                // it would show the round both settled and open, refused below.
                 rounds.insert(*round, questions.len());
+                answered.insert(*round);
             }
             ThreadEntry::Reask {
                 round, questions, ..
@@ -1218,6 +1221,12 @@ pub(crate) fn validate_thread<'a>(
                         format!("re-ask of round {round}, which is not earlier in the thread"),
                     ));
                 };
+                if answered.contains(round) {
+                    return Err(ContractError::invalid(
+                        contract,
+                        format!("re-ask of round {round}, which the thread shows answered"),
+                    ));
+                }
                 for question in questions {
                     if usize::try_from(question.id.number()).map_or(true, |n| n > asked) {
                         return Err(ContractError::invalid(
