@@ -104,8 +104,8 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
   `peer_inbox_*` (2.1.283, by hand) and `usage_limit.jsonl` (constructed) stay as they are.
   - Drift from 2.1.300, found by diffing the fixtures' event kinds and fields:
     `init` gained `original_cwd` and `additional_directories`.
-    The `thinking_tokens` system event and the `thinking_display` and `thinking_duration_ms` fields of `assistant` events no longer appear in `beyond_run_tools_denied.jsonl`.
-    A few recordings differ in their count of events (the model's own steps), not in their kinds.
+    The recordings were made with the adapter's current command line, `--disable-slash-commands` included (OWL-333): their `init` offers no `Skill` and lists no skill, where the 2.1.300 ones offered `Skill`.
+    A few recordings differ in their count of events and in their thinking events (`beyond_run_tools_denied.jsonl` has none beyond the result's token detail, while four others still carry them): the model's own steps, not a change of the CLI.
     The denials are the same in number and place, the `cd` ones included.
     The exact values of `success` (tokens, cost, duration, rate-limit utilization) moved with the new run; its rate-limit event is again a plain `allowed`.
     None of it touches what the adapter reads.

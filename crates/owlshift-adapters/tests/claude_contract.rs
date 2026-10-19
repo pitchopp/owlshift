@@ -611,9 +611,9 @@ fn repository_settings_cannot_widen_a_role_on_every_launch() {
 /// CLI's own skills and offered `Skill`, and a run asked to invoke one got
 /// its text; with `--disable-slash-commands`, `init` listed no skill and no
 /// slash command and `Skill` was not offered (build plan, OWL-333, Claude
-/// Code 2.1.302). Only the command line is pinned here: the fixtures were
-/// recorded before the flag, so the CLI's behaviour under it is checked by
-/// the live test `bundled_skills_do_not_reach_a_confined_run` in
+/// Code 2.1.302). Only the command line is pinned here: the fixtures recorded
+/// since OWL-338 were made under the flag and offer no `Skill`, and the
+/// CLI's behaviour under it is checked by the live test `bundled_skills_do_not_reach_a_confined_run` in
 /// `owlshift-testkit/tests/executor_live.rs`.
 #[test]
 fn bundled_skills_are_disabled_on_every_launch() {
