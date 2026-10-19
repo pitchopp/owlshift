@@ -2345,6 +2345,26 @@ mod tests {
         }
     }
 
+    /// OWL-330: a red setup lets the harness start only on a worktree
+    /// holding the Build's own work, and only for the command's own fault.
+    #[test]
+    fn only_the_commands_own_failure_on_unfinished_work_is_recoverable() {
+        for resumed in [false, true] {
+            for fault in [None, Some(Fault::Command), Some(Fault::Runner)] {
+                let run = SetupRun {
+                    report: empty_report(&[], Path::new(SETUP_LOG)),
+                    resumed,
+                    fault,
+                };
+                assert_eq!(
+                    run.recoverable(),
+                    resumed && fault == Some(Fault::Command),
+                    "resumed {resumed}, fault {fault:?}"
+                );
+            }
+        }
+    }
+
     /// Runs `commands` as setup commands, unconfined, under `timeout`: the
     /// failure and its fault, and the log.
     #[cfg(unix)]

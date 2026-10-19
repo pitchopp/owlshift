@@ -3730,6 +3730,7 @@ impl OnDemand<'_> {
             base: &p.base.commit,
             run_dir: &run_dir,
             brief,
+            setup: &[],
         };
         let report = match executor.run(&spec, harness) {
             Ok(report) => report,
@@ -6889,6 +6890,7 @@ mod tests {
             stderr_log: PathBuf::from("stderr.log"),
             log_error: None,
             gate: None,
+            setup: None,
             warnings: Vec::new(),
         }
     }

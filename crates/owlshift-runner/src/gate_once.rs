@@ -306,6 +306,7 @@ impl GateOnce<'_> {
             base: &plan.commit,
             run_dir: &run_dir,
             commands: &plan.commands,
+            setup: &[],
         };
         let discard = || executor.discard_worktree(&checkout, &worktree, GATE_BRANCH);
         let run = match executor.run_gate(&spec) {

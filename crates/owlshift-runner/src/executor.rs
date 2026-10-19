@@ -33,6 +33,14 @@
 //! makes the file-system checks itself before its own git runs, and stops
 //! there on a violation (OWL-64).
 //!
+//! A Build run with a project setup (`stack.setup`, OWL-330) runs it before
+//! the harness, right after the isolation snapshot, then checks isolation
+//! ([`gate::run_setup`]): a violation quarantines the run, and a red setup
+//! fails it, [`Failure::Setup`], with no harness spawned. Only a red setup
+//! command on a worktree holding the Build's own work lets the harness
+//! start, its brief carrying the failure as `gate_failure`, so the Build can
+//! repair the setup it broke. The gate after a `done` runs the setup too.
+//!
 //! # Layout
 //!
 //! The run's own files live in the worktree under [`RUN_DIR`], which a
@@ -84,7 +92,7 @@ use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
 
 pub use codex::CodexHarness;
-pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport, GateStep};
+pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport, GateStep, SETUP_LOG, SETUP_PREFIX, SETUP_SHARE};
 pub use git::{Git, GitError, MINIMUM_GIT_VERSION};
 pub(crate) use git::{git_floor_reason, git_install_advice, git_recheck_note};
 pub use harness::{
@@ -201,6 +209,10 @@ pub struct RunSpec<'a> {
     pub run_dir: &'a Path,
     /// The brief; its `result_path` is replaced with [`RESULT_PATH`].
     pub brief: &'a Brief,
+    /// The project's setup (`stack.setup`, OWL-330): run before a Build's
+    /// harness and before the gate after a Build or a rebase `done`; empty
+    /// for none, and for the other roles.
+    pub setup: &'a [String],
 }
 
 /// What a run came to.
@@ -233,6 +245,9 @@ pub struct RunReport {
     /// rebase `done` that broke no isolation. Its commands and commit fill the delivery
     /// report's gate when it passed.
     pub gate: Option<GateReport>,
+    /// The project's setup before a Build's harness, when the executor ran
+    /// it (OWL-330): its steps in `setup`, no gate command.
+    pub setup: Option<GateReport>,
     /// What the run's harness home left to say: a changed login that was
     /// not written back, or a result that could not be written from the
     /// last message; and a read-only run's result read from its last
@@ -291,6 +306,10 @@ pub enum Failure {
     /// The role reported `done`, and the project's gate, run by the
     /// executor, failed: what the next Build run is given to fix.
     Gate(Box<GateFailure>),
+    /// The project's setup failed before a Build's harness (OWL-330), which
+    /// was never spawned: on a worktree with no work of the Build's own, or
+    /// for a reason other than the command's own failure.
+    Setup(Box<GateFailure>),
 }
 
 impl Failure {
@@ -307,7 +326,8 @@ impl Failure {
             | Self::Harness(_)
             | Self::Driver(_)
             | Self::NoResult
-            | Self::Gate(_) => None,
+            | Self::Gate(_)
+            | Self::Setup(_) => None,
         }
     }
 }
@@ -329,6 +349,18 @@ impl fmt::Display for Failure {
                     write!(f, "the project gate failed: {command}: {}", failure.reason)
                 }
                 None => write!(f, "the project gate failed: {}", failure.reason),
+            },
+            Self::Setup(failure) => match &failure.command {
+                Some(command) => write!(
+                    f,
+                    "the project setup failed before the harness: {command}: {}",
+                    failure.reason
+                ),
+                None => write!(
+                    f,
+                    "the project setup failed before the harness: {}",
+                    failure.reason
+                ),
             },
         }
     }
@@ -501,6 +533,62 @@ impl Executor {
         }
         .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
 
+        // The project's setup, before anything of the harness is prepared
+        // (OWL-330): confined as the gate is, in the run's own temporary
+        // folder, which the harness and the gate then share.
+        let mut warnings = Vec::new();
+        let mut setup = None;
+        if brief.role == Role::Build && !spec.setup.is_empty() {
+            let base_commit = self.resolve_commit(spec.main, spec.base)?;
+            let ran = gate::run_setup(
+                &self.git,
+                &self.agent,
+                &RunPaths {
+                    temp: Some(temp.path().to_owned()),
+                    ..paths.clone()
+                },
+                &base_commit,
+                spec.setup,
+                self.gate_timeout,
+                &spec.run_dir.join(SETUP_LOG),
+                &|| before.check_files(spec.worktree),
+            );
+            let stopped = after_check(
+                &ran.report,
+                || before.check(&self.git, spec.main, spec.worktree, spec.branch),
+                |failure| (!ran.recoverable()).then_some(Failure::Setup(failure)),
+            );
+            if let Some(outcome) = stopped {
+                log.finish();
+                return Ok(RunReport {
+                    outcome,
+                    exit_code: None,
+                    usage: None,
+                    model: None,
+                    harness_version: None,
+                    elapsed: started.elapsed(),
+                    wall_elapsed: wall_span(wall_started, SystemTime::now()),
+                    stdout_log: log.stdout_path,
+                    stderr_log: log.stderr_path,
+                    log_error: log.error,
+                    gate: None,
+                    setup: Some(ran.report),
+                    warnings,
+                });
+            }
+            if let Some(failure) = &ran.report.failure {
+                // A Build that broke its own setup: the harness starts, told.
+                brief.gate_failure = Some(failure.clone());
+                worktree::write_run_files(spec.worktree, &brief)?;
+                fs::write(spec.run_dir.join("brief.json"), brief.render()).map_err(run_dir)?;
+                warnings.push(format!(
+                    "the project setup failed before the harness: {}",
+                    failure.command.as_deref().unwrap_or(&failure.reason)
+                ));
+            }
+            setup = Some(ran.report);
+        }
+
         let context = HarnessRun {
             worktree: spec.worktree,
             brief: &brief,
@@ -605,7 +693,6 @@ impl Executor {
 
         // Once nothing of the run is left running: the result from the last
         // message, over whatever the run wrote there, and the login back.
-        let mut warnings = Vec::new();
         let mut result_written = Ok(());
         if needs.result_in_message {
             let message = driven.as_ref().ok().and_then(|end| end.message.as_deref());
@@ -658,11 +745,18 @@ impl Executor {
         }
         let mut gate = None;
         if matches!(brief.role, Role::Build | Role::Rebase) && is_done(&outcome) {
-            let report =
-                self.project_gate(&before, spec.worktree, paths, &brief.gate, spec.run_dir);
-            if let Some(after_gate) = after_gate(&report, || {
-                before.check(&self.git, spec.main, spec.worktree, spec.branch)
-            }) {
+            let report = self.project_gate(
+                &before,
+                spec.worktree,
+                paths,
+                (spec.setup, &brief.gate),
+                spec.run_dir,
+            );
+            if let Some(after_gate) = after_check(
+                &report,
+                || before.check(&self.git, spec.main, spec.worktree, spec.branch),
+                |failure| Some(Failure::Gate(failure)),
+            ) {
                 outcome = after_gate;
             }
             gate = Some(report);
@@ -679,6 +773,7 @@ impl Executor {
             stderr_log: log.stderr_path,
             log_error: log.error,
             gate,
+            setup,
             warnings,
         })
     }
@@ -716,13 +811,14 @@ impl Executor {
     /// confined as the run was (`paths`, its temporary folder included),
     /// without a harness's own folders, the guard checking `before`'s files
     /// before each of the gate's own git steps; its log goes to `run_dir`.
-    /// The one path a Build's gate and `owlshift gate` share (OWL-329).
+    /// The one path a Build's gate and `owlshift gate` share (OWL-329). The
+    /// project's `setup` runs before the `commands` (OWL-330).
     fn project_gate(
         &self,
         before: &isolation::Snapshot,
         worktree: &Path,
         paths: RunPaths,
-        commands: &[String],
+        (setup, commands): (&[String], &[String]),
         run_dir: &Path,
     ) -> GateReport {
         gate::run(
@@ -734,7 +830,7 @@ impl Executor {
                 read_only: false,
                 ..paths
             },
-            &[],
+            setup,
             commands,
             self.gate_timeout,
             &run_dir.join(gate::GATE_LOG),
@@ -771,7 +867,13 @@ impl Executor {
         }
         let before = isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch)
             .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
-        let report = self.project_gate(&before, spec.worktree, paths, spec.commands, spec.run_dir);
+        let report = self.project_gate(
+            &before,
+            spec.worktree,
+            paths,
+            (spec.setup, spec.commands),
+            spec.run_dir,
+        );
         let violations = gate_violations(&report, || {
             before.check(&self.git, spec.main, spec.worktree, spec.branch)
         });
@@ -812,6 +914,8 @@ pub struct GateSpec<'a> {
     pub run_dir: &'a Path,
     /// The gate commands, in order.
     pub commands: &'a [String],
+    /// The project's setup, run before them (OWL-330).
+    pub setup: &'a [String],
 }
 
 /// What a run of the gate alone came to.
@@ -906,12 +1010,18 @@ fn is_done(outcome: &Outcome) -> bool {
     matches!(outcome, Outcome::Finished { result, .. } if result.status == result::Status::Done)
 }
 
-/// What the gate makes of a Build `done`; `None` leaves it as it was. The
-/// gate ran code the run wrote, so isolation counts first: a breach the gate
-/// found before its own git quarantines the run as it is, with no more git;
-/// otherwise `check` checks isolation again, and a violation there wins over
-/// the gate's own verdict.
-fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Option<Outcome> {
+/// What the gate makes of a Build `done`, or the setup of the run before its
+/// harness (OWL-330); `None` leaves the run as it was. Either ran code the
+/// run's branch holds, so isolation counts first: a breach the guard found
+/// before the runner's own git quarantines the run as it is, with no more
+/// git; otherwise `check` checks isolation again, and a violation there wins
+/// over the report's own verdict. A red report is then the failure `failed`
+/// makes of it, none when it lets the run go on.
+fn after_check(
+    report: &GateReport,
+    check: impl FnOnce() -> Vec<Violation>,
+    failed: impl FnOnce(Box<GateFailure>) -> Option<Failure>,
+) -> Option<Outcome> {
     let violations = gate_violations(report, check);
     if !violations.is_empty() {
         Some(Outcome::Quarantined(violations))
@@ -919,7 +1029,8 @@ fn after_gate(report: &GateReport, check: impl FnOnce() -> Vec<Violation>) -> Op
         report
             .failure
             .as_ref()
-            .map(|failure| Outcome::Failed(Failure::Gate(Box::new(failure.clone()))))
+            .and_then(|failure| failed(Box::new(failure.clone())))
+            .map(Outcome::Failed)
     }
 }
 
@@ -1384,15 +1495,25 @@ mod tests {
         };
         let link = Violation::WorktreeLink("redirected".to_owned());
         let breached = report(vec![link.clone()], Some(failure.clone()));
-        let outcome = after_gate(&breached, || panic!("no more git after a breach"));
+        let gate = |failure| Some(Failure::Gate(failure));
+        let outcome = after_check(&breached, || panic!("no more git after a breach"), gate);
         assert!(matches!(outcome, Some(Outcome::Quarantined(v)) if v == [link.clone()]));
 
         let red = report(Vec::new(), Some(failure));
-        let outcome = after_gate(&red, || vec![Violation::MainHead]);
+        let outcome = after_check(&red, || vec![Violation::MainHead], gate);
         assert!(matches!(outcome, Some(Outcome::Quarantined(v)) if v == [Violation::MainHead]));
-        let outcome = after_gate(&red, Vec::new);
+        let outcome = after_check(&red, Vec::new, gate);
         assert!(matches!(outcome, Some(Outcome::Failed(Failure::Gate(f))) if f.reason == "red"));
 
-        assert!(after_gate(&report(Vec::new(), None), Vec::new).is_none());
+        assert!(after_check(&report(Vec::new(), None), Vec::new, gate).is_none());
+
+        // OWL-330: a red setup is the failure its caller makes of it, none
+        // when the run goes on; a violation still wins.
+        let setup = |failure| Some(Failure::Setup(failure));
+        let outcome = after_check(&red, Vec::new, setup);
+        assert!(matches!(outcome, Some(Outcome::Failed(Failure::Setup(f))) if f.reason == "red"));
+        assert!(after_check(&red, Vec::new, |_| None).is_none());
+        let outcome = after_check(&red, || vec![Violation::MainHead], |_| None);
+        assert!(matches!(outcome, Some(Outcome::Quarantined(_))));
     }
 }

@@ -27,8 +27,8 @@ use owlshift_platform::keychain::Secret;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
-    Executor, ExecutorError, Git, Harness, HarnessEnd, HarnessError, HarnessLogin, HarnessRun,
-    HarnessStatus, RunLog, RunReport, RunSpec, SandboxNeeds,
+    Executor, ExecutorError, Failure, Git, Harness, HarnessEnd, HarnessError, HarnessLogin,
+    HarnessRun, HarnessStatus, RunLog, RunReport, RunSpec, SandboxNeeds,
 };
 use owlshift_testkit::git::{GitEnv, seed};
 
@@ -152,6 +152,17 @@ impl Bench {
         harness: &dyn Harness,
         brief: &Brief,
     ) -> Result<RunReport, ExecutorError> {
+        self.run_set_up(agent, harness, brief, &[])
+    }
+
+    /// A run with the project's `setup` (OWL-330).
+    fn run_set_up(
+        &self,
+        agent: AgentEnv,
+        harness: &dyn Harness,
+        brief: &Brief,
+        setup: &[String],
+    ) -> Result<RunReport, ExecutorError> {
         let runner = self.env.clone();
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner.apply(command)),
@@ -167,6 +178,7 @@ impl Bench {
             base: "origin/main",
             run_dir: &self.run_dir(),
             brief,
+            setup,
         };
         executor.run(&spec, harness)
     }
@@ -379,6 +391,47 @@ fn a_declared_cache_is_read_and_never_written() {
     let gate = report.gate.as_ref().expect("the gate ran after the done");
     assert!(gate.passed(), "{gate:?}");
     assert!(!store.join("planted").exists() && !store.join("planted-by-gate").exists());
+}
+
+/// OWL-330: a setup command that writes into a declared cache is refused by
+/// the sandbox, so the setup of a Build on a pristine worktree fails the
+/// run before its harness, naming that command.
+#[cfg(unix)]
+#[test]
+fn a_setup_command_cannot_write_into_a_declared_cache() {
+    let bench = Bench::new();
+    let store = bench.tmp.path().join("home/Library/pnpm/store");
+    fs::create_dir_all(&store).unwrap();
+    let agent = bench.agent().with_caches(&["Library/pnpm"]);
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let write = "touch \"$HOME/Library/pnpm/store/x\"".to_owned();
+    let harness = Script {
+        line: "echo ran > .owlshift/run/harness-ran".to_owned(),
+        login: None,
+        temp_variable: None,
+        read_only: false,
+    };
+    let report = bench
+        .run_set_up(
+            agent,
+            &harness,
+            &brief(),
+            &["true".to_owned(), write.clone()],
+        )
+        .unwrap();
+    let owlshift_runner::executor::Outcome::Failed(Failure::Setup(failure)) = &report.outcome
+    else {
+        panic!("{:?}", report.outcome);
+    };
+    assert_eq!(failure.command.as_deref(), Some(write.as_str()));
+    assert!(
+        failure.reason.starts_with("setup: exit status"),
+        "{failure:?}"
+    );
+    assert!(!store.join("x").exists());
+    assert!(!bench.worktree.join(".owlshift/run/harness-ran").exists());
 }
 
 /// The token of OWL-94's bench test, made up.

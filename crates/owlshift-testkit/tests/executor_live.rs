@@ -516,6 +516,7 @@ fn run_live_seeded(
         base: "origin/main",
         run_dir: &paths.root.join("run"),
         brief: &brief,
+        setup: &[],
     };
     let report = executor.run(&spec, &harness).unwrap();
     Live {

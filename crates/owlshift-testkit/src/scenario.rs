@@ -1170,6 +1170,7 @@ impl Driver {
             base: "origin/main",
             run_dir: &dir,
             brief: &brief,
+            setup: &[],
         };
         let harness = FakeHarness {
             program: self.fake_harness.clone(),
