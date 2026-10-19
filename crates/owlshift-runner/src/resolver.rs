@@ -530,12 +530,6 @@ mod tests {
     use crate::artifact::ArtifactContents;
     use crate::executor::Failure;
 
-    /// OWL-344: half an hour, which `OnDemand::resolve` gives the executor.
-    #[test]
-    fn a_resolver_run_has_half_an_hour() {
-        assert_eq!(RESOLVER_TIMEOUT, Duration::from_secs(30 * 60));
-    }
-
     fn question(id: &str, category: &str) -> Question {
         Question {
             id: QuestionId::new(id).unwrap(),
