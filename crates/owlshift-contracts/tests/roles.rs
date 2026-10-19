@@ -484,6 +484,27 @@ fn build_gate_comes_from_the_brief() {
     }
 }
 
+/// The whole gate runs once per Build, in the runner (OWL-355): the role
+/// checks its change and is never asked for the whole gate before `done`.
+#[test]
+fn build_leaves_the_whole_gate_to_the_runner() {
+    let text = build_prompt();
+    assert!(
+        text.contains("The whole gate is the runner's"),
+        "roles/build.md no longer leaves the whole gate to the runner"
+    );
+    assert!(
+        text.contains("Do not run the whole gate yourself"),
+        "roles/build.md no longer tells the role to leave the whole gate out"
+    );
+    for asked in ["the whole `gate`", "whole gate again", "full gate before"] {
+        assert!(
+            !text.contains(asked),
+            "roles/build.md asks for {asked:?}: the runner runs the whole gate"
+        );
+    }
+}
+
 /// Every dotted path the prompt writes as code, such as `checkpoint.plan` or
 /// `author.relation`, exists in the brief or `result.json`, from their root or
 /// from one of their definitions. The project config is left out on purpose:

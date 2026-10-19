@@ -1403,22 +1403,19 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
                 "{command}: the gate's variable differs from CI's"
             );
         }
-        let command = command.to_owned();
-        let command = &command;
-        // CI runs the tests under cargo-nextest and the doctests apart
-        // (OWL-241), where a developer runs them all with `cargo test`.
-        let in_ci: &[&str] = match command.as_str() {
-            "cargo test --workspace --locked" => &[
-                "cargo nextest run --workspace --locked --no-fail-fast",
-                "cargo test --workspace --doc --locked",
-            ],
-            command => &[command],
-        };
-        for step in in_ci {
-            assert!(runs.contains(step), "{step} is not a CI step");
-        }
+        // Each gate command is a CI step, verbatim: since OWL-355 the gate
+        // runs the tests under cargo-nextest and the doctests apart, as the
+        // ubuntu and macOS legs do (OWL-241; the Windows leg filters
+        // on_demand out, and no gate runs on Windows).
+        assert!(runs.contains(&command), "{command} is not a CI step");
     }
-    for step in ["cargo fmt", "cargo clippy", "cargo doc", "cargo test"] {
+    for step in [
+        "cargo fmt",
+        "cargo clippy",
+        "cargo doc",
+        "cargo nextest run --workspace --locked --no-fail-fast",
+        "cargo test --workspace --doc --locked",
+    ] {
         assert!(
             config.stack.gate.iter().any(|c| c.contains(step)),
             "the gate misses CI's {step}"

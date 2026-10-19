@@ -538,6 +538,16 @@ fn gate() {
     }
 }
 
+/// OWL-355's acceptance: a Build that checked only its own part is caught by
+/// the runner's single gate run, and its retry is told the other part's
+/// command.
+#[test]
+fn gate_scope() {
+    if let Err(error) = play(&scenarios().join("gate_scope.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
 /// Plays a scenario given as text on the gate fixture.
 fn play_on_gate(name: &str, scenario: &str) {
     if let Err(error) = play_str(name, scenario, &scenarios().join("gate"), fake_harness()) {

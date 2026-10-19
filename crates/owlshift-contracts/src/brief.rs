@@ -74,9 +74,10 @@ pub struct Brief {
     pub rules: Vec<Rule>,
     pub permissions: Permissions,
     /// The project's full gate, from `stack.gate` in its configuration: the
-    /// commands a role runs, in order, from the worktree root, before it
-    /// delivers. The runner is its only author; an empty list means the
-    /// project has no gate.
+    /// commands the runner runs, in order, from the worktree root, on the
+    /// commit a Build delivers; a role runs them, or narrows them to its
+    /// change, before it delivers. The runner is its only author; an empty
+    /// list means the project has no gate.
     pub gate: Vec<String>,
     /// The always-human categories the project adds to those of its
     /// delegation level (`policy.always_human`, OWL-151): normalized
