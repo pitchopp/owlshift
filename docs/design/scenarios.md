@@ -91,9 +91,9 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 *A PR that degrades is repaired without me, unless a decision is at stake.*
 
-- A red check or a confirmed finding starts a fix run; at most two review passes, the residue becomes a proposed follow-up.
+- A red check or a confirmed finding starts a fix run; at most two review passes, then one last fix, and what the work's author kept against a finding is listed in the report with its reason, never asked.
 - A merge conflict caused by another merge starts a rebase run on a fast tier, escalated on a non-trivial conflict.
-- A prerequisite (environment variable, flag, infrastructure) or a finding to arbitrate sends the ticket to needs-input, returning to review.
+- A prerequisite (environment variable, flag, infrastructure), or a choice of mine a finding uncovers, sends the ticket to needs-input, returning to review.
 
 ### S10. Circuit breakers and usage limits
 
