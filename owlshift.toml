@@ -25,8 +25,8 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
 
 [stack]
 # The project's full gate: lint, formatter and tests, run in order from the
-# repository root. The build role runs it before it reports done, then
-# Owlshift runs it again on the commit it delivers. With no command, the
+# repository root. Owlshift runs it on the commit it delivers; the build
+# role first runs the commands that cover its change. With no command, the
 # build role stops with `blocked`.
 # Each command runs through the platform's shell (`sh -c` on Unix), so the
 # rustdoc line sets RUSTDOCFLAGS with an inline `VAR=value` assignment, as

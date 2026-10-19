@@ -95,7 +95,7 @@ Dashed links mark the stages that stop for a human in the default pipeline: Inta
 | Intake | Understands the ticket, checks its external premises live, declares resources, picks the variant and the routing | Routing record, resources, questions |
 | Design | Writes the plan: approach, files, test strategy, risks, success criteria | Plan |
 | Design review | Independent reviewers, on another model than the author's when the configuration names one; their number follows the variant (section 5, "The quality pipeline") | Findings, approval |
-| Build | Implements step by step, one commit and one ledger entry per step; runs the project's full gate (lint, formatter, tests) | Commits, ledger |
+| Build | Implements step by step, one commit and one ledger entry per step; runs the checks that cover its change, while the runner runs the project's full gate (lint, formatter, tests) once on the commit it delivers (OWL-355) | Commits, ledger |
 | Verify | Reviews the diff against the plan and criteria, on another model than the author's when the configuration names one, before the PR opens; the complete CI result is Watch's (OWL-296); browser QA when declared, from P6 | Findings; a bounded fix loop |
 | Deliver | The runner opens the PR and posts the delivery report on the ticket | PR, report |
 | Watch | Reacts to CI regressions and merge conflicts with fix and rebase runs of its own, which keep the ticket at Watch (section 5, "Watch after delivery"); human review comments on the PR loop back to Build from P5 | Fix runs, rebases, gates |
