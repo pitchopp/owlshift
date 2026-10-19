@@ -659,15 +659,34 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
         .unwrap();
 
     // Told of no other run, as a run alone is, the same check finds the
-    // other runs' branches.
-    assert_eq!(
-        first.check(&git, &f.main, &f.worktree, BRANCH),
-        [Violation::Refs(vec![
+    // other runs' branches and their worktrees' entries.
+    let alone = first.check(&git, &f.main, &f.worktree, BRANCH);
+    assert!(
+        alone.contains(&Violation::Refs(vec![
             format!("refs/heads/{SECOND}"),
             format!("refs/heads/{THIRD}"),
             format!("refs/heads/{FOURTH}"),
-        ])]
+        ])),
+        "{alone:?}"
     );
+    let entries: Vec<&String> = alone
+        .iter()
+        .flat_map(|violation| match violation {
+            Violation::WorktreeEntries(paths) => paths.iter().collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    for path in [
+        "worktrees/worktree-2/index",
+        "worktrees/worktree-3/HEAD",
+        "worktrees/worktree-4/index",
+    ] {
+        assert!(
+            entries.iter().any(|entry| *entry == path),
+            "{path}: {alone:?}"
+        );
+    }
+    assert_eq!(alone.len(), 2, "{alone:?}");
 
     // Among concurrent runs, an ended run's branch stays where its own check
     // found it, and a parked ticket's branch and the tags stay out of reach.
@@ -684,4 +703,323 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
             "refs/tags/v1".into(),
         ])]
     );
+}
+
+const OTHER: &str = "other";
+const RUNNING: &str = "owlshift/running";
+
+/// The fixture with a second worktree, `other`, made before any snapshot,
+/// and the folder of its entry in the common git folder.
+fn with_other() -> (Fixture, PathBuf) {
+    let f = Fixture::new();
+    let base = f.commit(&f.main, "origin/main");
+    f.main_git(&["worktree", "add", "--quiet", "-b", OTHER, "../other", &base]);
+    let entry = f.main.join(".git/worktrees").join(OTHER);
+    (f, entry)
+}
+
+fn entries(paths: &[&str]) -> Violation {
+    Violation::WorktreeEntries(paths.iter().map(|path| (*path).to_owned()).collect())
+}
+
+fn running(branches: &[&str]) -> Concurrent {
+    Concurrent {
+        running: branches.iter().map(|branch| (*branch).to_owned()).collect(),
+        ..Concurrent::default()
+    }
+}
+
+/// A run's own commit, `add` and rebase change its own entry and nothing of
+/// another's; each way of reaching another worktree's entry is found
+/// (OWL-339).
+#[test]
+fn another_worktrees_entry_is_guarded_and_the_runs_own_is_not() {
+    let (f, other) = with_other();
+    // A new upstream commit, so that the run's rebase has work to do.
+    f.commit_file(&f.main, "README.md", "upstream\n");
+    f.main_git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    // The run's own work: a commit, an `add`, and a rebase.
+    let own = f.around(|f| {
+        fs::write(f.worktree.join("GREETING.md"), "hi\n").unwrap();
+        f.worktree_git(&["add", "GREETING.md"]);
+        f.worktree_git(&["commit", "--quiet", "-m", "Greet"]);
+        f.worktree_git(&["rebase", "--quiet", "origin/main"]);
+    });
+    assert_eq!(own, []);
+
+    // An edit of another's `index` and `HEAD`, a new file, a removed file.
+    let append = |name: &'static str, text: &'static str| {
+        let other = other.clone();
+        move |_: &Fixture| {
+            let path = other.join(name);
+            let mut bytes = fs::read(&path).unwrap_or_default();
+            bytes.extend_from_slice(text.as_bytes());
+            fs::write(path, bytes).unwrap();
+        }
+    };
+    assert_eq!(
+        f.around(append("index", "x")),
+        [entries(&["worktrees/other/index"])]
+    );
+    assert_eq!(
+        f.around(append("HEAD", "x\n")),
+        [entries(&["worktrees/other/HEAD"])]
+    );
+    assert_eq!(
+        f.around(append("planted", "x")),
+        [entries(&["worktrees/other/planted"])]
+    );
+    assert_eq!(
+        f.around(|_| fs::remove_file(other.join("planted")).unwrap()),
+        [entries(&["worktrees/other/planted"])]
+    );
+    // A new entry, with every path it holds.
+    assert_eq!(
+        f.around(|f| {
+            let evil = f.main.join(".git/worktrees/evil");
+            fs::create_dir_all(evil.join("logs")).unwrap();
+            fs::write(evil.join("HEAD"), "ref: refs/heads/evil\n").unwrap();
+        }),
+        [entries(&[
+            "worktrees/evil",
+            "worktrees/evil/HEAD",
+            "worktrees/evil/logs"
+        ])]
+    );
+    // Together with a hook, only the shared files are reported: the check
+    // ends before any git, and so before the entries are compared.
+    assert_eq!(
+        f.around(|f| {
+            fs::write(other.join("index"), "tampered").unwrap();
+            fs::write(f.main.join(".git/hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+        }),
+        [Violation::SharedGitFiles(vec!["hooks/pre-commit".into()])]
+    );
+}
+
+/// Every file under `dir` with its bytes, by path relative to `dir`.
+fn files_under(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let name = path.strip_prefix(root).unwrap().to_string_lossy();
+                out.insert(name.replace('\\', "/"), fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// A `gc` with another worktree in the clone whose reflog holds an expired
+/// line. The agent's git leaves that entry alone: its environment keeps
+/// housekeeping from expiring reflogs, as the runner's git does. A `gc`
+/// that expires them, as git's defaults do (a git outside the runner's, in
+/// a process that is not confined), rewrites the entry's `logs/HEAD`, and
+/// the check reports exactly that file (OWL-339).
+#[test]
+fn the_agents_gc_leaves_another_entry_alone_and_one_that_expires_reflogs_is_found() {
+    let (f, other) = with_other();
+    // An old line in `other`'s reflog, which an expiring `gc` removes; no
+    // maintenance runs first.
+    let old = f
+        .env
+        .at(jiff::Timestamp::from_second(1_577_836_800).unwrap());
+    let checkout = f.main.parent().unwrap().join(OTHER);
+    old.run(
+        &checkout,
+        &[
+            "-c",
+            "maintenance.auto=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "old",
+        ],
+    )
+    .unwrap();
+    let before = files_under(&other);
+
+    assert_eq!(f.around(|f| f.agent_git(&["gc", "--quiet"])), []);
+    assert_eq!(files_under(&other), before, "the agent's gc changed it");
+
+    let found = f.around(|f| {
+        f.agent_git(&[
+            "-c",
+            "gc.reflogExpire=90.days.ago",
+            "-c",
+            "gc.reflogExpireUnreachable=30.days.ago",
+            "gc",
+            "--quiet",
+        ])
+    });
+    assert_ne!(
+        files_under(&other)["logs/HEAD"],
+        before["logs/HEAD"],
+        "the expiring gc left the reflog"
+    );
+    assert_eq!(found, [entries(&["worktrees/other/logs/HEAD"])]);
+}
+
+/// A change past the first mebibyte of a large file of another's entry is
+/// found: the whole file counts (OWL-339).
+#[test]
+fn a_change_past_the_first_mebibyte_of_an_entry_file_is_found() {
+    let (f, other) = with_other();
+    let mut bytes = vec![b'a'; 1024 * 1024 + 100];
+    fs::write(other.join("big"), &bytes).unwrap();
+    *bytes.last_mut().unwrap() = b'b';
+    assert_eq!(
+        f.around(|_| fs::write(other.join("big"), &bytes).unwrap()),
+        [entries(&["worktrees/other/big"])]
+    );
+}
+
+/// Linux alone makes these names: a file whose name is not UTF-8, planted in
+/// another entry or under `hooks/`, is a breach, listed with the name made
+/// lossy.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_name_that_is_not_utf8_is_found_in_an_entry_and_in_the_hooks() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let (f, other) = with_other();
+    let odd = OsStr::from_bytes(b"x\xff");
+    assert_eq!(
+        f.around(|_| fs::write(other.join(odd), "x").unwrap()),
+        [entries(&["worktrees/other/x\u{fffd}"])]
+    );
+    assert_eq!(
+        f.around(|f| fs::write(f.main.join(".git/hooks").join(odd), "x").unwrap()),
+        [Violation::SharedGitFiles(vec!["hooks/x\u{fffd}".into()])]
+    );
+}
+
+/// A run in flight at the same time may change its own entry: told of it,
+/// in either answer, the check leaves it out, and only it (OWL-339).
+#[test]
+fn a_concurrent_runs_entry_is_left_out_when_the_check_is_told_of_it() {
+    let (f, other) = with_other();
+    let check = |before: &Snapshot, first: Concurrent, second: Concurrent| {
+        let calls = std::cell::Cell::new(0);
+        before
+            .check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    first.clone()
+                } else {
+                    second.clone()
+                }
+            })
+            .violations
+    };
+    let before = Snapshot::take(&f.git, &f.main, &f.worktree, BRANCH).unwrap();
+    // The other run commits in its worktree: its index, logs and `HEAD`.
+    let other_worktree = f.worktree.with_file_name("other");
+    f.commit_file(&other_worktree, "OTHER.md", "other\n");
+    fs::write(other.join("planted"), "x").unwrap();
+    // The branch `other` moved too, which is the same run's.
+    let named = running(&[OTHER]);
+    assert_eq!(check(&before, named.clone(), named.clone()), []);
+    assert_eq!(check(&before, Concurrent::default(), named.clone()), []);
+    assert_eq!(check(&before, named.clone(), Concurrent::default()), []);
+    // Or of a run that ended, in either answer or both, at the commit its
+    // own check verified: the entry it left is its too.
+    let tip = f.commit(&other_worktree, "HEAD");
+    let ended = || Concurrent {
+        ended: [(OTHER.to_owned(), tip.clone())].into(),
+        ..Concurrent::default()
+    };
+    assert_eq!(check(&before, ended(), ended()), []);
+    assert_eq!(check(&before, Concurrent::default(), ended()), []);
+    assert_eq!(check(&before, ended(), Concurrent::default()), []);
+    // Told of an unrelated run, or of none, the entry is a breach.
+    for told in [running(&["owlshift/unrelated"]), Concurrent::default()] {
+        let found = check(&before, told.clone(), told);
+        assert!(
+            found.iter().any(|violation| matches!(
+                violation,
+                Violation::WorktreeEntries(paths)
+                    if paths.contains(&"worktrees/other/planted".to_owned())
+            )),
+            "{found:?}"
+        );
+    }
+    // A write to the entry together with its owner's: the owner is the one
+    // the snapshot saw, so rewriting `HEAD` to another branch does not move
+    // the entry to a running one.
+    fs::write(other.join("HEAD"), format!("ref: refs/heads/{RUNNING}\n")).unwrap();
+    let forged = running(&[RUNNING]);
+    let found = check(&before, forged.clone(), forged);
+    assert!(
+        found
+            .iter()
+            .any(|violation| matches!(violation, Violation::WorktreeEntries(_))),
+        "{found:?}"
+    );
+}
+
+/// An entry made after the snapshot is a run's when the check is told so,
+/// and a breach when it is not; and a run that registers between the check's
+/// two answers, with its entry made before the second one, is not flagged
+/// even though the first answer was empty (OWL-339).
+#[test]
+fn an_entry_made_after_the_snapshot_is_judged_by_the_branch_it_holds() {
+    let make = |f: &Fixture| {
+        let base = f.commit(&f.main, "origin/main");
+        f.main_git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            RUNNING,
+            "../running",
+            &base,
+        ]);
+    };
+    let (f, _) = with_other();
+    let before = Snapshot::take(&f.git, &f.main, &f.worktree, BRANCH).unwrap();
+    make(&f);
+    let told = running(&[RUNNING]);
+    let checked = before.check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| told.clone());
+    assert_eq!(checked.violations, []);
+    let alone = before.check(&f.git, &f.main, &f.worktree, BRANCH);
+    assert!(
+        alone
+            .iter()
+            .any(|violation| matches!(violation, Violation::WorktreeEntries(_))),
+        "{alone:?}"
+    );
+
+    // The registration race: the entry is made by the scheduler's first
+    // answer, which is empty; the second answer knows the run.
+    for (second, expected_clean) in [(running(&[RUNNING]), true), (Concurrent::default(), false)] {
+        let (f, _) = with_other();
+        let before = Snapshot::take(&f.git, &f.main, &f.worktree, BRANCH).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let checked = before.check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                make(&f);
+                Concurrent::default()
+            } else {
+                second.clone()
+            }
+        });
+        assert_eq!(checked.violations.is_empty(), expected_clean, "{checked:?}");
+        if !expected_clean {
+            assert!(
+                checked
+                    .violations
+                    .iter()
+                    .any(|violation| matches!(violation, Violation::WorktreeEntries(_))),
+                "{checked:?}"
+            );
+        }
+    }
 }

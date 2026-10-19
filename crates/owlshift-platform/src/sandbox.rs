@@ -56,6 +56,11 @@ pub struct Policy {
     /// Never written, even inside a writable folder: the git folder's hooks
     /// and configuration.
     pub protected: Vec<PathBuf>,
+    /// Written again inside a protected path, such as the run's own entry in
+    /// the git folder's `worktrees`, which is protected whole. Each lies
+    /// inside a protected folder; the hidden paths still close whatever they
+    /// name.
+    pub reopened: Vec<PathBuf>,
     /// Neither read nor written, wherever they are: secret files and the
     /// runner's own run folder.
     pub hidden: Vec<PathBuf>,
@@ -194,6 +199,7 @@ fn resolved(policy: &Policy) -> Policy {
         readable: all(&policy.readable),
         writable: all(&policy.writable),
         protected: all(&policy.protected),
+        reopened: all(&policy.reopened),
         hidden: all(&policy.hidden),
         temp: all(&policy.temp),
         // A link's own place is kept, only its folder made real: resolving
@@ -222,8 +228,9 @@ const READ: &str = "file-read-data file-read-xattr";
 /// wins, so the rules go from the widest to the narrowest: everything
 /// allowed, then no write anywhere but the devices, then the home and the
 /// closed folders shut, then the readable, writable and temporary folders
-/// opened again, then the protected and hidden paths and the Keychain closed
-/// whatever came before.
+/// opened again, then the protected paths closed, the reopened ones written
+/// again inside them, and the hidden paths and the Keychain closed whatever
+/// came before.
 ///
 /// Every read rule names `READ` rather than the wildcard `file-read*`: an
 /// operation named outranks the wildcard whatever the order, so a wildcard
@@ -272,6 +279,10 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, String)
     }
     for path in &policy.protected {
         profile.push_str(&format!("(deny file-write* {})\n", param("P", path)?));
+    }
+    // The same operation as the protected denials, and later: it wins.
+    for path in &policy.reopened {
+        profile.push_str(&format!("(allow file-write* {})\n", param("O", path)?));
     }
     for path in &policy.hidden {
         let path = param("H", path)?;
@@ -329,7 +340,8 @@ pub enum Kind {
 /// bound inside another, or a path hidden inside a bound folder, lands on
 /// top of it; at the same depth, the private folders come first, then the
 /// read-only binds and the links, the writable ones, the protected paths and
-/// the hidden ones.
+/// the reopened ones inside them (deeper than the protected path, so after
+/// it), and the hidden ones.
 pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<OsString> {
     // Rank orders mounts of the same depth.
     let mut mounts: Vec<(PathBuf, u8, Vec<OsString>)> = Vec::new();
@@ -376,6 +388,9 @@ pub fn bwrap_args(policy: &Policy, kind: impl Fn(&Path) -> Option<Kind>) -> Vec<
     }
     for path in &policy.protected {
         add(path, 4, vec![os("--ro-bind-try"), path.into(), path.into()]);
+    }
+    for path in &policy.reopened {
+        add(path, 4, vec![os("--bind-try"), path.into(), path.into()]);
     }
     let bound = |path: &Path| {
         policy
@@ -644,6 +659,7 @@ mod tests {
             readable: vec!["/home/op/.rustup".into()],
             writable: vec!["/home/op/wt".into(), "/srv/repo/.git".into()],
             protected: vec!["/srv/repo/.git/hooks".into()],
+            reopened: Vec::new(),
             hidden: vec![
                 "/home/op/.ssh".into(),
                 "/home/op/wt/.env".into(),
@@ -698,6 +714,50 @@ mod tests {
                 "/srv/run",
             ]
         );
+    }
+
+    /// A protected folder with one path inside it written again (the git
+    /// folder's `worktrees` and the run's own entry): on Seatbelt the allow
+    /// comes after the deny and before the hidden rules, on bwrap the writable
+    /// bind of the entry lands after the read-only bind of the folder.
+    #[test]
+    fn a_reopened_path_is_written_again_after_its_protected_folder() {
+        let mut policy = policy();
+        policy.protected.push("/srv/repo/.git/worktrees".into());
+        policy.reopened.push("/srv/repo/.git/worktrees/own".into());
+        let (profile, params) = seatbelt_profile(&policy).unwrap();
+        let denied = "(deny file-write* (subpath (param \"P8\")))\n";
+        let allowed = "(allow file-write* (subpath (param \"O9\")))\n";
+        let hidden = "(deny file-read-data file-read-xattr file-read-metadata file-write* \
+                      (subpath (param \"H10\")))\n";
+        assert!(
+            profile.contains(&format!("{denied}{allowed}{hidden}")),
+            "{profile}"
+        );
+        assert!(params.contains(&("O9".into(), "/srv/repo/.git/worktrees/own".into())));
+
+        let kind = |_: &Path| None;
+        let args: Vec<String> = bwrap_args(&policy, kind)
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        let at = |mount: [&str; 3]| {
+            args.windows(3)
+                .position(|window| window == mount)
+                .unwrap_or_else(|| panic!("{mount:?} in {args:?}"))
+        };
+        let git = at(["--bind-try", "/srv/repo/.git", "/srv/repo/.git"]);
+        let worktrees = at([
+            "--ro-bind-try",
+            "/srv/repo/.git/worktrees",
+            "/srv/repo/.git/worktrees",
+        ]);
+        let own = at([
+            "--bind-try",
+            "/srv/repo/.git/worktrees/own",
+            "/srv/repo/.git/worktrees/own",
+        ]);
+        assert!(git < worktrees && worktrees < own, "{args:?}");
     }
 
     /// `getcwd` on macOS lists each folder above the working directory, so

@@ -711,6 +711,327 @@ fn a_read_only_run_reads_the_worktree_and_writes_only_its_own_files() {
     );
 }
 
+/// What a run tries on another ticket's worktree entry in the common git
+/// folder, one `name=status` line each (OWL-339): append to its `index`,
+/// overwrite its `HEAD`, add a file, remove one, and make an entry of its own.
+#[cfg(unix)]
+const WRITES_TO_OTHER_ENTRY: &str = r##"
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+other="$common/worktrees/other"
+(echo x >> "$other/index") 2> /dev/null; echo "append=$?"
+(echo x > "$other/HEAD") 2> /dev/null; echo "head=$?"
+(echo x > "$other/planted") 2> /dev/null; echo "new=$?"
+(rm "$other/gitdir") 2> /dev/null; echo "rm=$?"
+(mkdir "$common/worktrees/evil") 2> /dev/null; echo "mkdir=$?"
+"##;
+
+/// The run's own work in its own worktree and entry: two commits and an
+/// interactive rebase that drops the second, which writes and removes
+/// `rebase-merge/` in the entry; then `git worktree prune` and `git gc`,
+/// with their statuses and output, and the worktree's state.
+#[cfg(unix)]
+const OWN_WORK: &str = r##"
+start=$(git rev-parse HEAD)
+who="-c user.name=run -c user.email=run@example.invalid"
+echo a > a.txt; git add a.txt; echo "add=$?"
+git $who commit -q -m first; echo "commit1=$?"
+echo b > b.txt; git add b.txt; git $who commit -q -m second; echo "commit2=$?"
+GIT_SEQUENCE_EDITOR="sed -i.bak 's/^pick \([0-9a-f]*\) \(# \)\{0,1\}second\$/drop \1 second/'" \
+  git $who rebase -q -i "$start" > /dev/null 2>&1; echo "rebase=$?"
+echo "log=$(git log --format=%s "$start"..HEAD | tr '\n' ',')"
+test -e a.txt; echo "a=$?"
+test -e b.txt; echo "b=$?"
+test -e "$(git rev-parse --git-dir)/rebase-merge"; echo "rebase_dir=$?"
+out=$(git worktree prune --verbose 2>&1); echo "prune=$?"
+echo "prune.out=$(echo "$out" | tr '\n' '|')"
+out=$(git gc --quiet 2>&1); echo "gc=$?"
+echo "gc.err=$(echo "$out" | tr '\n' '|')"
+git status --porcelain > /dev/null 2>&1; echo "status=$?"
+echo "dirty=$(git status --porcelain | wc -l | tr -d ' ')"
+"##;
+
+/// The gate's version of the same: the writes, then `add`, `commit` and a
+/// `reset` back to where the gate started, so the worktree ends clean on the
+/// same commit. It exits 0 whatever the writes answered.
+#[cfg(unix)]
+const GATE_COMMAND: &str = r##"
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+other="$common/worktrees/other"
+(echo x >> "$other/index") 2> /dev/null; echo "append=$?"
+(echo x > "$other/HEAD") 2> /dev/null; echo "head=$?"
+(echo x > "$other/planted") 2> /dev/null; echo "new=$?"
+(rm "$other/gitdir") 2> /dev/null; echo "rm=$?"
+(mkdir "$common/worktrees/evil") 2> /dev/null; echo "mkdir=$?"
+echo a > a.txt; git add a.txt; echo "add=$?"
+git -c user.name=gate -c user.email=gate@example.invalid commit -q -m gate; echo "commit=$?"
+git reset -q --hard HEAD~1; echo "reset=$?"
+"##;
+
+/// A second worktree, `other`, and a stale one, `stale`, in the common git
+/// folder: the stale one's directory is gone and its `gitdir` is dated 2020,
+/// so that `git worktree prune` and `git gc` find it expired.
+#[cfg(unix)]
+fn plant_entries(bench: &Bench) {
+    for name in ["other", "stale"] {
+        bench
+            .env
+            .run(
+                &bench.main,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    name,
+                    &format!("../{name}"),
+                    "origin/main",
+                ],
+            )
+            .unwrap();
+    }
+    fs::remove_dir_all(bench.tmp.path().join("stale")).unwrap();
+    let gitdir = bench.main.join(".git/worktrees/stale/gitdir");
+    let status = Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(&gitdir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Every file under `worktrees/other` and `worktrees/stale`, with its bytes.
+#[cfg(unix)]
+fn entry_files(bench: &Bench) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        let Ok(children) = fs::read_dir(dir) else {
+            return;
+        };
+        for child in children {
+            let path = child.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.insert(path.clone(), fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    for name in ["other", "stale"] {
+        walk(&bench.main.join(".git/worktrees").join(name), &mut files);
+    }
+    files
+}
+
+/// `name=value` lines as a map.
+#[cfg(unix)]
+fn named(output: &str) -> std::collections::BTreeMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+#[cfg(unix)]
+fn show(what: &str, lines: &std::collections::BTreeMap<String, String>) {
+    // Printed so that CI's log of a passing run carries them (OWL-339).
+    eprintln!(
+        "{what}: prune={} gc={}\n{what}: prune.out={}\n{what}: gc.err={}",
+        lines.get("prune").map_or("-", String::as_str),
+        lines.get("gc").map_or("-", String::as_str),
+        lines.get("prune.out").map_or("-", String::as_str),
+        lines.get("gc.err").map_or("-", String::as_str),
+    );
+}
+
+/// A confined run's writes to another worktree's entry are refused, while
+/// its own commits, `add` and rebase in its own entry work. `git worktree
+/// prune` and `git gc` leave another ticket's expired entry intact. The bare
+/// control makes the same writes, and the isolation check marks the breach.
+#[cfg(unix)]
+#[test]
+fn a_confined_run_cannot_write_another_worktrees_entry_but_its_own() {
+    use owlshift_runner::executor::{Outcome, Violation};
+    let script = format!("{WRITES_TO_OTHER_ENTRY}{OWN_WORK}");
+
+    // The bare control, which runs wherever the unit tests do.
+    let bench = Bench::new();
+    plant_entries(&bench);
+    let bare = bench
+        .run(bench.agent().without_confinement(), &script)
+        .unwrap();
+    let lines = named(&fs::read_to_string(&bare.stdout_log).unwrap());
+    show("bare run", &lines);
+    for name in [
+        "append", "head", "new", "rm", "mkdir", "add", "commit1", "commit2", "rebase", "prune",
+        "gc", "a", "status",
+    ] {
+        assert_eq!(
+            lines.get(name).map(String::as_str),
+            Some("0"),
+            "{name}: {lines:?}"
+        );
+    }
+    assert_eq!(lines["log"], "first,");
+    assert_eq!(lines["b"], "1");
+    assert_eq!(lines["rebase_dir"], "1");
+    assert_eq!(lines["dirty"], "0");
+    assert!(lines["prune.out"].contains("worktrees/stale"), "{lines:?}");
+    assert!(
+        !bench.main.join(".git/worktrees/stale").exists(),
+        "the expired entry was not pruned: the fixture is not eligible"
+    );
+    let Outcome::Quarantined(violations) = &bare.outcome else {
+        panic!("{:?}", bare.outcome);
+    };
+    assert!(
+        violations.iter().any(|violation| matches!(
+            violation,
+            Violation::WorktreeEntries(paths)
+                if paths.contains(&"worktrees/other/index".to_owned())
+        )),
+        "{violations:?}"
+    );
+
+    let bench = Bench::new();
+    let agent = bench.agent();
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    plant_entries(&bench);
+    let before = entry_files(&bench);
+    assert!(!before.is_empty());
+    let report = bench.run(agent, &script).unwrap();
+    let lines = named(&fs::read_to_string(&report.stdout_log).unwrap());
+    show("confined run", &lines);
+    for name in ["append", "head", "new", "rm", "mkdir"] {
+        assert_ne!(
+            lines.get(name).map(String::as_str),
+            Some("0"),
+            "{name}: {lines:?}"
+        );
+        assert!(lines.contains_key(name), "{name}: {lines:?}");
+    }
+    assert_eq!(entry_files(&bench), before, "an entry was changed");
+    assert!(!bench.main.join(".git/worktrees/evil").exists());
+    for name in ["add", "commit1", "commit2", "rebase", "a", "status"] {
+        assert_eq!(
+            lines.get(name).map(String::as_str),
+            Some("0"),
+            "{name}: {lines:?}"
+        );
+    }
+    assert_eq!(lines["log"], "first,");
+    assert_eq!(lines["b"], "1");
+    assert_eq!(lines["rebase_dir"], "1");
+    assert_eq!(lines["dirty"], "0");
+    // Statuses step 1(d) of the plan recorded under a read-only `worktrees`
+    // (build plan, "OWL-339 live checks"): both commands end 0 and say what
+    // they could not do. The command found the entry it could not remove.
+    assert_eq!(
+        lines.get("prune").map(String::as_str),
+        Some("0"),
+        "{lines:?}"
+    );
+    assert_eq!(lines.get("gc").map(String::as_str), Some("0"), "{lines:?}");
+    assert!(lines["prune.out"].contains("worktrees/stale"), "{lines:?}");
+    assert!(
+        !matches!(report.outcome, Outcome::Quarantined(_)),
+        "{:?}",
+        report.outcome
+    );
+}
+
+impl Bench {
+    /// Runs the project's gate alone with one command, in a fresh worktree
+    /// of its own, as a Build's gate runs: the same `project_gate` and
+    /// `gate_violations`.
+    #[cfg(unix)]
+    fn run_gate(&self, agent: AgentEnv, command: &str) -> owlshift_runner::executor::GateRun {
+        let runner = self.env.clone();
+        let executor = Executor {
+            git: Git::with_setup("git", move |command| runner.apply(command)),
+            agent,
+            forge_hosts: Vec::new(),
+            timeout: Duration::from_secs(60),
+            gate_timeout: Duration::from_secs(60),
+        };
+        let worktree = self.tmp.path().join("gate-worktree");
+        let run_dir = self.tmp.path().join("gate-run");
+        let commands = [command.to_owned()];
+        executor
+            .run_gate(&owlshift_runner::executor::GateSpec {
+                main: &self.main,
+                worktree: &worktree,
+                branch: "owlshift/gate",
+                base: "origin/main",
+                run_dir: &run_dir,
+                commands: &commands,
+            })
+            .unwrap()
+    }
+}
+
+/// The gate runs confined as the run was: its writes to another entry are
+/// refused, its `add`, `commit` and `reset` in its own worktree work, and
+/// isolation holds after it. A bare gate that makes the same writes passes
+/// its own commands, and the check after it marks the breach.
+#[cfg(unix)]
+#[test]
+fn a_confined_gate_cannot_write_another_worktrees_entry_but_its_own() {
+    use owlshift_runner::executor::Violation;
+
+    let bench = Bench::new();
+    plant_entries(&bench);
+    let bare = bench.run_gate(bench.agent().without_confinement(), GATE_COMMAND);
+    let lines = named(&bare.report.steps[0].output);
+    for name in [
+        "append", "head", "new", "rm", "mkdir", "add", "commit", "reset",
+    ] {
+        assert_eq!(
+            lines.get(name).map(String::as_str),
+            Some("0"),
+            "{name}: {lines:?}"
+        );
+    }
+    assert!(bare.report.passed(), "{:?}", bare.report);
+    assert!(
+        bare.violations.iter().any(|violation| matches!(
+            violation,
+            Violation::WorktreeEntries(paths)
+                if paths.contains(&"worktrees/other/index".to_owned())
+        )),
+        "{:?}",
+        bare.violations
+    );
+    assert!(!bare.passed());
+
+    let bench = Bench::new();
+    let agent = bench.agent();
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    plant_entries(&bench);
+    let before = entry_files(&bench);
+    let confined = bench.run_gate(agent, GATE_COMMAND);
+    let lines = named(&confined.report.steps[0].output);
+    for name in ["append", "head", "new", "rm", "mkdir"] {
+        assert!(lines.contains_key(name), "{name}: {lines:?}");
+        assert_ne!(lines[name], "0", "{name}: {lines:?}");
+    }
+    for name in ["add", "commit", "reset"] {
+        assert_eq!(
+            lines.get(name).map(String::as_str),
+            Some("0"),
+            "{name}: {lines:?}"
+        );
+    }
+    assert!(confined.report.passed(), "{:?}", confined.report);
+    assert_eq!(confined.violations, []);
+    assert_eq!(entry_files(&bench), before, "an entry was changed");
+    assert!(!bench.main.join(".git/worktrees/evil").exists());
+}
+
 /// Native Windows has no sandbox: the run is refused before anything is
 /// written, and the error says to use WSL2.
 #[cfg(windows)]

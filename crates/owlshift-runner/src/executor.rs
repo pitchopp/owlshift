@@ -91,6 +91,7 @@ pub use harness::{
     Harness, HarnessEnd, HarnessError, HarnessHome, HarnessLogin, HarnessRun, HarnessStatus,
     SandboxNeeds,
 };
+pub(crate) use isolation::own_entry;
 pub use isolation::{Violation, check_worktree_link};
 pub use watch::RunStop;
 
@@ -696,9 +697,13 @@ impl Executor {
             )
             .map_err(|e| ExecutorError::Worktree(e.to_string()))?;
         let git_dir = PathBuf::from(String::from_utf8_lossy(&printed).trim());
+        // The one entry of `worktrees` the run may write (OWL-339); the
+        // worktree is already linked, so a failure is the link's.
+        let worktree_git_dir = own_entry(&git_dir, worktree).map_err(ExecutorError::Worktree)?;
         Ok(RunPaths {
             workdir: worktree.to_owned(),
             git_dir: Some(git_dir),
+            worktree_git_dir: Some(worktree_git_dir),
             readable: Vec::new(),
             writable: Vec::new(),
             hidden: vec![run_dir.to_owned()],
