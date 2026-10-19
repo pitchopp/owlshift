@@ -10,6 +10,10 @@
 //! correction. A comment is the decider's by the rule of a brief's thread
 //! ([`crate::on_demand::thread`]): its author is the decider of the latest ask
 //! before it, or, before any ask, the ticket's decider now.
+//!
+//! Since OWL-351 a DECISION comment holds the decisions of one resolver run,
+//! D1..Dn: a reply reverses those it names, and every decision of the comment
+//! when it names none ([`concerns`]).
 
 use std::time::Duration;
 
@@ -23,7 +27,7 @@ use owlshift_contracts::{Role, Stage};
 use owlshift_core::reply::{self, Reply};
 use owlshift_core::state::Event;
 
-use crate::on_demand::FINDING_CATEGORY;
+use crate::on_demand::{APPROVAL_CATEGORY, FINDING_CATEGORY};
 
 /// A kept decision with the decider's replies no run followed yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,10 +66,42 @@ pub fn reversals<'a>(
                 .filter(|c| c.parent.as_deref() == Some(kept.comment.as_str()))
                 .filter(|c| through.is_none_or(|through| c.last_edit() > through))
                 .filter(|c| by_decider(c, questions, current))
+                .filter(|c| concerns(&c.body, kept, &questions.decisions))
                 .collect();
             (!replies.is_empty()).then_some(Reversed { decision, replies })
         })
         .collect()
+}
+
+/// Whether a reply of body `body`, threaded under the DECISION comment of
+/// `kept`, one of `decisions`, concerns it (OWL-351): the reply names its
+/// number among those of the comment's decisions, or names none of them
+/// ([`reply::named_decisions`]). A decision kept before OWL-351 is D1, alone
+/// in its comment, so any reply concerns it.
+pub fn concerns(body: &str, kept: &KeptDecision, decisions: &[KeptDecision]) -> bool {
+    let named = reply::named_decisions(body, in_comment(kept, decisions));
+    named.is_empty() || named.contains(&(kept.place().get() as usize))
+}
+
+/// How many decisions the DECISION comment of `kept`, one of `decisions`,
+/// holds: the highest number among them, 1 for a comment of one decision.
+pub(crate) fn in_comment(kept: &KeptDecision, decisions: &[KeptDecision]) -> usize {
+    decisions
+        .iter()
+        .filter(|other| other.comment == kept.comment)
+        .map(|other| other.place().get() as usize)
+        .max()
+        .unwrap_or(1)
+}
+
+/// Whether `kept` is the decision kept as the plan's approval: the one on
+/// the approval question whose DECISION comment approved it, the run's
+/// other decisions sharing that comment since OWL-351 not counting.
+fn is_kept_approval(kept: &KeptDecision, plan: Option<&TicketPlan>) -> bool {
+    kept.question.category == APPROVAL_CATEGORY
+        && plan
+            .and_then(|plan| plan.approval.as_ref())
+            .is_some_and(|approval| approval.comment == kept.comment)
 }
 
 /// Whether `comment` is the decider's: its author's account is the one of
@@ -144,10 +180,7 @@ pub fn followed(questions: &mut TicketQuestions, reversals: &[Reversed<'_>]) -> 
 /// for one a Verify asked. `None` for any other decision, and for one kept
 /// before it carried its asking role: the next run follows the reply.
 pub fn reopens(kept: &KeptDecision, plan: Option<&TicketPlan>) -> Option<Stage> {
-    if plan
-        .and_then(|plan| plan.approval.as_ref())
-        .is_some_and(|approval| approval.comment == kept.comment)
-    {
+    if is_kept_approval(kept, plan) {
         return Some(Stage::Design);
     }
     if kept.question.category != FINDING_CATEGORY {
@@ -208,14 +241,11 @@ pub fn reopening(
         .filter(|&&(_, wants)| wants == to)
         .map(|&(decision, _)| decision)
         .collect();
-    let approval = plan
-        .and_then(|plan| plan.approval.as_ref())
-        .map(|approval| approval.comment.as_str());
     let drops_approval = served.iter().any(|&decision| {
         questions
             .decisions
             .get(decision)
-            .is_some_and(|kept| Some(kept.comment.as_str()) == approval)
+            .is_some_and(|kept| is_kept_approval(kept, plan))
     });
     let event = match (stage == to, to) {
         (true, _) => None,
@@ -248,7 +278,18 @@ pub fn correction(
             .iter()
             .filter_map(|reversed| {
                 let kept = questions.decisions.get(reversed.decision)?;
-                let joined: Vec<&str> = reversed.replies.iter().map(|c| c.body.trim()).collect();
+                let mut joined: Vec<String> = Vec::new();
+                // A comment of several decisions (OWL-351): the run is told
+                // which one this is, as the replies name them.
+                let count = in_comment(kept, &questions.decisions);
+                if count > 1 {
+                    joined.push(format!(
+                        "[Owlshift: this decision is D{} of a DECISION comment holding D1 to \
+                         D{count}; the replies below are those that name it or name none.]",
+                        kept.place()
+                    ));
+                }
+                joined.extend(reversed.replies.iter().map(|c| c.body.trim().to_owned()));
                 Some(ReversedDecision {
                     question: kept.question.clone(),
                     decision: kept.decision.clone(),
@@ -322,6 +363,7 @@ mod tests {
             basis: "the ticket".into(),
             basis_kind: None,
             asked_by: None,
+            number: None,
             reversed: None,
         }
     }
@@ -537,6 +579,111 @@ mod tests {
         assert_eq!(run(Stage::Intake, &[0, 1, 2]), None);
         assert_eq!(run(Stage::Watch, &[0, 1, 2]), None);
         assert_eq!(run(Stage::Build, &[]), None);
+    }
+
+    /// Decision `number` of the DECISION comment `comment` (OWL-351).
+    fn numbered(comment: &str, number: u32, id: &str) -> KeptDecision {
+        let mut decision = kept(1, comment);
+        decision.number = NonZeroU32::new(number);
+        decision.question.id = QuestionId::new(id).unwrap();
+        decision
+    }
+
+    fn says(id: &str, minute: i64, parent: &str, body: &str) -> Comment {
+        Comment {
+            body: body.to_owned(),
+            ..reply(id, "ada", minute, Some(parent))
+        }
+    }
+
+    /// OWL-351: a reply under a DECISION comment of several decisions
+    /// reverses those it names, `Dn` or `Qn`, and every one when it names
+    /// none of the comment's numbers; a decision kept alone before OWL-351
+    /// takes any reply. The correction run is told which decision each is.
+    #[test]
+    fn a_reply_reverses_the_decisions_of_its_comment_it_names() {
+        let questions = TicketQuestions {
+            decisions: vec![
+                kept(0, "old"),
+                numbered("c", 1, "Q2"),
+                numbered("c", 2, "Q4"),
+                numbered("c", 3, "Q5"),
+            ],
+            ..TicketQuestions::default()
+        };
+        let ada = person("ada");
+        let found = |comments: &[Comment]| {
+            let found = reversals(comments, &questions, Current::Known(&ada));
+            ids(&found)
+                .into_iter()
+                .map(|(decision, replies)| {
+                    (
+                        decision,
+                        replies.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let named = [says("r", 3, "c", "D2: HELLO.md instead")];
+        assert_eq!(found(&named), [(2, vec!["r".to_owned()])]);
+        let alias = [says("r", 3, "c", "q3 – colder")];
+        assert_eq!(found(&alias), [(3, vec!["r".to_owned()])]);
+        let both = [says("r", 3, "c", "Not D1, nor **D3**.")];
+        assert_eq!(
+            found(&both),
+            [(1, vec!["r".to_owned()]), (3, vec!["r".to_owned()])]
+        );
+        for body in ["No, none of this.", "D7 and D0 are wrong"] {
+            let all = [says("r", 3, "c", body)];
+            assert_eq!(
+                found(&all).iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+                [1, 2, 3],
+                "{body}"
+            );
+        }
+        let old = [says("r", 3, "old", "D2: no")];
+        assert_eq!(found(&old), [(0, vec!["r".to_owned()])]);
+
+        let replies = [
+            says("r1", 3, "c", "D2: HELLO.md"),
+            says("r2", 4, "c", "D3: colder"),
+        ];
+        let reversed = reversals(&replies, &questions, Current::Known(&ada));
+        let correction = correction(&reversed, &questions, 7, "https://x/7", "h");
+        assert_eq!(correction.reversed.len(), 2);
+        assert_eq!(
+            correction.reversed[0].reply,
+            "[Owlshift: this decision is D2 of a DECISION comment holding D1 to D3; the \
+             replies below are those that name it or name none.]\n\nD2: HELLO.md"
+        );
+        assert!(correction.reversed[1].reply.ends_with("D3 of a DECISION comment holding D1 to D3; the replies below are those that name it or name none.]\n\nD3: colder"));
+    }
+
+    /// OWL-351: the approval's DECISION comment holds the run's other
+    /// decisions too; only the one on the approval question reopens Design
+    /// and drops the approval.
+    #[test]
+    fn only_the_approval_question_of_its_comment_is_the_approval() {
+        let plan = approved_plan();
+        let approval = plan.approval.as_ref().unwrap().comment.clone();
+        let mut approving = numbered(&approval, 1, "Q1");
+        approving.question.category = APPROVAL_CATEGORY.into();
+        let mut sibling = numbered(&approval, 2, "Q2");
+        sibling.asked_by = Some(Role::Design);
+        assert_eq!(reopens(&approving, Some(&plan)), Some(Stage::Design));
+        assert_eq!(reopens(&sibling, Some(&plan)), None);
+        let questions = TicketQuestions {
+            decisions: vec![approving, sibling],
+            ..TicketQuestions::default()
+        };
+        let replies = [says("r", 5, &approval, "D2: no")];
+        let ada = person("ada");
+        let reversed = reversals(&replies, &questions, Current::Known(&ada));
+        assert_eq!(ids(&reversed), [(1, vec!["r"])]);
+        assert_eq!(
+            reopening(Stage::Build, &reversed, &questions, Some(&plan)),
+            None
+        );
     }
 
     #[test]

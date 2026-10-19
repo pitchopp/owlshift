@@ -77,7 +77,7 @@ use owlshift_adapters::forge::{
     Repo, ReviewsRead, Verdict,
 };
 use owlshift_adapters::harness::claude::Usage;
-use owlshift_adapters::tracker::{Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
+use owlshift_adapters::tracker::{self, Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
     AnsweredQuestion, AskedBy, Author, Brief, Checkpoint, GateFailure, GivenPlan, PermissionLevel,
     Permissions, PullRequestReview, RebaseBrief, Relation, ThreadEntry, TicketBrief,
@@ -89,9 +89,9 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{FindingId, QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
-    AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest, KeptDecision,
-    KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketDelivery, TicketQuestions,
-    cut_reason, cut_to,
+    self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest,
+    KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketDelivery,
+    TicketQuestions, cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -126,10 +126,10 @@ use crate::routing::{Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
-    Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment,
-    Posted, QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Reported,
-    Restart, ResumeComment, Reviewed, VisibleStage, WriteError, Writer, park_reason,
-    rebase_keeps_delivery,
+    self, Corrected, Decided, DecisionComment, DecisionGroup, DeliveryReport, FixPass, Gate,
+    MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning, Rebased,
+    ReopenedChoice, ReplyComment, Reported, Restart, ResumeComment, Reviewed, VisibleStage,
+    WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 
@@ -158,7 +158,7 @@ use design::Built;
 use review_loop::{in_review_loop, loop_base, loop_reviews};
 use verify::Verified;
 
-pub(crate) use design::FINDING_CATEGORY;
+pub(crate) use design::{APPROVAL_CATEGORY, FINDING_CATEGORY};
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
@@ -2506,52 +2506,73 @@ impl OnDemand<'_> {
             &quotable,
             premise_false,
         );
-        for logged in sorted.logged {
-            let question = logged.question;
+        // One DECISION comment for the run's decisions (OWL-351), its
+        // reasoning in the ticket's decisions document, published first so
+        // the comment links to it.
+        if !sorted.logged.is_empty() {
+            let run_decided = Decided::of_run(&sorted.logged);
+            let (reasoning, document) = self.publish_decisions(p, &run_decided, &ran.run, sink);
             let comment = DecisionComment {
                 ticket: ticket.clone(),
-                question: question.clone(),
-                decision: logged.decision.to_owned(),
-                basis: logged.basis.to_owned(),
-                kind: logged.kind,
+                decisions: run_decided,
                 level,
+                reasoning,
                 run: Some(ran.run.clone()),
             };
-            // Never an unlogged decision: one whose comment is not on the
-            // ticket goes to the decider.
-            let Ok(posted) = Writer::new(self.tracker).post_decision(&comment) else {
-                unposted.push(question.id.clone());
-                continue;
-            };
-            let mut written = comment_written("DECISION", &posted);
-            written.insert("question".to_owned(), json!(question.id.as_str()));
-            sink.emit(&ticket, Some(&ran.run), EventKind::TrackerWrite, written);
-            let mut kept = p.questions();
-            // As a round does, a kept decision keeps what the asking run
-            // asked: Build's kept refusal is cleared with it (OWL-192).
-            kept.build_refusal = None;
-            kept.decisions.push(KeptDecision {
-                at: posted.created_at,
-                comment: posted.id.clone(),
-                question: question.clone(),
-                decision: comment.decision,
-                basis: comment.basis,
-                basis_kind: Some(logged.kind),
-                asked_by: Some(asked.role),
-                reversed: None,
-            });
-            self.store(p, state, kept).map_err(|e| {
-                Stop::Refused(format!(
-                    "the decision on {} is on the ticket (comment {}), but keeping it in the \
-                     ticket's ref failed: {e}",
-                    question.id, posted.id
-                ))
-            })?;
-            decided.push(DecidedOn {
-                question: question.id.clone(),
-                comment: posted.id.clone(),
-                option: logged.option.map(str::to_owned),
-            });
+            let ids: Vec<QuestionId> = sorted
+                .logged
+                .iter()
+                .map(|l| l.question.id.clone())
+                .collect();
+            // Never an unlogged decision: those whose comment is not on the
+            // ticket go to the decider.
+            match Writer::new(self.tracker).post_decision(&comment) {
+                Err(_) => unposted.extend(ids),
+                Ok(posted) => {
+                    let mut written = comment_written("DECISION", &posted);
+                    written.insert("questions".to_owned(), question_ids(&ids));
+                    sink.emit(&ticket, Some(&ran.run), EventKind::TrackerWrite, written);
+                    let mut kept = p.questions();
+                    // As a round does, a kept decision keeps what the asking
+                    // run asked: Build's kept refusal is cleared with it
+                    // (OWL-192).
+                    kept.build_refusal = None;
+                    if document.is_some() {
+                        kept.decisions_document = document;
+                    }
+                    for (n, (logged, shown)) in
+                        sorted.logged.iter().zip(comment.decisions).enumerate()
+                    {
+                        kept.decisions.push(KeptDecision {
+                            at: posted.created_at,
+                            comment: posted.id.clone(),
+                            question: shown.question,
+                            decision: shown.decision,
+                            basis: shown.basis,
+                            basis_kind: shown.kind,
+                            asked_by: Some(asked.role),
+                            number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
+                            reversed: None,
+                        });
+                        decided.push(DecidedOn {
+                            question: logged.question.id.clone(),
+                            comment: posted.id.clone(),
+                            option: logged.option.map(str::to_owned),
+                        });
+                    }
+                    self.store(p, state, kept).map_err(|e| {
+                        Stop::Refused(format!(
+                            "the decisions on {} are on the ticket (comment {}), but keeping them \
+                             in the ticket's ref failed: {e}",
+                            ids.iter()
+                                .map(QuestionId::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            posted.id
+                        ))
+                    })?;
+                }
+            }
         }
         let decided_ids: Vec<QuestionId> = decided.iter().map(|d| d.question.clone()).collect();
         let mut event = resolved_event("done", Some(&ran.run), &decided_ids);
@@ -3105,6 +3126,87 @@ impl OnDemand<'_> {
         questions.build_refusal = Some(next);
         self.store(p, state, questions)
             .map_err(|e| refused("keeping Build's refused result in the ticket's ref", e))
+    }
+
+    /// Publishes the ticket's decisions document (OWL-351): the decisions
+    /// the ticket ref keeps, one group per DECISION comment, then
+    /// `run_decided`, the decisions of resolver run `run` about to be
+    /// posted. Gives where their DECISION comment says the reasoning is, and
+    /// the document to keep with them. On a tracker without documents, or
+    /// when publishing fails (a warning), the comment folds the reasoning.
+    fn publish_decisions(
+        &self,
+        p: &Prepared,
+        run_decided: &[Decided],
+        run: &str,
+        sink: &mut EventSink<'_>,
+    ) -> (Reasoning, Option<refs::DecisionsDocument>) {
+        if !self
+            .tracker
+            .capabilities()
+            .contains(&tracker::Capability::Documents)
+        {
+            return (Reasoning::Folded, None);
+        }
+        let kept = p.questions();
+        let mut groups: Vec<DecisionGroup> = Vec::new();
+        for (i, decision) in kept.decisions.iter().enumerate() {
+            let same = i > 0 && kept.decisions[i - 1].comment == decision.comment;
+            match groups.last_mut() {
+                Some(group) if same => group.decisions.push(Decided::kept(decision)),
+                _ => groups.push(DecisionGroup {
+                    at: decision.at,
+                    decisions: vec![Decided::kept(decision)],
+                }),
+            }
+        }
+        groups.push(DecisionGroup {
+            at: (self.clock)(),
+            decisions: run_decided.to_vec(),
+        });
+        let document = writer::DecisionsDocument {
+            ticket: p.ticket.clone(),
+            level: p.policy.level(),
+            groups,
+        };
+        let existing = kept.decisions_document.as_ref().map(|d| d.id.as_str());
+        match Writer::new(self.tracker).publish_decisions(existing, &document) {
+            Ok(published) => {
+                sink.emit(
+                    &p.ticket,
+                    Some(run),
+                    EventKind::TrackerWrite,
+                    data([
+                        ("target", json!("tracker")),
+                        ("action", json!("document")),
+                        ("kind", json!("DECISION")),
+                        ("document", json!(published.id)),
+                        ("made", json!(existing != Some(published.id.as_str()))),
+                    ]),
+                );
+                (
+                    Reasoning::Document {
+                        url: published.url.clone(),
+                    },
+                    Some(refs::DecisionsDocument {
+                        id: published.id,
+                        url: published.url,
+                    }),
+                )
+            }
+            Err(e) => {
+                sink.emit(
+                    &p.ticket,
+                    Some(run),
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("decisions_document_unpublished")),
+                        ("error", json!(e.to_string())),
+                    ]),
+                );
+                (Reasoning::Folded, None)
+            }
+        }
     }
 
     /// Keeps what a resolver run's outcome changes of the resolver's kept
@@ -5646,8 +5748,8 @@ fn push_what(kind: PushKind) -> &'static str {
 /// understood, as the RESUME comment told it; any other ask is whole, the
 /// latest one an answer check judges among them. A decision shows its
 /// question's id and text, but whole when it was reversed or a comment
-/// replies directly to its DECISION comment, a reply that may name an
-/// option.
+/// replies directly to its DECISION comment, naming it or none of the
+/// comment's decisions (OWL-351), a reply that may name an option.
 ///
 /// The test bench's stand-in driver builds its briefs' threads with it too
 /// (`owlshift_testkit::scenario`), from the asks and decisions it keeps.
@@ -5657,7 +5759,7 @@ pub fn thread(
     decisions: &[KeptDecision],
     current: &Person,
 ) -> Vec<ThreadEntry> {
-    let shown = Shown::new(comments, asks);
+    let shown = Shown::new(comments, asks, decisions);
     let posted: HashSet<&str> = asks
         .iter()
         .map(|ask| ask.comment.as_str())
@@ -5704,14 +5806,16 @@ pub fn thread(
 }
 
 /// What a brief's thread shows short (OWL-359): the questions of each
-/// answered round, and the DECISION comments a comment replies to.
+/// answered round, and the decisions a comment replies to, by their DECISION
+/// comment and question, a reply under a comment of several concerning those
+/// it names or, naming none, all of them (OWL-351).
 struct Shown<'a> {
     answered: HashMap<NonZeroU32, Vec<AnsweredQuestion>>,
-    replied: HashSet<&'a str>,
+    replied: HashSet<(&'a str, &'a str)>,
 }
 
 impl<'a> Shown<'a> {
-    fn new(comments: &'a [Comment], asks: &[Ask]) -> Self {
+    fn new(comments: &'a [Comment], asks: &[Ask], decisions: &'a [KeptDecision]) -> Self {
         // A round shows as `answered` in the place of its first ask: one kept
         // with no such ask stays as its asks.
         let rounds: BTreeSet<NonZeroU32> = asks
@@ -5743,7 +5847,14 @@ impl<'a> Shown<'a> {
             .collect();
         let replied = comments
             .iter()
-            .filter_map(|comment| comment.parent.as_deref())
+            .filter_map(|comment| Some((comment.parent.as_deref()?, comment.body.as_str())))
+            .flat_map(|(parent, body)| {
+                decisions
+                    .iter()
+                    .filter(move |kept| kept.comment == parent)
+                    .filter(move |kept| reversal::concerns(body, kept, decisions))
+                    .map(|kept| (kept.comment.as_str(), kept.question.id.as_str()))
+            })
             .collect();
         Self { answered, replied }
     }
@@ -5894,7 +6005,11 @@ impl Kept<'_> {
                 None => Some(ask.entry()),
             },
             Self::Decision(kept) => Some(
-                if kept.reversed.is_some() || shown.replied.contains(kept.comment.as_str()) {
+                if kept.reversed.is_some()
+                    || shown
+                        .replied
+                        .contains(&(kept.comment.as_str(), kept.question.id.as_str()))
+                {
                     kept.entry()
                 } else {
                     kept.short_entry()
@@ -6547,6 +6662,7 @@ mod tests {
             basis: "the ticket".into(),
             basis_kind: None,
             asked_by: None,
+            number: None,
             reversed: None,
         };
         let asked = "[owlshift] QUESTIONS · round 1\n\nThe questions.\n";
@@ -6701,6 +6817,7 @@ mod tests {
             basis: "The ticket.".into(),
             basis_kind: None,
             asked_by: None,
+            number: None,
             reversed: None,
         };
         let mut reply = comment("re1", 16, "B instead.");
@@ -7565,7 +7682,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 14,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 15,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

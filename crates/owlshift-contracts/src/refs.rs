@@ -305,6 +305,24 @@ pub struct TicketQuestions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = r"\S"))]
     pub resolver_refusal: Option<String>,
+    /// The ticket's decisions document (format 15, OWL-351), once one was
+    /// published: the reasoning of every kept decision, rewritten whole at
+    /// each resolver run that keeps decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions_document: Option<DecisionsDocument>,
+}
+
+/// The ticket's decisions document, as the ticket ref keeps it (OWL-351).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionsDocument {
+    /// The tracker's identifier of the document, which the next resolver
+    /// run updates.
+    #[schemars(regex(pattern = r"\S"))]
+    pub id: String,
+    /// Where a person opens it, as the tracker gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// A Build run's refused results, as the ticket ref keeps them for the next
@@ -593,6 +611,12 @@ pub struct KeptDecision {
     /// that asked it; absent from a decision kept before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked_by: Option<Role>,
+    /// Its number in its DECISION comment, `Dn` (format 15, OWL-351), which
+    /// holds the decisions of one resolver run: a reply naming it reverses
+    /// it alone. Absent from a decision kept before, alone in its comment,
+    /// which [`Self::place`] reads as 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<NonZeroU32>,
     /// The decider reversed it by replying to its DECISION comment
     /// (format 10, OWL-146): the replies a run was given and followed, up to
     /// [`Reversal::through`]. A newer reply is one no run has followed yet.
@@ -613,6 +637,12 @@ pub struct Reversal {
 }
 
 impl KeptDecision {
+    /// Its number in its DECISION comment: the kept `number`, or 1 for a
+    /// decision kept before OWL-351, alone in its comment.
+    pub fn place(&self) -> NonZeroU32 {
+        self.number.unwrap_or(NonZeroU32::MIN)
+    }
+
     /// The decision as a brief's thread shows it, its question whole: what a
     /// thread shows of a decision the decider replied to (OWL-359).
     pub fn entry(&self) -> ThreadEntry {
@@ -723,6 +753,7 @@ impl TicketQuestions {
             decisions: Vec::new(),
             build_refusal: None,
             resolver_refusal: None,
+            decisions_document: None,
         }
     }
 
@@ -740,7 +771,9 @@ impl TicketQuestions {
     /// question's options and recommendation were structured (OWL-324), and
     /// a format-12 one, written before a decision kept its basis kind
     /// (OWL-343), and a format-13 one, written before it kept its asking
-    /// role (OWL-345), are read as the current format with what they lack empty,
+    /// role (OWL-345), and a format-14 one, written before it kept its
+    /// number and the decisions document (OWL-351), are read as the
+    /// current format with what they lack empty,
     /// a format-6 or 7
     /// Build refusal upgraded (`LegacyBuildRefusal::upgrade`), a format-8
     /// one's lists kept as text, and every question's options and
@@ -755,7 +788,7 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 13 document read as the current format, or `None` for
+    /// A format-2 to 14 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
@@ -763,11 +796,12 @@ impl TicketQuestions {
     /// a decision's reversal, format 11 a question's `replan`, format 12
     /// reshaped a question's options and recommendation, which every older
     /// format keeps as strings, format 13 adds a decision's basis kind and
-    /// format 14 its asking role.
+    /// format 14 its asking role, format 15 its number and the decisions
+    /// document.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=13).contains(&format) {
+        if !(2..=14).contains(&format) {
             return None;
         }
         let kinded = format <= 12
@@ -776,11 +810,13 @@ impl TicketQuestions {
                     .iter()
                     .any(|decision| decision.get("basis_kind").is_some())
             });
-        let asker = document["decisions"].as_array().is_some_and(|decisions| {
-            decisions
-                .iter()
-                .any(|decision| decision.get("asked_by").is_some())
-        });
+        let in_a_decision = |field: &str| {
+            document["decisions"]
+                .as_array()
+                .is_some_and(|decisions| decisions.iter().any(|d| d.get(field).is_some()))
+        };
+        let asker = format <= 13 && in_a_decision("asked_by");
+        let numbered = in_a_decision("number");
         let asked = document["asks"]
             .as_array()
             .into_iter()
@@ -829,6 +865,10 @@ impl TicketQuestions {
             Some("decision's basis kind")
         } else if asker {
             Some("decision's asking role")
+        } else if numbered {
+            Some("decision's number")
+        } else if document.get("decisions_document").is_some() {
+            Some("decisions document")
         } else {
             None
         };

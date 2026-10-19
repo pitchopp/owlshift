@@ -954,6 +954,7 @@ mod tests {
             basis: format!("basis {n}"),
             basis_kind: kind,
             asked_by: None,
+            number: None,
             reversed: None,
         };
         let decisions = [

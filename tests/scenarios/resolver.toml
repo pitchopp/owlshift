@@ -73,7 +73,8 @@ brief_decisions = ["GREETING.md, at the root."]
 author = "owlshift"
 first_line = "[owlshift] DECISION"
 contains = [
-  "### Question · Should the README link to GREETING.md?",
+  "- **D1 · Should the README link to GREETING.md?** — Yes, in the README's list of files.",
+  "### D1 · Should the README link to GREETING.md?",
   "**Decision:** Yes, in the README's list of files.",
   "**Settled by:** README.md lists every file at the root.",
 ]
