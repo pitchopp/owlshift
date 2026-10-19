@@ -1,7 +1,7 @@
 +++
 role = "rebase"
-brief_format = 21
-result_format = 12
+brief_format = 22
+result_format = 13
 +++
 
 # Rebase
@@ -38,7 +38,7 @@ Once the rebase is done, run every command of `gate` in this worktree, in order,
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 12, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 13, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: the branch rebased onto `onto`, every conflict resolved and committed, the gate green.
 - `questions`: at least one question, each with an `id` (`Q1`, `Q2`, … in order), a `category`, a `text` that fits on one line, a `context` of at most two sentences and 300 characters giving what the decider needs, `options` when there are answers to choose from (each a short `label`, with a one-line `detail` only when it needs one; the runner letters them A, B, C… in order), and always a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; the rebase aborted first.
@@ -49,7 +49,7 @@ Always give `summary`, one or two sentences naming the paths you resolved and ho
 
 ```json
 {
-  "format": 12,
+  "format": 13,
   "status": "done",
   "summary": "Rebased onto 3f2a…: README.md kept both the new install section and the delivered usage section; the gate passes.",
   "questions": [],

@@ -152,7 +152,8 @@ pub struct RunResult {
     pub rulings: Vec<Ruling>,
     /// The author's answer to each finding of its brief, in finding order
     /// (format 9): only from a design or build run whose brief gives
-    /// findings to answer, and only with `done`.
+    /// findings to answer, or since format 13 to fix (OWL-377), and only
+    /// with `done`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finding_responses: Vec<FindingResponse>,
 }
@@ -947,8 +948,9 @@ impl RunResult {
     /// brief has `approval` and a plan otherwise; findings from the design
     /// review and verify roles only; rulings from the arbiter only, one for
     /// each finding of its brief when `done`; responses from a design or
-    /// build run whose brief gives findings to answer only, one for each
-    /// when `done`.
+    /// build run whose brief gives findings to answer or to fix only, one
+    /// for each when `done`, each with an outcome its brief's mode and the
+    /// finding allow ([`crate::review::ResponseOutcome::refused`], format 13, OWL-377).
     fn quality_pipeline_against(&self, brief: &Brief) -> Result<(), ContractError> {
         let role = brief.role;
         let refused = |field: &str, roles: &str| {
@@ -1031,27 +1033,48 @@ impl RunResult {
         } else if self.status == Status::Done {
             covers(self.rulings.iter().map(|r| &r.finding).collect(), "rulings")?;
         }
-        let answers = matches!(role, Role::Design | Role::Build)
-            && brief
-                .findings
-                .as_ref()
-                .is_some_and(|given| given.mode == FindingsMode::Answer);
-        if !answers {
+        let answered = brief.findings.as_ref().filter(|given| {
+            matches!(role, Role::Design | Role::Build)
+                && matches!(given.mode, FindingsMode::Answer | FindingsMode::Fix)
+        });
+        let Some(given) = answered else {
             if !self.finding_responses.is_empty() {
                 return Err(ContractError::invalid(
                     CONTRACT,
                     format!(
                         "finding_responses are given but the run's brief gives no finding to \
-                         answer (role {})",
+                         answer or fix (role {})",
                         role.as_str()
                     ),
                 ));
             }
-        } else if self.status == Status::Done {
+            return Ok(());
+        };
+        if self.status == Status::Done {
             covers(
                 self.finding_responses.iter().map(|r| &r.finding).collect(),
                 "finding_responses",
             )?;
+        }
+        for response in &self.finding_responses {
+            let refused = given
+                .findings
+                .iter()
+                .find(|finding| finding.id == response.finding)
+                .and_then(|finding| response.outcome.refused(given.mode, finding));
+            if let Some(refused) = refused {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "finding_responses answers {} {}: {refused}",
+                        response.finding,
+                        serde_json::to_value(response.outcome)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_default()
+                    ),
+                ));
+            }
         }
         Ok(())
     }

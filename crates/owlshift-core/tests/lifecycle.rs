@@ -108,11 +108,9 @@ fn a_standard_ticket_from_admission_to_merge() {
     };
     let major = Standing {
         severity: Severity::Major,
-        on_criterion: true,
     };
     let minor = Standing {
         severity: Severity::Minor,
-        on_criterion: false,
     };
     // A minor alone never sends the plan back (OWL-356): it is noted.
     assert_eq!(pass(&ticket, &[minor]).event(), Event::Completed);
@@ -120,15 +118,12 @@ fn a_standard_ticket_from_admission_to_merge() {
     step(&mut ticket, event);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
     step(&mut ticket, Event::Completed);
+    // The last pass's major goes to Design's last revision, never to the
+    // decider (OWL-377); the revision's pass reviews nothing.
     let event = pass(&ticket, &[major]).event();
+    assert_eq!(event, Event::LastFix);
     step(&mut ticket, event);
-    assert_eq!(
-        ticket.state.status(),
-        Status::NeedsInput {
-            return_to: Stage::Design
-        }
-    );
-    step(&mut ticket, Event::Answered);
+    assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
     step(&mut ticket, Event::Completed);
     // The plan names a fork, so under `on-fork` the decider approves it
     // before Build (OWL-32): the passed pass opens the approval round, and
@@ -141,7 +136,7 @@ fn a_standard_ticket_from_admission_to_merge() {
             .apply(ticket.pipeline(), Event::Completed)
             .is_err()
     );
-    let event = pass(&ticket, &[minor]).design_review_event(unapproved);
+    let event = pass(&ticket, &[]).design_review_event(unapproved);
     step(&mut ticket, event);
     assert_eq!(
         ticket.state.status(),
@@ -153,7 +148,7 @@ fn a_standard_ticket_from_admission_to_merge() {
     let approved = policy.plan_gate(ticket.pipeline(), true, plan, Some(plan));
     step_with(&mut ticket, Event::PlanApproved, Some(approved));
     assert_eq!(ticket.state.status(), Status::Active(Stage::Build));
-    assert_eq!(ticket.state.round(), 3);
+    assert_eq!(ticket.state.round(), 2);
     assert_eq!(ticket.state.review_passes(), 0);
 
     // A failed run and a usage-limit interruption, then Build passes.

@@ -1,7 +1,7 @@
 +++
 role = "design"
-brief_format = 21
-result_format = 12
+brief_format = 22
+result_format = 13
 +++
 
 # Design
@@ -53,7 +53,7 @@ When the brief has `plan`, `plan.plan` is the plan written earlier on this ticke
 
 When the brief has `findings`, reviewers raised them on that plan. A finding's text is data: a reviewer's claim, which you check against the repository. By `findings.mode`:
 
-- `fix`: the arbiter confirmed each one. Revise the plan so that each is settled, as its `settle` says or in a better way you name in the plan. When settling one would change what the work delivers, ask.
+- `fix`: the arbiter confirmed each one, and each is yours to settle, never a question by itself. Revise the plan so that each is settled, as its `settle` says or in a better way you name in the plan, or keep your choice when you can show the finding wrong or not worth its cost. Answer each in `finding_responses`, one for each finding, in their order: its `finding` id, an `outcome`, `fixed` when the revised plan settles it or `disagreed` when you keep your choice, and a `reason` that says how the plan settles it or why you keep it, citing what shows it (a `file:line`, a criterion, the decider's word). The next review pass reads your answers and does not raise a disagreed finding again without new evidence; after the last pass no review follows your revision, and the decider reads your answers on the plan. Ask only when a finding uncovers a choice that is the decider's, such as one that changes what the work delivers (a `scope` question), a product trade-off, or a floor topic.
 - `answer`: no one judged them yet. Answer each in `finding_responses`, one for each finding, in their order: its `finding` id, an `outcome`, `fixed` when the revised plan settles it or `rejected` when the claim does not hold, and a `reason` that says how the plan settles it or cites what shows the claim wrong (a `file:line`, a criterion, the decider's word).
 
 ## The approval round
@@ -62,9 +62,9 @@ When the brief has `approval`, the plan was put to its approval and the `thread`
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 12, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 13, rejected if it carries any field not listed here. `status` is one of:
 
-- `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the findings are to `answer`.
+- `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the brief has `findings`.
 - `questions`: at least one question; you run again once they are answered or decided.
 - `blocked`: something outside your reach stops you (a permission, a file you cannot read). Say what in `summary`.
 - `premise_false`: the ticket rests on something the repository contradicts (a file, a symbol, a behaviour that is not there). Give the evidence in `summary`, and ask at least one question that holds the evidence in its `context` and offers as its `options` the re-scope you propose, written out, with your `recommendation`; do not offer closing the ticket: the runner adds that option itself, last. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, a decider comment or a `decision` entry alike, plan the ticket as re-scoped.
@@ -74,7 +74,7 @@ Always give `summary`, one or two sentences. Leave out `pr`, `artifacts`, `follo
 
 ```json
 {
-  "format": 12,
+  "format": 13,
   "status": "done",
   "summary": "Planned the logs command on the event store's reader, in two steps.",
   "plan": {

@@ -4,7 +4,6 @@
 //! of `on_demand.rs`: the Markdown tracker, the fake harness playing every
 //! run, the verify seats' included, the fake GitHub.
 
-use owlshift_contracts::result::FollowupSource;
 use owlshift_contracts::review::{FindingOutcome, FindingsMode, Mandate, ResponseOutcome};
 use owlshift_core::vocab::Harness as HarnessKind;
 
@@ -25,7 +24,7 @@ pub(super) fn found(findings: &[(&str, &str)]) -> String {
             })
         })
         .collect();
-    json!({ "format": 12, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 13, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -42,11 +41,19 @@ fn ruled(outcomes: &[&str]) -> String {
             })
         })
         .collect();
-    json!({ "format": 12, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+    json!({ "format": 13, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+}
+
+/// A Build's `done` answering the findings to fix of its brief, one per
+/// (finding, outcome) (format 13, OWL-377).
+pub(super) fn fixed_build(given: &[(&str, &str)]) -> String {
+    let mut result: Value = serde_json::from_str(DONE).unwrap();
+    result["finding_responses"] = super::design_scenarios::answers(given);
+    result.to_string()
 }
 
 const FAILED_REVIEW: &str =
-    r#"{"format":12,"status":"failed","summary":"Could not read the diff."}"#;
+    r#"{"format":13,"status":"failed","summary":"Could not read the diff."}"#;
 
 impl Bench {
     /// A bench whose verify seats play from its reply queue.
@@ -228,7 +235,7 @@ fn the_arbiter_confirms_a_finding_the_verify_fix_run_fixes_and_rejects_another()
             ("major", "GREETING.md needs a licence header."),
         ])),
         bench.reviewing(&ruled(&["confirmed", "rejected"])),
-        bench.reply(Some("Hello, again"), Some(DONE)),
+        bench.reply(Some("Hello, again"), Some(&fixed_build(&[("F1", "fixed")]))),
         bench.reviewing(&found(&[])),
     ];
     let (outcome, printed) = bench.run(replies, None);
@@ -372,123 +379,113 @@ fn the_author_answers_every_verify_finding_and_its_rejection_is_kept() {
     );
 }
 
-/// The residue: after the last pass, a `blocker` goes to the resolver first
-/// (OWL-342), told the finding, its ruling and the diff, then, passed on, to
-/// the decider in a round, and a `major` off every criterion becomes a
-/// follow-up of the delivery. After the answer, a Verify fix run with it in
-/// its thread and one more pass, a last one, clean; the follow-up is filed
-/// with the reviewer as its source and listed in the report.
+/// OWL-377 at Verify: each finding goes to the Build that owns the code,
+/// none to the decider. Pass 1's two majors go to a fix run, which fixes
+/// one and disagrees with the other, with its reason; pass 2 reads the
+/// disagreement in its `earlier` and leaves a `blocker` and a `minor`,
+/// which go to one last Build: it fixes the blocker and defers the minor,
+/// and the delivery follows with no third pass. No question round, no
+/// resolver run, no follow-up filed by the runner; the DELIVERY report
+/// lists what the Builds kept against their reviewers, with their reasons,
+/// and what the last Build fixed.
 #[test]
-fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
+fn every_verify_finding_goes_to_its_build_and_the_report_lists_what_it_kept() {
     let bench = Bench::verifying();
     bench.inbox.borrow_mut().on = true;
     let replies = vec![
         bench.reply(Some("Hello"), Some(DONE)),
-        bench.reviewing(&found(&[("major", "The greeting has no full stop.")])),
-        bench.reviewing(&ruled(&["confirmed"])),
-        bench.reply(Some("Hello, again"), Some(DONE)),
         bench.reviewing(&found(&[
-            ("blocker", "The greeting still has no full stop."),
-            ("major", "GREETING.md could open with a heading."),
+            ("major", "The greeting has no full stop."),
+            ("major", "GREETING.md needs a licence header."),
         ])),
         bench.reviewing(&ruled(&["confirmed", "confirmed"])),
-        bench.reviewing(&passed_on(&["Q1"])),
+        bench.reply(
+            Some("Hello, again"),
+            Some(&fixed_build(&[("F1", "fixed"), ("F2", "disagreed")])),
+        ),
+        bench.reviewing(&found(&[
+            ("blocker", "The greeting still has no full stop."),
+            ("minor", "GREETING.md could open with a heading."),
+        ])),
+        bench.reviewing(&ruled(&["confirmed", "confirmed"])),
+        bench.reply(
+            Some("Hello, at last"),
+            Some(&fixed_build(&[("F1", "fixed"), ("F2", "deferred")])),
+        ),
     ];
     let (outcome, printed) = bench.run(replies, None);
-    let stop = outcome.expect_err("the blocker goes to the decider");
-    let Stop::NeedsInput {
-        questions, posted, ..
-    } = &stop
-    else {
-        panic!("{stop:?}\n{printed}");
-    };
-    assert_eq!(posted.as_ref().map(|round| round.get()), Ok(1));
-    assert_eq!(questions.len(), 1);
-    let question = &questions[0];
-    assert_eq!(question.category, "review_finding");
-    assert!(
-        question
-            .text
-            .starts_with("The greeting still has no full stop.")
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.run_roles(),
+        [
+            Role::Build,
+            Role::Verify,
+            Role::Arbiter,
+            Role::Build,
+            Role::Verify,
+            Role::Arbiter,
+            Role::Build
+        ],
+        "no third pass, no resolver"
     );
-    assert!(question.text.ends_with("How should the change settle it?"));
-    assert_eq!(question.options[1].label, "Leave the change as it is");
-    assert!(question.context.starts_with("Finding F1 · blocker · "));
-    let resolver = bench.last_of(Role::Resolver);
-    let asked = resolver.asked_by.as_ref().unwrap();
-    assert_eq!(asked.role, Role::Verify);
-    let diff = asked.diff.as_ref().expect("the branch's diff");
-    assert_eq!(diff.path.as_str(), ".owlshift/run/diff.patch");
-    assert_eq!(resolver.resolve[0].finding.as_ref().unwrap().as_str(), "F1");
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] QUESTIONS")),
+        "no round"
+    );
+    let second = bench.last_of(Role::Verify).review.expect("a review");
+    let earlier: Vec<(u32, &str, Option<FindingOutcome>)> = second
+        .earlier
+        .iter()
+        .map(|e| (e.pass.get(), e.kept.finding.id.as_str(), e.kept.outcome))
+        .collect();
+    assert_eq!(
+        earlier,
+        [
+            (1, "F1", Some(FindingOutcome::Fixed)),
+            (1, "F2", Some(FindingOutcome::Disagreed))
+        ]
+    );
+    let last = bench.last_of(Role::Build);
+    let given = last.findings.as_ref().expect("the last pass's findings");
+    let ids: Vec<&str> = given.findings.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!((given.mode, ids), (FindingsMode::Fix, vec!["F1", "F2"]));
     let residue = &bench.reviews("residue")[0];
     assert_eq!(
-        (&residue["asked"], &residue["proposed"]),
-        (&json!(["F1"]), &json!(["F2"]))
+        (&residue["pass"], &residue["asked"], &residue["last_fix"]),
+        (&json!(2), &json!([]), &json!(["F1", "F2"]))
     );
-    let record = bench.record();
-    assert_eq!(
-        (
-            record.state.stage,
-            record.state.waiting,
-            record.state.review_passes
-        ),
-        (Stage::Build, Some(Waiting::NeedsInput), 2)
-    );
-    let review = record.review.unwrap();
-    let second = &review.passes[1].findings;
-    assert_eq!(second[0].outcome, Some(FindingOutcome::Asked));
-    assert_eq!(second[1].outcome, Some(FindingOutcome::Proposed));
-    let followups = review.build.expect("the Build under review").followups;
-    assert_eq!(followups.len(), 1);
-    assert_eq!(followups[0].source, FollowupSource::Reviewer);
-    assert_eq!(followups[0].title, "GREETING.md could open with a heading.");
-
-    bench.answer("Q1: add the full stop. Go.");
-    let replies = vec![
-        bench.reviewing(&check(&[("Q1", "answered", "Add the full stop.")])),
-        bench.reply(Some("Hello, at last."), Some(DONE)),
-        bench.reviewing(&found(&[])),
-    ];
-    let (outcome, printed) = bench.continue_ticket(replies);
-    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let fix = bench.last_of(Role::Build);
-    assert!(fix.findings.is_none(), "the answers are in the thread");
-    // The round is answered: it reads as its readings (OWL-359).
-    assert!(latest_ask(&fix).is_empty());
-    assert_eq!(last_answered(&fix), ["Q1"]);
-    assert_eq!(
-        bench.last_of(Role::Verify).review.unwrap().pass.get(),
-        3,
-        "the pass the round buys"
-    );
-    let passes: Vec<u32> = bench
-        .record()
-        .review
-        .unwrap()
+    let review = bench.record().review.unwrap();
+    let outcomes: Vec<Vec<Option<FindingOutcome>>> = review
         .passes
         .iter()
-        .map(|pass| pass.pass.get())
+        .map(|pass| pass.findings.iter().map(|kept| kept.outcome).collect())
         .collect();
-    assert_eq!(passes, [1, 2, 3]);
-    let filed = bench.inbox.borrow().tickets.clone();
-    assert_eq!(filed.len(), 1, "{filed:?}");
-    assert_eq!(filed[0].1, "GREETING.md could open with a heading.");
-    assert!(filed[0].2.contains("reviewer"), "{}", filed[0].2);
+    assert_eq!(
+        outcomes,
+        [
+            vec![Some(FindingOutcome::Fixed), Some(FindingOutcome::Disagreed)],
+            vec![Some(FindingOutcome::Fixed), Some(FindingOutcome::Deferred)]
+        ]
+    );
+    assert!(bench.inbox.borrow().tickets.is_empty(), "nothing filed");
     let report = bench.comments().pop().unwrap();
     for text in [
-        "**Verify, 3 passes.**",
-        "**Findings proposed as follow-ups,** listed in what remains:\n- Pass 2, F2, major, \
-         critic and conformance on Claude Code\n",
-        &format!(
-            "Proposed follow-up **GREETING.md could open with a heading.**, filed as {} for \
-             triage",
-            filed[0].0
-        ),
+        "**Verify, 2 passes.**",
+        "**Findings the Build kept its choice on or deferred,** with its reasons:\n- Pass 1, F2, \
+         major, critic and conformance on Claude Code: GREETING.md needs a licence header. \
+         Disagreed: F2 disagreed: the plan's step 1 shows it.\n- Pass 2, F2, minor, critic and \
+         conformance on Claude Code: GREETING.md could open with a heading. Deferred: F2 \
+         deferred: the plan's step 1 shows it.",
+        "**Findings given to the last Build,** which the runner's gate checked, with no Verify \
+         pass after it:\n- Pass 2, F1, blocker, critic and conformance on Claude Code: The \
+         greeting still has no full stop.",
     ] {
         assert!(report.contains(text), "{text}\n---\n{report}");
     }
 }
-
 /// OWL-160's run of 2026-10-18, replayed (OWL-356): Verify raises four
 /// `minor` findings and the arbiter confirms them; one more Build fixes
 /// them, the runner's gate passes, and the delivery follows with no second
@@ -508,7 +505,15 @@ fn verify_minors_get_one_last_build_and_no_second_pass() {
         bench.reply(Some("Hello"), Some(DONE)),
         bench.reviewing(&found(&minors)),
         bench.reviewing(&ruled(&["confirmed"; 4])),
-        bench.reply(Some("Hello, again"), Some(DONE)),
+        bench.reply(
+            Some("Hello, again"),
+            Some(&fixed_build(&[
+                ("F1", "fixed"),
+                ("F2", "fixed"),
+                ("F3", "fixed"),
+                ("F4", "fixed"),
+            ])),
+        ),
     ];
     let (outcome, printed) = bench.run(replies, None);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
@@ -596,7 +601,7 @@ fn a_last_fix_that_asks_is_reviewed_on_what_changed_since() {
         bench.reviewing(&ruled(&["confirmed"])),
         bench.reply(None, Some(NAMING)),
         bench.reviewing(DECIDED_Q1),
-        bench.reply(Some("Hello, again"), Some(DONE)),
+        bench.reply(Some("Hello, again"), Some(&fixed_build(&[("F1", "fixed")]))),
         bench.reviewing(&found(&[])),
     ];
     let (outcome, printed) = bench.run(replies, None);
@@ -637,11 +642,11 @@ fn a_last_fix_that_asks_is_reviewed_on_what_changed_since() {
     assert!(!report.contains("given to the last Build"), "{report}");
 }
 
-/// A last pass proposes a follow-up, then the push is refused. `continue`
-/// runs that pass again in place of its record; clean this time, it takes
-/// back its follow-up, so the delivery files none.
+/// A last pass passes, then the push is refused. `continue` runs that pass
+/// again in place of its record, and delivers; the runner files no
+/// follow-up from a finding (OWL-377).
 #[test]
-fn a_pass_run_again_after_a_failed_delivery_takes_back_its_proposals() {
+fn a_pass_run_again_after_a_failed_delivery_takes_its_records_place() {
     let bench = Bench::verifying();
     bench.inbox.borrow_mut().on = true;
     // Someone else's commit is already on the ticket's branch: the push is
@@ -659,12 +664,8 @@ fn a_pass_run_again_after_a_failed_delivery_takes_back_its_proposals() {
         bench.reply(Some("Hello"), Some(DONE)),
         bench.reviewing(&found(&[("major", "The greeting has no full stop.")])),
         bench.reviewing(&ruled(&["confirmed"])),
-        bench.reply(Some("Hello, again"), Some(DONE)),
-        bench.reviewing(&found(&[(
-            "major",
-            "GREETING.md could open with a heading.",
-        )])),
-        bench.reviewing(&ruled(&["confirmed"])),
+        bench.reply(Some("Hello, again"), Some(&fixed_build(&[("F1", "fixed")]))),
+        bench.reviewing(&found(&[])),
     ];
     let (outcome, printed) = bench.run(replies, None);
     assert!(
@@ -672,11 +673,8 @@ fn a_pass_run_again_after_a_failed_delivery_takes_back_its_proposals() {
         "{outcome:?}\n{printed}"
     );
     let review = bench.record().review.unwrap();
-    assert_eq!(
-        review.passes[1].findings[0].outcome,
-        Some(FindingOutcome::Proposed)
-    );
-    assert_eq!(review.build.unwrap().followups.len(), 1);
+    assert_eq!(review.passes.len(), 2);
+    assert!(review.build.unwrap().followups.is_empty());
 
     bench
         .env

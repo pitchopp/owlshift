@@ -270,7 +270,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(13);
+            v["format"] = json!(14);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -329,20 +329,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 13, "status""#),
+        RunResult::parse(r#"{"format": 14, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 12, "status""#),
+        RunResult::parse(r#"{"format": 13, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(13));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(14));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 13,
-            supported: 12,
+            found: 14,
+            supported: 13,
             ..
         })
     ));
@@ -1539,7 +1539,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(22)),
+        parse(|v| v["format"] = json!(23)),
         "upgrade Owlshift",
     );
     rejects(

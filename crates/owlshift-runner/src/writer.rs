@@ -65,7 +65,7 @@ use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedCommen
 use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::{FindingId, QuestionId, TicketId};
+use owlshift_contracts::ids::{QuestionId, TicketId};
 use owlshift_contracts::refs::{AnsweredReview, DeliveredPullRequest, KeptDecision, PushKind};
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
@@ -137,8 +137,10 @@ pub struct Reviewed {
 /// What the DELIVERY report says of the Verify passes a delivery went
 /// through (OWL-304, architecture section 5, "Confirming a finding"): how
 /// many there were, the reviewers of the last, the findings the arbiter or
-/// the author rejected, with their reasons, and those proposed as
-/// follow-ups, which the report lists with its other follow-ups.
+/// the author rejected, with their reasons, those a Build kept its choice
+/// on or deferred, with its reasons (OWL-377), and those proposed as
+/// follow-ups before OWL-377, which the report lists with its other
+/// follow-ups.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportedReview {
     pub passes: u32,
@@ -147,9 +149,12 @@ pub struct ReportedReview {
     pub rejected: Vec<(u32, KeptFinding)>,
     /// The findings proposed as follow-ups, each with its pass.
     pub proposed: Vec<(u32, KeptFinding)>,
-    /// The `minor` findings of the last pass given to the last Build,
-    /// which the runner's gate checked and no Verify pass reviewed after it
-    /// (OWL-356), each with its pass.
+    /// The findings a Build of the loop disagreed with or deferred, each
+    /// with its pass, the Build's reason in its response (OWL-377).
+    pub kept: Vec<(u32, KeptFinding)>,
+    /// The findings of the last pass the last Build fixed, which the
+    /// runner's gate checked and no Verify pass reviewed after it (OWL-356,
+    /// OWL-377), each with its pass.
     pub last_fixed: Vec<(u32, KeptFinding)>,
 }
 
@@ -1894,9 +1899,6 @@ pub enum PlanNext {
     /// The plan waits for its approval: a DECISION of the resolver, or the
     /// decider's answer to the QUESTIONS comment that follows (OWL-342).
     Approval,
-    /// Findings the passes left go to the resolver, then to the decider in
-    /// the QUESTIONS comment that follows for what it passes on (OWL-342).
-    Findings,
 }
 
 /// A reviewer of the pass a PLAN comment reports (OWL-303).
@@ -1913,8 +1915,8 @@ pub struct PlanReviewer {
 
 /// The PLAN comment (OWL-303, architecture section 5, "Kept and shown"):
 /// once a ticket's review passes end, its plan, the reviewers of the pass
-/// that ended, the findings left and those rejected with their reasons, and
-/// what follows.
+/// that ended, the findings left, those rejected and those the design kept
+/// its choice on, with their reasons, and what follows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanComment {
     pub ticket: TicketId,
@@ -1922,16 +1924,18 @@ pub struct PlanComment {
     /// The review pass that ended, from 1.
     pub pass: u32,
     pub reviewers: Vec<PlanReviewer>,
-    /// The findings of that pass, as the ticket's review record keeps them.
+    /// The findings of that pass, as the ticket's review record keeps them;
+    /// for the last revision's pass, those of the pass before, which the
+    /// revision answered.
     pub findings: Vec<KeptFinding>,
     /// The findings of the loop's earlier passes still listed, each with its
-    /// pass: the arbiter's or the author's rejections, listed with their
-    /// reasons, and the `minor` ones noted for the Build (OWL-356).
+    /// pass: the arbiter's or the author's rejections and those the design
+    /// kept its choice on (OWL-377), listed with their reasons, and the
+    /// `minor` ones noted for the Build (OWL-356).
     pub earlier: Vec<(u32, KeptFinding)>,
-    /// Findings of the pass that stand but a round could not ask, past
-    /// [`owlshift_contracts::result::MAX_QUESTIONS`]: the pass after the round
-    /// is told them, still open, and checks them again (OWL-356).
-    pub not_asked: Vec<FindingId>,
+    /// The pass that ended is Design's last revision, which no reviewer
+    /// reviews (OWL-377).
+    pub revision: bool,
     pub next: PlanNext,
     /// The design run that wrote the plan.
     pub run: Option<String>,
@@ -1956,19 +1960,24 @@ impl PlanComment {
     /// hold in [`MAX_COMMENT_CHARS`], the findings first.
     pub fn render(&self) -> String {
         let mut texts = plan_texts(&self.plan, false);
-        let (left, rejected) = self.sorted();
-        finding_texts(&mut texts, &left, &rejected);
+        let (left, rejected, kept) = self.sorted();
+        finding_texts(&mut texts, &left, &rejected, &kept);
         fitted(MAX_COMMENT_CHARS, texts, |texts| {
-            self.body(texts, &left, &rejected)
+            self.body(texts, &left, &rejected, &kept)
         })
     }
 
-    /// The findings left, each with what became of it, and those rejected,
-    /// each with its pass and its reason, the earlier passes' first, each
-    /// pass in id order; an earlier pass's note for the Build is left too
-    /// (OWL-356).
+    /// The findings left, each with what became of it, those rejected and
+    /// those the design kept its choice on (OWL-377), each with its pass and
+    /// its reason, the earlier passes' first, each pass in id order; an
+    /// earlier pass's note for the Build is left too (OWL-356).
     fn sorted(&self) -> Sorted<'_> {
-        let (mut last, mut rejected) = fates(self.pass, &self.findings, &self.not_asked);
+        let at = if self.revision {
+            self.pass.saturating_sub(1)
+        } else {
+            self.pass
+        };
+        let (mut last, mut rejected, mut kept) = fates(at, &self.findings, self.revision);
         let mut earlier: Vec<Rejected<'_>> = self
             .earlier
             .iter()
@@ -1976,6 +1985,13 @@ impl PlanComment {
             .map(|(pass, kept)| (*pass, kept, reason_of(kept)))
             .collect();
         earlier.append(&mut rejected);
+        let mut earlier_kept: Vec<Rejected<'_>> = self
+            .earlier
+            .iter()
+            .filter(|(_, kept)| kept_against(kept))
+            .map(|(pass, kept)| (*pass, kept, response_reason(kept)))
+            .collect();
+        earlier_kept.append(&mut kept);
         let mut left: Vec<Left<'_>> = self
             .earlier
             .iter()
@@ -1983,16 +1999,24 @@ impl PlanComment {
             .map(|(_, kept)| (kept, "noted for the Build at an earlier pass"))
             .collect();
         left.append(&mut last);
-        (left, earlier)
+        (left, earlier, earlier_kept)
     }
 
-    /// The findings left, as [`PlanPointer::open`] counts them.
+    /// The findings left and those the design kept its choice on, as
+    /// [`PlanPointer::open`] counts them.
     pub fn open_findings(&self) -> usize {
-        self.sorted().0.len()
+        let (left, _, kept) = self.sorted();
+        left.len() + kept.len()
     }
 
     /// The body of `texts`, in the order [`Self::render`] gives them.
-    fn body(&self, texts: &[String], left: &[Left<'_>], rejected: &[Rejected<'_>]) -> String {
+    fn body(
+        &self,
+        texts: &[String],
+        left: &[Left<'_>],
+        rejected: &[Rejected<'_>],
+        kept: &[Rejected<'_>],
+    ) -> String {
         let plan = &self.plan;
         let mut texts = texts.iter();
         let mut next = || texts.next().cloned().unwrap_or_default();
@@ -2010,7 +2034,9 @@ impl PlanComment {
         sections.push(format!(
             "**Design review, pass {}.** {}",
             self.pass,
-            if reviewers.is_empty() {
+            if self.revision {
+                last_revision_line(self.pass)
+            } else if reviewers.is_empty() {
                 "No reviewer.".to_owned()
             } else {
                 format!("Reviewers:\n{}", bullets(&reviewers))
@@ -2037,6 +2063,24 @@ impl PlanComment {
                 .collect();
             sections.push(format!("**Findings rejected.**\n{}", bullets(&lines)));
         }
+        if !kept.is_empty() {
+            let lines: Vec<String> = kept
+                .iter()
+                .map(|(pass, kept, _)| {
+                    format!(
+                        "Pass {pass}, {}: {} {}: {}",
+                        finding_label(kept),
+                        next(),
+                        answer_name(kept),
+                        next()
+                    )
+                })
+                .collect();
+            sections.push(format!(
+                "**Findings the design kept its choice on.**\n{}",
+                bullets(&lines)
+            ));
+        }
         sections.push(self.next.line().to_owned());
         sections.push(plan_footer(&self.ticket, &self.run));
         sections.join("\n\n")
@@ -2053,10 +2097,6 @@ impl PlanNext {
             PlanNext::Approval => {
                 "**Next.** The plan waits for its approval, by a DECISION comment or by the \
                  decider's answer below."
-            }
-            PlanNext::Findings => {
-                "**Next.** The findings left are settled by DECISION comments or by the \
-                 decider's answers below; the design runs again with them."
             }
         }
     }
@@ -2077,13 +2117,52 @@ fn plan_footer(ticket: &TicketId, run: &Option<String>) -> String {
 /// A finding left after its pass, with what became of it.
 type Left<'a> = (&'a KeptFinding, &'static str);
 
-/// A finding rejected, with its pass and the reason.
+/// A finding rejected, or kept against by its author (OWL-377), with its
+/// pass and the reason.
 type Rejected<'a> = (u32, &'a KeptFinding, &'a str);
 
-/// The findings left and those rejected.
-type Sorted<'a> = (Vec<Left<'a>>, Vec<Rejected<'a>>);
+/// The findings left, those rejected, and those the author kept its choice
+/// on or deferred.
+type Sorted<'a> = (Vec<Left<'a>>, Vec<Rejected<'a>>, Vec<Rejected<'a>>);
 
-/// The reason a finding was ruled or answered with.
+/// What the PLAN comment and the plan's document say of the last
+/// revision's pass, `pass` (OWL-377).
+fn last_revision_line(pass: u32) -> String {
+    format!(
+        "The design's last revision, after the findings of pass {}: past the review loop's \
+         bound, no reviewer reviews it.",
+        pass.saturating_sub(1)
+    )
+}
+
+/// Whether the author kept its choice against `kept` or deferred it
+/// (OWL-377).
+fn kept_against(kept: &KeptFinding) -> bool {
+    matches!(
+        kept.outcome,
+        Some(FindingOutcome::Disagreed | FindingOutcome::Deferred)
+    )
+}
+
+/// The author's own reason for a finding it answered: never the ruling's,
+/// which a disagreement answers (OWL-377).
+fn response_reason(kept: &KeptFinding) -> &str {
+    kept.response
+        .as_ref()
+        .map(|response| response.reason.as_str())
+        .unwrap_or_default()
+}
+
+/// How a report names what the author did with a finding it kept against.
+fn answer_name(kept: &KeptFinding) -> &'static str {
+    match kept.outcome {
+        Some(FindingOutcome::Deferred) => "Deferred",
+        _ => "Disagreed",
+    }
+}
+
+/// The reason a finding was rejected with: the arbiter's, or the author's
+/// in author mode.
 fn reason_of(kept: &KeptFinding) -> &str {
     kept.ruling
         .as_ref()
@@ -2095,26 +2174,30 @@ fn reason_of(kept: &KeptFinding) -> &str {
         .unwrap_or_default()
 }
 
-/// The findings of pass `pass` left, each with what became of it, and
-/// those rejected, in id order; `not_asked` are those of the pass a round
-/// could not ask.
-fn fates<'a>(pass: u32, findings: &'a [KeptFinding], not_asked: &[FindingId]) -> Sorted<'a> {
+/// The findings of pass `pass` left, each with what became of it, those
+/// rejected, and those its author kept its choice on or deferred, in id
+/// order; when the last revision answered them (`revised`, OWL-377), those
+/// it fixed are left too, no pass having reviewed the fix.
+fn fates<'a>(pass: u32, findings: &'a [KeptFinding], revised: bool) -> Sorted<'a> {
     let mut left = Vec::new();
     let mut rejected = Vec::new();
+    let mut kept_on = Vec::new();
     for kept in findings {
         match kept.outcome {
             Some(FindingOutcome::Rejected) => rejected.push((pass, kept, reason_of(kept))),
-            Some(FindingOutcome::Asked) => left.push((kept, "asked below")),
-            _ if not_asked.contains(&kept.finding.id) => left.push((
-                kept,
-                "not asked in this round, past the questions one round holds: the next pass \
-                 checks it again",
-            )),
+            Some(FindingOutcome::Disagreed | FindingOutcome::Deferred) => {
+                kept_on.push((pass, kept, response_reason(kept)))
+            }
+            // A record written before OWL-377.
+            Some(FindingOutcome::Asked) => left.push((kept, "asked")),
+            Some(FindingOutcome::Fixed) if revised => {
+                left.push((kept, "fixed by the last revision, which no pass reviewed"))
+            }
             Some(FindingOutcome::Fixed | FindingOutcome::Proposed) => {}
             None => left.push((kept, "noted for the Build")),
         }
     }
-    (left, rejected)
+    (left, rejected, kept_on)
 }
 
 /// The plan's texts, flattened, in the order [`plan_sections`] shows them.
@@ -2147,14 +2230,19 @@ fn plan_texts(plan: &Plan, lettered: bool) -> Vec<Fit> {
     texts
 }
 
-/// The texts of findings left and rejected, after the plan's, capped so
-/// that they give way before it.
-fn finding_texts(texts: &mut Vec<Fit>, left: &[Left<'_>], rejected: &[Rejected<'_>]) {
+/// The texts of findings left, rejected and kept against, after the
+/// plan's, capped so that they give way before it.
+fn finding_texts(
+    texts: &mut Vec<Fit>,
+    left: &[Left<'_>],
+    rejected: &[Rejected<'_>],
+    kept: &[Rejected<'_>],
+) {
     let capped = |text: &str| Fit::capped(flatten(text), FINDING_KEPT, PLAN_FINDING_CHARS);
     for (kept, _) in left {
         texts.push(capped(&kept.finding.claim));
     }
-    for (_, kept, reason) in rejected {
+    for (_, kept, reason) in rejected.iter().chain(kept) {
         texts.push(capped(&kept.finding.claim));
         texts.push(capped(reason));
     }
@@ -2253,6 +2341,9 @@ pub struct DocumentPass {
     pub reviewers: Vec<PlanReviewer>,
     /// Its findings, as the ticket's review record keeps them.
     pub findings: Vec<KeptFinding>,
+    /// The pass is Design's last revision, which no reviewer reviews
+    /// (OWL-377).
+    pub revision: bool,
 }
 
 /// The plan's document (OWL-350, architecture section 5, "Kept and shown"):
@@ -2266,8 +2357,6 @@ pub struct PlanDocument {
     pub version: u32,
     /// The passes of the loop, oldest first, the one that just ended last.
     pub passes: Vec<DocumentPass>,
-    /// Findings of the last pass a round could not ask.
-    pub not_asked: Vec<FindingId>,
 }
 
 impl PlanDocument {
@@ -2295,20 +2384,18 @@ impl PlanDocument {
     fn render_from(&self, skip: usize) -> String {
         let passes = &self.passes[skip.min(self.passes.len())..];
         let last = self.passes.last().map(|pass| pass.pass);
+        // A pass the last revision answered lists what it fixed (OWL-377).
         let sorted: Vec<Sorted<'_>> = passes
             .iter()
-            .map(|pass| {
-                let not_asked: &[FindingId] = if Some(pass.pass) == last {
-                    &self.not_asked
-                } else {
-                    &[]
-                };
-                fates(pass.pass, &pass.findings, not_asked)
+            .enumerate()
+            .map(|(n, pass)| {
+                let revised = passes.get(n + 1).is_some_and(|after| after.revision);
+                fates(pass.pass, &pass.findings, revised)
             })
             .collect();
         let mut texts = plan_texts(&self.plan, true);
-        for (left, rejected) in &sorted {
-            document_finding_texts(&mut texts, left, rejected);
+        for (left, rejected, kept) in &sorted {
+            document_finding_texts(&mut texts, left, rejected, kept);
         }
         let texts: Vec<Fit> = texts
             .into_iter()
@@ -2334,14 +2421,16 @@ impl PlanDocument {
                     self.passes[skip - 1].pass
                 ));
             }
-            for (pass, (left, rejected)) in passes.iter().zip(&sorted) {
+            for (pass, (left, rejected, kept)) in passes.iter().zip(&sorted) {
                 let reviewers: Vec<String> = pass
                     .reviewers
                     .iter()
                     .map(|reviewer| reviewer_line(reviewer, "the design run's"))
                     .collect();
                 let mut lines = vec![format!("### Design review, pass {}", pass.pass)];
-                lines.push(if reviewers.is_empty() {
+                lines.push(if pass.revision {
+                    last_revision_line(pass.pass)
+                } else if reviewers.is_empty() {
                     "No reviewer named.".to_owned()
                 } else {
                     format!("Reviewers:\n{}", bullets(&reviewers))
@@ -2381,7 +2470,25 @@ impl PlanDocument {
                         .collect();
                     lines.push(format!("**Findings rejected.**\n{}", bullets(&found)));
                 }
-                if left.is_empty() && rejected.is_empty() {
+                if !kept.is_empty() {
+                    let found: Vec<String> = kept
+                        .iter()
+                        .map(|(_, kept, _)| {
+                            format!(
+                                "{}: {} {}: {}",
+                                finding_label(kept),
+                                next(),
+                                answer_name(kept),
+                                next()
+                            )
+                        })
+                        .collect();
+                    lines.push(format!(
+                        "**Findings the design kept its choice on.**\n{}",
+                        bullets(&found)
+                    ));
+                }
+                if left.is_empty() && rejected.is_empty() && kept.is_empty() && !pass.revision {
                     lines.push("No finding left or rejected.".to_owned());
                 }
                 sections.push(lines.join("\n\n"));
@@ -2391,11 +2498,16 @@ impl PlanDocument {
     }
 }
 
-/// The texts of the findings left, whole, and of those rejected, as the
-/// plan's document shows them (OWL-352): each finding left with its claim,
-/// evidence, settlement, criterion and ruling, which a residue question
-/// links to; each rejected one capped as in a PLAN comment.
-fn document_finding_texts(texts: &mut Vec<Fit>, left: &[Left<'_>], rejected: &[Rejected<'_>]) {
+/// The texts of the findings left, whole, and of those rejected or kept
+/// against, as the plan's document shows them (OWL-352): each finding left
+/// with its claim, evidence, settlement, criterion and ruling; each
+/// rejected or kept against capped as in a PLAN comment.
+fn document_finding_texts(
+    texts: &mut Vec<Fit>,
+    left: &[Left<'_>],
+    rejected: &[Rejected<'_>],
+    kept: &[Rejected<'_>],
+) {
     let whole = |text: &str| Fit::new(flatten(text), DOCUMENT_KEPT);
     for (kept, _) in left {
         let finding = &kept.finding;
@@ -2409,7 +2521,7 @@ fn document_finding_texts(texts: &mut Vec<Fit>, left: &[Left<'_>], rejected: &[R
             texts.push(whole(&ruling.reason));
         }
     }
-    finding_texts(texts, &[], rejected);
+    finding_texts(texts, &[], rejected, kept);
 }
 
 fn ruling_name(outcome: RulingOutcome) -> &'static str {
@@ -2468,7 +2580,8 @@ pub struct PlanPointer {
     pub change: PlanChange,
     /// The plan's forks.
     pub forks: usize,
-    /// The findings the pass left: asked, noted, or not asked.
+    /// The findings the pass left: noted, fixed by the last revision, or
+    /// kept against by the design (OWL-377).
     pub open: usize,
     pub next: PlanNext,
     /// The design run that wrote the plan.
@@ -2641,6 +2754,25 @@ impl ReportedReview {
                 })
                 .collect();
             section.push_str(&format!("\n\n**Findings rejected.**\n{}", bullets(&lines)));
+        }
+        if !self.kept.is_empty() {
+            let lines: Vec<String> = self
+                .kept
+                .iter()
+                .map(|(pass, kept)| {
+                    format!(
+                        "Pass {pass}, {}: {} {}: {}",
+                        finding_label(kept),
+                        flatten(&kept.finding.claim),
+                        answer_name(kept),
+                        flatten(response_reason(kept))
+                    )
+                })
+                .collect();
+            section.push_str(&format!(
+                "\n\n**Findings the Build kept its choice on or deferred,** with its reasons:\n{}",
+                bullets(&lines)
+            ));
         }
         if !self.last_fixed.is_empty() {
             let lines: Vec<String> = self
@@ -4037,6 +4169,8 @@ mod tests {
     use owlshift_adapters::tracker::{Author, Capability, ErrorKind as TrackerErrorKind, Ticket};
     use owlshift_contracts::result::{FollowupSource, QuestionOption, Recommendation};
 
+    use owlshift_contracts::ids::FindingId;
+
     use super::*;
 
     const HEAD: &str = "3e368b2a0f1c9d8e7b6a5f4e3d2c1b0a99887766";
@@ -4607,6 +4741,13 @@ Merge state reported by the forge: `CLEAN`.
             model: model.to_owned(),
             same_model,
         };
+        // A disagreement of a fix Build (OWL-377): its own reason shows, never
+        // the arbiter's confirmation.
+        let mut disagreed = kept_finding(5, Severity::Major, Some(FindingOutcome::Disagreed), None);
+        disagreed.response = Some(owlshift_contracts::review::KeptResponse {
+            outcome: owlshift_contracts::review::ResponseOutcome::Disagreed,
+            reason: "The ticket asks for\nthis wording.".to_owned(),
+        });
         report.review = Some(ReportedReview {
             passes: 2,
             reviewers: vec![
@@ -4623,13 +4764,18 @@ Merge state reported by the forge: `CLEAN`.
                 2,
                 kept_finding(3, Severity::Minor, Some(FindingOutcome::Proposed), None),
             )],
+            kept: vec![(1, disagreed)],
             last_fixed: vec![(
                 2,
                 kept_finding(4, Severity::Minor, Some(FindingOutcome::Fixed), None),
             )],
         });
         let body = report.render();
+        assert!(!body.contains("Seen at GREETING.md:1."), "{body}");
         for text in [
+            "**Findings the Build kept its choice on or deferred,** with its reasons:\n- Pass 1, \
+             F5, major, critic and conformance on Claude Code: Claim 5. Disagreed: The ticket \
+             asks for this wording.",
             "**Verify, 2 passes.** Reviewers of the last pass:\n\
              - critic on Claude Code (its default model)\n\
              - conformance on Claude Code (`claude-x`, the Build's own model: no other is \
@@ -4682,9 +4828,8 @@ Merge state reported by the forge: `CLEAN`.
                 ),
                 kept_finding(2, Severity::Minor, None, None),
                 kept_finding(3, Severity::Major, Some(FindingOutcome::Asked), None),
-                kept_finding(4, Severity::Major, None, None),
+                disagreed(4),
             ],
-            not_asked: vec![FindingId::nth(4)],
             earlier: vec![(
                 1,
                 kept_finding(
@@ -4694,7 +4839,8 @@ Merge state reported by the forge: `CLEAN`.
                     Some("Earlier."),
                 ),
             )],
-            next: PlanNext::Findings,
+            revision: false,
+            next: PlanNext::Approval,
             run: Some("r1".to_owned()),
         };
         let body = comment.render();
@@ -4710,29 +4856,71 @@ Merge state reported by the forge: `CLEAN`.
             "**Design review, pass 2.** Reviewers:\n- critic on Claude Code (its default model)\n\
              - conformance on Claude Code (`opus`, the design run's own model",
             "- F2, minor, critic and conformance on Claude Code: Claim 2. (noted for the Build)",
-            "- F3, major, critic and conformance on Claude Code: Claim 3. (asked below)",
-            "Claim 4. (not asked in this round",
+            // A record written before OWL-377.
+            "- F3, major, critic and conformance on Claude Code: Claim 3. (asked)",
             "**Findings rejected.**\n- Pass 1, F1, minor, critic and conformance on Claude Code: \
              Claim 1. Rejected: Earlier.\n- Pass 2, F1, major, critic and conformance on Claude \
              Code: Claim 1. Rejected: Not so.",
-            "**Next.** The findings left are settled by DECISION comments or by the decider's",
+            // The design's own reason, never the arbiter's (OWL-377).
+            "**Findings the design kept its choice on.**\n- Pass 2, F4, major, critic and \
+             conformance on Claude Code: Claim 4. Disagreed: Kept: the ticket names it.",
+            "**Next.** The plan waits for its approval",
         ] {
             assert!(body.contains(line), "{line}\n---\n{body}");
         }
+        assert!(!body.contains("Claim 4. Disagreed: Seen at"), "{body}");
+        assert_eq!(comment.open_findings(), 3);
         let footers = body.lines().filter(|line| line.starts_with("<!--"));
         assert_eq!(footers.count(), 1, "{body}");
         assert!(!body.contains("**Risks.**"), "an empty list is left out");
         assert!(!body.contains("standing in"), "{body}");
         let quiet = PlanComment {
             findings: Vec::new(),
-            not_asked: Vec::new(),
             earlier: Vec::new(),
             next: PlanNext::Build,
-            ..comment
+            ..comment.clone()
         }
         .render();
         assert!(!quiet.contains("**Findings"), "{quiet}");
         assert!(quiet.contains("**Next.** The Build follows this plan."));
+        // The last revision's pass (OWL-377): no reviewer, and the findings
+        // of the pass before as the revision answered them.
+        let revision = PlanComment {
+            pass: 3,
+            reviewers: Vec::new(),
+            findings: vec![
+                kept_finding(1, Severity::Major, Some(FindingOutcome::Fixed), None),
+                disagreed(2),
+            ],
+            earlier: Vec::new(),
+            revision: true,
+            next: PlanNext::Build,
+            ..comment
+        };
+        let body = revision.render();
+        for line in [
+            "**Design review, pass 3.** The design's last revision, after the findings of pass \
+             2: past the review loop's bound, no reviewer reviews it.",
+            "- F1, major, critic and conformance on Claude Code: Claim 1. (fixed by the last \
+             revision, which no pass reviewed)",
+            "- Pass 2, F2, major, critic and conformance on Claude Code: Claim 2. Disagreed: \
+             Kept: the ticket names it.",
+        ] {
+            assert!(body.contains(line), "{line}\n---\n{body}");
+        }
+        assert_eq!(revision.open_findings(), 2);
+    }
+
+    /// A finding the arbiter confirmed and the design disagreed with
+    /// (OWL-377), its ruling's reason and its response's apart.
+    fn disagreed(n: u32) -> KeptFinding {
+        KeptFinding {
+            response: Some(owlshift_contracts::review::KeptResponse {
+                outcome: owlshift_contracts::review::ResponseOutcome::Disagreed,
+                reason: "Kept: the ticket names it.".to_owned(),
+            }),
+            ..kept_finding(n, Severity::Major, Some(FindingOutcome::Disagreed), None)
+        }
     }
 
     /// OWL-303: the largest plan and a pass's most findings still make one
@@ -4754,8 +4942,8 @@ Merge state reported by the forge: `CLEAN`.
             pass: 1,
             reviewers: Vec::new(),
             findings,
-            not_asked: Vec::new(),
             earlier: Vec::new(),
+            revision: false,
             next: PlanNext::Build,
             run: None,
         }
@@ -4789,7 +4977,7 @@ Merge state reported by the forge: `CLEAN`.
             },
             forks: usize::MAX,
             open: usize::MAX,
-            next: PlanNext::Findings,
+            next: PlanNext::Approval,
             run: Some("20261019T011425Z-4294967295".to_owned()),
         };
         let body = pointer.render();
@@ -4895,25 +5083,40 @@ Merge state reported by the forge: `CLEAN`.
                             Some("Not so."),
                         ),
                     ],
+                    revision: false,
                 },
                 DocumentPass {
                     pass: 2,
                     reviewers: vec![reviewer],
-                    findings: vec![kept_finding(1, Severity::Major, None, None)],
+                    findings: vec![
+                        kept_finding(1, Severity::Major, Some(FindingOutcome::Fixed), None),
+                        disagreed(3),
+                    ],
+                    revision: false,
+                },
+                // The last revision (OWL-377).
+                DocumentPass {
+                    pass: 3,
+                    reviewers: Vec::new(),
+                    findings: Vec::new(),
+                    revision: true,
                 },
             ],
-            not_asked: vec![FindingId::nth(1)],
         };
         assert_eq!(document.title(), "Plan · OWL-1");
         let body = document.render();
         for text in [
-            "Version 2, after design review pass 2.\n\n**Goal.** Greet all",
+            "Version 2, after design review pass 3.\n\n**Goal.** Greet all",
             "**Steps.**\n1. Add GREETING.md. - injected Test: The gate's grep.",
             "## Review log\n\n### Design review, pass 1\n\nReviewers:\n- critic on Claude Code \
              (its default model)\n\n**Findings rejected.**\n- F2, minor, critic and conformance \
              on Claude Code: Claim 2. Rejected: Not so.\n\n### Design review, pass 2",
-            "- F1, major, critic and conformance on Claude Code: Claim 1. (not asked in this \
-             round",
+            "- F1, major, critic and conformance on Claude Code: Claim 1. (fixed by the last \
+             revision, which no pass reviewed)",
+            "**Findings the design kept its choice on.**\n- F3, major, critic and conformance on \
+             Claude Code: Claim 3. Disagreed: Kept: the ticket names it.",
+            "### Design review, pass 3\n\nThe design's last revision, after the findings of pass \
+             2: past the review loop's bound, no reviewer reviews it.",
             // OWL-352: each fork's options lettered as an answer names them,
             // and each finding left whole, which a residue question links to.
             "**Forks.**\n- Fork 1: Markdown.\n  Why: The repository's docs are Markdown.\n  - \
@@ -4951,8 +5154,8 @@ Merge state reported by the forge: `CLEAN`.
                 pass: 1,
                 reviewers: Vec::new(),
                 findings: findings.clone(),
+                revision: false,
             }],
-            not_asked: Vec::new(),
         }
         .render();
         assert!(chars(&cut) <= MAX_DOCUMENT_CHARS, "{}", chars(&cut));
@@ -4974,9 +5177,9 @@ Merge state reported by the forge: `CLEAN`.
                     pass,
                     reviewers: Vec::new(),
                     findings: short.clone(),
+                    revision: false,
                 })
                 .collect(),
-            not_asked: Vec::new(),
         }
         .render();
         assert!(chars(&long) <= MAX_DOCUMENT_CHARS, "{}", chars(&long));
@@ -6991,6 +7194,13 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                         2,
                         kept_finding(n, Severity::Major, Some(FindingOutcome::Proposed), None),
                     )
+                })
+                .collect(),
+            kept: (1..=192)
+                .map(|n| {
+                    let mut kept = disagreed(n);
+                    kept.finding.claim = "c".repeat(8_000);
+                    (2, kept)
                 })
                 .collect(),
             last_fixed: Vec::new(),

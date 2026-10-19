@@ -1,7 +1,7 @@
 +++
 role = "verify"
-brief_format = 21
-result_format = 12
+brief_format = 22
+result_format = 13
 +++
 
 # Verify
@@ -32,7 +32,7 @@ You read the repository in this worktree, at the Build's last commit, and may ru
 - `conformance`: the change against the ticket's success criteria, the plan, the decider's answers, the `decision` entries and the `rules`. A criterion not delivered or not tested; a plan step skipped or done otherwise without a word; work the ticket did not ask for; a rule broken.
 - `debt`: what the change does to the code around it. An existing function, type or helper duplicated (name it); a pattern of the codebase bypassed; a second path beside one that exists; dead code left; a test that tests nothing or tests again what another test pins (name it).
 
-`review.pass` is the review pass. Above 1, the Build changed the work after an earlier pass, and `review.earlier` holds the findings of the earlier passes, each with its `pass` and, in `kept`, the finding, the arbiter's `ruling` or the author's `response`, and its `outcome`: `fixed`, `rejected`, `asked`, `proposed`, or none when it is still open. With `review.since`, review only what changed since pass `review.since.pass`: `review.since.diff.path` is a file holding the diff from `review.since.diff.base`, the commit that pass reviewed, to this worktree's head; read the whole diff for context, and raise findings only on the hunks of that change and on what it breaks elsewhere. Check too that each finding `fixed` since is settled. Do not raise again a finding `rejected` unless the change gives new evidence; a `blocker` or `major` with no `outcome` was left by a round that could not ask it: it is still open, check it again. Without `review.since`, review the whole diff as it is now.
+`review.pass` is the review pass. Above 1, the Build changed the work after an earlier pass, and `review.earlier` holds the findings of the earlier passes, each with its `pass` and, in `kept`, the finding, the arbiter's `ruling`, the author's `response`, or both when the author answered a finding the arbiter confirmed, and its `outcome`: `fixed`, `rejected`, `disagreed` (the author kept its choice, the `response`'s `reason` saying why), `deferred` (a `minor` the author left for a follow-up or a note, its `reason` saying which), `asked`, `proposed`, or none when it is still open. With `review.since`, review only what changed since pass `review.since.pass`: `review.since.diff.path` is a file holding the diff from `review.since.diff.base`, the commit that pass reviewed, to this worktree's head; read the whole diff for context, and raise findings only on the hunks of that change and on what it breaks elsewhere. Check too that each finding `fixed` since is settled. Do not raise again a finding `rejected`, `disagreed` or `deferred` unless the change gives new evidence that the author's reason does not answer; a `blocker` or `major` with no `outcome` is still open: check it again. Without `review.since`, review the whole diff as it is now.
 
 ## Findings
 
@@ -49,7 +49,7 @@ A doubt you could not check is a `minor` finding at most, and says so. At most 6
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 12, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 13, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: your `findings`, possibly none.
 - `blocked`: something outside your reach stops you (no diff given, a file you cannot read). Say what in `summary`.
@@ -59,7 +59,7 @@ You ask no question: a point the change leaves unclear is a finding, saying what
 
 ```json
 {
-  "format": 12,
+  "format": 13,
   "status": "done",
   "summary": "One finding: an empty store makes the command fail.",
   "findings": [

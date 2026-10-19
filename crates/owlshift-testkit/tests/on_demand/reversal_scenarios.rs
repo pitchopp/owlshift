@@ -3,26 +3,23 @@
 //! the DECISION comment of the resolver's plan approval or residue decision
 //! returns the ticket to the author stage, on the bench of `on_demand.rs`: the
 //! Markdown tracker, the fake harness playing every role, the fake GitHub.
+//! Since OWL-377 no residue decision is taken: the residue scenarios seed one
+//! in the ref, as a ref kept before holds it.
 
-use super::design_scenarios::{FORKED, PLAN, REVISED, at_level, designed, reviewed, ruled};
+use super::design_scenarios::{
+    FORKED, PLAN, REVISED, at_level, designed, reviewed, revised, ruled,
+};
 use super::review_scenarios::{ASKS_WHICH_CASE, FORGE, RENAMED, review};
-use super::verify_scenarios::found;
+use super::verify_scenarios::{fixed_build, found};
 use super::*;
 
 /// The resolver's approval of the forked plan, as it decides it under
 /// `on-fork`.
-const APPROVES: &str = r#"{"format":12,"status":"done","summary":"The fork's choice is the repository's.",
+const APPROVES: &str = r#"{"format":13,"status":"done","summary":"The fork's choice is the repository's.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"approval",
 "decision":"Approve the plan as it is.",
 "basis":"The plan's fork keeps Markdown, as the repository's docs are; plain text buys nothing.",
 "basis_kind":"judgment","option":"A"}]}"#;
-
-/// The resolver's decision on a Design review residue finding.
-const APPLIED: &str = r#"{"format":12,"status":"done","summary":"The plan does not check the word.",
-"resolutions":[{"question":"Q1","outcome":"decided","category":"testing",
-"decision":"Settle it: change step 1 so its test greps for the word Hello.",
-"basis":"Plan step 1's test greps for the line, not the word, as the arbiter confirmed.",
-"basis_kind":"fact","option":"A"}]}"#;
 
 impl Bench {
     /// `on-fork` plan approval for a bench at the level `all`, on a
@@ -169,10 +166,27 @@ fn a_reversed_plan_approval_returns_the_ticket_to_design() {
     assert_eq!(bench.decisions("reversed").len(), 1, "returned once");
 }
 
+impl Bench {
+    /// Rewrites the ref's first decision as a residue decision asked by
+    /// `asked_by`, as a ref kept before OWL-377 holds one: since then no
+    /// residue decision is taken, and OWL-345's return still serves those
+    /// kept before.
+    fn as_residue(&self, asked_by: Role) -> String {
+        let mut record = self.record();
+        let kept = &mut record.questions.decisions[0];
+        kept.question.category = "review_finding".to_owned();
+        kept.asked_by = Some(asked_by);
+        let comment = kept.comment.clone();
+        self.write_record(&record);
+        comment
+    }
+}
+
 /// A Design review residue decided by the resolver and reversed by the
-/// decider (OWL-345): the pass cut short by a usage limit would run again,
-/// but the ticket returns to Design first, its review passes kept, and the
-/// review follows the Design run as after an answered round.
+/// decider (OWL-345), its decision kept before OWL-377: the pass cut short
+/// by a usage limit would run again, but the ticket returns to Design
+/// first, its review passes kept, and the review follows the Design run as
+/// after an answered round.
 #[test]
 fn a_reversed_design_review_residue_returns_the_ticket_to_design() {
     let bench = Bench::of("standard");
@@ -184,15 +198,9 @@ fn a_reversed_design_review_residue_returns_the_ticket_to_design() {
         )])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed"])),
-        bench.read(&designed(PLAN)),
-        bench.read(&reviewed(&[(
-            "major",
-            "Step 1's test still does not check the word.",
-        )])),
-        bench.read(&reviewed(&[])),
-        bench.read(&ruled(&["confirmed"])),
-        bench.read(APPLIED),
-        bench.read(&designed(REVISED)),
+        bench.read(NAMING),
+        bench.read(DECIDED_Q1),
+        bench.read(&revised(REVISED, &[("F1", "fixed")])),
         bench.limited(),
     ];
     let (stopped, printed) = bench.run(replies, None);
@@ -203,18 +211,19 @@ fn a_reversed_design_review_residue_returns_the_ticket_to_design() {
     let record = bench.record();
     assert_eq!(
         (record.state.stage, record.state.review_passes),
-        (Stage::DesignReview, 2)
+        (Stage::DesignReview, 1)
     );
     let passes = record.state.review_passes;
-    let kept = &record.questions.decisions[0];
-    assert_eq!(kept.asked_by, Some(Role::DesignReview));
-    let decision = kept.comment.clone();
+    let decision = bench.as_residue(Role::DesignReview);
     let before = bench.roles().len();
 
     bench.reply_as("maintainer", &decision, "No: leave the test as it is.");
     // The Design run the reply returns to, then a usage limit at the review:
     // the return itself counts no review pass.
-    let replies = vec![bench.read(&designed(REVISED)), bench.limited()];
+    let replies = vec![
+        bench.read(&revised(REVISED, &[("F1", "disagreed")])),
+        bench.limited(),
+    ];
     let (stopped, printed) = bench.continue_ticket(replies);
     assert!(
         matches!(&stopped, Err(Stop::UsageLimit { .. })),
@@ -255,7 +264,6 @@ fn a_reversed_design_review_residue_returns_the_ticket_to_design() {
     );
     assert_eq!(reopened[0]["approval_dropped"], json!(false));
 }
-
 /// A stranger's reply returns nothing (OWL-345): the next run is the Build the
 /// usage limit cut off, and the approval stays.
 #[test]
@@ -297,30 +305,19 @@ fn a_reply_inside_the_quiet_window_survives_a_completed_build() {
     assert!(bench.decisions("reversed").is_empty());
 }
 
-/// The resolver's decision on a Verify residue finding.
-const SETTLED: &str = r#"{"format":12,"status":"done","summary":"The greeting has no full stop.",
-"resolutions":[{"question":"Q1","outcome":"decided","category":"style",
-"decision":"Settle it: add the full stop.",
-"basis":"Both documents of the repository end their lines with one.",
-"basis_kind":"fact","option":"A"}]}"#;
-
 impl Bench {
-    /// Runs `owlshift do` through two Verify passes and the resolver's
-    /// decision on their residue finding, then through `after`, whose last
-    /// reply is a usage limit; returns the id of the decision's DECISION
-    /// comment.
+    /// Runs `owlshift do` through a Verify pass whose major goes to a fix
+    /// run that asks, the resolver's decision on its question, the fix run
+    /// again, then `after`, whose last reply is a usage limit; the decision
+    /// is then kept as a Verify residue decision kept before OWL-377
+    /// ([`Bench::as_residue`]). Returns the id of its DECISION comment.
     fn verify_residue_decided(&self, after: Vec<Reply>) -> String {
         let mut replies = vec![
             self.reply(Some("Hello"), Some(DONE)),
             self.reviewing(&found(&[("major", "The greeting has no full stop.")])),
             self.reviewing(&ruled(&["confirmed"])),
-            self.reply(Some("Hello, again"), Some(DONE)),
-            self.reviewing(&found(&[(
-                "blocker",
-                "The greeting still has no full stop.",
-            )])),
-            self.reviewing(&ruled(&["confirmed"])),
-            self.reviewing(SETTLED),
+            self.reply(None, Some(NAMING)),
+            self.reviewing(DECIDED_Q1),
         ];
         replies.extend(after);
         let (stopped, printed) = self.run(replies, None);
@@ -328,21 +325,19 @@ impl Bench {
             matches!(&stopped, Err(Stop::UsageLimit { .. })),
             "{stopped:?}\n{printed}"
         );
-        let kept = &self.record().questions.decisions[0];
-        assert_eq!(kept.asked_by, Some(Role::Verify));
-        kept.comment.clone()
+        self.as_residue(Role::Verify)
     }
 }
 
 /// A Verify residue decided by the resolver and reversed by the decider
-/// (OWL-345): the Verify pass cut short by a usage limit would run again,
-/// but the ticket returns to Build first, whose fix run follows the reply,
-/// and Verify reviews its commit.
+/// (OWL-345), its decision kept before OWL-377: the Verify pass cut short
+/// by a usage limit would run again, but the ticket returns to Build first,
+/// whose fix run follows the reply, and Verify reviews its commit.
 #[test]
 fn a_reversed_verify_residue_returns_the_ticket_to_build() {
     let bench = Bench::verifying();
     let decision = bench.verify_residue_decided(vec![
-        bench.reply(Some("Hello, at last"), Some(DONE)),
+        bench.reply(Some("Hello, again"), Some(&fixed_build(&[("F1", "fixed")]))),
         bench.limited(),
     ]);
     assert_eq!(bench.record().state.stage, Stage::Verify);
@@ -350,7 +345,10 @@ fn a_reversed_verify_residue_returns_the_ticket_to_build() {
 
     bench.reply_as("maintainer", &decision, "No: leave the greeting as it is.");
     let replies = vec![
-        bench.reply(Some("Hello, for good"), Some(DONE)),
+        bench.reply(
+            Some("Hello, for good"),
+            Some(&fixed_build(&[("F1", "disagreed")])),
+        ),
         bench.reviewing(&found(&[])),
     ];
     let (outcome, printed) = bench.continue_ticket(replies);
@@ -382,7 +380,10 @@ fn a_reversed_verify_residue_at_build_moves_nothing() {
 
     bench.reply_as("maintainer", &decision, "No: leave the greeting as it is.");
     let replies = vec![
-        bench.reply(Some("Hello, for good"), Some(DONE)),
+        bench.reply(
+            Some("Hello, for good"),
+            Some(&fixed_build(&[("F1", "disagreed")])),
+        ),
         bench.reviewing(&found(&[])),
     ];
     let (outcome, printed) = bench.continue_ticket(replies);
@@ -401,7 +402,6 @@ fn a_reversed_verify_residue_at_build_moves_nothing() {
     );
     assert_eq!(reopened[0]["approval_dropped"], json!(false));
 }
-
 /// A review loop is after delivery, with its pull request open, and the core
 /// has no way back from Design to Watch (OWL-345): a reply reversing the
 /// plan's approval then returns the ticket nowhere. Its Build runs as the

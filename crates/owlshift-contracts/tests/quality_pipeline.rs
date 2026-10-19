@@ -65,7 +65,7 @@ fn brief(role: &str) -> Value {
 }
 
 fn base_result(status: &str) -> Value {
-    json!({ "format": 12, "status": status, "summary": "s" })
+    json!({ "format": 13, "status": status, "summary": "s" })
 }
 
 fn question(replan: bool) -> Value {
@@ -97,6 +97,28 @@ fn each_quality_pipeline_field_comes_from_its_roles_only() {
     answer_brief["findings"] = json!({ "mode": "answer", "findings": [finding("F2")] });
     let mut fix_brief = brief("build");
     fix_brief["findings"] = json!({ "mode": "fix", "findings": [finding("F2")] });
+    // A minor on no criterion, which the Build may defer (OWL-377), and one
+    // on a criterion, which it may not (S13).
+    let minor = |id: &str, on_criterion: bool| {
+        let mut f = finding(id);
+        f["severity"] = "minor".into();
+        if !on_criterion {
+            f.as_object_mut().unwrap().remove("criterion");
+        }
+        f
+    };
+    let mut minors_brief = brief("build");
+    minors_brief["findings"] =
+        json!({ "mode": "fix", "findings": [minor("F1", false), minor("F2", true)] });
+    let responses = |answers: &[(&str, &str)]| {
+        let answers: Vec<Value> = answers
+            .iter()
+            .map(|(id, outcome)| json!({ "finding": id, "outcome": outcome, "reason": "r" }))
+            .collect();
+        let mut result = base_result("done");
+        result["finding_responses"] = answers.into();
+        result
+    };
     let premise_false = with(
         base_result("premise_false"),
         "questions",
@@ -235,21 +257,59 @@ fn each_quality_pipeline_field_comes_from_its_roles_only() {
         ("responses", answer_brief.clone(), answered.clone(), None),
         (
             "author mode done without responses",
-            answer_brief,
+            answer_brief.clone(),
+            base_result("done"),
+            Some("the finding_responses name none but the brief gives F2"),
+        ),
+        // Findings to fix are answered too (format 13, OWL-377): fixed or
+        // disagreed with, a minor on no criterion deferred.
+        (
+            "fix mode done without responses",
+            fix_brief.clone(),
             base_result("done"),
             Some("the finding_responses name none but the brief gives F2"),
         ),
         (
-            "responses to findings to fix",
-            fix_brief,
+            "a disagreement with a finding to fix",
+            fix_brief.clone(),
+            responses(&[("F2", "disagreed")]),
+            None,
+        ),
+        (
+            "a rejection of a confirmed finding",
+            fix_brief.clone(),
             answered.clone(),
-            Some("gives no finding to answer"),
+            Some("answers F2 rejected: the arbiter confirmed it"),
+        ),
+        (
+            "a blocker deferred",
+            fix_brief,
+            responses(&[("F2", "deferred")]),
+            Some("answers F2 deferred: only a minor finding that names no criterion"),
+        ),
+        (
+            "a minor deferred and one fixed",
+            minors_brief.clone(),
+            responses(&[("F1", "deferred"), ("F2", "fixed")]),
+            None,
+        ),
+        (
+            "a minor on a criterion deferred",
+            minors_brief,
+            responses(&[("F1", "fixed"), ("F2", "deferred")]),
+            Some("answers F2 deferred: only a minor finding that names no criterion"),
+        ),
+        (
+            "a disagreement in author mode",
+            answer_brief.clone(),
+            responses(&[("F2", "disagreed")]),
+            Some("answers F2 disagreed: no one judged it"),
         ),
         (
             "responses without findings",
             brief("build"),
             answered,
-            Some("gives no finding to answer"),
+            Some("gives no finding to answer or fix"),
         ),
     ];
     for (case, brief, result, refusal) in cases {
@@ -529,7 +589,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 22.into()),
+            with(brief("build"), "format", 23.into()),
             "upgrade Owlshift",
         ),
     ] {
@@ -831,7 +891,7 @@ fn a_later_pass_is_told_what_changed_and_the_last_fix_is_kept() {
     let mut build = brief("build");
     build["findings"] = notes.clone();
     let parsed = Brief::parse(&build.to_string()).unwrap();
-    let done = json!({ "format": 12, "status": "done", "summary": "s",
+    let done = json!({ "format": 13, "status": "done", "summary": "s",
         "finding_responses": [{ "finding": "F1", "outcome": "fixed", "reason": "r" }] });
     assert!(
         RunResult::parse_against(&done.to_string(), &parsed).is_err(),

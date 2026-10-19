@@ -245,8 +245,9 @@ pub enum FindingsMode {
     /// The author answers each, fixed or rejected with its reason
     /// (`pipeline.findings = "author"`): a design or build run.
     Answer,
-    /// The author fixes each, as confirmed by the arbiter: a design or
-    /// build run.
+    /// The author settles each, as confirmed by the arbiter, and answers
+    /// each (format 13, OWL-377): fixed, disagreed with, or, from the Build
+    /// and for a `minor` on no criterion, deferred; a design or build run.
     Fix,
     /// The Build weighs each, `minor` findings the plan's review noted for
     /// it (format 21, OWL-356), and answers none.
@@ -272,8 +273,9 @@ pub enum RulingOutcome {
     Rejected,
 }
 
-/// The author's answer to one finding it was given, in author mode
-/// (`pipeline.findings = "author"`).
+/// The author's answer to one finding it was given: in author mode
+/// (`pipeline.findings = "author"`), or, since OWL-377, to one the arbiter
+/// confirmed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FindingResponse {
@@ -283,12 +285,63 @@ pub struct FindingResponse {
     pub reason: String,
 }
 
-/// What the author did with a finding.
+/// What the author did with a finding (architecture section 5, "A finding
+/// goes to its author").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseOutcome {
+    /// The work settles it.
     Fixed,
+    /// In author mode: the claim does not hold.
     Rejected,
+    /// The arbiter confirmed it and the author keeps its choice, saying why
+    /// (format 13, OWL-377).
+    Disagreed,
+    /// A `minor` on no success criterion the Build leaves for a follow-up or
+    /// a note, its reason saying which (format 13, OWL-377).
+    Deferred,
+}
+
+impl ResponseOutcome {
+    /// The finding's outcome this answer gives it.
+    pub const fn outcome(self) -> FindingOutcome {
+        match self {
+            Self::Fixed => FindingOutcome::Fixed,
+            Self::Rejected => FindingOutcome::Rejected,
+            Self::Disagreed => FindingOutcome::Disagreed,
+            Self::Deferred => FindingOutcome::Deferred,
+        }
+    }
+
+    /// Why a run given `finding` in `mode` may not answer it so, if it may
+    /// not: in answer mode the answer is `fixed` or `rejected`; in fix mode
+    /// `fixed` or `disagreed`, or `deferred` for a `minor` that names no
+    /// criterion, which S13 forbids deferring otherwise.
+    pub fn refused(self, mode: FindingsMode, finding: &Finding) -> Option<&'static str> {
+        match (mode, self) {
+            (FindingsMode::Answer, Self::Fixed | Self::Rejected)
+            | (FindingsMode::Fix, Self::Fixed | Self::Disagreed) => None,
+            (FindingsMode::Fix, Self::Deferred)
+                if finding.severity == Severity::Minor && finding.criterion.is_none() =>
+            {
+                None
+            }
+            (FindingsMode::Fix, Self::Deferred) => Some(
+                "only a minor finding that names no criterion may be deferred: fix it or \
+                 disagree with it",
+            ),
+            (FindingsMode::Fix, Self::Rejected) => Some(
+                "the arbiter confirmed it: answer fixed, disagreed or, for a minor on no \
+                 criterion, deferred",
+            ),
+            (FindingsMode::Answer, _) => {
+                Some("no one judged it: answer fixed, or rejected when its claim does not hold")
+            }
+            (FindingsMode::Rule | FindingsMode::Note, _) => {
+                Some("the brief gives no finding to answer")
+            }
+        }
+    }
 }
 
 /// The rules of findings: at most `max`, each not blank and at most
@@ -631,6 +684,13 @@ pub struct ReviewPass {
     /// keeping only the current plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanPrint>,
+    /// At Design review, the design run whose last revision the pass keeps
+    /// (OWL-377): the revision that answered the findings of the pass
+    /// before, the loop's last, which no reviewer reviews. Such a pass has
+    /// no reviewer, no finding and no plan's print.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"\S"))]
+    pub revision: Option<String>,
 }
 
 /// A plan's print (OWL-356): the SHA-256 of each part's
@@ -784,10 +844,17 @@ pub enum FindingOutcome {
     Fixed,
     /// The arbiter or the author rejected it.
     Rejected,
-    /// It went to the decider in a question round.
+    /// It went to the decider in a question round; no pass asks one since
+    /// OWL-377, a record written before keeps it.
     Asked,
-    /// It became a proposed follow-up.
+    /// It became a proposed follow-up; the runner proposes none since
+    /// OWL-377, a record written before keeps it.
     Proposed,
+    /// The author kept its choice against it, saying why (OWL-377).
+    Disagreed,
+    /// The Build left it, a `minor` on no criterion, for a follow-up or a
+    /// note (OWL-377).
+    Deferred,
 }
 
 impl Default for TicketReview {
@@ -824,18 +891,23 @@ impl TicketReview {
 
     /// Checks each pass is at Design review or Verify, its findings keep a
     /// result's rules with ids increasing, each raised by a reviewer of the
-    /// pass's role with its mandates distinct and a model named, and none
-    /// both ruled on and responded to, nor given an outcome its ruling or
-    /// response contradicts (a rejected ruling or response gives
-    /// `rejected` only, a confirmed ruling anything but `rejected`, a fixed
-    /// response `fixed` only); each reviewer a pass names is of its role,
+    /// pass's role with its mandates distinct and a model named, each
+    /// response one its judgment allows (none to a rejected ruling; to a
+    /// confirmed one, an answer of fix mode since OWL-377; with no ruling,
+    /// author mode, `fixed` or `rejected`), and none given an outcome its
+    /// ruling or response contradicts (a rejected ruling gives `rejected`
+    /// only; a response its own outcome; a confirmed ruling with no
+    /// response `fixed`, `asked` or `proposed`); each reviewer a pass names is of its role,
     /// with its mandates distinct and a model named; each answered review is
     /// named once; each review under way once, not answered, with a body or
     /// a comment, each comment with a path and a body, within the bytes a
     /// brief gives it; the kept build's commit is a full commit id; a pass's
     /// `head` only at Verify, a full commit id, and its plan print only at
-    /// Design review, 9 part hashes and a hash per step in lowercase hex;
-    /// and `last_fix` names the record's last pass, at Verify (OWL-356).
+    /// Design review, 9 part hashes and a hash per step in lowercase hex; a
+    /// pass's `revision` only at Design review, a name written exactly,
+    /// with no reviewer, finding or print (OWL-377); and `last_fix` names
+    /// the record's last pass, at Design review or Verify (OWL-356,
+    /// OWL-377).
     ///
     /// Passes are numbered from 1 in each run of consecutive passes at one
     /// stage, each pass the one before it plus 1, or 1 again: a review loop
@@ -896,6 +968,20 @@ impl TicketReview {
                     ));
                 }
             }
+            if let Some(run) = &pass.revision {
+                if pass.stage != Stage::DesignReview {
+                    return invalid(format!("{at} keeps a revision"));
+                }
+                if let Err(broken) = check_name(run) {
+                    return invalid(format!("the revision of {at} {broken}"));
+                }
+                if !pass.reviewers.is_empty() || !pass.findings.is_empty() || pass.plan.is_some() {
+                    return invalid(format!(
+                        "{at} keeps a revision, which no reviewer reviewed, with reviewers, \
+                         findings or a plan's print"
+                    ));
+                }
+            }
             for reviewer in &pass.reviewers {
                 if reviewer.role != role {
                     return invalid(format!(
@@ -923,31 +1009,46 @@ impl TicketReview {
                 if let Err(broken) = check_name(&reviewer.model) {
                     return invalid(format!("the model of finding {id} of {at} {broken}"));
                 }
-                if kept.ruling.is_some() && kept.response.is_some() {
-                    return invalid(format!(
-                        "finding {id} of {at} keeps both a ruling and a response"
-                    ));
-                }
-                let reason = kept
-                    .ruling
-                    .as_ref()
-                    .map(|r| &r.reason)
-                    .or(kept.response.as_ref().map(|r| &r.reason));
-                if reason.is_some_and(|r| r.trim().is_empty()) {
+                let blank = [
+                    kept.ruling.as_ref().map(|r| &r.reason),
+                    kept.response.as_ref().map(|r| &r.reason),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|reason| reason.trim().is_empty());
+                if blank {
                     return invalid(format!("finding {id} of {at} keeps a blank reason"));
                 }
                 use FindingOutcome::{Asked, Fixed, Proposed, Rejected};
-                let (judgment, allowed): (&str, &[FindingOutcome]) =
-                    match (&kept.ruling, &kept.response) {
-                        (Some(ruling), _) if ruling.outcome == RulingOutcome::Rejected => {
-                            ("rejected ruling", &[Rejected])
+                let confirmed = kept
+                    .ruling
+                    .as_ref()
+                    .map(|ruling| ruling.outcome == RulingOutcome::Confirmed);
+                if let Some(response) = &kept.response {
+                    // A confirmed finding is answered as in fix mode, an
+                    // unjudged one as in answer mode (OWL-377).
+                    let mode = match confirmed {
+                        Some(false) => {
+                            return invalid(format!(
+                                "finding {id} of {at} keeps a response to a rejected ruling"
+                            ));
                         }
-                        (Some(_), _) => ("confirmed ruling", &[Fixed, Asked, Proposed]),
-                        (_, Some(response)) if response.outcome == ResponseOutcome::Rejected => {
-                            ("rejected response", &[Rejected])
-                        }
-                        (_, Some(_)) => ("fixed response", &[Fixed]),
-                        (None, None) => ("", &[Fixed, Rejected, Asked, Proposed]),
+                        Some(true) => FindingsMode::Fix,
+                        None => FindingsMode::Answer,
+                    };
+                    if let Some(refused) = response.outcome.refused(mode, &kept.finding) {
+                        return invalid(format!(
+                            "finding {id} of {at} keeps the response {:?}: {refused}",
+                            response.outcome
+                        ));
+                    }
+                }
+                let (judgment, allowed): (&str, Vec<FindingOutcome>) =
+                    match (confirmed, &kept.response) {
+                        (_, Some(response)) => ("response", vec![response.outcome.outcome()]),
+                        (Some(false), None) => ("rejected ruling", vec![Rejected]),
+                        (Some(true), None) => ("confirmed ruling", vec![Fixed, Asked, Proposed]),
+                        (None, None) => ("", vec![Fixed, Rejected, Asked, Proposed]),
                     };
                 if let Some(outcome) = kept.outcome
                     && !allowed.contains(&outcome)
@@ -990,13 +1091,10 @@ impl TicketReview {
             ));
         }
         if let Some(pass) = self.last_fix
-            && !self
-                .passes
-                .last()
-                .is_some_and(|last| last.stage == Stage::Verify && last.pass == pass)
+            && !self.passes.last().is_some_and(|last| last.pass == pass)
         {
             return invalid(format!(
-                "the last fix names verify pass {pass}, which is not the record's last pass"
+                "the last fix names pass {pass}, which is not the record's last pass"
             ));
         }
         Ok(())
@@ -1213,11 +1311,39 @@ mod tests {
                 ),
                 (
                     &|d| {
+                        d["passes"][0]["findings"][0]["ruling"]["outcome"] = "rejected".into();
                         d["passes"][0]["findings"][0]["response"] =
                             json!({ "outcome": "fixed", "reason": "r" })
                     },
-                    "both a ruling and a response",
+                    "a response to a rejected ruling",
                 ),
+                (
+                    &|d| {
+                        d["passes"][0]["findings"][0]["response"] =
+                            json!({ "outcome": "rejected", "reason": "r" })
+                    },
+                    "keeps the response Rejected: the arbiter confirmed it",
+                ),
+                (
+                    &|d| {
+                        d["passes"][0]["findings"][0]["response"] =
+                            json!({ "outcome": "deferred", "reason": "r" })
+                    },
+                    "keeps the response Deferred: only a minor finding",
+                ),
+                (
+                    &|d| d["passes"][0]["revision"] = "run-1".into(),
+                    "keeps a revision, which no reviewer reviewed, with reviewers",
+                ),
+                (
+                    &|d| {
+                        d["passes"] = json!([{
+                            "stage": "verify", "pass": 1, "revision": "run-1"
+                        }])
+                    },
+                    "keeps a revision",
+                ),
+                (&|d| d["last_fix"] = 2.into(), "not the record's last pass"),
                 (
                     &|d| d["passes"][0]["findings"][0]["ruling"]["reason"] = " ".into(),
                     "blank reason",
@@ -1294,7 +1420,7 @@ mod tests {
         for kept in ["rejected", "asked", "proposed"] {
             let error = settled("response", "fixed", kept).unwrap_err();
             assert!(
-                error.contains("its fixed response contradicts"),
+                error.contains("its response contradicts"),
                 "{kept}: {error}"
             );
         }
@@ -1306,10 +1432,60 @@ mod tests {
         for kept in ["fixed", "asked", "proposed"] {
             let error = settled("response", "rejected", kept).unwrap_err();
             assert!(
-                error.contains("its rejected response contradicts"),
+                error.contains("its response contradicts"),
                 "{kept}: {error}"
             );
         }
+        // With no ruling, author mode: a disagreement is a rejection.
+        let error = settled("response", "disagreed", "disagreed").unwrap_err();
+        assert!(error.contains("no one judged it"), "{error}");
+    }
+
+    /// The author's answer to a finding the arbiter confirmed (OWL-377):
+    /// kept beside the ruling, the finding's outcome its own; a `minor` on
+    /// no criterion may be deferred.
+    #[test]
+    fn a_confirmed_finding_keeps_its_authors_answer() {
+        let answered = |response: &str, kept: &str, minor: bool| {
+            let mut document = ticket_review();
+            let finding = &mut document["passes"][0]["findings"][0];
+            finding["response"] = json!({ "outcome": response, "reason": "kept, see a.rs:2" });
+            finding["outcome"] = kept.into();
+            if minor {
+                finding["finding"]["severity"] = "minor".into();
+                finding["finding"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("criterion");
+            }
+            TicketReview::parse(&document.to_string()).map_err(|e| e.to_string())
+        };
+        let kept = answered("disagreed", "disagreed", false).unwrap();
+        let finding = &kept.passes[0].findings[0];
+        assert_eq!(finding.outcome, Some(FindingOutcome::Disagreed));
+        assert!(finding.ruling.is_some());
+        answered("fixed", "fixed", false).unwrap();
+        answered("deferred", "deferred", true).unwrap();
+        let error = answered("disagreed", "fixed", false).unwrap_err();
+        assert!(error.contains("its response contradicts"), "{error}");
+    }
+
+    /// Design's last revision is kept as a pass no reviewer ran (OWL-377),
+    /// naming its design run, and the last fix may name it.
+    #[test]
+    fn the_last_revision_is_a_pass_with_no_reviewer() {
+        let mut document = ticket_review();
+        document["passes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "stage": "design_review", "pass": 2, "revision": "run-7" }));
+        document["last_fix"] = 2.into();
+        let kept = TicketReview::parse(&document.to_string()).unwrap();
+        assert_eq!(kept.passes[1].revision.as_deref(), Some("run-7"));
+        assert_eq!(TicketReview::parse(&kept.render()).unwrap(), kept);
+        document["passes"][1]["revision"] = " ".into();
+        let error = TicketReview::parse(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("the revision of"), "{error}");
     }
 
     #[test]
