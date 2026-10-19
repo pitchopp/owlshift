@@ -88,7 +88,7 @@ fn a_standard_ticket_from_admission_to_merge() {
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
 
     // Design, then its review: the critic and conformance. The first pass's
-    // confirmed finding sends the plan back; the second, last, pass leaves a
+    // confirmed major sends the plan back; the second, last, pass leaves a
     // major for the decider, whose answer the design takes in before one
     // more pass, which only notes a minor.
     step(&mut ticket, Event::Completed);
@@ -114,7 +114,9 @@ fn a_standard_ticket_from_admission_to_merge() {
         severity: Severity::Minor,
         on_criterion: false,
     };
-    let event = pass(&ticket, &[minor]).event();
+    // A minor alone never sends the plan back (OWL-356): it is noted.
+    assert_eq!(pass(&ticket, &[minor]).event(), Event::Completed);
+    let event = pass(&ticket, &[major, minor]).event();
     step(&mut ticket, event);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
     step(&mut ticket, Event::Completed);
