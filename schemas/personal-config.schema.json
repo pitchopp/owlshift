@@ -4,6 +4,13 @@
   "description": "The personal file, in the user's configuration directory, never committed.",
   "type": "object",
   "properties": {
+    "allow_caches": {
+      "description": "Folders of the home, from the home with `/` between their parts, that\na project may open read-only to its agents by declaring them in\n`stack.caches`, compared as written. A project's declaration never\nwidens this list. It applies to every project run on this machine;\n`repositories` allows a folder for one repository only. A folder that\nis, lies in or holds a credential path cannot be listed.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "allow_gate_env": {
       "description": "Names of variables of this machine's environment that a project may\npass to its agents by declaring them in `stack.gate_env`, in any\nletter case. A project's declaration never widens this list: a name\ndeclared but not listed here is refused. It applies to every project\nrun on this machine; `repositories` allows a name for one repository\nonly. A credential variable, a `GIT_` name, a variable Owlshift\noverrides or one that makes the dynamic loader load code cannot be\nlisted.",
       "type": "array",
@@ -165,6 +172,13 @@
       "description": "The personal settings of one repository.",
       "type": "object",
       "properties": {
+        "allow_caches": {
+          "description": "Folders a project of this repository may open read-only to its\nagents, on top of the machine-wide `allow_caches`, under the same\nrules.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "allow_gate_env": {
           "description": "Names a project of this repository may pass to its agents, on top of\nthe machine-wide `allow_gate_env`, under the same rules.",
           "type": "array",

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use owlshift_core::agent_env::{check_declared, check_names};
+use owlshift_core::agent_env::{check_declared, check_home_folders, check_names};
 use owlshift_core::decider::ZoneOwners;
 use owlshift_core::gate::{GatePolicy, PassLimit, ResolverPolicy, usd_micros};
 use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
@@ -245,6 +245,22 @@ pub struct Stack {
     /// operator does not allow in the personal `allow_gate_env`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_env: Vec<String>,
+    /// Shell commands that install the gate's dependencies, run in order by
+    /// the runner, confined as the gate is and with the network open: before
+    /// a Build's harness starts, on every Build run, and before the gate's
+    /// commands, after a Build or a Rebase `done` and in `owlshift gate`.
+    /// They may write only into ignored folders, and must leave the work in
+    /// the worktree as they found it. A failing command fails the run, and
+    /// they share a third of the gate's deadline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup: Vec<String>,
+    /// Folders of the home, from the home with `/` between their parts,
+    /// that the setup, the harness and the gate read, never write: a tool
+    /// chain's package store or cache, such as `Library/pnpm`. Each must be
+    /// allowed by the operator in the personal `allow_caches`; a folder that
+    /// is, lies in or holds a credential path is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caches: Vec<String>,
     /// The files whose text reaches agents as the project's rules, paths
     /// from the repository's root with `/` between folders, in order. Each is
     /// read at the base commit, taken whole, and must exist there; a blank
@@ -262,6 +278,23 @@ impl Stack {
     /// The names of [`Stack::gate_env`], as the agent environment takes them.
     pub fn gate_env_names(&self) -> Vec<&str> {
         self.gate_env.iter().map(String::as_str).collect()
+    }
+
+    /// The folders of [`Stack::caches`], from the home.
+    pub fn cache_folders(&self) -> Vec<&str> {
+        names(&self.caches)
+    }
+
+    /// Checks [`Stack::setup`]: no command blank.
+    fn check_setup(&self) -> Result<(), String> {
+        match self
+            .setup
+            .iter()
+            .position(|command| command.trim().is_empty())
+        {
+            Some(i) => Err(format!("command {} is blank", i + 1)),
+            None => Ok(()),
+        }
     }
 
     /// Checks the paths of [`Stack::rules`]: each a path from the
@@ -817,6 +850,11 @@ impl ProjectConfig {
                 .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         }
         self.zone_owners()?;
+        self.stack
+            .check_setup()
+            .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.setup: {reason}")))?;
+        check_home_folders(&self.stack.cache_folders())
+            .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.caches: {reason}")))?;
         check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
     }
 
@@ -850,6 +888,34 @@ impl ProjectConfig {
     /// so on a parsed file only a name the operator does not allow fails.
     pub fn check_gate_env(&self, allowed: &[&str]) -> Result<(), ContractError> {
         check_declared(&self.stack.gate_env_names(), allowed).map_err(gate_env_error)
+    }
+
+    /// Checks `stack.caches` against the folders the operator allows for
+    /// this project, from the personal file
+    /// ([`PersonalConfig::allow_caches_names`], OWL-330): a declared folder
+    /// not listed there, compared as written, is refused, so a project's file
+    /// never opens a folder of the operator's home on its own.
+    pub fn check_caches(&self, allowed: &[&str]) -> Result<(), ContractError> {
+        let refused: Vec<&str> = self
+            .stack
+            .cache_folders()
+            .into_iter()
+            .filter(|folder| !allowed.contains(folder))
+            .collect();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        let quoted: Vec<String> = refused.iter().map(|f| format!("{f:?}")).collect();
+        Err(ContractError::invalid(
+            PROJECT,
+            format!(
+                "stack.caches: {} may not be read by an agent on this machine: the operator \
+                 allows a cache folder in the personal configuration, for every repository in \
+                 `allow_caches`, or for one in the `allow_caches` of its \
+                 `[repositories.\"github.com/<owner>/<name>\"]` table",
+                quoted.join(", ")
+            ),
+        ))
     }
 }
 
@@ -892,6 +958,14 @@ pub struct PersonalConfig {
     /// listed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_gate_env: Vec<String>,
+    /// Folders of the home, from the home with `/` between their parts, that
+    /// a project may open read-only to its agents by declaring them in
+    /// `stack.caches`, compared as written. A project's declaration never
+    /// widens this list. It applies to every project run on this machine;
+    /// `repositories` allows a folder for one repository only. A folder that
+    /// is, lies in or holds a credential path cannot be listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_caches: Vec<String>,
     /// Settings for one repository, keyed `github.com/<owner>/<name>` in any
     /// letter case. The repository of a project is read from its checkout's
     /// `origin` remote, which the committed project file cannot set.
@@ -907,6 +981,11 @@ pub struct RepositorySettings {
     /// the machine-wide `allow_gate_env`, under the same rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_gate_env: Vec<String>,
+    /// Folders a project of this repository may open read-only to its
+    /// agents, on top of the machine-wide `allow_caches`, under the same
+    /// rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_caches: Vec<String>,
 }
 
 /// The host part of a repository key of [`PersonalConfig::repositories`]:
@@ -1033,10 +1112,30 @@ impl PersonalConfig {
             .collect()
     }
 
+    /// The cache folders the operator allows a project of `repository` to
+    /// open read-only (OWL-330): the machine-wide
+    /// [`PersonalConfig::allow_caches`], then those of the
+    /// [`PersonalConfig::repositories`] entry whose key is `repository`, as
+    /// for [`PersonalConfig::allow_gate_env_names`].
+    pub fn allow_caches_names(&self, repository: Option<&str>) -> Vec<&str> {
+        let scoped = self
+            .repositories
+            .iter()
+            .filter(|(key, _)| repository.is_some_and(|r| key.eq_ignore_ascii_case(r)))
+            .flat_map(|(_, settings)| &settings.allow_caches);
+        self.allow_caches
+            .iter()
+            .chain(scoped)
+            .map(String::as_str)
+            .collect()
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
         check_names(&names(&self.allow_gate_env)).map_err(|error| {
             ContractError::invalid(PERSONAL, format!("allow_gate_env: {error}"))
         })?;
+        check_home_folders(&names(&self.allow_caches))
+            .map_err(|error| ContractError::invalid(PERSONAL, format!("allow_caches: {error}")))?;
         for (key, settings) in &self.repositories {
             let quoted = toml::Value::String(key.clone());
             check_repository_key(key).map_err(|error| {
@@ -1046,6 +1145,12 @@ impl PersonalConfig {
                 ContractError::invalid(
                     PERSONAL,
                     format!("repositories.{quoted}.allow_gate_env: {error}"),
+                )
+            })?;
+            check_home_folders(&names(&settings.allow_caches)).map_err(|error| {
+                ContractError::invalid(
+                    PERSONAL,
+                    format!("repositories.{quoted}.allow_caches: {error}"),
                 )
             })?;
         }
@@ -1796,6 +1901,123 @@ mod tests {
                 "[repositories.\"github.com/acme/web\"]\nallow_gate_env = [\"GH_TOKEN\"]",
                 "repositories.\"github.com/acme/web\".allow_gate_env: agents never receive \
                  credentials",
+            ),
+        ] {
+            let actual = PersonalConfig::parse(input).unwrap_err().to_string();
+            assert!(
+                actual.starts_with(&format!("invalid personal configuration: {error}")),
+                "{input}: {actual}"
+            );
+        }
+    }
+
+    /// OWL-330: `stack.setup` and `stack.caches` round-trip, and a blank
+    /// command or a cache folder that is not plain, or that would open a
+    /// credential path, makes the file invalid.
+    #[test]
+    fn setup_and_caches_are_read_and_checked() {
+        let config =
+            project_with_stack("setup = [\"pnpm install\"]\ncaches = [\"Library/pnpm\"]").unwrap();
+        assert_eq!(config.stack.setup, ["pnpm install"]);
+        assert_eq!(config.stack.cache_folders(), ["Library/pnpm"]);
+        let rendered = config.render();
+        assert_eq!(ProjectConfig::parse(&rendered).unwrap(), config);
+        let bare = project_with_stack("").unwrap();
+        assert!(bare.stack.setup.is_empty() && bare.stack.caches.is_empty());
+        assert!(!bare.render().contains("setup") && !bare.render().contains("caches"));
+
+        let error = project_with_stack("setup = [\"make deps\", \" \"]")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid owlshift.toml: stack.setup: command 2 is blank"
+        );
+        for cache in [
+            "../x",
+            "/abs",
+            "~/x",
+            "",
+            ".ssh",
+            ".config",
+            ".config/gh/hosts.yml",
+            "Library/Keychains",
+        ] {
+            let error = project_with_stack(&format!("caches = [{cache:?}]"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("invalid owlshift.toml: stack.caches: "),
+                "{cache:?}: {error}"
+            );
+        }
+        let error = project_with_stack("caches = [\"a\", \"a\"]")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("named twice"), "{error}");
+    }
+
+    /// OWL-330: a declared cache passes only once the operator lists it,
+    /// machine-wide or for the repository, compared as written; another
+    /// repository's list does not count.
+    #[test]
+    fn caches_pass_only_what_the_operator_allows() {
+        let config = project_with_stack("caches = [\"Library/pnpm\", \".cache/uv\"]").unwrap();
+        let error = config
+            .check_caches(&["Library/pnpm"])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid owlshift.toml: stack.caches: \".cache/uv\" may not be read by an agent on \
+             this machine: the operator allows a cache folder in the personal configuration, \
+             for every repository in `allow_caches`, or for one in the `allow_caches` of its \
+             `[repositories.\"github.com/<owner>/<name>\"]` table"
+        );
+        assert!(config.check_caches(&["library/pnpm", ".cache/uv"]).is_err());
+        let personal = PersonalConfig::parse(
+            r#"
+            allow_caches = ["Library/pnpm"]
+            [repositories."github.com/acme/api"]
+            allow_caches = [".cache/uv"]
+            [repositories."github.com/acme/web"]
+            allow_caches = [".cache/pip"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            personal.allow_caches_names(Some("github.com/Acme/API")),
+            ["Library/pnpm", ".cache/uv"]
+        );
+        assert_eq!(personal.allow_caches_names(None), ["Library/pnpm"]);
+        config
+            .check_caches(&personal.allow_caches_names(Some("github.com/acme/api")))
+            .unwrap();
+        assert!(
+            config
+                .check_caches(&personal.allow_caches_names(Some("github.com/acme/web")))
+                .is_err()
+        );
+        project_with_stack("").unwrap().check_caches(&[]).unwrap();
+    }
+
+    /// OWL-330: the operator's list is held to the same rules, machine-wide
+    /// and for each repository: listing a credential path does not open it.
+    #[test]
+    fn allow_caches_refuses_what_no_project_may_open() {
+        for (input, error) in [
+            (
+                "allow_caches = [\".ssh\"]",
+                "allow_caches: \".ssh\" would open",
+            ),
+            ("allow_caches = [\"../x\"]", "allow_caches: \"../x\" is not"),
+            (
+                "allow_caches = [\"a\", \"a\"]",
+                "allow_caches: \"a\" is named twice",
+            ),
+            (
+                "[repositories.\"github.com/acme/api\"]\nallow_caches = [\".config/gh\"]",
+                "repositories.\"github.com/acme/api\".allow_caches: \".config/gh\" would open",
             ),
         ] {
             let actual = PersonalConfig::parse(input).unwrap_err().to_string();

@@ -36,7 +36,7 @@ use std::process::Command;
 
 use owlshift_adapters::harness::claude;
 use owlshift_core::agent_env::{
-    AgentEnvError, NO_CREDENTIAL, agent_environment, check_agent_variables,
+    AgentEnvError, HIDDEN_IN_HOME, NO_CREDENTIAL, agent_environment, check_agent_variables,
 };
 use owlshift_core::floor::FloorViolation;
 use owlshift_platform::process::{Captured, OUTPUT_CAP, find_executable_in, run_command};
@@ -90,33 +90,6 @@ pub struct RunPaths {
 
 /// The variables that name a temporary folder.
 const TEMP_VARIABLES: &[&str] = &["TMPDIR", "TMP", "TEMP"];
-
-/// Credential files and folders under the home, closed even when a folder
-/// that holds them is opened. Paths are relative to the home.
-const HIDDEN_IN_HOME: &[&str] = &[
-    ".ssh",
-    ".aws",
-    ".azure",
-    ".kube",
-    ".docker",
-    ".gnupg",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".git-credentials",
-    ".config/gh",
-    ".config/gcloud",
-    ".cargo/credentials",
-    ".cargo/credentials.toml",
-    ".local/share/keyrings",
-    // Maven's and Gradle's repository passwords.
-    ".m2/settings.xml",
-    ".m2/settings-security.xml",
-    ".gradle/gradle.properties",
-    // The Keychain, which the macOS sandbox closes itself: listed so that no
-    // folder holding it, `~/Library`, is opened for a variable.
-    "Library/Keychains",
-];
 
 /// Tool-chain folders under the home an agent reads: installed compilers and
 /// their package caches, never their credentials ([`HIDDEN_IN_HOME`]). The
