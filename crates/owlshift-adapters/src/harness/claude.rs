@@ -198,6 +198,11 @@ pub struct Request {
     /// total, whatever the billing. On a subscription the CLI counts the
     /// run's cost at list price.
     pub max_budget_usd: Option<f64>,
+    /// A read-only run allowed Bash, and nothing else, in place of its
+    /// result's rule: the resolver's (OWL-344), which gives its result as
+    /// its last message. Refused at the write-in-worktree level, which
+    /// already allows every tool.
+    pub bash: bool,
 }
 
 /// Why a request cannot be turned into a command.
@@ -241,6 +246,13 @@ impl std::error::Error for CommandError {}
 ///   moves: the result's write was then refused, and the same name below
 ///   allowed. Checked live with Claude Code 2.1.300 (OWL-323, recorded under
 ///   check C1 in `docs/design/build-plan.md`);
+/// - read-only with [`Request::bash`]: `--permission-mode dontAsk` with one
+///   allow rule, bare `Bash`, and no rule for a result file, which the run
+///   gives as its last message. Every command is then allowed: what the run
+///   reads and writes is bounded by the executor's read-only sandbox profile
+///   (worktree and git folder read, never written), never by the CLI, and
+///   the network stays open to Bash. Checked live with Claude Code 2.1.302
+///   on macOS and Linux (OWL-344, recorded in `docs/design/build-plan.md`);
 /// - write in worktree: `--permission-mode bypassPermissions`, so no tool
 ///   asks. What the run writes is bounded by the executor, never by the CLI:
 ///   the operating system's sandbox (`AgentEnv::confine`) keeps every write
@@ -281,9 +293,20 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
     }
     let level = request.permissions.level;
     command.args(["--permission-mode", permission_mode(level)]);
-    if level == PermissionLevel::ReadOnly {
-        command.arg("--allowedTools");
-        command.arg(format!("Edit(/{result_path})"));
+    match (level, request.bash) {
+        (PermissionLevel::ReadOnly, false) => {
+            command.arg("--allowedTools");
+            command.arg(format!("Edit(/{result_path})"));
+        }
+        (PermissionLevel::ReadOnly, true) => {
+            command.args(["--allowedTools", "Bash"]);
+        }
+        (PermissionLevel::WriteWorktree, false) => {}
+        (PermissionLevel::WriteWorktree, true) => {
+            return Err(CommandError::Unsupported(
+                "a Bash flag at the write-in-worktree level, which allows every tool",
+            ));
+        }
     }
     command.args(["--permission-prompts", "none"]);
     command.arg("--disallowedTools").args(BEYOND_RUN_TOOLS);
@@ -755,6 +778,7 @@ mod tests {
             result_path: RelativePath::new(".owlshift/result.json").unwrap(),
             json_schema: None,
             max_budget_usd: None,
+            bash: false,
         }
     }
 

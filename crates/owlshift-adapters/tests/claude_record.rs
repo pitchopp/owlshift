@@ -80,6 +80,7 @@ fn request(workdir: &Path, level: PermissionLevel, network: bool, result: &str) 
         result_path: RelativePath::new(result).unwrap(),
         json_schema: None,
         max_budget_usd: None,
+        bash: false,
     }
 }
 

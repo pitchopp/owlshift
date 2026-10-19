@@ -397,6 +397,7 @@ impl Harness for ClaudeHarness {
             result_path: run.brief.result_path.clone(),
             json_schema: None,
             max_budget_usd: self.max_budget_usd,
+            bash: false,
         };
         Ok(claude::command(&self.program, &request)?)
     }
