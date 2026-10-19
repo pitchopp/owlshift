@@ -1573,10 +1573,7 @@ impl Driver {
             )?;
         }
         if let Some(expected) = &expect.gate_log {
-            let report = self
-                .last_run
-                .as_ref()
-                .ok_or("expected a run, found none")?;
+            let report = self.last_run.as_ref().ok_or("expected a run, found none")?;
             let dir = report
                 .stdout_log
                 .parent()
