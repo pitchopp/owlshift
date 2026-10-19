@@ -1169,11 +1169,12 @@ fn a_design_question_is_decided_on_judgment_at_all_and_not_below() {
     assert_eq!(told.asked_by.as_ref().unwrap().role, Role::Design);
     assert!(shape(&bench.briefs()[2]).contains(&"decision".to_owned()));
     let decision = bench.marked("[owlshift] DECISION");
+    // Its line says it rests on judgment, the lead the level (OWL-351).
     assert!(
-        decision.contains(
-            "Decided on judgment, allowed by this project's delegation level, `all` \
-             (`policy.resolver_delegation`)."
-        ),
+        decision.contains("as delegation level `all` allows")
+            && decision
+                .lines()
+                .any(|line| line.starts_with("- **D1 · ") && line.ends_with("*(on judgment)*")),
         "{decision}"
     );
     let kept = &bench.record().questions.decisions[0];

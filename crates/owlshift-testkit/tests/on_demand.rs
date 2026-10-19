@@ -1252,6 +1252,23 @@ impl Bench {
             .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
     }
 
+    /// The ticket's document titled `<title> · <ticket>` (OWL-350,
+    /// OWL-351), as the Markdown tracker keeps it, its title its first line.
+    fn document(&self, title: &str) -> String {
+        let dir = self
+            .remote
+            .checkout
+            .join("tickets")
+            .join(TICKET)
+            .join("documents");
+        let heading = format!("# {title} · {TICKET}\n");
+        fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .find(|text| text.starts_with(&heading))
+            .unwrap_or_else(|| panic!("no document {heading}"))
+    }
+
     fn comments(&self) -> Vec<String> {
         let tracker = MarkdownTracker::new(&self.remote.checkout);
         tracker
@@ -1621,7 +1638,7 @@ fn a_reopened_choice_reaches_the_resolver() {
             { "choice": 2, "question": "Q2", "raised_as": "Q2" }
         ])
     );
-    let written = data_of(&events, EventKind::TrackerWrite, "question");
+    let written = data_of(&events, EventKind::TrackerWrite, "questions");
     assert_eq!(written.len(), 1);
     assert!(!written[0].as_object().unwrap().contains_key("reopened"));
 }
@@ -4384,13 +4401,25 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
         "{}",
         comments[0]
     );
+    // One line in the comment, the reasoning in the ticket's decisions
+    // document (OWL-351).
+    assert!(
+        comments[0].contains(
+            "- **D1 · Which file should hold the greeting?** — GREETING.md, at the root. The \
+             ticket's description.\n"
+        ) && comments[0].contains("Why: the decisions document, `tickets/DEMO-1/documents/1.md`."),
+        "{}",
+        comments[0]
+    );
+    let document = bench.document("Decisions");
     for text in [
-        "### Question · Which file should hold the greeting?",
+        "#### D1 · Which file should hold the greeting?",
         "**Decision:** GREETING.md, at the root.",
         "**Settled by:** The ticket's description.",
     ] {
-        assert!(comments[0].contains(text), "{text}\n{}", comments[0]);
+        assert!(document.contains(text), "{text}\n{document}");
     }
+    assert!(bench.record().questions.decisions_document.is_some());
     let round_1 = &comments[1];
     assert!(
         round_1.starts_with("[owlshift] QUESTIONS · round 1 · @maintainer\n"),
@@ -4430,7 +4459,7 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     assert_eq!(resolved[0]["to_decider"], json!(["Q2"]));
     let opened = data_of(&events, EventKind::Gate, "opened");
     assert_eq!(opened[0]["raised_as"], json!(["Q2"]));
-    let written = &data_of(&events, EventKind::TrackerWrite, "question")[0];
+    let written = &data_of(&events, EventKind::TrackerWrite, "questions")[0];
     assert_eq!(written["kind"], "DECISION");
     // Without a hold, nothing is reopened (OWL-203).
     assert!(opened[0].get("reopened").is_none() && written.get("reopened").is_none());
@@ -4566,6 +4595,96 @@ fn without_a_logged_decision_every_question_goes_to_the_decider() {
     assert!(bench.record().questions.decisions.is_empty());
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
     assert_eq!(resolved[0]["unposted"], json!(["Q1"]));
+}
+
+/// A Build run's two discoverable questions (OWL-351).
+const TWO_NAMINGS: &str = r#"{"format":12,"status":"questions",
+"summary":"The greeting's file and its link are not named.",
+"questions":[
+  {"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+   "text":"Which file should hold the greeting?","recommendation":{"why":"The simplest reading of the ticket."}},
+  {"id":"Q2","category":"naming","context":"The README lists the files at the root.",
+   "text":"Should the README link to it?","recommendation":{"why":"The README's list."}}]}"#;
+
+/// The resolver decides both of [`TWO_NAMINGS`].
+const DECIDED_BOTH: &str = r#"{"format":12,"status":"done","summary":"The ticket and the README settle both.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"naming","decision":"GREETING.md, at the root.",
+"basis":"The ticket's description.","basis_kind":"settled"},
+{"question":"Q2","outcome":"decided","category":"naming","decision":"Yes, in its list of files.",
+"basis":"README.md lists every file at the root.","basis_kind":"fact"}]}"#;
+
+/// OWL-351: a resolver run that decides two questions posts one DECISION
+/// comment of two lines, D1 and D2, their reasoning in the ticket's
+/// decisions document; both decisions are kept with that comment, in one
+/// write. When the tracker refuses the comment, both go to the decider.
+#[test]
+fn a_resolver_runs_decisions_are_one_comment() {
+    let bench = Bench::new(true);
+    let mut limited = bench.reply(None, None);
+    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(TWO_NAMINGS)),
+            bench.reply(None, Some(DECIDED_BOTH)),
+            limited,
+        ],
+        None,
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let comments = bench.comments();
+    assert_eq!(comments.len(), 1, "one DECISION: {comments:?}");
+    let lines: Vec<&str> = comments[0]
+        .lines()
+        .filter(|line| line.starts_with("- **D"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "- **D1 · Which file should hold the greeting?** — GREETING.md, at the root. The \
+             ticket's description.",
+            "- **D2 · Should the README link to it?** — Yes, in its list of files. README.md \
+             lists every file at the root.",
+        ],
+        "{}",
+        comments[0]
+    );
+    let record = bench.record();
+    let kept: Vec<(&str, u32)> = record
+        .questions
+        .decisions
+        .iter()
+        .map(|d| (d.comment.as_str(), d.place().get()))
+        .collect();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0].0, kept[1].0);
+    assert_eq!((kept[0].1, kept[1].1), (1, 2));
+    let document = bench.document("Decisions");
+    assert!(
+        document.contains("#### D1 · Which file should hold the greeting?")
+            && document.contains("#### D2 · Should the README link to it?"),
+        "{document}"
+    );
+    let written = data_of(&bench.events(), EventKind::TrackerWrite, "questions");
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0]["questions"], json!(["Q1", "Q2"]));
+
+    let bench = Bench::new(true);
+    bench.refuse.set(Some("[owlshift] DECISION"));
+    let (outcome, _) = bench.run(
+        vec![
+            bench.reply(None, Some(TWO_NAMINGS)),
+            bench.reply(None, Some(DECIDED_BOTH)),
+        ],
+        None,
+    );
+    let stop = outcome.expect_err("a round");
+    assert_eq!(asked_texts(&stop).len(), 2);
+    assert!(bench.record().questions.decisions.is_empty());
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["unposted"], json!(["Q1", "Q2"]));
 }
 
 /// The resolver resolves Q2, which a brief giving Q1 alone did not give: its
@@ -4949,7 +5068,7 @@ fn a_quoted_scope_question_is_decided_at_ticket_and_asked_at_discoverable() {
     let comments = bench.comments();
     assert!(
         comments[0].starts_with("[owlshift] DECISION\n")
-            && comments[0].contains("delegation level, `ticket`"),
+            && comments[0].contains("delegation level `ticket`"),
         "{}",
         comments[0]
     );

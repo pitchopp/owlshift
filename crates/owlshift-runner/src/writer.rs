@@ -6562,7 +6562,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     fn a_maximal_decision_comment_holds_in_one_comment() {
         let huge = |n: usize| Decided {
             question: Question {
-                id: QuestionId::new(&format!("Q{n}")).unwrap(),
+                id: QuestionId::new(format!("Q{n}")).unwrap(),
                 category: "c".repeat(1 << 20),
                 context: "x".repeat(1 << 20),
                 text: format!("Which?{}", "t".repeat(1 << 20)),
