@@ -147,11 +147,19 @@ fn unquarantine_is_refused_without_a_terminal() {
     let project = config_dir.path().join("data/projects/github.com/acme/app");
     fs::create_dir_all(&project).unwrap();
     let marker = project.join("unverified");
-    fs::write(&marker, "Run r1 of OWL-7 broke isolation:\n- the main checkout's HEAD moved\n").unwrap();
+    fs::write(
+        &marker,
+        "Run r1 of OWL-7 broke isolation:\n- the main checkout's HEAD moved\n",
+    )
+    .unwrap();
 
     let output = owlshift(repo.path(), config_dir.path(), &["unquarantine"]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("confirms it at a terminal"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("confirms it at a terminal"),
+        "{}",
+        stderr(&output)
+    );
     assert!(marker.exists());
 }
 

@@ -61,9 +61,9 @@ fn run_with(config: &Effective) -> Result<Cleared, String> {
 /// The repository the project file is looked for in.
 fn repository_root<T>(project: &FileState<T>) -> Result<&Path, String> {
     let path = match project {
-        FileState::Loaded { path, .. } | FileState::Invalid { path, .. } | FileState::Absent(path) => {
-            path
-        }
+        FileState::Loaded { path, .. }
+        | FileState::Invalid { path, .. }
+        | FileState::Absent(path) => path,
         FileState::NotApplicable(reason) => {
             return Err(format!(
                 "`owlshift unquarantine` runs in the project's git repository: {reason}"

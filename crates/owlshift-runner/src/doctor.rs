@@ -2138,7 +2138,11 @@ fn quarantine_check(system: &dyn System, config: &Effective, home: Option<&Path>
              `owlshift doctor` again once it ends",
         ),
         Ok(MarkerState::Marked { path, text }) => {
-            let said: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            let said: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
             let folder = path.parent().map_or_else(String::new, |p| shown(p, home));
             Check::fail(
                 Section::Project,
@@ -4058,7 +4062,9 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
         let (_dir, config) = markdown_project();
         let marked = MarkerState::Marked {
-            path: PathBuf::from("/home/ada/.local/share/owlshift/projects/github.com/o/r/unverified"),
+            path: PathBuf::from(
+                "/home/ada/.local/share/owlshift/projects/github.com/o/r/unverified",
+            ),
             text: "Run r1 of OWL-160 broke isolation:\n- the main checkout's HEAD moved\n"
                 .to_owned(),
         };
@@ -4080,8 +4086,14 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         );
         for (system, status) in [
             (ready(), Status::Ok),
-            (ready().quarantine_is(Ok(MarkerState::InFlight)), Status::Info),
-            (ready().quarantine_is(Err("no remote".to_owned())), Status::Info),
+            (
+                ready().quarantine_is(Ok(MarkerState::InFlight)),
+                Status::Info,
+            ),
+            (
+                ready().quarantine_is(Err("no remote".to_owned())),
+                Status::Info,
+            ),
         ] {
             let report = run(&system, &config);
             assert_eq!(line(&report, "quarantine").status, status, "{report}");

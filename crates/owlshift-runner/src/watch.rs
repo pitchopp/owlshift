@@ -651,7 +651,12 @@ impl Watch<'_> {
     ) {
         self.note(memory, out, Project::Quarantined(marker));
         for (ticket, stored) in refs {
-            let Ok(stored) = stored else {
+            // A ticket told already costs no read of its comments.
+            let told = memory
+                .quarantine
+                .as_ref()
+                .is_some_and(|known| known.told.contains(&ticket));
+            let (false, Ok(stored)) = (told, stored) else {
                 continue;
             };
             if TicketState::try_from(&stored.record.state).is_ok_and(|s| watched(s.status())) {
@@ -677,8 +682,7 @@ impl Watch<'_> {
         let Some(known) = memory.quarantine.as_mut() else {
             return;
         };
-        if known.told.contains(ticket) || on_demand::check_team(on_demand.config, ticket).is_err()
-        {
+        if known.told.contains(ticket) || on_demand::check_team(on_demand.config, ticket).is_err() {
             return;
         }
         quarantine::tell(on_demand.tracker, ticket, held, sink);
@@ -1339,11 +1343,7 @@ impl Watch<'_> {
     /// cannot be. The marker is read first, so that one left once the
     /// dedicated checkout was deleted still stands. No dedicated checkout
     /// and no marker: nothing was asked.
-    fn snapshot(
-        &self,
-        memory: &mut Memory,
-        sink: &mut EventSink<'_>,
-    ) -> Result<Snapshot, Project> {
+    fn snapshot(&self, memory: &mut Memory, sink: &mut EventSink<'_>) -> Result<Snapshot, Project> {
         let dirs = self.on_demand.dirs;
         let checkout = dirs.checkout();
         let checked_out = fs::symlink_metadata(&checkout).is_ok();

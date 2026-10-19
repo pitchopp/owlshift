@@ -6,9 +6,9 @@
 //! person clears it ([`crate::project`]). This module says so to everyone it
 //! stops, once each:
 //!
-//! - the operator, by the notifier: [`notify_written`] as the runner writes a
-//!   breach marker, [`notify_found`] when watch finds a marker no command
-//!   notified (a crash, a Ctrl-C, `owlshift gate`);
+//! - the operator, by the notifier: as the runner writes a breach marker
+//!   ([`written_line`]), or when watch finds a marker no command notified,
+//!   as a crash, a Ctrl-C or `owlshift gate` leaves ([`found_line`]);
 //! - each ticket it holds up, by one [`QuarantineWait`] comment;
 //! - `owlshift doctor`, through [`marker_state`];
 //! - and [`clear`], `owlshift unquarantine`, lifts it once a person types the
@@ -181,7 +181,12 @@ pub(crate) fn notify_written(
     };
     let line = written_line(sink.project(), ticket, run, kinds);
     if let Err(error) = notifier.notify(&notify::with_link(line, tracker, ticket)) {
-        sink.emit(ticket, Some(run), EventKind::Warning, notify::not_shown(&error));
+        sink.emit(
+            ticket,
+            Some(run),
+            EventKind::Warning,
+            notify::not_shown(&error),
+        );
     }
     let notified = Record {
         notified: true,
@@ -580,7 +585,13 @@ mod tests {
             &mut sink,
         );
         for _ in 0..2 {
-            assert!(notify_found(Some(&recording), dirs, &lock, BREACH, &mut sink));
+            assert!(notify_found(
+                Some(&recording),
+                dirs,
+                &lock,
+                BREACH,
+                &mut sink
+            ));
         }
         assert_eq!(recording.0.borrow().len(), 1);
 
@@ -689,7 +700,9 @@ mod tests {
                     assert_eq!(left, None);
                     assert!(!bench.dirs.told_file().exists());
                     assert!(shown[0].contains("evil.txt"), "{shown:?}");
-                    assert!(shown[0].ends_with("Type acme/app to clear the quarantine, anything else to keep it: "));
+                    assert!(shown[0].ends_with(
+                        "Type acme/app to clear the quarantine, anything else to keep it: "
+                    ));
                     let events = bench.events();
                     assert_eq!(events.len(), 1, "{events:?}");
                     assert_eq!(events[0].ticket, None);
