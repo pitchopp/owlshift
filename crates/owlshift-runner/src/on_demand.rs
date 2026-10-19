@@ -2263,6 +2263,17 @@ impl OnDemand<'_> {
             decided: left.decided,
             fallback: left.fallback,
             reopened: left.reopened,
+            // The plan's forks under its approval, on a tracker with
+            // documents (OWL-352).
+            notes: match (&p.plan, questions.first()) {
+                (Some(plan), Some(question)) if question.category == design::APPROVAL_CATEGORY => {
+                    design::plan_link(&ticket, plan)
+                        .and_then(|link| design::approval_note(question, &plan.plan, link))
+                        .into_iter()
+                        .collect()
+                }
+                _ => Vec::new(),
+            },
         };
         let writer = Writer::new(self.tracker).mentioning(&decider.account);
         let Posted {

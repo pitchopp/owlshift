@@ -641,10 +641,20 @@ fn a_risky_plan_is_approved_and_its_build_starts_from_the_moved_base() {
             .iter()
             .map(|o| o.label.as_str())
             .collect::<Vec<_>>(),
-        [
-            "Approve the plan as it is",
-            "Fork 1: Plain text. instead of Markdown."
-        ]
+        ["Approve the plan as it is", "Change it"]
+    );
+    // On a tracker with documents, the fork is a line under the question,
+    // linking to the plan's document (OWL-352).
+    let round = bench
+        .comments()
+        .into_iter()
+        .rfind(|body| body.starts_with("[owlshift] QUESTIONS"))
+        .expect("the approval round");
+    assert!(
+        round.contains(
+            "**The plan's forks**, each with its choice:\n- Fork 1: Markdown. · its options"
+        ),
+        "{round}"
     );
     let mandates: Vec<Vec<Mandate>> = bench
         .briefs()

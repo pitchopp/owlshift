@@ -41,7 +41,7 @@ Once the rebase is done, run every command of `gate` in this worktree, in order,
 Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 12, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: the branch rebased onto `onto`, every conflict resolved and committed, the gate green.
-- `questions`: at least one question, each with an `id` (`Q1`, `Q2`, … in order), a `category`, a `text` that fits on one line, a `context` of at most two sentences giving what the decider needs, `options` when there are answers to choose from (each a short `label`, with a one-line `detail` only when it needs one; the runner letters them A, B, C… in order), and always a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; the rebase aborted first.
+- `questions`: at least one question, each with an `id` (`Q1`, `Q2`, … in order), a `category`, a `text` that fits on one line, a `context` of at most two sentences and 300 characters giving what the decider needs, `options` when there are answers to choose from (each a short `label`, with a one-line `detail` only when it needs one; the runner letters them A, B, C… in order), and always a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; the rebase aborted first.
 - `blocked`: something outside your reach stops you (a permission, access). Say what, with evidence, in `summary`.
 - `failed`: you could not finish, such as a conflict you could not resolve or a gate you could not make pass; the rebase aborted first. Say why in `summary`.
 

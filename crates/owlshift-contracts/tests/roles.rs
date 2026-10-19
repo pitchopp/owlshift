@@ -620,6 +620,27 @@ fn answer_check_prompt_states_the_short_answers() {
     }
 }
 
+/// The answer check takes a choice in the decider's own words (OWL-352): a
+/// letter followed by words, such as the approval's `B, fork 1 option C`,
+/// plain words, and a fork's option by its letter, which the brief's plan
+/// must have.
+#[test]
+fn answer_check_prompt_takes_a_choice_in_own_words() {
+    let text = answer_check_prompt();
+    for rule in [
+        "such as `B, fork 1 option C`, is a choice with what it says",
+        "plain words that settle the question, with no letter, are an answer too",
+        "`fork 2 option C` names the plan's second fork in the brief's `plan` and its third \
+         option",
+        "such as a fork or an option the brief's `plan` does not have",
+    ] {
+        assert!(
+            text.contains(rule),
+            "roles/answer_check.md does not state: {rule}"
+        );
+    }
+}
+
 #[test]
 fn answer_check_example_result_parses() {
     let text = answer_check_prompt();

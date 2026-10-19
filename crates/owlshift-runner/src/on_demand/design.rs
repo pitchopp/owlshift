@@ -63,7 +63,9 @@ use owlshift_core::vocab::Harness as HarnessKind;
 use super::*;
 use crate::ticket_ref::text_sha256;
 use crate::writer::{
-    DocumentPass, PlanComment, PlanDocument, PlanNext, PlanPointer, PlanReviewer, WriteError,
+    CONTEXT_CHARS, DocumentPass, PlanComment, PlanDocument, PlanNext, PlanPointer, PlanReviewer,
+    QuestionNote, ROUND_BUDGET_CHARS, ROUND_FRAME_CHARS, WriteError, chars, document_link, flatten,
+    question_block,
 };
 
 /// The category of the plan-approval question (architecture section 5,
@@ -127,10 +129,9 @@ pub(super) struct PassRun {
     /// pass made of it.
     pub findings: Vec<KeptFinding>,
     pub verdict: PassVerdict,
-    /// The residue round's questions when the pass asks, each with its
-    /// finding.
-    pub questions: Vec<(Question, FindingId)>,
-    /// Findings the round could not ask, past the questions it holds.
+    /// Findings the round could not ask, past the questions it holds: the
+    /// others asked keep their `Asked` outcome, which [`residue_questions`]
+    /// reads.
     pub not_asked: Vec<FindingId>,
     /// The pass's last run, its arbiter's when one ran.
     pub last_run: Option<String>,
@@ -484,13 +485,135 @@ fn fitting(budget: usize, make: impl Fn(usize) -> Question) -> Question {
     question
 }
 
+/// Where the plan's document is, for the runner's questions to link to
+/// (OWL-352): the ticket names it when the tracker gave no link.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlanLink<'a> {
+    pub(crate) ticket: &'a TicketId,
+    pub(crate) url: Option<&'a str>,
+}
+
+impl PlanLink<'_> {
+    /// A link to the document, `what` its text.
+    fn to(self, what: &str) -> String {
+        document_link(what, self.url, self.ticket)
+    }
+}
+
+/// The link to `plan`'s document, once the plan is published (OWL-350): on
+/// a tracker with documents only.
+pub(crate) fn plan_link<'a>(ticket: &'a TicketId, plan: &'a TicketPlan) -> Option<PlanLink<'a>> {
+    plan.published.as_ref().map(|published| PlanLink {
+        ticket,
+        url: published.url.as_deref(),
+    })
+}
+
 /// The approval question (architecture section 5, "Plan approval", How): one
-/// question, whether the decider approves the plan of the PLAN comment,
-/// with its forks' other options as the options to change, cut so the
-/// question holds in [`MAX_QUESTION_BYTES`]; past that, one option per fork,
-/// its options left to the PLAN comment. It recommends approval, option A
-/// (OWL-324): the plan passed its review.
-pub(crate) fn approval_question(plan: &Plan) -> Question {
+/// question, whether the decider approves the plan, recommending approval,
+/// option A (OWL-324): the plan passed its review. With the plan's document
+/// (`document`, OWL-352), two options, approve or change it, the forks in the
+/// document with their options lettered, and listed under the question in
+/// its QUESTIONS comment ([`approval_note`]). Without, the forks' other
+/// options are the options to change ([`per_fork_approval`]).
+pub(crate) fn approval_question(plan: &Plan, document: Option<PlanLink<'_>>) -> Question {
+    let Some(link) = document else {
+        return per_fork_approval(plan);
+    };
+    let context = |doc: &str| {
+        if plan.forks.is_empty() {
+            format!("The plan passed its design review, with no fork; {doc} shows it.")
+        } else {
+            format!(
+                "The plan passed its design review. Its forks are in {doc}, each fork's options \
+                 lettered A, B, C… in their order."
+            )
+        }
+    };
+    let linked = context(&link.to("the plan's document"));
+    let context = if chars(&linked) <= CONTEXT_CHARS {
+        linked
+    } else {
+        context("the plan's document")
+    };
+    let change = if plan.forks.is_empty() {
+        "say what in your own words"
+    } else {
+        "say what in your own words, such as `B, fork 1 option C`"
+    };
+    Question {
+        id: QuestionId::nth(1),
+        category: APPROVAL_CATEGORY.to_owned(),
+        context,
+        text: "Do you approve the plan as it is, or change it?".to_owned(),
+        options: vec![
+            QuestionOption::new(APPROVE),
+            QuestionOption {
+                label: "Change it".to_owned(),
+                detail: Some(change.to_owned()),
+            },
+        ],
+        recommendation: Some(Recommendation {
+            option: Some("A".to_owned()),
+            why: "The plan passed its design review.".to_owned(),
+        }),
+        replan: false,
+    }
+}
+
+/// The longest choice a fork line shows, tried in turn until the lines fit.
+const NOTE_CAPS: [usize; 4] = [120, 80, 50, 30];
+
+/// The lines under the approval question in its QUESTIONS comment
+/// (OWL-352): one per fork, its choice and a link to the plan's document,
+/// fitted to what [`ROUND_BUDGET_CHARS`] leaves past [`ROUND_FRAME_CHARS`]
+/// and the question, each choice clipped over [`NOTE_CAPS`]; past that, one
+/// line linking the document. None for a plan with no fork.
+pub(crate) fn approval_note(
+    question: &Question,
+    plan: &Plan,
+    link: PlanLink<'_>,
+) -> Option<QuestionNote> {
+    if plan.forks.is_empty() {
+        return None;
+    }
+    let room = ROUND_BUDGET_CHARS
+        .saturating_sub(ROUND_FRAME_CHARS)
+        .saturating_sub(chars(&question_block(question)));
+    let options = link.to("its options");
+    let lines = |cap: usize| -> Vec<String> {
+        let mut lines = vec!["**The plan's forks**, each with its choice:".to_owned()];
+        lines.extend(plan.forks.iter().enumerate().map(|(n, fork)| {
+            format!(
+                "- Fork {}: {} · {options}",
+                n + 1,
+                clip(&flatten(&fork.choice), cap)
+            )
+        }));
+        lines
+    };
+    let lines = NOTE_CAPS
+        .iter()
+        .map(|cap| lines(*cap))
+        .find(|lines| chars(&lines.join("\n")) <= room)
+        .unwrap_or_else(|| {
+            vec![format!(
+                "The plan's {} forks, each fork's options lettered, are in {}.",
+                plan.forks.len(),
+                link.to("the plan's document")
+            )]
+        });
+    Some(QuestionNote {
+        question: question.id.clone(),
+        lines,
+    })
+}
+
+/// The approval question without the plan's document: its forks' other
+/// options as the options to change, cut so the question holds in
+/// [`MAX_QUESTION_BYTES`]; past that, one option per fork, its options left
+/// to the PLAN comment.
+fn per_fork_approval(plan: &Plan) -> Question {
     let budget = MAX_QUESTION_BYTES - 256;
     let question = |options: Vec<String>| Question {
         id: QuestionId::nth(1),
@@ -543,25 +666,11 @@ pub(crate) fn approval_question(plan: &Plan) -> Question {
     ])
 }
 
-/// The residue round's questions (architecture section 5, "Design review",
-/// The bound, and "Verify", The residue): one per finding `findings` of
-/// review pass `pass` at `stage` asks, blockers first, then by id, at most
-/// [`MAX_QUESTIONS`], each cut so the round holds in [`MAX_QUESTION_BYTES`]
-/// each and [`MAX_QUESTIONS_BYTES`] together. A Design review finding asks
-/// how the plan settles it, a Verify one how the change does (OWL-304);
-/// each recommends settling it, option A (OWL-324).
-/// Returns the questions, each with the finding it asks, and the findings
-/// past the cap, left for the pass after the round.
-pub(crate) fn residue_questions(
-    findings: &[KeptFinding],
-    stage: Stage,
-    pass: u32,
-) -> (Vec<(Question, FindingId)>, Vec<FindingId>) {
-    let (pass_name, work) = if stage == Stage::Verify {
-        ("verify", "change")
-    } else {
-        ("design review", "plan")
-    };
+/// The findings a residue round asks (architecture section 5, "Design
+/// review", The bound, and "Verify", The residue): those asked, blockers
+/// first, then by id, at most [`MAX_QUESTIONS`]; and the ids of those past
+/// the cap, left for the pass after the round.
+pub(crate) fn residue_split(findings: &[KeptFinding]) -> (Vec<&KeptFinding>, Vec<FindingId>) {
     let mut asked: Vec<&KeptFinding> = findings
         .iter()
         .filter(|kept| kept.outcome == Some(FindingOutcome::Asked))
@@ -578,66 +687,110 @@ pub(crate) fn residue_questions(
         .map(|kept| kept.finding.id.clone())
         .collect();
     asked.truncate(MAX_QUESTIONS);
-    let budget = (MAX_QUESTIONS_BYTES / asked.len().max(1)).min(MAX_QUESTION_BYTES) - 256;
-    let questions = asked
+    (asked, over)
+}
+
+/// The longest claim, evidence and settlement a residue question shows,
+/// tried in turn until it fits.
+const RESIDUE_CAPS: [usize; 9] = [2_000, 1_000, 500, 250, 180, 120, 90, 60, 30];
+
+/// The fewest characters of evidence a residue question's context shows;
+/// with less room, it shows none.
+const MIN_EVIDENCE_CHARS: usize = 20;
+
+/// The residue round's questions: one per finding [`residue_split`] asks of
+/// review pass `pass` at `stage`, each with the finding it asks. A Design
+/// review finding asks how the plan settles it, a Verify one how the change
+/// does (OWL-304); each recommends settling it, option A (OWL-324). Each is
+/// cut to hold in [`MAX_QUESTION_BYTES`], the round in
+/// [`MAX_QUESTIONS_BYTES`], and its block in an equal share of what
+/// [`ROUND_BUDGET_CHARS`] leaves past [`ROUND_FRAME_CHARS`] (OWL-352). Its
+/// context, within [`CONTEXT_CHARS`], names the finding and its ruling,
+/// links to the review log of the plan's `document` when given, and shows
+/// the evidence that the room left holds.
+pub(crate) fn residue_questions(
+    findings: &[KeptFinding],
+    stage: Stage,
+    document: Option<PlanLink<'_>>,
+) -> Vec<(Question, FindingId)> {
+    let work = if stage == Stage::Verify {
+        "change"
+    } else {
+        "plan"
+    };
+    let (asked, _) = residue_split(findings);
+    let n = asked.len().max(1);
+    let bytes = (MAX_QUESTIONS_BYTES / n).min(MAX_QUESTION_BYTES) - 256;
+    let share = ROUND_BUDGET_CHARS.saturating_sub(ROUND_FRAME_CHARS) / n;
+    asked
         .iter()
         .enumerate()
-        .map(|(n, kept)| {
+        .map(|(i, kept)| {
             let finding = &kept.finding;
+            let judged = match &kept.ruling {
+                Some(ruling) if ruling.outcome == RulingOutcome::Confirmed => {
+                    "confirmed by the arbiter"
+                }
+                Some(_) => "ruled by the arbiter",
+                None => "judged by no one",
+            };
+            let mut lead = format!(
+                "Finding {} · {} · {} · {judged}",
+                finding.id,
+                severity_name(finding.severity),
+                mandate_names(&kept.reviewer.mandates),
+            );
+            if let Some(link) = document {
+                lead.push_str(" · ");
+                lead.push_str(&link.to("review log"));
+            }
+            lead.push('.');
+            const EVIDENCE: &str = " Evidence: ";
+            let room = CONTEXT_CHARS
+                .saturating_sub(chars(&lead))
+                .saturating_sub(chars(EVIDENCE));
             let make = |cap: usize| {
-                let judged = match (&kept.ruling, &kept.response) {
-                    (Some(ruling), _) => {
-                        format!("The arbiter confirmed it: {}", clip(&ruling.reason, cap))
-                    }
-                    _ => "No one judged it: its author answers findings after a pass, and none \
-                          follows this one."
-                        .to_owned(),
-                };
-                let criterion = finding
-                    .criterion
-                    .as_deref()
-                    .map(|criterion| {
-                        format!(" It bears on the criterion: {}.", clip(criterion, cap))
-                    })
-                    .unwrap_or_default();
+                let mut context = lead.clone();
+                if room >= MIN_EVIDENCE_CHARS {
+                    context.push_str(EVIDENCE);
+                    context.push_str(&clip(&flatten(&finding.evidence), room.min(cap)));
+                }
                 Question {
-                    id: QuestionId::nth(u32::try_from(n + 1).unwrap_or(u32::MAX)),
+                    id: QuestionId::nth(u32::try_from(i + 1).unwrap_or(u32::MAX)),
                     category: FINDING_CATEGORY.to_owned(),
-                    context: format!(
-                        "Finding {} of {pass_name} pass {pass}, {}, raised by the {} reviewer \
-                         on {}, still stands after the passes the design allows. Evidence: \
-                         {}. {judged}{criterion}",
-                        finding.id,
-                        severity_name(finding.severity),
-                        mandate_names(&kept.reviewer.mandates),
-                        harness_name(kept.reviewer.harness),
-                        clip(&finding.evidence, cap),
-                    ),
+                    context,
                     text: format!(
                         "{} How should the {work} settle it?",
-                        clip(&finding.claim, cap)
+                        clip(&flatten(&finding.claim), cap)
                     ),
                     options: vec![
-                        QuestionOption::new(format!("Settle it: {}", clip(&finding.settle, cap))),
+                        QuestionOption::new(format!(
+                            "Settle it: {}",
+                            clip(&flatten(&finding.settle), cap)
+                        )),
                         QuestionOption::new(format!("Leave the {work} as it is")),
                     ],
                     recommendation: Some(Recommendation {
                         option: Some("A".to_owned()),
-                        why: "The finding still stands after the passes the design allows."
-                            .to_owned(),
+                        why: "It stands after the passes the design allows.".to_owned(),
                     }),
                     replan: false,
                 }
             };
-            (fitting(budget, make), finding.id.clone())
+            let fits = |q: &Question| weight(q) <= bytes && chars(&question_block(q)) <= share;
+            let question = RESIDUE_CAPS
+                .iter()
+                .map(|cap| make(*cap))
+                .find(fits)
+                .unwrap_or_else(|| make(RESIDUE_CAPS[RESIDUE_CAPS.len() - 1]));
+            (question, finding.id.clone())
         })
-        .collect();
-    (questions, over)
+        .collect()
 }
 
 fn severity_name(severity: Severity) -> &'static str {
     match severity {
-        Severity::Blocker => "a blocker",
+        Severity::Blocker => "blocker",
         Severity::Major => "major",
         Severity::Minor => "minor",
     }
@@ -654,13 +807,6 @@ fn mandate_names(mandates: &[owlshift_contracts::review::Mandate]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" and ")
-}
-
-fn harness_name(harness: HarnessKind) -> &'static str {
-    match harness {
-        HarnessKind::Claude => "Claude Code",
-        HarnessKind::Codex => "Codex",
-    }
 }
 
 fn harness_key(harness: HarnessKind) -> &'static str {
@@ -1332,10 +1478,10 @@ impl OnDemand<'_> {
             settle_pass(stage, pass, &mut findings, confirmation).expect("a review stage settles");
         // The residue round asks what it can; the rest waits for the pass
         // after the round (OWL-303).
-        let (questions, not_asked) = if verdict.outcome == PassOutcome::Ask {
-            residue_questions(&findings, stage, pass)
+        let not_asked = if verdict.outcome == PassOutcome::Ask {
+            residue_split(&findings).1
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
         for kept in &mut findings {
             if not_asked.contains(&kept.finding.id) {
@@ -1441,7 +1587,6 @@ impl OnDemand<'_> {
             outputs,
             findings,
             verdict,
-            questions,
             not_asked,
             last_run,
             cost,
@@ -1482,7 +1627,6 @@ impl OnDemand<'_> {
             outputs,
             findings,
             verdict,
-            questions,
             not_asked,
             last_run,
             cost,
@@ -1577,17 +1721,20 @@ impl OnDemand<'_> {
                     "The plan passed design review pass {pass} and waits for your approval: \
                          the PLAN comment above shows it."
                 ),
-                vec![approval_question(&kept.plan)],
+                vec![approval_question(&kept.plan, plan_link(&ticket, &kept))],
                 Vec::new(),
             )
         } else {
-            let (asked, findings) = questions
-                .into_iter()
-                .map(|(question, finding)| {
-                    let id = question.id.clone();
-                    (question, (id, finding))
-                })
-                .unzip();
+            // Built once the plan is published, to link to its review log
+            // (OWL-352).
+            let (asked, findings) =
+                residue_questions(&findings, Stage::DesignReview, plan_link(&ticket, &kept))
+                    .into_iter()
+                    .map(|(question, finding)| {
+                        let id = question.id.clone();
+                        (question, (id, finding))
+                    })
+                    .unzip();
             (
                 format!(
                     "Design review pass {pass} left findings that the plan's revisions did \
@@ -1856,6 +2003,8 @@ impl OnDemand<'_> {
 mod tests {
     use owlshift_contracts::review::{Alternative, Fork, Mandate, PlanStep, Ruling};
     use owlshift_core::state::{Status, TicketState};
+
+    use crate::writer::MAX_POINTER_URL_CHARS;
 
     use super::*;
 
@@ -2143,8 +2292,9 @@ mod tests {
         }
     }
 
-    /// The approval question offers to approve, then each fork's other
-    /// options, and holds in a question's bytes whatever the plan's forks.
+    /// Without the plan's document, the approval question offers to
+    /// approve, then each fork's other options, and holds in a question's
+    /// bytes whatever the plan's forks.
     #[test]
     fn the_approval_question_offers_the_forks_within_a_questions_bytes() {
         let fork = |choice: &str, other: &str| Fork {
@@ -2155,7 +2305,7 @@ mod tests {
         let labels = |question: &Question| -> Vec<String> {
             question.options.iter().map(|o| o.label.clone()).collect()
         };
-        let question = approval_question(&plan(vec![fork("Markdown", "Plain text")]));
+        let question = approval_question(&plan(vec![fork("Markdown", "Plain text")]), None);
         assert_eq!(question.category, APPROVAL_CATEGORY);
         assert_eq!(
             labels(&question),
@@ -2163,18 +2313,161 @@ mod tests {
         );
         // It recommends approval, option A (OWL-324).
         assert_eq!(question.recommended_option(), Some(0));
-        let none = approval_question(&plan(Vec::new()));
+        let none = approval_question(&plan(Vec::new()), None);
         assert_eq!(labels(&none), [APPROVE]);
         // Alternatives past 8 KiB are cut, then left to the PLAN comment.
         let long = "x".repeat(3_000);
         let other = "y".repeat(3_000);
         let wide: Vec<Fork> = (0..4).map(|_| fork(&long, &other)).collect();
-        let cut = approval_question(&plan(wide));
+        let cut = approval_question(&plan(wide), None);
         assert!(weight(&cut) <= MAX_QUESTION_BYTES, "{}", weight(&cut));
         assert_eq!(cut.options.len(), 5);
         let many: Vec<Fork> = (0..400).map(|n| fork(&format!("a{n}"), &long)).collect();
-        let folded = approval_question(&plan(many));
+        let folded = approval_question(&plan(many), None);
         assert!(weight(&folded) <= MAX_QUESTION_BYTES, "{}", weight(&folded));
+    }
+
+    fn ticket_id() -> TicketId {
+        TicketId::new("OWL-160").unwrap()
+    }
+
+    /// A Linear document link of the length OWL-350's live check saw.
+    const URL: &str = "https://linear.app/owlshift/document/plan-owl-160-3f2a9c1b7d4e";
+
+    fn link(url: &str) -> PlanLink<'_> {
+        static TICKET: std::sync::OnceLock<TicketId> = std::sync::OnceLock::new();
+        PlanLink {
+            ticket: TICKET.get_or_init(ticket_id),
+            url: Some(url),
+        }
+    }
+
+    /// A QUESTIONS comment of the runner's, as `ask` posts it, and its
+    /// characters with a mention of `mention` characters on its header.
+    fn round(
+        summary: &str,
+        questions: Vec<Question>,
+        notes: Vec<QuestionNote>,
+        decided: usize,
+        fallback: Option<crate::resolver::Fallback>,
+        mention: usize,
+    ) -> (String, usize) {
+        let body = crate::writer::QuestionsComment {
+            ticket: ticket_id(),
+            round: NonZeroU32::new(12).unwrap(),
+            summary: summary.to_owned(),
+            questions,
+            premise_false: false,
+            decided,
+            fallback,
+            reopened: Vec::new(),
+            notes,
+        }
+        .render();
+        let total = chars(&body) + if mention > 0 { 3 + mention } else { 0 };
+        (body, total)
+    }
+
+    /// OWL-160's approval round, replayed (OWL-352): 3 forks of 26 options
+    /// in all, which the round before showed as 26 options, reads as 2
+    /// options and 3 fork lines, each linking to the plan's document, in
+    /// under 1,500 characters.
+    #[test]
+    fn the_owl_160_approval_round_fits_at_a_glance() {
+        let fork = |n: usize, options: usize| {
+            let options: Vec<String> = (0..options)
+                .map(|i| {
+                    format!(
+                        "Option {i} of fork {n}: {}",
+                        "a fairly long alternative ".repeat(3)
+                    )
+                })
+                .collect();
+            Fork {
+                choice: format!(
+                    "{} (fork {n})",
+                    "Keep the whole plan in the ticket ref and ".repeat(2)
+                ),
+                options,
+                reason: "R".to_owned(),
+            }
+        };
+        let plan = plan(vec![fork(1, 12), fork(2, 9), fork(3, 5)]);
+        let question = approval_question(&plan, Some(link(URL)));
+        let labels: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, [APPROVE, "Change it"]);
+        assert_eq!(question.recommended_option(), Some(0));
+        assert!(question.context.contains(URL), "{}", question.context);
+        let note = approval_note(&question, &plan, link(URL)).unwrap();
+        let summary = "The plan passed design review pass 5 and waits for your approval: the \
+                       PLAN comment above shows it.";
+        let (body, total) = round(summary, vec![question], vec![note], 0, None, 45);
+        let forks: Vec<&str> = body.lines().filter(|l| l.starts_with("- Fork ")).collect();
+        assert_eq!(forks.len(), 3, "{body}");
+        assert!(forks.iter().all(|line| line.contains(URL)), "{body}");
+        assert!(!body.contains(" instead of "), "{body}");
+        assert!(total < 1_500, "{total}\n{body}");
+        // A plan of many forks gives one line linking the document, within
+        // the budget.
+        let many = Plan {
+            forks: (1..=40).map(|n| fork(n, 3)).collect(),
+            ..plan
+        };
+        let question = approval_question(&many, Some(link(URL)));
+        let note = approval_note(&question, &many, link(URL)).unwrap();
+        assert_eq!(note.lines.len(), 1, "{:?}", note.lines);
+        let (body, total) = round(summary, vec![question], vec![note], 0, None, 45);
+        assert!(total <= ROUND_BUDGET_CHARS, "{total}\n{body}");
+        // No fork, no note.
+        assert!(
+            approval_note(&question_without_forks(), &plan_without_forks(), link(URL)).is_none()
+        );
+    }
+
+    /// OWL-352: the approval round on a tracker with documents, exactly.
+    #[test]
+    fn the_approval_round_renders_as_the_target() {
+        let plan = plan(vec![Fork {
+            choice: "Markdown.".to_owned(),
+            options: vec!["Markdown.".to_owned(), "Plain text.".to_owned()],
+            reason: "R".to_owned(),
+        }]);
+        let question = approval_question(&plan, Some(link(URL)));
+        let note = approval_note(&question, &plan, link(URL)).unwrap();
+        let (body, _) = round("S.", vec![question], vec![note], 0, None, 0);
+        let target = format!(
+            "\
+[owlshift] QUESTIONS · round 12
+
+S.
+
+### Q1 · Do you approve the plan as it is, or change it?
+The plan passed its design review. Its forks are in [the plan's document]({URL}), each fork's \
+             options lettered A, B, C… in their order.
+
+- **A.** ⭐ Approve the plan as it is
+- **B.** Change it — say what in your own words, such as `B, fork 1 option C`
+
+**Recommendation: A.** The plan passed its design review.
+
+**The plan's forks**, each with its choice:
+- Fork 1: Markdown. · [its options]({URL})
+
+---
+Reply `Q1: A`, `ok` to take every recommendation, or in your own words.
+
+<!-- owlshift:{{\"format\":1,\"kind\":\"QUESTIONS\",\"ticket\":\"OWL-160\",\"round\":12}} -->
+"
+        );
+        assert_eq!(body, target);
+    }
+
+    fn plan_without_forks() -> Plan {
+        plan(Vec::new())
+    }
+
+    fn question_without_forks() -> Question {
+        approval_question(&plan_without_forks(), Some(link(URL)))
     }
 
     fn asked(n: u32, severity: Severity, text: usize) -> KeptFinding {
@@ -2194,6 +2487,10 @@ mod tests {
         }
     }
 
+    fn ids(questions: &[(Question, FindingId)]) -> Vec<&str> {
+        questions.iter().map(|(_, id)| id.as_str()).collect()
+    }
+
     /// One question per asked finding, blockers first, within a round's
     /// bounds; past the most questions a round holds, the rest wait.
     #[test]
@@ -2206,34 +2503,28 @@ mod tests {
                 ..asked(3, Severity::Minor, 10)
             },
         ];
-        let (questions, over) = residue_questions(&findings, Stage::DesignReview, 2);
-        let asked_ids: Vec<&str> = questions.iter().map(|(_, id)| id.as_str()).collect();
-        assert_eq!(asked_ids, ["F2", "F1"]);
-        assert!(over.is_empty());
+        let questions = residue_questions(&findings, Stage::DesignReview, None);
+        assert_eq!(ids(&questions), ["F2", "F1"]);
+        assert!(residue_split(&findings).1.is_empty());
         let (first, _) = &questions[0];
         assert_eq!(first.id, QuestionId::nth(1));
         assert_eq!(first.category, FINDING_CATEGORY);
-        assert!(
-            first
-                .context
-                .contains("Finding F2 of design review pass 2, a blocker")
+        assert_eq!(
+            first.context,
+            "Finding F2 · blocker · critic · confirmed by the arbiter. Evidence: eeeeeeeeee"
         );
         assert_eq!(first.options[1].label, "Leave the plan as it is");
         // It recommends settling it, option A (OWL-324).
         assert_eq!(first.recommended_option(), Some(0));
         // At Verify, the change settles it (OWL-304).
-        let (questions, _) = residue_questions(&findings, Stage::Verify, 3);
+        let questions = residue_questions(&findings, Stage::Verify, None);
         let (first, _) = &questions[0];
-        assert!(
-            first
-                .context
-                .contains("Finding F2 of verify pass 3, a blocker")
-        );
         assert!(first.text.ends_with("How should the change settle it?"));
         assert_eq!(first.options[1].label, "Leave the change as it is");
 
         let many: Vec<KeptFinding> = (1..=70).map(|n| asked(n, Severity::Major, 2_000)).collect();
-        let (questions, over) = residue_questions(&many, Stage::DesignReview, 3);
+        let questions = residue_questions(&many, Stage::DesignReview, Some(link(URL)));
+        let (_, over) = residue_split(&many);
         assert_eq!(questions.len(), MAX_QUESTIONS);
         assert_eq!(over.len(), 6);
         assert_eq!(over[0], FindingId::nth(65));
@@ -2244,6 +2535,102 @@ mod tests {
                 .iter()
                 .all(|(q, _)| weight(q) <= MAX_QUESTION_BYTES)
         );
+    }
+
+    /// Four residue questions of maximal texts make a round within
+    /// [`ROUND_BUDGET_CHARS`] (OWL-352), whatever the resolver adds to the
+    /// round and with the longest document link; each context holds in
+    /// [`CONTEXT_CHARS`], linking to the review log when there is a
+    /// document, and shows some evidence.
+    #[test]
+    fn a_residue_round_of_four_holds_in_the_budget() {
+        let long = format!(
+            "https://linear.app/{}",
+            "w".repeat(MAX_POINTER_URL_CHARS - 19)
+        );
+        assert_eq!(long.chars().count(), MAX_POINTER_URL_CHARS);
+        let mut findings: Vec<KeptFinding> = (1..=4)
+            .map(|n| asked(n, Severity::Blocker, 2_000))
+            .collect();
+        findings[0].reviewer.mandates = vec![Mandate::Critic, Mandate::Conformance, Mandate::Debt];
+        let summary = "Design review pass 3 left findings that the plan's revisions did not \
+                       settle: each is a question below, and the plan the PLAN comment above \
+                       shows lists them.";
+        for document in [Some(link(&long)), Some(link(URL)), None] {
+            let questions: Vec<Question> =
+                residue_questions(&findings, Stage::DesignReview, document)
+                    .into_iter()
+                    .map(|(q, _)| q)
+                    .collect();
+            for question in &questions {
+                assert!(
+                    chars(&question.context) <= CONTEXT_CHARS,
+                    "{}",
+                    question.context
+                );
+                assert!(
+                    question.context.contains(" Evidence: e"),
+                    "{}",
+                    question.context
+                );
+                if let Some(link) = document {
+                    assert!(
+                        question
+                            .context
+                            .contains(&format!("[review log]({})", link.url.unwrap()))
+                    );
+                }
+            }
+            let (body, total) = round(
+                summary,
+                questions,
+                Vec::new(),
+                2,
+                Some(crate::resolver::Fallback::CostUnreported),
+                MAX_POINTER_URL_CHARS,
+            );
+            assert!(total <= ROUND_BUDGET_CHARS, "{total}\n{body}");
+            assert!(!body.contains("(cut: a question shows"), "{body}");
+        }
+    }
+
+    /// [`ROUND_FRAME_CHARS`] holds the longest frame a round of the
+    /// runner's shows: the longest summary, mention, resolver lines and
+    /// round number.
+    #[test]
+    fn the_round_frame_reserve_holds_the_longest_frame() {
+        use crate::resolver::Fallback;
+        let question = || Question {
+            id: QuestionId::nth(1),
+            category: FINDING_CATEGORY.to_owned(),
+            context: String::new(),
+            text: String::new(),
+            options: vec![QuestionOption::new("x")],
+            recommendation: None,
+            replan: false,
+        };
+        let block = chars(&question_block(&question()));
+        for fallback in [
+            Fallback::UsageLimit,
+            Fallback::Failed,
+            Fallback::PassLimit(u32::MAX),
+            Fallback::Budget,
+            Fallback::CostUnreported,
+        ] {
+            let (body, total) = round(
+                &"s".repeat(2_000),
+                vec![question()],
+                Vec::new(),
+                usize::MAX,
+                Some(fallback),
+                MAX_POINTER_URL_CHARS,
+            );
+            assert!(
+                total - block <= ROUND_FRAME_CHARS,
+                "{}\n{body}",
+                total - block
+            );
+        }
     }
 
     #[test]

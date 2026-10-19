@@ -238,6 +238,7 @@ fn a_question_round_through_the_app_reaches_its_decider() {
         decided: 0,
         fallback: None,
         reopened: Vec::new(),
+        notes: Vec::new(),
     };
     let posted = Writer::new(&tracker)
         .mentioning(&decider)
@@ -377,6 +378,7 @@ fn maximal_round(ticket: TicketId) -> QuestionsComment {
                 },
             })
             .collect(),
+        notes: Vec::new(),
     }
 }
 

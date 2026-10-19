@@ -418,6 +418,7 @@ mod tests {
             decided: 0,
             fallback: None,
             reopened: Vec::new(),
+            notes: Vec::new(),
         }
         .parts(600);
         assert_eq!(parts.len(), 2);
@@ -508,6 +509,7 @@ mod tests {
             decided: 0,
             fallback: None,
             reopened: Vec::new(),
+            notes: Vec::new(),
         }
         .parts(600);
         assert_eq!(parts.len(), 2);

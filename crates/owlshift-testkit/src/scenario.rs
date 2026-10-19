@@ -848,6 +848,7 @@ impl Driver {
             decided,
             fallback,
             reopened,
+            notes: Vec::new(),
         }
         .render();
         let account = self

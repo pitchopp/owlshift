@@ -71,7 +71,8 @@ use owlshift_contracts::result::{
     Verdict as AnswerVerdict, option_letter,
 };
 use owlshift_contracts::review::{
-    FindingOutcome, KeptFinding, Mandate, Plan, PlanChange, PlanPart, Reviewer, Severity,
+    FindingOutcome, KeptFinding, Mandate, Plan, PlanChange, PlanPart, Reviewer, RulingOutcome,
+    Severity,
 };
 use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
@@ -895,11 +896,24 @@ const SUMMARY_CHARS: usize = 400;
 const QUESTIONS_SUMMARY_CUT: &str = "a question round shows at most 400 characters of the summary";
 
 /// The most characters a question's context shows, in every comment
-/// (OWL-324): the roles write at most two sentences.
-const CONTEXT_CHARS: usize = 1_000;
+/// (OWL-324, 300 since OWL-352): the roles write at most two sentences,
+/// and the runner's own questions link to the plan's document for more.
+pub(crate) const CONTEXT_CHARS: usize = 300;
 
 /// Why a question's context is cut.
-const CONTEXT_CUT: &str = "a question shows at most 1,000 characters of context";
+const CONTEXT_CUT: &str = "a question shows at most 300 characters of context";
+
+/// The most characters a round of the runner's own questions (plan
+/// approval, residue findings) takes, for up to 4 questions (OWL-352;
+/// build plan, "The QUESTIONS layout"): read at a glance, the details one
+/// link away in the plan's document.
+pub const ROUND_BUDGET_CHARS: usize = 3_000;
+
+/// What the runner's own questions leave of [`ROUND_BUDGET_CHARS`] for the
+/// rest of their QUESTIONS comment: the header with the longest mention,
+/// the summary, what the resolver decided or why it did not, the answer
+/// line and the footer (`the_round_frame_reserve_holds_the_longest_frame`).
+pub(crate) const ROUND_FRAME_CHARS: usize = 1_100;
 
 /// The most characters an option's detail shows, in every comment
 /// (OWL-324): the roles write one line.
@@ -937,6 +951,18 @@ pub struct QuestionsComment {
     /// The refused choices the round's questions reopen, under the round's
     /// ids, in place order (OWL-203).
     pub reopened: Vec<ReopenedChoice>,
+    /// The runner's lines shown under a question of this comment alone,
+    /// such as the plan's forks under its approval (OWL-352).
+    pub notes: Vec<QuestionNote>,
+}
+
+/// Lines the runner shows under one question of a QUESTIONS comment, and
+/// nowhere else (OWL-352): Markdown the runner wrote, any model text in it
+/// already flattened. The ticket ref keeps the question without them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionNote {
+    pub question: QuestionId,
+    pub lines: Vec<String>,
 }
 
 /// What follows "Part k of n of this round:" in a part of a split round.
@@ -1102,6 +1128,12 @@ impl QuestionsComment {
             .map(|question| {
                 let mut block = vec![question_block(question)];
                 block.extend(
+                    self.notes
+                        .iter()
+                        .filter(|note| note.question == question.id && !note.lines.is_empty())
+                        .map(|note| note.lines.join("\n")),
+                );
+                block.extend(
                     self.reopened
                         .iter()
                         .filter(|reopened| reopened.question == question.id)
@@ -1116,7 +1148,7 @@ impl QuestionsComment {
 
 /// The characters of `text`, counted as Unicode code points, as Linear
 /// counts them.
-fn chars(text: &str) -> usize {
+pub(crate) fn chars(text: &str) -> usize {
     text.chars().count()
 }
 
@@ -1680,7 +1712,7 @@ impl PlanComment {
     /// from a model, so each is flattened to one line; the comment is cut to
     /// hold in [`MAX_COMMENT_CHARS`], the findings first.
     pub fn render(&self) -> String {
-        let mut texts = plan_texts(&self.plan);
+        let mut texts = plan_texts(&self.plan, false);
         let (left, rejected) = self.sorted();
         finding_texts(&mut texts, &left, &rejected);
         fitted(MAX_COMMENT_CHARS, texts, |texts| {
@@ -1718,7 +1750,7 @@ impl PlanComment {
             round: None,
         };
         let mut sections = vec![header.render()];
-        sections.extend(plan_sections(plan, &mut next));
+        sections.extend(plan_sections(plan, false, &mut next));
         let reviewers: Vec<String> = self
             .reviewers
             .iter()
@@ -1835,7 +1867,7 @@ fn fates<'a>(pass: u32, findings: &'a [KeptFinding], not_asked: &[FindingId]) ->
 }
 
 /// The plan's texts, flattened, in the order [`plan_sections`] shows them.
-fn plan_texts(plan: &Plan) -> Vec<Fit> {
+fn plan_texts(plan: &Plan, lettered: bool) -> Vec<Fit> {
     let mut texts: Vec<Fit> = Vec::new();
     let mut push = |text: &str| texts.push(Fit::new(flatten(text), PLAN_KEPT));
     push(&plan.goal);
@@ -1847,7 +1879,11 @@ fn plan_texts(plan: &Plan) -> Vec<Fit> {
     }
     for fork in &plan.forks {
         push(&fork.choice);
-        push(&fork.options.join(" / "));
+        if lettered {
+            fork.options.iter().for_each(|o| push(o));
+        } else {
+            push(&fork.options.join(" / "));
+        }
         push(&fork.reason);
     }
     for alternative in &plan.alternatives {
@@ -1875,8 +1911,10 @@ fn finding_texts(texts: &mut Vec<Fit>, left: &[Left<'_>], rejected: &[Rejected<'
 
 /// The plan's sections, from its goal to what is out of scope, each text
 /// taken from `next` in [`plan_texts`]'s order: what a PLAN comment and the
-/// plan's document show alike.
-fn plan_sections(plan: &Plan, next: &mut dyn FnMut() -> String) -> Vec<String> {
+/// plan's document show alike, but for a fork's options, which the
+/// document, `lettered`, shows one per bullet lettered A, B, C… in their
+/// order, as an answer names them (OWL-352).
+fn plan_sections(plan: &Plan, lettered: bool, next: &mut dyn FnMut() -> String) -> Vec<String> {
     let mut sections = vec![format!("**Goal.** {}", next())];
     let criteria: Vec<String> = plan.criteria.iter().map(|_| next()).collect();
     sections.push(format!("**Criteria.**\n{}", bullets(&criteria)));
@@ -1895,14 +1933,27 @@ fn plan_sections(plan: &Plan, next: &mut dyn FnMut() -> String) -> Vec<String> {
             .forks
             .iter()
             .enumerate()
-            .map(|(n, _)| {
-                format!(
-                    "Fork {}: {} (options: {}). Why: {}",
-                    n + 1,
-                    next(),
-                    next(),
-                    next()
-                )
+            .map(|(n, fork)| {
+                if !lettered {
+                    return format!(
+                        "Fork {}: {} (options: {}). Why: {}",
+                        n + 1,
+                        next(),
+                        next(),
+                        next()
+                    );
+                }
+                let choice = next();
+                let options: Vec<String> = (0..fork.options.len())
+                    .map(|i| format!("  - **{}.** {}", option_letter(i), next()))
+                    .collect();
+                let reason = next();
+                let mut line = format!("Fork {}: {choice}\n  Why: {reason}", n + 1);
+                for option in options {
+                    line.push('\n');
+                    line.push_str(&option);
+                }
+                line
             })
             .collect();
         sections.push(format!("**Forks.**\n{}", bullets(&forks)));
@@ -2004,9 +2055,9 @@ impl PlanDocument {
                 fates(pass.pass, &pass.findings, not_asked)
             })
             .collect();
-        let mut texts = plan_texts(&self.plan);
+        let mut texts = plan_texts(&self.plan, true);
         for (left, rejected) in &sorted {
-            finding_texts(&mut texts, left, rejected);
+            document_finding_texts(&mut texts, left, rejected);
         }
         let texts: Vec<Fit> = texts
             .into_iter()
@@ -2023,7 +2074,7 @@ impl PlanDocument {
                 self.version,
                 last.unwrap_or(1)
             )];
-            sections.extend(plan_sections(&self.plan, &mut next));
+            sections.extend(plan_sections(&self.plan, true, &mut next));
             sections.push("## Review log".to_owned());
             if skip > 0 {
                 sections.push(format!(
@@ -2047,7 +2098,26 @@ impl PlanDocument {
                 if !left.is_empty() {
                     let found: Vec<String> = left
                         .iter()
-                        .map(|(kept, fate)| format!("{}: {} ({fate})", finding_label(kept), next()))
+                        .map(|(kept, fate)| {
+                            let mut line = format!(
+                                "{}: {} ({fate}) Evidence: {} Settle: {}",
+                                finding_label(kept),
+                                next(),
+                                next(),
+                                next()
+                            );
+                            if kept.finding.criterion.is_some() {
+                                line.push_str(&format!(" Criterion: {}", next()));
+                            }
+                            if let Some(ruling) = &kept.ruling {
+                                line.push_str(&format!(
+                                    " The arbiter {}: {}",
+                                    ruling_name(ruling.outcome),
+                                    next()
+                                ));
+                            }
+                            line
+                        })
                         .collect();
                     lines.push(format!("**Findings left.**\n{}", bullets(&found)));
                 }
@@ -2067,6 +2137,45 @@ impl PlanDocument {
             }
             sections.join("\n\n")
         })
+    }
+}
+
+/// The texts of the findings left, whole, and of those rejected, as the
+/// plan's document shows them (OWL-352): each finding left with its claim,
+/// evidence, settlement, criterion and ruling, which a residue question
+/// links to; each rejected one capped as in a PLAN comment.
+fn document_finding_texts(texts: &mut Vec<Fit>, left: &[Left<'_>], rejected: &[Rejected<'_>]) {
+    let whole = |text: &str| Fit::new(flatten(text), DOCUMENT_KEPT);
+    for (kept, _) in left {
+        let finding = &kept.finding;
+        texts.push(whole(&finding.claim));
+        texts.push(whole(&finding.evidence));
+        texts.push(whole(&finding.settle));
+        if let Some(criterion) = &finding.criterion {
+            texts.push(whole(criterion));
+        }
+        if let Some(ruling) = &kept.ruling {
+            texts.push(whole(&ruling.reason));
+        }
+    }
+    finding_texts(texts, &[], rejected);
+}
+
+fn ruling_name(outcome: RulingOutcome) -> &'static str {
+    match outcome {
+        RulingOutcome::Confirmed => "confirmed it",
+        RulingOutcome::Rejected => "rejected it",
+    }
+}
+
+/// A link to the plan's document, `what` its text: a Markdown link when
+/// the tracker's link is `https`, otherwise the link as code beside it, or
+/// the document's title when the tracker gave none.
+pub(crate) fn document_link(what: &str, url: Option<&str>, ticket: &TicketId) -> String {
+    match url {
+        Some(url) if safe_url(url) => link(what, url),
+        Some(url) => format!("{what}, {}", code(url)),
+        None => format!("{what}, in the ticket's document Plan · {ticket}"),
     }
 }
 
@@ -2099,12 +2208,11 @@ impl PlanPointer {
     /// text is the runner's but the link, which a person opens: an `https`
     /// one is a link, another is shown as code beside the title.
     pub fn render(&self) -> String {
-        const WHAT: &str = "the plan and its review log";
-        let document = match self.url.as_deref() {
-            Some(url) if safe_url(url) => link(WHAT, url),
-            Some(url) => format!("{WHAT}, {}", code(url)),
-            None => format!("{WHAT}, in the ticket's document Plan · {}", self.ticket),
-        };
+        let document = document_link(
+            "the plan and its review log",
+            self.url.as_deref(),
+            &self.ticket,
+        );
         let header = Header {
             kind: MarkerKind::Plan,
             round: None,
@@ -4447,6 +4555,12 @@ Merge state reported by the forge: `CLEAN`.
              on Claude Code: Claim 2. Rejected: Not so.\n\n### Design review, pass 2",
             "- F1, major, critic and conformance on Claude Code: Claim 1. (not asked in this \
              round",
+            // OWL-352: each fork's options lettered as an answer names them,
+            // and each finding left whole, which a residue question links to.
+            "**Forks.**\n- Fork 1: Markdown.\n  Why: The repository's docs are Markdown.\n  - \
+             **A.** Markdown.\n  - **B.** Plain text.\n\n",
+            ") Evidence: GREETING.md:1 Settle: Do it. The arbiter confirmed it: Seen at \
+             GREETING.md:1.",
         ] {
             assert!(body.contains(text), "{text}\n---\n{body}");
         }
@@ -4905,6 +5019,7 @@ Context.
                 decided,
                 fallback,
                 reopened: Vec::new(),
+                notes: Vec::new(),
             }
             .render()
         };
@@ -4984,6 +5099,7 @@ Context.
                 reopened(2, "Q2", " ", "Hello"),
                 reopened(3, "Q1", "Which tone", ""),
             ],
+            notes: Vec::new(),
         }
         .render();
         let blocks = [
@@ -5027,6 +5143,7 @@ Context.
             decided: 0,
             fallback: None,
             reopened: Vec::new(),
+            notes: Vec::new(),
         };
         let body = with_mention(comment.render(), Some("@decider"));
         let target = "\
@@ -5121,6 +5238,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     decided: 0,
                     fallback: None,
                     reopened: Vec::new(),
+                    notes: Vec::new(),
                 }
                 .render(),
                 ReaskComment {
@@ -5214,6 +5332,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             decided: 0,
             fallback: None,
             reopened: Vec::new(),
+            notes: Vec::new(),
         };
         let body = comment.render();
         assert!(!body.contains("DECISION"), "{body}");
@@ -5367,6 +5486,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             decided: 0,
             fallback: None,
             reopened: Vec::new(),
+            notes: Vec::new(),
         };
         let reask = ReaskComment {
             ticket: ticket(),
@@ -5470,8 +5590,8 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             .map(|n| Question {
                 id: QuestionId::new(format!("Q{n}")).unwrap(),
                 category: "scope".to_owned(),
-                context: "c".repeat(980),
-                text: format!("Which {n}? {}", "t".repeat(600)),
+                context: "c".repeat(300),
+                text: format!("Which {n}? {}", "t".repeat(1_280)),
                 options: vec![option("o", "d"), option("p", "e")],
                 recommendation: recommends(Some("B"), &"r".repeat(20)),
                 replan: false,
@@ -5506,6 +5626,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             decided: 0,
             fallback: None,
             reopened,
+            notes: Vec::new(),
         }
     }
 
