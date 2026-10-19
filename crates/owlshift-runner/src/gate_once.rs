@@ -153,7 +153,8 @@ impl fmt::Display for Stop {
             ),
             Self::Unverified { marker, text } => write!(
                 f,
-                "the project is refused until a person looks: {}\nRemove {} once done.",
+                "the project is refused until a person looks: {}\nOnce done, run `owlshift \
+                 unquarantine` to clear {}.",
                 text.trim_end(),
                 marker.display()
             ),
@@ -309,9 +310,11 @@ impl GateOnce<'_> {
         }
         // The worktree stays for the person who looks; no more git runs.
         let lines: Vec<String> = run.violations.iter().map(|v| format!("- {v}")).collect();
+        // Its time makes the marker unique, as a run's are (OWL-368).
         let text = format!(
-            "`owlshift gate` on {} broke isolation; its worktree is kept at {}:\n{}\n",
+            "`owlshift gate` on {} broke isolation at {}; its worktree is kept at {}:\n{}\n",
             plan.commit,
+            Timestamp::now(),
             worktree.display(),
             lines.join("\n")
         );
@@ -358,7 +361,8 @@ pub fn render(checked: &Checked) -> String {
         }
         if let Some(marker) = &checked.marker {
             out.push_str(&format!(
-                "The project is refused until a person looks: see {}.\n",
+                "The project is refused until a person looks: see {}, then clear it with \
+                 `owlshift unquarantine`.\n",
                 marker.display()
             ));
         }

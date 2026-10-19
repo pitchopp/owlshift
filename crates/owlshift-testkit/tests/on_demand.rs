@@ -25,6 +25,7 @@ use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::{Repo, Verdict};
 use owlshift_adapters::graphql::{Response, RestAnswer, Transport};
 use owlshift_adapters::harness::codex;
+use owlshift_adapters::notifier::{Error as NotifierError, Notifier};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{self, Capability, Comment, Ticket, Tracker};
 use owlshift_contracts::brief::{
@@ -722,6 +723,19 @@ struct Bench {
     /// The verify seats play from the bench's reply queue, as every other
     /// run does; otherwise they review clean ([`CleanReview`], OWL-304).
     verify_plays: Cell<bool>,
+    /// Each line the runner's notifier showed (OWL-368).
+    notified: Notified,
+}
+
+/// A notifier that records each line instead of showing it.
+#[derive(Default)]
+struct Notified(RefCell<Vec<String>>);
+
+impl Notifier for Notified {
+    fn notify(&self, line: &str) -> Result<(), NotifierError> {
+        self.0.borrow_mut().push(line.to_owned());
+        Ok(())
+    }
 }
 
 const DONE: &str = r#"{"format":12,"status":"done","summary":"Added GREETING.md; the gate passes.",
@@ -848,6 +862,7 @@ impl Bench {
             fold: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
+            notified: Notified::default(),
         }
     }
 
@@ -1245,6 +1260,7 @@ impl Bench {
             dirs: &dirs,
             head_wait: Duration::ZERO,
             clock: &now,
+            notifier: Some(&self.notified),
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
@@ -2476,6 +2492,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         dirs: &dirs,
         head_wait: Duration::ZERO,
         clock: &on_demand::system_clock,
+        notifier: None,
     };
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
@@ -2554,6 +2571,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         dirs: &dirs,
         head_wait: Duration::ZERO,
         clock: &on_demand::system_clock,
+        notifier: None,
     };
     for command in ["do", "continue"] {
         let mut out = Vec::new();
