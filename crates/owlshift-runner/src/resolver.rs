@@ -7,7 +7,7 @@
 //! adds, goes to the decider and never to the resolver, and so does the
 //! plan-approval question under `plan_approval = "always"`. Since OWL-342
 //! every other question every role raises goes to a run of the `resolver`
-//! role (`roles/resolver.md`), read-only and without network, whose brief
+//! role (`roles/resolver.md`), read-only with Bash (OWL-344), whose brief
 //! lists them in `resolve` beside the asking run's own output. Its outcome
 //! ([`outcome`])
 //! either decides or passes on each question, or, when the run gave no usable
