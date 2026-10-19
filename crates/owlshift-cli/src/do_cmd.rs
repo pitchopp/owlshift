@@ -321,8 +321,6 @@ fn run_with(
     ))
 }
 
-/// The project file `command` works with, and its path, from a valid
-/// configuration: why it cannot otherwise.
 /// The resolver's router (OWL-344): the shared harness with the resolver's
 /// prompt and Bash, inside the read-only profile, on the tier and effort
 /// `OnDemand::resolve` routes each run to.
@@ -337,6 +335,8 @@ fn resolver_router(harness: &ClaudeHarness, prompt: String, models: &Models) -> 
     }
 }
 
+/// The project file `command` works with, and its path, from a valid
+/// configuration: why it cannot otherwise.
 pub(crate) fn loaded_project<'c>(
     config: &'c Effective,
     command: &str,
