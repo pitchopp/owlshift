@@ -118,6 +118,16 @@ states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs I
 # in the personal configuration. A path under your home stays unreadable to
 # the sandboxed run unless it is on the PATH.
 # gate_env = [\"FEATURE_FLAGS\"]
+# The commands that install the gate's dependencies, run in order with the
+# network open before a Build's agent starts and again before the gate. The
+# run's temporary folder is kept between them; the worktree may change only
+# in ignored files, so install with a frozen or locked lockfile.
+# setup = [\"pnpm install --frozen-lockfile\"]
+# Folders of your home, such as a package store, that the setup, the agent
+# and the gate read, never write. Each machine that runs Owlshift opens only
+# the folders its operator lists in `allow_caches` in the personal
+# configuration; a folder holding credentials is refused.
+# caches = [\"Library/pnpm\"]
 # The files agents receive as the project's rules, taken whole from the
 # default branch. Left out, the root AGENTS.md is used when there is one.
 # Once set, every file listed must exist there; [] sends no rule.
@@ -539,6 +549,14 @@ mod tests {
             linear.lines().filter(|l| l.starts_with('#')).count() > 10,
             "{linear}"
         );
+
+        // OWL-330: the setup and cache examples are valid once uncommented.
+        let uncommented = linear
+            .replace("# setup = ", "setup = ")
+            .replace("# caches = ", "caches = ");
+        let config = ProjectConfig::parse(&uncommented).unwrap();
+        assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
+        assert_eq!(config.stack.caches, ["Library/pnpm"]);
 
         let markdown = project_file(&options(TrackerKind::Markdown, None, &[])).unwrap();
         let config = ProjectConfig::parse(&markdown).unwrap();

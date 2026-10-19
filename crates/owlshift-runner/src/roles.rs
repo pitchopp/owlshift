@@ -153,6 +153,36 @@ mod tests {
         }
     }
 
+    /// OWL-330: the built-in prompts tell the truth about the network and
+    /// the project's setup: the Build's, that a declared setup already ran
+    /// and what a setup failure asks; the rebase's, that none ran before it.
+    #[test]
+    fn the_prompts_say_what_the_network_and_the_setup_are() {
+        let build = format::strip_role_front_matter(Role::Build, BUILD_ROLE).expect("strips");
+        for said in [
+            "limit those tools only: your shell keeps the network",
+            "through the project's package manager",
+            "When the project declares a setup for its gate, the runner ran it in this worktree \
+             before your run started, and runs it again before its gate",
+            "whose `reason` starts `setup: ` is the project's setup that failed",
+        ] {
+            assert!(build.contains(said), "roles/build.md does not say {said:?}");
+        }
+        let rebase = format::strip_role_front_matter(Role::Rebase, REBASE_ROLE).expect("strips");
+        for said in [
+            "limits your web tools (WebFetch, WebSearch) only: your shell keeps the network",
+            "through the project's package manager",
+            "runs the setup the project declares for its gate only before its own gate, after \
+             your `done`, never before your run",
+        ] {
+            assert!(
+                rebase.contains(said),
+                "roles/rebase.md does not say {said:?}"
+            );
+        }
+        assert!(!rebase.contains("ran it"), "{rebase}");
+    }
+
     #[test]
     fn refuses_a_missing_file() {
         let dir = tempfile::tempdir().expect("tempdir");
