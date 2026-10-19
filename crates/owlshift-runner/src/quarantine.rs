@@ -55,6 +55,7 @@ pub fn breach_kinds(violations: &[Violation]) -> Vec<&'static str> {
                 "the main checkout changed"
             }
             Violation::SharedGitFiles(_) => "the repository's shared git files changed",
+            Violation::WorktreeEntries(_) => "other worktrees' entries in the git folder changed",
             Violation::Refs(_) => "refs changed outside the run's branch",
             Violation::Branch { .. } => "the worktree changed branch",
             Violation::WorktreeLink(_) => LINK_CHANGED,
