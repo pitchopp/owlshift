@@ -52,7 +52,7 @@ fn findings(found: &[(&str, &str, Option<&str>)]) -> String {
             finding
         })
         .collect();
-    json!({ "format": 12, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 13, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -123,7 +123,7 @@ impl Bench {
 #[test]
 fn scenario_s8_a_false_premise_at_intake_is_rescoped() {
     let bench = Bench::draining("maintainer");
-    let premise = r#"{"format":12,"status":"premise_false",
+    let premise = r#"{"format":13,"status":"premise_false",
 "summary":"The ticket extends a greeting file that does not exist.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; there is none.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
@@ -208,12 +208,12 @@ fn scenario_s8_a_false_premise_at_intake_is_rescoped() {
 #[test]
 fn scenario_s8_a_false_premise_at_design_is_closed() {
     let bench = Bench::draining("maintainer");
-    let premise = r#"{"format":12,"status":"premise_false",
+    let premise = r#"{"format":13,"status":"premise_false",
 "summary":"The greeting file the ticket extends is not in the repository.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; no such file exists.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
 "options":[{"label":"Re-scope: create GREETING.md."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
-    let closed = r#"{"format":12,"status":"blocked",
+    let closed = r#"{"format":13,"status":"blocked",
 "summary":"The decider closes the ticket: its premise is false, so nothing is to be built."}"#;
     let closure = "B: Close the ticket: its premise is false.";
     let replies = vec![

@@ -157,14 +157,24 @@
           "const": "rejected"
         },
         {
-          "description": "It went to the decider in a question round.",
+          "description": "It went to the decider in a question round; no pass asks one since\nOWL-377, a record written before keeps it.",
           "type": "string",
           "const": "asked"
         },
         {
-          "description": "It became a proposed follow-up.",
+          "description": "It became a proposed follow-up; the runner proposes none since\nOWL-377, a record written before keeps it.",
           "type": "string",
           "const": "proposed"
+        },
+        {
+          "description": "The author kept its choice against it, saying why (OWL-377).",
+          "type": "string",
+          "const": "disagreed"
+        },
+        {
+          "description": "The Build left it, a `minor` on no criterion, for a follow-up or a\nnote (OWL-377).",
+          "type": "string",
+          "const": "deferred"
         }
       ]
     },
@@ -478,11 +488,28 @@
       ]
     },
     "ResponseOutcome": {
-      "description": "What the author did with a finding.",
-      "type": "string",
-      "enum": [
-        "fixed",
-        "rejected"
+      "description": "What the author did with a finding (architecture section 5, \"A finding\ngoes to its author\").",
+      "oneOf": [
+        {
+          "description": "The work settles it.",
+          "type": "string",
+          "const": "fixed"
+        },
+        {
+          "description": "In author mode: the claim does not hold.",
+          "type": "string",
+          "const": "rejected"
+        },
+        {
+          "description": "The arbiter confirmed it and the author keeps its choice, saying why\n(format 13, OWL-377).",
+          "type": "string",
+          "const": "disagreed"
+        },
+        {
+          "description": "A `minor` on no success criterion the Build leaves for a follow-up or\na note, its reason saying which (format 13, OWL-377).",
+          "type": "string",
+          "const": "deferred"
+        }
       ]
     },
     "ReviewComment": {
@@ -555,6 +582,14 @@
           "items": {
             "$ref": "#/$defs/Reviewer"
           }
+        },
+        "revision": {
+          "description": "At Design review, the design run whose last revision the pass keeps\n(OWL-377): the revision that answered the findings of the pass\nbefore, the loop's last, which no reviewer reviews. Such a pass has\nno reviewer, no finding and no plan's print.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "\\S"
         },
         "stage": {
           "description": "`design_review` or `verify`.",

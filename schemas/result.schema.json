@@ -29,7 +29,7 @@
       }
     },
     "finding_responses": {
-      "description": "The author's answer to each finding of its brief, in finding order\n(format 9): only from a design or build run whose brief gives\nfindings to answer, and only with `done`.",
+      "description": "The author's answer to each finding of its brief, in finding order\n(format 9): only from a design or build run whose brief gives\nfindings to answer, or since format 13 to fix (OWL-377), and only\nwith `done`.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/FindingResponse"
@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 12
+      "const": 13
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -627,7 +627,7 @@
       "pattern": "^F[1-9][0-9]*$"
     },
     "FindingResponse": {
-      "description": "The author's answer to one finding it was given, in author mode\n(`pipeline.findings = \"author\"`).",
+      "description": "The author's answer to one finding it was given: in author mode\n(`pipeline.findings = \"author\"`), or, since OWL-377, to one the arbiter\nconfirmed.",
       "type": "object",
       "properties": {
         "finding": {
@@ -1088,11 +1088,28 @@
       ]
     },
     "ResponseOutcome": {
-      "description": "What the author did with a finding.",
-      "type": "string",
-      "enum": [
-        "fixed",
-        "rejected"
+      "description": "What the author did with a finding (architecture section 5, \"A finding\ngoes to its author\").",
+      "oneOf": [
+        {
+          "description": "The work settles it.",
+          "type": "string",
+          "const": "fixed"
+        },
+        {
+          "description": "In author mode: the claim does not hold.",
+          "type": "string",
+          "const": "rejected"
+        },
+        {
+          "description": "The arbiter confirmed it and the author keeps its choice, saying why\n(format 13, OWL-377).",
+          "type": "string",
+          "const": "disagreed"
+        },
+        {
+          "description": "A `minor` on no success criterion the Build leaves for a follow-up or\na note, its reason saying which (format 13, OWL-377).",
+          "type": "string",
+          "const": "deferred"
+        }
       ]
     },
     "Routing": {

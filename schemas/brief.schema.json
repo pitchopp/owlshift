@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 21
+      "const": 22
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -701,14 +701,24 @@
           "const": "rejected"
         },
         {
-          "description": "It went to the decider in a question round.",
+          "description": "It went to the decider in a question round; no pass asks one since\nOWL-377, a record written before keeps it.",
           "type": "string",
           "const": "asked"
         },
         {
-          "description": "It became a proposed follow-up.",
+          "description": "It became a proposed follow-up; the runner proposes none since\nOWL-377, a record written before keeps it.",
           "type": "string",
           "const": "proposed"
+        },
+        {
+          "description": "The author kept its choice against it, saying why (OWL-377).",
+          "type": "string",
+          "const": "disagreed"
+        },
+        {
+          "description": "The Build left it, a `minor` on no criterion, for a follow-up or a\nnote (OWL-377).",
+          "type": "string",
+          "const": "deferred"
         }
       ]
     },
@@ -726,7 +736,7 @@
           "const": "answer"
         },
         {
-          "description": "The author fixes each, as confirmed by the arbiter: a design or\nbuild run.",
+          "description": "The author settles each, as confirmed by the arbiter, and answers\neach (format 13, OWL-377): fixed, disagreed with, or, from the Build\nand for a `minor` on no criterion, deferred; a design or build run.",
           "type": "string",
           "const": "fix"
         },
@@ -1331,11 +1341,28 @@
       "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
     },
     "ResponseOutcome": {
-      "description": "What the author did with a finding.",
-      "type": "string",
-      "enum": [
-        "fixed",
-        "rejected"
+      "description": "What the author did with a finding (architecture section 5, \"A finding\ngoes to its author\").",
+      "oneOf": [
+        {
+          "description": "The work settles it.",
+          "type": "string",
+          "const": "fixed"
+        },
+        {
+          "description": "In author mode: the claim does not hold.",
+          "type": "string",
+          "const": "rejected"
+        },
+        {
+          "description": "The arbiter confirmed it and the author keeps its choice, saying why\n(format 13, OWL-377).",
+          "type": "string",
+          "const": "disagreed"
+        },
+        {
+          "description": "A `minor` on no success criterion the Build leaves for a follow-up or\na note, its reason saying which (format 13, OWL-377).",
+          "type": "string",
+          "const": "deferred"
+        }
       ]
     },
     "ReversedDecision": {

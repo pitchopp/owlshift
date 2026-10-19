@@ -834,7 +834,7 @@ mod tests {
             })
             .collect();
         finished(&format!(
-            r#"{{"format":12,"status":"done","summary":"s","verdicts":[{}]}}"#,
+            r#"{{"format":13,"status":"done","summary":"s","verdicts":[{}]}}"#,
             verdicts.join(",")
         ))
     }
@@ -869,12 +869,12 @@ mod tests {
         assert_eq!(event_of(&done(&[])), Event::RunFailed);
         for status in ["failed", "blocked", "premise_false"] {
             let outcome = finished(&format!(
-                r#"{{"format":12,"status":"{status}","summary":"s"}}"#
+                r#"{{"format":13,"status":"{status}","summary":"s"}}"#
             ));
             assert_eq!(event_of(&outcome), Event::RunFailed, "{status}");
         }
         let asking = finished(
-            r#"{"format":12,"status":"questions","summary":"s","questions":[
+            r#"{"format":13,"status":"questions","summary":"s","questions":[
                 {"id":"Q1","category":"scope","context":"c","text":"t",
                 "recommendation":{"why":"r"}}]}"#,
         );
@@ -944,7 +944,7 @@ mod tests {
             question("Q3"),
         ));
         let verdicts = RunResult::parse(
-            r#"{"format":12,"status":"done","summary":"s","verdicts":[
+            r#"{"format":13,"status":"done","summary":"s","verdicts":[
                 {"question":"Q2","class":"answered","reason":"Settled."},
                 {"question":"Q3","class":"partial","reason":"The tone is missing."}]}"#,
         )
@@ -967,7 +967,7 @@ mod tests {
             question("Q3"),
         ));
         let verdicts = RunResult::parse(
-            r#"{"format":12,"status":"done","summary":"s","verdicts":[
+            r#"{"format":13,"status":"done","summary":"s","verdicts":[
                 {"question":"Q1","class":"counter_question","reason":"Asks back.","reply":"R1"},
                 {"question":"Q2","class":"unanswered","reason":"Nothing."},
                 {"question":"Q3","class":"counter_question","reason":"Asks back.","reply":"R3"}]}"#,

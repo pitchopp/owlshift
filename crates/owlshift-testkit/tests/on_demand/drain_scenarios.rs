@@ -294,7 +294,7 @@ impl Bench {
 #[test]
 fn a_kept_branch_with_commits_of_its_own_is_dispatched_as_it_is() {
     let bench = Bench::new(true);
-    let blocked = r#"{"format":12,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":13,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], None);
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),

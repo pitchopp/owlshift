@@ -1,7 +1,7 @@
 +++
 role = "answer_check"
-brief_format = 21
-result_format = 12
+brief_format = 22
+result_format = 13
 +++
 
 # Answer check
@@ -41,7 +41,7 @@ A `counter_question` verdict also has a `reply`: the answer to what the decider 
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 12, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 13, rejected if it carries any field not listed here:
 
 - `status`: `done` once every question of the latest ask has its verdict; `failed` when you cannot give them, for instance when the `thread` holds no ask. No other status is yours: anything else fails the run.
 - `summary`: one or two sentences on what the decider's answers settled.
@@ -53,7 +53,7 @@ Leave out `questions`, `decisions`, `followups`, `artifacts` and `pr`: they belo
 
 ```json
 {
-  "format": 12,
+  "format": 13,
   "status": "done",
   "summary": "The decider chose English and gave the words; they asked what a sign-off is before saying whether the greeting ends with one.",
   "verdicts": [

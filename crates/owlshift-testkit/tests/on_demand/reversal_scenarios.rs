@@ -11,14 +11,14 @@ use super::*;
 
 /// The resolver's approval of the forked plan, as it decides it under
 /// `on-fork`.
-const APPROVES: &str = r#"{"format":12,"status":"done","summary":"The fork's choice is the repository's.",
+const APPROVES: &str = r#"{"format":13,"status":"done","summary":"The fork's choice is the repository's.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"approval",
 "decision":"Approve the plan as it is.",
 "basis":"The plan's fork keeps Markdown, as the repository's docs are; plain text buys nothing.",
 "basis_kind":"judgment","option":"A"}]}"#;
 
 /// The resolver's decision on a Design review residue finding.
-const APPLIED: &str = r#"{"format":12,"status":"done","summary":"The plan does not check the word.",
+const APPLIED: &str = r#"{"format":13,"status":"done","summary":"The plan does not check the word.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"testing",
 "decision":"Settle it: change step 1 so its test greps for the word Hello.",
 "basis":"Plan step 1's test greps for the line, not the word, as the arbiter confirmed.",
@@ -298,7 +298,7 @@ fn a_reply_inside_the_quiet_window_survives_a_completed_build() {
 }
 
 /// The resolver's decision on a Verify residue finding.
-const SETTLED: &str = r#"{"format":12,"status":"done","summary":"The greeting has no full stop.",
+const SETTLED: &str = r#"{"format":13,"status":"done","summary":"The greeting has no full stop.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"style",
 "decision":"Settle it: add the full stop.",
 "basis":"Both documents of the repository end their lines with one.",

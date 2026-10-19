@@ -32,8 +32,11 @@ use crate::Role;
 /// format 19 the thread's `answered` entries and a decision's short
 /// question (OWL-359); format 20 leaves the plan's `forks` and
 /// `alternatives` out of Build's brief (OWL-365); format 21 adds a review
-/// run's `since` and `earlier` and Build's findings to `note` (OWL-356).
-pub const BRIEF_FORMAT: u32 = 21;
+/// run's `since` and `earlier` and Build's findings to `note` (OWL-356);
+/// format 22 the author's `disagreed` and `deferred` answers, beside a
+/// confirmed ruling, in `earlier`, and answers to findings to `fix`
+/// (OWL-377).
+pub const BRIEF_FORMAT: u32 = 22;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -45,8 +48,10 @@ pub const BRIEF_FORMAT: u32 = 21;
 /// options as `{label, detail}` and its required `recommendation` as
 /// `{option, why}` (OWL-324); format 11 the resolver's `basis_kind` on each
 /// decision, and its `quote` on a `ticket` one (OWL-337); format 12 the
-/// `judgment` basis kind and a decision's `option` (OWL-343).
-pub const RESULT_FORMAT: u32 = 12;
+/// `judgment` basis kind and a decision's `option` (OWL-343); format 13
+/// `finding_responses` to findings to `fix` too, and their `disagreed` and
+/// `deferred` outcomes (OWL-377).
+pub const RESULT_FORMAT: u32 = 13;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
