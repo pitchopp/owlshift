@@ -1631,7 +1631,7 @@ Designed on 2026-10-15 (OWL-296). The rules are [architecture](architecture.md) 
 
 ## P5 tasks & exit gate
 
-The tasks are the parts above, OWL-297 to OWL-311, in the Linear project "P5 · Quality pipeline", with OWL-32 (after D), OWL-131 and OWL-132 (after B).
+The tasks are the parts above, OWL-297 to OWL-311 and OWL-347, OWL-350, OWL-353 and OWL-356, in the Linear project "P5 · Quality pipeline", with OWL-32 (after D), OWL-131 and OWL-132 (after B), and the tickets filed in that project since 2026-10-15, OWL-339 among them.
 
 **Exit gate.** Five pull requests judged at least as good as `/parallel` output by the maintainer; first Locary tickets delivered. Run by the maintainer, as P4's was, once M passes:
 
