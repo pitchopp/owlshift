@@ -10,7 +10,7 @@
 //! values.
 
 use crate::roster::other_model;
-use crate::vocab::{Effort, Harness, Role, Routing, Tier};
+use crate::vocab::{DelegationLevel, Effort, Harness, Role, Routing, Tier};
 
 /// What a run is given: its harness, its tier, and its effort, `None` for
 /// the harness's default.
@@ -82,6 +82,22 @@ pub fn role_routing(role: Role, ticket: TicketRouting) -> Option<RunRouting> {
             ..PROJECT_DEFAULT
         }),
         Role::DesignReview | Role::Verify => None,
+    }
+}
+
+/// The routing of a resolver run at the project's delegation `level` on a
+/// ticket routed `ticket` (OWL-344): at `all`, where it may decide on its
+/// own judgment (OWL-342), Claude Code on the deep tier at the ticket's
+/// effort, whatever the ticket's tier; below `all`, [`role_routing`]'s, the
+/// standard tier without an effort.
+pub fn resolver_routing(level: DelegationLevel, ticket: TicketRouting) -> RunRouting {
+    match level {
+        DelegationLevel::All => RunRouting {
+            harness: Harness::Claude,
+            tier: Tier::Deep,
+            effort: ticket.effort,
+        },
+        _ => role_routing(Role::Resolver, ticket).expect("the resolver has a routing of its own"),
     }
 }
 
@@ -205,6 +221,32 @@ mod tests {
         ];
         for (role, expected) in cases {
             assert_eq!(role_routing(role, routed), expected, "{role:?}");
+        }
+    }
+
+    /// OWL-344: deep at the ticket's effort at `all`, whatever the ticket's
+    /// tier; the project default at every level below.
+    #[test]
+    fn the_resolver_is_deep_at_the_ticket_effort_only_at_all() {
+        for level in DelegationLevel::ALL {
+            for tier in [Tier::Standard, Tier::Deep] {
+                for effort in [Some(Effort::Max), None] {
+                    let expected = if level == DelegationLevel::All {
+                        RunRouting {
+                            harness: Harness::Claude,
+                            tier: Tier::Deep,
+                            effort,
+                        }
+                    } else {
+                        PROJECT_DEFAULT
+                    };
+                    assert_eq!(
+                        resolver_routing(level, ticket(tier, effort, true)),
+                        expected,
+                        "{level:?} {tier:?} {effort:?}"
+                    );
+                }
+            }
         }
     }
 
