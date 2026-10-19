@@ -230,7 +230,13 @@ fn a_runs_own_work_passes_and_every_breach_is_found() {
     f.worktree_git(&["switch", "--quiet", BRANCH]);
     let rewound = f.around(|f| f.worktree_git(&["reset", "--quiet", "--hard", "HEAD~1"]));
     assert!(
-        matches!(rewound.as_slice(), [Violation::History { .. }]),
+        matches!(
+            rewound.as_slice(),
+            [Violation::History {
+                rewritten: true,
+                ..
+            }]
+        ),
         "{rewound:?}"
     );
 
@@ -445,13 +451,23 @@ fn a_rebase_run_may_land_on_its_new_base_and_nowhere_else() {
         f.worktree_git(&["reset", "--quiet", "--hard", &seeded]);
         f.worktree_git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
     });
+    // A rebase that lands elsewhere shares history with its start by design:
+    // its message names no rewrite.
     assert_eq!(
         rewound,
         [Violation::History {
             start: start.clone(),
             end: seeded.clone(),
             onto: Some(upstream.clone()),
+            rewritten: false,
         }]
+    );
+    assert_eq!(
+        rewound[0].to_string(),
+        format!(
+            "the branch is at {seeded}, which descends neither from the run's start {start} \
+             nor from its new base {upstream}"
+        )
     );
     restart(&f);
 
@@ -467,6 +483,82 @@ fn a_rebase_run_may_land_on_its_new_base_and_nowhere_else() {
 
     // A base that names no commit is refused before the run.
     assert!(Snapshot::take_rebase(&f.git, &f.main, &f.worktree, BRANCH, "no-such-base").is_err());
+}
+
+/// OWL-369: a run that may only add to its branch and rewrote it is still a
+/// breach, and its message says the run rewrote its own history when the
+/// branch still shares a commit with the start; a history from elsewhere
+/// keeps the plain message.
+#[test]
+fn a_rewritten_branch_is_a_breach_that_names_the_rewrite() {
+    let f = Fixture::new();
+    // Before the run: the earlier runs' commits on the branch.
+    f.commit_file(&f.worktree, "GREETING.md", "hi\n");
+    f.commit_file(&f.worktree, "GREETING.md", "hi again\n");
+    let start = f.commit(&f.worktree, "HEAD");
+
+    // OWL-160: the run re-applies the branch onto its own base, the same
+    // trees under new commits (another committer, so the ids differ
+    // whatever the clock), then adds a commit.
+    let rebased = f.around(|f| {
+        f.worktree_git(&[
+            "-c",
+            "user.name=Rebaser",
+            "rebase",
+            "--quiet",
+            "--force-rebase",
+            "origin/main",
+        ]);
+        f.commit_file(&f.worktree, "NEW.md", "new\n");
+    });
+    let end = f.commit(&f.worktree, "HEAD");
+    assert_ne!(f.commit(&f.worktree, "HEAD~1"), start);
+    assert_eq!(
+        f.commit(&f.worktree, "HEAD~1^{tree}"),
+        f.commit(&f.worktree, &format!("{start}^{{tree}}"))
+    );
+    assert_eq!(
+        rebased,
+        [Violation::History {
+            start: start.clone(),
+            end: end.clone(),
+            onto: None,
+            rewritten: true,
+        }]
+    );
+    assert_eq!(
+        rebased[0].to_string(),
+        format!(
+            "the branch is at {end}, which does not descend from the run's start {start}: \
+             the run rewrote its branch's history (rebase, amend or reset)"
+        )
+    );
+    f.worktree_git(&["reset", "--quiet", "--hard", &start]);
+
+    // A commit sharing nothing with the start: the plain message.
+    let unrelated = f.around(|f| {
+        let tree = format!("{start}^{{tree}}");
+        let orphan = f
+            .env
+            .run(&f.worktree, &["commit-tree", &tree, "-m", "Unrelated"])
+            .unwrap();
+        let orphan = String::from_utf8(orphan).unwrap();
+        f.worktree_git(&["reset", "--quiet", "--hard", orphan.trim()]);
+    });
+    let orphan = f.commit(&f.worktree, "HEAD");
+    assert_eq!(
+        unrelated,
+        [Violation::History {
+            start: start.clone(),
+            end: orphan.clone(),
+            onto: None,
+            rewritten: false,
+        }]
+    );
+    assert_eq!(
+        unrelated[0].to_string(),
+        format!("the branch is at {orphan}, which does not descend from the run's start {start}")
+    );
 }
 
 #[test]

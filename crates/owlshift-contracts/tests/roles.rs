@@ -370,6 +370,24 @@ fn build_prompt_stays_short() {
     );
 }
 
+/// OWL-369: a Build only adds to its branch, so the isolation check's
+/// history breach is never something its prompt allowed.
+#[test]
+fn build_never_rewrites_the_commits_it_started_on() {
+    let text = build_prompt();
+    for rule in [
+        "never rewrite a commit the branch held when this run started",
+        "(no `rebase`, `commit --amend`, `reset` or `cherry-pick` over it)",
+        "only add commits on top",
+        "without rebasing it (a new base is the `rebase` role's)",
+    ] {
+        assert!(
+            text.contains(rule),
+            "roles/build.md no longer says {rule:?}"
+        );
+    }
+}
+
 #[test]
 fn build_prompt_names_every_result_field_and_value() {
     let text = build_prompt();

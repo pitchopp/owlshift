@@ -767,6 +767,55 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
     }
 }
 
+/// OWL-369: a run that amends a commit its branch held at the start is
+/// quarantined, its valid result notwithstanding, and the breach names the
+/// rewrite.
+#[test]
+fn a_run_that_rewrites_its_start_is_quarantined_and_named() {
+    let bench = Bench::new();
+    bench.kept();
+    fs::write(bench.worktree.join("GREETING.md"), "hi\n").unwrap();
+    bench
+        .env
+        .run(&bench.worktree, &["add", "GREETING.md"])
+        .unwrap();
+    bench
+        .env
+        .run(&bench.worktree, &["commit", "--quiet", "-m", "Mine"])
+        .unwrap();
+    let start = bench.head_of(&bench.worktree);
+    let done = r#"{"format":12,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+    let script = format!(
+        "git commit --quiet --amend -m 'Mine, again' && printf '%s' '{done}' > .owlshift/run/result.json"
+    );
+    let report = bench
+        .run_with(&bench.executor, &Script(script), &bench.brief)
+        .unwrap();
+    let end = bench.head_of(&bench.worktree);
+    assert_ne!(end, start);
+    match &report.outcome {
+        Outcome::Quarantined(violations) => {
+            assert_eq!(
+                violations.as_slice(),
+                [Violation::History {
+                    start: start.clone(),
+                    end: end.clone(),
+                    onto: None,
+                    rewritten: true,
+                }]
+            );
+            assert!(
+                violations[0]
+                    .to_string()
+                    .ends_with(": the run rewrote its branch's history (rebase, amend or reset)"),
+                "{}",
+                violations[0]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A kept worktree whose `.git` an earlier run redirected is refused before
 /// any git runs in it.
 #[test]
