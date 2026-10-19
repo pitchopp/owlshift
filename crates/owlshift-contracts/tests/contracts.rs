@@ -2624,6 +2624,12 @@ fn comment_headers() {
     };
     assert_eq!(plan.render(), "[owlshift] PLAN");
     assert_eq!(Header::parse(&plan.render()).unwrap(), plan);
+    let waiting = Header {
+        kind: MarkerKind::Waiting,
+        round: None,
+    };
+    assert_eq!(waiting.render(), "[owlshift] WAITING");
+    assert_eq!(Header::parse(&waiting.render()).unwrap(), waiting);
     // A comment that waits for the decider ends its header with their
     // mention, which is passed over (OWL-324).
     let mention = " · https://linear.app/owlshift/profiles/ada";

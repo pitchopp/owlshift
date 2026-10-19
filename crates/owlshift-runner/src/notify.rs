@@ -21,9 +21,10 @@ use owlshift_contracts::config::PersonalConfig;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::result;
+use owlshift_core::state::ParkReason;
 
 use crate::config::FileState;
-use crate::events::{EventSink, data};
+use crate::events::{Data, EventSink, data};
 use crate::on_demand::{Delivered, Landed, Stop};
 use crate::system::System;
 
@@ -78,8 +79,20 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// ([`Stop::Ready`]) waits for the drain, not a person. The decision comment
 /// asks nothing of anyone, so a failure to keep its state stays a refusal,
 /// as does a RESUME the tracker refused, since nothing reached the ticket.
+/// The park of an isolation breach, its state kept or not
+/// ([`Landed::Quarantined`]), shows nothing here: the runner notified the
+/// operator of the quarantine as it wrote the marker (OWL-368,
+/// [`crate::quarantine`]), a line that says the ticket broke isolation.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
     Some(match stop {
+        Stop::Parked {
+            reason: ParkReason::IsolationBreach,
+            ..
+        }
+        | Stop::NotKept {
+            landed: Landed::Quarantined,
+            ..
+        } => return None,
         Stop::NeedsInput { status, posted, .. } => match (status, posted) {
             (result::Status::PremiseFalse, Ok(round)) => format!(
                 "{ticket}: the run found the ticket's premise false; a decision waits on the \
@@ -123,6 +136,7 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
                     "the intake's verdict is on the ticket",
                     "its record was not kept, so the drain cannot dispatch it",
                 ),
+                Landed::Quarantined => return None,
             };
             format!("{ticket}: {what}, but {lost}; see the terminal")
         }
@@ -169,26 +183,32 @@ pub fn notify_blocker(
     let (Some(notifier), Err(stop)) = (notifier, outcome) else {
         return;
     };
-    let Some(mut line) = blocker_line(ticket, stop) else {
+    let Some(line) = blocker_line(ticket, stop) else {
         return;
     };
+    if let Err(error) = notifier.notify(&with_link(line, tracker, ticket)) {
+        sink.emit(ticket, None, EventKind::Warning, not_shown(&error));
+    }
+}
+
+/// `line` with the ticket's link after it, when the tracker gives one fit
+/// to show.
+pub(crate) fn with_link(mut line: String, tracker: &dyn Tracker, ticket: &TicketId) -> String {
     if let Some(url) = tracker.ticket_url(ticket)
         && let Some(url) = shown_link(&url)
     {
         line.push(' ');
         line.push_str(url);
     }
-    if let Err(error) = notifier.notify(&line) {
-        sink.emit(
-            ticket,
-            None,
-            EventKind::Warning,
-            data([
-                ("what", json!("notification_not_shown")),
-                ("reason", json!(error.to_string())),
-            ]),
-        );
-    }
+    line
+}
+
+/// The `warning` event's data for a line the notifier could not show.
+pub(crate) fn not_shown(error: &Error) -> Data {
+    data([
+        ("what", json!("notification_not_shown")),
+        ("reason", json!(error.to_string())),
+    ])
 }
 
 /// The system a desktop notification is shown through.
@@ -575,6 +595,14 @@ mod tests {
             }),
             Err(Stop::Delivery("d".to_owned())),
             Err(Stop::Ready { ticket: owl_7() }),
+            // The runner notified the quarantine as it wrote the marker
+            // (OWL-368): the breach's park, its state kept or not, adds none.
+            Err(Stop::Parked {
+                reason: ParkReason::IsolationBreach,
+                detail: "files changed in the main checkout: planted.txt".to_owned(),
+                unposted: None,
+            }),
+            Err(not_kept(Landed::Quarantined)),
         ];
         for outcome in outcomes {
             let recording = Recording::default();

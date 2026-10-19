@@ -50,6 +50,7 @@ use owlshift_core::vocab::Stage;
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Watch};
 use crate::events::{EventSink, data};
 use crate::on_demand::{self, Delivered, DispatchSeen, Stop, Taken, delivery_followed};
+use crate::quarantine::Held;
 use crate::ticket_ref::{self, Stored, text_sha256};
 
 /// Why `owlshift watch --drain` refuses to start on a project configured
@@ -272,11 +273,15 @@ impl Watch<'_> {
     ) {
         let on_demand = self.on_demand;
         // Read again: watch's work may have ended a following or closed a
-        // round in this pass. A project busy or quarantined now waits for
-        // the next pass, which watch's own note tells.
-        let Ok(read) = self.snapshot() else {
+        // round in this pass. A project busy now waits for the next pass,
+        // which watch's own note tells. A quarantined one takes nothing in,
+        // and its ticket the ready set would dispatch is told that it waits
+        // (OWL-368).
+        let Ok(snapshot) = self.snapshot(memory, sink) else {
             return;
         };
+        let quarantined = snapshot.quarantine.is_some();
+        let read = snapshot.refs;
         let mut refs = HashMap::new();
         let mut unread = Vec::new();
         for (ticket, stored) in read {
@@ -340,9 +345,16 @@ impl Watch<'_> {
             .collect();
         rows.sort_by(Row::order);
 
-        let taken = match self.take_in(memory, &rows, sink, out, continued) {
-            Intake::Done(taken) => taken,
-            Intake::Paused => return,
+        // Under quarantine no intake runs, nor is its candidate told: its
+        // gesture is checked at the base commit under the lock, which the
+        // quarantine refuses, and a ticket at Intake is not ready yet.
+        let taken = if quarantined {
+            None
+        } else {
+            match self.take_in(memory, &rows, sink, out, continued) {
+                Intake::Done(taken) => taken,
+                Intake::Paused => return,
+            }
         };
         let exclude = tracker.exclude.as_deref();
         let mut reads = HashMap::new();
@@ -432,6 +444,9 @@ impl Watch<'_> {
         let Some(commit) = row.commit() else {
             return;
         };
+        if quarantined {
+            return self.tell(memory, sink, out, row.id(), Held::Ready);
+        }
         self.dispatch(memory, row.id(), commit, sink, out, continued);
     }
 

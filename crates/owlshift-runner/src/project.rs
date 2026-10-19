@@ -191,8 +191,19 @@ impl ProjectDirs {
         fs::write(self.unverified_file(), text)
     }
 
+    /// Removes the marker, then what was told of it (OWL-368): a record left
+    /// behind names another marker's text, so it is read as empty anyway.
     pub(crate) fn clear_unverified(&self) -> io::Result<()> {
-        remove_file_if_any(&self.unverified_file())
+        remove_file_if_any(&self.unverified_file())?;
+        let _ = remove_file_if_any(&self.told_file());
+        Ok(())
+    }
+
+    /// What was told of the current marker: whether the operator was
+    /// notified and which tickets were told (OWL-368,
+    /// [`crate::quarantine::Record`]).
+    pub fn told_file(&self) -> PathBuf {
+        self.root.join("unverified-told")
     }
 
     /// The marker of a first clone that has not finished (OWL-80).

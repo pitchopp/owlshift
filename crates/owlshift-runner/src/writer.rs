@@ -2893,7 +2893,9 @@ impl ParkedComment {
                 }
             }
             ParkReason::IsolationBreach => sections.push(format!(
-                "Parked: {}. What it changed is recorded on the machine that ran it, not here.",
+                "Parked: {}. What it changed is recorded on the machine that ran it, not here. \
+                 Until a person clears the quarantine there, Owlshift refuses the whole project \
+                 on that machine: no other ticket of it is continued, taken in or built either.",
                 park_reason(self.reason)
             )),
             ParkReason::FailedRuns
@@ -2912,9 +2914,10 @@ impl ParkedComment {
         let continue_cmd = code(&format!("owlshift continue {ticket}"));
         let restart = match (self.reason, self.restart) {
             (ParkReason::IsolationBreach, _) => format!(
-                "**To restart it:** a person checks the machine that ran it first: Owlshift \
-                 refuses this project there until the quarantine is cleared. Then run \
-                 {continue_cmd}, or {} if the project's checkout was deleted.",
+                "**To restart it:** a person on the machine that ran it checks what the run \
+                 changed, then clears the quarantine with {} in the project's repository there. \
+                 Then run {continue_cmd}, or {} if the project's checkout was deleted.",
+                code("owlshift unquarantine"),
                 code(&format!("owlshift do {ticket}"))
             ),
             (ParkReason::Reasks, _) => format!(
@@ -3697,6 +3700,15 @@ impl<'a> Writer<'a> {
 
     /// Posts a PARKED comment and returns it as the tracker recorded it.
     pub fn post_parked(&self, comment: &ParkedComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Posts the WAITING comment of a ticket a quarantine holds up and
+    /// returns it as the tracker recorded it (OWL-368).
+    pub fn post_quarantine_wait(
+        &self,
+        comment: &crate::quarantine::QuarantineWait,
+    ) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
     }
 
@@ -5175,11 +5187,13 @@ Context.
                 ),
                 vec![
                     "Parked: the run broke isolation and is quarantined. What it changed is \
-                     recorded on the machine that ran it, not here.",
-                    "**To restart it:** a person checks the machine that ran it first: \
-                     Owlshift refuses this project there until the quarantine is cleared. Then \
-                     run `owlshift continue OWL-18`, or `owlshift do OWL-18` if the project's \
-                     checkout was deleted.",
+                     recorded on the machine that ran it, not here. Until a person clears the \
+                     quarantine there, Owlshift refuses the whole project on that machine: no \
+                     other ticket of it is continued, taken in or built either.",
+                    "**To restart it:** a person on the machine that ran it checks what the run \
+                     changed, then clears the quarantine with `owlshift unquarantine` in the \
+                     project's repository there. Then run `owlshift continue OWL-18`, or \
+                     `owlshift do OWL-18` if the project's checkout was deleted.",
                 ],
                 vec!["planted", "/Users"],
             ),

@@ -245,6 +245,10 @@ fn run_with(
     let arbiter = routed(&arbiter_prompt);
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
+    let desktop = notify::desktop_enabled(&config.personal)
+        .then(|| DesktopNotifier::for_this_machine(system))
+        .flatten();
+    let desktop = desktop.as_ref().map(|d| d as &dyn Notifier);
     let on_demand = OnDemand {
         executor: &executor,
         tracker: tracker.as_ref(),
@@ -263,13 +267,12 @@ fn run_with(
         dirs: &dirs,
         head_wait: HEAD_WAIT,
         clock: &on_demand::system_clock,
+        // The quarantine's notification, sent as its marker is written
+        // (OWL-368); the others are `report`'s.
+        notifier: desktop,
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
-    let desktop = notify::desktop_enabled(&config.personal)
-        .then(|| DesktopNotifier::for_this_machine(system))
-        .flatten();
-    let desktop = desktop.as_ref().map(|d| d as &dyn Notifier);
     let (ticket, outcome) = match (mode, &ticket) {
         (Mode::Do(_), Some(ticket)) => (ticket, on_demand.run(ticket, &mut sink)),
         (Mode::Continue(_), Some(ticket)) => (ticket, on_demand.continue_ticket(ticket, &mut sink)),

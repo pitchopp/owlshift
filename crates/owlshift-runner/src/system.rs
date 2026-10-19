@@ -16,6 +16,7 @@ use owlshift_adapters::forge::Repo;
 
 pub use crate::forge::TokenTryError;
 pub use crate::project::DefaultBranchFile;
+pub use crate::quarantine::MarkerState;
 use crate::secrets::TrackerAccounts;
 use crate::ticket_ref::{self, RefState};
 pub use crate::tracker::{AppError, StatesError};
@@ -161,6 +162,21 @@ pub trait System {
         ticket_ref::states(&git, &checkout)
             .map(Some)
             .map_err(|_| "git could not list them in the dedicated checkout".to_owned())
+    }
+    /// Where the `unverified` marker of the project whose repository is at
+    /// `root` stands ([`crate::quarantine::marker_state`], OWL-368), found
+    /// in the data directory as `owlshift do` finds it. The error says why
+    /// it could not be read, in Owlshift's words only. Only `owlshift
+    /// doctor` asks.
+    fn quarantine(&self, root: &Path) -> Result<MarkerState, String> {
+        let git = crate::project::runner_git();
+        let repo = crate::on_demand::check_origin(&crate::project::origin_url(&git, root)?)?;
+        let (data_dir, _) = self
+            .data_dir()
+            .ok_or_else(|| "this system has no data directory".to_owned())?;
+        let dirs = crate::project::ProjectDirs::new(&data_dir, &repo);
+        crate::quarantine::marker_state(&dirs)
+            .map_err(|_| "the project's marker or its lock could not be read".to_owned())
     }
     /// The project file at the default branch of the checkout at `root`, as
     /// its last fetch left `refs/remotes/origin/HEAD`
@@ -309,6 +325,8 @@ pub(crate) mod fake {
         /// What reading the project's ticket refs gives; `None`: no
         /// dedicated checkout.
         ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
+        /// Where the project's marker stands; `None`: there is none.
+        quarantine: Option<Result<MarkerState, String>>,
         /// What reading the project file at the default branch gives;
         /// `None`: the default branch is unknown here.
         default_branch_file: Option<Result<DefaultBranchFile, String>>,
@@ -451,6 +469,13 @@ pub(crate) mod fake {
             self
         }
 
+        /// The project's marker stands so, or cannot be read for this
+        /// reason.
+        pub(crate) fn quarantine_is(mut self, answer: Result<MarkerState, String>) -> Self {
+            self.quarantine = Some(answer);
+            self
+        }
+
         /// Reading the project file at the default branch gives this.
         pub(crate) fn default_branch_file_is(
             mut self,
@@ -537,6 +562,11 @@ pub(crate) mod fake {
         /// answer; never git.
         fn ticket_refs(&self, _root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
             self.ticket_refs.clone().transpose()
+        }
+
+        /// As [`Self::quarantine_is`] scripted it; never the disk.
+        fn quarantine(&self, _root: &Path) -> Result<MarkerState, String> {
+            self.quarantine.clone().unwrap_or(Ok(MarkerState::Clear))
         }
 
         /// As [`Self::default_branch_file_is`] scripted it; never git.

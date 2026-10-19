@@ -77,6 +77,7 @@ use owlshift_adapters::forge::{
     Repo, ReviewsRead, Verdict,
 };
 use owlshift_adapters::harness::claude::Usage;
+use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::{self, Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
     AnsweredQuestion, AskedBy, Author, Brief, Checkpoint, GateFailure, GivenPlan, PermissionLevel,
@@ -119,6 +120,7 @@ use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::proposals::{self, Filing};
+use crate::quarantine;
 use crate::rebase;
 use crate::resolver::{self, Fallback, Quotable, Resolved};
 use crate::reversal;
@@ -442,6 +444,11 @@ pub struct OnDemand<'a> {
     /// This machine's clock, read for the quiet window alone
     /// ([`answer_check::counts_at`]).
     pub clock: &'a dyn Fn() -> Timestamp,
+    /// Tells the operator of a quarantine as its marker is written, and
+    /// watch's of one it finds ([`quarantine`], OWL-368); `None` when this
+    /// machine shows no notification. Every other notification is the
+    /// command's, from its outcome ([`crate::notify`]).
+    pub notifier: Option<&'a dyn Notifier>,
 }
 
 /// A ticket delivered.
@@ -505,6 +512,11 @@ pub enum Landed {
     /// still parked the ticket, which waits for a person whatever reached it,
     /// as a park whose state was kept does (OWL-159).
     ParkedUnposted,
+    /// The park of a run that broke isolation, its PARKED comment posted or
+    /// not, as when the run moved the ticket ref: the runner notified the
+    /// quarantine as it wrote the marker, so this one notifies nothing more
+    /// (OWL-368).
+    Quarantined,
 }
 
 /// Why `owlshift do` or `owlshift continue` stopped short of a delivery.
@@ -608,9 +620,10 @@ impl fmt::Display for Stop {
             Self::Unverified { marker, text } => write!(
                 f,
                 "Refused: a previous run's isolation check did not pass, so the dedicated \
-                 checkout may hold changes it made outside its worktree.\n{}\nInspect the \
-                 project's folder, then delete its `checkout` and `worktrees` folders to start \
-                 from a fresh clone, or delete {} to keep them.",
+                 checkout may hold changes it made outside its worktree, and no ticket of this \
+                 project runs until a person clears the quarantine.\n{}\nInspect the project's \
+                 folder, then delete its `checkout` and `worktrees` folders to start from a fresh \
+                 clone, or keep them, and run `owlshift unquarantine` to clear {}.",
                 text.trim_end(),
                 marker.display()
             ),
@@ -723,8 +736,8 @@ impl fmt::Display for Stop {
                 write!(f, "Parked: {}: {detail}", park_reason(*reason))?;
                 if *reason == ParkReason::IsolationBreach {
                     f.write_str(
-                        "\nThe project is refused until a person looks: see the `unverified` \
-                         file in its folder.",
+                        "\nNo ticket of the project runs until a person clears the quarantine: \
+                         `owlshift unquarantine` shows what the run changed and clears it.",
                     )?;
                 }
                 if let Some(why) = unposted {
@@ -1497,7 +1510,13 @@ impl OnDemand<'_> {
             && let Err(reason) =
                 crate::executor::check_worktree_link(&checkout.join(".git"), &worktree)
         {
-            let text = format!("The worktree of {ticket} was changed between runs: {reason}\n");
+            // Its time makes the marker unique, as a run's are (OWL-368).
+            let text = format!(
+                "The worktree of {ticket} was found changed between runs at {}: {reason}\n",
+                Timestamp::now()
+            );
+            // Refused at once, before any run: the terminal says it, and a
+            // watch pass that finds the marker notifies it.
             self.dirs
                 .mark_unverified(&text)
                 .map_err(|e| refused("the project's marker", e))?;
@@ -3049,14 +3068,24 @@ impl OnDemand<'_> {
                     park_reason(reason)
                 )
             };
-            // Posted or not, the park waits for a person (OWL-159).
+            // Posted or not, the park waits for a person (OWL-159); a
+            // breach's was notified with its quarantine (OWL-368).
+            let breach = reason == ParkReason::IsolationBreach;
             return match &unposted {
                 Some(error) => Stop::NotKept {
-                    landed: Landed::ParkedUnposted,
+                    landed: if breach {
+                        Landed::Quarantined
+                    } else {
+                        Landed::ParkedUnposted
+                    },
                     message: message(&format!("the PARKED comment could not be posted: {error}")),
                 },
                 None => Stop::NotKept {
-                    landed: Landed::Parked,
+                    landed: if breach {
+                        Landed::Quarantined
+                    } else {
+                        Landed::Parked
+                    },
                     message: message("the PARKED comment is on the ticket"),
                 },
             };
@@ -3409,16 +3438,34 @@ impl OnDemand<'_> {
             }
             _ => Vec::new(),
         };
-        let marked = if breaches.is_empty() {
-            self.dirs.clear_unverified()
+        if breaches.is_empty() {
+            self.dirs
+                .clear_unverified()
+                .map_err(|e| refused("the project's marker", e))?;
         } else {
             let lines: Vec<String> = breaches.iter().map(|b| format!("- {b}")).collect();
-            self.dirs.mark_unverified(&format!(
+            let marker = format!(
                 "Run {run} of {ticket} broke isolation:\n{}\n",
                 lines.join("\n")
-            ))
-        };
-        marked.map_err(|e| refused("the project's marker", e))?;
+            );
+            self.dirs
+                .mark_unverified(&marker)
+                .map_err(|e| refused("the project's marker", e))?;
+            // The operator learns of the quarantine now, once (OWL-368).
+            if let Outcome::Quarantined(violations) = &report.outcome {
+                quarantine::notify_written(
+                    self.notifier,
+                    self.tracker,
+                    self.dirs,
+                    &p._lock,
+                    &marker,
+                    ticket,
+                    &run,
+                    &quarantine::breach_kinds(violations),
+                    sink,
+                );
+            }
+        }
         sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
         // What the run's harness home left to say, such as a refreshed login
         // not written back (OWL-299): a warning each (OWL-303).
@@ -5927,7 +5974,8 @@ fn brief_body(comment: &Comment) -> String {
         | MarkerKind::ReAsk
         | MarkerKind::Decision
         | MarkerKind::Parked
-        | MarkerKind::Intake => {
+        | MarkerKind::Intake
+        | MarkerKind::Waiting => {
             let note = format!(
                 "\n\n(Cut to {MAX_THREAD_COMMENT_BYTES} bytes in this brief: the whole comment \
                  is on the ticket, tracker comment `{}`.)",
@@ -6137,7 +6185,7 @@ fn name_of(decider: &AskDecider, ticket: &Ticket) -> String {
 }
 
 /// The `tracker_write` event of a marked comment the runner posted.
-fn comment_written(kind: &str, comment: &Comment) -> Data {
+pub(crate) fn comment_written(kind: &str, comment: &Comment) -> Data {
     data([
         ("target", json!("tracker")),
         ("action", json!("comment")),

@@ -22,6 +22,7 @@ pub mod on_demand;
 pub mod pr_reviews;
 pub mod project;
 pub mod proposals;
+pub mod quarantine;
 pub mod rebase;
 pub mod resolver;
 pub mod reversal;

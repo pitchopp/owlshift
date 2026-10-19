@@ -125,6 +125,11 @@ impl<'a> EventSink<'a> {
         }
     }
 
+    /// The project's name, as every event records it.
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
     /// Records one event about `ticket`, now, and returns it.
     pub fn emit(
         &mut self,
@@ -133,11 +138,28 @@ impl<'a> EventSink<'a> {
         kind: EventKind,
         data: Data,
     ) -> Event {
+        self.record(Some(ticket), run, kind, data)
+    }
+
+    /// Records one event about the whole project, of no single ticket, now,
+    /// and returns it: a quarantine cleared, or its notification not shown
+    /// (OWL-368).
+    pub fn emit_project(&mut self, run: Option<&str>, kind: EventKind, data: Data) -> Event {
+        self.record(None, run, kind, data)
+    }
+
+    fn record(
+        &mut self,
+        ticket: Option<&TicketId>,
+        run: Option<&str>,
+        kind: EventKind,
+        data: Data,
+    ) -> Event {
         let event = Event {
             format: Format,
             at: Timestamp::now(),
             project: self.project.clone(),
-            ticket: Some(ticket.clone()),
+            ticket: ticket.cloned(),
             run: run.map(ToOwned::to_owned),
             kind,
             data,
