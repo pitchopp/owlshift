@@ -734,6 +734,7 @@ impl Executor {
                 read_only: false,
                 ..paths
             },
+            &[],
             commands,
             self.gate_timeout,
             &run_dir.join(gate::GATE_LOG),
@@ -1379,6 +1380,7 @@ mod tests {
             failure,
             breach,
             steps: Vec::new(),
+            setup: Vec::new(),
         };
         let link = Violation::WorktreeLink("redirected".to_owned());
         let breached = report(vec![link.clone()], Some(failure.clone()));

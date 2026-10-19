@@ -42,7 +42,18 @@
 //! commands share one deadline: each gets what is left of it, none starts
 //! once it is spent, and a command, or a process it started, still running
 //! at the deadline is stopped with its whole tree.
+//!
+//! The project's setup (`stack.setup`, OWL-330) runs first, the same way,
+//! logged at the head of the same log, under a deadline of its own: a third
+//! of the gate's ([`SETUP_SHARE`]). A failing setup command fails the gate,
+//! its reason starting `setup: `; once it passes, the guard, the clean check
+//! and HEAD are checked again, and the gate's commands get their whole
+//! deadline. [`run_setup`] runs the setup alone before a Build's harness,
+//! where the worktree may hold a resumed Build's unfinished work: it must
+//! leave that work as it found it, which it reads before and after
+//! ([`worktree_state`]) rather than requiring a clean tree.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +63,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use owlshift_contracts::brief::GateFailure;
+use sha2::{Digest, Sha256};
 
 use super::git::Git;
 use super::isolation::Violation;
@@ -75,6 +87,57 @@ const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 /// The names of uncommitted paths a failure lists before "and N more".
 const LISTED_PATHS: usize = 10;
 
+/// The share of the gate's deadline the project's setup gets: a third
+/// (OWL-330). The gate's commands keep their whole deadline after it.
+pub const SETUP_SHARE: u32 = 3;
+
+/// The file of the run directory a Build's setup before its harness logs
+/// to ([`run_setup`]).
+pub const SETUP_LOG: &str = "setup.log";
+
+/// The start of the reason of a setup command's failure.
+pub const SETUP_PREFIX: &str = "setup: ";
+
+/// Whose a failed command's failure is (OWL-330): internal, never written
+/// into a brief or a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// The project's: the command exited non-zero, was ended by a signal or
+    /// reached the deadline, and nothing went wrong on the runner's side.
+    Command,
+    /// The runner's: a command it could not confine, start or watch, a log
+    /// it could not write, an output a process kept open. It wins over the
+    /// command's own end, whatever that was.
+    Runner,
+}
+
+/// A command that failed, and whose failure it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandFailure {
+    pub failure: GateFailure,
+    pub fault: Fault,
+}
+
+/// Which commands [`run_commands`] runs: the deadline's words differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Gate,
+    Setup,
+}
+
+impl Phase {
+    /// The reason of a command stopped at the deadline of `timeout`.
+    fn stopped(self, timeout: Duration) -> String {
+        match self {
+            Self::Gate => format!("stopped at the gate's deadline, {} s", timeout.as_secs()),
+            Self::Setup => format!(
+                "stopped at the setup's deadline, a third of the gate's, {} s",
+                timeout.as_secs()
+            ),
+        }
+    }
+}
+
 /// What the runner's run of the gate came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateReport {
@@ -96,6 +159,9 @@ pub struct GateReport {
     /// Each command started, in order, the failing one last: what
     /// `owlshift gate` prints (OWL-329). Empty when none started.
     pub steps: Vec<GateStep>,
+    /// Each setup command started before them, in order, as `steps`
+    /// (OWL-330). Empty when the project has none or none started.
+    pub setup: Vec<GateStep>,
 }
 
 impl GateReport {
@@ -139,13 +205,19 @@ impl From<GateFailure> for Stop {
 
 /// Runs the gate in the worktree of `paths`, each command confined to them
 /// as the run was (OWL-41), with `guard` checked before each of the gate's
-/// own git steps; see the module documentation. Whatever goes wrong, the
-/// runner's side included, is a failure: a gate that could not be run never
-/// passes. A violation the guard finds is a breach, and a failure as well.
+/// own git steps; see the module documentation. `setup`, the project's
+/// `stack.setup`, runs first (OWL-330). Whatever goes wrong, the runner's
+/// side included, is a failure: a gate that could not be run never passes. A
+/// violation the guard finds is a breach, and a failure as well.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one gate run's inputs, each its own"
+)]
 pub(crate) fn run(
     git: &Git,
     agent: &AgentEnv,
     paths: &RunPaths,
+    setup: &[String],
     commands: &[String],
     timeout: Duration,
     log_path: &Path,
@@ -153,19 +225,12 @@ pub(crate) fn run(
 ) -> GateReport {
     let deadline = Instant::now() + timeout;
     let git = git.as_agent(agent);
-    let mut report = GateReport {
-        commands: commands.to_vec(),
-        commit: None,
-        log: log_path.to_owned(),
-        failure: None,
-        breach: Vec::new(),
-        steps: Vec::new(),
-    };
+    let mut report = empty_report(commands, log_path);
     let checked = check_and_run(
         &git,
         agent,
         paths,
-        commands,
+        (setup, commands),
         (timeout, deadline),
         guard,
         &mut report,
@@ -173,24 +238,50 @@ pub(crate) fn run(
     match checked {
         Ok(()) => {}
         Err(Stop::Failed(failure)) => report.failure = Some(failure),
-        Err(Stop::Breach(violations)) => {
-            let reasons: Vec<String> = violations.iter().map(ToString::to_string).collect();
-            report.failure = Some(around(format!(
-                "the gate broke isolation, found before its own git ran: {}",
-                reasons.join("; ")
-            )));
-            report.breach = violations;
-        }
+        Err(Stop::Breach(violations)) => breached(&mut report, violations),
     }
     report
+}
+
+/// A report of a gate of `commands`, logged to `log_path`, before anything
+/// ran.
+fn empty_report(commands: &[String], log_path: &Path) -> GateReport {
+    GateReport {
+        commands: commands.to_vec(),
+        commit: None,
+        log: log_path.to_owned(),
+        failure: None,
+        breach: Vec::new(),
+        steps: Vec::new(),
+        setup: Vec::new(),
+    }
+}
+
+/// Records the guard's `violations` in `report`, as its failure too.
+fn breached(report: &mut GateReport, violations: Vec<Violation>) {
+    let reasons: Vec<String> = violations.iter().map(ToString::to_string).collect();
+    report.failure = Some(around(format!(
+        "the gate broke isolation, found before its own git ran: {}",
+        reasons.join("; ")
+    )));
+    report.breach = violations;
+}
+
+/// A setup command's failure, as the gate reports it: its reason starts
+/// [`SETUP_PREFIX`].
+fn setup_failure(failure: GateFailure) -> GateFailure {
+    GateFailure {
+        reason: format!("{SETUP_PREFIX}{}", failure.reason),
+        ..failure
+    }
 }
 
 fn check_and_run(
     git: &Git,
     agent: &AgentEnv,
     paths: &RunPaths,
-    commands: &[String],
-    (timeout, deadline): (Duration, Instant),
+    (setup, commands): (&[String], &[String]),
+    (timeout, mut deadline): (Duration, Instant),
     guard: Guard<'_>,
     report: &mut GateReport,
 ) -> Result<(), Stop> {
@@ -213,15 +304,41 @@ fn check_and_run(
         ))
         .into());
     }
+    if !setup.is_empty() {
+        let share = timeout / SETUP_SHARE;
+        run_commands(
+            agent,
+            paths,
+            (setup, Phase::Setup),
+            share,
+            Instant::now() + share,
+            &mut log,
+            &mut report.setup,
+        )
+        .map_err(|failed| setup_failure(failed.failure))?;
+        // The setup ran the branch's code, as the gate does: checked as the
+        // gate is, before the gate's commands get their whole deadline.
+        guarded(guard, &mut log)?;
+        let dirty = uncommitted(git, worktree)?;
+        if !dirty.is_empty() {
+            return Err(around(format!("the setup changed files: {dirty}")).into());
+        }
+        let after = head(git, worktree)?;
+        if after != before {
+            return Err(around(format!("the setup moved HEAD from {before} to {after}")).into());
+        }
+        deadline = Instant::now() + timeout;
+    }
     run_commands(
         agent,
         paths,
-        commands,
+        (commands, Phase::Gate),
         timeout,
         deadline,
         &mut log,
         &mut report.steps,
-    )?;
+    )
+    .map_err(|failed| failed.failure)?;
     // The commands wrote what the sandbox let them, the repository's git
     // folder included: nothing they planted may run in the gate's git.
     guarded(guard, &mut log)?;
@@ -275,6 +392,55 @@ fn head(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
 /// guard does not check. Every filter driver git would find is switched off
 /// ([`filter_drivers_off`]); a list read that way names them.
 fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
+    let status = status(git, worktree)?;
+    let paths: Vec<String> = status
+        .entries
+        .iter()
+        .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+        .collect();
+    let mut listed = listed(&paths);
+    if !listed.is_empty() && !status.drivers.is_empty() {
+        listed.push_str(&format!(
+            " (read with the filter drivers {} switched off: a file they filter reads as \
+             modified once its timestamps change)",
+            status.drivers.join(", ")
+        ));
+    }
+    Ok(listed)
+}
+
+/// `paths` as a short list: the first [`LISTED_PATHS`], then "and N more".
+fn listed(paths: &[String]) -> String {
+    let mut listed = paths
+        .iter()
+        .take(LISTED_PATHS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > LISTED_PATHS {
+        listed.push_str(&format!(" and {} more", paths.len() - LISTED_PATHS));
+    }
+    listed
+}
+
+/// One path `git status` lists: its two-letter code and its path, as git
+/// wrote them, bytes and all (OWL-330).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StatusEntry {
+    code: [u8; 2],
+    path: Vec<u8>,
+}
+
+/// The worktree's status, read as [`uncommitted`] reads it: every entry,
+/// uncapped, and the filter drivers switched off to read it.
+struct Status {
+    entries: Vec<StatusEntry>,
+    drivers: Vec<String>,
+}
+
+/// Reads the worktree's status: see [`uncommitted`] for what it leaves out
+/// and why.
+fn status(git: &Git, worktree: &Path) -> Result<Status, GateFailure> {
     let (drivers, off) = filter_drivers_off(git, worktree)?;
     let mut args: Vec<&str> = off.iter().map(String::as_str).collect();
     args.extend([
@@ -292,28 +458,15 @@ fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
     })?;
     // Each entry is `XY path`, NUL-terminated; with no renames, no entry
     // carries a second path.
-    let paths: Vec<String> = out
+    let entries = out
         .split(|&b| b == 0)
         .filter(|entry| entry.len() > 3)
-        .map(|entry| String::from_utf8_lossy(&entry[3..]).into_owned())
+        .map(|entry| StatusEntry {
+            code: [entry[0], entry[1]],
+            path: entry[3..].to_vec(),
+        })
         .collect();
-    let mut listed = paths
-        .iter()
-        .take(LISTED_PATHS)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if paths.len() > LISTED_PATHS {
-        listed.push_str(&format!(" and {} more", paths.len() - LISTED_PATHS));
-    }
-    if !listed.is_empty() && !drivers.is_empty() {
-        listed.push_str(&format!(
-            " (read with the filter drivers {} switched off: a file they filter reads as \
-             modified once its timestamps change)",
-            drivers.join(", ")
-        ));
-    }
-    Ok(listed)
+    Ok(Status { entries, drivers })
 }
 
 /// Every filter driver git would find for the worktree, and the arguments
@@ -401,35 +554,479 @@ fn agent_git_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     all
 }
 
+/// What the project's setup came to before a Build's harness
+/// ([`run_setup`], OWL-330).
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SetupRun {
+    /// The setup's report: its steps in `setup`, no gate command, its failure
+    /// and a breach the guard found, as a gate's.
+    pub report: GateReport,
+    /// Whether the worktree held the Build's own work when the setup
+    /// started: an entry `git status` lists, or a HEAD that is neither the
+    /// run's base nor an ancestor of it. Read before the commands ran.
+    pub resumed: bool,
+    /// Whose the failure is: `Some(Fault::Command)` only when a setup
+    /// command failed the project's way and the work was found as it was
+    /// left, the guard passing; `None` when the setup passed, and for every
+    /// failure around the commands.
+    pub fault: Option<Fault>,
+}
+
+impl SetupRun {
+    /// Whether a red setup may still let the harness start (OWL-330, round
+    /// 3): only on a worktree that holds the Build's own work, and only for
+    /// the command's own failure, the work left as it was. A passed setup
+    /// is not recoverable: there is nothing to recover from.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "used by the executor from the next step of OWL-330"
+        )
+    )]
+    pub(crate) fn recoverable(&self) -> bool {
+        self.resumed && self.fault == Some(Fault::Command)
+    }
+}
+
+/// Why the setup before a harness stopped short of passing.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+enum SetupStop {
+    /// A failure, and whose it is when a command failed.
+    Failed(GateFailure, Option<Fault>),
+    Breach(Vec<Violation>),
+}
+
+impl From<GateFailure> for SetupStop {
+    fn from(failure: GateFailure) -> Self {
+        Self::Failed(failure, None)
+    }
+}
+
+impl From<Stop> for SetupStop {
+    fn from(stop: Stop) -> Self {
+        match stop {
+            Stop::Failed(failure) => Self::Failed(failure, None),
+            Stop::Breach(violations) => Self::Breach(violations),
+        }
+    }
+}
+
+/// Runs the project's `setup` in the worktree of `paths` before a Build's
+/// harness (OWL-330), each command confined as a gate command is, under a
+/// third of `timeout`, the gate's deadline, logged to `log_path`. The guard
+/// is checked before the runner's own git and again after the commands.
+///
+/// The worktree may hold a resumed Build's unfinished work, so it need not
+/// be clean: its state ([`worktree_state`]) is read before the commands and
+/// again after them, passed or failed, and any difference fails the setup,
+/// a moved HEAD as the gate says it. `base_commit` is the run's base, a
+/// commit id: the worktree holds the Build's own work when status lists an
+/// entry or HEAD is neither it nor an ancestor of it.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one setup run's inputs, each its own"
+)]
+pub(crate) fn run_setup(
+    git: &Git,
+    agent: &AgentEnv,
+    paths: &RunPaths,
+    base_commit: &str,
+    setup: &[String],
+    timeout: Duration,
+    log_path: &Path,
+    guard: Guard<'_>,
+) -> SetupRun {
+    let git = git.as_agent(agent);
+    let mut run = SetupRun {
+        report: empty_report(&[], log_path),
+        resumed: false,
+        fault: None,
+    };
+    let checked = check_and_set_up(
+        &git,
+        agent,
+        paths,
+        base_commit,
+        setup,
+        timeout,
+        guard,
+        &mut run,
+    );
+    match checked {
+        Ok(()) => {}
+        Err(SetupStop::Failed(failure, fault)) => {
+            run.report.failure = Some(failure);
+            run.fault = fault;
+        }
+        Err(SetupStop::Breach(violations)) => {
+            breached(&mut run.report, violations);
+            run.fault = None;
+        }
+    }
+    run
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+#[allow(clippy::too_many_arguments, reason = "run_setup's inputs, passed on")]
+fn check_and_set_up(
+    git: &Git,
+    agent: &AgentEnv,
+    paths: &RunPaths,
+    base_commit: &str,
+    setup: &[String],
+    timeout: Duration,
+    guard: Guard<'_>,
+    run: &mut SetupRun,
+) -> Result<(), SetupStop> {
+    let worktree = paths.workdir.as_path();
+    let report = &mut run.report;
+    let mut log = File::create(&report.log).map_err(|e| {
+        around(format!(
+            "the runner could not write the setup log {}: {e}",
+            report.log.display()
+        ))
+    })?;
+    guarded(guard, &mut log)?;
+    let before = worktree_state(git, worktree)?;
+    report.commit = Some(before.head.clone());
+    let at_or_behind = git
+        .is_ancestor(worktree, &before.head, base_commit)
+        .map_err(|e| {
+            around(format!(
+                "the runner could not tell whether HEAD is the run's base {base_commit} or \
+                 behind it: {e}"
+            ))
+        })?;
+    run.resumed = !before.entries.is_empty() || !at_or_behind;
+    let share = timeout / SETUP_SHARE;
+    let ran = run_commands(
+        agent,
+        paths,
+        (setup, Phase::Setup),
+        share,
+        Instant::now() + share,
+        &mut log,
+        &mut report.setup,
+    );
+    // Passed or failed, the commands ran the branch's code: the guard, then
+    // the work as it was left.
+    guarded(guard, &mut log)?;
+    let after = worktree_state(git, worktree)?;
+    if after.head != before.head {
+        return Err(around(format!(
+            "the setup moved HEAD from {} to {}",
+            before.head, after.head
+        ))
+        .into());
+    }
+    let changed = before.changed(&after);
+    if !changed.is_empty() {
+        return Err(around(format!(
+            "the setup changed unfinished work: {}",
+            listed(&changed)
+        ))
+        .into());
+    }
+    ran.map_err(|failed| SetupStop::Failed(setup_failure(failed.failure), Some(failed.fault)))
+}
+
+/// What a setup must leave as it found it before a Build's harness
+/// (OWL-330): HEAD, the index, and every path `git status` lists with its
+/// code and its content on disk. Ignored files are outside it.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreeState {
+    head: String,
+    /// Each index entry by its path: `<mode> <blob> <stage>`, as
+    /// `git ls-files -s -z` prints it, every stage of a conflict.
+    index: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// Each path status lists, with its code and what is on disk there.
+    entries: BTreeMap<Vec<u8>, ([u8; 2], OnDisk)>,
+}
+
+impl WorktreeState {
+    /// The paths whose index entries, status or content differ between
+    /// `self` and `after`, each once, as text.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "used by the executor from the next step of OWL-330"
+        )
+    )]
+    fn changed(&self, after: &Self) -> Vec<String> {
+        let mut paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
+        for (one, other) in [(self, after), (after, self)] {
+            paths.extend(
+                one.index
+                    .iter()
+                    .filter(|(path, stages)| other.index.get(*path) != Some(stages))
+                    .map(|(path, _)| path),
+            );
+            paths.extend(
+                one.entries
+                    .iter()
+                    .filter(|(path, entry)| other.entries.get(*path) != Some(entry))
+                    .map(|(path, _)| path),
+            );
+        }
+        paths
+            .into_iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect()
+    }
+}
+
+/// What is on disk at a path status lists, read by the runner itself, never
+/// through git: no filter, textconv or diff driver the worktree names runs.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OnDisk {
+    /// A regular file: its content's SHA-256, and whether it is executable
+    /// (always false where the system has no such bit).
+    File { sha256: [u8; 32], executable: bool },
+    /// A symbolic link: its target, never followed.
+    Link(PathBuf),
+    /// Nothing there, such as a tracked file the worktree deleted.
+    Absent,
+    /// A folder above it is a symbolic link: not followed, so nothing
+    /// outside the worktree is read.
+    UnderLink,
+    /// Anything else, by its kind, never opened.
+    Other(&'static str),
+}
+
+/// Reads the worktree's state ([`WorktreeState`]) with git run as the agent,
+/// filter drivers off for the status as the gate reads it, and the index
+/// read as it is: `ls-files` runs no filter and looks into no submodule.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+fn worktree_state(git: &Git, worktree: &Path) -> Result<WorktreeState, GateFailure> {
+    let head = head(git, worktree)?;
+    let listing = git
+        .run(worktree, &agent_git_args(&["ls-files", "-s", "-z"]))
+        .map_err(|e| around(format!("the runner could not read the index: {e}")))?;
+    let mut index: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for record in listing.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        // `<mode> <blob> <stage>\t<path>`.
+        let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+            return Err(around(
+                "the runner could not read the index: an entry without a path".to_owned(),
+            ));
+        };
+        index
+            .entry(record[tab + 1..].to_vec())
+            .or_default()
+            .push(record[..tab].to_vec());
+    }
+    let mut entries = BTreeMap::new();
+    for entry in status(git, worktree)?.entries {
+        let disk = on_disk(worktree, &entry.path).map_err(|e| {
+            around(format!(
+                "the runner could not read {}: {e}",
+                String::from_utf8_lossy(&entry.path)
+            ))
+        })?;
+        entries.insert(entry.path, (entry.code, disk));
+    }
+    Ok(WorktreeState {
+        head,
+        index,
+        entries,
+    })
+}
+
+/// What is on disk at `path`, as status wrote it, in `worktree`: each folder
+/// above it is checked first, and none that is a link is followed.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+fn on_disk(worktree: &Path, path: &[u8]) -> io::Result<OnDisk> {
+    let relative = path_from_bytes(path);
+    let parts: Vec<_> = relative.components().collect();
+    let mut at = worktree.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(OnDisk::Absent),
+            Err(e) => return Err(e),
+        };
+        let last = i + 1 == parts.len();
+        if !last {
+            if meta.file_type().is_symlink() {
+                return Ok(OnDisk::UnderLink);
+            }
+            if !meta.is_dir() {
+                return Ok(OnDisk::Absent);
+            }
+            continue;
+        }
+        let kind = meta.file_type();
+        return Ok(if kind.is_symlink() {
+            OnDisk::Link(std::fs::read_link(&at)?)
+        } else if kind.is_file() {
+            OnDisk::File {
+                sha256: file_sha256(&at)?,
+                executable: executable(&meta),
+            }
+        } else if kind.is_dir() {
+            OnDisk::Other("folder")
+        } else {
+            OnDisk::Other("special file")
+        });
+    }
+    Ok(OnDisk::Absent)
+}
+
+/// A path as git printed it: bytes on Unix, UTF-8 elsewhere.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+fn path_from_bytes(path: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(path).into_owned())
+    }
+}
+
+/// Whether a file's mode lets its owner, group or others run it; always
+/// false where the system keeps no such bit.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+fn executable(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The SHA-256 of the file at `path`, read in chunks.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the executor from the next step of OWL-330"
+    )
+)]
+fn file_sha256(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buffer[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// Runs the commands in order until the first failure, sharing one deadline,
-/// and records each one started in `steps`.
+/// and records each one started in `steps`. A failure says whose it is
+/// ([`classify`]): a command not started because the deadline had passed is
+/// the command's, a log line that could not be written the runner's.
 fn run_commands(
     agent: &AgentEnv,
     paths: &RunPaths,
-    commands: &[String],
+    (commands, phase): (&[String], Phase),
     timeout: Duration,
     deadline: Instant,
     log: &mut File,
     steps: &mut Vec<GateStep>,
-) -> Result<(), GateFailure> {
+) -> Result<(), CommandFailure> {
     for command in commands {
-        let failed = |reason: String, tail: Tail| {
+        let failed = |reason: String, tail: Tail, fault: Fault| {
             let (output, truncated) = tail.text();
-            GateFailure {
-                command: Some(command.clone()),
-                reason,
-                output,
-                truncated,
+            CommandFailure {
+                failure: GateFailure {
+                    command: Some(command.clone()),
+                    reason,
+                    output,
+                    truncated,
+                },
+                fault,
             }
         };
-        let stopped = || format!("stopped at the gate's deadline, {} s", timeout.as_secs());
+        let stopped = || phase.stopped(timeout);
         if Instant::now() >= deadline {
-            return Err(failed(stopped(), Tail::default()));
+            return Err(failed(stopped(), Tail::default(), Fault::Command));
         }
         if let Err(e) = writeln!(log, "$ {command}") {
             return Err(failed(
                 format!("the runner could not write the gate log: {e}"),
                 Tail::default(),
+                Fault::Runner,
             ));
         }
         let started = Instant::now();
@@ -441,38 +1038,68 @@ fn run_commands(
             End::Error(error) => format!("runner error: {error}"),
         };
         let _ = writeln!(log, "[{status}]");
-        let reason = match ran.end {
-            End::TimedOut => Some(stopped()),
-            End::Error(error) => Some(error),
-            End::Exited(status) if !status.success() => Some(match status.code() {
-                Some(code) => format!("exit status {code}"),
-                None => "ended by a signal".to_owned(),
-            }),
-            End::Exited(_) if ran.output_held => {
-                Some("a process it started kept its output open after it ended".to_owned())
-            }
-            End::Exited(_) => ran
-                .log_error
-                .map(|e| format!("the runner could not write the gate log: {e}")),
-        };
+        let classified = classify(ran.end, ran.output_held, ran.log_error, stopped);
         let (output, truncated) = ran.tail.text();
         steps.push(GateStep {
             command: command.clone(),
-            failure: reason.clone(),
+            failure: classified.as_ref().map(|(reason, _)| reason.clone()),
             elapsed,
             output: output.clone(),
             truncated,
         });
-        if let Some(reason) = reason {
-            return Err(GateFailure {
-                command: Some(command.clone()),
-                reason,
-                output,
-                truncated,
+        if let Some((reason, fault)) = classified {
+            return Err(CommandFailure {
+                failure: GateFailure {
+                    command: Some(command.clone()),
+                    reason,
+                    output,
+                    truncated,
+                },
+                fault,
             });
         }
     }
     Ok(())
+}
+
+/// Why a command that ended so failed, and whose failure it is; `None` when
+/// it passed. The reason keeps the gate's order: the deadline, a runner
+/// error, the exit status, a held output, a log write error. The fault is the
+/// runner's for a runner error, a held output or a log write error, whatever
+/// the end; the command's only for a non-zero exit, a signal or the deadline
+/// with neither (OWL-330, round 4).
+fn classify(
+    end: End,
+    output_held: bool,
+    log_error: Option<String>,
+    stopped: impl FnOnce() -> String,
+) -> Option<(String, Fault)> {
+    let fault = if output_held || log_error.is_some() {
+        Fault::Runner
+    } else {
+        Fault::Command
+    };
+    match end {
+        End::TimedOut => Some((stopped(), fault)),
+        End::Error(error) => Some((error, Fault::Runner)),
+        End::Exited(status) if !status.success() => Some((
+            match status.code() {
+                Some(code) => format!("exit status {code}"),
+                None => "ended by a signal".to_owned(),
+            },
+            fault,
+        )),
+        End::Exited(_) if output_held => Some((
+            "a process it started kept its output open after it ended".to_owned(),
+            Fault::Runner,
+        )),
+        End::Exited(_) => log_error.map(|e| {
+            (
+                format!("the runner could not write the gate log: {e}"),
+                Fault::Runner,
+            )
+        }),
+    }
 }
 
 /// How one command ended.
@@ -718,12 +1345,13 @@ mod tests {
         let outcome = run_commands(
             agent,
             &paths(dir.path()),
-            commands,
+            (commands, Phase::Gate),
             timeout,
             Instant::now() + timeout,
             &mut log,
             &mut Vec::new(),
-        );
+        )
+        .map_err(|failed| failed.failure);
         (outcome, std::fs::read_to_string(&log_path).unwrap())
     }
 
@@ -895,13 +1523,16 @@ mod tests {
         let outcome = run_commands(
             &agent(),
             &paths(dir.path()),
-            &[helper("helper_leave_an_escaped_pipe_holder")],
+            (
+                &[helper("helper_leave_an_escaped_pipe_holder")],
+                Phase::Gate,
+            ),
             timeout,
             Instant::now() + timeout,
             &mut log,
             &mut Vec::new(),
         );
-        let failure = outcome.unwrap_err();
+        let failure = outcome.unwrap_err().failure;
         assert_eq!(
             failure.reason,
             "a process it started kept its output open after it ended"
@@ -911,7 +1542,7 @@ mod tests {
         let next = run_commands(
             &agent(),
             &paths(dir.path()),
-            &lines(&["echo second"]),
+            (&lines(&["echo second"]), Phase::Gate),
             timeout,
             Instant::now() + timeout,
             &mut log,
@@ -1088,12 +1719,13 @@ mod tests {
         run_commands(
             agent,
             paths,
-            &[line.to_owned()],
+            (&[line.to_owned()], Phase::Gate),
             timeout,
             Instant::now() + timeout,
             &mut log,
             &mut Vec::new(),
         )
+        .map_err(|failed| failed.failure)
     }
 
     /// Whether agent runs can be confined here. Where they cannot, the test
@@ -1384,15 +2016,15 @@ mod tests {
 
         /// A checkout whose `a.txt` names the `owl` filter, and a worktree of
         /// it on `owl-1`, snapshotted as a run's would be.
-        struct Repo {
-            base: tempfile::TempDir,
-            worktree: PathBuf,
-            marker: PathBuf,
-            snapshot: Snapshot,
+        pub(super) struct Repo {
+            pub(super) base: tempfile::TempDir,
+            pub(super) worktree: PathBuf,
+            pub(super) marker: PathBuf,
+            pub(super) snapshot: Snapshot,
         }
 
         /// The test's own git, away from the operator's configuration.
-        fn git_in(dir: &Path, args: &[&str]) -> Vec<u8> {
+        pub(super) fn git_in(dir: &Path, args: &[&str]) -> Vec<u8> {
             let out = Command::new("git")
                 .args([
                     "-c",
@@ -1411,7 +2043,7 @@ mod tests {
             out.stdout
         }
 
-        fn repo() -> Repo {
+        pub(super) fn repo() -> Repo {
             let base = tempfile::tempdir().unwrap();
             let root = std::fs::canonicalize(base.path()).unwrap();
             let main = root.join("main");
@@ -1445,6 +2077,7 @@ mod tests {
                     &Git::new("git"),
                     agent,
                     &paths(&self.worktree),
+                    &[],
                     &[command.to_owned()],
                     Duration::from_secs(60),
                     &self.base.path().join(GATE_LOG),
@@ -1453,7 +2086,7 @@ mod tests {
             }
 
             /// A command that has git touch the marker, for `filter.owl.clean`.
-            fn touch_marker(&self) -> String {
+            pub(super) fn touch_marker(&self) -> String {
                 format!("touch '{}'; cat", self.marker.display())
             }
 
@@ -1654,6 +2287,547 @@ mod tests {
 
             git_in(&repo.worktree, &["status", "--porcelain"]);
             assert!(repo.marker.exists(), "the control never ran the filter");
+        }
+    }
+
+    /// OWL-330: whose a failure is, from how the command ended.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_is_the_commands_only_with_nothing_wrong_on_the_runners_side() {
+        use std::os::unix::process::ExitStatusExt;
+        let stopped = || "stopped".to_owned();
+        let ends = || {
+            [
+                ("exit 0", End::Exited(ExitStatus::from_raw(0))),
+                ("exit 1", End::Exited(ExitStatus::from_raw(1 << 8))),
+                ("signal", End::Exited(ExitStatus::from_raw(9))),
+                ("deadline", End::TimedOut),
+                ("error", End::Error("could not start: no".to_owned())),
+            ]
+        };
+        for held in [false, true] {
+            for log_error in [None, Some("disk full".to_owned())] {
+                for (name, end) in ends() {
+                    let classified = classify(end, held, log_error.clone(), stopped);
+                    let runner_side = held || log_error.is_some();
+                    let expected = match name {
+                        "exit 0" if held => Some((
+                            "a process it started kept its output open after it ended",
+                            Fault::Runner,
+                        )),
+                        "exit 0" if log_error.is_some() => Some((
+                            "the runner could not write the gate log: disk full",
+                            Fault::Runner,
+                        )),
+                        "exit 0" => None,
+                        "error" => Some(("could not start: no", Fault::Runner)),
+                        _ => {
+                            let reason = match name {
+                                "exit 1" => "exit status 1",
+                                "signal" => "ended by a signal",
+                                _ => "stopped",
+                            };
+                            let fault = if runner_side {
+                                Fault::Runner
+                            } else {
+                                Fault::Command
+                            };
+                            Some((reason, fault))
+                        }
+                    };
+                    assert_eq!(
+                        classified,
+                        expected.map(|(reason, fault)| (reason.to_owned(), fault)),
+                        "{name}, held {held}, log error {log_error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Runs `commands` as setup commands, unconfined, under `timeout`: the
+    /// failure and its fault, and the log.
+    #[cfg(unix)]
+    fn set_up(commands: &[String], timeout: Duration) -> (Result<(), CommandFailure>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join(GATE_LOG);
+        let mut log = File::create(&log_path).unwrap();
+        let outcome = run_commands(
+            &agent(),
+            &paths(dir.path()),
+            (commands, Phase::Setup),
+            timeout,
+            Instant::now() + timeout,
+            &mut log,
+            &mut Vec::new(),
+        );
+        // What a helper left behind may wait for this, then stops.
+        File::create(dir.path().join("go")).unwrap();
+        (outcome, std::fs::read_to_string(&log_path).unwrap())
+    }
+
+    /// OWL-330: real commands. An exit status, a signal and the deadline are
+    /// the command's; the same with a process left holding the output is the
+    /// runner's, the reason unchanged; and so is a log the runner cannot
+    /// write, here its `$ command` line to a log opened read-only. A runner
+    /// error writing the output to the log has no portable trigger: the
+    /// `classify` table covers it.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_command_failure_says_whose_it_is() {
+        let fault = |commands: &[String], timeout: u64| {
+            let (outcome, _) = set_up(commands, Duration::from_secs(timeout));
+            let failed = outcome.unwrap_err();
+            (failed.failure.reason, failed.fault)
+        };
+        assert_eq!(
+            fault(&lines(&["exit 1"]), 60),
+            ("exit status 1".to_owned(), Fault::Command)
+        );
+        assert_eq!(
+            fault(&lines(&["kill -9 $$"]), 60),
+            ("ended by a signal".to_owned(), Fault::Command)
+        );
+        assert_eq!(
+            fault(&lines(&["sleep 20"]), 1),
+            (
+                "stopped at the setup's deadline, a third of the gate's, 1 s".to_owned(),
+                Fault::Command
+            )
+        );
+        let holder = helper("helper_leave_an_escaped_pipe_holder");
+        assert_eq!(
+            fault(&[format!("{holder}; exit 1")], 5),
+            ("exit status 1".to_owned(), Fault::Runner)
+        );
+        assert_eq!(
+            fault(&[format!("{holder}; sleep 20")], 3),
+            (
+                "stopped at the setup's deadline, a third of the gate's, 3 s".to_owned(),
+                Fault::Runner
+            )
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join(GATE_LOG);
+        File::create(&log_path).unwrap();
+        let mut read_only = File::open(&log_path).unwrap();
+        let failed = run_commands(
+            &agent(),
+            &paths(dir.path()),
+            (&lines(&["true"]), Phase::Setup),
+            Duration::from_secs(60),
+            Instant::now() + Duration::from_secs(60),
+            &mut read_only,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            failed
+                .failure
+                .reason
+                .starts_with("the runner could not write the gate log"),
+            "{failed:?}"
+        );
+        assert_eq!(failed.fault, Fault::Runner);
+    }
+
+    /// OWL-330: the project's setup in the gate, before its commands.
+    #[cfg(unix)]
+    mod setup {
+        use super::planted::{Repo, git_in, repo};
+        use super::*;
+
+        impl Repo {
+            /// The gate with `setup` before `commands`, the run's own
+            /// temporary folder given, within `timeout`.
+            fn gate_set_up(
+                &self,
+                setup: &[&str],
+                commands: &[&str],
+                timeout: Duration,
+            ) -> GateReport {
+                let temp = tempfile::tempdir().unwrap();
+                run(
+                    &Git::new("git"),
+                    &agent(),
+                    &RunPaths {
+                        temp: Some(temp.path().to_owned()),
+                        ..paths(&self.worktree)
+                    },
+                    &lines(setup),
+                    &lines(commands),
+                    timeout,
+                    &self.base.path().join(GATE_LOG),
+                    &|| self.snapshot.check_files(&self.worktree),
+                )
+            }
+
+            /// The setup before a harness, with `base` as the run's base.
+            fn before_harness(&self, base: &str, setup: &[&str]) -> SetupRun {
+                let temp = tempfile::tempdir().unwrap();
+                run_setup(
+                    &Git::new("git"),
+                    &agent(),
+                    &RunPaths {
+                        temp: Some(temp.path().to_owned()),
+                        ..paths(&self.worktree)
+                    },
+                    base,
+                    &lines(setup),
+                    Duration::from_secs(180),
+                    &self.base.path().join(SETUP_LOG),
+                    &|| self.snapshot.check_files(&self.worktree),
+                )
+            }
+
+            fn head(&self) -> String {
+                self.git(&["rev-parse", "HEAD"])
+            }
+
+            fn git(&self, args: &[&str]) -> String {
+                String::from_utf8(git_in(&self.worktree, args))
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+            }
+
+            fn write(&self, path: &str, content: &str) {
+                let path = self.worktree.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, content).unwrap();
+            }
+
+            fn read(&self, path: &str) -> String {
+                std::fs::read_to_string(self.worktree.join(path)).unwrap()
+            }
+
+            /// Commits on the branch the checkout has, `main`'s, so the
+            /// worktree's base moves ahead of it.
+            fn advance_main(&self) -> String {
+                let main = self.worktree.with_file_name("main");
+                git_in(&main, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+                String::from_utf8(git_in(&main, &["rev-parse", "HEAD"]))
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+            }
+        }
+
+        fn reason(report: &GateReport) -> &str {
+            &report.failure.as_ref().expect("the setup failed").reason
+        }
+
+        #[test]
+        fn the_setup_runs_first_and_its_temporary_files_reach_the_gate() {
+            let repo = repo();
+            let report = repo.gate_set_up(
+                &["echo a > \"$TMPDIR/x\""],
+                &["test \"$(cat \"$TMPDIR/x\")\" = a"],
+                Duration::from_secs(60),
+            );
+            assert!(report.passed(), "{report:?}");
+            assert_eq!(report.setup.len(), 1);
+            assert_eq!(report.steps.len(), 1);
+            let log = std::fs::read_to_string(&report.log).unwrap();
+            let setup = log.find("$ echo a").unwrap();
+            assert!(setup < log.find("$ test").unwrap(), "{log}");
+        }
+
+        #[test]
+        fn a_failing_setup_command_stops_the_gate_before_its_commands() {
+            let repo = repo();
+            let touch = format!("touch '{}'", repo.marker.display());
+            let report = repo.gate_set_up(
+                &["echo partial; exit 1", "echo never"],
+                &[&touch],
+                Duration::from_secs(60),
+            );
+            assert!(!repo.marker.exists(), "a gate command ran");
+            let failure = report.failure.clone().unwrap();
+            assert_eq!(failure.command.as_deref(), Some("echo partial; exit 1"));
+            assert_eq!(failure.reason, "setup: exit status 1");
+            assert!(failure.output.contains("partial"), "{failure:?}");
+            assert_eq!(report.setup.len(), 1);
+            assert!(report.steps.is_empty());
+        }
+
+        #[test]
+        fn a_setup_that_leaves_a_file_or_moves_head_fails_the_gate() {
+            let repo = repo();
+            let report =
+                repo.gate_set_up(&["echo x > stray.txt"], &["true"], Duration::from_secs(60));
+            assert!(
+                reason(&report).starts_with("the setup changed files: stray.txt"),
+                "{report:?}"
+            );
+            assert!(report.steps.is_empty());
+
+            let repo = super::planted::repo();
+            let report = repo.gate_set_up(
+                &[
+                    "git -c user.name=o -c user.email=o@example.invalid -c commit.gpgsign=false \
+                   commit -q --allow-empty -m moved",
+                ],
+                &["true"],
+                Duration::from_secs(60),
+            );
+            assert!(
+                reason(&report).starts_with("the setup moved HEAD from "),
+                "{report:?}"
+            );
+        }
+
+        /// The setup has a third of the gate's deadline, in its own words;
+        /// the gate's commands get the whole of it afterwards.
+        #[test]
+        fn the_setup_has_a_third_of_the_deadline_and_the_gate_its_whole() {
+            let repo = repo();
+            let started = Instant::now();
+            let report = repo.gate_set_up(&["sleep 20"], &["true"], Duration::from_secs(3));
+            assert_eq!(
+                reason(&report),
+                "setup: stopped at the setup's deadline, a third of the gate's, 1 s"
+            );
+            assert!(started.elapsed() < Duration::from_secs(10));
+
+            // 2 s of setup and 7.5 s of gate: past the 9 s they would share.
+            let report = repo.gate_set_up(&["sleep 2"], &["sleep 7.5"], Duration::from_secs(9));
+            assert!(report.passed(), "{report:?}");
+        }
+
+        /// Unfinished work, tracked, staged and untracked, comes out of a
+        /// setup as it went in, and the run counts as resumed.
+        #[test]
+        fn unfinished_work_survives_the_setup_before_a_harness() {
+            let repo = repo();
+            let base = repo.head();
+            repo.write("a.txt", "edited\n");
+            repo.write("b.txt", "staged\n");
+            repo.git(&["add", "b.txt"]);
+            repo.write("c.txt", "untracked\n");
+            let run = repo.before_harness(&base, &["echo set up > \"$TMPDIR/x\""]);
+            assert!(run.report.passed(), "{run:?}");
+            assert!(run.resumed && run.fault.is_none() && !run.recoverable());
+            assert_eq!(run.report.setup.len(), 1);
+            assert_eq!(
+                (repo.read("a.txt"), repo.read("b.txt"), repo.read("c.txt")),
+                ("edited\n".into(), "staged\n".into(), "untracked\n".into())
+            );
+            assert!(run.report.log.ends_with(SETUP_LOG));
+        }
+
+        /// Resumed or pristine: by HEAD against the run's base, ancestry and
+        /// not equality, and by any entry status lists.
+        #[test]
+        fn resumed_is_read_from_head_and_the_base() {
+            let repo = repo();
+            let base = repo.head();
+            assert!(!repo.before_harness(&base, &["true"]).resumed);
+            // The base moved ahead: a branch with no commits of its own.
+            let ahead = repo.advance_main();
+            assert!(!repo.before_harness(&ahead, &["true"]).resumed);
+            // The branch has a commit of its own: past the base, or beside it.
+            repo.git(&["commit", "-q", "--allow-empty", "-m", "own"]);
+            assert!(repo.before_harness(&base, &["true"]).resumed);
+            assert!(repo.before_harness(&ahead, &["true"]).resumed);
+
+            let repo = super::planted::repo();
+            let base = repo.head();
+            repo.write("u.txt", "u\n");
+            assert!(repo.before_harness(&base, &["true"]).resumed);
+
+            let run = repo.before_harness(&"0".repeat(40), &["true"]);
+            let failure = run.report.failure.clone().expect("an unknown base fails");
+            assert!(failure.command.is_none(), "{failure:?}");
+            assert!(run.fault.is_none() && !run.recoverable());
+            assert!(run.report.setup.is_empty(), "no command ran");
+        }
+
+        /// A red command on unfinished work is the command's, recoverable;
+        /// on a pristine worktree it is not.
+        #[test]
+        fn a_red_setup_is_recoverable_only_on_unfinished_work() {
+            let repo = repo();
+            let base = repo.head();
+            let run = repo.before_harness(&base, &["exit 1"]);
+            assert_eq!(reason(&run.report), "setup: exit status 1");
+            assert_eq!(run.fault, Some(Fault::Command));
+            assert!(!run.resumed && !run.recoverable());
+            repo.write("a.txt", "edited\n");
+            let run = repo.before_harness(&base, &["exit 1"]);
+            assert!(run.resumed && run.recoverable(), "{run:?}");
+        }
+
+        /// Each change a setup makes to unfinished work fails it, naming the
+        /// path: a tracked edit changed, an untracked file deleted, a file
+        /// added, a deleted file restored, the index alone, the mode alone,
+        /// a conflict's stages. Ignored files and a deletion left as it was
+        /// pass.
+        #[test]
+        fn a_setup_that_changes_unfinished_work_fails_naming_it() {
+            let changed = |prepare: &dyn Fn(&Repo), setup: &str| {
+                let repo = repo();
+                let base = repo.head();
+                prepare(&repo);
+                let run = repo.before_harness(&base, &[setup]);
+                assert!(run.fault.is_none() && !run.recoverable(), "{run:?}");
+                reason(&run.report).to_owned()
+            };
+            let edited = |repo: &Repo| {
+                repo.write("a.txt", "edited\n");
+                repo.write("u.txt", "untracked\n");
+            };
+            assert_eq!(
+                changed(&edited, "echo again > a.txt"),
+                "the setup changed unfinished work: a.txt"
+            );
+            assert_eq!(
+                changed(&edited, "rm u.txt"),
+                "the setup changed unfinished work: u.txt"
+            );
+            assert_eq!(
+                changed(&edited, "echo new > new.txt"),
+                "the setup changed unfinished work: new.txt"
+            );
+            // A red command that also changed the work fails for the change.
+            assert_eq!(
+                changed(&edited, "echo again > a.txt; exit 1"),
+                "the setup changed unfinished work: a.txt"
+            );
+            let deleted = |repo: &Repo| std::fs::remove_file(repo.worktree.join("a.txt")).unwrap();
+            assert_eq!(
+                changed(&deleted, "echo a > a.txt"),
+                "the setup changed unfinished work: a.txt"
+            );
+            let staged = |repo: &Repo| {
+                repo.write("a.txt", "staged\n");
+                repo.git(&["add", "a.txt"]);
+            };
+            assert_eq!(
+                changed(
+                    &staged,
+                    "git update-index --cacheinfo \
+                     \"100644,$(echo other | git hash-object -w --stdin),a.txt\""
+                ),
+                "the setup changed unfinished work: a.txt"
+            );
+            assert_eq!(
+                changed(&edited, "chmod +x a.txt"),
+                "the setup changed unfinished work: a.txt"
+            );
+            let conflicted = |repo: &Repo| {
+                let blob = repo.git(&["rev-parse", "HEAD:a.txt"]);
+                let stages = format!("100644 {blob} 1\tc.txt\n100644 {blob} 2\tc.txt\n");
+                let mut command = Command::new("git");
+                command
+                    .args(["update-index", "--index-info"])
+                    .current_dir(&repo.worktree)
+                    .stdin(Stdio::piped());
+                let mut child = command.spawn().unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(stages.as_bytes())
+                    .unwrap();
+                assert!(child.wait().unwrap().success());
+            };
+            assert_eq!(
+                changed(
+                    &conflicted,
+                    "printf '100644 %s 3\\tc.txt\\n' \"$(git rev-parse HEAD:a.txt)\" | \
+                     git update-index --index-info"
+                ),
+                "the setup changed unfinished work: c.txt"
+            );
+
+            let repo = repo();
+            let base = repo.head();
+            repo.write(".gitignore", "*.log\n");
+            std::fs::remove_file(repo.worktree.join("a.txt")).unwrap();
+            let run = repo.before_harness(&base, &["echo log > x.log"]);
+            assert!(run.report.passed(), "{run:?}");
+        }
+
+        /// Every path counts, past the ten a failure lists.
+        #[test]
+        fn the_last_of_many_unfinished_paths_is_checked() {
+            let repo = repo();
+            let base = repo.head();
+            for i in 1..=12 {
+                repo.write(&format!("u{i:02}.txt"), "u\n");
+            }
+            let run = repo.before_harness(&base, &["echo changed > u12.txt"]);
+            assert_eq!(
+                reason(&run.report),
+                "the setup changed unfinished work: u12.txt"
+            );
+        }
+
+        /// A folder of tracked files swapped for a link to a folder outside
+        /// the worktree: the state read follows no link, so what changes
+        /// behind it is not read and does not count.
+        #[test]
+        fn the_state_read_follows_no_link_out_of_the_worktree() {
+            let repo = repo();
+            let base = repo.head();
+            repo.write("dir/f", "tracked\n");
+            repo.git(&["add", "dir/f"]);
+            repo.git(&["commit", "-q", "-m", "dir"]);
+            let elsewhere = repo.base.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("f"), "outside\n").unwrap();
+            std::fs::remove_dir_all(repo.worktree.join("dir")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, repo.worktree.join("dir")).unwrap();
+            let run = repo.before_harness(
+                &base,
+                &[&format!("echo changed > '{}/f'", elsewhere.display())],
+            );
+            assert!(run.report.passed(), "{run:?}");
+            assert!(run.resumed);
+        }
+
+        /// The planted submodule of OWL-64, planted by a setup: neither state
+        /// read looks into it, so its filter never runs.
+        #[test]
+        fn a_submodule_planted_by_the_setup_is_not_looked_into() {
+            let repo = repo();
+            let base = repo.head();
+            let plant = format!(
+                "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 && \
+                 git init -q sub && cd sub && git config filter.owl.clean \"{marker}\" && \
+                 printf 'f filter=owl\\n' > .gitattributes && printf 'f\\n' > f && \
+                 git add f .gitattributes && \
+                 git -c user.name=owl -c user.email=owl@example.invalid \
+                 -c commit.gpgsign=false commit -q -m sub && rm -f '{path}' && cd .. && \
+                 git update-index --add --cacheinfo \"160000,$(git -C sub rev-parse HEAD),sub\" && \
+                 touch -t 200001010000 sub/f",
+                marker = repo.touch_marker(),
+                path = repo.marker.display(),
+            );
+            let run = repo.before_harness(&base, &[&plant]);
+            assert!(!run.report.passed());
+            assert!(!repo.marker.exists(), "the state read ran the filter");
+            git_in(&repo.worktree, &["status", "--porcelain"]);
+            assert!(repo.marker.exists(), "the control never ran the filter");
+        }
+
+        /// A path that is not UTF-8 is read by its bytes: a setup that edits
+        /// it is caught. Linux only: APFS refuses such names.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_path_that_is_not_utf8_is_read_by_its_bytes() {
+            use std::os::unix::ffi::OsStrExt;
+            let repo = repo();
+            let base = repo.head();
+            let name = std::ffi::OsStr::from_bytes(b"odd-\xff.txt");
+            std::fs::write(repo.worktree.join(name), "u\n").unwrap();
+            let run = repo.before_harness(&base, &["for f in odd-*; do echo x > \"$f\"; done"]);
+            assert!(
+                reason(&run.report).starts_with("the setup changed unfinished work: odd-"),
+                "{run:?}"
+            );
         }
     }
 }
