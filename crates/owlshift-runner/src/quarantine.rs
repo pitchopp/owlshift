@@ -386,9 +386,12 @@ pub fn clear(
     sink: &mut EventSink<'_>,
 ) -> Result<Cleared, String> {
     let marker_error = |error: io::Error| format!("the project's marker: {error}");
-    // A project never run has no folder, which the lock would make.
-    if fs::symlink_metadata(dirs.unverified_file()).is_err() {
-        return Ok(Cleared::Nothing);
+    // A project never run has no folder, which the lock would make. Only a
+    // marker missing is no quarantine: one that cannot be looked at is.
+    match fs::symlink_metadata(dirs.unverified_file()) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Cleared::Nothing),
+        Err(error) => return Err(marker_error(error)),
     }
     let marker = {
         let _lock = locked(dirs)?;
@@ -725,6 +728,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A marker that cannot be looked at is a refusal, never "nothing to
+    /// clear" (OWL-368, Codex P2).
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_that_cannot_be_looked_at_is_no_clear_quarantine() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bench = Bench::new();
+        bench.mark(BREACH);
+        let root = bench.dirs.root();
+        fs::set_permissions(root, fs::Permissions::from_mode(0o000)).unwrap();
+        // A superuser looks through any folder: nothing to check then.
+        let superuser = fs::read_dir(root).is_ok();
+        let mut ask = |_: &str| -> io::Result<String> { unreachable!("nothing is shown") };
+        let mut out = Vec::new();
+        let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
+        let cleared = clear(&bench.dirs, &mut ask, &mut sink);
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        if !superuser {
+            let refused = cleared.unwrap_err();
+            assert!(refused.starts_with("the project's marker: "), "{refused}");
+        }
+        assert_eq!(bench.dirs.unverified().unwrap().as_deref(), Some(BREACH));
     }
 
     /// A marker the person did not see is never cleared: one written while
