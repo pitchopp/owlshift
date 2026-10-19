@@ -24,7 +24,9 @@
 //! - **Expected branch**: the worktree's HEAD is still the run's branch,
 //!   and its commit descends from the one the run started from or, for a
 //!   rebase ([`Snapshot::take_rebase`]), from the new base, resolved to a
-//!   commit before the run.
+//!   commit before the run. A run that is not a rebase and rewrote its
+//!   branch is still a breach; its violation says so when the branch shares
+//!   a commit with the start (OWL-369).
 //!
 //! Runs in flight at the same time move their own branches, so
 //! [`Snapshot::check_among`] is told which ([`Concurrent`]), just before and
@@ -195,6 +197,13 @@ pub enum Violation {
         /// The rebase's new base; `None` for a run that may only add to its
         /// branch.
         onto: Option<String>,
+        /// Whether the branch still shares a commit with the start, the
+        /// likely mark of a rebase, an amend or a reset of the run's own
+        /// branch rather than a history from elsewhere. Only looked for when
+        /// `onto` is `None`, and always `false` otherwise. `false` means not
+        /// found, not ruled out: an amended root commit, or a commit at a
+        /// shallow clone's boundary, leaves no shared commit to find.
+        rewritten: bool,
     },
     /// A check could not run, so a change cannot be ruled out.
     CheckFailed(String),
@@ -226,14 +235,22 @@ impl fmt::Display for Violation {
                 start,
                 end,
                 onto: None,
-            } => write!(
-                f,
-                "the branch is at {end}, which does not descend from the run's start {start}"
-            ),
+                rewritten,
+            } => {
+                write!(
+                    f,
+                    "the branch is at {end}, which does not descend from the run's start {start}"
+                )?;
+                if *rewritten {
+                    f.write_str(": the run rewrote its branch's history (rebase, amend or reset)")?;
+                }
+                Ok(())
+            }
             Self::History {
                 start,
                 end,
                 onto: Some(onto),
+                ..
             } => write!(
                 f,
                 "the branch is at {end}, which descends neither from the run's start {start} \
@@ -429,10 +446,22 @@ impl Snapshot {
                 None => false,
             };
         if !accepted {
+            // Only for a run that may only add to its branch: a rebase that
+            // lands elsewhere shares history with its start by design. The
+            // answer only explains the breach, so a git that cannot give it
+            // keeps the breach and adds a check that could not run.
+            let rewritten = self.onto.is_none()
+                && git
+                    .shares_history(worktree, &self.start, &end)
+                    .unwrap_or_else(|error| {
+                        violations.push(Violation::CheckFailed(error.to_string()));
+                        false
+                    });
             violations.push(Violation::History {
                 start: self.start.clone(),
                 end: end.clone(),
                 onto: self.onto.clone(),
+                rewritten,
             });
         }
         Ok(Some(end))

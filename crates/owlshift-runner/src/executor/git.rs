@@ -202,24 +202,44 @@ impl Git {
         ancestor: &str,
         end: &str,
     ) -> Result<bool, GitError> {
-        let args = [
-            "merge-base",
-            "--is-ancestor",
-            "--end-of-options",
-            ancestor,
-            end,
-        ];
-        let ancestry = self.output(dir, &args, None)?;
-        match ancestry.code {
+        self.yes_or_no(
+            dir,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                "--end-of-options",
+                ancestor,
+                end,
+            ],
+        )
+    }
+
+    /// Whether `one` and `other` have a commit in common, in the repository
+    /// at `dir`: `merge-base`, whose exit 1 is a no and any other failure an
+    /// error.
+    pub(crate) fn shares_history(
+        &self,
+        dir: &Path,
+        one: &str,
+        other: &str,
+    ) -> Result<bool, GitError> {
+        self.yes_or_no(dir, &["merge-base", "--end-of-options", one, other])
+    }
+
+    /// Runs `args` in `dir` as a question git answers by its exit status:
+    /// 0 is a yes, 1 a no, anything else an error.
+    fn yes_or_no(&self, dir: &Path, args: &[&str]) -> Result<bool, GitError> {
+        let answer = self.output(dir, args, None)?;
+        match answer.code {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             code => Err(GitError::new(
                 dir,
-                &args,
+                args,
                 format!(
                     "failed with {}: {}",
                     exit_text(code),
-                    tail(&String::from_utf8_lossy(&ancestry.stderr))
+                    tail(&String::from_utf8_lossy(&answer.stderr))
                 ),
             )),
         }
