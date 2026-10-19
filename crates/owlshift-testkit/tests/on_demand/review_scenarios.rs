@@ -348,3 +348,79 @@ fn a_merge_ends_a_review_loop_waiting_at_build() {
     assert!(lines.contains("its review loop ends"), "{lines}");
     assert_eq!(bench.stage(), "In Review");
 }
+
+/// OWL-357's acceptance on the bench: a `risky` ticket's plan is approved by
+/// the decider, built, delivered, then sent back to Build by a review. That
+/// loop Build's thread follows a PLAN, a RESUME and a DELIVERY comment and
+/// holds none of their bodies, each read as its header line; the decider's
+/// answer reads byte for byte as posted. The answer check of the approval
+/// is given the plan, which its PLAN comment no longer shows in the thread.
+#[test]
+fn a_later_brief_holds_owlshifts_comments_short_and_the_deciders_whole() {
+    use super::design_scenarios::{FORKED, answered, designed, reviewed};
+
+    let bench = Bench::with("maintainer", "assignee = \"maintainer\"\n", FORGE);
+    bench.add_labels(&["variant:risky"]);
+    let replies = vec![
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+    ];
+    let (asked, printed) = bench.run(replies, None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let answer = "Approved as it is.\n\nKeep the greeting short: one line, no sign-off.";
+    bench.answer(answer);
+    let replies = vec![
+        bench.read(&check(&[("Q1", "answered", "Approved as it is.")])),
+        bench.read(&answered("approved", None)),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.continue_ticket(replies);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let checked = bench.last_of(Role::AnswerCheck);
+    assert_eq!(
+        checked.plan.map(|given| given.plan),
+        bench.record().plan.map(|kept| kept.plan),
+        "the answer check is given the plan"
+    );
+
+    bench.reviews_on_github(vec![review(7_000_000_357, "ann-dev", "Use capitals.", &[])]);
+    let (looped, printed) =
+        bench.continue_ticket(vec![bench.reply(Some("Hello there"), Some(RENAMED))]);
+    looped.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let posted = bench.comments();
+    let brief = bench.last_of(Role::Build);
+    assert!(!brief.pull_request_reviews.is_empty(), "the loop's Build");
+    let mut shown = Vec::new();
+    for entry in &brief.thread {
+        let ThreadEntry::Comment { author, body, .. } = entry else {
+            continue;
+        };
+        if author.relation == Relation::Decider {
+            assert_eq!(body.trim_end(), answer, "the decider's comment, whole");
+            shown.push("decider".to_owned());
+            continue;
+        }
+        let header = body.lines().next().unwrap();
+        let whole = posted
+            .iter()
+            .find(|whole| whole.starts_with(header))
+            .unwrap_or_else(|| panic!("{header} posted"));
+        assert!(body.contains("Left out of this brief: "), "{body}");
+        assert!(body.len() < whole.len(), "{header}: {body}");
+        shown.push(header.to_owned());
+    }
+    assert_eq!(
+        shown,
+        [
+            "[owlshift] PLAN",
+            "decider",
+            "[owlshift] RESUME · round 1",
+            "[owlshift] DELIVERY"
+        ]
+    );
+}

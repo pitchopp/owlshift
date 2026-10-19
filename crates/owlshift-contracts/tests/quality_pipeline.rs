@@ -337,7 +337,15 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         "author": { "name": "ada", "relation": "decider" },
         "comments": [{ "path": "src/lib.rs", "line": 3, "body": "Rename this." }]
     });
-    for role in ["design", "design_review", "build", "verify", "arbiter"] {
+    // The answer check since OWL-357: its approval question points to it.
+    for role in [
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "arbiter",
+        "answer_check",
+    ] {
         parse(&with(brief(role), "plan", given_plan.clone()))
             .unwrap_or_else(|e| panic!("{role}: {e}"));
     }

@@ -159,7 +159,8 @@ pub struct Brief {
     /// OWL-300): what Build follows, the review roles and the arbiter read,
     /// and a design run revises or puts to the decider. Required in the
     /// design review role's brief; given to the design, design review,
-    /// build, verify and arbiter roles only.
+    /// build, verify and arbiter roles, and since OWL-357 to the answer
+    /// check, whose approval question points to it, only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<GivenPlan>,
     /// The plan was put to the decider for approval, and the thread holds
@@ -945,11 +946,17 @@ impl Brief {
             Some(given) => {
                 if !matches!(
                     role,
-                    Role::Design | Role::DesignReview | Role::Build | Role::Verify | Role::Arbiter
+                    Role::Design
+                        | Role::DesignReview
+                        | Role::Build
+                        | Role::Verify
+                        | Role::Arbiter
+                        | Role::AnswerCheck
                 ) {
                     return mismatch(
                         "a plan",
-                        "the design, design review, build, verify and arbiter roles only",
+                        "the design, design review, build, verify, arbiter and answer check \
+                         roles only",
                     );
                 }
                 if !is_commit_id(&given.base) {
