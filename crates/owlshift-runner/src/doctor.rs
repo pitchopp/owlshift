@@ -4061,10 +4061,10 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
     fn a_quarantine_fails_with_its_marker_and_how_to_clear_it() {
         let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
         let (_dir, config) = markdown_project();
+        let path =
+            PathBuf::from("/home/ada/.local/share/owlshift/projects/github.com/o/r/unverified");
         let marked = MarkerState::Marked {
-            path: PathBuf::from(
-                "/home/ada/.local/share/owlshift/projects/github.com/o/r/unverified",
-            ),
+            path: path.clone(),
             text: "Run r1 of OWL-160 broke isolation:\n- the main checkout's HEAD moved\n"
                 .to_owned(),
         };
@@ -4072,10 +4072,20 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         assert!(!report.ready(), "{report}");
         let failed = line(&report, "quarantine");
         assert_eq!(failed.status, Status::Fail);
+        // The marker's path as the report writes every path: `~` for the fake
+        // home where that home is absolute, as on Unix.
+        let shown_path = shown(&path, Some(Path::new("/home/ada")));
         assert_eq!(
             failed.detail,
-            "~/.local/share/owlshift/projects/github.com/o/r/unverified says: Run r1 of OWL-160 \
-             broke isolation: - the main checkout's HEAD moved"
+            format!(
+                "{shown_path} says: Run r1 of OWL-160 broke isolation: - the main checkout's HEAD \
+                 moved"
+            )
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            shown_path,
+            "~/.local/share/owlshift/projects/github.com/o/r/unverified"
         );
         assert!(
             failed
