@@ -192,6 +192,7 @@ impl OnDemand<'_> {
         let review = p.review.get_or_insert_with(TicketReview::new);
         review.answering = given;
         review.build = None;
+        review.last_fix = None;
         self.keep(p, &building)?;
         self.show(&ticket, None, VisibleStage::Working, sink);
         let dispatched = self.dispatch(p, Command::Continue, sink)?;
@@ -297,6 +298,7 @@ impl OnDemand<'_> {
         };
         if let Some(review) = p.review.as_mut() {
             review.build = None;
+            review.last_fix = None;
         }
         self.keep(p, &building)?;
         let given = loop_reviews(p);
@@ -463,6 +465,7 @@ pub(super) fn answer_reviews(p: &mut Prepared) {
             }
         }
         review.build = None;
+        review.last_fix = None;
     }
 }
 
