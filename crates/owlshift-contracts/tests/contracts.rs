@@ -1539,7 +1539,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(20)),
+        parse(|v| v["format"] = json!(21)),
         "upgrade Owlshift",
     );
     rejects(

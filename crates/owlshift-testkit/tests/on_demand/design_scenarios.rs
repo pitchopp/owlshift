@@ -32,6 +32,16 @@ pub(super) const FORKED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
 "forks":[{"choice":"Markdown.","options":["Markdown.","Plain text."],
 "reason":"The repository's docs are Markdown."}]}"#;
 
+/// A plan with a fork and an alternative set aside, which the Build's brief
+/// leaves out (OWL-365).
+const FORKED_WITH_ALTERNATIVE: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+"criteria":["GREETING.md says Hello."],
+"approach":"Write GREETING.md with the line the gate greps.",
+"alternatives":[{"approach":"Greet in the README.","reason":"The ticket names GREETING.md."}],
+"steps":[{"what":"Add GREETING.md.","test":"The gate's grep for Hello."}],
+"forks":[{"choice":"Markdown.","options":["Markdown.","Plain text."],
+"reason":"The repository's docs are Markdown."}]}"#;
+
 /// A design run's `done` with `plan`.
 pub(super) fn designed(plan: &str) -> String {
     format!(r#"{{"format":12,"status":"done","summary":"Planned the greeting.","plan":{plan}}}"#)
@@ -940,7 +950,7 @@ fn a_replan_the_resolver_settles_sends_the_ticket_back_to_design() {
 fn a_replan_on_an_approved_plan_goes_to_the_decider_and_returns_to_design() {
     let bench = Bench::of("risky");
     let replies = vec![
-        bench.read(&designed(FORKED)),
+        bench.read(&designed(FORKED_WITH_ALTERNATIVE)),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
@@ -963,9 +973,22 @@ fn a_replan_on_an_approved_plan_goes_to_the_decider_and_returns_to_design() {
         matches!(&stop, Stop::NeedsInput { posted: Ok(round), .. } if round.get() == 2),
         "{stop:?}\n{printed}"
     );
-    let resolver = bench.last_of(Role::Resolver);
-    assert!(resolver.asked_by.as_ref().unwrap().plan.is_some());
     let record = bench.record();
+    let kept = record.plan.as_ref().expect("plan.json");
+    // The Build follows the plan without its forks and alternatives
+    // (OWL-365); the resolver deciding its replan reads it whole.
+    let build = bench.last_of(Role::Build);
+    let given = build.plan.as_ref().expect("the plan the Build follows");
+    let mut cut = kept.plan.clone();
+    cut.forks.clear();
+    cut.alternatives.clear();
+    assert_eq!((&given.base, &given.plan), (&kept.base, &cut));
+    let resolver = bench.last_of(Role::Resolver);
+    let asked_by = resolver.asked_by.as_ref().unwrap();
+    assert_eq!(asked_by.role, Role::Build);
+    let whole = &asked_by.plan.as_ref().unwrap().plan;
+    assert_eq!(whole, &kept.plan);
+    assert_eq!((whole.forks.len(), whole.alternatives.len()), (1, 1));
     assert_eq!(
         (record.state.stage, record.state.waiting),
         (Stage::Design, Some(Waiting::NeedsInput))
@@ -1270,7 +1293,7 @@ fn the_resolver_approves_a_forked_plan_under_on_fork() {
 "basis":"The plan's fork keeps Markdown, as the repository's docs are; plain text buys nothing.",
 "basis_kind":"judgment","option":"A"}]}"#;
     let replies = vec![
-        bench.read(&designed(FORKED)),
+        bench.read(&designed(FORKED_WITH_ALTERNATIVE)),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
         bench.read(approves),
@@ -1295,6 +1318,15 @@ fn the_resolver_approves_a_forked_plan_under_on_fork() {
     );
     assert!(told.asked_by.as_ref().unwrap().plan.is_some());
     let record = bench.record();
+    // Verify reviews against the whole plan, which the Build got without
+    // its fork and alternative (OWL-365).
+    let kept = &record.plan.as_ref().unwrap().plan;
+    let verify = bench.last_of(Role::Verify);
+    assert_eq!(&verify.plan.as_ref().unwrap().plan, kept);
+    let build = bench.last_of(Role::Build);
+    let given = &build.plan.as_ref().unwrap().plan;
+    assert!(given.forks.is_empty() && given.alternatives.is_empty());
+    assert_eq!(given.steps, kept.steps);
     let decision = &record.questions.decisions[0];
     let approval = record.plan.unwrap().approval.expect("the approval is kept");
     assert_eq!(approval.comment, decision.comment);
