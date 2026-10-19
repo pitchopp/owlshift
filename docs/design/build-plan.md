@@ -181,9 +181,25 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
     a `--settings` hook approving `.claude/` paths (a path check in a hook program, for no reach the sandbox does not bound).
   - Tests: the unit test `a_write_run_edits_the_worktree_and_runs_bash` pins the new argv; the contract tests replay output and do not.
     The live test `a_build_edits_claude_files_and_the_runners_guards_still_hold` (`owlshift-testkit/tests/executor_live.rs`) repeats the bypass run through `Executor::run`,
-    without network, so the WebFetch row rests on the probe: the two `.claude/` files are edited, the hook and a file beside the worktree get the sandbox's `EPERM`,
+    without network, so the WebFetch row rests on the probe: the two `.claude/` files are edited, on macOS the hook and a file beside the worktree get the sandbox's `EPERM`,
     and the run is quarantined for the ref alone. It passed on 2026-10-18 on macOS with Claude Code 2.1.302, in 19 s.
-  - What stays open: Linux was not run, its bwrap profile following the same policy.
+  - On Linux, checked on 2026-10-19 by OWL-349, in a Linux container, not on a Linux host: the same test passed (`test result: ok. 1 passed`, 22.38 s).
+    - **Where.** Docker Desktop on the maintainer's Mac, Linux container (linux/aarch64, kernel 6.12.76-linuxkit), Debian bookworm, bubblewrap 0.8.0, Claude Code 2.1.302 from npm,
+      source at `32e1308`; the run user was `owl`, uid 1001, not root, and `init` reported `bypassPermissions`.
+      The container ran with `--security-opt seccomp=unconfined --security-opt systempaths=unconfined`, which bwrap needs inside Docker, as for OWL-101 (under OWL-94 below).
+    - **How the token got there.** As for OWL-101: the maintainer ran a throwaway script, since removed, that piped the token for agent runs from the macOS Keychain
+      into the container's standard input, where a probe stored it in gnome-keyring on a tmpfs; the test read it back as the executor does.
+      A dry run with a made-up token ended on API status 401 first.
+    - **What Linux changes in the test.** bwrap gives the run a private `/tmp`, a tmpfs, and the test's folder is in `/tmp`:
+      the Write of a file beside the worktree succeeded there, into the tmpfs, and the file was absent on the host. So on Linux that row rests on host absence, not on a tool error.
+      The hook, a read-only bind, gets `EROFS` ("read-only file system") where Seatbelt says `EPERM`, as a credential-free bwrap probe of the same layout showed;
+      on Linux the test accepts either error for a sandbox refusal, and nothing broader.
+      The refusal of a write outside the worktree is probed instead in `OWLSHIFT_LIVE_OUTSIDE_DIR`, a folder the user can write on the host outside `/tmp`, `/var/tmp`, `/run/user` and the home,
+      which the sandbox sees only through its read-only `/` (`/srv/owl349-outside` in the container): the Write was refused by the sandbox and nothing reached the host.
+      The test asks for that eighth call on Linux only, and matches every call on its exact path.
+    - **What this settles.** A write-in-worktree run in bypass mode on Linux edits the `.claude/` files and stays bounded by bwrap and the isolation check: the hook and a file outside the worktree refused, the run quarantined for the ref alone.
+  - What stays open: a Linux host. The Docker Desktop kernel has no AppArmor restriction on unprivileged user namespaces, so the Ubuntu 24.04 path (the `bwrap` profile) was not exercised,
+    and neither x86_64 nor bare metal was checked; one run, on haiku.
     A Linux runner started as root cannot run a write-in-worktree role on Claude Code (the refusal above); `IS_SANDBOX=1` would lift it, and is not set.
     Managed settings themselves were not tried, `--settings` standing in for them.
     The peer inbox was not rerun in the bypass class, where OWL-52 found delivery follows the sender's class: `PEER_INBOX_ENV` binds no socket whatever the mode (OWL-65), and the refuse flag stays.
