@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-10-11 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
+  "recorded": "2026-10-19 on the Owlshift workspace, recorded live, except the comment posted on OWL-13, made up (see `synthesized`)",
   "exchanges": [
     {
       "request": {
@@ -78,7 +78,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } parent { id } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } parent { id } reactions { emoji createdAt user { id displayName app } externalUser { name } } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -99,6 +99,7 @@
                   "externalUser": null,
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "parent": null,
+                  "reactions": [],
                   "user": {
                     "app": false,
                     "displayName": "person-1",
@@ -113,6 +114,7 @@
                   "externalUser": null,
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "parent": null,
+                  "reactions": [],
                   "user": {
                     "app": false,
                     "displayName": "person-1",
@@ -131,7 +133,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } parent { id } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } parent { id } reactions { emoji createdAt user { id displayName app } externalUser { name } } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -213,7 +215,7 @@
             "comment": {
               "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
               "botActor": null,
-              "createdAt": "2026-10-11T20:46:05.731Z",
+              "createdAt": "2026-10-19T21:54:44.622Z",
               "editedAt": null,
               "externalUser": null,
               "id": "00000000-0000-4000-8000-00000000c001",
@@ -231,7 +233,7 @@
     },
     {
       "request": {
-        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } parent { id } } pageInfo { hasNextPage endCursor } } } }",
+        "query": "query Comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { comments(first: $first, after: $after) { nodes { id body createdAt editedAt user { id displayName app } botActor { name } externalUser { name } parent { id } reactions { emoji createdAt user { id displayName app } externalUser { name } } } pageInfo { hasNextPage endCursor } } } }",
         "variables": {
           "after": null,
           "first": 50,
@@ -247,7 +249,7 @@
                 {
                   "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
                   "botActor": null,
-                  "createdAt": "2026-10-11T20:46:05.731Z",
+                  "createdAt": "2026-10-19T21:54:44.622Z",
                   "editedAt": null,
                   "externalUser": null,
                   "id": "00000000-0000-4000-8000-00000000c001",
@@ -265,6 +267,7 @@
                   "externalUser": null,
                   "id": "16859be9-8c1d-4db8-8409-b2506c51572c",
                   "parent": null,
+                  "reactions": [],
                   "user": {
                     "app": false,
                     "displayName": "person-1",
@@ -279,6 +282,7 @@
                   "externalUser": null,
                   "id": "47ff9d2c-2cfb-4e44-8da2-5fd6aa769dff",
                   "parent": null,
+                  "reactions": [],
                   "user": {
                     "app": false,
                     "displayName": "person-1",
