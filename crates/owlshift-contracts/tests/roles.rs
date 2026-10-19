@@ -523,6 +523,38 @@ fn build_leaves_the_whole_gate_to_the_runner() {
     }
 }
 
+/// A broad change runs a command whole once at most (OWL-366): each step
+/// checks what it changed, the check of what uses it runs once before `done`,
+/// and a fix after it re-runs only what failed and what the fix touches.
+#[test]
+fn build_widens_its_checks_once() {
+    let text = build_prompt();
+    for rule in [
+        "any other runs whole once in a run at most",
+        "After each step, check what that step changed",
+        "not what uses it.",
+        "Once, before `done`, widen to the parts that use what your plan's steps changed",
+        "Run that wider check once in a run: fix what it finds in a step of its own, \
+         then re-run only the part that failed and what the fix touches, \
+         never the wider check again",
+        "the last of them on your last commit",
+    ] {
+        assert!(
+            text.contains(rule),
+            "roles/build.md no longer says {rule:?}"
+        );
+    }
+    for gone in [
+        "Widen the scope to the parts that use what you changed",
+        "a change after them means running them again.",
+    ] {
+        assert!(
+            !text.contains(gone),
+            "roles/build.md says {gone:?} again: each step widened, and each fix re-ran the widened check"
+        );
+    }
+}
+
 /// Every dotted path the prompt writes as code, such as `checkpoint.plan` or
 /// `author.relation`, exists in the brief or `result.json`, from their root or
 /// from one of their definitions. The project config is left out on purpose:
