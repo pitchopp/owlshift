@@ -38,10 +38,21 @@
         "$ref": "#/$defs/KeptDecision"
       }
     },
+    "decisions_document": {
+      "description": "The ticket's decisions document (format 15, OWL-351), once one was\npublished: the reasoning of every kept decision, rewritten whole at\neach resolver run that keeps decisions.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DecisionsDocument"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 14
+      "const": 15
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -253,6 +264,28 @@
         }
       ]
     },
+    "DecisionsDocument": {
+      "description": "The ticket's decisions document, as the ticket ref keeps it (OWL-351).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The tracker's identifier of the document, which the next resolver\nrun updates.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "url": {
+          "description": "Where a person opens it, as the tracker gave it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ]
+    },
     "KeptDecision": {
       "description": "A decision the resolver took without the decider, as the ticket ref\nkeeps it: what the brief's `decision` entry is built from, so only the\nrunner's own record, never a comment's text, reaches a run as a decision.",
       "type": "object",
@@ -297,6 +330,15 @@
         "decision": {
           "type": "string",
           "pattern": "\\S"
+        },
+        "number": {
+          "description": "Its number in its DECISION comment, `Dn` (format 15, OWL-351), which\nholds the decisions of one resolver run: a reply naming it reverses\nit alone. Absent from a decision kept before, alone in its comment,\nwhich [`Self::place`] reads as 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
         },
         "question": {
           "description": "The question as the raising run asked it, under that run's id.",
