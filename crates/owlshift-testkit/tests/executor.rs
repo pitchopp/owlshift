@@ -29,6 +29,8 @@ use owlshift_runner::executor::{
     HarnessRun, HarnessStatus, Outcome, RunLog, RunReport, RunSpec, SandboxNeeds, Violation,
 };
 use owlshift_testkit::git::{GitEnv, seed};
+use owlshift_testkit::harness::FakeHarness;
+use owlshift_testkit::reply::Reply;
 
 const BRANCH: &str = "owlshift/T-1";
 
@@ -815,6 +817,66 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
         assert_eq!(report.gate.is_some(), case == "the gate", "{case}");
         assert_eq!(*redirected.lock().unwrap(), Vec::<String>::new(), "{case}");
     }
+}
+
+/// The build role's `done`, as a prepared result.
+const DONE: &str = r#"{"format":12,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+
+impl Bench {
+    /// The fake harness playing `reply`, its prepared result `DONE`.
+    fn fake(&self, mut reply: Reply) -> FakeHarness {
+        let replies = self.tmp.path().join("replies");
+        fs::create_dir_all(&replies).unwrap();
+        let done = replies.join("done.json");
+        fs::write(&done, DONE).unwrap();
+        reply.result = Some(done);
+        let path = replies.join("reply.toml");
+        fs::write(&path, reply.render()).unwrap();
+        FakeHarness {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
+            reply: path,
+            readable: Vec::new(),
+        }
+    }
+
+    /// What the fake harness observed in the last run.
+    fn observed(&self) -> String {
+        fs::read_to_string(self.worktree.join(".owlshift/run/observed.txt")).unwrap()
+    }
+}
+
+/// OWL-330: the fake harness writes what it observes, a committed file, a
+/// missing one and a missing file of its temporary folder, in order, into
+/// the run's own folder, which git ignores, so the gate after its `done`
+/// finds the worktree clean.
+#[test]
+fn the_fake_harness_observes_the_worktree_and_its_temporary_folder() {
+    let bench = Bench::new();
+    let harness = bench.fake(Reply {
+        observe: vec![
+            "README.md".to_owned(),
+            "missing.txt".to_owned(),
+            "$TMPDIR/none".to_owned(),
+        ],
+        observe_into: Some(RelativePath::new(".owlshift/run/observed.txt").unwrap()),
+        ..Reply::default()
+    });
+    let mut brief = bench.brief.clone();
+    brief.gate = vec!["git status --porcelain".to_owned()];
+    let report = bench.run_with(&bench.executor, &harness, &brief).unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Finished { .. }),
+        "{:?}",
+        report.outcome
+    );
+    assert!(
+        report.gate.as_ref().is_some_and(|gate| gate.passed()),
+        "{report:?}"
+    );
+    assert_eq!(
+        bench.observed(),
+        "README.md=hello\nmissing.txt absent\n$TMPDIR/none absent\n"
+    );
 }
 
 /// OWL-369: a run that amends a commit its branch held at the start is
