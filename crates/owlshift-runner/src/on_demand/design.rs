@@ -150,11 +150,23 @@ fn kept_plan(p: &Prepared) -> Option<GivenPlan> {
     })
 }
 
-/// The plan a Build follows (architecture section 5, "Kept and shown"): the
-/// kept plan with its base, in a pipeline with Design; none on `trivial`,
-/// which has no plan.
+/// The plan the stages after Design read (architecture section 5, "Kept and
+/// shown"): the kept plan with its base, in a pipeline with Design; none on
+/// `trivial`, which has no plan.
 pub(super) fn given_plan(p: &Prepared) -> Option<GivenPlan> {
     kept_plan(p).filter(|_| p.pipeline.contains(Stage::Design))
+}
+
+/// The plan a Build follows (OWL-365): [`given_plan`] without its `forks`
+/// and `alternatives`, how the design chose among approaches, whose choices
+/// its approach and steps carry. A copy for the brief: the kept plan, and
+/// the hash its approval binds, are untouched.
+pub(super) fn build_plan(p: &Prepared) -> Option<GivenPlan> {
+    given_plan(p).map(|mut given| {
+        given.plan.forks.clear();
+        given.plan.alternatives.clear();
+        given
+    })
 }
 
 /// The SHA-256 of a plan's [`Plan::canonical`] text, in lowercase hex: the

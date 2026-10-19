@@ -1,6 +1,6 @@
 +++
 role = "build"
-brief_format = 19
+brief_format = 20
 result_format = 12
 +++
 
@@ -45,7 +45,7 @@ Then read the `thread` for the decider's answers and the `decision` entries sinc
 
 Only after a step's commit lands do you set its `"done":true` and add `"commit":"<sha>"`.
 
-**A given plan.** When the brief has `plan`, `plan.plan` is the design's plan for this ticket, reviewed, and approved when approval was due, written on commit `plan.base`: your plan takes its `steps` in order, each with its `test` as that step's check, and keeps its `approach`, `files` and `out_of_scope`. Your branch may start from a newer base than `plan.base`; that alone changes nothing. When you cannot follow it (a step impossible, the approach wrong, an answer or a `decision` entry the approach cannot hold), do not plan around it: ask, with that question's `replan` set to `true`, saying what in the plan fails and the evidence; once it is answered or decided, the ticket goes back to Design. Without a given plan, never set `replan`.
+**A given plan.** When the brief has `plan`, `plan.plan` is the design's plan for this ticket, reviewed, and approved when approval was due, written on commit `plan.base`: your plan takes its `steps` in order, each with its `test` as that step's check, and keeps its `approach`, `files` and `out_of_scope`. Its `forks` and `alternatives` are always empty in your brief, whatever the design wrote: they record how the design chose among approaches, and the choices are in its `approach` and `steps`. An answer or a `decision` entry of the plan's approval rounds that names a fork ("fork 2 option C") is one the design already followed in the plan you are given. Your branch may start from a newer base than `plan.base`; that alone changes nothing. When you cannot follow it (a step impossible, the approach wrong, an answer or a `decision` entry the approach cannot hold), do not plan around it: ask, with that question's `replan` set to `true`, saying what in the plan fails and the evidence; once it is answered or decided, the ticket goes back to Design. Without a given plan, never set `replan`.
 
 ## Building
 

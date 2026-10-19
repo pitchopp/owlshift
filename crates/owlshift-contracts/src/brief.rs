@@ -161,7 +161,9 @@ pub struct Brief {
     /// and a design run revises or puts to the decider. Required in the
     /// design review role's brief; given to the design, design review,
     /// build, verify and arbiter roles, and since OWL-357 to the answer
-    /// check, whose approval question points to it, only.
+    /// check, whose approval question points to it, only. Build's has empty
+    /// `forks` and `alternatives` since format 20 (OWL-365): the choices are
+    /// in its approach and steps, and the other roles read it whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<GivenPlan>,
     /// The plan was put to the decider for approval, and the thread holds

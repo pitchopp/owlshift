@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 19
+      "const": 20
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -116,7 +116,7 @@
       "$ref": "#/$defs/Permissions"
     },
     "plan": {
-      "description": "The ticket's plan and the base commit it was written on (format 15,\nOWL-300): what Build follows, the review roles and the arbiter read,\nand a design run revises or puts to the decider. Required in the\ndesign review role's brief; given to the design, design review,\nbuild, verify and arbiter roles, and since OWL-357 to the answer\ncheck, whose approval question points to it, only.",
+      "description": "The ticket's plan and the base commit it was written on (format 15,\nOWL-300): what Build follows, the review roles and the arbiter read,\nand a design run revises or puts to the decider. Required in the\ndesign review role's brief; given to the design, design review,\nbuild, verify and arbiter roles, and since OWL-357 to the answer\ncheck, whose approval question points to it, only. Build's has empty\n`forks` and `alternatives` since format 20 (OWL-365): the choices are\nin its approach and steps, and the other roles read it whole.",
       "anyOf": [
         {
           "$ref": "#/$defs/GivenPlan"

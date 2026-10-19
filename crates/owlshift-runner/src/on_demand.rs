@@ -1934,8 +1934,10 @@ impl OnDemand<'_> {
             // Why an earlier Build result was refused, from the ticket ref,
             // whatever command ran it (OWL-192).
             tell_build(&mut brief, &p.questions());
-            // The plan the Build follows, with its base (OWL-303).
-            brief.plan = design::given_plan(p);
+            // The plan the Build follows, with its base (OWL-303), without
+            // its forks and alternatives (OWL-365); the resolver deciding
+            // its questions gets it whole, below.
+            brief.plan = design::build_plan(p);
             // In a review loop, the reviews it answers (OWL-307).
             brief.pull_request_reviews = loop_reviews(p);
             // The findings of the latest Verify pass, to fix or answer
