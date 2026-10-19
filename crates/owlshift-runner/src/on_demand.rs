@@ -1240,9 +1240,11 @@ impl OnDemand<'_> {
     /// lock, also still shows `shown`: `None`, with nothing run, kept or
     /// recorded, once it shows another stage. Watch resumes through it a
     /// ticket an answered intake round left at Intake (OWL-273, architecture
-    /// section 5, "Intake"), which shows needs input until its intake ends:
-    /// one a person moved since is theirs, one in the ready column the
-    /// drain's.
+    /// section 5, "Intake"), which shows needs input until its intake ends,
+    /// and one an answered round left at Design, Design review, Build or
+    /// Verify (OWL-340, "Which tickets"), which shows working until its
+    /// stage ends: one a person moved since is theirs, one in the ready
+    /// column the drain's.
     pub fn continue_shown(
         &self,
         ticket: &TicketId,
@@ -6035,7 +6037,7 @@ fn verdict_classes(verdicts: &[AnswerVerdict]) -> Value {
 }
 
 /// A stage's name as the contracts write it, such as `build`.
-fn stage_name(stage: Stage) -> String {
+pub(crate) fn stage_name(stage: Stage) -> String {
     serde_json::to_value(stage)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))

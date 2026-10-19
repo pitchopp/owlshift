@@ -62,8 +62,11 @@ enum Command {
     },
     /// Watch this project's tickets whose questions wait, in the foreground,
     /// and continue each one as `owlshift continue` would once its decider's
-    /// reply counts; checked every minute, until Ctrl-C. A parked ticket, or
-    /// one left at Build, still needs `owlshift continue`.
+    /// reply counts; checked every minute, until Ctrl-C. It also resumes a
+    /// ticket at Intake, Design, Design review, Build or Verify that an
+    /// answered round (round > 0) left shown working or needing input, a
+    /// refusal after the answer check included. A parked ticket, or one left
+    /// at Build before any question round, still needs `owlshift continue`.
     Watch {
         /// Also take admitted tickets in from the ready column, intake
         /// first, and dispatch them to Build one at a time.
