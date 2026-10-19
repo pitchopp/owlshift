@@ -106,8 +106,13 @@ Checks run on 2026-09-28 (OWL-6) with Claude Code 2.1.283 and git 2.54 on macOS.
     `init` gained `original_cwd` and `additional_directories`.
     The recordings were made with the adapter's current command line, `--disable-slash-commands` included (OWL-333): their `init` offers no `Skill` and lists no skill, where the 2.1.300 ones offered `Skill`.
     A few recordings differ in their count of events and in their thinking events (`beyond_run_tools_denied.jsonl` has none beyond the result's token detail, while four others still carry them): the model's own steps, not a change of the CLI.
+    Every `init` gained the capability `mcp_call_result_not_for_model_v1`, a change of the CLI itself.
+    `beyond_run_tools_denied.jsonl` and `peer_message_refused.jsonl`, the two write-in-worktree recordings, now carry the OWL-346 command line: `permissionMode` is `bypassPermissions` where it was `acceptEdits`, and their `tool_result_meta` `reason_type` is `mode` (`rule` in the 2.1.300 `peer_message_refused.jsonl`, absent in the other).
+    That is the argv change the OWL-346 entry announced (the recorder takes the new argv at its next run), not a change of the CLI.
     The denials are the same in number and place, the `cd` ones included.
     The exact values of `success` (tokens, cost, duration, rate-limit utilization) moved with the new run; its rate-limit event is again a plain `allowed`.
+    On the OWL-346 item that the peer inbox was not rerun in the bypass class: `peer_message_refused.jsonl` is now a recording in that class. It shows the receiver, refuse flag set, ending with `NONE` under `bypassPermissions` while the sender got the `Cross-session message refused` notice, both of which the recorder asserts.
+    It is one macOS run on `haiku`: it does not settle the item for other roles, platforms or models, and `peer_inbox_open.jsonl` and `peer_inbox_switched_off.jsonl` were not rerun.
     None of it touches what the adapter reads.
   - 2.1.302 joins `harness/tested.rs`. The adapter did not change.
 - **Skills in an agent run (OWL-333), checked on 2026-10-17 with Claude Code 2.1.302.**
