@@ -1554,6 +1554,7 @@ impl OnDemand<'_> {
             EventKind::TrackerWrite,
             comment_written("PLAN", &posted),
         );
+        self.fold(&ticket, last_run.as_deref(), &posted, sink);
         if event == Event::Completed {
             p.review = Some(review);
             let next = match state.apply_gated(p.pipeline, Event::Completed, gate) {

@@ -127,8 +127,9 @@ use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
     Corrected, DecisionComment, DeliveryReport, FixPass, Gate, MentionDropped, ParkedComment,
-    Posted, QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Restart,
-    ResumeComment, Reviewed, VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
+    Posted, QuestionsComment, ReaskComment, Rebased, ReopenedChoice, ReplyComment, Reported,
+    Restart, ResumeComment, Reviewed, VisibleStage, WriteError, Writer, park_reason,
+    rebase_keeps_delivery,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 
@@ -2277,6 +2278,7 @@ impl OnDemand<'_> {
             EventKind::TrackerWrite,
             comment_written("QUESTIONS", &posted),
         );
+        self.fold(&ticket, Some(run), &posted, sink);
         if let Some(dropped) = &mention_dropped {
             sink.emit(
                 &ticket,
@@ -2700,6 +2702,7 @@ impl OnDemand<'_> {
                     EventKind::TrackerWrite,
                     comment_written("RESUME", &posted),
                 );
+                self.fold(&ticket, Some(&ran.run), &posted, sink);
                 // The ref still waits for answers: nothing resumes Build but
                 // a person, so the stop says the RESUME landed (OWL-169).
                 self.store(p, &next, questions).map_err(|e| Stop::NotKept {
@@ -3500,6 +3503,43 @@ impl OnDemand<'_> {
     ) {
         if let Some(stage) = VisibleStage::after(event) {
             self.show(ticket, run, stage, sink);
+        }
+    }
+
+    /// Folds the runner's own comments that `posted`, just posted, supersedes
+    /// (OWL-353, [`Writer::fold`]): a `tracker_write` event for each one
+    /// resolved, a `warning` for each failure, and the command goes on.
+    fn fold(
+        &self,
+        ticket: &TicketId,
+        run: Option<&str>,
+        posted: &Comment,
+        sink: &mut EventSink<'_>,
+    ) {
+        let folded = Writer::new(self.tracker).fold(ticket, posted);
+        for comment in folded.resolved {
+            sink.emit(
+                ticket,
+                run,
+                EventKind::TrackerWrite,
+                data([
+                    ("target", json!("tracker")),
+                    ("action", json!("resolve")),
+                    ("comment", json!(comment)),
+                    ("by", json!(posted.id)),
+                ]),
+            );
+        }
+        for failed in folded.failed {
+            let mut warning = data([
+                ("what", json!("comment_not_folded")),
+                ("by", json!(posted.id)),
+                ("reason", json!(failed.reason)),
+            ]);
+            if let Some(comment) = failed.comment {
+                warning.insert("comment".to_owned(), json!(comment));
+            }
+            sink.emit(ticket, run, EventKind::Warning, warning);
         }
     }
 
@@ -5209,7 +5249,7 @@ impl OnDemand<'_> {
             }),
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
-            Ok(comment) => {
+            Ok(Reported { comment, new }) => {
                 let mut written = data([
                     ("target", json!("tracker")),
                     ("action", json!("comment")),
@@ -5220,6 +5260,10 @@ impl OnDemand<'_> {
                     written.insert(counted.to_owned(), json!(owed.count));
                 }
                 sink.emit(ticket, None, EventKind::TrackerWrite, written);
+                // A report found already there folded its PLAN when posted.
+                if new {
+                    self.fold(ticket, None, &comment, sink);
+                }
                 following.report_settled(ticket);
                 Ok(comment)
             }
