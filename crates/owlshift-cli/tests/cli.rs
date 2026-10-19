@@ -1455,6 +1455,39 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
     }
 }
 
+/// OWL-339: CI shows what the confinement tests printed when they pass, so
+/// the dated live check of the sandbox can be read from the log: nextest's
+/// config shows that binary's successful output, and CI still runs the tests
+/// through `cargo nextest run`.
+#[test]
+fn ci_shows_the_confinement_tests_output() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = fs::read_to_string(root.join(".config/nextest.toml")).unwrap();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    assert!(lines.contains(&"[[profile.default.overrides]]"), "{text}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("filter = ")
+            && line.contains("binary_id(owlshift-testkit::confinement)")),
+        "{text}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("success-output = ") && !line.contains("never")),
+        "{text}"
+    );
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(
+        ci.lines()
+            .any(|line| line.trim() == "run: cargo nextest run --workspace --locked --no-fail-fast"),
+        "CI no longer runs the tests through cargo nextest run"
+    );
+}
+
 /// OWL-339: the confinement tests must run, not skip, on both unix legs, so
 /// the variable that makes them fail instead of skipping is set by a step of
 /// its own for every OS but Windows, not by the Linux-only bwrap step.

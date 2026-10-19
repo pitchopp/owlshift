@@ -1,0 +1,10 @@
+# OWL-339: the confinement tests print what `git worktree prune` and
+# `git gc` said inside the sandbox (their statuses and diagnostics), and the
+# build plan's live check of the sandbox is read from the CI log of a passing
+# run. nextest hides a passing test's output by default, so this binary's, and
+# only its, is shown at the end of each run, passing or not. The CI command
+# line is unchanged. Approved on OWL-339 on 2026-10-18 (round 3, Q2, answer A),
+# as the CI-settings floor of architecture section 8 requires.
+[[profile.default.overrides]]
+filter = 'binary_id(owlshift-testkit::confinement)'
+success-output = "final"
