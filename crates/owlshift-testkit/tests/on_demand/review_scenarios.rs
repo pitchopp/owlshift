@@ -349,6 +349,153 @@ fn a_merge_ends_a_review_loop_waiting_at_build() {
     assert_eq!(bench.stage(), "In Review");
 }
 
+/// A review loop whose Build asked, whose question the decider answered, and
+/// whose resume the forge refuses once right after the RESUME (OWL-340): the
+/// ticket stays at Build in round 1, shown working, with nothing running.
+fn answered_loop() -> Bench {
+    let bench = Bench::reviewed();
+    bench.reviews_on_github(vec![review(7_000_000_002, "ann-dev", "Use capitals.", &[])]);
+    let (asked, printed) = bench.continue_ticket(vec![bench.reply(None, Some(ASKS_WHICH_CASE))]);
+    assert!(matches!(&asked, Err(Stop::NeedsInput { .. })), "{printed}");
+    bench.answer("Q1: Its first word. Go.\n");
+    *bench.github.refuse_open.lock().unwrap() = 1;
+    bench
+}
+
+/// What a review loop left by a refusal after its RESUME looks like.
+fn assert_left_at_build(bench: &Bench, dispatches: usize) {
+    assert_eq!(bench.state(), (Status::Active(Stage::Build), 1));
+    assert_eq!(bench.review_record().answering.len(), 1);
+    assert!(bench.record().delivery.unwrap().followed());
+    assert_eq!(bench.stage(), "In Progress");
+    assert_eq!(bench.resumes(), 1);
+    let now = bench
+        .events()
+        .iter()
+        .filter(|event| event.kind == EventKind::Dispatch)
+        .count();
+    assert_eq!(now, dispatches, "no run was dispatched");
+}
+
+fn dispatches(bench: &Bench) -> usize {
+    bench
+        .events()
+        .iter()
+        .filter(|event| event.kind == EventKind::Dispatch)
+        .count()
+}
+
+/// OWL-340, a review loop (OWL-307): the decider answers the loop Build's
+/// question, the answer check resumes it, and the forge refuses the dispatch
+/// once. The ref stays at Build in round 1 with the review waiting to be
+/// answered, and a later pass resumes it, with no `continue` typed: the loop
+/// Build runs with the review in its brief and pushes to the same pull
+/// request, after one answer check and one RESUME in all.
+#[test]
+fn watch_resumes_a_review_loop_a_refusal_stopped_after_its_answer_check() {
+    let bench = answered_loop();
+    let before = dispatches(&bench);
+    let mut pass = 0;
+    let replies = vec![
+        bench.reply(None, Some(&check(&[("Q1", "answered", "First word.")]))),
+        bench.reply(Some("Hello there"), Some(RENAMED)),
+    ];
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        if pass == 1 {
+            assert_left_at_build(&bench, before);
+            bench.wait(1);
+            return true;
+        }
+        false
+    });
+    assert!(
+        matches!(&outcomes[0], Err(Stop::Refused(m)) if m.contains("GitHub (demo/project)")),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(
+        matches!(&outcomes[1..], [Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.watch_resumes(), ["build"]);
+    let brief = bench.last_of(Role::Build);
+    assert_eq!(brief.pull_request_reviews[0].id, 7_000_000_002);
+    assert_eq!(bench.github.created.lock().unwrap().len(), 1);
+    assert_eq!(bench.state(), (Status::Active(Stage::Watch), 1));
+    assert_eq!(bench.stage(), "In Review");
+    assert_eq!((bench.answer_checks(), bench.resumes()), (1, 1));
+    assert_eq!(bench.review_record().answered_reviews, [7_000_000_002]);
+}
+
+/// OWL-340: the same loop, merged meanwhile. The pass that would resume it
+/// reads its pull request first, ends the loop and starts no Build.
+#[test]
+fn a_review_loop_a_merge_ended_is_not_resumed() {
+    let bench = answered_loop();
+    let before = dispatches(&bench);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.reply(None, Some(&check(&[("Q1", "answered", "First word.")])))],
+        &mut |_| {
+            pass += 1;
+            if pass == 1 {
+                assert_left_at_build(&bench, before);
+                bench.github.followed.lock().unwrap().state = "MERGED";
+                bench.wait(1);
+                return true;
+            }
+            false
+        },
+    );
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.state().0, Status::Active(Stage::Watch));
+    assert_eq!(
+        bench.record().delivery.unwrap().ended.unwrap().why,
+        EndedWhy::Merged
+    );
+    assert!(bench.watch_resumes().is_empty());
+    assert_eq!(dispatches(&bench), before);
+    assert!(lines.contains("its review loop ends"), "{lines}");
+}
+
+/// OWL-340: a review loop's Build refused right after the loop's write keeps
+/// round 0, and a Build at round 0 still needs `owlshift continue`: watch
+/// runs nothing and reads no stage for it.
+#[test]
+fn a_review_loop_left_at_round_zero_is_left_to_continue() {
+    let bench = Bench::reviewed();
+    bench.reviews_on_github(vec![review(7_000_000_004, "ann-dev", "Use capitals.", &[])]);
+    *bench.github.refuse_open.lock().unwrap() = 1;
+    let reads = Cell::new(0);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            1 => {
+                assert_eq!(bench.state(), (Status::Active(Stage::Build), 0));
+                assert_eq!(bench.stage(), "In Progress");
+                bench.wait(1);
+            }
+            2 => {
+                reads.set(bench.stage_reads.get());
+                bench.wait(11);
+            }
+            3 => {
+                assert_eq!(bench.stage_reads.get(), reads.get());
+                return false;
+            }
+            _ => unreachable!(),
+        }
+        true
+    });
+    assert!(
+        matches!(&outcomes[..], [Err(Stop::Refused(_))]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(bench.watch_resumes().is_empty());
+    assert_eq!(bench.state(), (Status::Active(Stage::Build), 0));
+}
+
 /// OWL-357's acceptance on the bench: a `risky` ticket's plan is approved by
 /// the decider, built, delivered, then sent back to Build by a review. That
 /// loop Build's thread follows a PLAN, a RESUME and a DELIVERY comment and

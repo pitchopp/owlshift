@@ -1473,7 +1473,7 @@ fn a_plan_comment_refused_after_its_document_keeps_one_document() {
 
 /// A `standard` ticket whose design asked a question the decider answered:
 /// the ref waits at Design in round 1, and the answer is posted.
-fn answered_design() -> Bench {
+pub(super) fn answered_design() -> Bench {
     let bench = Bench::of("standard");
     let (outcome, printed) = bench.run(
         vec![bench.read(TRADE_OFF), bench.read(&passed_on(&["Q1"]))],
@@ -1490,7 +1490,7 @@ fn answered_design() -> Bench {
 
 /// The replies of a design round's answer check, the design, its two
 /// reviews and the Build.
-fn design_replies(bench: &Bench, check_first: bool) -> Vec<Reply> {
+pub(super) fn design_replies(bench: &Bench, check_first: bool) -> Vec<Reply> {
     let mut replies = Vec::new();
     if check_first {
         replies.push(bench.read(&check(&[("Q1", "answered", "Markdown.")])));
@@ -1506,29 +1506,29 @@ fn design_replies(bench: &Bench, check_first: bool) -> Vec<Reply> {
 
 impl Bench {
     /// Moves the bench's clock `minutes` on, for the next watch pass.
-    fn wait(&self, minutes: i64) {
+    pub(super) fn wait(&self, minutes: i64) {
         self.waited
             .set(self.waited.get() + SignedDuration::from_mins(minutes));
     }
 
     /// The ticket ref's state: its status and its round.
-    fn state(&self) -> (Status, u32) {
+    pub(super) fn state(&self) -> (Status, u32) {
         let state = TicketState::try_from(&self.record().state).unwrap();
         (state.status(), state.round())
     }
 
-    fn open_reads(&self) -> u32 {
+    pub(super) fn open_reads(&self) -> u32 {
         *self.github.open_reads.lock().unwrap()
     }
 
-    fn resumes(&self) -> usize {
+    pub(super) fn resumes(&self) -> usize {
         self.comments()
             .iter()
             .filter(|comment| comment.starts_with("[owlshift] RESUME"))
             .count()
     }
 
-    fn answer_checks(&self) -> usize {
+    pub(super) fn answer_checks(&self) -> usize {
         self.roles()
             .iter()
             .filter(|role| **role == Role::AnswerCheck)
@@ -1537,7 +1537,7 @@ impl Bench {
 
     /// The `stage` of each `watch: continue` decision that names one, the
     /// resumes of a stage left (OWL-273, OWL-340), oldest first.
-    fn watch_resumes(&self) -> Vec<String> {
+    pub(super) fn watch_resumes(&self) -> Vec<String> {
         self.decisions("watch")
             .iter()
             .filter(|event| event["watch"] == "continue")
@@ -1712,4 +1712,349 @@ fn a_stage_left_shown_elsewhere_is_left_alone_and_its_stage_read_rarely() {
     assert_eq!(bench.answer_checks(), 1);
     assert_eq!(bench.stage(), "In Review");
     assert_eq!(bench.state(), (Status::Active(Stage::Design), 1));
+}
+
+/// A run's reply that meets the harness's usage limit, reset at `resets`.
+pub(super) fn limited(bench: &Bench, resets: &str) -> Reply {
+    let mut reply = bench.reply(None, None);
+    reply.usage_limit = Some(resets.parse().unwrap());
+    reply
+}
+
+/// A reset long past at the bench's clock.
+const LONG_PAST: &str = "2026-10-01T00:00:00Z";
+/// A reset ahead of the bench's clock for the whole test.
+const FAR_AHEAD: &str = "2026-10-03T18:00:00Z";
+
+/// A ticket whose design round was answered and whose `stage` a usage limit
+/// then cut off (round 1, the stage shown working), and the replies that
+/// resume it.
+fn cut_off_at(stage: Stage, resets: &str) -> (Bench, Vec<Reply>) {
+    let bench = answered_design();
+    let cut = |replies: Vec<Reply>| {
+        let (outcome, printed) = bench.continue_ticket(replies);
+        assert!(
+            matches!(outcome, Err(Stop::UsageLimit { .. })),
+            "{outcome:?}\n{printed}"
+        );
+    };
+    let check = bench.read(&check(&[("Q1", "answered", "Markdown.")]));
+    let resume = match stage {
+        Stage::DesignReview => {
+            cut(vec![
+                check,
+                bench.read(&designed(PLAN)),
+                limited(&bench, resets),
+            ]);
+            vec![
+                bench.read(&reviewed(&[])),
+                bench.read(&reviewed(&[])),
+                bench.built(),
+            ]
+        }
+        Stage::Build => {
+            cut(vec![
+                check,
+                bench.read(&designed(PLAN)),
+                bench.read(&reviewed(&[])),
+                bench.read(&reviewed(&[])),
+                limited(&bench, resets),
+            ]);
+            vec![bench.built()]
+        }
+        Stage::Verify => {
+            bench.verify_plays.set(true);
+            cut(vec![
+                check,
+                bench.read(&designed(PLAN)),
+                bench.read(&reviewed(&[])),
+                bench.read(&reviewed(&[])),
+                bench.built(),
+                limited(&bench, resets),
+            ]);
+            vec![bench.read(&verify_scenarios::found(&[]))]
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(bench.state(), (Status::Active(stage), 1));
+    assert_eq!(bench.stage(), "In Progress");
+    (bench, resume)
+}
+
+/// OWL-340: a ticket at Design review, Build or Verify with an answered
+/// round, which a usage limit cut off and whose stage still shows working, is
+/// resumed by a watch pass with no `continue` typed and no second answer
+/// check.
+#[test]
+fn watch_resumes_design_review_build_and_verify_cut_off_after_a_round() {
+    for (stage, name) in [
+        (Stage::DesignReview, "design_review"),
+        (Stage::Build, "build"),
+        (Stage::Verify, "verify"),
+    ] {
+        let (bench, replies) = cut_off_at(stage, LONG_PAST);
+        let checks = bench.answer_checks();
+        let (outcomes, lines, printed) = bench.watch(replies, &mut |_| false);
+        assert!(
+            matches!(&outcomes[..], [Ok(_)]),
+            "{stage:?}: {outcomes:?}\n{lines}\n{printed}"
+        );
+        assert_eq!(bench.watch_resumes(), [name]);
+        assert_eq!(bench.answer_checks(), checks, "{stage:?}");
+        assert_eq!(bench.stage(), "In Review", "{stage:?}");
+    }
+}
+
+/// OWL-340, a usage limit met again by the resume. With a reset still ahead,
+/// every continue is paused until it: the next pass starts no harness and
+/// reads no stage, and a pass after the reset resumes. With a reset already
+/// past, nothing pauses: the resume is held ten minutes like any continue
+/// that left the ref as it was.
+#[test]
+fn a_resume_meeting_the_usage_limit_again_waits_for_its_reset_or_ten_minutes() {
+    // A reset ahead.
+    let (bench, mut replies) = cut_off_at(Stage::Build, FAR_AHEAD);
+    replies.insert(0, limited(&bench, FAR_AHEAD));
+    let (mut ran, mut reads) = (0, 0);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        match pass {
+            1 => {
+                (ran, reads) = (bench.briefs().len(), bench.stage_reads.get());
+                bench.wait(1);
+            }
+            2 => {
+                assert_eq!(
+                    (bench.briefs().len(), bench.stage_reads.get()),
+                    (ran, reads)
+                );
+                // Past the reset.
+                bench.wait(40 * 60);
+            }
+            _ => return false,
+        }
+        true
+    });
+    assert!(
+        matches!(&outcomes[..], [Err(Stop::UsageLimit { .. }), Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(lines.contains("no ticket is continued before the usage limit resets"));
+    assert_eq!(bench.watch_resumes(), ["build", "build"]);
+
+    // A reset already past.
+    let (bench, mut replies) = cut_off_at(Stage::Build, LONG_PAST);
+    replies.insert(0, limited(&bench, LONG_PAST));
+    let (mut ran, mut reads) = (0, 0);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        match pass {
+            1 => {
+                (ran, reads) = (bench.briefs().len(), bench.stage_reads.get());
+                bench.wait(1);
+            }
+            2 => {
+                assert_eq!(
+                    (bench.briefs().len(), bench.stage_reads.get()),
+                    (ran, reads)
+                );
+                bench.wait(11);
+            }
+            _ => return false,
+        }
+        true
+    });
+    assert!(
+        matches!(&outcomes[..], [Err(Stop::UsageLimit { .. }), Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(lines.contains("DEMO-1 is at Build as it was before that resume"));
+    assert_eq!(bench.watch_resumes(), ["build", "build"]);
+}
+
+/// OWL-340, the bound is the stage's: a Build watch resumes whose run fails
+/// moves the ref each time, is resumed at the next pass while it can be, and
+/// is parked by the second failed run; a parked ref is not resumed.
+#[test]
+fn a_resumed_build_that_fails_twice_is_parked_and_not_resumed_again() {
+    let (bench, _) = cut_off_at(Stage::Build, LONG_PAST);
+    let mut pass = 0;
+    // The first resume fails once and meets the usage limit, which keeps the
+    // failed run in the ref: the ref moved, so the next pass resumes it, and
+    // its failed run is the second.
+    let replies = vec![
+        bench.read(FAILED),
+        limited(&bench, LONG_PAST),
+        bench.read(FAILED),
+    ];
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        pass < 4
+    });
+    assert!(
+        matches!(
+            &outcomes[..],
+            [Err(Stop::UsageLimit { .. }), Err(Stop::Parked { .. })]
+        ),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(matches!(
+        bench.state().0,
+        Status::Parked {
+            at: Stage::Build,
+            ..
+        }
+    ));
+    assert_eq!(bench.watch_resumes(), ["build", "build"]);
+}
+
+/// OWL-340: a resumed Design run asks questions, and keeping the round fails
+/// once its QUESTIONS comment is posted: the ticket is held until a person
+/// acts, so later passes read no stage, run nothing and post nothing.
+#[test]
+fn a_resume_whose_state_was_not_kept_waits_for_a_person() {
+    let bench = answered_design();
+    *bench.github.refuse_open.lock().unwrap() = 1;
+    let mark = Cell::new((0, 0, 0));
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(
+        vec![
+            bench.read(&check(&[("Q1", "answered", "Markdown.")])),
+            bench.read(TRADE_OFF),
+            bench.read(&passed_on(&["Q1"])),
+        ],
+        &mut |_| {
+            pass += 1;
+            let now = (
+                bench.briefs().len(),
+                bench.comments().len(),
+                bench.stage_reads.get(),
+            );
+            match pass {
+                1 => {
+                    bench.lock_after.set(Some("[owlshift] QUESTIONS"));
+                    bench.wait(1);
+                }
+                // The resume asked and its state was not kept.
+                2 => {
+                    mark.set(now);
+                    bench.wait(11);
+                }
+                3 => {
+                    assert_eq!(now, mark.get());
+                    bench.wait(10);
+                }
+                4 => {
+                    assert_eq!(now, mark.get());
+                    return false;
+                }
+                _ => unreachable!(),
+            }
+            true
+        },
+    );
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(
+        matches!(&outcomes[1], Err(Stop::NotKept { .. })),
+        "{outcomes:?}"
+    );
+    assert!(
+        lines.contains("DEMO-1 waits for a person to act"),
+        "{lines}"
+    );
+    assert_eq!(bench.state(), (Status::Active(Stage::Design), 1));
+}
+
+/// OWL-340: while another command holds the project's lock, a ticket shown
+/// working is a run in flight. A pass ends at its snapshot with the busy
+/// line: no stage read, no resume, no hold and no comment. The first pass
+/// after the lock is released resumes it, with no ten-minute wait.
+#[test]
+fn a_run_in_flight_is_not_resumed_and_its_ticket_is_resumed_once_it_ends() {
+    let (bench, replies) = cut_off_at(Stage::Build, LONG_PAST);
+    let dirs = bench.dirs();
+    let mut lock = Some(dirs.lock().unwrap().expect("the project is free"));
+    let before = (
+        bench.briefs().len(),
+        bench.comments().len(),
+        bench.ref_commit(),
+    );
+    let reads = bench.stage_reads.get();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        match pass {
+            1 | 2 => {
+                assert_eq!(bench.stage_reads.get(), reads);
+                assert_eq!(
+                    (
+                        bench.briefs().len(),
+                        bench.comments().len(),
+                        bench.ref_commit()
+                    ),
+                    before
+                );
+                assert!(bench.watch_resumes().is_empty());
+                if pass == 2 {
+                    drop(lock.take());
+                }
+                bench.wait(1);
+                true
+            }
+            _ => false,
+        }
+    });
+    assert!(matches!(&outcomes[..], [Ok(_)]), "{outcomes:?}\n{lines}");
+    assert_eq!(
+        lines
+            .matches("another command is working the project: watch looks again at its next pass")
+            .count(),
+        1,
+        "{lines}"
+    );
+    for text in ["resumes it again", "waits for a person", "Not run"] {
+        assert!(!lines.contains(text) && !printed.contains(text), "{lines}");
+    }
+    assert_eq!(bench.watch_resumes(), ["build"]);
+}
+
+/// OWL-340: a ticket whose pull request was closed, which a person then ran
+/// `do` on again as a new cycle, and which a usage limit left at Build, is
+/// resumed by watch as a typed `continue` would run it.
+#[test]
+fn watch_resumes_a_new_cycle_started_after_its_pull_request_closed() {
+    let bench = answered_design();
+    let (outcome, printed) = bench.continue_ticket(design_replies(&bench, true));
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    // The pull request is closed, and watch ends the following.
+    bench.github.followed.lock().unwrap().state = "CLOSED";
+    *bench.github.open.lock().unwrap() = None;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert!(bench.record().delivery.is_some_and(|d| !d.followed()));
+    // A person runs it again; a usage limit cuts the new Build off.
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.read(&designed(PLAN)),
+            bench.read(&reviewed(&[])),
+            bench.read(&reviewed(&[])),
+            limited(&bench, LONG_PAST),
+        ],
+        None,
+    );
+    assert!(
+        matches!(outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.state(), (Status::Active(Stage::Build), 1));
+    // The first cycle's commit holds the greeting: this Build says it anew.
+    let rebuilt = bench.reply(Some("Hello again"), Some(DONE));
+    let (outcomes, lines, printed) = bench.watch(vec![rebuilt], &mut |_| false);
+    assert!(
+        matches!(&outcomes[..], [Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.watch_resumes(), ["build"]);
 }
