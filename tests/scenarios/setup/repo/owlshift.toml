@@ -1,0 +1,21 @@
+requires = ">=0.0"
+
+[tracker]
+kind = "markdown"
+admit = { label = "owlshift" }
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+
+[stack]
+# Fails until the setup has run: deps/ is ignored, so only setup.sh writes it.
+gate = ["grep -q ready deps/ready"]
+# Run before the Build's harness and before the gate (OWL-330).
+setup = ["sh setup.sh"]
+
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+
+[models]
+
+[policy]
+always_human = []

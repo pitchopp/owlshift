@@ -550,6 +550,78 @@ fn gate_scope() {
     }
 }
 
+/// OWL-330: the project's setup runs before the Build's harness and before
+/// its gate, which finds what it installed.
+#[cfg(unix)]
+#[test]
+fn setup() {
+    if let Err(error) = play(&scenarios().join("setup.toml"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
+/// Plays a scenario given as text on the setup fixture.
+#[cfg(unix)]
+fn play_on_setup(name: &str, scenario: &str) {
+    if let Err(error) = play_str(name, scenario, &scenarios().join("setup"), fake_harness()) {
+        panic!("{error}");
+    }
+}
+
+/// OWL-330: a project whose setup is red from the start fails its Build
+/// runs before the harness, and the second failure parks the ticket.
+#[cfg(unix)]
+#[test]
+fn a_setup_red_from_the_start_fails_before_the_harness_and_parks() {
+    play_on_setup(
+        "setup-red",
+        r#"
+        description = "The project's setup fails on a fresh worktree: two failed runs, no harness, the ticket parked."
+        ticket = "DEMO-3"
+        start = "2026-10-19T09:00:00Z"
+        setup = ["echo no registry; exit 1"]
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n" }, commit = "Add a greeting", result = "results/build-done.json" }
+        expect = { event = "run_failed", failed_runs = 1, setup_failure = "setup: exit status 1", branch_pushed = false }
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n" }, commit = "Add a greeting", result = "results/build-done.json" }
+        expect = { event = "run_failed", waiting = "parked", setup_failure = "no registry", branch_pushed = false }
+        "#,
+    );
+}
+
+/// OWL-330: a Build whose `done` broke the setup script fails the runner's
+/// gate on it; the next run starts all the same, told, repairs the script
+/// and the gate passes.
+#[cfg(unix)]
+#[test]
+fn a_build_that_breaks_the_setup_repairs_it_on_the_next_run() {
+    play_on_setup(
+        "setup-broken",
+        r#"
+        description = "The first done breaks setup.sh: the gate fails on the setup, and the next run, told, repairs it."
+        ticket = "DEMO-3"
+        start = "2026-10-19T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n", "setup.sh" = "exit 3\n" }, commit = "Add a greeting", result = "results/build-done.json" }
+        expect = { event = "run_failed", stage = "build", setup_failure = "none", gate_failure = "setup: exit status 3", branch_pushed = false }
+
+        [[step]]
+        run = { files = { "setup.sh" = "mkdir -p deps && echo ready > deps/ready\n" }, commit = "Repair the setup", result = "results/build-done.json" }
+        expect = { event = "completed", stage = "verify", brief_gate_failure = "setup: exit status 3", setup_failure = "none", gate_passed = ["grep -q ready deps/ready"], branch_pushed = true }
+        "#,
+    );
+}
+
 /// Plays a scenario given as text on the gate fixture.
 fn play_on_gate(name: &str, scenario: &str) {
     if let Err(error) = play_str(name, scenario, &scenarios().join("gate"), fake_harness()) {

@@ -2175,8 +2175,15 @@ impl OnDemand<'_> {
                     design::design_notes(&state, p.review.as_ref(), confirmation)
                         .filter(|_| !in_review_loop(p))
                 });
-            let (ran, event) =
-                self.run_role_once(p, &*harness, &state, &brief, attempt, &mut gathered, sink)?;
+            let (ran, event) = self.run_role_once(
+                p,
+                (&*harness, dispatched.rules.setup()),
+                &state,
+                &brief,
+                attempt,
+                &mut gathered,
+                sink,
+            )?;
             // A last fix that asks is no longer the last fix alone: a Verify
             // pass follows it (OWL-356).
             if event == Event::Questions && drop_last_fix(p) {
@@ -2411,18 +2418,20 @@ impl OnDemand<'_> {
     /// gate's failure and the follow-ups it gathers for the next brief and
     /// the report, and its core event ([`stage_event`], a quarantine for a
     /// breach). Only a Build run keeps a refused result for the next one.
+    /// `setup` is the project's (OWL-330), from the rules the brief was
+    /// made with.
     #[allow(clippy::too_many_arguments)]
     fn run_role_once(
         &self,
         p: &mut Prepared,
-        harness: &dyn Harness,
+        (harness, setup): (&dyn Harness, &[String]),
         state: &TicketState,
         brief: &Brief,
         attempt: u32,
         gathered: &mut Gathered,
         sink: &mut EventSink<'_>,
     ) -> Result<(Ran, Event), Stop> {
-        let ran = self.execute(p, self.executor, harness, brief, attempt, sink)?;
+        let ran = self.execute(p, self.executor, (harness, setup), brief, attempt, sink)?;
         if let Some(gate) = &ran.report.gate {
             gathered.gate_failure = gate.failure.clone();
         }
@@ -2762,7 +2771,7 @@ impl OnDemand<'_> {
         let harness = self
             .resolver
             .harness(resolver_routing(level, read_routing(p).routing));
-        let ran = self.execute(p, &executor, &*harness, &brief, 1, sink)?;
+        let ran = self.execute(p, &executor, (&*harness, &[]), &brief, 1, sink)?;
         p.chain.resolved(run_cost(&ran));
         if ran.breaches.is_empty() {
             self.keep_resolver_refusal(p, state, &ran.report.outcome)?;
@@ -3030,7 +3039,7 @@ impl OnDemand<'_> {
             timeout: ANSWER_CHECK_TIMEOUT,
             ..self.executor.clone()
         };
-        let ran = self.execute(p, &executor, self.answer_check, &brief, 1, sink)?;
+        let ran = self.execute(p, &executor, (self.answer_check, &[]), &brief, 1, sink)?;
         let event = if ran.breaches.is_empty() {
             answer_check::event(&ran.report.outcome, &brief).0
         } else {
@@ -3672,12 +3681,13 @@ impl OnDemand<'_> {
     /// Runs one role through the executor, between the project's marker
     /// and the events: `run_started`, a `warning` for each `zone:` label the
     /// brief leaves out, `run_ended`, and `usage` when the harness reported
-    /// it.
+    /// it. `setup` is the project's, for a Build or a rebase run, empty for
+    /// the other roles (OWL-330).
     fn execute(
         &self,
         p: &Prepared,
         executor: &Executor,
-        harness: &dyn Harness,
+        (harness, setup): (&dyn Harness, &[String]),
         brief: &Brief,
         attempt: u32,
         sink: &mut EventSink<'_>,
@@ -3730,7 +3740,7 @@ impl OnDemand<'_> {
             base: &p.base.commit,
             run_dir: &run_dir,
             brief,
-            setup: &[],
+            setup,
         };
         let report = match executor.run(&spec, harness) {
             Ok(report) => report,
@@ -4965,8 +4975,15 @@ impl OnDemand<'_> {
             );
             (run.decorate)(&mut brief, &p.questions());
             let harness = (run.harness)(attempt);
-            let (ran, mut event) =
-                self.run_role_once(p, harness, &state, &brief, attempt, &mut gathered, sink)?;
+            let (ran, mut event) = self.run_role_once(
+                p,
+                (harness, run.rules.setup()),
+                &state,
+                &brief,
+                attempt,
+                &mut gathered,
+                sink,
+            )?;
             let mut detail = None;
             let gated = ran
                 .report

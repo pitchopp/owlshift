@@ -37,6 +37,8 @@ pub struct ProjectRules {
     roles: BTreeMap<Role, Vec<Rule>>,
     /// The commands of `stack.gate`, in order.
     gate: Vec<String>,
+    /// The commands of `stack.setup`, in order (OWL-330).
+    setup: Vec<String>,
 }
 
 impl ProjectRules {
@@ -49,6 +51,7 @@ impl ProjectRules {
             common: Vec::new(),
             roles: BTreeMap::new(),
             gate: Vec::new(),
+            setup: Vec::new(),
         }
     }
 
@@ -56,6 +59,13 @@ impl ProjectRules {
     /// listed from.
     pub fn gate(&self) -> &[String] {
         &self.gate
+    }
+
+    /// The project's setup (OWL-330): `stack.setup` of the same project
+    /// file as the gate, which the executor runs before a Build's harness
+    /// and before the gate.
+    pub fn setup(&self) -> &[String] {
+        &self.setup
     }
 
     /// The rules of `stack.rules`, which every brief holds.
@@ -138,6 +148,7 @@ pub fn project_rules(
         common: read_all(git, checkout, base, &common)?,
         roles: BTreeMap::new(),
         gate: config.stack.gate.clone(),
+        setup: config.stack.setup.clone(),
     };
     for (role, listed) in own {
         let read = read_all(git, checkout, base, &listed)?;

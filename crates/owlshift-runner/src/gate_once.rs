@@ -72,6 +72,9 @@ pub struct Plan {
     pub name: String,
     pub source: Source,
     pub commands: Vec<String>,
+    /// The project's setup, run before the commands (OWL-330), from the same
+    /// project file.
+    pub setup: Vec<String>,
     /// The gate log.
     pub log: PathBuf,
     /// The names the commit's `stack.gate_env` declares, when they differ
@@ -96,6 +99,12 @@ impl fmt::Display for Plan {
             short(&self.commit),
             self.name
         )?;
+        if !self.setup.is_empty() {
+            writeln!(f, "  after its setup:")?;
+            for command in &self.setup {
+                writeln!(f, "    {command}")?;
+            }
+        }
         for command in &self.commands {
             writeln!(f, "  {command}")?;
         }
@@ -267,12 +276,14 @@ impl GateOnce<'_> {
             self.local.stack.cache_folders(),
         );
         let commands = config.stack.gate.clone();
+        let setup = config.stack.setup.clone();
         let run_dir = run_dir(dirs);
         let plan = Plan {
             commit,
             name,
             source,
             commands,
+            setup,
             log: run_dir.join(GATE_LOG),
             gate_env_differs,
             caches_differ,
@@ -306,7 +317,7 @@ impl GateOnce<'_> {
             base: &plan.commit,
             run_dir: &run_dir,
             commands: &plan.commands,
-            setup: &[],
+            setup: &plan.setup,
         };
         let discard = || executor.discard_worktree(&checkout, &worktree, GATE_BRANCH);
         let run = match executor.run_gate(&spec) {
@@ -360,8 +371,14 @@ pub fn render(checked: &Checked) -> String {
         return out;
     };
     let report = &run.report;
-    for step in &report.steps {
-        out.push_str(&format!("$ {}\n", step.command));
+    for (step, setup) in report
+        .setup
+        .iter()
+        .map(|step| (step, true))
+        .chain(report.steps.iter().map(|step| (step, false)))
+    {
+        let kind = if setup { "setup " } else { "" };
+        out.push_str(&format!("{kind}$ {}\n", step.command));
         let lines: Vec<&str> = step.output.lines().collect();
         let shown = &lines[lines.len().saturating_sub(TAIL_LINES)..];
         if step.truncated || shown.len() < lines.len() {
@@ -758,6 +775,66 @@ mod tests {
         std::fs::remove_file(bench.dirs.unverified_file()).unwrap();
         let green = bench.gate(&executor, &[], Some("origin/fixed")).unwrap();
         assert!(green.passed(), "{}", render(&green));
+        assert!(!bench.left_over());
+    }
+
+    /// OWL-330: `owlshift gate` runs the commit's setup before its gate, in
+    /// the same temporary folder, lists it first and fails on a red one; a
+    /// setup alone is no gate.
+    #[test]
+    fn the_gate_runs_the_setup_first_and_fails_on_a_red_one() {
+        let bench = Bench::new();
+        let with = |gate: &str, setup: &str| project_file(&format!("{gate}]\nsetup = [{setup}"));
+        bench.push(
+            "main",
+            Some(&with(
+                r#""test -f \"$TMPDIR/x\"""#,
+                r#""touch \"$TMPDIR/x\"""#,
+            )),
+        );
+        bench.push(
+            "red",
+            Some(&with(r#""echo never""#, r#""echo partial; exit 4""#)),
+        );
+        bench.push("alone", Some(&with("", r#""true""#)));
+        let executor = bench.executor(bench.agent().without_confinement());
+
+        let mut told = None;
+        let origin = bench.origin.to_string_lossy().into_owned();
+        let green = GateOnce {
+            executor: &executor,
+            dirs: &bench.dirs,
+            remote_url: &origin,
+            local: &local_config(&["true"]),
+            at: None,
+        }
+        .run(&mut |plan| told = Some(plan.clone()))
+        .unwrap();
+        assert!(green.passed(), "{}", render(&green));
+        let told = told.unwrap();
+        assert_eq!(told.setup, ["touch \"$TMPDIR/x\""]);
+        let shown = told.to_string();
+        let setup_at = shown.find("after its setup:").unwrap();
+        assert!(setup_at < shown.find("test -f").unwrap(), "{shown}");
+        let text = render(&green);
+        let setup_at = text.find("setup $ touch").unwrap();
+        assert!(setup_at < text.find("$ test -f").unwrap(), "{text}");
+
+        let red = bench.gate(&executor, &[], Some("origin/red")).unwrap();
+        assert!(!red.passed());
+        let report = &red.run.as_ref().unwrap().report;
+        let failure = report.failure.as_ref().unwrap();
+        assert_eq!(failure.command.as_deref(), Some("echo partial; exit 4"));
+        assert_eq!(failure.reason, "setup: exit status 4");
+        assert!(report.steps.is_empty());
+        assert!(
+            render(&red).contains("Gate red: `echo partial; exit 4`: setup: exit status 4."),
+            "{}",
+            render(&red)
+        );
+
+        let alone = bench.gate(&executor, &[], Some("origin/alone")).unwrap();
+        assert!(alone.passed() && alone.run.is_none(), "{alone:?}");
         assert!(!bench.left_over());
     }
 

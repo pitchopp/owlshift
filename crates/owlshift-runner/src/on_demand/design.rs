@@ -1166,7 +1166,7 @@ impl OnDemand<'_> {
             attempt += 1;
             let (ran, event) = self.run_role_once(
                 p,
-                harness,
+                (harness, &[]),
                 state,
                 brief,
                 attempt,
@@ -1253,7 +1253,7 @@ impl OnDemand<'_> {
             brief.findings = input.findings.filter(|_| brief.plan.is_some());
             let (ran, event) = self.run_role_once(
                 p,
-                &*harness,
+                (&*harness, &[]),
                 &state,
                 &brief,
                 attempt,

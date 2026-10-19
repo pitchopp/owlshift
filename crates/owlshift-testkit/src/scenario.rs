@@ -169,6 +169,9 @@ pub struct Scenario {
     /// The project's gate for this scenario, in place of the fixture's
     /// `stack.gate`: a bench convenience, so short scenarios share a fixture.
     pub gate: Option<Vec<String>>,
+    /// The project's setup for this scenario, in place of the fixture's
+    /// `stack.setup` (OWL-330), as `gate` replaces its gate.
+    pub setup: Option<Vec<String>>,
     /// Variables added to the runner's environment the agent environment is
     /// built from (the bench's, not the test process's), replacing one of
     /// the same name in any letter case: what a project's `stack.gate_env`
@@ -280,6 +283,9 @@ pub struct Expect {
     /// The gate failure the last brief carried: `none`, or a text its
     /// command, reason or output contains.
     pub brief_gate_failure: Option<String>,
+    /// The failure of the project's setup before the step's Build harness
+    /// (OWL-330): `none`, or a text its command, reason or output contains.
+    pub setup_failure: Option<String>,
     /// The refusal of the previous result the last brief carried: `none`,
     /// or a text it contains.
     pub brief_result_refusal: Option<String>,
@@ -498,6 +504,9 @@ struct Driver {
     pipeline: Pipeline,
     /// The project's gate (`stack.gate`), carried in every brief.
     gate: Vec<String>,
+    /// The project's setup (`stack.setup`), which the executor runs before
+    /// a Build's harness and before the gate (OWL-330).
+    setup: Vec<String>,
     /// The latest failure of the gate the executor ran, for the next Build
     /// brief; a passing gate clears it, other outcomes leave it.
     gate_failure: Option<GateFailure>,
@@ -628,6 +637,7 @@ impl Driver {
             refuse_questions: false,
             refuse_save: false,
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
+            setup: scenario.setup.clone().unwrap_or(config.stack.setup),
             gate_failure: None,
             has_ref: false,
             branch: format!("owlshift/{}", scenario.ticket),
@@ -1170,7 +1180,7 @@ impl Driver {
             base: "origin/main",
             run_dir: &dir,
             brief: &brief,
-            setup: &[],
+            setup: &self.setup,
         };
         let harness = FakeHarness {
             program: self.fake_harness.clone(),
@@ -1530,6 +1540,16 @@ impl Driver {
                     _ => None,
                 });
             gate_failure_is("gate_failure", expected, found)?;
+        }
+        if let Some(expected) = &expect.setup_failure {
+            let found = self
+                .last_run
+                .as_ref()
+                .and_then(|report| match &report.outcome {
+                    Outcome::Failed(Failure::Setup(failure)) => Some(failure.as_ref()),
+                    _ => None,
+                });
+            gate_failure_is("setup_failure", expected, found)?;
         }
         if let Some(expected) = &expect.brief_gate_failure {
             let brief = self

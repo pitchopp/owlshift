@@ -297,7 +297,7 @@ impl OnDemand<'_> {
             let brief = self.brief(p, Role::Intake, &comments, &rules, None, &current);
             let (ran, mut event) = self.run_role_once(
                 p,
-                self.intake,
+                (self.intake, &[]),
                 &state,
                 &brief,
                 attempt,

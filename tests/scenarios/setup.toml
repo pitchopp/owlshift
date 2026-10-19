@@ -1,0 +1,29 @@
+# OWL-330's scenario, played by crates/owlshift-testkit/tests/scenarios.rs.
+# Its fixture folder is setup/: the project in repo/, whose setup writes the
+# ignored deps/ready its gate checks, and a prepared result in results/.
+
+description = """
+DEMO-3: the runner runs the project's setup before the Build's harness and again
+before its gate, which finds what the setup installed. The build commits a
+greeting and reports done; the gate passes, and the ticket moves to Verify with
+the branch pushed."""
+ticket = "DEMO-3"
+start = "2026-10-19T09:00:00Z"
+
+[[step]]
+dispatch = true
+expect = { event = "dispatched", stage = "build" }
+
+[[step]]
+[step.run]
+files = { "GREETING.md" = "Hello, reader.\n" }
+commit = "Add a greeting"
+result = "results/build-done.json"
+[step.expect]
+event = "completed"
+stage = "verify"
+setup_failure = "none"
+gate_failure = "none"
+gate_passed = ["grep -q ready deps/ready"]
+branch_pushed = true
+branch_files = { "GREETING.md" = "Hello, reader.\n" }
