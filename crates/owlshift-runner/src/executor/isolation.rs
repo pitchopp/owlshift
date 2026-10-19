@@ -1711,6 +1711,34 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_in_the_middle_of_an_apply_rebase_reads_as_detached() {
+        // The `--apply` backend detaches `HEAD` before it writes any
+        // `head-name` (checked live on 2026-10-19): the entry is caught with
+        // a detached `HEAD` and a state folder without `head-name`. No
+        // branch is guessed from `ORIG_HEAD` or the reflog, which a run can
+        // write.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = fake_entry(dir.path(), "other", "topic");
+        fs::write(entry.join("HEAD"), SHA).unwrap();
+        fs::write(entry.join("ORIG_HEAD"), SHA).unwrap();
+        fs::create_dir(entry.join("rebase-apply")).unwrap();
+        fs::write(entry.join("rebase-apply/applying"), "").unwrap();
+        fs::write(entry.join("rebase-apply/orig-head"), SHA).unwrap();
+        fs::create_dir(entry.join("logs")).unwrap();
+        fs::write(
+            entry.join("logs/HEAD"),
+            "0 1 A <a@b> 0 +0000\trebase (start): checkout topic\n",
+        )
+        .unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Detached);
+
+        // Once the backend has written `head-name`, the entry is its
+        // branch's again.
+        fs::write(entry.join("rebase-apply/head-name"), "refs/heads/topic\n").unwrap();
+        assert_eq!(owner(&entry, &|_| {}), Owner::Branch("topic".into()));
+    }
+
+    #[test]
     fn an_entry_without_a_head_is_being_made_and_a_head_that_is_odd_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let entry = fake_entry(dir.path(), "other", "topic");
