@@ -106,13 +106,26 @@ use crate::config::exit_text;
 /// compared by its size and the digest of the whole file.
 const SHARED_FILE_CAP: u64 = 1024 * 1024;
 
-/// The most bytes of files one read of the shared git files, or one read of
-/// the other worktrees' entries, takes in, all files together. Past it the
-/// read fails, one byte later, and the check reports that it could not run:
-/// a run that got past the sandbox cannot keep the check reading with a
-/// huge or sparse file (OWL-339). Far above what git writes there, a large
-/// repository's `index` included.
+/// The most bytes of files one read of the shared git files takes in, all
+/// files together. Past it the read fails, one byte later, and the check
+/// reports that it could not run: a run that got past the sandbox cannot
+/// keep the check reading with a huge or sparse file (OWL-339).
 const READ_BUDGET: u64 = 1024 * 1024 * 1024;
+
+/// The most bytes of files one read of the other worktrees' entries takes in
+/// from any one entry, as [`READ_BUDGET`] does: far above what git writes in
+/// an entry, whose largest file is the `index`, about 100 bytes a tracked
+/// file, so some 100 MiB for a million files.
+const ENTRY_BUDGET: u64 = 1024 * 1024 * 1024;
+
+/// The most bytes of files one read of the other worktrees' entries takes in,
+/// all entries together. The runner keeps every ticket's worktree, so the
+/// entries add up. A worktree's checkout takes some 40 times what its index
+/// does (at least a 4 KiB block a file), so 64 GiB of indexes, some 650 of
+/// a million files, comes with 2.5 TiB of checkouts on the same disk. A
+/// budget per entry alone would let a run past the sandbox keep the
+/// check reading, a GiB at a time, with every entry it adds.
+const ENTRIES_BUDGET: u64 = 64 * 1024 * 1024 * 1024;
 
 /// The most names a violation lists before summing up the rest.
 const LISTED: usize = 10;
@@ -221,7 +234,8 @@ struct Entry {
 enum Content {
     /// A regular file, by its blob id or, for a shared file, its bytes.
     File(Vec<u8>),
-    /// A shared file past the cap: its size and the SHA-256 of the whole
+    /// A file of the common directory past the cap of its read (every file
+    /// of another worktree's entry): its size and the SHA-256 of the whole
     /// file, so a change anywhere in it shows.
     Large(u64, Vec<u8>),
     Link(PathBuf),
@@ -951,7 +965,7 @@ fn path_of(bytes: &[u8]) -> PathBuf {
 /// configuration (OWL-50).
 fn read_shared(common: &Path) -> Result<BTreeMap<PathBuf, Content>, SnapshotError> {
     let mut shared = BTreeMap::new();
-    let mut budget = Budget::new(READ_BUDGET);
+    let mut budget = Budget::new(SHARED_FILE_CAP, READ_BUDGET, READ_BUDGET);
     for name in ["commondir", "config", "config.worktree", "hooks", "info"] {
         walk(common, Path::new(name), &mut shared, &mut budget, &|_| {})
             .map_err(|e| SnapshotError(format!("{}: {e}", common.join(name).display())))?;
@@ -1065,9 +1079,10 @@ fn read_link_file(path: &Path) -> Result<String, String> {
 /// name that is not UTF-8 is a key of its own and a plant under it is seen.
 /// A path that vanishes between the listing, the metadata and the open (a
 /// concurrent run renaming a lock file) is read as absent, not as an error;
-/// any other I/O error is returned. Every byte read is taken from `budget`:
-/// a file that would read past what is left of it is an error, found after
-/// one byte more and no more. `between` is called with the path after its
+/// any other I/O error is returned. A file within `budget`'s cap is kept as
+/// its bytes, a larger one as its size and digest. Every byte read is taken
+/// from `budget`: a file that would read past what is left of it is an
+/// error, found after one byte more and no more. `between` is called with the path after its
 /// metadata is read and before it is opened, which lets a test change the
 /// file at exactly that point.
 fn walk(
@@ -1110,12 +1125,10 @@ fn walk(
             return Ok(());
         };
         // One byte past what is left, so that a file past it shows.
-        let mut file = file.take(budget.left.saturating_add(1));
+        let mut file = file.take(budget.left().saturating_add(1));
         let mut bytes = Vec::new();
-        (&mut file)
-            .take(SHARED_FILE_CAP + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > SHARED_FILE_CAP {
+        (&mut file).take(budget.cap + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > budget.cap {
             // Past the cap: the digest of the whole file, so a change
             // anywhere in it shows.
             let mut hasher = Sha256::new();
@@ -1146,27 +1159,62 @@ fn walk(
     Ok(())
 }
 
-/// The bytes one read of files may still take in ([`READ_BUDGET`]).
+/// How one read of files takes them in: the bytes it may still read, in all
+/// ([`READ_BUDGET`], [`ENTRIES_BUDGET`]) and of the entry it reads
+/// ([`ENTRY_BUDGET`]), and the size up to which a file is kept as it is.
 struct Budget {
-    limit: u64,
+    /// The most bytes of one file kept as they are; past it, its size and
+    /// digest.
+    cap: u64,
+    /// What one entry may take, and what is left of it for the current one.
+    each: u64,
+    part: u64,
+    /// What the whole read may take, and what is left of it.
+    all: u64,
     left: u64,
 }
 
 impl Budget {
-    fn new(limit: u64) -> Self {
-        Self { limit, left: limit }
+    fn new(cap: u64, each: u64, all: u64) -> Self {
+        Self {
+            cap,
+            each,
+            part: each,
+            all,
+            left: all,
+        }
+    }
+
+    /// Starts the next entry, with the whole of what one entry may take.
+    fn next_entry(&mut self) {
+        self.part = self.each;
+    }
+
+    /// What may still be read: the least of what is left of the entry and
+    /// of the whole.
+    fn left(&self) -> u64 {
+        self.part.min(self.left)
     }
 
     /// Takes the `read` bytes of `path` from what is left, or fails when
     /// they are more.
     fn spend(&mut self, path: &Path, read: u64) -> io::Result<()> {
-        self.left = self.left.checked_sub(read).ok_or_else(|| {
+        let past = |what: &str, limit: u64| {
             io::Error::other(format!(
-                "{} takes the files read past the {} bytes a check reads",
-                path.display(),
-                self.limit
+                "{} takes {what} past the {limit} bytes a check reads",
+                path.display()
             ))
-        })?;
+        };
+        let left = self
+            .left
+            .checked_sub(read)
+            .ok_or_else(|| past("the files read", self.all))?;
+        let part = self
+            .part
+            .checked_sub(read)
+            .ok_or_else(|| past("its entry", self.each))?;
+        self.left = left;
+        self.part = part;
         Ok(())
     }
 }
@@ -1189,17 +1237,31 @@ fn other_entries(common: &Path, own: &OsStr) -> io::Result<Vec<OsString>> {
 /// The files of the other worktrees' entries under `<common>/worktrees`,
 /// the run's own (`own`) left out, by path relative to `common`. A run that
 /// got past the sandbox could change another ticket's `index` or `HEAD`
-/// there, and with it what that worktree stages and sees (OWL-339).
+/// there, and with it what that worktree stages and sees (OWL-339). Every
+/// file is kept as its size and digest, so that what the entries hold in
+/// memory does not grow with their bytes; each entry has a budget of its
+/// own, and all of them one more ([`ENTRY_BUDGET`], [`ENTRIES_BUDGET`]).
 fn read_worktree_entries(
     common: &Path,
     own: &OsStr,
     between: &dyn Fn(&Path),
 ) -> Result<BTreeMap<PathBuf, Content>, SnapshotError> {
+    let budget = Budget::new(0, ENTRY_BUDGET, ENTRIES_BUDGET);
+    read_entries_within(common, own, between, budget)
+}
+
+/// [`read_worktree_entries`] within `budget`.
+fn read_entries_within(
+    common: &Path,
+    own: &OsStr,
+    between: &dyn Fn(&Path),
+    mut budget: Budget,
+) -> Result<BTreeMap<PathBuf, Content>, SnapshotError> {
     let worktrees = common.join("worktrees");
     let fail = |e: io::Error| SnapshotError(format!("{}: {e}", worktrees.display()));
     let mut entries = BTreeMap::new();
-    let mut budget = Budget::new(READ_BUDGET);
     for name in other_entries(common, own).map_err(fail)? {
+        budget.next_entry();
         walk(
             common,
             &Path::new("worktrees").join(name),
@@ -1548,7 +1610,7 @@ mod tests {
 
     fn walked(common: &Path, name: &str, between: &dyn Fn(&Path)) -> io::Result<Vec<PathBuf>> {
         let mut out = BTreeMap::new();
-        let mut budget = Budget::new(READ_BUDGET);
+        let mut budget = Budget::new(SHARED_FILE_CAP, READ_BUDGET, READ_BUDGET);
         walk(common, Path::new(name), &mut out, &mut budget, between)?;
         Ok(out.into_keys().collect())
     }
@@ -1564,7 +1626,7 @@ mod tests {
         fs::write(hooks.join("a"), [b'a'; 600]).unwrap();
         fs::write(hooks.join("b"), [b'b'; 600]).unwrap();
         let read = |limit: u64| {
-            let mut budget = Budget::new(limit);
+            let mut budget = Budget::new(SHARED_FILE_CAP, limit, limit);
             let mut out = BTreeMap::new();
             walk(
                 dir.path(),
@@ -1573,7 +1635,7 @@ mod tests {
                 &mut budget,
                 &|_| {},
             )
-            .map(|()| budget.left)
+            .map(|()| budget.left())
         };
         assert_eq!(read(1200).unwrap(), 0);
         let error = read(1199).unwrap_err();
@@ -1590,6 +1652,42 @@ mod tests {
         let error = read(limit).unwrap_err();
         assert!(error.to_string().contains("hooks"), "{error}");
         assert!(read(1200 + 4 * SHARED_FILE_CAP).is_ok());
+    }
+
+    /// The entries the runner keeps add up: each has a budget of its own,
+    /// so many entries within theirs are read whatever their sum, while one
+    /// entry past its own, or all of them past the whole, fail. Every file
+    /// of an entry is kept as its size and digest.
+    #[test]
+    fn each_worktree_entry_has_its_own_budget_within_one_for_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = dir.path().join("worktrees");
+        for name in ["a", "b", "c", "own"] {
+            fs::create_dir_all(entries.join(name)).unwrap();
+            fs::write(entries.join(name).join("index"), [b'i'; 900]).unwrap();
+        }
+        let own = OsStr::new("own");
+        let read = |each: u64, all: u64| {
+            read_entries_within(dir.path(), own, &|_| {}, Budget::new(0, each, all))
+        };
+        // Three entries of 900 bytes, 2,700 in all, past one entry's 1,000.
+        let read_all = read(1000, 2700).unwrap();
+        let index: PathBuf = ["worktrees", "c", "index"].iter().collect();
+        assert!(
+            matches!(read_all.get(&index), Some(Content::Large(900, _))),
+            "{read_all:?}"
+        );
+        assert!(!read_all.contains_key(Path::new("worktrees/own/index")));
+        let error = read(1000, 2699).unwrap_err().to_string();
+        assert!(
+            error.contains("the files read past the 2699 bytes"),
+            "{error}"
+        );
+        // One entry past its own budget fails, whatever is left of the whole.
+        fs::write(entries.join("b").join("index"), [b'i'; 1001]).unwrap();
+        let error = read(1000, 10_000).unwrap_err().to_string();
+        assert!(error.contains("its entry past the 1000 bytes"), "{error}");
+        assert!(error.contains("index"), "{error}");
     }
 
     #[test]
