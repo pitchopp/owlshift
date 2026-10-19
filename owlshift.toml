@@ -36,7 +36,8 @@ gate = [
     "cargo fmt --all -- --check",
     "cargo clippy --workspace --all-targets --locked -- -D warnings",
     "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked",
-    "cargo test --workspace --locked",
+    "cargo nextest run --workspace --locked --no-fail-fast",
+    "cargo test --workspace --doc --locked",
 ]
 
 [pipeline]
