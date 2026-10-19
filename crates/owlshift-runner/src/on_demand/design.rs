@@ -1447,15 +1447,14 @@ impl OnDemand<'_> {
                         Stop::Refused("an approval round the ref keeps no ask of".to_owned())
                     })?;
                     let approver = person(&ask.decider, &p.found);
-                    answer_check::answering_comment(comments, &approver, &questions)
-                        .ok_or_else(|| {
+                    answer_check::answering_comment(comments, &approver, &questions).ok_or_else(
+                        || {
                             Stop::Refused(format!(
                                 "the plan of {ticket} is approved, but no comment of its decider \
                                  holds the approval"
                             ))
-                        })?
-                        .id
-                        .clone()
+                        },
+                    )?
                 }
             };
             let sha = plan_sha256(&kept.plan);

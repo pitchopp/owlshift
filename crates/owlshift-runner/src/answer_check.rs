@@ -155,23 +155,30 @@ fn thumbs_up_reading(question: &Question) -> String {
     }
 }
 
-/// The comment that holds the decider's answer to the latest ask, which a
-/// plan's approval keeps (OWL-32): the ask's own comment when their
-/// thumbs-up on it resumed the ticket (OWL-371), its time then being the
-/// `checked_through` that resume kept; else their newest comment, as
-/// before; else the ask's comment when their thumbs-up is on it.
-pub fn answering_comment<'c>(
-    comments: &'c [Comment],
+/// The identifier of the comment that holds the decider's answer to the
+/// latest ask, which a plan's approval keeps (OWL-32): the ask's own
+/// comment when their thumbs-up on it resumed the ticket (OWL-371), which
+/// the verdicts kept on the ask tell ([`resumed_by_thumbs_up`]), so a
+/// reaction removed since, or a design run retried, changes nothing; else
+/// their newest comment, as before.
+pub fn answering_comment(
+    comments: &[Comment],
     decider: &Person,
     asked: &TicketQuestions,
-) -> Option<&'c Comment> {
-    let thumbs_up = thumbs_up(comments, decider, asked);
-    if let Some((comment, reaction)) = thumbs_up
-        && asked.checked_through == Some(reaction.created_at)
+) -> Option<String> {
+    if let Some(ask) = asked.latest()
+        && resumed_by_thumbs_up(&ask.verdicts, &ask.questions)
     {
-        return Some(comment);
+        return Some(ask.comment.clone());
     }
-    newest_decider_comment(comments, decider).or(thumbs_up.map(|(comment, _)| comment))
+    newest_decider_comment(comments, decider).map(|comment| comment.id.clone())
+}
+
+/// Whether `verdicts`, kept on an ask of `questions`, are those a thumbs-up
+/// gave ([`thumbs_up_verdicts`]): what the ticket ref keeps of a resume by
+/// thumbs-up, the reaction itself being read live only.
+pub fn resumed_by_thumbs_up(verdicts: &[Verdict], questions: &[Question]) -> bool {
+    !verdicts.is_empty() && verdicts == thumbs_up_verdicts(questions).as_slice()
 }
 
 /// The newest last edit among the decider's comments, if they wrote any.
@@ -1219,40 +1226,54 @@ mod tests {
     #[test]
     fn the_approval_names_the_comment_that_answered() {
         use thumbs::*;
-        let named = |comments: &[Comment], checked| {
-            answering_comment(comments, &decider(), &asked(vec![lettered("Q1")], checked))
-                .map(|c| c.id.clone())
+        let questions = vec![lettered("Q1")];
+        // The ask as the ticket ref keeps it once a check or a thumbs-up
+        // resumed it, with the verdicts that resumed it.
+        let resumed = |verdicts: Vec<Verdict>, checked| {
+            let mut asked = asked(questions.clone(), Some(checked));
+            asked.asks[0].verdicts = verdicts;
+            asked
         };
+        let named = |comments: &[Comment], asked: &TicketQuestions| {
+            answering_comment(comments, &decider(), asked)
+        };
+        let by_thumbs_up = resumed(thumbs_up_verdicts(&questions), 11);
         let earlier = comment(account("u1"), 5, vec![]);
-        let up = |minute| reaction(account("u1"), "+1", minute);
+        let up = reaction(account("u1"), "+1", 11);
         // Resumed by the thumbs-up, the decider having spoken in an
-        // earlier round: the round's comment.
+        // earlier round: the round's comment, never that older one, the
+        // reaction still there, taken back since, or the round's comment
+        // gone from the listing.
+        for comments in [
+            vec![earlier.clone(), round(vec![up.clone()])],
+            vec![earlier.clone(), round(vec![])],
+            vec![earlier.clone()],
+        ] {
+            assert_eq!(named(&comments, &by_thumbs_up).as_deref(), Some("c10"));
+        }
+        // A counter-question replied to, then the thumbs-up resumed it.
+        let counter = comment(account("u1"), 11, vec![]);
+        let after_counter = resumed(thumbs_up_verdicts(&questions), 13);
         assert_eq!(
-            named(&[earlier.clone(), round(vec![up(11)])], Some(11)).as_deref(),
+            named(&[round(vec![]), counter], &after_counter).as_deref(),
             Some("c10")
         );
-        // The words judged, a thumbs-up after them: the words.
+        // The words a check judged, a thumbs-up after them: the words.
         let words = comment(account("u1"), 12, vec![]);
+        let by_words = resumed(
+            vec![Verdict {
+                question: owlshift_contracts::ids::QuestionId::new("Q1").unwrap(),
+                class: AnswerClass::Answered,
+                reason: "Approved as it is.".into(),
+                reply: None,
+            }],
+            12,
+        );
         assert_eq!(
-            named(&[round(vec![up(13)]), words.clone()], Some(12)).as_deref(),
+            named(&[earlier, round(vec![up]), words], &by_words).as_deref(),
             Some("c12")
         );
-        // A counter-question replied to, then the thumbs-up resumed it.
-        assert_eq!(
-            named(&[round(vec![up(13)]), words], Some(13)).as_deref(),
-            Some("c10")
-        );
-        // A thumbs-up put back after the resume, and no comment of the
-        // decider at all: still the round's comment.
-        assert_eq!(
-            named(&[round(vec![up(14)])], Some(11)).as_deref(),
-            Some("c10")
-        );
-        // No thumbs-up: their newest comment, as before.
-        assert_eq!(
-            named(&[earlier, round(vec![])], Some(11)).as_deref(),
-            Some("c5")
-        );
+        assert!(!resumed_by_thumbs_up(&[], &questions));
     }
 
     #[test]
