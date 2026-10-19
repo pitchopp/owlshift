@@ -14,10 +14,11 @@ use owlshift_contracts::review::Mandate;
 use owlshift_core::vocab::Harness as HarnessKind;
 
 use super::design_scenarios::{
-    FORKED, PLAN, REPLAN, REVISED, TRADE_OFF, answered, designed, reviewed, ruled,
+    FORKED, PLAN, REPLAN, REVISED, TRADE_OFF, answered, designed, reviewed, revised, ruled,
 };
 use super::drain_scenarios::{by_pass, done_for, merge_read};
 use super::review_scenarios::{FORGE, review};
+use super::verify_scenarios::fixed_build;
 use super::*;
 
 /// The plan a design run writes once a `replan` is answered.
@@ -275,16 +276,15 @@ fn scenario_s8_a_false_premise_at_design_is_closed() {
 }
 
 /// Scenario S9's findings and review passes on a drained `standard` ticket.
-/// At Design review the arbiter confirms the critic's finding,
-/// the design run fixes it and the next pass is clean. At Verify, pass 1's
-/// confirmed finding is fixed and its rejected one listed; pass 2 leaves a
-/// `blocker`, asked, a `major` off every criterion, proposed, and a `minor`
-/// on a criterion, never asked (OWL-356). Watch continues the decider's
-/// answer: a Verify fix run given the minor, the pass the round buys, the
-/// delivery, and the proposal filed at `Triage` in the Markdown tracker's
-/// inbox. The texts each part
-/// writes are pinned part by part (`design_scenarios.rs`,
-/// `verify_scenarios.rs`); this plays their composition.
+/// At Design review the arbiter confirms the critic's finding, the design
+/// run fixes it and the next pass is clean. At Verify, pass 1's confirmed
+/// finding is fixed and its rejected one listed; pass 2 leaves a `blocker`,
+/// a `major` and a `minor` on a criterion, which go to one last Build, never
+/// to the decider (OWL-377): it fixes the blocker and the minor and
+/// disagrees with the major, and the delivery follows with no third pass,
+/// no follow-up filed. The texts each part writes are pinned part by part
+/// (`design_scenarios.rs`, `verify_scenarios.rs`); this plays their
+/// composition.
 #[test]
 fn scenario_s9_findings_and_review_passes() {
     let bench = Bench::draining("maintainer");
@@ -302,90 +302,56 @@ fn scenario_s9_findings_and_review_passes() {
         )])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed"])),
-        bench.read(&designed(REVISED)),
+        bench.read(&revised(REVISED, &[("F1", "fixed")])),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
-        // Build and Verify's two passes.
+        // Build and Verify's two passes, then the last fix.
         bench.greets("Hello"),
         bench.read(&findings(&[
             ("major", "The greeting has no full stop.", None),
             ("major", "GREETING.md needs a licence header.", None),
         ])),
         bench.read(&ruled(&["confirmed", "rejected"])),
-        bench.greets("Hello, again"),
+        bench.reply(Some("Hello, again"), Some(&fixed_build(&[("F1", "fixed")]))),
         bench.read(&findings(&[
             ("blocker", "The greeting still has no full stop.", None),
             ("major", "GREETING.md could open with a heading.", None),
             ("minor", "The greeting does not say Hello alone.", criterion),
         ])),
         bench.read(&ruled(&["confirmed", "confirmed", "confirmed"])),
-        // The residue reaches the resolver first, which passes it on
-        // (OWL-342).
-        bench.read(&passed_on(&["Q1"])),
-        // Pass 3: the answer, a Verify fix run and the pass it buys.
-        bench.read(&check(&[("Q1", "answered", "Add the full stop.")])),
-        bench.greets("Hello, at last."),
-        bench.read(&findings(&[])),
+        bench.reply(
+            Some("Hello, at last."),
+            Some(&fixed_build(&[
+                ("F1", "fixed"),
+                ("F2", "disagreed"),
+                ("F3", "fixed"),
+            ])),
+        ),
     ];
-    let ends = RefCell::new(Vec::new());
-    let (outcomes, lines, printed) = bench.drain(replies, 3, |pass| {
-        ends.borrow_mut().push(bench.events().len());
-        if pass == 2 {
-            assert_eq!(
-                bench.status(),
-                Status::NeedsInput {
-                    return_to: Stage::Build
-                }
-            );
-            bench.answer("Q1: add the full stop.");
-        }
-    });
-    let Some(Err(Stop::NeedsInput { questions, .. })) = outcomes
-        .iter()
-        .find(|outcome| matches!(outcome, Err(Stop::NeedsInput { .. })))
-    else {
-        panic!("{outcomes:?}\n{lines}\n{printed}");
-    };
-    let asked: Vec<&str> = questions.iter().map(|q| q.text.as_str()).collect();
-    assert_eq!(asked.len(), 1, "a minor is never asked: {asked:?}");
-    assert!(asked[0].starts_with("The greeting still has no full stop."));
-    // The fix run after the round is given the minor on the criterion.
-    let fix = bench
+    let (outcomes, lines, printed) = bench.drain(replies, 2, |_| {});
+    assert!(
+        matches!(outcomes.last(), Some(Ok(_))),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Err(Stop::NeedsInput { .. }))),
+        "no round: {outcomes:?}"
+    );
+    // The last Build is given every finding of the last pass.
+    let last = bench
         .briefs()
         .into_iter()
         .rev()
         .find(|brief| brief.role == Role::Build)
         .and_then(|brief| brief.findings)
-        .expect("the minor to fix");
-    let ids: Vec<&str> = fix.findings.iter().map(|f| f.id.as_str()).collect();
-    assert_eq!(ids, ["F3"]);
-    assert!(
-        matches!(outcomes.last(), Some(Ok(_))),
-        "{outcomes:?}\n{lines}\n{printed}"
-    );
-    assert_eq!(
-        runs_by_pass(&bench.events(), &ends.borrow()),
-        [
-            vec!["intake"],
-            vec![
-                "design",
-                "design_review",
-                "design_review",
-                "arbiter",
-                "design",
-                "design_review",
-                "design_review",
-                "build",
-                "verify",
-                "arbiter",
-                "build",
-                "verify",
-                "arbiter",
-                "resolver",
-            ],
-            vec!["answer_check", "build", "verify"],
-        ]
-    );
+        .expect("the last pass's findings");
+    let ids: Vec<&str> = last.findings.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(ids, ["F1", "F2", "F3"]);
+    let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
+    assert!(!roles.contains(&Role::Resolver), "{roles:?}");
+    assert_eq!(roles.iter().filter(|r| **r == Role::Verify).count(), 2);
     let passes: Vec<(Value, Value, Value)> = bench
         .decisions("review")
         .into_iter()
@@ -404,37 +370,22 @@ fn scenario_s9_findings_and_review_passes() {
             (json!("design_review"), json!(1), json!("design")),
             (json!("design_review"), json!(2), json!("build")),
             (json!("verify"), json!(1), json!("build")),
-            (json!("verify"), json!(2), json!("questions")),
-            (json!("verify"), json!(3), json!("deliver")),
+            (json!("verify"), json!(2), json!("build")),
         ]
     );
-    // The off-criterion major alone is filed, at Triage, by the reviewer.
-    let proposal = bench.shown("DEMO-2");
-    assert_eq!(proposal.title, "GREETING.md could open with a heading.");
-    assert_eq!(
-        (proposal.stage.as_str(), proposal.author.as_str()),
-        ("Triage", "owlshift")
-    );
-    assert!(!bench.remote.checkout.join("tickets/DEMO-3").exists());
+    // No follow-up is filed from a finding.
+    assert!(!bench.remote.checkout.join("tickets/DEMO-2").exists());
     let report = bench.comments().pop().unwrap();
     for text in [
-        "**Verify, 3 passes.**",
+        "**Verify, 2 passes.**",
         "GREETING.md needs a licence header. Rejected: ",
-        "filed as DEMO-2 for triage",
+        "GREETING.md could open with a heading. Disagreed: F2 disagreed",
+        "- Pass 2, F1, blocker, critic and conformance on Claude Code: The greeting still has no \
+         full stop.",
     ] {
         assert!(report.contains(text), "{text}\n---\n{report}");
     }
-    // To Design by the drain; each stage step after it by watch's resume,
-    // Design review twice, Design, then Build at each of its three steps
-    // (OWL-367).
-    assert_eq!(
-        dispatches(&bench.events()),
-        [
-            "drain", "continue", "continue", "continue", "continue", "continue", "continue"
-        ]
-    );
 }
-
 /// Scenario S17's routing part on a drained `standard` ticket: the verdict
 /// names Codex on the deep tier at effort `high`, an `effort:max` label
 /// overrides its effort, and the project names a model for `deep` and for
@@ -834,6 +785,12 @@ fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
         "Greet once more.",
     );
     let builds = |greeting: &str| bench.reply(Some(greeting), Some(&done_for("DEMO-2")));
+    // A fix run answers the findings it is given (OWL-377).
+    let answering = |greeting: &str| {
+        let mut done: Value = serde_json::from_str(&done_for("DEMO-2")).unwrap();
+        done["finding_responses"] = super::design_scenarios::answers(&[("F1", "fixed")]);
+        bench.reply(Some(greeting), Some(&done.to_string()))
+    };
     let replies = vec![
         // Pass 1: DEMO-1's intake. Pass 2: DEMO-2's, then DEMO-1's design
         // asks, the resolver passing the question on.
@@ -852,7 +809,7 @@ fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
         // Pass 4: DEMO-1's answer check; DEMO-2's fix and Verify, a minor
         // left for its last fix.
         bench.read(&check(&[("Q1", "answered", "Markdown.")])),
-        builds("Hello."),
+        answering("Hello."),
         bench.read(&findings(&[(
             "minor",
             "The greeting could end the line.",
@@ -861,7 +818,7 @@ fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
         bench.read(&ruled(&["confirmed"])),
         // Pass 5: DEMO-2's last fix and its delivery. Pass 6: DEMO-1's
         // design.
-        builds("Hello.\n"),
+        answering("Hello.\n"),
         bench.read(&designed(PLAN)),
     ];
     let ends = RefCell::new(Vec::new());

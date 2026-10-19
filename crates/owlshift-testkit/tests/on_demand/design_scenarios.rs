@@ -49,6 +49,29 @@ pub(super) fn designed(plan: &str) -> String {
     format!(r#"{{"format":13,"status":"done","summary":"Planned the greeting.","plan":{plan}}}"#)
 }
 
+/// The author's answers to the findings of its brief, one per (finding,
+/// outcome) (format 13, OWL-377), each with a reason of its own.
+pub(super) fn answers(answers: &[(&str, &str)]) -> Value {
+    answers
+        .iter()
+        .map(|(finding, outcome)| {
+            json!({
+                "finding": finding,
+                "outcome": outcome,
+                "reason": format!("{finding} {outcome}: the plan's step 1 shows it."),
+            })
+        })
+        .collect()
+}
+
+/// A design run's `done` with `plan`, answering the findings to fix
+/// (OWL-377).
+pub(super) fn revised(plan: &str, given: &[(&str, &str)]) -> String {
+    let mut result: Value = serde_json::from_str(&designed(plan)).unwrap();
+    result["finding_responses"] = answers(given);
+    result.to_string()
+}
+
 /// A review run's `done` with a finding per (severity, claim).
 pub(super) fn reviewed(findings: &[(&str, &str)]) -> String {
     let findings: Vec<Value> = findings
@@ -305,7 +328,7 @@ fn the_arbiter_confirms_a_finding_the_design_fixes_and_rejects_another() {
         ])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed", "rejected"])),
-        bench.read(&designed(REVISED)),
+        bench.read(&revised(REVISED, &[("F1", "fixed")])),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
         bench.built(),
@@ -419,7 +442,7 @@ fn the_design_roles_rules_reach_their_own_briefs() {
         )])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed"])),
-        bench.read(&designed(REVISED)),
+        bench.read(&revised(REVISED, &[("F1", "fixed")])),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
         bench.built(),
@@ -513,16 +536,22 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
     );
 }
 
-/// The bound: a `major` still confirmed after the second pass goes to the
-/// resolver first (OWL-342), told its finding, with the arbiter's ruling,
-/// and the plan; passed on, it goes to the decider, one question; a `minor`
-/// is noted in the PLAN comment. After the answer, the design runs with it
-/// in its thread, and the one more pass it buys is clean, so the Build
-/// follows.
-#[test]
-fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
-    let bench = Bench::of("standard");
-    let replies = vec![
+/// The plan Design's last revision writes.
+const LAST: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+"criteria":["GREETING.md says Hello."],
+"approach":"Write GREETING.md with the line the gate greps, the word itself checked.",
+"steps":[{"what":"Add GREETING.md.","test":"The gate's grep for the word Hello alone."}]}"#;
+
+/// The replies of a standard ticket whose second design review pass
+/// confirms `second`'s findings, then the last revision answering them
+/// with `answered`.
+fn to_the_last_revision(
+    bench: &Bench,
+    second: &[(&str, &str)],
+    answered: &[(&str, &str)],
+) -> Vec<Reply> {
+    let confirmed = vec!["confirmed"; second.len()];
+    vec![
         bench.read(&designed(PLAN)),
         bench.read(&reviewed(&[(
             "major",
@@ -530,61 +559,181 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
         )])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed"])),
-        bench.read(&designed(REVISED)),
-        bench.read(&reviewed(&[
-            ("major", "Step 1's test still does not check the word."),
-            ("minor", "The goal could name the file's path."),
-        ])),
+        bench.read(&revised(REVISED, &[("F1", "fixed")])),
+        bench.read(&reviewed(second)),
         bench.read(&reviewed(&[])),
-        bench.read(&ruled(&["confirmed", "confirmed"])),
-        bench.read(&passed_on(&["Q1"])),
-    ];
-    let (outcome, printed) = bench.run(replies, None);
-    let stop = outcome.expect_err("the residue goes to the decider");
-    let Stop::NeedsInput {
-        questions, posted, ..
-    } = &stop
-    else {
-        panic!("{stop:?}\n{printed}");
-    };
-    assert_eq!(posted.as_ref().map(|round| round.get()), Ok(1));
-    assert_eq!(questions.len(), 1);
-    assert_eq!(questions[0].category, "review_finding");
-    assert!(
-        questions[0]
-            .text
-            .starts_with("Step 1's test still does not check the word.")
+        bench.read(&ruled(&confirmed)),
+        bench.read(&revised(LAST, answered)),
+    ]
+}
+
+/// OWL-377's acceptance: a design review leaves two majors after its two
+/// passes. They go to Design's last revision, never to the decider: it
+/// fixes one and disagrees with the other, recorded with its reason; no
+/// review pass follows, and the plan goes to Build with no QUESTIONS round,
+/// the `residue` event's `asked` empty. The PLAN lists what the revision
+/// answered, the disagreement with the design's own reason; the minor is a
+/// note for the Build.
+#[test]
+fn two_majors_left_after_two_passes_go_to_the_last_revision_with_no_round() {
+    let bench = Bench::of("standard");
+    let mut replies = to_the_last_revision(
+        &bench,
+        &[
+            ("major", "Step 1's test still does not check the word."),
+            ("major", "GREETING.md needs a licence header."),
+            ("minor", "The goal could name the file's path."),
+        ],
+        &[("F1", "fixed"), ("F2", "disagreed")],
     );
-    let resolver = bench.last_of(Role::Resolver);
-    let asked = resolver.asked_by.as_ref().unwrap();
-    assert_eq!(asked.role, Role::DesignReview);
-    assert!(asked.plan.is_some() && asked.diff.is_none());
-    assert_eq!(asked.findings.len(), 2);
-    assert!(asked.findings[0].ruling.is_some());
-    assert_eq!(resolver.resolve[0].finding.as_ref().unwrap().as_str(), "F1");
+    replies.push(bench.built());
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.roles(),
+        [
+            Role::Design,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::Arbiter,
+            Role::Design,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::Arbiter,
+            Role::Design,
+            Role::Build,
+            Role::Verify,
+        ],
+        "no review pass after the last revision"
+    );
+    let briefs = bench.briefs();
+    let last = briefs[8].findings.as_ref().expect("the findings to answer");
+    let ids: Vec<&str> = last.findings.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(
+        (last.mode, ids),
+        (FindingsMode::Fix, vec!["F1", "F2"]),
+        "the minor is the Build's note"
+    );
+    assert!(
+        !bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] QUESTIONS")),
+        "no round"
+    );
+    assert!(!bench.roles().contains(&Role::Resolver));
+    let residue = bench
+        .decisions("review")
+        .into_iter()
+        .find(|event| event["review"] == "residue")
+        .expect("the residue event");
+    assert_eq!(residue["asked"], json!([]));
+    assert_eq!(residue["last_fix"], json!(["F1", "F2"]));
+    assert_eq!(residue["noted"], json!(["F3"]));
+    let revision = bench
+        .decisions("review")
+        .into_iter()
+        .find(|event| event["review"] == "last_revision")
+        .expect("the last revision's event");
+    assert_eq!(
+        (
+            &revision["fixed"],
+            &revision["disagreed"],
+            &revision["next"]
+        ),
+        (&json!(["F1"]), &json!(["F2"]), &json!("build"))
+    );
+
+    let record = bench.record();
+    assert!(
+        record
+            .plan
+            .unwrap()
+            .plan
+            .approach
+            .contains("the word itself")
+    );
+    let review = record.review.unwrap();
+    let passes: Vec<(Stage, u32, bool)> = review
+        .passes
+        .iter()
+        .map(|pass| (pass.stage, pass.pass.get(), pass.revision.is_some()))
+        .collect();
+    assert_eq!(
+        passes,
+        [
+            (Stage::DesignReview, 1, false),
+            (Stage::DesignReview, 2, false),
+            (Stage::DesignReview, 3, true),
+            (Stage::Verify, 1, false),
+        ]
+    );
+    assert!(review.passes[2].reviewers.is_empty());
+    let second = &review.passes[1].findings;
+    let outcomes: Vec<Option<FindingOutcome>> = second.iter().map(|k| k.outcome).collect();
+    assert_eq!(
+        outcomes,
+        [
+            Some(FindingOutcome::Fixed),
+            Some(FindingOutcome::Disagreed),
+            None
+        ]
+    );
+    let disagreed = &second[1];
+    assert!(disagreed.ruling.is_some(), "kept beside the ruling");
+    assert_eq!(
+        disagreed.response.as_ref().map(|r| r.outcome),
+        Some(ResponseOutcome::Disagreed)
+    );
+    let notes = bench.last_of(Role::Build).findings.expect("the note");
+    assert_eq!(
+        (notes.mode, notes.findings[0].claim.as_str()),
+        (FindingsMode::Note, "The goal could name the file's path.")
+    );
     let plan = bench.plan_document();
     for text in [
-        "F1, major, critic on Claude Code: Step 1's test still does not check the word. (asked \
-         below)",
-        "F2, minor, critic on Claude Code: The goal could name the file's path. (noted for the \
-         Build)",
+        "### Design review, pass 3\n\nThe design's last revision, after the findings of pass 2",
+        "F1, major, critic on Claude Code: Step 1's test still does not check the word. (fixed by \
+         the last revision, which no pass reviewed)",
+        "F2, major, critic on Claude Code: GREETING.md needs a licence header. Disagreed: F2 \
+         disagreed: the plan's step 1 shows it.",
     ] {
         assert!(plan.contains(text), "{text}\n---\n{plan}");
     }
     let pointer = bench.plan_pointer();
-    for text in [
-        "**Findings open:** 2.",
-        "**Next.** The findings left are settled by DECISION comments or by the decider's",
-    ] {
-        assert!(pointer.contains(text), "{text}\n---\n{pointer}");
-    }
+    assert!(pointer.contains("**Findings open:** 3."), "{pointer}");
     assert!(
-        bench
-            .comments()
-            .last()
-            .unwrap()
-            .starts_with("[owlshift] QUESTIONS · round 1")
+        pointer.contains("**Next.** The Build follows this plan."),
+        "{pointer}"
     );
+}
+
+/// OWL-377 under `plan_approval = "always"`: after the last revision the
+/// plan goes to its approval round, the only question; the round counts the
+/// revision's pass, so the design run after the answer is given the
+/// approval, and the approved plan opens the Build.
+#[test]
+fn the_last_revision_goes_to_its_approval_round() {
+    let bench = Bench::of("standard");
+    let config = bench.remote.checkout.join("owlshift.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("plan_approval = \"never\"", "plan_approval = \"always\""),
+    )
+    .unwrap();
+    let replies = to_the_last_revision(
+        &bench,
+        &[("major", "GREETING.md needs a licence header.")],
+        &[("F1", "disagreed")],
+    );
+    let (outcome, printed) = bench.run(replies, None);
+    let stop = outcome.expect_err("the approval round");
+    let Stop::NeedsInput { questions, .. } = &stop else {
+        panic!("{stop:?}\n{printed}");
+    };
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].category, "plan_approval");
     let record = bench.record();
     assert_eq!(
         (
@@ -592,44 +741,30 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
             record.state.waiting,
             record.state.review_passes
         ),
-        (Stage::Design, Some(Waiting::NeedsInput), 2)
+        (Stage::Design, Some(Waiting::NeedsInput), 3)
     );
-    let residue = bench
-        .decisions("review")
-        .into_iter()
-        .find(|event| event["review"] == "residue")
-        .expect("the residue event");
-    assert_eq!(residue["asked"], json!(["F1"]));
-    assert_eq!(residue["noted"], json!(["F2"]));
+    assert!(
+        bench
+            .marked("[owlshift] QUESTIONS")
+            .contains("last revision")
+    );
 
-    bench.answer("Q1: settle it as it says, with the word checked.");
+    bench.answer("ok");
     let replies = vec![
-        bench.read(&check(&[(
-            "Q1",
-            "answered",
-            "Settle it as the finding says.",
-        )])),
-        bench.read(&designed(REVISED)),
-        bench.read(&reviewed(&[])),
-        bench.read(&reviewed(&[])),
+        bench.read(&check(&[("Q1", "answered", "Approved.")])),
+        bench.read(&answered("approved", None)),
         bench.built(),
     ];
     let (outcome, printed) = bench.continue_ticket(replies);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let briefs = bench.briefs();
-    // Design, its review pass, the Build and its Verify pass (OWL-304).
-    let after = &briefs[briefs.len() - 5];
-    assert_eq!(after.role, Role::Design);
-    assert!(after.findings.is_none() && !after.approval);
-    assert!(after.plan.is_some());
-    // The round is answered: it reads as its readings (OWL-359).
-    assert!(latest_ask(after).is_empty());
-    assert_eq!(last_answered(after), ["Q1"]);
-    let review = bench.record().review.unwrap();
-    assert_eq!(review.passes.len(), 4);
-    assert_eq!(review.passes[2].pass.get(), 3);
+    let roles = bench.roles();
+    assert_eq!(
+        roles[roles.len() - 4..],
+        [Role::AnswerCheck, Role::Design, Role::Build, Role::Verify]
+    );
+    assert!(bench.briefs()[roles.len() - 3].approval);
+    assert!(bench.record().plan.unwrap().approval.is_some());
 }
-
 /// A plan of two steps, and the one its revision changes step 2 of.
 const TWO_STEPS: &str = r#"{"goal":"Add GREETING.md saying Hello.",
 "criteria":["GREETING.md says Hello."],
@@ -704,7 +839,7 @@ fn a_pass_after_a_revision_reviews_the_changed_steps_with_the_earlier_findings()
         ])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed", "confirmed"])),
-        bench.read(&designed(TWO_STEPS_REVISED)),
+        bench.read(&revised(TWO_STEPS_REVISED, &[("F1", "fixed")])),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
         bench.built(),
@@ -1326,79 +1461,95 @@ fn a_design_question_is_decided_on_judgment_at_all_and_not_below() {
     );
 }
 
-/// OWL-343's acceptance, a residue finding decided: the finding two passes
-/// left reaches the resolver, which has its fix applied; no round opens,
-/// the next design run follows the decision, and the pass it buys is clean,
-/// so the Build follows.
+/// OWL-377's acceptance: a finding the design turns into a question of
+/// scope reaches the resolver, then the decider at a level that keeps
+/// scope. The design, given the confirmed finding to fix, asks instead,
+/// filing the question under a word of its own; the resolver runs on it,
+/// told of the asking design run, labels it `scope` and decides it, which
+/// `discoverable` refuses; the decider gets it as Design's own question.
+/// After the answer the design runs again with the finding still to
+/// answer, and disagrees with it on the decider's word. (A question filed
+/// `scope` goes to the decider at this level with no resolver run.)
 #[test]
-fn a_residue_finding_decided_is_applied_by_the_next_design_run() {
+fn a_finding_the_design_turns_into_a_scope_question_reaches_the_decider() {
     let bench = Bench::of("standard");
-    let applied = r#"{"format":13,"status":"done","summary":"The plan does not check the word.",
-"resolutions":[{"question":"Q1","outcome":"decided","category":"testing",
-"decision":"Settle it: change step 1 so its test greps for the word Hello.",
-"basis":"Plan step 1's test greps for the line, not the word, as the arbiter confirmed.",
-"basis_kind":"fact","option":"A"}]}"#;
+    let asks = r#"{"format":13,"status":"questions","summary":"Weighed the reviewer's point.",
+"questions":[{"id":"Q1","category":"languages","context":"A reviewer wants the greeting in every language.",
+"text":"Should GREETING.md greet in every language, beyond the ticket's Hello?",
+"recommendation":{"why":"Hello alone, as the ticket says."}}]}"#;
+    let labelled = r#"{"format":13,"status":"done","summary":"The ticket says Hello.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"scope",
+"decision":"Hello alone.","basis":"The ticket's description names Hello.","basis_kind":"settled"}]}"#;
     let replies = vec![
         bench.read(&designed(PLAN)),
         bench.read(&reviewed(&[(
             "major",
-            "Step 1's test does not check the word.",
+            "GREETING.md greets in English only; the ticket may want every language.",
         )])),
         bench.read(&reviewed(&[])),
         bench.read(&ruled(&["confirmed"])),
-        bench.read(&designed(PLAN)),
-        bench.read(&reviewed(&[(
-            "major",
-            "Step 1's test still does not check the word.",
-        )])),
-        bench.read(&reviewed(&[])),
-        bench.read(&ruled(&["confirmed"])),
-        bench.read(applied),
-        bench.read(&designed(REVISED)),
+        bench.read(asks),
+        bench.read(labelled),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    let stop = outcome.expect_err("the question reaches the decider");
+    let Stop::NeedsInput {
+        questions, posted, ..
+    } = &stop
+    else {
+        panic!("{stop:?}\n{printed}");
+    };
+    assert_eq!(posted.as_ref().map(|round| round.get()), Ok(1));
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].category, "languages", "Design's own question");
+    let resolver = bench.last_of(Role::Resolver);
+    let asked = resolver.asked_by.as_ref().unwrap();
+    assert_eq!(asked.role, Role::Design);
+    assert!(resolver.resolve[0].finding.is_none(), "no residue question");
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    assert_eq!(resolved[0]["refused"], json!(["Q1"]));
+    let record = bench.record();
+    assert!(record.questions.decisions.is_empty());
+    assert_eq!(
+        (
+            record.state.stage,
+            record.state.waiting,
+            record.state.review_passes
+        ),
+        (Stage::Design, Some(Waiting::NeedsInput), 1)
+    );
+
+    bench.answer("Q1: Hello alone.");
+    let replies = vec![
+        bench.read(&check(&[("Q1", "answered", "Hello alone.")])),
+        bench.read(&revised(PLAN, &[("F1", "disagreed")])),
         bench.read(&reviewed(&[])),
         bench.read(&reviewed(&[])),
         bench.built(),
     ];
-    let (outcome, printed) = bench.run(replies, None);
+    let (outcome, printed) = bench.continue_ticket(replies);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let roles = bench.roles();
-    assert_eq!(roles[8..10], [Role::Resolver, Role::Design]);
-    let after = &bench.briefs()[9];
-    assert!(after.findings.is_none() && !after.approval);
-    assert!(shape(after).contains(&"decision".to_owned()));
-    assert!(
-        !bench
-            .comments()
-            .iter()
-            .any(|c| c.starts_with("[owlshift] QUESTIONS"))
-    );
-    let record = bench.record();
-    assert!(
-        record
-            .plan
-            .unwrap()
-            .plan
-            .approach
-            .contains("the word checked")
-    );
-    let passes: Vec<(Stage, u32)> = record
-        .review
-        .unwrap()
-        .passes
-        .iter()
-        .map(|pass| (pass.stage, pass.pass.get()))
-        .collect();
+    let briefs = bench.briefs();
+    let after = &briefs[briefs.len() - 5];
+    assert_eq!(after.role, Role::Design);
+    let given = after
+        .findings
+        .as_ref()
+        .expect("the finding still to answer");
     assert_eq!(
-        passes,
-        [
-            (Stage::DesignReview, 1),
-            (Stage::DesignReview, 2),
-            (Stage::DesignReview, 3),
-            (Stage::Verify, 1)
-        ]
+        (given.mode, given.findings[0].id.as_str()),
+        (FindingsMode::Fix, "F1")
     );
+    assert_eq!(last_answered(after), ["Q1"]);
+    let review = bench.record().review.unwrap();
+    assert_eq!(
+        review.passes[0].findings[0].outcome,
+        Some(FindingOutcome::Disagreed)
+    );
+    // The pass after the round reads the disagreement and raises nothing.
+    let earlier = &briefs[briefs.len() - 4].review.as_ref().unwrap().earlier;
+    assert_eq!(earlier[0].kept.outcome, Some(FindingOutcome::Disagreed));
 }
-
 /// Under `on-fork`, the plan's approval reaches the resolver (OWL-342): its
 /// option A approves the plan as it is, kept in `plan.json` with the
 /// DECISION comment, and the Build follows it in the same command.
