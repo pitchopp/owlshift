@@ -6,6 +6,19 @@
 //! author answers the findings (`pipeline.findings = "author"`), because
 //! the author did not reject it. Which findings stand is the runner's to
 //! read; what follows from them is decided here.
+//!
+//! Every standing finding goes to the role that owns the work, Design for
+//! the plan and Build for the code, and none becomes a question by itself
+//! (OWL-377, "A finding goes to its author"): its author fixes it, or keeps
+//! its choice and says why. Each finding's fate, by stage, severity and
+//! pass:
+//!
+//! | Stage | Severity | Before the last pass | At a last pass |
+//! | --- | --- | --- | --- |
+//! | Design review | `blocker`, `major` | [`Fate::Fix`] | [`Fate::LastFix`] |
+//! | Design review | `minor` | [`Fate::Note`] | [`Fate::Note`] |
+//! | Verify | `blocker`, `major` | [`Fate::Fix`] | [`Fate::LastFix`] |
+//! | Verify | `minor` | [`Fate::Fix`] beside a `blocker` or `major`, else [`Fate::LastFix`] | [`Fate::LastFix`] |
 
 use crate::gate::PlanGate;
 use crate::state::{Event, is_last_review_pass};
@@ -15,51 +28,43 @@ use crate::vocab::{Severity, Stage};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Standing {
     pub severity: Severity,
-    /// Whether it bears on one of the ticket's success criteria.
-    pub on_criterion: bool,
 }
 
 /// What becomes of one standing finding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fate {
-    /// Its author fixes it: the next Design run or Verify fix run gets it,
-    /// and the next pass reviews the result.
+    /// Its author fixes it, or keeps its choice and says why: the next
+    /// Design run or Verify fix run gets it, and the next pass reviews the
+    /// result.
     Fix,
-    /// It goes to the decider in the pass's question round, one question
-    /// per finding, without the resolver.
-    Ask,
     /// A `minor` one at Design review, at any pass (OWL-356): listed in the
     /// PLAN comment and handed to the Build as a note, never a revision of
     /// the plan. Nothing settles it, so `review.json` keeps it with no
     /// outcome.
     Note,
-    /// A `major` one after Verify's last pass that is not on a criterion: a
-    /// proposed follow-up, filed as P4 files them, with the reviewer as its
-    /// source.
-    Propose,
-    /// A `minor` one at Verify that no `blocker` or `major` of the pass
-    /// sends back for another pass (OWL-356): fixed in one last Build,
-    /// which the runner's gate checks, with no Verify pass after it, and
-    /// listed in the DELIVERY report. When the pass asks the decider, the
-    /// Build after the round fixes it, and the pass the round buys reviews
-    /// it.
+    /// One its author answers in one last run, with no review pass after
+    /// it: at Design review, a `blocker` or `major` left by a last pass,
+    /// which Design's last revision answers (OWL-377); at Verify, a
+    /// `blocker` or `major` left by a last pass, or a `minor` that no
+    /// `blocker` or `major` of a pass before the last sends back for another
+    /// pass (OWL-356), which one last Build answers, the runner's gate then
+    /// checking it. The PLAN comment or the DELIVERY report lists what the
+    /// author answered. When that run asks the decider, the pass the round
+    /// buys reviews its work.
     LastFix,
 }
 
 /// Where a review pass sends the ticket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PassOutcome {
-    /// Nothing is left to fix or ask: the stage completes.
+    /// Nothing is left to fix: the stage completes.
     Passed,
     /// A pass before the last left findings: back to the author, Design or
     /// Build, for one more pass.
     Revise,
-    /// The last pass left findings for the decider: a question round,
-    /// which returns to the author ([`crate::pipeline::Pipeline::round_return`]).
-    Ask,
-    /// At Verify, only `minor` findings are left to fix (OWL-356): one last
-    /// Build fixes them, and the delivery follows its gate with no Verify
-    /// pass. Never at Design review.
+    /// Findings are left for one last run of their author, Design's last
+    /// revision or Verify's last fix, with no review pass after it (OWL-356,
+    /// OWL-377).
     LastFix,
 }
 
@@ -71,7 +76,6 @@ impl PassOutcome {
         match self {
             Self::Passed => Event::Completed,
             Self::Revise => Event::LoopBack,
-            Self::Ask => Event::Questions,
             Self::LastFix => Event::LastFix,
         }
     }
@@ -103,17 +107,13 @@ pub struct PassVerdict {
 /// from the findings that stand after it. `None` for a stage that is not
 /// Design review or Verify.
 ///
-/// A `minor` never sends the ticket back for another pass (OWL-356): at
-/// Design review it is noted for the Build, at any pass; at Verify it is
-/// fixed with the `blocker` and `major` findings of a pass before the last,
-/// and otherwise in one last Build with no Verify pass after it. Before the
-/// last pass, every `blocker` and `major` is fixed, and any one sends the
-/// ticket back to its author. After a last pass ([`is_last_review_pass`]):
-/// at Design review a `blocker` or `major` is asked; at Verify a `blocker`,
-/// or a `major` on a success criterion (which S13 forbids deferring), is
-/// asked and any other `major` proposed as a follow-up. The pass asks when
-/// one finding is asked, revises when one is fixed by its author, gives
-/// the last fix when one is left for it, and passes otherwise.
+/// Each finding's fate follows the module's table: no finding is asked
+/// (OWL-377) and none is proposed as a follow-up by the runner. The pass
+/// revises when one finding is fixed by its author before the last pass,
+/// gives the last run when one is left for it, and passes otherwise.
+/// Whether a finding bears on a success criterion changes no fate: its
+/// author may not defer it (S13), which the contracts hold
+/// (`owlshift_contracts::result`).
 pub fn settle(stage: Stage, pass: u32, findings: &[Standing]) -> Option<PassVerdict> {
     if !matches!(stage, Stage::DesignReview | Stage::Verify) {
         return None;
@@ -129,15 +129,11 @@ pub fn settle(stage: Stage, pass: u32, findings: &[Standing]) -> Option<PassVerd
             (Stage::DesignReview, Severity::Minor) => Fate::Note,
             (_, Severity::Minor) if revises => Fate::Fix,
             (_, Severity::Minor) => Fate::LastFix,
-            _ if !last => Fate::Fix,
-            (Stage::DesignReview, _) | (_, Severity::Blocker) => Fate::Ask,
-            _ if finding.on_criterion => Fate::Ask,
-            _ => Fate::Propose,
+            _ if last => Fate::LastFix,
+            _ => Fate::Fix,
         })
         .collect();
-    let outcome = if fates.contains(&Fate::Ask) {
-        PassOutcome::Ask
-    } else if fates.contains(&Fate::Fix) {
+    let outcome = if fates.contains(&Fate::Fix) {
         PassOutcome::Revise
     } else if fates.contains(&Fate::LastFix) {
         PassOutcome::LastFix
@@ -151,18 +147,15 @@ pub fn settle(stage: Stage, pass: u32, findings: &[Standing]) -> Option<PassVerd
 mod tests {
     use super::*;
 
-    const fn standing(severity: Severity, on_criterion: bool) -> Standing {
-        Standing {
-            severity,
-            on_criterion,
-        }
-    }
-
-    const BLOCKER: Standing = standing(Severity::Blocker, false);
-    const MAJOR: Standing = standing(Severity::Major, false);
-    const MAJOR_ON_CRITERION: Standing = standing(Severity::Major, true);
-    const MINOR: Standing = standing(Severity::Minor, false);
-    const MINOR_ON_CRITERION: Standing = standing(Severity::Minor, true);
+    const BLOCKER: Standing = Standing {
+        severity: Severity::Blocker,
+    };
+    const MAJOR: Standing = Standing {
+        severity: Severity::Major,
+    };
+    const MINOR: Standing = Standing {
+        severity: Severity::Minor,
+    };
 
     fn verdict(outcome: PassOutcome, fates: &[Fate]) -> Option<PassVerdict> {
         Some(PassVerdict {
@@ -173,9 +166,9 @@ mod tests {
 
     #[test]
     fn a_pass_settles_by_its_stage_its_number_and_its_findings() {
-        use Fate::{Ask, Fix, LastFix, Note, Propose};
+        use Fate::{Fix, LastFix, Note};
         use Stage::{DesignReview, Verify};
-        let cases: [(Stage, u32, &[Standing], Option<PassVerdict>); 13] = [
+        let cases: [(Stage, u32, &[Standing], Option<PassVerdict>); 12] = [
             // Before the last pass: a blocker or a major fixed.
             (DesignReview, 1, &[], verdict(PassOutcome::Passed, &[])),
             (
@@ -189,7 +182,7 @@ mod tests {
             (
                 DesignReview,
                 1,
-                &[MAJOR, MINOR_ON_CRITERION],
+                &[MAJOR, MINOR],
                 verdict(PassOutcome::Revise, &[Fix, Note]),
             ),
             (
@@ -198,12 +191,13 @@ mod tests {
                 &[MINOR, MINOR],
                 verdict(PassOutcome::Passed, &[Note, Note]),
             ),
-            // Design review's last pass: blocker and major asked, minor noted.
+            // Design review's last pass: a blocker or a major goes to the
+            // last revision (OWL-377); a minor is noted.
             (
                 DesignReview,
                 2,
-                &[BLOCKER, MAJOR_ON_CRITERION, MINOR_ON_CRITERION],
-                verdict(PassOutcome::Ask, &[Ask, Ask, Note]),
+                &[BLOCKER, MAJOR, MINOR],
+                verdict(PassOutcome::LastFix, &[LastFix, LastFix, Note]),
             ),
             (
                 DesignReview,
@@ -211,41 +205,30 @@ mod tests {
                 &[MINOR],
                 verdict(PassOutcome::Passed, &[Note]),
             ),
-            // At Verify, minors alone get one last Build, at any pass, one on
-            // a criterion included (OWL-356).
+            // At Verify, minors alone get one last Build, at any pass
+            // (OWL-356).
             (
                 Verify,
                 1,
-                &[MINOR, MINOR_ON_CRITERION],
+                &[MINOR, MINOR],
                 verdict(PassOutcome::LastFix, &[LastFix, LastFix]),
             ),
-            // Verify's last pass: a blocker or a major on a criterion asked,
-            // any other major proposed, a minor given the last fix.
+            // Verify's last pass: every finding goes to the last Build,
+            // none asked nor proposed (OWL-377).
             (
                 Verify,
                 2,
-                &[BLOCKER, MAJOR, MINOR_ON_CRITERION],
-                verdict(PassOutcome::Ask, &[Ask, Propose, LastFix]),
-            ),
-            (
-                Verify,
-                2,
-                &[MAJOR_ON_CRITERION],
-                verdict(PassOutcome::Ask, &[Ask]),
-            ),
-            (
-                Verify,
-                2,
-                &[MAJOR, MINOR],
-                verdict(PassOutcome::LastFix, &[Propose, LastFix]),
+                &[BLOCKER, MAJOR, MINOR],
+                verdict(PassOutcome::LastFix, &[LastFix, LastFix, LastFix]),
             ),
             // The pass an answered round buys is a last one too.
             (
                 Verify,
                 3,
                 &[MAJOR],
-                verdict(PassOutcome::Passed, &[Propose]),
+                verdict(PassOutcome::LastFix, &[LastFix]),
             ),
+            (DesignReview, 3, &[], verdict(PassOutcome::Passed, &[])),
             // Not a review stage.
             (Stage::Build, 1, &[MAJOR], None),
             (Stage::Design, 2, &[], None),
@@ -263,7 +246,6 @@ mod tests {
     fn each_outcome_is_the_machines_event() {
         assert_eq!(PassOutcome::Passed.event(), Event::Completed);
         assert_eq!(PassOutcome::Revise.event(), Event::LoopBack);
-        assert_eq!(PassOutcome::Ask.event(), Event::Questions);
         assert_eq!(PassOutcome::LastFix.event(), Event::LastFix);
     }
 
@@ -291,7 +273,10 @@ mod tests {
                 PassOutcome::Revise.design_review_event(gate),
                 Event::LoopBack
             );
-            assert_eq!(PassOutcome::Ask.design_review_event(gate), Event::Questions);
+            assert_eq!(
+                PassOutcome::LastFix.design_review_event(gate),
+                Event::LastFix
+            );
         }
     }
 }

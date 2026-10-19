@@ -43,10 +43,12 @@ pub const MAX_FIX_PASSES: u32 = 2;
 pub const MAX_REPAIRS: u32 = 6;
 
 /// Review passes at Design review or at Verify before what they leave goes
-/// to the decider: S9's bound (architecture, section 5, "The quality
-/// pipeline"). A confirmed finding of a pass before the last sends the
-/// ticket back to its author; the last pass's residue is asked, listed or
-/// proposed ([`crate::review::settle`]).
+/// to one last run of its author: S9's bound (architecture, section 5, "The
+/// quality pipeline"). A confirmed finding of a pass before the last sends
+/// the ticket back to its author for another pass; what the last pass
+/// leaves goes to its author once more, Design's last revision or Verify's
+/// last fix, with no pass after it, and is listed, never asked (OWL-377,
+/// [`crate::review::settle`]).
 pub const MAX_REVIEW_PASSES: u32 = 2;
 
 /// Whether review pass number `pass` (from 1, as `review.json` numbers
@@ -132,11 +134,11 @@ impl Status {
 /// | The scheduler claimed a ready ticket | `Dispatched` |
 /// | A stage run returned `done`, and the stage passed; at Design review, with the plan gate open ([`TicketState::apply_gated`]) | `Completed` |
 /// | A stage run returned `done` asking for a revision or a fix; a review pass before the last left confirmed findings ([`crate::review::settle`]); at Watch, review comments on the pull request (from P5) | `LoopBack` |
-/// | A stage run returned `questions` or `premise_false` (after the resolver); the last review pass left findings for the decider; a Design review pass passed with the plan gate shut, the approval round (OWL-32) | `Questions` |
+/// | A stage run returned `questions` or `premise_false` (after the resolver); a Design review pass passed with the plan gate shut, the approval round (OWL-32) | `Questions` |
 /// | A Build run asked a `replan`, and a round opens for its questions, the `replan` asked or decided (after the resolver) | `ReplanRound` |
 /// | A Build run asked a `replan`, and the resolver decided every question of the run | `ReplanDecided` |
-/// | The resolver decided every question a Design review or Verify pass left for the decider, its findings or the approval (OWL-342) | `RoundDecided` |
-/// | A Verify pass left only `minor` findings to fix, for one last Build (OWL-356, [`crate::review::PassOutcome::LastFix`]) | `LastFix` |
+/// | The resolver decided every question a Design review or Verify pass left for the decider, its findings or the approval (OWL-342); since OWL-377 the approval only | `RoundDecided` |
+/// | A Verify pass left findings for one last Build, `minor` ones at any pass (OWL-356) or any at a last pass; a last Design review pass left `blocker` or `major` findings for Design's last revision (OWL-377) ([`crate::review::PassOutcome::LastFix`]) | `LastFix` |
 /// | Before delivery, the decider reversed a resolver's plan approval or its decision on a Design review residue finding (OWL-345) | `ReversedToDesign` |
 /// | Before delivery, the decider reversed a resolver's decision on a Verify residue finding (OWL-345) | `ReversedToBuild` |
 /// | A design run answered an approval round `approved`, and the runner kept the approval | `PlanApproved` |
@@ -193,12 +195,17 @@ pub enum Event {
     /// limit or dollar ceiling bounds such rounds in a row. Valid only at
     /// Design review and Verify.
     RoundDecided,
-    /// A Verify pass left only `minor` findings to fix (OWL-356): the ticket
-    /// goes to Build for one last fix, the pass ended and counted as
-    /// [`Event::LoopBack`] ends one. Unlike a loop back, it is valid at a
-    /// last pass: no Verify pass follows that Build, which the runner reads
-    /// from the review record's mark of the last fix, dropped when anything
-    /// else reaches the Build. Valid only at Verify.
+    /// A review pass left findings for one last run of their author, with
+    /// no review pass after it: at Verify, the last fix of OWL-356, to
+    /// Build, `minor` findings at any pass and every finding at a last
+    /// pass; at Design review, Design's last revision of OWL-377, the
+    /// `blocker` and `major` findings of a last pass. The pass is ended and
+    /// counted as [`Event::LoopBack`] ends one; unlike a loop back, it is
+    /// valid at a last pass. No review pass follows that run, which the
+    /// runner reads from the review record (its mark of the last fix, and
+    /// at Design review the pass it keeps for the revision), dropped when
+    /// anything else reaches the run. Valid only at Design review and
+    /// Verify.
     LastFix,
     /// The decider reversed, by replying to its DECISION comment, a decision
     /// the resolver took on the plan's approval or on a Design review
@@ -704,15 +711,13 @@ impl TicketState {
                 let entered = self.enter(Status::Active(pipeline.round_return(stage)));
                 Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
             }
-            // Minors alone left at Verify (OWL-356): one last Build, the pass
-            // counted, at a last pass too.
-            (Status::Active(Stage::Verify), Event::LastFix) => {
-                let target = pipeline.loop_back(Stage::Verify).ok_or(invalid)?;
+            // One last run of the author, the pass counted, at a last pass
+            // too: Verify's last fix (OWL-356), Design's last revision
+            // (OWL-377).
+            (Status::Active(stage @ (Stage::DesignReview | Stage::Verify)), Event::LastFix) => {
+                let target = pipeline.loop_back(stage).ok_or(invalid)?;
                 let entered = self.enter(Status::Active(target));
-                Transition::To(
-                    self.end_review_pass(Stage::Verify, entered)
-                        .ok_or(invalid)?,
-                )
+                Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
             }
             // A decider's reply reversed a resolver's approval or residue
             // decision before delivery (OWL-345): back to the author stage,
@@ -1142,7 +1147,7 @@ mod tests {
                 Expect::To(Status::NeedsInput { return_to: Design })
             }
             (Status::Active(Build), Event::ReplanDecided) => Expect::To(Status::Active(Design)),
-            (Status::Active(DesignReview), Event::RoundDecided) => {
+            (Status::Active(DesignReview), Event::RoundDecided | Event::LastFix) => {
                 Expect::To(Status::Active(Design))
             }
             (Status::Active(Verify), Event::RoundDecided | Event::LastFix) => {
@@ -1834,9 +1839,10 @@ mod tests {
         (state.status(), state.review_passes())
     }
 
-    /// Two passes, the first sending the plan back; the second's residue
-    /// asked; the answer buys one more pass, itself last; passing leaves the
-    /// loop and resets the count.
+    /// Two passes, the first sending the plan back; the second's findings
+    /// go to the last revision (OWL-377), or a round opens, whose answer
+    /// buys one more pass, itself last; passing leaves the loop and resets
+    /// the count.
     #[test]
     fn design_review_counts_passes_to_the_bound_and_each_answered_round_buys_one() {
         use Event::{Answered, Completed, LoopBack, Questions};
@@ -1846,6 +1852,27 @@ mod tests {
         assert_eq!(second.review_pass_due(), 2);
         assert!(is_last_review_pass(second.review_pass_due()));
         assert!(second.apply(STANDARD, LoopBack).is_err());
+        // What the last pass leaves goes to Design's last revision, the
+        // pass counted (OWL-377); its approval round then counts the
+        // revision's pass, which the runner keeps with no reviewer.
+        let revised = walk(second, STANDARD, &[Event::LastFix]);
+        assert_eq!(at(revised), (Status::Active(Stage::Design), 2));
+        let revision = walk(revised, STANDARD, &[Completed]);
+        assert_eq!(at(revision), (Status::Active(Stage::DesignReview), 2));
+        assert_eq!(
+            at(walk(revision, STANDARD, &[Questions])),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Design
+                },
+                3
+            )
+        );
+        assert_eq!(
+            at(walk(design, STANDARD, &[Completed, Event::LastFix])),
+            (Status::Active(Stage::Design), 1),
+            "valid before the last pass too"
+        );
 
         let asked = walk(second, STANDARD, &[Questions]);
         assert_eq!(
