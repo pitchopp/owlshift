@@ -344,7 +344,6 @@ impl OnDemand<'_> {
             pass,
             findings,
             verdict,
-            questions,
             last_run,
             cost,
             mut review,
@@ -383,7 +382,7 @@ impl OnDemand<'_> {
             }
             PassOutcome::Ask => {
                 let (asked, asked_findings): (Vec<Question>, Vec<(QuestionId, FindingId)>) =
-                    questions
+                    design::residue_questions(&findings, Stage::Verify, None)
                         .into_iter()
                         .map(|(question, finding)| {
                             let id = question.id.clone();

@@ -413,11 +413,7 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
     );
     assert!(question.text.ends_with("How should the change settle it?"));
     assert_eq!(question.options[1].label, "Leave the change as it is");
-    assert!(
-        question
-            .context
-            .contains("Finding F1 of verify pass 2, a blocker")
-    );
+    assert!(question.context.starts_with("Finding F1 · blocker · "));
     let resolver = bench.last_of(Role::Resolver);
     let asked = resolver.asked_by.as_ref().unwrap();
     assert_eq!(asked.role, Role::Verify);
