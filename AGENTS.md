@@ -37,6 +37,7 @@ curl -s https://api.linear.app/graphql -H "Authorization: $KEY" -H "Content-Type
 | Todo | `50be5363-4cce-4989-9ba9-970c23db5093` | Ready to work, once its blockers are done |
 | In Progress | `23e8c0a5-dc85-451f-9488-d6227ae8ffb6` | Being worked |
 | Needs Input | `9a51b9b2-2efd-4f14-a965-62e1c22a7585` | Waiting on the maintainer's answer to questions posted on the issue |
+| Parked | `4d11e120-79d3-4747-b962-5ef1dc23dcf9` | Owlshift stopped the ticket; only a person's `owlshift continue` restarts it, an answer alone does not |
 | In Review | `c00d199b-cd25-4ffc-a3cb-cf03f3bb8c5e` | A pull request is open |
 | Done | `76f46edb-f965-4373-a668-b4a9c1eb1bae` | Merged into `main` |
 | Canceled | `50b565a1-0340-4678-9a34-6c5d44ff6be2` | Dropped |
