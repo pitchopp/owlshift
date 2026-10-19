@@ -27,6 +27,17 @@
     "plan": {
       "$ref": "#/$defs/Plan"
     },
+    "published": {
+      "description": "The plan as last published in the ticket's document (OWL-350), once\none was: kept across the plans of later design runs, so that each\nPLAN comment updates the same document and says what changed.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PublishedPlan"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "text_sha256": {
       "description": "The SHA-256 of the ticket's title, a NUL byte and its description,\nas 64 lowercase hexadecimal digits, as `intake.json` keeps it.",
       "type": "string",
@@ -180,6 +191,83 @@
         "steps"
       ]
     },
+    "PlanChange": {
+      "description": "What a PLAN comment says of its plan beside the version before\n(OWL-350).",
+      "oneOf": [
+        {
+          "description": "The ticket's first published plan.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "first"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "A new version: these parts differ from version `since`'s.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "changed"
+            },
+            "parts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PlanPart"
+              },
+              "maxItems": 9,
+              "minItems": 1
+            },
+            "since": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "since",
+            "parts"
+          ]
+        },
+        {
+          "description": "The plan published again unchanged, after a later pass.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unchanged"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PlanPart": {
+      "description": "A part of a [`Plan`], in the plan's order (OWL-350): what the PLAN\ncomment names when it says what changed since the previous version.",
+      "type": "string",
+      "enum": [
+        "goal",
+        "criteria",
+        "approach",
+        "steps",
+        "forks",
+        "alternatives",
+        "files",
+        "risks",
+        "out_of_scope"
+      ]
+    },
     "PlanStep": {
       "description": "One step of a plan.",
       "type": "object",
@@ -196,6 +284,63 @@
       "required": [
         "what",
         "test"
+      ]
+    },
+    "PublishedPlan": {
+      "description": "The plan as last published in the ticket's document (OWL-350,\narchitecture section 5, \"Kept and shown\"), and what its PLAN comment\ntold. The approval never reads it: it binds the plan of [`TicketPlan`].",
+      "type": "object",
+      "properties": {
+        "change": {
+          "description": "What its PLAN comment said changed.",
+          "$ref": "#/$defs/PlanChange"
+        },
+        "document": {
+          "description": "The tracker's identifier of the document, which the next PLAN\ncomment updates.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "parts": {
+          "description": "The SHA-256 of each part's [`Plan::part_canonical`] text, in\n[`PlanPart::ALL`]'s order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 9,
+          "minItems": 9
+        },
+        "pass": {
+          "description": "The Design review pass whose end published it.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "plan_sha256": {
+          "description": "The SHA-256 of the published plan's [`Plan::canonical`] text.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "url": {
+          "description": "Where a person opens it, as the tracker gave it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "The plan's version, from 1: one more each time a published plan's\nhash differs from the one before.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "document",
+        "version",
+        "pass",
+        "plan_sha256",
+        "parts",
+        "change"
       ]
     }
   }

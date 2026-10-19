@@ -41,6 +41,8 @@ use std::num::NonZeroU32;
 
 use sha2::{Digest, Sha256};
 
+use owlshift_adapters::tracker;
+
 use owlshift_contracts::brief::{GivenDiff, GivenFindings, GivenPlan, ReviewBrief};
 use owlshift_contracts::config::FindingsConfirmation;
 use owlshift_contracts::ids::FindingId;
@@ -50,7 +52,8 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{
     Finding, FindingOutcome, FindingsMode, KeptApproval, KeptFinding, KeptResponse, KeptRuling,
-    Plan, ResponseOutcome, ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan, TicketReview,
+    Plan, PlanChange, PlanPart, PublishedPlan, ResponseOutcome, ReviewPass, Reviewer,
+    RulingOutcome, Severity, TicketPlan, TicketReview,
 };
 use owlshift_core::review::{Fate, PassOutcome, PassVerdict, Standing, settle};
 use owlshift_core::roster;
@@ -59,7 +62,9 @@ use owlshift_core::vocab::Harness as HarnessKind;
 
 use super::*;
 use crate::ticket_ref::text_sha256;
-use crate::writer::{PlanComment, PlanNext, PlanReviewer};
+use crate::writer::{
+    DocumentPass, PlanComment, PlanDocument, PlanNext, PlanPointer, PlanReviewer, WriteError,
+};
 
 /// The category of the plan-approval question (architecture section 5,
 /// "Plan approval"): through the resolver under `on-fork`, the decider's
@@ -326,6 +331,31 @@ pub(crate) fn pass_findings(
 /// The findings the loop's Design review passes before `pass` rejected,
 /// oldest pass first, each with its pass: the passes that end `review`
 /// before its last one, `pass` itself, back to the loop's pass 1.
+/// The Design review passes of the loop that `pass` ends, oldest first, as
+/// the review record keeps them, `pass` included: the plan's document logs
+/// them (OWL-350).
+fn loop_passes(review: &TicketReview, pass: u32) -> Vec<&ReviewPass> {
+    let mut passes: Vec<&ReviewPass> = Vec::new();
+    let mut expected = pass;
+    for kept in review.passes.iter().rev() {
+        if expected == 0 || kept.stage != Stage::DesignReview || kept.pass.get() != expected {
+            break;
+        }
+        passes.push(kept);
+        expected -= 1;
+    }
+    passes.reverse();
+    passes
+}
+
+/// The SHA-256 of `text`, in lowercase hex.
+fn sha256_hex(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub(crate) fn earlier_rejected(review: &TicketReview, pass: u32) -> Vec<(u32, KeptFinding)> {
     let mut passes: Vec<&ReviewPass> = Vec::new();
     let mut expected = pass;
@@ -465,10 +495,11 @@ pub(crate) fn approval_question(plan: &Plan) -> Question {
     let question = |options: Vec<String>| Question {
         id: QuestionId::nth(1),
         category: APPROVAL_CATEGORY.to_owned(),
-        context: "The plan of this ticket passed its design review. The PLAN comment above holds \
-                  it whole, with its forks and the findings its reviewers left."
+        context: "The plan of this ticket passed its design review. The PLAN comment above shows \
+                  it whole, or links to the plan's document, with its forks and the findings its \
+                  reviewers left."
             .to_owned(),
-        text: "Do you approve the plan of the PLAN comment as it is, or change it, such as \
+        text: "Do you approve the plan the PLAN comment shows as it is, or change it, such as \
                choosing a fork otherwise?"
             .to_owned(),
         options: options.into_iter().map(QuestionOption::new).collect(),
@@ -498,8 +529,9 @@ pub(crate) fn approval_question(plan: &Plan) -> Question {
     }
     let mut options = vec![APPROVE.to_owned()];
     options.extend(
-        (1..=plan.forks.len())
-            .map(|n| format!("Change fork {n}: its options are in the PLAN comment")),
+        (1..=plan.forks.len()).map(|n| {
+            format!("Change fork {n}: its options are in the plan the PLAN comment shows")
+        }),
     );
     let per_fork = question(options);
     if weight(&per_fork) <= budget {
@@ -1161,6 +1193,8 @@ impl OnDemand<'_> {
             base: base.clone(),
             // A plan a design run writes starts unapproved (OWL-32).
             approval: None,
+            // Its document stays the ticket's (OWL-350).
+            published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
         };
         let sha = plan_sha256(&kept.plan);
         let forks = kept.plan.forks.len();
@@ -1426,7 +1460,7 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<TicketState, Stop> {
         let ticket = p.ticket.clone();
-        let kept = p.plan.clone().ok_or_else(|| {
+        let mut kept = p.plan.clone().ok_or_else(|| {
             Stop::Refused(format!(
                 "{ticket} is at design review but its ref keeps no plan: `owlshift forget \
                  {ticket}` starts its record over"
@@ -1500,9 +1534,20 @@ impl OnDemand<'_> {
             },
             run: last_run.clone(),
         };
-        let posted = Writer::new(self.tracker)
-            .post_plan(&comment)
-            .map_err(|e| refused("posting the PLAN comment on the ticket", e))?;
+        // On a tracker with documents, the plan goes in the ticket's document
+        // and the comment points to it (OWL-350).
+        let posted = if self
+            .tracker
+            .capabilities()
+            .contains(&tracker::Capability::Documents)
+        {
+            let pointer = self.publish_plan(p, &state, &comment, &review, sink)?;
+            kept.published = p.plan.as_ref().and_then(|plan| plan.published.clone());
+            Writer::new(self.tracker).post_plan_pointer(&pointer)
+        } else {
+            Writer::new(self.tracker).post_plan(&comment)
+        }
+        .map_err(|e| refused("posting the PLAN comment on the ticket", e))?;
         sink.emit(
             &ticket,
             last_run.as_deref(),
@@ -1529,7 +1574,7 @@ impl OnDemand<'_> {
             (
                 format!(
                     "The plan passed design review pass {pass} and waits for your approval: \
-                         the PLAN comment above holds it."
+                         the PLAN comment above shows it."
                 ),
                 vec![approval_question(&kept.plan)],
                 Vec::new(),
@@ -1545,8 +1590,8 @@ impl OnDemand<'_> {
             (
                 format!(
                     "Design review pass {pass} left findings that the plan's revisions did \
-                         not settle: each is a question below, and the PLAN comment above lists \
-                         them with the plan."
+                         not settle: each is a question below, and the plan the PLAN comment \
+                         above shows lists them."
                 ),
                 asked,
                 findings,
@@ -1628,6 +1673,139 @@ impl OnDemand<'_> {
                 ))
             }
         }
+    }
+
+    /// Publishes the plan of `comment` in the ticket's document (OWL-350,
+    /// architecture section 5, "Kept and shown") and returns the PLAN
+    /// comment that points to it. The ticket's [`PublishedPlan`] says which
+    /// document and version: a plan whose hash is the published one keeps
+    /// its version, and, at the same pass, a `continue` running the pass
+    /// again, the whole record; another plan is the next version, its
+    /// changed parts named. A document the tracker no longer shows is made
+    /// again. A document just made is kept in the ref at once, before the
+    /// comment, so a comment that cannot be posted never leaves a second
+    /// one: the state is as the ref keeps it, every change of it in the pass
+    /// being kept when made, and the review record does not take the pass
+    /// yet, so `continue` runs it again. `p.plan` keeps the new record.
+    fn publish_plan(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        comment: &PlanComment,
+        review: &TicketReview,
+        sink: &mut EventSink<'_>,
+    ) -> Result<PlanPointer, Stop> {
+        let ticket = p.ticket.clone();
+        let kept = p
+            .plan
+            .as_ref()
+            .ok_or_else(|| Stop::Refused(format!("{ticket} has no plan to publish")))?;
+        let pass = NonZeroU32::new(comment.pass)
+            .ok_or_else(|| Stop::Refused("a review pass numbered 0".to_owned()))?;
+        let plan_sha256 = plan_sha256(&kept.plan);
+        let parts: Vec<String> = PlanPart::ALL
+            .iter()
+            .map(|part| sha256_hex(&kept.plan.part_canonical(*part)))
+            .collect();
+        let prior = kept.published.clone();
+        let (version, change) = match &prior {
+            None => (NonZeroU32::MIN, PlanChange::First),
+            Some(prior) if prior.plan_sha256 == plan_sha256 && prior.pass == pass => {
+                (prior.version, prior.change.clone())
+            }
+            Some(prior) if prior.plan_sha256 == plan_sha256 => {
+                (prior.version, PlanChange::Unchanged)
+            }
+            Some(prior) => {
+                let changed: Vec<PlanPart> = PlanPart::ALL
+                    .iter()
+                    .zip(&parts)
+                    .zip(&prior.parts)
+                    .filter(|((_, now), then)| now != then)
+                    .map(|((part, _), _)| *part)
+                    .collect();
+                let next = prior.version.checked_add(1).ok_or_else(|| {
+                    Stop::Refused(format!("{ticket}'s plan has no version number left"))
+                })?;
+                let change = if changed.is_empty() {
+                    PlanChange::Unchanged
+                } else {
+                    PlanChange::Changed {
+                        since: prior.version,
+                        parts: changed,
+                    }
+                };
+                (next, change)
+            }
+        };
+        let document = PlanDocument {
+            ticket: ticket.clone(),
+            plan: kept.plan.clone(),
+            version: version.get(),
+            passes: loop_passes(review, comment.pass)
+                .into_iter()
+                .map(|kept| DocumentPass {
+                    pass: kept.pass.get(),
+                    reviewers: kept.reviewers.iter().map(PlanReviewer::from).collect(),
+                    findings: kept.findings.clone(),
+                })
+                .collect(),
+            not_asked: comment.not_asked.clone(),
+        };
+        let writer = Writer::new(self.tracker);
+        let existing = prior.as_ref().map(|prior| prior.document.as_str());
+        let published = match writer.publish_plan(existing, &document) {
+            Err(WriteError::Tracker(e))
+                if existing.is_some() && e.kind == tracker::ErrorKind::NotFound =>
+            {
+                // A person deleted it: the plan gets a document again.
+                writer.publish_plan(None, &document)
+            }
+            other => other,
+        }
+        .map_err(|e| refused("publishing the plan's document on the ticket", e))?;
+        let made = existing != Some(published.id.as_str());
+        let record = PublishedPlan {
+            document: published.id.clone(),
+            url: published.url.clone(),
+            version,
+            pass,
+            plan_sha256,
+            parts,
+            change: change.clone(),
+        };
+        if let Some(plan) = p.plan.as_mut() {
+            plan.published = Some(record);
+        }
+        sink.emit(
+            &ticket,
+            comment.run.as_deref(),
+            EventKind::TrackerWrite,
+            data([
+                ("target", json!("tracker")),
+                ("action", json!("document")),
+                ("kind", json!("PLAN")),
+                ("document", json!(published.id)),
+                ("made", json!(made)),
+                ("version", json!(version.get())),
+            ]),
+        );
+        if made {
+            let questions = p.questions();
+            self.store(p, state, questions)
+                .map_err(|e| refused("keeping the plan's document in the ticket's ref", e))?;
+        }
+        Ok(PlanPointer {
+            ticket,
+            version: version.get(),
+            pass: comment.pass,
+            url: published.url,
+            change,
+            forks: comment.plan.forks.len(),
+            open: comment.open_findings(),
+            next: comment.next,
+            run: comment.run.clone(),
+        })
     }
 
     /// The plan the resolver approved (OWL-342, option A of the approval

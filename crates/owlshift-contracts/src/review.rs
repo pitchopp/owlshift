@@ -61,6 +61,37 @@ pub struct Plan {
     pub forks: Vec<Fork>,
 }
 
+/// A part of a [`Plan`], in the plan's order (OWL-350): what the PLAN
+/// comment names when it says what changed since the previous version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPart {
+    Goal,
+    Criteria,
+    Approach,
+    Steps,
+    Forks,
+    Alternatives,
+    Files,
+    Risks,
+    OutOfScope,
+}
+
+impl PlanPart {
+    /// Every part, in the plan's order.
+    pub const ALL: [Self; 9] = [
+        Self::Goal,
+        Self::Criteria,
+        Self::Approach,
+        Self::Steps,
+        Self::Forks,
+        Self::Alternatives,
+        Self::Files,
+        Self::Risks,
+        Self::OutOfScope,
+    ];
+}
+
 /// An approach the plan set aside.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -95,6 +126,25 @@ impl Plan {
     /// ([`KeptApproval::plan_sha256`]).
     pub fn canonical(&self) -> String {
         serde_json::to_string(self).expect("a plan always serializes to JSON")
+    }
+
+    /// One part of the plan as compact JSON: the text whose SHA-256 a
+    /// [`PublishedPlan`] keeps, to tell which parts a later plan changed.
+    pub fn part_canonical(&self, part: PlanPart) -> String {
+        fn json<T: Serialize + ?Sized>(value: &T) -> String {
+            serde_json::to_string(value).expect("a plan's part always serializes to JSON")
+        }
+        match part {
+            PlanPart::Goal => json(&self.goal),
+            PlanPart::Criteria => json(&self.criteria),
+            PlanPart::Approach => json(&self.approach),
+            PlanPart::Steps => json(&self.steps),
+            PlanPart::Forks => json(&self.forks),
+            PlanPart::Alternatives => json(&self.alternatives),
+            PlanPart::Files => json(&self.files),
+            PlanPart::Risks => json(&self.risks),
+            PlanPart::OutOfScope => json(&self.out_of_scope),
+        }
     }
 
     /// Checks the rules the types do not carry: a criterion and a step at
@@ -350,6 +400,57 @@ pub struct TicketPlan {
     /// The decider's approval, once given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<KeptApproval>,
+    /// The plan as last published in the ticket's document (OWL-350), once
+    /// one was: kept across the plans of later design runs, so that each
+    /// PLAN comment updates the same document and says what changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<PublishedPlan>,
+}
+
+/// The plan as last published in the ticket's document (OWL-350,
+/// architecture section 5, "Kept and shown"), and what its PLAN comment
+/// told. The approval never reads it: it binds the plan of [`TicketPlan`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedPlan {
+    /// The tracker's identifier of the document, which the next PLAN
+    /// comment updates.
+    #[schemars(regex(pattern = r"\S"))]
+    pub document: String,
+    /// Where a person opens it, as the tracker gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The plan's version, from 1: one more each time a published plan's
+    /// hash differs from the one before.
+    pub version: NonZeroU32,
+    /// The Design review pass whose end published it.
+    pub pass: NonZeroU32,
+    /// The SHA-256 of the published plan's [`Plan::canonical`] text.
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub plan_sha256: String,
+    /// The SHA-256 of each part's [`Plan::part_canonical`] text, in
+    /// [`PlanPart::ALL`]'s order.
+    #[schemars(length(min = 9, max = 9))]
+    pub parts: Vec<String>,
+    /// What its PLAN comment said changed.
+    pub change: PlanChange,
+}
+
+/// What a PLAN comment says of its plan beside the version before
+/// (OWL-350).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlanChange {
+    /// The ticket's first published plan.
+    First,
+    /// A new version: these parts differ from version `since`'s.
+    Changed {
+        since: NonZeroU32,
+        #[schemars(length(min = 1, max = 9))]
+        parts: Vec<PlanPart>,
+    },
+    /// The plan published again unchanged, after a later pass.
+    Unchanged,
 }
 
 /// The decider's approval of a plan.
@@ -408,7 +509,56 @@ impl TicketPlan {
                 ));
             }
         }
+        if let Some(published) = &self.published {
+            published.check().map_err(|reason| {
+                ContractError::invalid(Self::CONTRACT, format!("published: {reason}"))
+            })?;
+        }
         Ok(())
+    }
+}
+
+impl PublishedPlan {
+    /// The rules the types do not carry: a document named exactly, the
+    /// hashes in lowercase hex, one per part, and a change that names parts
+    /// once each and an earlier version.
+    fn check(&self) -> Result<(), String> {
+        if let Err(broken) = check_name(&self.document) {
+            return Err(format!("document {:?} {broken}", self.document));
+        }
+        if !is_lower_hex(&self.plan_sha256, 64) {
+            return Err(format!(
+                "plan_sha256 {:?} is not a SHA-256 in lowercase hex",
+                self.plan_sha256
+            ));
+        }
+        if self.parts.len() != PlanPart::ALL.len()
+            || !self.parts.iter().all(|h| is_lower_hex(h, 64))
+        {
+            return Err(format!(
+                "parts must be {} SHA-256 in lowercase hex",
+                PlanPart::ALL.len()
+            ));
+        }
+        match &self.change {
+            PlanChange::First if self.version.get() != 1 => {
+                Err(format!("version {} is not a first one", self.version))
+            }
+            PlanChange::Changed { since, parts } => {
+                if *since >= self.version {
+                    return Err(format!("version {} changed since {since}", self.version));
+                }
+                let once = parts
+                    .iter()
+                    .enumerate()
+                    .all(|(i, part)| !parts[..i].contains(part));
+                if parts.is_empty() || !once {
+                    return Err("a change names its parts, once each".to_owned());
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -807,7 +957,13 @@ mod tests {
             "plan": plan(),
             "text_sha256": "a".repeat(64),
             "base": "b".repeat(40),
-            "approval": { "comment": "c-1", "plan_sha256": "d".repeat(64) }
+            "approval": { "comment": "c-1", "plan_sha256": "d".repeat(64) },
+            "published": {
+                "document": "doc-1", "url": "https://linear.app/o/document/plan-1",
+                "version": 2, "pass": 1, "plan_sha256": "e".repeat(64),
+                "parts": vec!["f".repeat(64); 9],
+                "change": { "kind": "changed", "since": 1, "parts": ["steps", "out_of_scope"] }
+            }
         })
     }
 
@@ -912,7 +1068,36 @@ mod tests {
                 ),
                 (&|d| d["plan"]["extra"] = 1.into(), "unknown field"),
                 (&|d| d["format"] = 2.into(), "upgrade Owlshift"),
+                (&|d| d["published"]["document"] = "".into(), "is blank"),
+                (
+                    &|d| d["published"]["parts"] = json!(["f"]),
+                    "parts must be 9",
+                ),
+                (
+                    &|d| d["published"]["change"]["since"] = 2.into(),
+                    "version 2 changed since 2",
+                ),
+                (
+                    &|d| d["published"]["change"]["parts"] = json!(["goal", "goal"]),
+                    "once each",
+                ),
+                (
+                    &|d| d["published"]["change"] = json!({ "kind": "first" }),
+                    "not a first one",
+                ),
             ],
+        );
+        // A plan published unchanged, and one never published.
+        let mut unchanged = ticket_plan();
+        unchanged["published"]["change"] = json!({ "kind": "unchanged" });
+        TicketPlan::parse(&unchanged.to_string()).unwrap();
+        let mut never = ticket_plan();
+        never.as_object_mut().unwrap().remove("published");
+        assert!(
+            !TicketPlan::parse(&never.to_string())
+                .unwrap()
+                .render()
+                .contains("published")
         );
     }
 

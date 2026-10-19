@@ -13,6 +13,9 @@ use crate::vocab::DelegationLevel;
 pub enum Action {
     /// Post or edit a marked comment on the ticket.
     Comment,
+    /// Create or update a document attached to the ticket: its plan
+    /// (OWL-350, architecture section 5, "Kept and shown").
+    Document,
     /// Move the ticket's visible stage on the tracker.
     SetVisibleStage,
     /// Propose a follow-up in the tracker's triage inbox.
@@ -54,6 +57,7 @@ pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), Floor
             HumanApproval::Absent => Err(FloorViolation::Unapproved(action)),
         },
         Action::Comment
+        | Action::Document
         | Action::SetVisibleStage
         | Action::ProposeFollowup
         | Action::PushBranch
@@ -327,6 +331,7 @@ mod tests {
     fn the_other_writer_actions_pass() {
         let actions = [
             Action::Comment,
+            Action::Document,
             Action::SetVisibleStage,
             Action::ProposeFollowup,
             Action::PushBranch,

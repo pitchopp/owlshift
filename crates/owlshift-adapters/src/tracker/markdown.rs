@@ -20,6 +20,9 @@
 //! a follow-up is filed as a new ticket folder after the parent's key's
 //! highest number, authored [`MarkdownTracker::AGENT`], `related` to its
 //! parent and, when it needs the parent's code, `blocked_by` it.
+//!
+//! A ticket's documents (OWL-350) are files `documents/<n>.md` in its
+//! folder, `n` from 1, each opening with its title as a `# ` line.
 
 use std::fmt;
 use std::fs;
@@ -360,6 +363,72 @@ impl MarkdownTracker {
         Ok(id)
     }
 
+    /// Writes a document of ticket `id` (OWL-350): with `document` `None`, a
+    /// new file `documents/<n>.md` in its folder, `n` one past the highest
+    /// there, claimed by creating it, as a proposal's folder is; otherwise
+    /// the file of that number, which must be there, written over. Either
+    /// way the file is `title` on a `# ` line, flattened to one, a blank
+    /// line, then `content`. Returns the document's number. A ticket that is
+    /// not there, or a number that is not one, is refused before anything
+    /// is written.
+    pub fn publish_document(
+        &self,
+        id: &TicketId,
+        document: Option<&str>,
+        title: &str,
+        content: &str,
+    ) -> Result<String, TrackerError> {
+        let ticket = self.ticket_file(id);
+        if !ticket.is_file() {
+            return Err(error(&ticket, "no such ticket"));
+        }
+        let dir = self.documents_dir(id);
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let text = format!("# {title}\n\n{content}");
+        if let Some(document) = document {
+            let path = dir.join(format!("{document}.md"));
+            if document_number(document).is_none() || !path.is_file() {
+                return Err(error(&path, "no such document"));
+            }
+            fs::write(&path, text).map_err(|e| error(&path, e))?;
+            return Ok(document.to_owned());
+        }
+        fs::create_dir_all(&dir).map_err(|e| error(&dir, e))?;
+        let highest = fs::read_dir(&dir)
+            .map_err(|e| error(&dir, e))?
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                document_number(name.strip_suffix(".md")?)
+            })
+            .max()
+            .unwrap_or(0);
+        for n in (highest + 1..).take(CLAIM_TRIES as usize) {
+            let path = dir.join(format!("{n}.md"));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(text.as_bytes())
+                        .map_err(|e| error(&path, e))?;
+                    return Ok(n.to_string());
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(error(&path, e)),
+            }
+        }
+        Err(error(
+            &dir,
+            format!("no free document number among the {CLAIM_TRIES} after {highest}"),
+        ))
+    }
+
+    /// Where a document of ticket `id` is, from the repository's root.
+    pub fn document_path(id: &TicketId, document: &str) -> String {
+        format!("tickets/{id}/documents/{document}.md")
+    }
+
     /// Creates the first free folder `<key>-<n>` for `n` past `after`,
     /// trying at most `tries` numbers, and returns its identifier and path.
     fn claim(
@@ -466,6 +535,18 @@ impl MarkdownTracker {
     fn comments_dir(&self, id: &TicketId) -> PathBuf {
         self.tickets.join(id.as_str()).join("comments")
     }
+
+    fn documents_dir(&self, id: &TicketId) -> PathBuf {
+        self.tickets.join(id.as_str()).join("documents")
+    }
+}
+
+/// The number a document's name gives: ASCII digits without a leading zero.
+fn document_number(name: &str) -> Option<u64> {
+    if name.is_empty() || name.starts_with('0') || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    name.parse().ok()
 }
 
 /// The runner's side of the Markdown tracker. The inherent methods above
@@ -616,6 +697,47 @@ impl shared::Tracker for MarkdownTracker {
         })
     }
 
+    /// The file `documents/<n>.md` of the ticket's folder
+    /// ([`MarkdownTracker::publish_document`]), its path from the
+    /// repository's root as its link. A document that is not there is
+    /// [`ErrorKind::NotFound`], as is a ticket that is not.
+    fn publish_document(
+        &self,
+        id: &TicketId,
+        document: Option<&str>,
+        title: &str,
+        content: &str,
+    ) -> Result<shared::Document, shared::Error> {
+        self.require_ticket(id)?;
+        if let Some(document) = document
+            && (document_number(document).is_none()
+                || !self
+                    .documents_dir(id)
+                    .join(format!("{document}.md"))
+                    .is_file())
+        {
+            return Err(shared::Error::new(
+                ErrorKind::NotFound,
+                format!("{id} has no document {document:?}"),
+            ));
+        }
+        if content.chars().count() > shared::MAX_DOCUMENT_CHARS {
+            return Err(shared::Error::new(
+                ErrorKind::Other,
+                format!(
+                    "a document of {id} holds at most {} characters",
+                    shared::MAX_DOCUMENT_CHARS
+                ),
+            ));
+        }
+        let number =
+            MarkdownTracker::publish_document(self, id, document, title, content).map_err(other)?;
+        Ok(shared::Document {
+            url: Some(Self::document_path(id, &number)),
+            id: number,
+        })
+    }
+
     /// Every ticket of `tickets/` not at the stage `Done` whose title is
     /// `title` once both are lowercased, or whose description contains
     /// `marker`, in folder order. Unicode's lowercasing, wider than the
@@ -662,6 +784,7 @@ impl MarkdownTracker {
         Capability::VisibleStage,
         Capability::BlockedBy,
         Capability::ProposalsInbox,
+        Capability::Documents,
     ];
 
     /// The author of the comments the runner posts, and of the proposals it
@@ -1649,5 +1772,39 @@ mod tests {
         ] {
             assert_eq!(numbered(&TicketId::new(id).unwrap()), read, "{id}");
         }
+    }
+
+    /// A ticket's first document is `documents/1.md`, its title on a first
+    /// line; an update writes that file over and a second document is
+    /// `2.md`. The comments ignore the folder. An unknown document, a number
+    /// that is not one, and a ticket that is not there are not found
+    /// (OWL-350).
+    #[test]
+    fn a_document_is_a_file_of_the_ticket_written_over_in_place() {
+        let (root, tracker, _) = repository(TICKET);
+        let publish = |id: &TicketId, document, title, content| {
+            shared::Tracker::publish_document(&tracker, id, document, title, content)
+        };
+        let made = publish(&id(), None, "Plan ·\nDEMO-1", "v1").unwrap();
+        assert_eq!(made.id, "1");
+        assert_eq!(made.url.as_deref(), Some("tickets/DEMO-1/documents/1.md"));
+        let file = root.path().join(made.url.as_deref().unwrap());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "# Plan · DEMO-1\n\nv1");
+        let updated = publish(&id(), Some("1"), "Plan · DEMO-1", "v2").unwrap();
+        assert_eq!(updated, made);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "# Plan · DEMO-1\n\nv2");
+        let second = publish(&id(), None, "Notes", "n").unwrap();
+        assert_eq!(second.id, "2");
+        assert!(
+            shared::Tracker::comments(&tracker, &id())
+                .unwrap()
+                .is_empty()
+        );
+        for document in ["3", "../1", "01", ""] {
+            let error = publish(&id(), Some(document), "t", "x").unwrap_err();
+            assert_eq!(error.kind, ErrorKind::NotFound, "{document:?}");
+        }
+        let error = publish(&TicketId::new("DEMO-9").unwrap(), None, "t", "x").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotFound);
     }
 }

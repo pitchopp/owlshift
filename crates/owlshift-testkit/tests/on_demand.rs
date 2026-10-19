@@ -443,6 +443,7 @@ const WITHOUT_INBOX: &[Capability] = &[
     Capability::Comments,
     Capability::VisibleStage,
     Capability::BlockedBy,
+    Capability::Documents,
 ];
 
 /// [`WITHOUT_INBOX`] is the Markdown tracker's list less the inbox alone.
@@ -515,6 +516,16 @@ impl Tracker for Clocked<'_> {
 
     fn ticket(&self, id: &TicketId) -> Result<Ticket, tracker::Error> {
         Tracker::ticket(&self.inner, id)
+    }
+
+    fn publish_document(
+        &self,
+        id: &TicketId,
+        document: Option<&str>,
+        title: &str,
+        content: &str,
+    ) -> Result<tracker::Document, tracker::Error> {
+        Tracker::publish_document(&self.inner, id, document, title, content)
     }
 
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, tracker::Error> {
