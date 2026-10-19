@@ -55,10 +55,13 @@ pub enum MarkerKind {
     /// The plan of a ticket's design run once its review passes end, with
     /// the findings left and the reviewers that ran (OWL-303).
     Plan,
+    /// The ticket waits for its project's quarantine to be cleared on the
+    /// runner's machine: told once per quarantine (OWL-368).
+    Waiting,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -68,6 +71,7 @@ impl MarkerKind {
         Self::Reply,
         Self::Intake,
         Self::Plan,
+        Self::Waiting,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -81,6 +85,7 @@ impl MarkerKind {
             Self::Reply => "REPLY",
             Self::Intake => "INTAKE",
             Self::Plan => "PLAN",
+            Self::Waiting => "WAITING",
         }
     }
 

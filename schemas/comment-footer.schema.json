@@ -86,6 +86,11 @@
           "description": "The plan of a ticket's design run once its review passes end, with\nthe findings left and the reviewers that ran (OWL-303).",
           "type": "string",
           "const": "PLAN"
+        },
+        {
+          "description": "The ticket waits for its project's quarantine to be cleared on the\nrunner's machine: told once per quarantine (OWL-368).",
+          "type": "string",
+          "const": "WAITING"
         }
       ]
     },
