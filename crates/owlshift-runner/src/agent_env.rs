@@ -327,6 +327,7 @@ impl AgentEnv {
             readable,
             writable,
             protected,
+            reopened: Vec::new(),
             hidden,
             temp: run.temp.iter().cloned().collect(),
             links,
