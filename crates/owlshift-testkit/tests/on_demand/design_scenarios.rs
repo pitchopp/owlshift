@@ -6,7 +6,9 @@
 
 use owlshift_contracts::BasisKind;
 use owlshift_contracts::comment::MarkedComment;
-use owlshift_contracts::review::{FindingOutcome, FindingsMode, Mandate, ResponseOutcome};
+use owlshift_contracts::review::{
+    FindingOutcome, FindingsMode, Mandate, PlanPart, ResponseOutcome,
+};
 use owlshift_core::vocab::Harness as HarnessKind;
 use owlshift_runner::writer::MAX_POINTER_CHARS;
 
@@ -626,6 +628,128 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     let review = bench.record().review.unwrap();
     assert_eq!(review.passes.len(), 4);
     assert_eq!(review.passes[2].pass.get(), 3);
+}
+
+/// A plan of two steps, and the one its revision changes step 2 of.
+const TWO_STEPS: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+"criteria":["GREETING.md says Hello."],
+"approach":"Write GREETING.md with the line the gate greps.",
+"steps":[{"what":"Add GREETING.md.","test":"The gate's grep for Hello."},
+{"what":"Say Hello in it.","test":"The gate's grep."}]}"#;
+const TWO_STEPS_REVISED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+"criteria":["GREETING.md says Hello."],
+"approach":"Write GREETING.md with the line the gate greps.",
+"steps":[{"what":"Add GREETING.md.","test":"The gate's grep for Hello."},
+{"what":"Say Hello in it.","test":"The gate's grep for the word Hello."}]}"#;
+
+/// OWL-356: a Design review pass whose only confirmed finding is `minor`
+/// sends the plan to Build, not back to Design; the PLAN lists it noted,
+/// and the Build's brief carries it as a note.
+#[test]
+fn a_design_review_pass_with_only_minors_goes_to_build_with_its_notes() {
+    let bench = Bench::of("standard");
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[(
+            "minor",
+            "Step 1 could name the file's encoding.",
+        )])),
+        bench.read(&reviewed(&[])),
+        bench.read(&ruled(&["confirmed"])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.roles(),
+        [
+            Role::Design,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::Arbiter,
+            Role::Build,
+            Role::Verify
+        ]
+    );
+    let pass = &bench.decisions("review")[1];
+    assert_eq!(
+        (&pass["review"], &pass["outcome"], &pass["next"]),
+        (&json!("pass"), &json!("passed"), &json!("build"))
+    );
+    let notes = bench.last_of(Role::Build).findings.expect("the notes");
+    assert_eq!(notes.mode, FindingsMode::Note);
+    let claims: Vec<&str> = notes.findings.iter().map(|f| f.claim.as_str()).collect();
+    assert_eq!(claims, ["Step 1 could name the file's encoding."]);
+    let plan = bench.plan_document();
+    assert!(
+        plan.contains(
+            "F1, minor, critic on Claude Code: Step 1 could name the file's encoding. (noted \
+             for the Build)"
+        ),
+        "{plan}"
+    );
+}
+
+/// OWL-356: the pass after a revision is told what changed since pass 1,
+/// the step whose text is new and the parts that changed, and pass 1's
+/// findings, the major fixed and the minor noted; the Build gets the note.
+#[test]
+fn a_pass_after_a_revision_reviews_the_changed_steps_with_the_earlier_findings() {
+    let bench = Bench::of("standard");
+    let replies = vec![
+        bench.read(&designed(TWO_STEPS)),
+        bench.read(&reviewed(&[
+            ("major", "Step 2's test does not check the word."),
+            ("minor", "The goal could name the file's path."),
+        ])),
+        bench.read(&reviewed(&[])),
+        bench.read(&ruled(&["confirmed", "confirmed"])),
+        bench.read(&designed(TWO_STEPS_REVISED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = bench.briefs();
+    let revision = briefs[4].findings.as_ref().expect("the major to fix");
+    let ids: Vec<&str> = revision.findings.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(ids, ["F1"], "the minor is not the design's");
+    assert!(briefs[1].review.as_ref().unwrap().since.is_none());
+    for brief in &briefs[5..7] {
+        let review = brief.review.as_ref().unwrap();
+        assert_eq!(review.pass.get(), 2);
+        let since = review.since.as_ref().expect("what changed");
+        let steps: Vec<u32> = since.steps.iter().map(|n| n.get()).collect();
+        assert_eq!(
+            (
+                since.pass.get(),
+                since.parts.as_slice(),
+                steps,
+                since.removed
+            ),
+            (1, &[PlanPart::Steps][..], vec![2], 1)
+        );
+        let earlier: Vec<(&str, Option<FindingOutcome>)> = review
+            .earlier
+            .iter()
+            .map(|e| (e.kept.finding.id.as_str(), e.kept.outcome))
+            .collect();
+        assert_eq!(earlier, [("F1", Some(FindingOutcome::Fixed)), ("F2", None)]);
+    }
+    let notes = bench.last_of(Role::Build).findings.expect("the note");
+    assert_eq!(
+        (notes.mode, notes.findings[0].claim.as_str()),
+        (FindingsMode::Note, "The goal could name the file's path.")
+    );
+    let review = bench.record().review.unwrap();
+    assert_eq!(
+        review.passes[1].plan.as_ref().map(|p| p.steps.len()),
+        Some(2)
+    );
+    // The PLAN counts pass 1's note among the findings left.
+    let pointer = bench.plan_pointer();
+    assert!(pointer.contains("**Findings open:** 1."), "{pointer}");
 }
 
 /// A `risky` ticket's plan approval (OWL-32): the clean pass of its three
