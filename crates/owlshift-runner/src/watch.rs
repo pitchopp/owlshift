@@ -38,7 +38,7 @@
 //! is adopted; both under the project's lock.
 //!
 //! Since OWL-273, a ticket an answered intake round left at Intake
-//! ([`resumable_stage`]), its second intake cut off by a usage limit or a
+//! (`resumable_stage`), its second intake cut off by a usage limit or a
 //! refusal, is resumed while the tracker still shows it needs input: its
 //! intake runs again through [`OnDemand::continue_shown`], held as a
 //! continue is. One shown elsewhere, in the ready column (the drain's) or
@@ -107,7 +107,7 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 /// for its decider. A parked ticket waits for a person's `continue`, which
 /// alone restarts it (watch only ends a park at Watch whose pull request
 /// ended, [`outlived`]), and one at a stage waits for no answer: only one an
-/// answered round left there is resumed, by [`resumable_stage`] (OWL-273,
+/// answered round left there is resumed, by `resumable_stage` (OWL-273,
 /// OWL-340).
 pub fn watched(status: Status) -> bool {
     matches!(status, Status::NeedsInput { .. })
