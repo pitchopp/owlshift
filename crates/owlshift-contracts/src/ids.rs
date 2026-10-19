@@ -45,6 +45,14 @@ impl TicketId {
     }
 }
 
+/// The identifier as text, for the core's pure functions that order
+/// identifiers naturally (`schedule::slot_turn`).
+impl AsRef<str> for TicketId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A question's identifier within a round: `Q1`, `Q2`, and so on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

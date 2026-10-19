@@ -51,10 +51,21 @@
 //! shown In Progress with nothing running. It goes through `continue`'s path
 //! with no answer check and no RESUME, as the ref waits for no answer. A
 //! review loop's ticket at Build or Verify ([`outlived`]) is resumed once
-//! its pull request, read for an end, has not ended the loop. A ticket at
-//! those stages at round 0 still needs `owlshift continue`. While another
+//! its pull request, read for an end, has not ended the loop. While another
 //! command holds the project's lock, the pass ends at its snapshot, before
 //! any ticket is read.
+//!
+//! Since OWL-367, watch works a ticket one stage step a pass (architecture
+//! section 5, "One step a pass"): a continue stops once its answer check's
+//! RESUME is kept, and a resume, the drain's dispatch or a review loop once
+//! its stage's run is kept, a Build and the Verify pass of its commit being
+//! one step ([`Stop::Stepped`]). The next pass, which comes at once after a
+//! step, takes the next step. So a ticket at Design, Design review, Build or
+//! Verify that the tracker shows working is resumed whatever its round, at
+//! round 0 too, in its turn of the project's slot ([`schedule::slot_turn`]):
+//! the others wait, told once per holder, while every waiting ticket's
+//! answer is still checked at each pass. What a step carries, the
+//! resolver's chain and the late-comment integration, goes to the next.
 //!
 //! Since OWL-368, a snapshot that finds the `unverified` marker still reads
 //! the ticket refs, through the runner's read-only plumbing, and the pass
@@ -85,13 +96,14 @@ use owlshift_adapters::tracker::Person;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::follow::{Action, Decision};
+use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
 
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
-use crate::on_demand::{self, Delivered, Landed, OnDemand, PIPELINE, Stop};
+use crate::on_demand::{self, Carried, Delivered, Landed, OnDemand, PIPELINE, Stop};
 use crate::pr_reviews;
 use crate::project::ProjectLock;
 use crate::quarantine::{self, Held, Record};
@@ -157,14 +169,14 @@ pub fn outlived(status: Status, stored: &Stored) -> bool {
 /// OWL-340: a ticket at Design, Design review, Build or Verify with an
 /// answered round (round > 0), which a refusal or a cut-off run left after
 /// the RESUME moved it to working, is resumed while it still shows working.
-/// A ticket at those stages at round 0 is not: it needs `owlshift continue`,
-/// as does one parked or waiting.
+///
+/// OWL-367: whatever its round, since watch runs one stage step a pass and
+/// leaves every ticket it works there between two passes; so is a `do` or a
+/// drain's dispatch that a stop left at round 0. One parked or waiting needs
+/// `owlshift continue` or an answer.
 fn resumable_stage(state: &TicketState) -> Option<VisibleStage> {
-    if state.round() == 0 {
-        return None;
-    }
     match state.status() {
-        Status::Active(Stage::Intake) => Some(VisibleStage::NeedsInput),
+        Status::Active(Stage::Intake) if state.round() > 0 => Some(VisibleStage::NeedsInput),
         Status::Active(Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify) => {
             Some(VisibleStage::Working)
         }
@@ -173,7 +185,7 @@ fn resumable_stage(state: &TicketState) -> Option<VisibleStage> {
 }
 
 /// How the stage reads in watch's lines.
-fn stage_label(stage: Stage) -> &'static str {
+pub(crate) fn stage_label(stage: Stage) -> &'static str {
     match stage {
         Stage::Intake => "Intake",
         Stage::Ready => "Ready",
@@ -372,6 +384,23 @@ struct Memory {
     /// What watch knows of the marker that quarantines the project, while
     /// one stands (OWL-368).
     quarantine: Option<Quarantine>,
+    /// Whose turn the project's one slot is for watch's stage steps
+    /// (OWL-367): chosen at each pass by [`schedule::slot_turn`], its holder
+    /// keeping it while its ref holds the slot, and taken during a pass by
+    /// a ticket whose ref came to hold a free slot.
+    turn: Option<Turn<TicketId>>,
+    /// What each ticket's last stage step left for its next one
+    /// ([`Stop::Stepped`]), while its ref holds the slot.
+    carried: HashMap<TicketId, Carried>,
+    /// The tickets told that they wait for the slot, with the holders told.
+    slot_waits: HashMap<TicketId, Vec<TicketId>>,
+    /// The tickets whose answer check watch ran into a stage that needs the
+    /// slot, with their ref's commit after it: the tracker may still show
+    /// them needs input when the move to working after the RESUME failed.
+    resumed: HashMap<TicketId, String>,
+    /// This pass took a step after which the next pass is due at once: a
+    /// stage step whose ref moved, or a holder of the slot that left it.
+    stepped: bool,
 }
 
 /// What watch knows of one marker: what its [`Record`] says, joined with
@@ -459,11 +488,19 @@ impl Watch<'_> {
     ) {
         let mut memory = Memory::default();
         loop {
+            memory.stepped = false;
             self.pass(&mut memory, sink, out, continued);
             if draining {
                 self.drain(&mut memory, sink, out, continued);
             }
-            if !sleep(self.interval) {
+            // The interval is only between idle passes (OWL-367): after a
+            // step, the next stage step is due at once.
+            let interval = if memory.stepped {
+                Duration::ZERO
+            } else {
+                self.interval
+            };
+            if !sleep(interval) {
                 return;
             }
         }
@@ -490,12 +527,20 @@ impl Watch<'_> {
         // A ticket whose ref cannot be read now keeps its hold: only one
         // read and found not waiting, or gone from the list, loses it.
         let mut unread = Vec::new();
+        // The tickets whose ref holds the slot (OWL-367), one that does not
+        // read among the unread, which may hold it.
+        let mut holding = Vec::new();
         for (ticket, stored) in read {
             let state = stored.and_then(|stored| {
                 TicketState::try_from(&stored.record.state)
                     .map(|state| (stored, state))
                     .map_err(|e| format!("its ticket ref keeps no valid state: {e:?}"))
             });
+            if let Ok((_, state)) = &state
+                && schedule::holds_slot(state)
+            {
+                holding.push(ticket.clone());
+            }
             match state {
                 // A ticket parked at Watch is read for an end alone (OWL-243),
                 // its comments never: only a waiting ticket's are.
@@ -581,6 +626,17 @@ impl Watch<'_> {
         memory
             .stale
             .retain(&[&followed[..], &read[..], &unread[..]].concat());
+        // The slot's turn for this pass's stage steps (OWL-367).
+        let kept = match &memory.turn {
+            Some(Turn::Holder(holder)) => Some(holder),
+            _ => None,
+        };
+        memory.turn = Some(schedule::slot_turn(&holding, &unread, kept));
+        memory.carried.retain(|ticket, _| holding.contains(ticket));
+        memory.resumed.retain(|ticket, _| holding.contains(ticket));
+        memory
+            .slot_waits
+            .retain(|ticket, _| holding.contains(ticket) || followed.contains(ticket));
         self.note(
             memory,
             out,
@@ -834,9 +890,9 @@ impl Watch<'_> {
                     adopt: false,
                     action: Action::Green | Action::WaitChecks | Action::WaitBaseRed,
                 }
-            ) && !self.correct(memory, sink, continued, ticket, stored, commit.clone())
+            ) && !self.correct(memory, sink, out, continued, ticket, stored, commit.clone())
             {
-                self.review(memory, sink, continued, ticket, stored, commit);
+                self.review(memory, sink, out, continued, ticket, stored, commit);
             }
             return;
         }
@@ -848,6 +904,7 @@ impl Watch<'_> {
         self.held_run(
             memory,
             sink,
+            out,
             continued,
             ticket,
             held,
@@ -863,10 +920,12 @@ impl Watch<'_> {
     /// Its outcome is told, then what it did is held as a continue is
     /// ([`Holds::after`]), from the ticket ref read after it. Returns
     /// whether it ran.
+    #[allow(clippy::too_many_arguments)]
     fn held_run(
         &self,
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         held: Seen,
@@ -881,15 +940,12 @@ impl Watch<'_> {
             return false;
         };
         continued(ticket, &outcome, sink);
-        let git = &on_demand.executor.git;
-        let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket)
-            .ok()
-            .flatten()
-            .map(|stored| stored.commit);
-        let now = (on_demand.clock)();
-        memory
-            .holds
-            .after(ticket, held, &outcome, after.as_deref(), now);
+        // A review loop's ref at Build holds the slot from its start, run or
+        // refused after it (OWL-367).
+        let after = self.read_after(ticket);
+        let commit = after.as_ref().map(|stored| stored.commit.as_str());
+        let holds_now = after.as_ref().is_some_and(holds);
+        self.after(memory, sink, out, ticket, held, &outcome, commit, holds_now);
         true
     }
 
@@ -904,10 +960,12 @@ impl Watch<'_> {
     /// the loop, which reads them under the lock with the reviewers at the
     /// base commit. A delivery made before OWL-307 is dated first, and no
     /// review is due at that pass.
+    #[allow(clippy::too_many_arguments)]
     fn review(
         &self,
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         stored: &Stored,
@@ -967,13 +1025,30 @@ impl Watch<'_> {
         {
             return;
         }
+        // The loop's Build holds the slot: it starts in a free turn only,
+        // read again at a later pass (OWL-367).
+        match memory.turn.clone() {
+            Some(Turn::Holder(holder)) => {
+                return self.wait_for_slot(memory, sink, out, ticket, vec![holder]);
+            }
+            Some(Turn::Unknown(unread)) => {
+                return self.wait_for_slot(memory, sink, out, ticket, unread);
+            }
+            Some(Turn::Free) | None => {}
+        }
         let held = Seen {
             commit,
             answer: pr_reviews::newest(&due),
         };
-        self.held_run(memory, sink, continued, ticket, held, |seen, _, sink| {
-            on_demand.review_seen(ticket, seen, read, sink)
-        });
+        self.held_run(
+            memory,
+            sink,
+            out,
+            continued,
+            ticket,
+            held,
+            |seen, _, sink| on_demand.review_seen(ticket, seen, read, sink),
+        );
     }
 
     /// Dates the delivery of `ticket`, whose ref is at `seen`, at `now`
@@ -1240,10 +1315,12 @@ impl Watch<'_> {
     /// read only once a reply is found; a ticket whose zones' owners decide
     /// is left to [`OnDemand::correct_seen`], which reads them under the
     /// lock. Returns whether a correction ran.
+    #[allow(clippy::too_many_arguments)]
     fn correct(
         &self,
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         stored: &Stored,
@@ -1287,6 +1364,7 @@ impl Watch<'_> {
         self.held_run(
             memory,
             sink,
+            out,
             continued,
             ticket,
             held,
@@ -1441,21 +1519,29 @@ impl Watch<'_> {
         // Recorded by `continue_seen` once the ticket ref is confirmed under
         // the lock, so the log never says watch continued a ticket it left.
         let decision = data([("watch", json!("continue")), ("answer", json!(seen.answer))]);
-        let Some(outcome) = on_demand.continue_seen(ticket, &seen.commit, decision, sink) else {
+        // The RESUME names the ticket whose turn the slot is (OWL-367).
+        let held_by = match &memory.turn {
+            Some(Turn::Holder(holder)) if holder != ticket => Some(holder.clone()),
+            _ => None,
+        };
+        let Some(outcome) =
+            on_demand.continue_seen(ticket, &seen.commit, held_by.as_ref(), decision, sink)
+        else {
             // The ticket ref moved since the snapshot: the next pass reads it.
             return;
         };
         continued(ticket, &outcome, sink);
-        let git = &on_demand.executor.git;
-        let commit = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket)
-            .ok()
-            .flatten()
-            .map(|stored| stored.commit);
-        let now = (on_demand.clock)();
-        match memory
-            .holds
-            .after(ticket, seen, &outcome, commit.as_deref(), now)
+        let after = self.read_after(ticket);
+        // Its move to working after the RESUME may have failed: the stage
+        // step that follows takes it as shown needs input too (OWL-367).
+        if matches!(outcome, Err(Stop::Stepped { .. }))
+            && let Some(stored) = after.as_ref().filter(|stored| holds(stored))
         {
+            memory.resumed.insert(ticket.clone(), stored.commit.clone());
+        }
+        let commit = after.as_ref().map(|stored| stored.commit.as_str());
+        let holds_now = after.as_ref().is_some_and(holds);
+        match self.after(memory, sink, out, ticket, seen, &outcome, commit, holds_now) {
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(
@@ -1529,6 +1615,21 @@ impl Watch<'_> {
         {
             return;
         }
+        // A stage that needs the slot runs in its ticket's turn (OWL-367):
+        // another ticket's turn holds it back, told once per holder.
+        if shown == VisibleStage::Working {
+            match memory.turn.clone() {
+                Some(Turn::Holder(holder)) if holder != *ticket => {
+                    return self.wait_for_slot(memory, sink, out, ticket, vec![holder]);
+                }
+                Some(Turn::Unknown(unread)) => {
+                    return self.wait_for_slot(memory, sink, out, ticket, unread);
+                }
+                _ => {
+                    memory.slot_waits.remove(ticket);
+                }
+            }
+        }
         let seen = Seen {
             commit: stored.commit.clone(),
             answer: None,
@@ -1544,12 +1645,20 @@ impl Watch<'_> {
             }
         };
         memory.failing.remove(ticket);
-        if found != shown.state(&on_demand.config.tracker.states) {
-            let until = now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX);
-            memory
-                .elsewhere
-                .insert(ticket.clone(), (stored.commit.clone(), until));
-            return;
+        let states = &on_demand.config.tracker.states;
+        if found != shown.state(states) {
+            // An answer check of this watch whose move to working after the
+            // RESUME failed: moved now, then resumed (OWL-367).
+            let resumed = shown == VisibleStage::Working
+                && found == VisibleStage::NeedsInput.state(states)
+                && memory.resumed.get(ticket) == Some(&stored.commit);
+            if !(resumed && self.show_working(sink, ticket, &stored.commit)) {
+                let until = now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX);
+                memory
+                    .elsewhere
+                    .insert(ticket.clone(), (stored.commit.clone(), until));
+                return;
+            }
         }
         memory.elsewhere.remove(ticket);
         // Recorded by `continue_shown` once the ticket ref and its stage are
@@ -1558,23 +1667,19 @@ impl Watch<'_> {
             ("watch", json!("continue")),
             ("stage", json!(on_demand::stage_name(stage))),
         ]);
-        let Some(outcome) = on_demand.continue_shown(ticket, &seen.commit, shown, decision, sink)
+        let carried = memory.carried.get(ticket).copied().unwrap_or_default();
+        let Some(outcome) =
+            on_demand.continue_shown(ticket, &seen.commit, shown, carried, decision, sink)
         else {
             // The ref moved, or the ticket was moved, since the reads: the
             // next pass reads it again.
             return;
         };
         continued(ticket, &outcome, sink);
-        let repo = &on_demand.executor.git;
-        let commit = ticket_ref::read(repo, &on_demand.dirs.checkout(), ticket)
-            .ok()
-            .flatten()
-            .map(|stored| stored.commit);
-        let now = (on_demand.clock)();
-        match memory
-            .holds
-            .after(ticket, seen, &outcome, commit.as_deref(), now)
-        {
+        let after = self.read_after(ticket);
+        let commit = after.as_ref().map(|stored| stored.commit.as_str());
+        let holds_now = after.as_ref().is_some_and(holds);
+        match self.after(memory, sink, out, ticket, seen, &outcome, commit, holds_now) {
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(out, &held_text(ticket, stage, until)),
@@ -1593,6 +1698,120 @@ impl Watch<'_> {
                 &format!("no ticket is continued before the usage limit resets at {until}"),
             ),
             Some(Admit::Go) | None => {}
+        }
+    }
+
+    /// The ticket ref of `ticket` read after a command: `None` when gone or
+    /// unreadable.
+    fn read_after(&self, ticket: &TicketId) -> Option<Stored> {
+        let on_demand = self.on_demand;
+        ticket_ref::read(&on_demand.executor.git, &on_demand.dirs.checkout(), ticket)
+            .ok()
+            .flatten()
+    }
+
+    /// What a command of watch's on `ticket` from `seen` left, once its
+    /// `outcome` is told, `commit` being its ticket ref's commit read after
+    /// it (`None` when gone or unreadable) and `holds_now` whether that ref
+    /// holds the slot: held as a continue is ([`Holds::after`]), and, since
+    /// OWL-367, what a stage step carries, the slot's turn, and whether the
+    /// next pass is due at once. Returns the hold or the pause it set.
+    #[allow(clippy::too_many_arguments)]
+    fn after(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        seen: Seen,
+        outcome: &Result<Delivered, Stop>,
+        commit: Option<&str>,
+        holds_now: bool,
+    ) -> Option<Admit> {
+        let moved = commit != Some(seen.commit.as_str());
+        // A stage step whose ref moved: its next step is due at once.
+        if keep_carried(&mut memory.carried, ticket, outcome, moved) {
+            memory.stepped = true;
+        }
+        // A ref that holds the slot now takes a free turn, or waits for the
+        // holder's, told in this very pass; a holder that left the slot
+        // gives it at the next pass, at once.
+        match memory.turn.clone().unwrap_or(Turn::Free) {
+            Turn::Free if holds_now => {
+                memory.turn = Some(Turn::Holder(ticket.clone()));
+                memory.slot_waits.remove(ticket);
+            }
+            Turn::Holder(holder) if holder == *ticket => {
+                if holds_now {
+                    memory.slot_waits.remove(ticket);
+                } else if moved {
+                    memory.stepped = true;
+                }
+            }
+            Turn::Holder(holder) if holds_now => {
+                self.wait_for_slot(memory, sink, out, ticket, vec![holder]);
+            }
+            Turn::Unknown(unread) if holds_now => {
+                self.wait_for_slot(memory, sink, out, ticket, unread);
+            }
+            _ => {}
+        }
+        let now = (self.on_demand.clock)();
+        memory.holds.after(ticket, seen, outcome, commit, now)
+    }
+
+    /// Tells that `ticket` waits for the project's slot, which `holders`
+    /// hold (OWL-367): one `decision` event (`watch` = `waits`, `reason` =
+    /// `slot`) and one line, unless the last told named the same holders.
+    fn wait_for_slot(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        holders: Vec<TicketId>,
+    ) {
+        if memory.slot_waits.get(ticket) == Some(&holders) {
+            return;
+        }
+        let names: Vec<&str> = holders.iter().map(TicketId::as_str).collect();
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Decision,
+            data([
+                ("watch", json!("waits")),
+                ("reason", json!("slot")),
+                ("tickets", json!(names)),
+            ]),
+        );
+        self.line(
+            out,
+            &format!(
+                "{ticket} waits: the project's slot is held by {}, and its next stage runs once \
+                 the slot is its turn (`owlshift doctor` says how to clear a stale one)",
+                names.join(", ")
+            ),
+        );
+        memory.slot_waits.insert(ticket.clone(), holders);
+    }
+
+    /// Moves `ticket` to working, under the project's lock while its ref is
+    /// still `seen`, the commit this watch's answer check left, and only
+    /// while the tracker still shows needs input: the move after its RESUME
+    /// failed (OWL-367). Returns whether it shows working now; a move that
+    /// fails is a `stage_not_moved` warning, tried again later.
+    fn show_working(&self, sink: &mut EventSink<'_>, ticket: &TicketId, seen: &str) -> bool {
+        let Ok(Some(_lock)) = self.locked_at(ticket, seen) else {
+            return false;
+        };
+        let on_demand = self.on_demand;
+        match on_demand.working_after_resume(ticket, sink) {
+            Ok(moved) => moved,
+            Err(reason) => {
+                on_demand.stage_not_moved(ticket, None, VisibleStage::Working, &reason, sink);
+                false
+            }
         }
     }
 
@@ -1668,6 +1887,35 @@ impl Watch<'_> {
         let now = (self.on_demand.clock)();
         let _ = writeln!(out, "{}", printable(&format!("{now} watch: {text}")));
     }
+}
+
+/// Keeps in `carried` what a stage step of `ticket` whose `outcome` is
+/// [`Stop::Stepped`] and whose ref `moved` left for its next step (OWL-367),
+/// and returns `true`; any other outcome drops what an earlier step left, as
+/// a person's `continue` starts afresh, and returns `false`.
+fn keep_carried(
+    carried: &mut HashMap<TicketId, Carried>,
+    ticket: &TicketId,
+    outcome: &Result<Delivered, Stop>,
+    moved: bool,
+) -> bool {
+    match outcome {
+        Err(Stop::Stepped { carried: left, .. }) if moved => {
+            carried.insert(ticket.clone(), *left);
+            true
+        }
+        _ => {
+            carried.remove(ticket);
+            false
+        }
+    }
+}
+
+/// Whether the ticket ref `stored` holds the project's slot
+/// ([`schedule::holds_slot`]); one whose state does not read is no holder
+/// here, its ref being read by the next snapshot.
+fn holds(stored: &Stored) -> bool {
+    TicketState::try_from(&stored.record.state).is_ok_and(|state| schedule::holds_slot(&state))
 }
 
 /// What an end of the following adds to the `ended` event, and the words it
@@ -1761,12 +2009,14 @@ mod tests {
             Stage::Build,
             Stage::Verify,
         ] {
-            assert_eq!(
-                resumable_stage(&restored(active(stage), 1)),
-                Some(VisibleStage::Working),
-                "{stage:?}"
-            );
-            assert_eq!(resumable_stage(&restored(active(stage), 0)), None);
+            // Whatever the round since OWL-367: a stage step leaves it there.
+            for round in [0, 1] {
+                assert_eq!(
+                    resumable_stage(&restored(active(stage), round)),
+                    Some(VisibleStage::Working),
+                    "{stage:?} {round}"
+                );
+            }
         }
         assert_eq!(resumable_stage(&restored(active(Stage::Intake), 0)), None);
         for status in [
@@ -1790,6 +2040,33 @@ mod tests {
         ] {
             assert_eq!(resumable_stage(&restored(status, 1)), None, "{status:?}");
         }
+    }
+
+    /// OWL-367: what a stage step whose ref moved left is kept for the next
+    /// step; a step that left the ref as it was, or any other outcome, drops
+    /// it.
+    #[test]
+    fn a_step_keeps_its_chain_for_the_next_and_any_other_outcome_drops_it() {
+        let ticket = TicketId::new("OWL-1").unwrap();
+        let mut chain = owlshift_core::gate::Chain::default();
+        chain.settled_once();
+        let left = Carried {
+            chain,
+            integrated: true,
+        };
+        let step = Err(Stop::Stepped {
+            ticket: ticket.clone(),
+            stage: Stage::Build,
+            carried: left,
+        });
+        let mut carried = HashMap::new();
+        assert!(keep_carried(&mut carried, &ticket, &step, true));
+        assert_eq!(carried.get(&ticket), Some(&left));
+        assert!(!keep_carried(&mut carried, &ticket, &step, false));
+        assert!(carried.is_empty());
+        carried.insert(ticket.clone(), left);
+        assert!(!keep_carried(&mut carried, &ticket, &refused(), true));
+        assert!(carried.is_empty());
     }
 
     #[test]

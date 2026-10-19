@@ -1016,6 +1016,11 @@ impl OnDemand<'_> {
                         Stage::Design => self.design_run(p, &dispatched, state, sink)?,
                         _ => self.review_pass(p, &dispatched, state, sink)?,
                     };
+                    // Under watch the stage's run is the step (OWL-367): the
+                    // dispatch to Build is the next step's.
+                    if p.stepping {
+                        return Err(stepped(p, &next));
+                    }
                     if next.status() == Status::Active(Stage::Build) {
                         dispatched = self.dispatch_to_build(p, command, sink)?;
                     }
@@ -1023,6 +1028,7 @@ impl OnDemand<'_> {
                 }
                 Status::Active(Stage::Build) => match self.build(p, &dispatched, state, sink)? {
                     Built::Delivered(delivered) => return Ok(delivered),
+                    Built::Replan(next) if p.stepping => return Err(stepped(p, &next)),
                     Built::Replan(next) => state = next,
                 },
                 // A Verify pass `continue` runs again on the kept Build
@@ -1032,6 +1038,7 @@ impl OnDemand<'_> {
                         Verified::Passed(verified) => {
                             return self.deliver_verified(p, &dispatched, &verified, sink);
                         }
+                        Verified::Revise(next) if p.stepping => return Err(stepped(p, &next)),
                         Verified::Revise(next) => state = next,
                     }
                 }
@@ -1044,7 +1051,7 @@ impl OnDemand<'_> {
     /// "Design", The run): the base fetched again, the ticket's branch,
     /// which Design and its review left without a commit, fast-forwarded to
     /// it (OWL-274), then the dispatch's forge check, rules and events.
-    fn dispatch_to_build(
+    pub(super) fn dispatch_to_build(
         &self,
         p: &mut Prepared,
         command: Command,

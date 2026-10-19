@@ -428,8 +428,8 @@ struct Clocked<'a> {
     lock_after: &'a Cell<Option<&'static str>>,
     /// The ticket ref's lock file.
     ref_lock: PathBuf,
-    /// Every stage write is refused.
-    refuse_stage: bool,
+    /// Every stage write is refused while it is set, read at each write.
+    refuse_stage: &'a Cell<bool>,
     /// Every mention is unreadable, as a Linear profile link that cannot be
     /// read.
     refuse_mention: bool,
@@ -642,7 +642,7 @@ impl Tracker for Clocked<'_> {
     }
 
     fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), tracker::Error> {
-        if self.refuse_stage {
+        if self.refuse_stage.get() {
             return Err(tracker::Error::new(
                 tracker::ErrorKind::Other,
                 "the tracker is down",
@@ -683,6 +683,33 @@ impl Tracker for Clocked<'_> {
             ));
         }
         Ok(Some(format!("@{account}")))
+    }
+}
+
+/// How many passes in a row a stage step may make due at once before a
+/// bench says watch never settles (OWL-367).
+const STEPS_CAP: u32 = 64;
+
+/// The passes in a row a stage step made due at once (OWL-367), which the
+/// benches that count idle passes run on without counting.
+#[derive(Default)]
+struct Steps(u32);
+
+impl Steps {
+    /// After a pass whose interval is `interval`: on at once after a step,
+    /// else `sleep(interval)`, which counts an idle pass.
+    fn idle(&mut self, interval: Duration, sleep: &mut dyn FnMut(Duration) -> bool) -> bool {
+        if interval.is_zero() {
+            self.0 += 1;
+            assert!(
+                self.0 < STEPS_CAP,
+                "watch stepped {} passes in a row",
+                self.0
+            );
+            return true;
+        }
+        self.0 = 0;
+        sleep(interval)
     }
 }
 
@@ -1116,9 +1143,23 @@ impl Bench {
     }
 
     /// Runs `owlshift watch` (OWL-152) with one reply per run, `sleep`
-    /// called after each pass; returns each continue's outcome, watch's own
-    /// lines, and the events printed.
+    /// called after each idle pass; returns each continue's outcome, watch's
+    /// own lines, and the events printed. The passes a stage step makes due
+    /// at once (OWL-367) run on without calling `sleep`, so a test counts
+    /// the passes after which watch waits: [`Self::watch_passes`] sees
+    /// every pass.
     fn watch(
+        &self,
+        replies: Vec<Reply>,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) -> (Vec<Result<Delivered, Stop>>, String, String) {
+        let mut steps = Steps::default();
+        self.watch_passes(replies, &mut |interval| steps.idle(interval, &mut *sleep))
+    }
+
+    /// [`Self::watch`] with `sleep` called after every pass, a stage step's
+    /// included, with the interval watch waits then (OWL-367).
+    fn watch_passes(
         &self,
         replies: Vec<Reply>,
         sleep: &mut dyn FnMut(Duration) -> bool,
@@ -1229,7 +1270,7 @@ impl Bench {
             refuse: &self.refuse,
             lock_after: &self.lock_after,
             ref_lock: self.ref_lock(),
-            refuse_stage: self.refuse_stage.get(),
+            refuse_stage: &self.refuse_stage,
             refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
             after_stage_read: &self.after_stage_read,
@@ -3409,8 +3450,9 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
                 let cleared = quarantine::clear(&dirs, &mut ask, &mut sink).unwrap();
                 assert!(matches!(cleared, quarantine::Cleared::Cleared { .. }));
             }
-            // Continued: the answer check, Build and its Verify pass ran
-            // (OWL-304). The next pass finds no question waiting.
+            // Continued: the answer check, then, at the next pass, at once
+            // (OWL-367), Build and its Verify pass ran (OWL-304). The next
+            // pass finds no question waiting.
             7 => assert_eq!(ran(), 4),
             _ => return false,
         }
@@ -3430,8 +3472,15 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
         &mut sleep,
     );
     assert_eq!(pass, 8, "{lines}\n{printed}");
+    // The answer check is a stage step of its own (OWL-367).
     match &outcomes[..] {
-        [Ok(delivered)] => assert!(delivered.opened, "{delivered:?}"),
+        [
+            Err(Stop::Stepped {
+                stage: Stage::Build,
+                ..
+            }),
+            Ok(delivered),
+        ] => assert!(delivered.opened, "{delivered:?}"),
         other => panic!("{other:?}\n{lines}\n{printed}"),
     }
     assert_eq!(
@@ -3455,17 +3504,22 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
         "{comments:?}"
     );
     assert_eq!(bench.stage(), "In Review");
-    // The wait for the quarantine; the continue, then, in the same pass,
-    // watch's first read of the pull request it now follows (OWL-209).
+    // The wait for the quarantine; the continue of the answer, the resume
+    // of its Build at the next pass (OWL-367), then, in that pass, watch's
+    // first read of the pull request it now follows (OWL-209).
     let decided = data_of(&bench.events(), EventKind::Decision, "watch");
-    assert_eq!(decided.len(), 3, "{decided:?}");
+    assert_eq!(decided.len(), 4, "{decided:?}");
     assert_eq!(
         (&decided[0]["watch"], &decided[0]["reason"]),
         (&json!("waits"), &json!("quarantine"))
     );
     assert_eq!(decided[1]["watch"], "continue");
     assert_eq!(
-        (&decided[2]["watch"], &decided[2]["verdict"]),
+        (&decided[2]["watch"], &decided[2]["stage"]),
+        (&json!("continue"), &json!("build"))
+    );
+    assert_eq!(
+        (&decided[3]["watch"], &decided[3]["verdict"]),
         (&json!("read"), &json!("green"))
     );
     assert!(
@@ -3919,7 +3973,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     let (runs, events) = (bench.briefs().len(), bench.events().len());
     let (stale, _) = bench.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
         let decision = Data::from_iter([("watch".to_owned(), json!("continue"))]);
-        on_demand.continue_seen(&ticket(), &watched_at, decision, sink)
+        on_demand.continue_seen(&ticket(), &watched_at, None, decision, sink)
     });
     assert!(stale.is_none(), "{stale:?}");
     assert_eq!(
@@ -4068,10 +4122,15 @@ fn watch_retries_a_refused_check_at_the_last_attempt() {
         ],
         &mut sleep,
     );
+    // The answer check that passes is a stage step of its own (OWL-367).
     match &outcomes[..] {
         [
             Err(Stop::CheckFailed { .. }),
             Err(Stop::CheckFailed { .. }),
+            Err(Stop::Stepped {
+                stage: Stage::Build,
+                ..
+            }),
             Ok(delivered),
         ] => assert!(delivered.opened, "{delivered:?}"),
         other => panic!("{other:?}\n{lines}\n{printed}"),
@@ -5713,10 +5772,15 @@ fn a_resume_whose_state_is_not_kept_is_posted_once_under_watch() {
         &mut sleep,
     );
     assert_eq!(pass, 4, "{lines}\n{printed}");
+    // The second answer check is a stage step of its own (OWL-367).
     match &outcomes[..] {
         [
             Err(Stop::NotKept {
                 landed: Landed::Resume,
+                ..
+            }),
+            Err(Stop::Stepped {
+                stage: Stage::Build,
                 ..
             }),
             Ok(_),
@@ -9037,14 +9101,52 @@ impl Bench {
         )
     }
 
-    /// Runs `owlshift watch --drain` for `passes` passes, with one reply per
-    /// run, `between(n)` called after the `n`th pass but the last; returns
-    /// each reported outcome, watch's own lines and the events printed.
+    /// Runs `owlshift watch --drain` for `passes` idle passes, with one reply
+    /// per run, `between(n)` called after the `n`th but the last; returns
+    /// each reported outcome, watch's own lines and the events printed. The
+    /// passes a stage step makes due at once (OWL-367) run on uncounted:
+    /// [`Self::drain_passes`] counts every pass.
     fn drain(
         &self,
         replies: Vec<Reply>,
         passes: usize,
         mut between: impl FnMut(usize),
+    ) -> (Vec<Result<Delivered, Stop>>, String, String) {
+        let (mut steps, mut done) = (Steps::default(), 0);
+        let ((outcomes, lines), printed) =
+            self.with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+                let (mut outcomes, mut lines) = (Vec::new(), Vec::new());
+                let watch = Watch {
+                    on_demand,
+                    interval: POLL_INTERVAL,
+                };
+                watch.run_drain(
+                    sink,
+                    &mut lines,
+                    &mut |_, outcome, _| outcomes.push(outcome.clone()),
+                    &mut |interval| {
+                        steps.idle(interval, &mut |_| {
+                            done += 1;
+                            if done < passes {
+                                between(done);
+                            }
+                            done < passes
+                        })
+                    },
+                );
+                (outcomes, String::from_utf8(lines).unwrap())
+            });
+        (outcomes, lines, printed)
+    }
+
+    /// Runs `owlshift watch --drain` for `passes` passes, every pass counted
+    /// (OWL-367), `between(n, interval)` called after the `n`th but the last
+    /// with the interval watch waits then; returns as [`Self::drain`].
+    fn drain_passes(
+        &self,
+        replies: Vec<Reply>,
+        passes: usize,
+        mut between: impl FnMut(usize, Duration),
     ) -> (Vec<Result<Delivered, Stop>>, String, String) {
         let mut done = 0;
         let ((outcomes, lines), printed) =
@@ -9058,10 +9160,10 @@ impl Bench {
                     sink,
                     &mut lines,
                     &mut |_, outcome, _| outcomes.push(outcome.clone()),
-                    &mut |_| {
+                    &mut |interval| {
                         done += 1;
                         if done < passes {
-                            between(done);
+                            between(done, interval);
                         }
                         done < passes
                     },
@@ -9645,13 +9747,25 @@ fn watch_resumes_an_intake_cut_off_after_its_answered_round() {
         }
         true
     });
-    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}");
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}");
+    // The answer check is a stage step of its own (OWL-367): watch resumes
+    // the intake at the next pass, at once.
     assert!(
-        matches!(outcomes[0], Err(Stop::UsageLimit { .. })),
+        matches!(
+            outcomes[0],
+            Err(Stop::Stepped {
+                stage: Stage::Intake,
+                ..
+            })
+        ),
         "{outcomes:?}"
     );
     assert!(
-        matches!(outcomes[1], Err(Stop::Ready { .. })),
+        matches!(outcomes[1], Err(Stop::UsageLimit { .. })),
+        "{outcomes:?}"
+    );
+    assert!(
+        matches!(outcomes[2], Err(Stop::Ready { .. })),
         "{outcomes:?}"
     );
     assert!(
@@ -9674,8 +9788,14 @@ fn watch_resumes_an_intake_cut_off_after_its_answered_round() {
         .into_iter()
         .filter(|data| data["stage"] == json!("intake"))
         .collect();
-    assert_eq!(resumed.len(), 1, "{resumed:?}");
-    assert_eq!(resumed[0]["watch"], json!("continue"));
+    // Once after the answer check's step, cut off, once after the reset.
+    assert_eq!(resumed.len(), 2, "{resumed:?}");
+    assert!(
+        resumed
+            .iter()
+            .all(|data| data["watch"] == json!("continue")),
+        "{resumed:?}"
+    );
 }
 
 /// OWL-341: a Codex usage limit gives its reset time in the message only, as
@@ -9740,10 +9860,22 @@ fn watch_holds_a_pause_until_the_reset_time_read_from_a_codex_message() {
         }
         true
     });
-    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}");
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}");
+    // The answer check is a stage step of its own (OWL-367): watch resumes
+    // the intake at the next pass, at once.
     assert!(
         matches!(
             outcomes[0],
+            Err(Stop::Stepped {
+                stage: Stage::Intake,
+                ..
+            })
+        ),
+        "{outcomes:?}"
+    );
+    assert!(
+        matches!(
+            outcomes[1],
             Err(Stop::UsageLimit {
                 resets_at: Some(at)
             }) if at == reset
@@ -9751,7 +9883,7 @@ fn watch_holds_a_pause_until_the_reset_time_read_from_a_codex_message() {
         "{outcomes:?}"
     );
     assert!(
-        matches!(outcomes[1], Err(Stop::Ready { .. })),
+        matches!(outcomes[2], Err(Stop::Ready { .. })),
         "{outcomes:?}"
     );
     assert!(
@@ -9891,16 +10023,28 @@ fn the_drain_takes_in_an_intake_moved_back_to_todo_after_its_round() {
         }
         _ => {}
     });
-    assert_eq!(outcomes.len(), 3, "{outcomes:?}\n{lines}");
+    assert_eq!(outcomes.len(), 4, "{outcomes:?}\n{lines}");
+    // The answer check is a stage step of its own (OWL-367): watch resumes
+    // the intake at the next pass, at once.
     assert!(
-        matches!(outcomes[0], Err(Stop::UsageLimit { .. })),
+        matches!(
+            outcomes[0],
+            Err(Stop::Stepped {
+                stage: Stage::Intake,
+                ..
+            })
+        ),
         "{outcomes:?}"
     );
     assert!(
-        matches!(outcomes[1], Err(Stop::Ready { .. })),
+        matches!(outcomes[1], Err(Stop::UsageLimit { .. })),
         "{outcomes:?}"
     );
-    assert!(outcomes[2].is_ok(), "{outcomes:?}");
+    assert!(
+        matches!(outcomes[2], Err(Stop::Ready { .. })),
+        "{outcomes:?}"
+    );
+    assert!(outcomes[3].is_ok(), "{outcomes:?}");
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
     assert_eq!(
         roles,
@@ -9913,12 +10057,14 @@ fn the_drain_takes_in_an_intake_moved_back_to_todo_after_its_round() {
             Role::Verify
         ]
     );
-    // Watch continued the answered round once; the restart is the drain's.
+    // Watch continued the answered round once, then resumed its intake at
+    // the next pass, the answer check being a step of its own (OWL-367);
+    // the restart after the move to Todo is the drain's.
     let continued: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
         .into_iter()
         .filter(|data| data["stage"] == json!("intake"))
         .collect();
-    assert!(continued.is_empty(), "{continued:?}");
+    assert_eq!(continued.len(), 1, "{continued:?}");
     assert_eq!(
         bench
             .drain_decisions()

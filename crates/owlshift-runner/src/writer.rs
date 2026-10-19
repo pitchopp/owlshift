@@ -2711,6 +2711,11 @@ pub struct ResumeComment {
     /// intake round asked before OWL-269 (OWL-248), the ticket goes back to
     /// the ready column.
     pub return_to: Stage,
+    /// Under `owlshift watch`, the ticket whose turn the project's one slot
+    /// is, when another ticket holds it and the round returns to a stage
+    /// that needs it (OWL-367): the comment says the work starts once that
+    /// ticket frees the slot. `None` otherwise.
+    pub slot_held_by: Option<TicketId>,
 }
 
 impl ResumeComment {
@@ -2786,6 +2791,16 @@ impl ResumeComment {
                 "{}\n\n**Understood:** {}",
                 question_lines(question.id.as_str(), question, &texts[..QUESTION_TEXTS]),
                 texts[QUESTION_TEXTS]
+            ));
+        }
+        if let Some(holder) = &self.slot_held_by
+            && matches!(
+                self.return_to,
+                Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify
+            )
+        {
+            sections.push(format!(
+                "{holder} holds the project's one slot: this work starts once {holder} frees it."
             ));
         }
         let footer = Footer {
@@ -5058,6 +5073,7 @@ Merge state reported by the forge: `CLEAN`.
         let comment = ResumeComment {
             ticket: ticket(),
             return_to: Stage::Build,
+            slot_held_by: None,
             round: NonZeroU32::new(2).unwrap(),
             understood: vec![
                 (
@@ -5120,6 +5136,25 @@ Context.
             "Every question of round 2 is answered. Watch reads the pull request again, and a \
              repair still due starts with this understanding:"
         ));
+
+        // Under watch, a round returning to a stage that waits for the slot
+        // says so before the footer; Watch needs no slot (OWL-367).
+        let line = "OWL-160 holds the project's one slot: this work starts once OWL-160 frees it.";
+        let waiting = ResumeComment {
+            return_to: Stage::Design,
+            slot_held_by: Some(TicketId::new("OWL-160").unwrap()),
+            ..at_watch.clone()
+        };
+        let body = waiting.render();
+        assert!(
+            body.contains(&format!("{line}\n\n<!-- owlshift:")),
+            "{body}"
+        );
+        let at_watch = ResumeComment {
+            slot_held_by: waiting.slot_held_by.clone(),
+            ..at_watch
+        };
+        assert!(!at_watch.render().contains(line));
     }
 
     #[test]
@@ -5636,6 +5671,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     round,
                     understood: vec![(question.clone(), Some(verdict.clone()))],
                     return_to: Stage::Build,
+                    slot_held_by: None,
                 }
                 .render(),
                 ParkedComment {
@@ -5762,6 +5798,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         let resume = ResumeComment {
             ticket: ticket(),
             return_to: Stage::Build,
+            slot_held_by: None,
             round: NonZeroU32::new(2).unwrap(),
             understood: Vec::new(),
         };
@@ -5916,6 +5953,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         let resume = ResumeComment {
             ticket: ticket(),
             return_to: Stage::Build,
+            slot_held_by: None,
             round,
             understood: Vec::new(),
         };
@@ -6572,6 +6610,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         let resume = ResumeComment {
             ticket: ticket(),
             return_to: Stage::Build,
+            slot_held_by: None,
             round: NonZeroU32::new(3).unwrap(),
             understood: maximal_open()
                 .into_iter()

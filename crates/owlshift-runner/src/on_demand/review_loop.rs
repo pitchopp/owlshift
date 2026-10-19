@@ -89,6 +89,9 @@ impl OnDemand<'_> {
             Ok(p) => p,
             Err(stop) => return Some(Err(stop)),
         };
+        // The loop's Build and its Verify pass are one stage step of
+        // watch's (OWL-367): a Verify fix run is a later pass's.
+        p.stepping = true;
         Some(self.review_loop(&mut p, Some(read), sink))
     }
 

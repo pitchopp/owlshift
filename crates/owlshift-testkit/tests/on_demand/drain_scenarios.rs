@@ -13,7 +13,7 @@ use owlshift_runner::notify;
 use super::*;
 
 /// A Build run's `done` delivering `id` on its own branch.
-fn done_for(id: &str) -> String {
+pub(super) fn done_for(id: &str) -> String {
     DONE.replace(BRANCH, &format!("owlshift/{}", id.to_lowercase()))
 }
 
@@ -21,7 +21,7 @@ impl Bench {
     /// Writes the ticket `id` at `stage`, created by `author`, decided by
     /// `maintainer`, labelled `labels`, with `front` added to its front
     /// matter, and `description`.
-    fn put_ticket(
+    pub(super) fn put_ticket(
         &self,
         id: &str,
         author: &str,
@@ -463,19 +463,32 @@ fn scenario_s3_questions_at_intake() {
         }
     });
     // The questions reach the decider, told as a person's blocker; the
-    // ticket back in the column is not.
-    assert_eq!(outcomes.len(), 4, "{outcomes:?}\n{lines}\n{printed}");
+    // answer check's step (OWL-367) and the ticket back in the column are
+    // not.
+    assert_eq!(outcomes.len(), 5, "{outcomes:?}\n{lines}\n{printed}");
     assert!(
         matches!(&outcomes[0], Err(Stop::NeedsInput { .. })),
         "{outcomes:?}"
     );
     assert!(notify::blocker_line(&ticket(), outcomes[0].as_ref().unwrap_err()).is_some());
-    for outcome in &outcomes[1..3] {
+    let stepped = outcomes[1].as_ref().unwrap_err();
+    assert!(
+        matches!(
+            stepped,
+            Stop::Stepped {
+                stage: Stage::Intake,
+                ..
+            }
+        ),
+        "{stepped}"
+    );
+    assert_eq!(notify::blocker_line(&ticket(), stepped), None);
+    for outcome in &outcomes[2..4] {
         let stop = outcome.as_ref().unwrap_err();
         assert!(matches!(stop, Stop::Ready { .. }), "{stop}");
         assert_eq!(notify::blocker_line(&ticket(), stop), None);
     }
-    assert!(outcomes[3].is_ok(), "{outcomes:?}");
+    assert!(outcomes[4].is_ok(), "{outcomes:?}");
 
     let events = bench.events();
     let passes = by_pass(&events, 0, &ends.borrow());
@@ -557,11 +570,12 @@ fn scenario_s3_questions_at_intake() {
 
 /// Scenario S6, "The human is the bottleneck", with `max_open_prs = 1`. The
 /// drain's Build of DEMO-1 stops at a usage limit, which tells the operator,
-/// and leaves DEMO-1 at Build: after the reset, DEMO-2, taken in, waits for
-/// the one slot until a person types `continue`, which delivers DEMO-1. In
-/// a new `watch --drain`, DEMO-1's open pull request holds DEMO-2's Build at
-/// the cap, told once, while nothing is notified; the pass that reads
-/// DEMO-1 merged builds DEMO-2.
+/// and leaves DEMO-1 at Build: DEMO-2, taken in, waits for the one slot
+/// until the reset, after which watch resumes DEMO-1's Build itself, at
+/// round 0 as at any round (OWL-367), and delivers it, with nothing typed.
+/// DEMO-2 then waits at the cap. In a new `watch --drain`, DEMO-1's open pull request holds
+/// DEMO-2's Build at the cap, told once, while nothing is notified; the pass
+/// that reads DEMO-1 merged builds DEMO-2.
 #[test]
 fn scenario_s6_the_human_is_the_bottleneck() {
     let bench = Bench::build_admitting(
@@ -580,25 +594,28 @@ fn scenario_s6_the_human_is_the_bottleneck() {
         "Greet once more.",
     );
 
-    // DEMO-1's Build cut by the usage limit; after the reset, DEMO-2 waits
-    // for the slot DEMO-1 holds.
+    // DEMO-1's Build cut by the usage limit; DEMO-2 waits for the slot
+    // DEMO-1 holds; after the reset, watch resumes DEMO-1's Build.
     let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
     let reset: Timestamp = "2026-10-02T12:00:00Z".parse().unwrap();
     let mut limited = bench.reply(None, None);
     limited.usage_limit = Some(reset);
+    let resumed = bench.reply(Some("Hello"), Some(DONE));
     let ends = RefCell::new(Vec::new());
-    let (held, lines, printed) = bench.drain(vec![intake(), intake(), limited], 4, |pass| {
+    let replies = vec![intake(), intake(), limited, resumed];
+    let (held, lines, printed) = bench.drain(replies, 4, |pass| {
         ends.borrow_mut().push(bench.events().len());
-        if pass == 2 {
+        if pass == 3 {
             bench.clock.set(reset);
         }
     });
-    assert_eq!(held.len(), 3, "{held:?}\n{lines}\n{printed}");
+    assert_eq!(held.len(), 4, "{held:?}\n{lines}\n{printed}");
     let stop = held[2].as_ref().expect_err("the usage limit");
     assert!(matches!(stop, Stop::UsageLimit { .. }), "{stop}");
     assert!(notify::blocker_line(&ticket(), stop).is_some());
+    assert!(held[3].is_ok(), "{held:?}\n{lines}");
     let at = TicketState::try_from(&bench.record().state).unwrap();
-    assert_eq!(at.status(), Status::Active(Stage::Build));
+    assert_eq!(at.status(), Status::Active(Stage::Watch));
     let events = bench.events();
     let passes = by_pass(&events, 0, &ends.borrow());
     assert_eq!(
@@ -606,11 +623,18 @@ fn scenario_s6_the_human_is_the_bottleneck() {
         [("DEMO-2".to_owned(), json!("slot"), json!(["DEMO-1"]))],
         "{lines}"
     );
-    assert!(passes[2..].iter().all(|pass| dispatched(pass).is_empty()));
-
-    // The person continues DEMO-1, which delivers its pull request.
-    let (outcome, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
-    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    // No dispatch from Ready: the resume's is a `continue`'s.
+    let from_ready = |pass: &[Event]| {
+        pass.iter()
+            .filter(|e| e.kind == EventKind::Dispatch && e.data["command"] == json!("drain"))
+            .count()
+    };
+    assert!(passes[2..].iter().all(|pass| from_ready(pass) == 0));
+    let resumes: Vec<Value> = data_of(&events, EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["stage"] == json!("build"))
+        .collect();
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
 
     // At the cap, then released by the merge.
     let before = bench.events().len();

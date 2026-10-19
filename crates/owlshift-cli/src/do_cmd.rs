@@ -415,8 +415,12 @@ fn finish(
         Err(stop) => {
             let _ = writeln!(stdout, "\n{}", printable(&stop.to_string()));
             // A look at a followed pull request is no failure (OWL-209),
-            // nor is a ticket back in the ready column (OWL-248).
-            if matches!(stop, Stop::Watched { .. } | Stop::Ready { .. }) {
+            // nor is a ticket back in the ready column (OWL-248), nor a
+            // stage step of watch's (OWL-367).
+            if matches!(
+                stop,
+                Stop::Watched { .. } | Stop::Ready { .. } | Stop::Stepped { .. }
+            ) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
