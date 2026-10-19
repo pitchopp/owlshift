@@ -132,10 +132,10 @@ pub const OVERRIDES: &[(&str, &str)] = &[
     // empty configuration directory does not stop the keyring fallback.
     ("GH_TOKEN", NO_CREDENTIAL),
     ("GH_ENTERPRISE_TOKEN", NO_CREDENTIAL),
-    // Two settings in the command scope, read last. No git credential
+    // Six settings in the command scope, read last. No git credential
     // helper: an empty `credential.helper` resets the list, helpers scoped
     // to a URL included.
-    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_COUNT", "6"),
     ("GIT_CONFIG_KEY_0", "credential.helper"),
     ("GIT_CONFIG_VALUE_0", ""),
     // No `update-server-info` when git repacks, its own housekeeping
@@ -146,6 +146,21 @@ pub const OVERRIDES: &[(&str, &str)] = &[
     // runner's own git sets the same with `-c` (`executor::git`).
     ("GIT_CONFIG_KEY_1", "repack.updateServerInfo"),
     ("GIT_CONFIG_VALUE_1", "false"),
+    // No reflog expiry and no pruning of worktree entries in housekeeping:
+    // its reflog step rewrites the `logs/HEAD` of every worktree's entry
+    // in the common git folder, another ticket's included, which the
+    // isolation check guards (OWL-339, live check (e)). The sandbox refuses
+    // those writes, yet git would still try them and print errors the agent
+    // may chase. An explicit `git worktree prune` still prunes. The
+    // runner's own git sets the same with `-c` (`executor::git`).
+    ("GIT_CONFIG_KEY_2", "gc.reflogExpire"),
+    ("GIT_CONFIG_VALUE_2", "never"),
+    ("GIT_CONFIG_KEY_3", "gc.reflogExpireUnreachable"),
+    ("GIT_CONFIG_VALUE_3", "never"),
+    ("GIT_CONFIG_KEY_4", "gc.worktreePruneExpire"),
+    ("GIT_CONFIG_VALUE_4", "never"),
+    ("GIT_CONFIG_KEY_5", "maintenance.worktree-prune.auto"),
+    ("GIT_CONFIG_VALUE_5", "0"),
     // No askpass program: an empty `GIT_ASKPASS` makes git skip
     // `core.askPass` and `SSH_ASKPASS` too. No terminal prompt either.
     ("GIT_ASKPASS", ""),
@@ -521,11 +536,19 @@ mod tests {
             ("GH_ENTERPRISE_TOKEN", NO_CREDENTIAL),
             ("GH_TOKEN", NO_CREDENTIAL),
             ("GIT_ASKPASS", ""),
-            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_COUNT", "6"),
             ("GIT_CONFIG_KEY_0", "credential.helper"),
             ("GIT_CONFIG_KEY_1", "repack.updateServerInfo"),
+            ("GIT_CONFIG_KEY_2", "gc.reflogExpire"),
+            ("GIT_CONFIG_KEY_3", "gc.reflogExpireUnreachable"),
+            ("GIT_CONFIG_KEY_4", "gc.worktreePruneExpire"),
+            ("GIT_CONFIG_KEY_5", "maintenance.worktree-prune.auto"),
             ("GIT_CONFIG_VALUE_0", ""),
             ("GIT_CONFIG_VALUE_1", "false"),
+            ("GIT_CONFIG_VALUE_2", "never"),
+            ("GIT_CONFIG_VALUE_3", "never"),
+            ("GIT_CONFIG_VALUE_4", "never"),
+            ("GIT_CONFIG_VALUE_5", "0"),
             ("GIT_SSH_COMMAND", ssh),
             ("GIT_TERMINAL_PROMPT", "0"),
             ("HOME", "/home/op"),

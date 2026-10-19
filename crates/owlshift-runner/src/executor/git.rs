@@ -295,15 +295,15 @@ impl Git {
 /// maintenance a `fetch` starts in the background and which outlives it,
 /// writes no `info/refs`: the isolation check guards that file, and a run
 /// during which it changed would be quarantined for nothing (OWL-197). The
-/// agent environment carries the same setting
-/// (`owlshift_core::agent_env::OVERRIDES`). The same maintenance, once its
-/// reflog step runs, rewrites the `logs/HEAD` of every worktree entry, which
-/// the isolation check guards too (OWL-339, live check (e)): so reflogs never
-/// expire (`gc.reflogExpire`, `gc.reflogExpireUnreachable`), nor do worktree
-/// entries in housekeeping (`gc.worktreePruneExpire`,
-/// `maintenance.worktree-prune.auto`); an explicit `git worktree prune`
-/// still removes a stale entry. Given with `-c`, they win over every
-/// configuration file, and reach the git commands git starts itself.
+/// same maintenance, once its reflog step runs, rewrites the `logs/HEAD` of
+/// every worktree entry, which the isolation check guards too (OWL-339, live
+/// check (e)): so reflogs never expire (`gc.reflogExpire`,
+/// `gc.reflogExpireUnreachable`), nor do worktree entries in housekeeping
+/// (`gc.worktreePruneExpire`, `maintenance.worktree-prune.auto`); an
+/// explicit `git worktree prune` still removes a stale entry. Given with
+/// `-c`, they win over every configuration file, and reach the git commands
+/// git starts itself. The agent environment carries the same five settings
+/// (`owlshift_core::agent_env::OVERRIDES`).
 fn hardening() -> [OsString; 14] {
     [
         "-c".into(),
