@@ -354,9 +354,11 @@ struct Memory {
     stale: Stale,
     /// What the drain keeps (OWL-250).
     drain: drain::Memory,
-    /// The tickets left at Intake found shown in another stage than needs
-    /// input (OWL-273): the commit their ref was at, and until when their
-    /// stage is not read again unless the ref moves.
+    /// The tickets a stop left in a stage watch resumes, found shown in
+    /// another stage than that stage must show (OWL-273 at Intake, which must
+    /// show needs input; OWL-340 at Design, Design review, Build and Verify,
+    /// which must show working): the commit their ref was at, and until when
+    /// their stage is not read again unless the ref moves.
     elsewhere: HashMap<TicketId, (String, Timestamp)>,
 }
 
