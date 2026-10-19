@@ -13,8 +13,10 @@ use owlshift_contracts::result::Status as RunStatus;
 use owlshift_contracts::review::Mandate;
 use owlshift_core::vocab::Harness as HarnessKind;
 
-use super::design_scenarios::{FORKED, PLAN, REPLAN, REVISED, answered, designed, reviewed, ruled};
-use super::drain_scenarios::{by_pass, merge_read};
+use super::design_scenarios::{
+    FORKED, PLAN, REPLAN, REVISED, TRADE_OFF, answered, designed, reviewed, ruled,
+};
+use super::drain_scenarios::{by_pass, done_for, merge_read};
 use super::review_scenarios::{FORGE, review};
 use super::*;
 
@@ -149,9 +151,20 @@ fn scenario_s8_a_false_premise_at_intake_is_rescoped() {
         assert!(bench.remote_branch().is_none());
         bench.answer(rescope);
     });
-    let [premise_round, back, delivered] = &outcomes[..] else {
+    // The answer check is a stage step of its own (OWL-367).
+    let [premise_round, stepped, back, delivered] = &outcomes[..] else {
         panic!("{outcomes:?}\n{lines}\n{printed}");
     };
+    assert!(
+        matches!(
+            stepped,
+            Err(Stop::Stepped {
+                stage: Stage::Intake,
+                ..
+            })
+        ),
+        "{stepped:?}"
+    );
     assert!(
         matches!(
             premise_round,
@@ -411,9 +424,15 @@ fn scenario_s9_findings_and_review_passes() {
     ] {
         assert!(report.contains(text), "{text}\n---\n{report}");
     }
-    // To Design, then to Build, by the drain; the answers by watch's
-    // continue.
-    assert_eq!(dispatches(&bench.events()), ["drain", "drain", "continue"]);
+    // To Design by the drain; each stage step after it by watch's resume,
+    // Design review twice, Design, then Build at each of its three steps
+    // (OWL-367).
+    assert_eq!(
+        dispatches(&bench.events()),
+        [
+            "drain", "continue", "continue", "continue", "continue", "continue", "continue"
+        ]
+    );
 }
 
 /// Scenario S17's routing part on a drained `standard` ticket: the verdict
@@ -487,13 +506,24 @@ fn scenario_s17_the_tickets_routing_is_followed() {
                 )
             })
             .collect();
-    let not_followed = (
-        json!("not_followed"),
-        json!("drain"),
-        json!("verdict"),
-        json!("label"),
+    let not_followed = |command| {
+        (
+            json!("not_followed"),
+            json!(command),
+            json!("verdict"),
+            json!("label"),
+        )
+    };
+    // The drain's dispatch to Design, then the resumes of Design review and
+    // Build, each a stage step of watch's (OWL-367).
+    assert_eq!(
+        routing,
+        [
+            not_followed("drain"),
+            not_followed("continue"),
+            not_followed("continue")
+        ]
     );
-    assert_eq!(routing, [not_followed.clone(), not_followed]);
     let pass = bench
         .decisions("review")
         .into_iter()
@@ -579,7 +609,12 @@ fn scenario_a_standard_ticket_walks_to_its_merge_through_a_review_loop() {
             vec![],
         ]
     );
-    assert_eq!(dispatches(&events), ["drain", "drain", "continue"]);
+    // The drain's to Design; Design review and Build resumed, a stage step
+    // each (OWL-367); the review loop's.
+    assert_eq!(
+        dispatches(&events),
+        ["drain", "continue", "continue", "continue"]
+    );
     let mandates: Vec<Vec<Mandate>> = bench
         .briefs()
         .iter()
@@ -754,10 +789,252 @@ fn scenario_a_risky_plan_refused_approved_and_replanned() {
     assert_eq!(
         dispatches(&bench.events()),
         [
-            "drain", "continue", "continue", "continue", "continue", "continue", "continue"
+            "drain", "continue", "continue", "continue", "continue", "continue", "continue",
+            "continue", "continue", "continue"
         ],
-        "the drain's from Ready to Design; then each pass's continue of an answer, and, \
-         within the continue that approves a plan, its own dispatch to Build"
+        "the drain's from Ready to Design; then each stage step's resume, an answer's \
+         check dispatching none (OWL-367)"
     );
     assert!(merge_read(&bench.events(), TICKET).is_some(), "{lines}");
+}
+
+/// The `decision` events of watch's slot waits (OWL-367), each as its
+/// ticket and the tickets it names.
+fn slot_waits(events: &[Event]) -> Vec<(String, Value)> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Decision)
+        .filter(|e| e.data.get("watch") == Some(&json!("waits")))
+        .filter(|e| e.data.get("reason") == Some(&json!("slot")))
+        .map(|e| {
+            let ticket = e.ticket.as_ref().unwrap().as_str().to_owned();
+            (ticket, e.data["tickets"].clone())
+        })
+        .collect()
+}
+
+/// OWL-367's first acceptance: DEMO-2, a drained `trivial` ticket, runs a
+/// Build and Verify loop over three passes, one stage step each, while
+/// DEMO-1's design round waits; DEMO-1's answer counts in the middle of it.
+/// The next pass checks the answer and posts the RESUME, which names DEMO-2
+/// as holding the slot, before DEMO-2's loop ends, and says once that
+/// DEMO-1 waits; DEMO-1's Design runs only at the pass after DEMO-2 frees the
+/// slot, so no two tickets' stage runs interleave. Every pass after a step
+/// comes at once; one with none sleeps the whole interval.
+#[test]
+fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
+    let bench = Bench::draining("maintainer");
+    bench.verify_plays.set(true);
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "Greet once more.",
+    );
+    let builds = |greeting: &str| bench.reply(Some(greeting), Some(&done_for("DEMO-2")));
+    let replies = vec![
+        // Pass 1: DEMO-1's intake. Pass 2: DEMO-2's, then DEMO-1's design
+        // asks, the resolver passing the question on.
+        bench.reply(None, Some(&verdict("standard"))),
+        bench.reply(None, Some(&verdict("trivial"))),
+        bench.read(TRADE_OFF),
+        bench.read(&passed_on(&["Q1"])),
+        // Pass 3: DEMO-2's Build and Verify pass, a major to fix.
+        builds("Hello"),
+        bench.read(&findings(&[(
+            "major",
+            "The greeting has no full stop.",
+            None,
+        )])),
+        bench.read(&ruled(&["confirmed"])),
+        // Pass 4: DEMO-1's answer check; DEMO-2's fix and Verify, a minor
+        // left for its last fix.
+        bench.read(&check(&[("Q1", "answered", "Markdown.")])),
+        builds("Hello."),
+        bench.read(&findings(&[(
+            "minor",
+            "The greeting could end the line.",
+            None,
+        )])),
+        bench.read(&ruled(&["confirmed"])),
+        // Pass 5: DEMO-2's last fix and its delivery. Pass 6: DEMO-1's
+        // design.
+        builds("Hello.\n"),
+        bench.read(&designed(PLAN)),
+    ];
+    let ends = RefCell::new(Vec::new());
+    let sleeps = RefCell::new(Vec::new());
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 6, |pass, interval| {
+        ends.borrow_mut().push(bench.events().len());
+        sleeps.borrow_mut().push(interval);
+        match pass {
+            3 => bench.answer("Q1: Markdown."),
+            4 => {
+                // Answer understood and working, waiting for the slot.
+                assert_eq!(bench.status(), Status::Active(Stage::Design));
+                assert_eq!(bench.stage(), "In Progress");
+            }
+            _ => {}
+        }
+    });
+    let events = bench.events();
+    assert_eq!(
+        runs_by_pass(&events, &ends.borrow()),
+        [
+            vec!["intake"],
+            vec!["intake", "design", "resolver"],
+            vec!["build", "verify", "arbiter"],
+            vec!["answer_check", "build", "verify", "arbiter"],
+            vec!["build"],
+            vec!["design"],
+        ],
+        "{lines}\n{printed}"
+    );
+    // DEMO-2's loop ends at pass 5, after DEMO-1's answer check at pass 4;
+    // DEMO-1's Design at pass 6, once DEMO-2 freed the slot.
+    let delivered = outcomes
+        .iter()
+        .position(Result::is_ok)
+        .expect("DEMO-2 delivered");
+    assert!(
+        matches!(
+            outcomes[delivered - 1],
+            Err(Stop::Stepped {
+                stage: Stage::Build,
+                ..
+            })
+        ),
+        "{outcomes:?}"
+    );
+    let briefs = bench.briefs();
+    let last_of_demo2 = briefs
+        .iter()
+        .rposition(|b| b.ticket.id.as_str() == "DEMO-2")
+        .unwrap();
+    let design_again = briefs.iter().rposition(|b| b.role == Role::Design).unwrap();
+    assert!(last_of_demo2 < design_again);
+    // The RESUME says the answer was understood and names the holder.
+    let resume = bench.marked("[owlshift] RESUME");
+    assert!(
+        resume.contains(
+            "DEMO-2 holds the project's one slot: this work starts once DEMO-2 frees it."
+        ),
+        "{resume}"
+    );
+    // Told once, in the answer's pass, with nothing more while it waits.
+    assert_eq!(
+        slot_waits(&events),
+        [("DEMO-1".to_owned(), json!(["DEMO-2"]))],
+        "{lines}"
+    );
+    let passes = by_pass(&events, 0, &ends.borrow());
+    assert_eq!(slot_waits(&passes[3]).len(), 1);
+    assert_eq!(
+        lines
+            .matches("DEMO-1 waits: the project's slot is held by DEMO-2")
+            .count(),
+        1,
+        "{lines}"
+    );
+    // The interval only after passes with no step.
+    assert_eq!(
+        sleeps.borrow()[..],
+        [
+            POLL_INTERVAL,
+            POLL_INTERVAL,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO
+        ]
+    );
+}
+
+/// OWL-367's second acceptance: a drained `standard` ticket alone goes from
+/// Design to Design review to Build, its Verify pass and the delivery, one
+/// stage step a pass, each pass after a step coming at once. The step into
+/// Build is the dispatch to Build: the base, moved since the dispatch from
+/// Ready, is fetched again and the branch fast-forwarded to it (OWL-274).
+#[test]
+fn a_lone_ticket_takes_its_stage_steps_with_no_wait() {
+    let bench = Bench::draining("maintainer");
+    let replies = vec![
+        bench.reply(None, Some(&verdict("standard"))),
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.greets("Hello"),
+    ];
+    let ends = RefCell::new(Vec::new());
+    let sleeps = RefCell::new(Vec::new());
+    let moved = RefCell::new(String::new());
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 5, |pass, interval| {
+        ends.borrow_mut().push(bench.events().len());
+        sleeps.borrow_mut().push(interval);
+        if pass == 3 {
+            // The plan passed its review; the base moves before Build.
+            assert_eq!(bench.status(), Status::Active(Stage::Build));
+            *moved.borrow_mut() = bench.move_base();
+        }
+    });
+    assert!(
+        matches!(outcomes.last(), Some(Ok(_))),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(
+        runs_by_pass(&bench.events(), &ends.borrow()),
+        [
+            vec!["intake"],
+            vec!["design"],
+            vec!["design_review", "design_review"],
+            vec!["build", "verify"],
+            vec![],
+        ]
+    );
+    assert_eq!(
+        sleeps.borrow()[..],
+        [
+            POLL_INTERVAL,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO
+        ]
+    );
+    let builds: Vec<Value> = data_of(&bench.events(), EventKind::Dispatch, "command")
+        .into_iter()
+        .filter(|data| data["command"] == json!("continue"))
+        .collect();
+    let to_build = builds.last().unwrap();
+    assert_eq!(to_build["base_commit"], json!(*moved.borrow()));
+    assert!(
+        bench.descends(&moved.borrow()),
+        "the branch starts at the moved base"
+    );
+}
+
+impl Bench {
+    /// A commit lands on the remote's `main`, as another pull request's
+    /// merge would: returns `main`'s new head.
+    fn move_base(&self) -> String {
+        let run = |args: &[&str]| {
+            let out = self.env.run(&self.remote.bare, args).unwrap();
+            String::from_utf8(out).unwrap().trim().to_owned()
+        };
+        let head = run(&["rev-parse", "refs/heads/main"]);
+        let tree = format!("{head}^{{tree}}");
+        let next = run(&["commit-tree", &tree, "-p", &head, "-m", "Another change."]);
+        run(&["update-ref", "refs/heads/main", &next]);
+        next
+    }
+
+    /// Whether the ticket's branch on the remote descends from `commit`.
+    fn descends(&self, commit: &str) -> bool {
+        self.env
+            .run(
+                &self.remote.bare,
+                &["merge-base", "--is-ancestor", commit, BRANCH],
+            )
+            .is_ok()
+    }
 }

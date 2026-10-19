@@ -145,6 +145,53 @@ pub fn holds_slot_or_unknown(state: Option<&TicketState>) -> bool {
     state.is_none_or(holds_slot)
 }
 
+/// Whose turn the project's one slot is for `owlshift watch`'s stage steps
+/// (OWL-367; architecture, section 5, "One step a pass"): a stage step runs
+/// one stage of one ticket, so several tickets' refs may hold the slot
+/// between two passes, and only one of them goes on.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Turn<K> {
+    /// No ticket ref holds the slot.
+    Free,
+    /// This ticket's steps run; every other ticket whose ref holds the slot
+    /// waits for it.
+    Holder(K),
+    /// No holder can be chosen: these ticket refs cannot be read, in
+    /// identifier order, and any of them may hold the slot.
+    Unknown(Vec<K>),
+}
+
+/// The turn among `holding`, the tickets whose ref holds the slot
+/// ([`holds_slot`]), with `unread` the ticket refs that cannot be read and
+/// `kept` the holder of the turn before. The holder keeps its turn while its
+/// ref holds the slot, so nothing is preempted. Otherwise an unread ref,
+/// which may hold the slot, leaves no holder to choose; otherwise the first
+/// holding ticket in identifier order ([`natural_cmp`]) takes the turn.
+pub fn slot_turn<K: Clone + Ord + AsRef<str>>(
+    holding: &[K],
+    unread: &[K],
+    kept: Option<&K>,
+) -> Turn<K> {
+    if let Some(kept) = kept
+        && holding.contains(kept)
+    {
+        return Turn::Holder(kept.clone());
+    }
+    let first = |ids: &[K]| {
+        let mut ids = ids.to_vec();
+        ids.sort_by(|a, b| natural_cmp(a.as_ref(), b.as_ref()).then_with(|| a.cmp(b)));
+        ids.dedup();
+        ids
+    };
+    if !unread.is_empty() {
+        return Turn::Unknown(first(unread));
+    }
+    first(holding)
+        .into_iter()
+        .next()
+        .map_or(Turn::Free, Turn::Holder)
+}
+
 /// Orders identifiers naturally: runs of digits compare as numbers, so
 /// `OWL-9` comes before `OWL-10`; identifiers equal as numbers fall back to
 /// their text.
@@ -686,6 +733,29 @@ mod tests {
         assert_eq!(ready.dispatch, None);
         assert_eq!(ready.waiting[1], ("A", Wait::Slot(vec!["X-9", "X-10"])));
         assert_eq!(ready.waiting[1].1.tickets(), ["X-9", "X-10"]);
+    }
+
+    /// OWL-367: the holder keeps its turn while its ref holds the slot;
+    /// then an unread ref blocks the choice, else the first in identifier
+    /// order takes it.
+    #[test]
+    fn the_turn_stays_with_its_holder_then_goes_in_identifier_order() {
+        let holding = ["X-10", "X-9"];
+        assert_eq!(
+            slot_turn(&holding, &[], Some(&"X-10")),
+            Turn::Holder("X-10")
+        );
+        assert_eq!(
+            slot_turn(&holding, &["Z-1"], Some(&"X-10")),
+            Turn::Holder("X-10")
+        );
+        assert_eq!(slot_turn(&holding, &[], Some(&"Y-1")), Turn::Holder("X-9"));
+        assert_eq!(slot_turn(&holding, &[], None), Turn::Holder("X-9"));
+        assert_eq!(
+            slot_turn(&holding, &["Z-2", "Z-10", "Z-2"], None),
+            Turn::Unknown(vec!["Z-2", "Z-10"])
+        );
+        assert_eq!(slot_turn::<&str>(&[], &[], Some(&"Y-1")), Turn::Free);
     }
 
     #[test]

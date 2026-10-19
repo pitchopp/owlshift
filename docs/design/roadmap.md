@@ -77,7 +77,7 @@ The central bet, used by hand.
 
 - Every reply that counts is continued by watch.
 - Every delivered pull request that goes red or conflicts is repaired or parked by watch.
-- No `continue` is typed except where watch leaves the ticket to a person by design: restarting a parked ticket, or a ticket left at Build by a usage limit, a failed delivery or a refused push before any question round ([architecture](architecture.md) section 5, "Which tickets"). Each such `continue` is recorded with its reason. Since 2026-10-18 (OWL-340), watch also resumes a ticket left at Design, Design review, Build or Verify with an answered round (round > 0) while the tracker still shows it working; the parked ticket and a Build left at round 0 stay a person's.
+- No `continue` is typed except where watch leaves the ticket to a person by design: restarting a parked ticket, or a ticket left at Build by a usage limit, a failed delivery or a refused push before any question round ([architecture](architecture.md) section 5, "Which tickets"). Each such `continue` is recorded with its reason. Since 2026-10-18 (OWL-340), watch also resumes a ticket left at Design, Design review, Build or Verify with an answered round (round > 0) while the tracker still shows it working; the parked ticket and a Build left at round 0 stay a person's. Since 2026-10-19 (OWL-367), whatever its round: only the parked ticket stays a person's.
 - At least one delivered pull request is repaired after a red check, staged if none occurs, as P2's rounds were.
 - One pull request is repaired after a conflict, if a conflict occurs.
 
@@ -98,7 +98,7 @@ Owlshift picks its own work, one ticket at a time.
 - S3's intake records routing and dependencies; resources and zones wait for P6, as that step already says. The routing verdict is recorded and shown in P4, and followed from P5.
 - S12's `owlshift pause` comes with the background service (P7): until then, stopping watch stops the drain. The exclusion label is P4's.
 - Admission by delegation waits: decision D8's Linear app takes no delegation scope. A label or the ready state admits.
-- A ticket left at Build by a usage limit, a failed delivery or a refused push holds the drain's one slot until a person types `continue`, as P3 leaves those restarts to a person, or until watch resumes it (OWL-340, [architecture](architecture.md) section 5), which it does with an answered round (round > 0) only: a Build left at round 0 still needs `continue`.
+- A ticket left at Build by a usage limit, a failed delivery or a refused push holds the drain's one slot until watch resumes it ([architecture](architecture.md) section 5, "Which tickets"), or a person types `continue`. Watch did so with an answered round (round > 0) only (OWL-340), a Build left at round 0 needing `continue`, as P3 leaves those restarts to a person; since 2026-10-19 it does so whatever the round (OWL-367, "One step a pass"), since watch runs one stage step a pass and the drain's own tickets wait at their stage between two steps. S6's Build cut by a usage limit is resumed once the limit has reset, and a `do` typed by hand that a stop left there is picked up by a running watch too.
 
 **Exit gate.** Ten Owlshift tickets drained serially, at least one started by the merge of its blocker.
 

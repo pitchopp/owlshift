@@ -519,6 +519,21 @@ pub enum Landed {
     Quarantined,
 }
 
+/// What one stage step of `owlshift watch` hands the next step of its
+/// ticket (OWL-367, architecture section 5, "One step a pass"): what a
+/// command keeps in memory to bound its runs, which a step must not lose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Carried {
+    /// The resolver's chain of runs whose questions it all decided
+    /// ([`GatePolicy::chain_end`]): a round of a review pass the resolver
+    /// decides buys one more pass, so only the chain bounds such rounds in
+    /// a row.
+    pub chain: Chain,
+    /// A Build run of the delivery already integrated late comments
+    /// (OWL-139), which happens once: a further late comment opens a round.
+    pub integrated: bool,
+}
+
 /// Why `owlshift do` or `owlshift continue` stopped short of a delivery.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stop {
@@ -604,6 +619,14 @@ pub enum Stop {
     /// decided ([`follow`], OWL-209): nothing is wrong, nobody is the
     /// blocker.
     Watched { ticket: TicketId, seen: Box<Seen> },
+    /// `owlshift watch` ran one stage step of the ticket and kept its state
+    /// (OWL-367): it is now at `stage`, and its next step runs at a later
+    /// pass, going on from `carried`. Nobody is the blocker.
+    Stepped {
+        ticket: TicketId,
+        stage: Stage,
+        carried: Carried,
+    },
 }
 
 impl fmt::Display for Stop {
@@ -772,6 +795,12 @@ impl fmt::Display for Stop {
                 "{ticket} is back in the ready column with its intake record: `owlshift watch \
                  --drain` dispatches it in its turn, or `owlshift do {ticket}` runs it now."
             ),
+            Self::Stepped { ticket, stage, .. } => write!(
+                f,
+                "{ticket} is at {}, its state kept: watch runs its next step at a later pass, \
+                 once the project's slot is its turn.",
+                crate::watch::stage_label(*stage)
+            ),
         }
     }
 }
@@ -788,6 +817,23 @@ fn nothing_to_continue(ticket: &TicketId) -> Stop {
     Stop::Refused(format!(
         "nothing to continue: Owlshift keeps nothing on {ticket}; run `owlshift do {ticket}`"
     ))
+}
+
+/// What `owlshift watch` gives a continue it runs as one stage step
+/// (OWL-367).
+struct Watched {
+    carried: Carried,
+    slot_held_by: Option<TicketId>,
+}
+
+/// The stop of a stage step of watch's whose ticket is now in `state`
+/// (OWL-367): its state is kept, and its next step runs at a later pass.
+fn stepped(p: &Prepared, state: &TicketState) -> Stop {
+    Stop::Stepped {
+        ticket: p.ticket.clone(),
+        stage: state.stage(),
+        carried: p.carried(),
+    }
 }
 
 /// Whether the ticket waits for its decider's answers, parked or not.
@@ -1054,11 +1100,31 @@ struct Prepared {
     /// asking runs and their resolver runs cost. Never reset in a command,
     /// it bounds Intake's, Design's and Build's re-runs, a `replan` the
     /// resolver decided among them, by the project's pass limit and ceiling
-    /// ([`GatePolicy::chain_end`]).
+    /// ([`GatePolicy::chain_end`]). Under `owlshift watch` it is carried
+    /// from one stage step to the next ([`Carried`], OWL-367).
     chain: Chain,
+    /// `owlshift watch` runs this command one stage step at a time (OWL-367,
+    /// architecture section 5, "One step a pass"): it stops with
+    /// [`Stop::Stepped`] at the next change of stage, its state kept.
+    stepping: bool,
+    /// A Build run of this delivery already integrated late comments
+    /// (OWL-139), here or at an earlier step ([`Carried::integrated`]): a
+    /// further late comment opens a round instead.
+    integrated: bool,
+    /// Under `owlshift watch`, the ticket that holds the project's slot when
+    /// another does, which the RESUME of an answer check names (OWL-367).
+    slot_held_by: Option<TicketId>,
 }
 
 impl Prepared {
+    /// What the next stage step of this ticket goes on from (OWL-367).
+    fn carried(&self) -> Carried {
+        Carried {
+            chain: self.chain,
+            integrated: self.integrated,
+        }
+    }
+
     /// The asks the ticket ref keeps, none without one, without Build's
     /// refusal once a run of this command heeded it ([`Prepared::heeded`]).
     fn questions(&self) -> TicketQuestions {
@@ -1240,14 +1306,24 @@ impl OnDemand<'_> {
     /// person's `continue` does. `decision`, watch's `decision` event, is
     /// recorded once the ref is confirmed, before anything runs, so the log
     /// never says watch continued a ticket it left alone.
+    ///
+    /// Since OWL-367 it is one stage step: a RESUME stops it with
+    /// [`Stop::Stepped`], the stage running at a later pass. `slot_held_by`
+    /// is the ticket whose turn the project's slot is when another ticket
+    /// holds it, which the RESUME names.
     pub fn continue_seen(
         &self,
         ticket: &TicketId,
         seen: &str,
+        slot_held_by: Option<&TicketId>,
         decision: Data,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        self.continue_guarded(ticket, seen, None, decision, sink)
+        let watched = Watched {
+            carried: Carried::default(),
+            slot_held_by: slot_held_by.cloned(),
+        };
+        self.continue_guarded(ticket, seen, None, watched, decision, sink)
     }
 
     /// [`Self::continue_seen`], run only while the tracker, read under the
@@ -1259,31 +1335,45 @@ impl OnDemand<'_> {
     /// Verify (OWL-340, "Which tickets"), which shows working until its
     /// stage ends: one a person moved since is theirs, one in the ready
     /// column the drain's.
+    ///
+    /// Since OWL-367 it is one stage step, going on from `carried`, what the
+    /// ticket's previous step left ([`Stop::Stepped`]), and watch resumes a
+    /// ticket at Design, Design review, Build or Verify whatever its round.
     pub fn continue_shown(
         &self,
         ticket: &TicketId,
         seen: &str,
         shown: VisibleStage,
+        carried: Carried,
         decision: Data,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        self.continue_guarded(ticket, seen, Some(shown), decision, sink)
+        let watched = Watched {
+            carried,
+            slot_held_by: None,
+        };
+        self.continue_guarded(ticket, seen, Some(shown), watched, decision, sink)
     }
 
     /// [`Self::continue_seen`], with [`Self::continue_shown`]'s guard when
-    /// `shown` names a stage.
+    /// `shown` names a stage, one stage step from `watched`.
     fn continue_guarded(
         &self,
         ticket: &TicketId,
         seen: &str,
         shown: Option<VisibleStage>,
+        watched: Watched,
         decision: Data,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        let p = match self.prepare(ticket, Command::Continue) {
+        let mut p = match self.prepare(ticket, Command::Continue) {
             Ok(p) => p,
             Err(stop) => return Some(Err(stop)),
         };
+        p.stepping = true;
+        p.chain = watched.carried.chain;
+        p.integrated = watched.carried.integrated;
+        p.slot_held_by = watched.slot_held_by;
         if p.stored.as_ref().map(|stored| stored.commit.as_str()) != Some(seen) {
             return None;
         }
@@ -1369,6 +1459,13 @@ impl OnDemand<'_> {
         }
         if let Status::NeedsInput { .. } = state.status() {
             state = self.check_answers(&mut p, state, sink)?;
+            // Under watch the answer check is the step (OWL-367): what it
+            // resumes runs at a later pass. A ticket back at Ready, an intake
+            // round asked before OWL-269, goes back to the ready column now,
+            // which runs nothing.
+            if p.stepping && state.status() != Status::Active(Stage::Ready) {
+                return Err(stepped(&p, &state));
+            }
         }
         // At Intake, intake runs again (OWL-248): after a park, a usage
         // limit, or the answers to its round (OWL-269).
@@ -1407,7 +1504,19 @@ impl OnDemand<'_> {
         }
         // A stage's run may ask a new round, which goes to the decider now.
         p.current()?;
-        let dispatched = self.dispatch(&p, Command::Continue, sink)?;
+        // Watch's step into Build is the dispatch to Build (OWL-367): the
+        // step that reached Build stopped before it, so the base is fetched
+        // again and a branch with no commits of its own fast-forwarded to it
+        // (OWL-274), as when one command runs from Design review to Build. A
+        // person's `continue` keeps OWL-331's rule: no fast-forward.
+        let dispatched = if p.stepping
+            && state.status() == Status::Active(Stage::Build)
+            && !in_review_loop(&p)
+        {
+            self.dispatch_to_build(&mut p, Command::Continue, sink)?
+        } else {
+            self.dispatch(&p, Command::Continue, sink)?
+        };
         self.drive(&mut p, Command::Continue, dispatched, state, sink)
     }
 
@@ -1565,6 +1674,9 @@ impl OnDemand<'_> {
             repairing: false,
             // The person's project file, as every `[policy]` key (OWL-331).
             policy: self.config.gate_policy(),
+            stepping: false,
+            integrated: false,
+            slot_held_by: None,
         })
     }
 
@@ -2027,18 +2139,17 @@ impl OnDemand<'_> {
                 let late = self.late(p, &comments)?;
                 if !late.is_empty() {
                     let ids: Vec<&str> = late.iter().map(|c| c.id.as_str()).collect();
-                    let outcome = if integrating.is_none() {
-                        "integrate"
-                    } else {
-                        "ask"
-                    };
+                    // Once per delivery, an earlier step's integration
+                    // included (OWL-367).
+                    let first = integrating.is_none() && !p.integrated;
+                    let outcome = if first { "integrate" } else { "ask" };
                     sink.emit(
                         &p.ticket,
                         Some(&ran.run),
                         EventKind::Gate,
                         data([("late_comments", json!(ids)), ("outcome", json!(outcome))]),
                     );
-                    if integrating.is_none() {
+                    if first {
                         gather(&mut gathered.decisions, &[late_decision(&late)]);
                         integrating = Some(late);
                         // Nor is one that takes late comments (OWL-356).
@@ -2160,6 +2271,13 @@ impl OnDemand<'_> {
                         Verified::Passed(verified) => {
                             state = verified;
                             break;
+                        }
+                        // Under watch the Build and its Verify pass are the
+                        // step (OWL-367): the fix run is the next step's,
+                        // the integration of late comments carried.
+                        Verified::Revise(next) if p.stepping => {
+                            p.integrated |= integrating.is_some();
+                            return Err(stepped(p, &next));
                         }
                         // A Verify fix run follows, its findings given, and
                         // what the pass proposed kept for the delivery (a
@@ -2767,6 +2885,10 @@ impl OnDemand<'_> {
                     round,
                     understood: answer_check::understood(questions.round_asks(round)),
                     return_to: next.stage(),
+                    // Under watch, the ticket whose turn the slot is while
+                    // another holds it (OWL-367); the comment names it for
+                    // a stage that needs the slot.
+                    slot_held_by: p.slot_held_by.clone().filter(|holder| *holder != ticket),
                 };
                 let posted = Writer::new(self.tracker)
                     .post_resume(&resume)
@@ -3596,6 +3718,24 @@ impl OnDemand<'_> {
         Ok(true)
     }
 
+    /// For `owlshift watch` (OWL-367), under the project's lock: moves a
+    /// ticket whose answer check watch ran, and whose move to working after
+    /// the RESUME failed, to working while the tracker still shows needs
+    /// input. Returns whether it moved; the stage read or written otherwise
+    /// is the error.
+    pub(crate) fn working_after_resume(
+        &self,
+        ticket: &TicketId,
+        sink: &mut EventSink<'_>,
+    ) -> Result<bool, String> {
+        self.move_while(
+            ticket,
+            VisibleStage::NeedsInput,
+            VisibleStage::Working,
+            sink,
+        )
+    }
+
     /// Moves a ticket the tracker still shows as working back to review
     /// (architecture section 5, "The stage while a repair runs", OWL-259):
     /// after a repair's runs end, and after a read adopts a push a crash
@@ -3669,7 +3809,8 @@ impl OnDemand<'_> {
                 | Stop::UsageLimit { .. }
                 | Stop::Delivery(_)
                 | Stop::Watched { .. }
-                | Stop::Ready { .. } => false,
+                | Stop::Ready { .. }
+                | Stop::Stepped { .. } => false,
             },
         };
         if !moved_itself {

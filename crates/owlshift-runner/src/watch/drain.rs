@@ -494,7 +494,7 @@ impl Watch<'_> {
                 Taken::Ran(outcome) => {
                     memory.drain.warned.remove(ticket);
                     let outcome = as_reported(ticket, outcome);
-                    self.ran(memory, ticket, seen, &outcome, sink, continued);
+                    self.ran(memory, ticket, seen, &outcome, sink, out, continued);
                     return Intake::Done(Some(ticket.clone()));
                 }
             }
@@ -533,7 +533,7 @@ impl Watch<'_> {
             }
             Some(DispatchSeen::Taken(Taken::Ran(outcome))) => {
                 memory.drain.warned.remove(ticket);
-                self.ran(memory, ticket, seen, &outcome, sink, continued);
+                self.ran(memory, ticket, seen, &outcome, sink, out, continued);
             }
         }
     }
@@ -578,6 +578,7 @@ impl Watch<'_> {
     /// An intake's or a dispatch's outcome reported as a continue's, then
     /// held as one: a ref left as it was, an absent one included, holds the
     /// ticket for [`RETRY_AFTER`].
+    #[allow(clippy::too_many_arguments)]
     fn ran(
         &self,
         memory: &mut WatchMemory,
@@ -585,6 +586,7 @@ impl Watch<'_> {
         seen: Seen,
         outcome: &Result<Delivered, Stop>,
         sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
         continued: &mut Continued<'_>,
     ) {
         let on_demand = self.on_demand;
@@ -594,13 +596,25 @@ impl Watch<'_> {
         }
         continued(ticket, outcome, sink);
         let git = &on_demand.executor.git;
-        let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket)
-            .map(|stored| stored.map_or_else(String::new, |stored| stored.commit))
-            .ok();
-        let now = (on_demand.clock)();
-        memory
-            .holds
-            .after(ticket, seen, outcome, after.as_deref(), now);
+        let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket).ok();
+        let commit = after.as_ref().map(|stored| {
+            stored
+                .as_ref()
+                .map_or_else(String::new, |stored| stored.commit.clone())
+        });
+        let holds_now = after.flatten().as_ref().is_some_and(super::holds);
+        // A dispatch is its ticket's first stage step (OWL-367): it takes
+        // the slot's turn, and its next step is due at once.
+        self.after(
+            memory,
+            sink,
+            out,
+            ticket,
+            seen,
+            outcome,
+            commit.as_deref(),
+            holds_now,
+        );
     }
 
     /// A gesture by `account` that does not admit `ticket`: one `warning`

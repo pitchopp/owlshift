@@ -154,7 +154,8 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         | Stop::CheckFailed { .. }
         | Stop::Delivery(_)
         | Stop::Watched { .. }
-        | Stop::Ready { .. } => return None,
+        | Stop::Ready { .. }
+        | Stop::Stepped { .. } => return None,
     })
 }
 

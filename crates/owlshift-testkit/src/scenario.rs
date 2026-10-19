@@ -1035,6 +1035,7 @@ impl Driver {
                     round,
                     understood: answer_check::understood(self.questions.round_asks(round)),
                     return_to: self.state.stage(),
+                    slot_held_by: None,
                 }
                 .render();
                 self.post(&body)?;

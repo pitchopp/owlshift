@@ -165,6 +165,9 @@ impl OnDemand<'_> {
                 max_open_prs,
             });
         }
+        // The dispatch runs the ticket's first stage step (OWL-367): watch
+        // resumes it at a later pass.
+        p.stepping = true;
         let outcome = self.run_prepared(&mut p, Command::Drain, sink);
         Some(DispatchSeen::Taken(Taken::Ran(outcome)))
     }
