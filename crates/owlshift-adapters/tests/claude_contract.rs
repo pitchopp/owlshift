@@ -1,14 +1,14 @@
 //! Contract tests of the Claude Code harness: recorded `claude -p` output
 //! replayed through the adapter, with no model and no login.
 //!
-//! The fixtures in `fixtures/claude/` were recorded on 2026-10-17 with Claude
-//! Code 2.1.300 by `tests/claude_record.rs` (OWL-327), but for the
+//! The fixtures in `fixtures/claude/` were recorded on 2026-10-19 with Claude
+//! Code 2.1.302 by `tests/claude_record.rs` (OWL-338), but for the
 //! `peer_inbox_*` pair, made by hand on 2.1.283 (see its test). The recorder
 //! also scrubs them: session, message, request and tool-use ids, timestamps,
 //! paths and thinking signatures replaced, the user's skills, plugins,
 //! agents, commands and memory paths removed from the `init` event, and the
 //! inbox socket replaced (see `docs/design/build-plan.md`, OWL-14, OWL-46,
-//! OWL-52, OWL-53, OWL-77 and OWL-327 results). Each test states the exit status and standard error
+//! OWL-52, OWL-53, OWL-77, OWL-327 and OWL-338 results). Each test states the exit status and standard error
 //! the run had, since both decide the outcome; the recorder checks them.
 //! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
 //! limit on purpose (C7's open item). It follows the shapes C7 logged.
@@ -57,7 +57,7 @@ fn success() {
         }
     );
     assert_eq!(run.billing, Billing::Subscription);
-    assert_eq!(run.harness_version.as_deref(), Some("2.1.300"));
+    assert_eq!(run.harness_version.as_deref(), Some("2.1.302"));
     assert_eq!(run.model.as_deref(), Some("claude-haiku-5-5"));
     assert_eq!(run.malformed_lines, 0);
     assert!(run.permission_denials.is_empty());
@@ -68,10 +68,10 @@ fn success() {
         (2, 4),
         "{usage:?}"
     );
-    assert_eq!(usage.cache_read_input_tokens, 11092);
-    assert_eq!(usage.cache_creation_input_tokens, 6535);
-    assert_eq!(usage.cost_usd, Some(0.00142012));
-    assert_eq!((usage.duration_ms, usage.num_turns), (Some(1268), Some(1)));
+    assert_eq!(usage.cache_read_input_tokens, 16868);
+    assert_eq!(usage.cache_creation_input_tokens, 4115);
+    assert_eq!(usage.cost_usd, Some(0.00099388));
+    assert_eq!((usage.duration_ms, usage.num_turns), (Some(1371), Some(1)));
     let haiku = &usage.models["claude-haiku-5-5"];
     assert_eq!((haiku.input_tokens, haiku.output_tokens), (2, 4));
 
@@ -80,14 +80,14 @@ fn success() {
     assert_eq!(limit.window.as_deref(), Some("five_hour"));
     assert_eq!(
         limit.resets_at,
-        Some(Timestamp::from_second(1792274400).unwrap())
+        Some(Timestamp::from_second(1792425600).unwrap())
     );
-    assert_eq!(limit.five_hour_utilization, Some(0.03));
-    assert_eq!(limit.seven_day_utilization, Some(0.05));
+    assert_eq!(limit.five_hour_utilization, Some(0.31));
+    assert_eq!(limit.seven_day_utilization, Some(0.34));
 }
 
 /// Constructed: the warning a run reported on 2.1.284, when the seven-day
-/// window passed its threshold (the success run of OWL-77). The 2.1.300
+/// window passed its threshold (the success run of OWL-77). The 2.1.302
 /// recording reports a plain `allowed`, so this line keeps the warning read.
 #[test]
 fn rate_limit_warning() {
