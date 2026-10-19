@@ -1167,7 +1167,9 @@ impl Brief {
     /// The rules of format 21's `since` and `earlier` (OWL-356): the
     /// previous pass and every earlier finding's pass below the pass
     /// reviewed, at most [`MAX_PASS_FINDINGS`] earlier findings; a diff
-    /// since only for verify, its base a full commit id; changed parts,
+    /// since for verify, always, and only for it, its base a full commit
+    /// id, a pass with nothing to compare with having no `since`; changed
+    /// parts,
     /// steps and removed steps only for design review, the parts once each
     /// in the plan's order, the steps increasing within the plan's.
     fn check_since(&self, review: &ReviewBrief) -> Result<(), ContractError> {
@@ -1196,6 +1198,9 @@ impl Brief {
         let names_plan = !since.parts.is_empty() || !since.steps.is_empty() || since.removed > 0;
         if self.role == Role::Verify && names_plan {
             return invalid("verify's since names plan parts or steps".to_owned());
+        }
+        if self.role == Role::Verify && since.diff.is_none() {
+            return invalid("verify's since names no diff".to_owned());
         }
         if self.role == Role::DesignReview && since.diff.is_some() {
             return invalid("design review's since names a diff".to_owned());

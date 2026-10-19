@@ -478,7 +478,9 @@ pub(crate) fn plan_print(plan: &Plan) -> PlanPrint {
 /// the pass after `pass`: the parts whose hash differs, the steps of `plan`
 /// whose text `before` did not hold, matched by content so that a step an
 /// insertion renumbers is not new, and how many of `before`'s steps `plan`
-/// no longer holds.
+/// no longer holds. Steps are matched as a multiset: each step of `before`
+/// matches one step of `plan` at most, so two steps of one text count as
+/// two.
 pub(crate) fn plan_since(pass: NonZeroU32, before: &PlanPrint, plan: &Plan) -> ReviewSince {
     let now = plan_print(plan);
     let parts = PlanPart::ALL
@@ -488,18 +490,18 @@ pub(crate) fn plan_since(pass: NonZeroU32, before: &PlanPrint, plan: &Plan) -> R
         .filter(|((_, now), then)| now != then)
         .map(|((part, _), _)| *part)
         .collect();
-    let steps = now
-        .steps
-        .iter()
-        .enumerate()
-        .filter(|(_, hash)| !before.steps.contains(hash))
-        .filter_map(|(n, _)| u32::try_from(n + 1).ok().and_then(NonZeroU32::new))
-        .collect();
-    let removed = before
-        .steps
-        .iter()
-        .filter(|hash| !now.steps.contains(hash))
-        .count();
+    // The previous steps not matched yet, each consumed by its first match.
+    let mut unmatched: Vec<&String> = before.steps.iter().collect();
+    let mut steps = Vec::new();
+    for (n, hash) in now.steps.iter().enumerate() {
+        match unmatched.iter().position(|then| *then == hash) {
+            Some(at) => {
+                unmatched.swap_remove(at);
+            }
+            None => steps.extend(u32::try_from(n + 1).ok().and_then(NonZeroU32::new)),
+        }
+    }
+    let removed = unmatched.len();
     ReviewSince {
         pass,
         diff: None,
@@ -2553,6 +2555,26 @@ mod tests {
         assert!(since.diff.is_none());
         let same = plan_since(NonZeroU32::MIN, &print, &before);
         assert!(same.parts.is_empty() && same.steps.is_empty() && same.removed == 0);
+    }
+
+    /// Two steps of one text count as two: a duplicate dropped is removed,
+    /// a duplicate added is new (OWL-356).
+    #[test]
+    fn duplicated_steps_are_matched_one_for_one() {
+        let step = |text: &str| PlanStep {
+            what: text.to_owned(),
+            test: format!("{text} tested."),
+        };
+        let mut twice = plan(Vec::new());
+        twice.steps = vec![step("A"), step("A"), step("B")];
+        let mut once = twice.clone();
+        once.steps.remove(1);
+        let dropped = plan_since(NonZeroU32::MIN, &plan_print(&twice), &once);
+        assert!(dropped.steps.is_empty());
+        assert_eq!(dropped.removed, 1);
+        let added = plan_since(NonZeroU32::MIN, &plan_print(&once), &twice);
+        let steps: Vec<u32> = added.steps.iter().map(|n| n.get()).collect();
+        assert_eq!((steps, added.removed), (vec![2], 0));
     }
 
     fn plan(forks: Vec<Fork>) -> Plan {

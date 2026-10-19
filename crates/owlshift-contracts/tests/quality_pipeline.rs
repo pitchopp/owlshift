@@ -851,6 +851,11 @@ fn a_later_pass_is_told_what_changed_and_the_last_fix_is_kept() {
             "verify's since names plan parts or steps",
         ),
         (
+            "no diff at verify",
+            at_pass("verify", json!({ "pass": 1 }), json!([])).unwrap_err(),
+            "verify's since names no diff",
+        ),
+        (
             "a diff at design review",
             at_pass("design_review", since_diff.clone(), json!([])).unwrap_err(),
             "design review's since names a diff",
