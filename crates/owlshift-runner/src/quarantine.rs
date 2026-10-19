@@ -37,7 +37,9 @@ use owlshift_contracts::ids::TicketId;
 use crate::events::{EventSink, data, printable};
 use crate::executor::Violation;
 use crate::notify;
+use crate::on_demand;
 use crate::project::{ProjectDirs, ProjectLock};
+use crate::writer::Writer;
 
 /// The breach of a kept worktree whose `.git` link changed between runs.
 pub const LINK_CHANGED: &str = "the worktree's .git link changed";
@@ -225,6 +227,42 @@ fn not_recorded(error: &io::Error) -> crate::events::Data {
         ("what", json!("quarantine_not_recorded")),
         ("reason", json!(error.to_string())),
     ])
+}
+
+/// Tells `ticket`, which the quarantine holds up as `held` says, that it
+/// waits: one `decision` event (`watch` or `drain` = `waits`, `reason` =
+/// `quarantine`) and one WAITING comment, its `tracker_write` event, or a
+/// `warning` when it could not be posted. The caller tells each ticket once
+/// per marker.
+pub(crate) fn tell(tracker: &dyn Tracker, ticket: &TicketId, held: Held, sink: &mut EventSink<'_>) {
+    let by = match held {
+        Held::Answer => "watch",
+        Held::Ready => "drain",
+    };
+    sink.emit(
+        ticket,
+        None,
+        EventKind::Decision,
+        data([(by, json!("waits")), ("reason", json!("quarantine"))]),
+    );
+    let comment = QuarantineWait {
+        ticket: ticket.clone(),
+        held,
+    };
+    let (kind, written) = match Writer::new(tracker).post_quarantine_wait(&comment) {
+        Ok(posted) => (
+            EventKind::TrackerWrite,
+            on_demand::comment_written("WAITING", &posted),
+        ),
+        Err(error) => (
+            EventKind::Warning,
+            data([
+                ("what", json!("quarantine_comment_not_posted")),
+                ("reason", json!(error.to_string())),
+            ]),
+        ),
+    };
+    sink.emit(ticket, None, kind, written);
 }
 
 /// What a ticket held up by a quarantine waits to do.

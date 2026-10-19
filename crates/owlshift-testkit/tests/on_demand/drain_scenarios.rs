@@ -1062,3 +1062,222 @@ fn scenario_s13_proposed_follow_ups() {
         assert!(bench.record_of(id).is_none(), "{id}");
     }
 }
+
+impl Bench {
+    /// What the quarantine told `id` so far (OWL-368): the operator's
+    /// notifications, the `waits` events for the quarantine and the WAITING
+    /// comments on `id`.
+    fn quarantine_told(&self, id: &str) -> (usize, usize, usize) {
+        let waits = self
+            .events()
+            .iter()
+            .filter(|e| {
+                e.kind == EventKind::Decision
+                    && e.ticket.as_ref().is_some_and(|t| t.as_str() == id)
+                    && e.data.get("reason") == Some(&json!("quarantine"))
+            })
+            .count();
+        let comments = self
+            .comments_on(id)
+            .iter()
+            .filter(|c| c.starts_with("[owlshift] WAITING\n"))
+            .count();
+        (self.notified.0.borrow().len(), waits, comments)
+    }
+
+    /// `owlshift unquarantine`, the project's name typed.
+    fn unquarantine(&self) -> quarantine::Cleared {
+        let mut out = Vec::new();
+        let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
+        let mut ask = |_: &str| Ok(format!("{REPO}\n"));
+        quarantine::clear(&self.dirs(), &mut ask, &mut sink).unwrap()
+    }
+}
+
+/// OWL-368's acceptance, under `watch --drain`. DEMO-1's intake asks its
+/// decider; DEMO-2, taken in, is dispatched, and its Build writes in the
+/// main checkout. The runner notifies the quarantine once, as it writes the
+/// marker, in fixed words, and the park adds nothing; DEMO-2's PARKED
+/// comment says that the whole project is refused. The decider's answer on
+/// DEMO-1 then counts: two quarantined passes tell it once, one event and
+/// one WAITING comment, and notify nothing more, and what `owlshift doctor`
+/// reads names the run and the breach. Once `owlshift unquarantine` clears
+/// it, the next pass continues DEMO-1 and builds it.
+#[test]
+fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
+    let bench = Bench::draining("maintainer");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "Greet once more.",
+    );
+    let question = r#"[{"id":"Q1","category":"scope",
+        "context":"The ticket does not say the greeting's language.",
+        "text":"Which language?","recommendation":{"why":"The simplest reading of the ticket."}}]"#;
+    let mut breach = bench.reply(Some("Hello again"), Some(&done_for("DEMO-2")));
+    breach
+        .main_checkout
+        .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("questions", None, question))),
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        breach,
+        bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(&done_for("DEMO-1"))),
+    ];
+    let (outcomes, lines, printed) = bench.drain(replies, 6, |pass| match pass {
+        // DEMO-2's Build broke isolation: notified once; DEMO-1 waits.
+        3 => {
+            assert_eq!(bench.quarantine_told("DEMO-1"), (1, 0, 0));
+            bench.answer("Q1: English, please.");
+        }
+        // Told once, over two passes, and nothing more notified.
+        4 => assert_eq!(bench.quarantine_told("DEMO-1"), (1, 1, 1)),
+        5 => {
+            assert_eq!(bench.quarantine_told("DEMO-1"), (1, 1, 1));
+            let state = quarantine::marker_state(&bench.dirs()).unwrap();
+            let quarantine::MarkerState::Marked { text, .. } = state else {
+                panic!("{state:?}");
+            };
+            assert!(text.contains("of DEMO-2 broke isolation"), "{text}");
+            assert!(text.contains("planted.txt"), "{text}");
+            assert!(matches!(
+                bench.unquarantine(),
+                quarantine::Cleared::Cleared { .. }
+            ));
+        }
+        _ => {}
+    });
+    let notified = bench.notified.0.borrow().clone();
+    assert_eq!(notified.len(), 1, "{notified:?}\n{lines}\n{printed}");
+    assert!(
+        notified[0].starts_with(&format!("{REPO} is quarantined: run ")),
+        "{notified:?}"
+    );
+    assert!(
+        notified[0].contains(
+            " of DEMO-2 broke isolation (the main checkout changed). No ticket of the project \
+             runs until a person clears it with owlshift unquarantine"
+        ),
+        "{notified:?}"
+    );
+    assert!(!notified[0].contains("planted"), "{notified:?}");
+    // The breach's park notifies nothing more from the command's outcome.
+    let parked: Vec<&Stop> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .filter(|stop| {
+            matches!(
+                stop,
+                Stop::Parked {
+                    reason: ParkReason::IsolationBreach,
+                    ..
+                } | Stop::NotKept {
+                    landed: Landed::Quarantined,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(parked.len(), 1, "{outcomes:?}");
+    let demo_2 = TicketId::new("DEMO-2").unwrap();
+    assert_eq!(notify::blocker_line(&demo_2, parked[0]), None);
+    let park = bench
+        .comments_on("DEMO-2")
+        .into_iter()
+        .find(|c| c.starts_with("[owlshift] PARKED"))
+        .expect("DEMO-2's PARKED comment");
+    assert!(
+        park.contains("Owlshift refuses the whole project on that machine"),
+        "{park}"
+    );
+    assert!(park.contains("`owlshift unquarantine`"), "{park}");
+    // Cleared, DEMO-1 is continued and built; DEMO-2 stays parked.
+    assert_eq!(bench.dirs().unverified().unwrap(), None);
+    assert!(outcomes.last().unwrap().is_ok(), "{outcomes:?}\n{lines}");
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-2".to_owned()),
+            (Role::Build, "DEMO-2".to_owned()),
+            (Role::AnswerCheck, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Verify, "DEMO-1".to_owned()),
+        ]
+    );
+    assert_eq!(bench.quarantine_told("DEMO-1"), (1, 1, 1));
+    assert!(
+        lines.contains("watch: DEMO-1 waits for the quarantine to be cleared"),
+        "{lines}"
+    );
+}
+
+/// A marker no command notified, as a cut-off run leaves, found by `watch
+/// --drain` (OWL-368): its first pass notifies it, and the ticket the drain
+/// would dispatch is told once, over two passes, that it waits; nothing is
+/// built. The quarantined checkout is only read: a file-system monitor
+/// planted in its configuration never runs, and no ref of it moves.
+#[test]
+fn a_cut_off_run_is_notified_once_and_the_ready_ticket_told_once() {
+    let bench = Bench::draining("maintainer");
+    let checkout = bench.dirs().checkout();
+    let fired = bench.tmp.path().join("fsmonitor-fired");
+    let refs = || bench.env.run(&checkout, &["for-each-ref"]).unwrap();
+    let before = RefCell::new(Vec::new());
+    let replies = vec![bench.reply(None, Some(&intake_result("done", None, "")))];
+    let (outcomes, lines, printed) = bench.drain(replies, 3, |pass| {
+        if pass == 1 {
+            let monitor = bench.tmp.path().join("fsmonitor.sh");
+            fs::write(&monitor, format!("#!/bin/sh\n: > '{}'\n", fired.display())).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&monitor, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let monitor = monitor.to_string_lossy().into_owned();
+            bench
+                .env
+                .run(&checkout, &["config", "core.fsmonitor", &monitor])
+                .unwrap();
+            fs::write(
+                bench.dirs().unverified_file(),
+                "Run r1 of DEMO-1 started at 2026-10-19T00:00:00Z; its isolation check has not \
+                 passed.\n",
+            )
+            .unwrap();
+            *before.borrow_mut() = refs();
+        } else {
+            assert_eq!(bench.quarantine_told(TICKET), (1, 1, 1), "{pass}");
+        }
+    });
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(
+        bench.notified.0.borrow()[..],
+        [quarantine::found_line(REPO)]
+    );
+    let told: Vec<(String, Value, Value)> = waits(&bench.events())
+        .into_iter()
+        .filter(|(_, reason, _)| *reason == json!("quarantine"))
+        .collect();
+    assert_eq!(
+        told,
+        [(TICKET.to_owned(), json!("quarantine"), Value::Null)],
+        "{lines}"
+    );
+    let comment = bench
+        .comments_on(TICKET)
+        .into_iter()
+        .find(|c| c.starts_with("[owlshift] WAITING"))
+        .unwrap();
+    assert!(comment.contains("This ticket is ready"), "{comment}");
+    assert!(dispatched(&bench.events()).is_empty());
+    assert_eq!(bench.runs(), [(Role::Intake, TICKET.to_owned())]);
+    assert!(!fired.exists(), "the planted file-system monitor ran");
+    assert_eq!(refs(), *before.borrow());
+}

@@ -52,6 +52,7 @@ use owlshift_runner::executor::{
 };
 use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
+use owlshift_runner::quarantine;
 use owlshift_runner::routing::{ClaudeRouter, Router};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
@@ -3314,7 +3315,10 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
 /// the answer, live through a tracker that cannot list the comments, hold a
 /// reply within the project's own quiet window, skip a project another
 /// command holds and one a person must look at, then continue the ticket
-/// to a delivery through `continue`'s path.
+/// to a delivery through `continue`'s path. The marker a cut-off run left,
+/// which no command notified, is notified by the first pass that finds it,
+/// and the ticket whose answer counts is told once that it waits, over two
+/// passes, until `owlshift unquarantine` clears it (OWL-368).
 #[test]
 fn an_answer_on_the_ticket_resumes_it_under_watch() {
     let bench = Bench::new(true);
@@ -3342,6 +3346,18 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
     };
 
     let dirs = bench.dirs();
+    let quarantine_told = || {
+        let waits = data_of(&bench.events(), EventKind::Decision, "watch")
+            .iter()
+            .filter(|data| data["watch"] == "waits" && data["reason"] == "quarantine")
+            .count();
+        let comments = bench
+            .comments()
+            .iter()
+            .filter(|c| c.starts_with("[owlshift] WAITING\n"))
+            .count();
+        (bench.notified.0.borrow().len(), waits, comments)
+    };
     let mut lock = None;
     let mut pass = 0;
     let mut sleep = |interval: Duration| {
@@ -3377,14 +3393,25 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
                 drop(lock.take());
                 fs::write(dirs.unverified_file(), "A run was cut off.\n").unwrap();
             }
-            // Nothing is continued until a person clears it.
+            // Nothing is continued until a person clears it; the operator
+            // is notified once, the ticket told once.
             5 => {
                 assert_eq!(ran(), 1);
-                fs::remove_file(dirs.unverified_file()).unwrap();
+                assert_eq!(quarantine_told(), (1, 1, 1));
+            }
+            // The second pass tells nothing more. A person clears it.
+            6 => {
+                assert_eq!(ran(), 1);
+                assert_eq!(quarantine_told(), (1, 1, 1));
+                let mut out = Vec::new();
+                let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
+                let mut ask = |_: &str| Ok(format!("{REPO}\n"));
+                let cleared = quarantine::clear(&dirs, &mut ask, &mut sink).unwrap();
+                assert!(matches!(cleared, quarantine::Cleared::Cleared { .. }));
             }
             // Continued: the answer check, Build and its Verify pass ran
             // (OWL-304). The next pass finds no question waiting.
-            6 => assert_eq!(ran(), 4),
+            7 => assert_eq!(ran(), 4),
             _ => return false,
         }
         true
@@ -3402,11 +3429,16 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
         ],
         &mut sleep,
     );
-    assert_eq!(pass, 7, "{lines}\n{printed}");
+    assert_eq!(pass, 8, "{lines}\n{printed}");
     match &outcomes[..] {
         [Ok(delivered)] => assert!(delivered.opened, "{delivered:?}"),
         other => panic!("{other:?}\n{lines}\n{printed}"),
     }
+    assert_eq!(
+        bench.notified.0.borrow()[..],
+        [quarantine::found_line(REPO)],
+        "{lines}"
+    );
     // The answer check, then Build and its Verify pass (OWL-304), after
     // `do`'s Build; one warning only.
     let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
@@ -3423,13 +3455,17 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
         "{comments:?}"
     );
     assert_eq!(bench.stage(), "In Review");
-    // The continue, then, in the same pass, watch's first read of the pull
-    // request it now follows (OWL-209).
+    // The wait for the quarantine; the continue, then, in the same pass,
+    // watch's first read of the pull request it now follows (OWL-209).
     let decided = data_of(&bench.events(), EventKind::Decision, "watch");
-    assert_eq!(decided.len(), 2, "{decided:?}");
-    assert_eq!(decided[0]["watch"], "continue");
+    assert_eq!(decided.len(), 3, "{decided:?}");
     assert_eq!(
-        (&decided[1]["watch"], &decided[1]["verdict"]),
+        (&decided[0]["watch"], &decided[0]["reason"]),
+        (&json!("waits"), &json!("quarantine"))
+    );
+    assert_eq!(decided[1]["watch"], "continue");
+    assert_eq!(
+        (&decided[2]["watch"], &decided[2]["verdict"]),
         (&json!("read"), &json!("green"))
     );
     assert!(

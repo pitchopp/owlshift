@@ -56,6 +56,13 @@
 //! command holds the project's lock, the pass ends at its snapshot, before
 //! any ticket is read.
 //!
+//! Since OWL-368, a snapshot that finds the `unverified` marker still reads
+//! the ticket refs, through the runner's read-only plumbing, and the pass
+//! then runs nothing: it notifies a marker no command notified, prints the
+//! project's line once, and tells each waiting ticket whose answer counts,
+//! and the ticket the drain would dispatch, that it waits for the quarantine,
+//! once per ticket and marker ([`crate::quarantine`]).
+//!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
 //! continue that left the ticket ref as it was is held for [`RETRY_AFTER`],
@@ -66,7 +73,7 @@
 //! (OWL-158, OWL-169 for a RESUME), so the comment is not posted again at
 //! each retry.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::time::Duration;
@@ -87,6 +94,7 @@ use crate::follow::{self, Following, Look};
 use crate::on_demand::{self, Delivered, Landed, OnDemand, PIPELINE, Stop};
 use crate::pr_reviews;
 use crate::project::ProjectLock;
+use crate::quarantine::{self, Held, Record};
 use crate::reversal::{self, Current};
 use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::writer::VisibleStage;
@@ -328,8 +336,9 @@ pub struct Watch<'a> {
 enum Project {
     /// Another command holds the project's lock.
     Busy,
-    /// A run's isolation check did not pass: a person looks first.
-    Quarantined,
+    /// A run's isolation check did not pass: a person looks first. The
+    /// marker's text, so that another quarantine is printed too.
+    Quarantined(String),
     /// The snapshot failed.
     Unread(String),
     /// The tickets whose questions wait, and those whose pull request watch
@@ -360,6 +369,31 @@ struct Memory {
     /// which must show working): the commit their ref was at, and until when
     /// their stage is not read again unless the ref moves.
     elsewhere: HashMap<TicketId, (String, Timestamp)>,
+    /// What watch knows of the marker that quarantines the project, while
+    /// one stands (OWL-368).
+    quarantine: Option<Quarantine>,
+}
+
+/// What watch knows of one marker: what its [`Record`] says, joined with
+/// what watch did and could not write there yet.
+#[derive(Debug)]
+struct Quarantine {
+    /// The marker's text, unique to it.
+    marker: String,
+    /// The operator was notified of it.
+    notified: bool,
+    /// The tickets told that they wait for it.
+    told: BTreeSet<TicketId>,
+    /// Those of `told` the record does not hold yet.
+    pending: BTreeSet<TicketId>,
+}
+
+/// What a snapshot read: the ticket refs, and the marker's text when one
+/// stands.
+#[derive(Default)]
+struct Snapshot {
+    refs: Vec<(TicketId, Result<Stored, String>)>,
+    quarantine: Option<String>,
 }
 
 /// What watch keeps, per ticket, of the stages a stop left at working
@@ -442,8 +476,12 @@ impl Watch<'_> {
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
     ) {
-        let read = match self.snapshot() {
-            Ok(read) => read,
+        let read = match self.snapshot(memory, sink) {
+            Ok(Snapshot {
+                quarantine: Some(marker),
+                refs,
+            }) => return self.quarantined(memory, sink, out, continued, marker, refs),
+            Ok(snapshot) => snapshot.refs,
             Err(project) => return self.note(memory, out, project),
         };
         let mut waiting = Vec::new();
@@ -566,7 +604,7 @@ impl Watch<'_> {
                 continue;
             }
             if watched(status) {
-                self.look(memory, sink, out, continued, &ticket, &stored);
+                self.look(memory, sink, out, continued, &ticket, &stored, false);
             } else if let Some(shown) = resume {
                 self.resume_stage(
                     memory,
@@ -595,6 +633,115 @@ impl Watch<'_> {
                 Status::Active(Stage::Watch),
             );
             self.follow(memory, sink, out, continued, &ticket, &stored);
+        }
+    }
+
+    /// A pass while the marker `marker` quarantines the project (OWL-368):
+    /// its line once, then each waiting ticket whose answer counts is told
+    /// that it waits, once per marker, instead of continued. Nothing else
+    /// runs: no continue, follow, stage move or resume.
+    fn quarantined(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        continued: &mut Continued<'_>,
+        marker: String,
+        refs: Vec<(TicketId, Result<Stored, String>)>,
+    ) {
+        self.note(memory, out, Project::Quarantined(marker));
+        for (ticket, stored) in refs {
+            let Ok(stored) = stored else {
+                continue;
+            };
+            if TicketState::try_from(&stored.record.state).is_ok_and(|s| watched(s.status())) {
+                self.look(memory, sink, out, continued, &ticket, &stored, true);
+            }
+        }
+    }
+
+    /// Tells `ticket`, held up as `held` says, that it waits for the
+    /// quarantine (OWL-368): once per marker, and never a ticket of another
+    /// team, which only a ref a breaking run planted could name. The record
+    /// keeps it at once when the project's lock is free, else at the next
+    /// snapshot.
+    fn tell(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        held: Held,
+    ) {
+        let on_demand = self.on_demand;
+        let Some(known) = memory.quarantine.as_mut() else {
+            return;
+        };
+        if known.told.contains(ticket) || on_demand::check_team(on_demand.config, ticket).is_err()
+        {
+            return;
+        }
+        quarantine::tell(on_demand.tracker, ticket, held, sink);
+        known.told.insert(ticket.clone());
+        let told = Record {
+            notified: false,
+            told: BTreeSet::from([ticket.clone()]),
+        };
+        let dirs = on_demand.dirs;
+        let kept = matches!(
+            dirs.lock(),
+            Ok(Some(lock)) if told.merge_into(dirs, &lock, &known.marker).is_ok()
+        );
+        if !kept {
+            known.pending.insert(ticket.clone());
+        }
+        self.line(
+            out,
+            &format!("{ticket} waits for the quarantine to be cleared: said so on the ticket"),
+        );
+    }
+
+    /// Under the snapshot's lock `lock`, what watch knows of the marker
+    /// `marker`: what its record says, what watch could not write there
+    /// before, and the operator notified of it if no command did.
+    fn keep_quarantine(
+        &self,
+        memory: &mut Memory,
+        lock: &ProjectLock,
+        marker: &str,
+        sink: &mut EventSink<'_>,
+    ) {
+        let dirs = self.on_demand.dirs;
+        if memory
+            .quarantine
+            .as_ref()
+            .is_none_or(|known| known.marker != marker)
+        {
+            memory.quarantine = Some(Quarantine {
+                marker: marker.to_owned(),
+                notified: false,
+                told: BTreeSet::new(),
+                pending: BTreeSet::new(),
+            });
+        }
+        let Some(known) = memory.quarantine.as_mut() else {
+            return;
+        };
+        let record = Record::read(dirs, marker);
+        known.notified |= record.notified;
+        known.told.extend(record.told);
+        if !known.pending.is_empty() {
+            let pending = Record {
+                notified: false,
+                told: known.pending.clone(),
+            };
+            if pending.merge_into(dirs, lock, marker).is_ok() {
+                known.pending.clear();
+            }
+        }
+        if !known.notified {
+            known.notified =
+                quarantine::notify_found(self.on_demand.notifier, dirs, lock, marker, sink);
         }
     }
 
@@ -1184,40 +1331,66 @@ impl Watch<'_> {
         Ok(Some(lock))
     }
 
-    /// The ticket refs, read under the project's lock, once its marker says
-    /// no run left it unverified. No dedicated checkout yet: nothing was
-    /// asked.
-    #[allow(clippy::type_complexity)]
-    fn snapshot(&self) -> Result<Vec<(TicketId, Result<Stored, String>)>, Project> {
+    /// The ticket refs, read under the project's lock, and the marker of a
+    /// run whose isolation check did not pass, when one stands. While it
+    /// does, what watch knows of it is brought up to date under that lock
+    /// (`keep_quarantine`, OWL-368), and the refs are read through the
+    /// runner's read-only plumbing alone, nothing written: none when they
+    /// cannot be. The marker is read first, so that one left once the
+    /// dedicated checkout was deleted still stands. No dedicated checkout
+    /// and no marker: nothing was asked.
+    fn snapshot(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Snapshot, Project> {
         let dirs = self.on_demand.dirs;
         let checkout = dirs.checkout();
-        if fs::symlink_metadata(&checkout).is_err() {
-            return Ok(Vec::new());
+        let checked_out = fs::symlink_metadata(&checkout).is_ok();
+        if !checked_out && fs::symlink_metadata(dirs.unverified_file()).is_err() {
+            memory.quarantine = None;
+            return Ok(Snapshot::default());
         }
-        let _lock = match dirs.lock() {
+        let lock = match dirs.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return Err(Project::Busy),
             Err(e) => return Err(Project::Unread(format!("the project's lock: {e}"))),
         };
-        match dirs.unverified() {
-            Ok(None) => {}
-            Ok(Some(_)) => return Err(Project::Quarantined),
+        let quarantine = match dirs.unverified() {
+            Ok(quarantine) => quarantine,
             Err(e) => return Err(Project::Unread(format!("the project's marker: {e}"))),
+        };
+        match &quarantine {
+            Some(marker) => self.keep_quarantine(memory, &lock, marker, sink),
+            None => memory.quarantine = None,
+        }
+        if !checked_out {
+            return Ok(Snapshot {
+                refs: Vec::new(),
+                quarantine,
+            });
         }
         let git = &self.on_demand.executor.git;
-        let tickets = ticket_ref::list(git, &checkout).map_err(Project::Unread)?;
-        Ok(tickets
+        let tickets = match ticket_ref::list(git, &checkout) {
+            Ok(tickets) => tickets,
+            Err(_) if quarantine.is_some() => Vec::new(),
+            Err(e) => return Err(Project::Unread(e)),
+        };
+        let refs = tickets
             .into_iter()
             .map(|ticket| {
                 let stored = ticket_ref::read(git, &checkout, &ticket)
                     .and_then(|stored| stored.ok_or_else(|| "its ticket ref is gone".to_owned()));
                 (ticket, stored)
             })
-            .collect())
+            .collect();
+        Ok(Snapshot { refs, quarantine })
     }
 
     /// One waiting ticket: its comments, whether the reply counts, and the
-    /// continue when it does.
+    /// continue when it does; while `quarantined`, telling it that it waits
+    /// instead, whatever holds it (OWL-368).
+    #[allow(clippy::too_many_arguments)]
     fn look(
         &self,
         memory: &mut Memory,
@@ -1226,6 +1399,7 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         stored: &Stored,
+        quarantined: bool,
     ) {
         let on_demand = self.on_demand;
         let questions = &stored.record.questions;
@@ -1254,6 +1428,9 @@ impl Watch<'_> {
         else {
             return;
         };
+        if quarantined {
+            return self.tell(memory, sink, out, ticket, Held::Answer);
+        }
         let seen = Seen {
             commit: stored.commit.clone(),
             answer: answer_check::newest_decider_edit(&comments, &decider),
@@ -1453,9 +1630,10 @@ impl Watch<'_> {
                 "another command is working the project: watch looks again at its next pass"
                     .to_owned()
             }
-            Project::Quarantined => format!(
-                "a run's isolation check did not pass, so nothing is continued until a person \
-                 looks: see {}",
+            Project::Quarantined(_) => format!(
+                "a run's isolation check did not pass, so no ticket of the project is continued \
+                 or built until a person clears the quarantine: `owlshift unquarantine` shows \
+                 what {} says and clears it",
                 self.on_demand.dirs.unverified_file().display()
             ),
             Project::Unread(reason) => format!("the ticket refs could not be read: {reason}"),

@@ -6185,7 +6185,7 @@ fn name_of(decider: &AskDecider, ticket: &Ticket) -> String {
 }
 
 /// The `tracker_write` event of a marked comment the runner posted.
-fn comment_written(kind: &str, comment: &Comment) -> Data {
+pub(crate) fn comment_written(kind: &str, comment: &Comment) -> Data {
     data([
         ("target", json!("tracker")),
         ("action", json!("comment")),
