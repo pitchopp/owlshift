@@ -1916,30 +1916,32 @@ mod tests {
         let common = dir.path();
         fake_entry(common, "own", "owlshift/own");
         let other = fake_entry(common, "other", "owlshift/other");
-        fs::write(other.join("index.lock"), "").unwrap();
+        // The snapshot holds no lock: it appears after, and goes while the
+        // entries are read, in the same pass where `index` really changes.
         let before = snapshot_of(common);
-        // The lock goes while the entries are read, and `index` really changes
-        // in the same pass.
         fs::write(other.join("index.lock"), "").unwrap();
+        fs::write(other.join("index"), "tampered\n").unwrap();
         let gone = |path: &Path| {
             if path.ends_with("index.lock") {
                 fs::remove_file(path).unwrap();
             }
         };
-        let read = read_worktree_entries(common, &before.own, &gone).unwrap();
-        assert!(!read.contains_key(&Path::new("worktrees/other/index.lock").to_owned()));
-        fs::write(other.join("index"), "tampered\n").unwrap();
         let after = MainState {
             worktree_entries: read_worktree_entries(common, &before.own, &gone).unwrap(),
             ..MainState::default()
         };
+        assert!(
+            !after
+                .worktree_entries
+                .contains_key(&Path::new("worktrees/other/index.lock").to_owned())
+        );
         let alone = Concurrent::default();
-        // The lock was in the snapshot, so its removal shows with the real change.
+        // Only the real change is reported, not the lock that vanished.
         assert_eq!(
             before
                 .main
                 .changed_entries(&after, &alone, &alone, &BTreeMap::new()),
-            ["worktrees/other/index", "worktrees/other/index.lock"]
+            ["worktrees/other/index"]
         );
     }
 

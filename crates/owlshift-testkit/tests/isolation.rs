@@ -797,6 +797,57 @@ fn another_worktrees_entry_is_guarded_and_the_runs_own_is_not() {
     );
 }
 
+/// Every file under `dir` with its bytes, by path relative to `dir`.
+fn files_under(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let name = path.strip_prefix(root).unwrap().to_string_lossy();
+                out.insert(name.replace('\\', "/"), fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// A bare `gc` by the agent's git, with another worktree in the clone: git
+/// itself rewrites the reflogs of every entry (git 2.54.0 gave the first
+/// line of each `logs/HEAD` a trailing tab, build plan, "OWL-339 live
+/// checks"), another's included. The check reports exactly what changed in
+/// that entry: in a confined run the write is refused (the agent cannot
+/// lock the entry's `HEAD`), so nothing changes and nothing is reported,
+/// while a bare run that does rewrite it is found, a documented limit
+/// (OWL-339).
+#[test]
+fn a_gc_by_the_agents_git_is_reported_exactly_where_it_rewrites_another_entry() {
+    let (f, other) = with_other();
+    let before = files_under(&other);
+    let found = f.around(|f| f.agent_git(&["gc", "--quiet"]));
+    let after = files_under(&other);
+    let changed: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|name| before.get(*name) != after.get(*name))
+        .map(|name| format!("worktrees/{OTHER}/{name}"))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if changed.is_empty() {
+        assert_eq!(found, []);
+    } else {
+        assert_eq!(
+            found,
+            [Violation::WorktreeEntries(changed)],
+            "gc changed another entry"
+        );
+    }
+}
+
 /// A change past the first mebibyte of a large file of another's entry is
 /// found: the whole file counts (OWL-339).
 #[test]
@@ -859,6 +910,16 @@ fn a_concurrent_runs_entry_is_left_out_when_the_check_is_told_of_it() {
     assert_eq!(check(&before, named.clone(), named.clone()), []);
     assert_eq!(check(&before, Concurrent::default(), named.clone()), []);
     assert_eq!(check(&before, named.clone(), Concurrent::default()), []);
+    // Or of a run that ended, in either answer or both, at the commit its
+    // own check verified: the entry it left is its too.
+    let tip = f.commit(&other_worktree, "HEAD");
+    let ended = || Concurrent {
+        ended: [(OTHER.to_owned(), tip.clone())].into(),
+        ..Concurrent::default()
+    };
+    assert_eq!(check(&before, ended(), ended()), []);
+    assert_eq!(check(&before, Concurrent::default(), ended()), []);
+    assert_eq!(check(&before, ended(), Concurrent::default()), []);
     // Told of an unrelated run, or of none, the entry is a breach.
     for told in [running(&["owlshift/unrelated"]), Concurrent::default()] {
         let found = check(&before, told.clone(), told);
