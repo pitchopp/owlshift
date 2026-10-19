@@ -607,7 +607,6 @@ fn a_plan_document_reaches_linear_through_the_app() {
         },
         version: 1,
         passes: Vec::new(),
-        not_asked: Vec::new(),
     };
 
     // 1. Made, through the app.
