@@ -149,7 +149,9 @@ result = "results/build-done.json"
 event = "completed"
 stage = "verify"
 failed_runs = 0
-brief_latest_ask = ["Q1"]
-brief_thread = ["decider", "decider", "owlshift", "decider", "owlshift", "decider", "owlshift"]
+# Both rounds are answered: the Build reads each as its readings (OWL-359).
+brief_latest_ask = []
+brief_entries = ["answered", "decider", "decider", "owlshift", "decider", "owlshift", "answered", "decider", "owlshift"]
+brief_thread =["decider", "decider", "owlshift", "decider", "owlshift", "decider", "owlshift"]
 branch_pushed = true
 branch_files = { "GREETING.md" = "Hello, reader.\n" }

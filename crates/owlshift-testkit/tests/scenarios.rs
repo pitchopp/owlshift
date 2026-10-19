@@ -425,8 +425,10 @@ fn decisions_and_asks_take_their_comments_places_in_the_thread() {
         resolve = { result = "results/resolver-decides-link.json" }
 
         [[step]]
+        # The round is answered: the Build reads it as its readings (OWL-359),
+        # where the answer check before it read it whole.
         run = { result = "results/build-done.json" }
-        expect = { event = "completed", brief_entries = ["decision", "questions", "decider", "owlshift", "decision"] }
+        expect = { event = "completed", brief_entries = ["decision", "answered", "decider", "owlshift", "decision"] }
     "#;
     if let Err(error) = play_str(
         "thread",

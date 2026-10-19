@@ -2545,8 +2545,24 @@ fn latest_ask(brief: &Brief) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A brief's thread, an entry per word: `questions`, `reask`, `decision`,
-/// or the comment author's relation.
+/// The ids of a brief's last `answered` round (OWL-359), whose questions the
+/// decider answered: no ask is open after it.
+fn last_answered(brief: &Brief) -> Vec<String> {
+    brief
+        .thread
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            ThreadEntry::Answered { questions, .. } => {
+                Some(questions.iter().map(|q| q.id.to_string()).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A brief's thread, an entry per word: `questions`, `reask`, `answered`,
+/// `decision`, or the comment author's relation.
 fn shape(brief: &Brief) -> Vec<String> {
     brief
         .thread
@@ -2554,6 +2570,7 @@ fn shape(brief: &Brief) -> Vec<String> {
         .map(|entry| match entry {
             ThreadEntry::Questions { .. } => "questions".to_owned(),
             ThreadEntry::Reask { .. } => "reask".to_owned(),
+            ThreadEntry::Answered { .. } => "answered".to_owned(),
             ThreadEntry::Decision { .. } => "decision".to_owned(),
             ThreadEntry::Comment { author, .. } => format!("{:?}", author.relation),
         })
@@ -2827,20 +2844,21 @@ fn a_question_round_goes_through_continue_to_a_delivery() {
             "Decider"
         ]
     );
+    // The Build reads the answered round as its readings, Q1's from the
+    // first check and Q2's from the last, its re-ask folded in (OWL-359).
     assert_eq!(build.role, Role::Build);
     assert_eq!(
         shape(&build),
         [
-            "questions",
-            "Decider",
-            "reask",
-            "Decider",
-            "Owlshift",
-            "Decider",
-            "Owlshift"
+            "answered", "Decider", "Decider", "Owlshift", "Decider", "Owlshift"
         ]
     );
-    assert_eq!(latest_ask(&build), ["Q2"]);
+    assert!(latest_ask(&build).is_empty());
+    let Some(ThreadEntry::Answered { questions, .. }) = build.thread.first() else {
+        panic!("{:?}", build.thread)
+    };
+    let understood: Vec<&str> = questions.iter().map(|q| q.understood.as_str()).collect();
+    assert_eq!(understood, ["English, the recommendation.", "No sign-off."]);
     let comments = bench.comments();
     assert_eq!(comments.len(), 8, "{comments:?}");
     let resume = &comments[6];
@@ -4247,7 +4265,7 @@ fn a_ticket_without_an_assignee_is_decided_by_the_owner_of_its_zone() {
     let (delivered, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let build = bench.last_of(Role::Build);
-    assert_eq!(shape(&build), ["questions", "Other", "Decider", "Owlshift"]);
+    assert_eq!(shape(&build), ["answered", "Other", "Decider", "Owlshift"]);
 }
 
 /// The owners are read from the project file the base commit holds: an
@@ -4429,7 +4447,7 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     let build = bench.last_of(Role::Build);
     assert_eq!(
         shape(&build),
-        ["decision", "questions", "Decider", "Owlshift"]
+        ["decision", "answered", "Decider", "Owlshift"]
     );
     let report = bench.comments().pop().unwrap();
     assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
@@ -6249,11 +6267,7 @@ fn a_fix_run_that_asks_goes_to_the_decider_and_the_answer_resumes_watch() {
     assert_eq!(bench.stage(), "In Review");
     let fix = bench.briefs().pop().unwrap();
     assert!(fix.check_failure.is_some());
-    assert!(
-        fix.thread
-            .iter()
-            .any(|e| matches!(e, ThreadEntry::Questions { .. }))
-    );
+    assert_eq!(last_answered(&fix), ["Q1"]);
     assert!(
         decider_says(&fix)
             .iter()

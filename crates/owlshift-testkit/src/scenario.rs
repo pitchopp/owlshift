@@ -1424,6 +1424,7 @@ impl Driver {
                     ThreadEntry::Comment { author, .. } => Some(author.relation),
                     ThreadEntry::Questions { .. }
                     | ThreadEntry::Reask { .. }
+                    | ThreadEntry::Answered { .. }
                     | ThreadEntry::Decision { .. } => None,
                 })
                 .collect();
@@ -1441,6 +1442,7 @@ impl Driver {
                     ThreadEntry::Comment { author, .. } => name(&author.relation),
                     ThreadEntry::Questions { .. } => "questions".to_owned(),
                     ThreadEntry::Reask { .. } => "reask".to_owned(),
+                    ThreadEntry::Answered { .. } => "answered".to_owned(),
                     ThreadEntry::Decision { .. } => "decision".to_owned(),
                 })
                 .collect();

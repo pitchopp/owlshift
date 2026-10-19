@@ -453,7 +453,9 @@ fn a_blocker_two_passes_left_is_asked_and_another_finding_is_proposed() {
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let fix = bench.last_of(Role::Build);
     assert!(fix.findings.is_none(), "the answers are in the thread");
-    assert_eq!(latest_ask(&fix), ["Q1"]);
+    // The round is answered: it reads as its readings (OWL-359).
+    assert!(latest_ask(&fix).is_empty());
+    assert_eq!(last_answered(&fix), ["Q1"]);
     assert_eq!(
         bench.last_of(Role::Verify).review.unwrap().pass.get(),
         3,

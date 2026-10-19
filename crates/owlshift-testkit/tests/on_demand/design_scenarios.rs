@@ -610,7 +610,9 @@ fn a_finding_two_passes_left_goes_to_the_decider_and_buys_one_more_pass() {
     assert_eq!(after.role, Role::Design);
     assert!(after.findings.is_none() && !after.approval);
     assert!(after.plan.is_some());
-    assert_eq!(latest_ask(after), ["Q1"]);
+    // The round is answered: it reads as its readings (OWL-359).
+    assert!(latest_ask(after).is_empty());
+    assert_eq!(last_answered(after), ["Q1"]);
     let review = bench.record().review.unwrap();
     assert_eq!(review.passes.len(), 4);
     assert_eq!(review.passes[2].pass.get(), 3);

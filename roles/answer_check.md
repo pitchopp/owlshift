@@ -1,6 +1,6 @@
 +++
 role = "answer_check"
-brief_format = 18
+brief_format = 19
 result_format = 12
 +++
 
@@ -14,6 +14,7 @@ The brief is a JSON file from the runner, and all you need: read no other file a
 
 - `questions` entries: a `round` of questions, each with its `id` (`Q1`, `Q2`, …), `category`, `context`, `text`, and when given `options`, each a `label` and maybe a `detail`, and a `recommendation`, its `why` and, with options, the `option` it names. The decider saw the options lettered A, B, C… in their order, the recommended one starred;
 - `reask` entries: questions of an earlier `round` asked again, under their original `id`;
+- `answered` entries: earlier rounds the decider answered, each question's `id`, `text` and what was `understood` of the answer. They are context, never an ask;
 - `comment` entries: what people wrote on the ticket, with the `body` and the `author.relation` of who wrote it, and the runner's own, whose PLAN, RESUME and DELIVERY comments read as their first line and where their content is (the plan they showed is the brief's `plan`, given when the ticket has one, which an approval question asks about);
 - `decision` entries: questions of a run that the runner decided without the decider. They are context, never an answer to a question of an ask.
 
@@ -32,7 +33,7 @@ Judge where each question stands after the decider's last word on it. Answers gi
 - `unanswered`: nothing the decider wrote addresses it, or the only reply is ambiguous, such as a bare "ok" to a question with no `recommendation`, or a bare letter when the latest ask has several questions.
 - `counter_question`: the decider's last word on it is a question back, such as what an option means, instead of an answer.
 
-When in doubt between `answered` and another class, do not choose `answered`: an incomplete answer must never start work. Each verdict has a `reason`, one or two sentences the decider will read: for `answered`, what you understood the answer to be; for `partial` and `unanswered`, what is still missing; for `counter_question`, what the decider asked.
+When in doubt between `answered` and another class, do not choose `answered`: an incomplete answer must never start work. Each verdict has a `reason`, one or two sentences the decider will read: for `answered`, what you understood the answer to be, with the chosen option's letter and label, or the answer in the decider's words, since later runs read the round by it alone; for `partial` and `unanswered`, what is still missing; for `counter_question`, what the decider asked.
 
 ## Replying to a counter-question
 

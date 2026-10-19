@@ -18,7 +18,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::brief::{
-    MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry, validate_thread,
+    DecidedQuestion, MAX_CHOICE_BYTES, MAX_REFUSED_CHOICES, MAX_RESULT_REFUSAL_BYTES,
+    ShortQuestion, ThreadEntry, validate_thread,
 };
 use crate::format::{
     self, CLAIM_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
@@ -612,11 +613,25 @@ pub struct Reversal {
 }
 
 impl KeptDecision {
-    /// The decision as a brief's thread shows it.
+    /// The decision as a brief's thread shows it, its question whole: what a
+    /// thread shows of a decision the decider replied to (OWL-359).
     pub fn entry(&self) -> ThreadEntry {
+        self.entry_with(DecidedQuestion::Whole(self.question.clone()))
+    }
+
+    /// The decision as a brief's thread shows it, its question by its id and
+    /// text alone (OWL-359): the decision says what was chosen.
+    pub fn short_entry(&self) -> ThreadEntry {
+        self.entry_with(DecidedQuestion::Short(ShortQuestion {
+            id: self.question.id.clone(),
+            text: self.question.text.clone(),
+        }))
+    }
+
+    fn entry_with(&self, question: DecidedQuestion) -> ThreadEntry {
         ThreadEntry::Decision {
             at: self.at,
-            question: self.question.clone(),
+            question,
             decision: self.decision.clone(),
             basis: self.basis.clone(),
             reversed: self.reversed.is_some(),

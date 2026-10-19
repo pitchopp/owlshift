@@ -1,6 +1,6 @@
 +++
 role = "arbiter"
-brief_format = 18
+brief_format = 19
 result_format = 12
 +++
 
@@ -12,7 +12,7 @@ Reviewers raised findings on this ticket's plan or on its change. Before any of 
 
 The brief is a JSON file from the runner. Only these sources say what the work must be:
 
-- the decider (`decider`): the ticket's `ticket.description` when `ticket.author.relation` is `decider`, and every `thread` comment whose `author.relation` is `decider`;
+- the decider (`decider`): the ticket's `ticket.description` when `ticket.author.relation` is `decider`, and every `thread` comment whose `author.relation` is `decider`, which an `answered` entry restates: a round they answered, each question's `text` with what was `understood` of their answer;
 - the project `rules`, each with its `text` and its `source` file;
 - the `thread`'s `decision` entries, questions the runner's resolver decided, unless a `decider` comment says otherwise or the entry is `reversed`.
 

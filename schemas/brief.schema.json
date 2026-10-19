@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 18
+      "const": 19
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -253,6 +253,30 @@
       "required": [
         "approach",
         "reason"
+      ]
+    },
+    "AnsweredQuestion": {
+      "description": "A question of an [`ThreadEntry::Answered`] round (OWL-359).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Its id in the round.",
+          "$ref": "#/$defs/QuestionId"
+        },
+        "text": {
+          "description": "The question, as asked.",
+          "type": "string"
+        },
+        "understood": {
+          "description": "The reason of its latest `answered` verdict: what the answer check\nunderstood the decider's answer to be.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "text",
+        "understood"
       ]
     },
     "AskedBy": {
@@ -457,6 +481,19 @@
         "url",
         "head",
         "reversed"
+      ]
+    },
+    "DecidedQuestion": {
+      "description": "The question of a [`ThreadEntry::Decision`] (format 19, OWL-359): whole,\nor its id and text only.",
+      "anyOf": [
+        {
+          "description": "As the raising run asked it, its context and options included.",
+          "$ref": "#/$defs/Question"
+        },
+        {
+          "description": "Its id and text: the decision says what was chosen.",
+          "$ref": "#/$defs/ShortQuestion"
+        }
       ]
     },
     "DelegationLevel": {
@@ -1444,6 +1481,23 @@
         "minor"
       ]
     },
+    "ShortQuestion": {
+      "description": "A question shown by its id and text alone (OWL-359).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/QuestionId"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "text"
+      ]
+    },
     "ThreadEntry": {
       "description": "One entry of the thread.",
       "oneOf": [
@@ -1514,6 +1568,39 @@
           ]
         },
         {
+          "description": "A round the decider answered (format 19, OWL-359): every question's\nlatest verdict is `answered`. It takes the place of the round's\n`questions` entry, and its re-asks are folded into it. Each question\nshows what was asked and what the answer check understood of the\ndecider's answer, which the RESUME comment told them; the options the\ndecider chose among are on the ticket, in the round's QUESTIONS\ncomment. An answer check never judges such a round: it is not an ask.",
+          "type": "object",
+          "properties": {
+            "at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "questions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AnsweredQuestion"
+              },
+              "minItems": 1
+            },
+            "round": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            },
+            "type": {
+              "type": "string",
+              "const": "answered"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "round",
+            "at",
+            "questions"
+          ]
+        },
+        {
           "description": "A comment on the ticket.",
           "type": "object",
           "properties": {
@@ -1556,8 +1643,8 @@
               "type": "string"
             },
             "question": {
-              "description": "The question as the raising run asked it, under that run's id.",
-              "$ref": "#/$defs/Question"
+              "description": "The question as the raising run asked it, under that run's id:\nits id and text since format 19 (OWL-359), the decision saying\nwhat was chosen, and whole when the decider replied to the\nDECISION comment, whose reply may name an option.",
+              "$ref": "#/$defs/DecidedQuestion"
             },
             "reversed": {
               "description": "The decider reversed it by replying to its DECISION comment\n(OWL-146): the reply, a `comment` of the thread, is followed and\nthis decision never is.",

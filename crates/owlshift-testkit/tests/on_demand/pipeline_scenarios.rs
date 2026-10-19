@@ -172,7 +172,9 @@ fn scenario_s8_a_false_premise_at_intake_is_rescoped() {
         ]
     );
     let again = &bench.briefs_of(Role::Intake)[1];
-    assert_eq!(latest_ask(again), ["Q1"]);
+    // The round is answered: it reads as its readings (OWL-359).
+    assert!(latest_ask(again).is_empty());
+    assert_eq!(last_answered(again), ["Q1"]);
     assert!(
         again.thread.iter().any(|entry| matches!(
             entry,
