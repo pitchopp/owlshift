@@ -2578,6 +2578,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         effort: None,
         max_budget_usd: None,
         login: None,
+        bash: false,
     };
     let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let config = ProjectConfig::parse(&config_text).unwrap();
@@ -2657,6 +2658,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         effort: None,
         max_budget_usd: None,
         login: None,
+        bash: false,
     };
     let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let config = ProjectConfig::parse(&config_text).unwrap();

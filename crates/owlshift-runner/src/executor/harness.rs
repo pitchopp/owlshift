@@ -385,6 +385,11 @@ pub struct ClaudeHarness {
     /// The token agent runs log in with, made by `claude setup-token` and
     /// read by the runner from the keychain ([`CLAUDE_AGENT_ACCOUNT`]).
     pub login: Option<Secret>,
+    /// The resolver's run (OWL-344): bare Bash allowed
+    /// ([`claude::Request::bash`]), inside the read-only profile, which
+    /// bounds what its commands read and write, the result given as the
+    /// run's last message.
+    pub bash: bool,
 }
 
 impl Harness for ClaudeHarness {
@@ -397,21 +402,23 @@ impl Harness for ClaudeHarness {
             result_path: run.brief.result_path.clone(),
             json_schema: None,
             max_budget_usd: self.max_budget_usd,
-            bash: false,
+            bash: self.bash,
         };
         Ok(claude::command(&self.program, &request)?)
     }
 
     /// Drives `claude -p`; a read-only run's last message comes with its
     /// end, for the executor to read the result from when the role left no
-    /// result file (OWL-323).
+    /// result file (OWL-323), or, with [`ClaudeHarness::bash`], as its
+    /// result. A run with Bash is told where its brief is in the run's own
+    /// files, and to give its result as its last message.
     fn drive(
         &self,
         run: &HarnessRun<'_>,
         child: &mut Child,
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
-        let ran = claude::drive(child, &prompt_with_brief(&self.prompt), |line| {
+        let ran = claude::drive(child, &self.prompt_with(run.brief_file), |line| {
             log.stdout(line);
         })?;
         log.stderr(&ran.stderr);
@@ -423,9 +430,15 @@ impl Harness for ClaudeHarness {
     /// with a configuration folder of the run's own; and, confined, a
     /// temporary folder of the run's own, clear of the user's
     /// `/tmp/claude-<uid>` (OWL-100). A confined run without a token, or with
-    /// one that is not one word, is refused with the fix.
+    /// one that is not one word, is refused with the fix. With
+    /// [`ClaudeHarness::bash`], the read-only profile and the result from
+    /// the last message (OWL-344).
     fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
-        let mut needs = SandboxNeeds::default();
+        let mut needs = SandboxNeeds {
+            read_only: self.bash,
+            result_in_message: self.bash,
+            ..SandboxNeeds::default()
+        };
         if agent.is_confined() {
             needs.temp_variable = Some(claude::TMPDIR_ENV);
         }
@@ -443,6 +456,19 @@ impl Harness for ClaudeHarness {
             None => {}
         }
         Ok(needs)
+    }
+}
+
+impl ClaudeHarness {
+    /// The role's prompt, then where its brief is: `brief_file`, in the
+    /// run's own files, for a run with Bash, which gives its result as its
+    /// last message; [`BRIEF_PATH`] in the worktree otherwise.
+    fn prompt_with(&self, brief_file: &Path) -> String {
+        if self.bash {
+            prompt_with_brief_file(&self.prompt, brief_file, "")
+        } else {
+            prompt_with_brief(&self.prompt)
+        }
     }
 }
 
@@ -472,6 +498,19 @@ pub fn prompt_with_brief(prompt: &str) -> String {
     format!(
         "{}\n\nThe brief of this run is the file `{BRIEF_PATH}` in the working directory.\n",
         prompt.trim_end()
+    )
+}
+
+/// The role's prompt, then where its brief is and how the run ends: a run
+/// that cannot write `result.json` gives it as its last message, `how`
+/// saying more of that message's shape (Codex's output schema), or nothing.
+pub fn prompt_with_brief_file(prompt: &str, brief_file: &Path, how: &str) -> String {
+    format!(
+        "{}\n\nThe brief of this run is the file `{}`. This harness gives you no way to write \
+         `result.json`: do not write it, and make your last message that JSON, whole{how}, with \
+         nothing after it.\n",
+        prompt.trim_end(),
+        brief_file.display()
     )
 }
 
@@ -786,6 +825,7 @@ mod tests {
             effort: None,
             max_budget_usd: None,
             login: login.map(Secret::new),
+            bash: false,
         }
     }
 
@@ -830,6 +870,76 @@ mod tests {
         let bare = AgentEnv::new(parent).unwrap().without_confinement();
         let needs = claude(None).sandbox_needs(&bare).unwrap();
         assert_eq!((needs.login, needs.temp_variable), (None, None));
+    }
+
+    /// OWL-344: with Bash, the read-only profile and the result from the
+    /// last message, bare `Bash` allowed and no result rule, and a prompt
+    /// naming the brief in the run's own files that mentions no schema;
+    /// without it, the needs, the rule and the prompt as before.
+    #[test]
+    fn a_bash_run_is_read_only_and_gives_its_result_as_its_last_message() {
+        let agent = AgentEnv::new([(OsString::from("PATH"), OsString::from("/usr/bin"))])
+            .unwrap()
+            .without_confinement();
+        let brief = Brief::parse(&format!(
+            r#"{{"format":{},"role":"intake","project":"p",
+                "ticket":{{"id":"T-1","title":"t","author":{{"name":"a","relation":"decider"}},"description":"d"}},
+                "decider":"a","permissions":{{"level":"read_only","network":false,"browser":false}},
+                "gate":[],"always_human":[],"result_path":"result.json"}}"#,
+            owlshift_contracts::format::BRIEF_FORMAT
+        ))
+        .unwrap();
+        let brief_file = Path::new("/tmp/run/run-files/brief.json");
+        let run = HarnessRun {
+            worktree: Path::new("/work"),
+            brief: &brief,
+            brief_file,
+            result_file: Path::new("/tmp/run/run-files/result.json"),
+            stop: None,
+        };
+        let allowed = |harness: &ClaudeHarness| {
+            let command = harness.command(&run).unwrap();
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let at = args.iter().position(|arg| arg == "--allowedTools").unwrap();
+            args[at + 1].clone()
+        };
+
+        let mut harness = claude(None);
+        let needs = harness.sandbox_needs(&agent).unwrap();
+        assert!(!needs.read_only && !needs.result_in_message, "{needs:?}");
+        assert_eq!(allowed(&harness), "Edit(/result.json)");
+        assert_eq!(harness.prompt_with(brief_file), prompt_with_brief(""));
+
+        harness.bash = true;
+        let needs = harness.sandbox_needs(&agent).unwrap();
+        assert!(needs.read_only && needs.result_in_message, "{needs:?}");
+        assert_eq!(allowed(&harness), "Bash");
+        let prompt = harness.prompt_with(brief_file);
+        assert!(
+            prompt.contains("The brief of this run is the file `/tmp/run/run-files/brief.json`.")
+                && !prompt.contains(BRIEF_PATH),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not write it, and make your last message that JSON, whole, with")
+                && !prompt.contains("schema"),
+            "{prompt}"
+        );
+    }
+
+    /// Codex's prompt is the shared one with its schema's words, as it was
+    /// before the text moved here (OWL-344).
+    #[test]
+    fn the_codex_prompt_keeps_its_text() {
+        assert_eq!(
+            super::super::codex::prompt_with_brief_file("# Verify\n\n", Path::new("/tmp/b.json")),
+            "# Verify\n\nThe brief of this run is the file `/tmp/b.json`. This harness gives you \
+             no way to write `result.json`: do not write it, and make your last message that \
+             JSON, whole, as the output schema describes, with nothing after it.\n"
+        );
     }
 
     #[test]

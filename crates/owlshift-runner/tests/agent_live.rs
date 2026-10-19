@@ -51,6 +51,7 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
         effort: None,
         max_budget_usd: None,
         login: Some(token),
+        bash: false,
     };
     let needs = harness.sandbox_needs(&agent).unwrap();
     let login = needs.login.expect("a confined run logs in with the token");

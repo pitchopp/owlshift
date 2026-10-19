@@ -28,7 +28,7 @@ use owlshift_platform::confined::read_confined;
 use owlshift_platform::keychain::Secret;
 
 use super::harness::{
-    Harness, HarnessEnd, HarnessError, HarnessHome, HarnessRun, HarnessStatus, SandboxNeeds,
+    self, Harness, HarnessEnd, HarnessError, HarnessHome, HarnessRun, HarnessStatus, SandboxNeeds,
     program_folders,
 };
 use super::{MAX_RESULT_BYTES, RunLog};
@@ -280,15 +280,10 @@ fn last_message(run: &HarnessRun<'_>) -> Option<String> {
 }
 
 /// The role's prompt, then where its brief is and how the run ends: a
-/// Codex run cannot write `result.json`, so its last message is the result.
+/// Codex run cannot write `result.json`, so its last message is the result,
+/// as the output schema describes.
 pub fn prompt_with_brief_file(prompt: &str, brief_file: &Path) -> String {
-    format!(
-        "{}\n\nThe brief of this run is the file `{}`. This harness gives you no way to write \
-         `result.json`: do not write it, and make your last message that JSON, whole, as the \
-         output schema describes, with nothing after it.\n",
-        prompt.trim_end(),
-        brief_file.display()
-    )
+    harness::prompt_with_brief_file(prompt, brief_file, ", as the output schema describes")
 }
 
 /// What a Codex run reported, as the executor reads it. Codex names neither

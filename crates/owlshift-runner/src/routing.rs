@@ -396,6 +396,8 @@ mod tests {
                 effort: Some(Effort::Max),
                 max_budget_usd: Some(5.0),
                 login: None,
+                // Kept from the shared harness, as the resolver's Bash (OWL-344).
+                bash: true,
             },
             models: models(Some("opus"), Some("sonnet"), None),
         };

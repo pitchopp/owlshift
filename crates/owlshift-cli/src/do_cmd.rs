@@ -197,6 +197,7 @@ fn run_with(
         effort: None,
         max_budget_usd: budget,
         login,
+        bash: false,
     };
     // Build on the ticket's routing (OWL-305): the tier of each run picks
     // its model from `[models]`.

@@ -608,7 +608,15 @@ impl Executor {
         let mut warnings = Vec::new();
         let mut result_written = Ok(());
         if needs.result_in_message {
-            let message = driven.as_ref().ok().and_then(|end| end.message.as_deref());
+            // Bare JSON, or prose ending on a closing JSON block, as the
+            // tolerance below reads a read-only run's message (OWL-344): a
+            // Codex run's JSON passes unchanged, trimmed. Any other message
+            // is written whole, for the result's validation to refuse.
+            let message = driven
+                .as_ref()
+                .ok()
+                .and_then(|end| end.message.as_deref())
+                .map(|text| message::last_message_result(text).unwrap_or(text));
             result_written = home::result_from_message(&result_file, message).map_err(|error| {
                 format!("it could not be written from the run's last message: {error}")
             });
