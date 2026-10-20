@@ -1020,7 +1020,7 @@ fn a_later_pass_is_told_what_changed_and_the_last_fix_is_kept() {
 fn findings_and_forge_keys_are_read_and_checked() {
     let base = fixture("owlshift.toml");
     let parsed = ProjectConfig::parse(&base).unwrap();
-    assert_eq!(parsed.pipeline.findings(), FindingsConfirmation::Arbiter);
+    assert_eq!(parsed.pipeline.findings(), FindingsConfirmation::Author);
     assert!(parsed.forge.is_none());
 
     let with = |pipeline: &str, forge: &str| {
@@ -1031,6 +1031,8 @@ fn findings_and_forge_keys_are_read_and_checked() {
     };
     let author = ProjectConfig::parse(&with("findings = \"author\"", "")).unwrap();
     assert_eq!(author.pipeline.findings(), FindingsConfirmation::Author);
+    let arbiter = ProjectConfig::parse(&with("findings = \"arbiter\"", "")).unwrap();
+    assert_eq!(arbiter.pipeline.findings(), FindingsConfirmation::Arbiter);
     let forge = ProjectConfig::parse(&with(
         "",
         "\n[forge]\nreviewers = { pitchopp = \"u-ann\", Octo-Cat = \"u-bob\" }\n",

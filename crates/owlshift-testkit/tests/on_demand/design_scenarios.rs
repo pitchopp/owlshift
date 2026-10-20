@@ -475,7 +475,7 @@ fn the_design_roles_rules_reach_their_own_briefs() {
     assert_eq!(seen, ["design", "design_review", "arbiter"]);
 }
 
-/// `pipeline.findings = "author"`: no arbiter runs; the next design run
+/// Without `pipeline.findings` (the default, OWL-391): no arbiter runs; the next design run
 /// answers every finding, a result that leaves one unanswered being refused
 /// as a failed run, and its rejection is kept and shown.
 #[test]
@@ -485,10 +485,8 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
     let text = fs::read_to_string(&config).unwrap();
     fs::write(
         &config,
-        text.replace(
-            "plan_approval = \"never\"",
-            "plan_approval = \"never\"\nfindings = \"author\"",
-        ),
+        // No `pipeline.findings`: the author's triage is the default.
+        text.replace("findings = \"arbiter\"", ""),
     )
     .unwrap();
     let answering = |responses: &str| {

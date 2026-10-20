@@ -113,7 +113,7 @@ PR quality at least on par with the current `/parallel` workflow.
 **Readings and deviations** (OWL-296, 2026-10-15).
 
 - Verify reviews the diff before the pull request opens; the complete CI result stays Watch's, through P3's fix runs. Browser QA, "when declared", waits for P6, where the browser becomes a resource; P6 leaves it to a later step of its own (P6's readings, below).
-- S9's confirmed finding and its two review passes are P5's; a finding is confirmed by an arbiter run by default, or triaged by the author's own fix run when the project sets `pipeline.findings = "author"`.
+- S9's confirmed finding and its two review passes are P5's; a finding is triaged by the author's own fix run by default, or confirmed by an arbiter run when the project sets `pipeline.findings = "author"`.
 - Human review comments on the pull request, deferred by P3, are read from P5, from the forge accounts `[forge].reviewers` lists; P10's identity map replaces that list.
 - S8 stops on a premise the repository or its documents contradict. Intake stays without network: a premise only the outside world can check is a question. Recording the dated finding where the project keeps external facts waits for a key that names that place.
 - S17's rule that a reviewer runs on another family applies when one is available and configured. Decided by the maintainer on 2026-10-18 (OWL-347): P5's reviewers all run on Claude Code, on another model than the author's when the configuration names one, so that no second subscription is required; the Codex critic P5 first built is unwired, and a reviewer of another family comes back as an opt-in complement (OWL-348).

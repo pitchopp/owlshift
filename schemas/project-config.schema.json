@@ -134,12 +134,12 @@
       "description": "Who confirms a review finding.",
       "oneOf": [
         {
-          "description": "One arbiter run per review pass rules on all its findings.",
+          "description": "One arbiter run per review pass rules on all its findings. Opt-in:\nthe P5 exit gate's drains ran it 90 times for 22 USD and it rejected\n18 findings of 516 (OWL-391).",
           "type": "string",
           "const": "arbiter"
         },
         {
-          "description": "The next design or fix run answers each finding, fixed or rejected.",
+          "description": "The next design or fix run answers each finding, fixed or rejected.\nThe default: the author already answers every finding it is given\n(OWL-377), so a ruling in front of it judges the same finding twice.",
           "type": "string",
           "const": "author"
         }
@@ -206,7 +206,7 @@
           "$ref": "#/$defs/Variant"
         },
         "findings": {
-          "description": "Who confirms a review finding before it is acted on (OWL-300,\narchitecture section 5, \"Confirming a finding\"): `arbiter`, the\ndefault when absent, or `author`. A file using it requires an\nOwlshift that reads it.",
+          "description": "Who confirms a review finding before it is acted on (OWL-300,\narchitecture section 5, \"Confirming a finding\"): `author`, the\ndefault when absent, or `arbiter`. A file using it requires an\nOwlshift that reads it.",
           "anyOf": [
             {
               "$ref": "#/$defs/FindingsConfirmation"

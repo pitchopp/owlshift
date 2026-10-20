@@ -329,10 +329,8 @@ fn the_author_answers_every_verify_finding_and_its_rejection_is_kept() {
     let text = fs::read_to_string(&config).unwrap();
     fs::write(
         &config,
-        text.replace(
-            "plan_approval = \"never\"",
-            "plan_approval = \"never\"\nfindings = \"author\"",
-        ),
+        // No `pipeline.findings`: the author's triage is the default.
+        text.replace("findings = \"arbiter\"", ""),
     )
     .unwrap();
     let answering = DONE.replace(
