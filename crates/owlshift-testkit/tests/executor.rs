@@ -114,6 +114,7 @@ impl Bench {
             delegation: None,
             asked_by: None,
             gate_failure: None,
+            setup_failure: None,
             result_refusal: None,
             decisions_refused: false,
             refused_choices: Vec::new(),
@@ -1248,7 +1249,8 @@ mod setup {
         assert!(!bench.harness_ran(), "the harness ran");
         assert!(report.exit_code.is_none() && report.usage.is_none());
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-        assert!(!bench.worktree_brief().contains("gate_failure"));
+        let brief = bench.worktree_brief();
+        assert!(!brief.contains("gate_failure") && !brief.contains("setup_failure"));
         (**failure).clone()
     }
 
@@ -1288,11 +1290,60 @@ mod setup {
                 report.warnings,
                 ["the project setup failed before the harness: exit 1"]
             );
-            assert!(
-                bench.worktree_brief().contains("setup: exit status 1"),
-                "{}",
-                bench.worktree_brief()
+            let told = Brief::parse(&bench.worktree_brief()).unwrap();
+            assert_eq!(
+                told.setup_failure.map(|f| f.reason).as_deref(),
+                Some("setup: exit status 1")
             );
+            assert!(told.gate_failure.is_none());
+        }
+    }
+
+    /// A Build fixing the runner's gate failure whose setup then fails on
+    /// its own work is told both (OWL-389): the setup's failure beside the
+    /// gate's, which it no longer replaces; only an earlier failure of the
+    /// same setup command is left out, the fresh one telling it again.
+    #[test]
+    fn a_build_fixing_a_gate_failure_is_told_its_setup_failure_beside_it() {
+        let bench = Bench::new();
+        let base = bench.commit("refs/remotes/origin/main");
+        bench.kept();
+        bench.own_commit(&[("own.txt", "own\n")]);
+        let failure = |command: &str, reason: &str| GateFailure {
+            command: Some(command.to_owned()),
+            reason: reason.to_owned(),
+            output: "earlier output\n".to_owned(),
+            truncated: false,
+        };
+        let tests_failed = failure("cargo test", "exit status 101");
+        let other_setup = failure("sh other.sh", "setup: exit status 2");
+        for (earlier, kept) in [
+            (tests_failed.clone(), Some(tests_failed)),
+            (other_setup.clone(), Some(other_setup)),
+            (failure("exit 1", "setup: exit status 1"), None),
+        ] {
+            let mut brief = bench.brief.clone();
+            brief.gate_failure = Some(earlier);
+            let report = bench.run_set_up(
+                &bench.executor,
+                &Script(MARKS.to_owned()),
+                &brief,
+                &["exit 1"],
+                &base,
+            );
+            assert!(bench.harness_ran(), "{report:?}");
+            let told = Brief::parse(&bench.worktree_brief()).unwrap();
+            let setup = told
+                .setup_failure
+                .clone()
+                .expect("the setup's failure is told");
+            assert_eq!(
+                (setup.command.as_deref(), setup.reason.as_str()),
+                (Some("exit 1"), "setup: exit status 1")
+            );
+            assert_eq!(told.gate_failure, kept);
+            let handed = fs::read_to_string(bench.tmp.path().join("run/brief.json")).unwrap();
+            assert_eq!(Brief::parse(&handed).unwrap(), told);
         }
     }
 

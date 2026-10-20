@@ -412,6 +412,7 @@ fn brief() -> Brief {
         delegation: None,
         asked_by: None,
         gate_failure: None,
+        setup_failure: None,
         result_refusal: None,
         decisions_refused: false,
         refused_choices: Vec::new(),

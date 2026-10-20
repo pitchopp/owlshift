@@ -35,8 +35,9 @@ use crate::Role;
 /// run's `since` and `earlier` and Build's findings to `note` (OWL-356);
 /// format 22 the author's `disagreed` and `deferred` answers, beside a
 /// confirmed ruling, in `earlier`, and answers to findings to `fix`
-/// (OWL-377).
-pub const BRIEF_FORMAT: u32 = 22;
+/// (OWL-377); format 23 Build's `setup_failure`, beside its `gate_failure`
+/// (OWL-389).
+pub const BRIEF_FORMAT: u32 = 23;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role

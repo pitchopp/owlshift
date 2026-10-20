@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 22
+      "const": 23
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -203,6 +203,17 @@
       "items": {
         "$ref": "#/$defs/Rule"
       }
+    },
+    "setup_failure": {
+      "description": "The project's setup (`stack.setup`) failed before this Build run's\nharness, and the harness started anyway, for the run to repair the\nsetup its own work broke (OWL-330): what it repairs first, its\nreason starting `setup: `. Beside `gate_failure`, which it never\nreplaces (OWL-389): that one is fixed once the setup is repaired. In\nBuild's brief only, written by the executor; absent otherwise.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GateFailure"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "thread": {
       "description": "The question-and-answer thread, oldest first.",

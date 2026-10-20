@@ -1,6 +1,6 @@
 +++
 role = "answer_check"
-brief_format = 22
+brief_format = 23
 result_format = 13
 +++
 

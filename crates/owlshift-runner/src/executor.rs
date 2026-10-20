@@ -38,8 +38,9 @@
 //! (`gate::run_setup`): a violation quarantines the run, and a red setup
 //! fails it, [`Failure::Setup`], with no harness spawned. Only a red setup
 //! command on a worktree holding the Build's own work lets the harness
-//! start, its brief carrying the failure as `gate_failure`, so the Build can
-//! repair the setup it broke. The gate after a `done` runs the setup too.
+//! start, its brief carrying the failure as `setup_failure`, so the Build can
+//! repair the setup it broke, beside any `gate_failure` it was fixing
+//! (OWL-389). The gate after a `done` runs the setup too.
 //!
 //! # Layout
 //!
@@ -577,8 +578,15 @@ impl Executor {
                 });
             }
             if let Some(failure) = &ran.report.failure {
-                // A Build that broke its own setup: the harness starts, told.
-                brief.gate_failure = Some(failure.clone());
+                // A Build that broke its own setup: the harness starts, told,
+                // beside the gate failure it was fixing (OWL-389), unless
+                // that one is the same setup command failing again.
+                if brief.gate_failure.as_ref().is_some_and(|earlier| {
+                    earlier.reason.starts_with(SETUP_PREFIX) && earlier.command == failure.command
+                }) {
+                    brief.gate_failure = None;
+                }
+                brief.setup_failure = Some(failure.clone());
                 worktree::write_run_files(spec.worktree, &brief)?;
                 fs::write(spec.run_dir.join("brief.json"), brief.render()).map_err(run_dir)?;
                 warnings.push(format!(
