@@ -807,11 +807,18 @@ fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
         done["finding_responses"] = super::design_scenarios::answers(&[("F1", "fixed")]);
         bench.reply(Some(greeting), Some(&done.to_string()))
     };
+    // Each holds a zone of its own, so neither waits for what the other
+    // holds (OWL-403).
+    let declaring = |variant: &str, zone: &str| {
+        let mut result: Value = serde_json::from_str(&verdict(variant)).unwrap();
+        result["intake"]["zones"] = json!([zone]);
+        bench.reply(None, Some(&result.to_string()))
+    };
     let replies = vec![
         // Pass 1: DEMO-1's intake. Pass 2: DEMO-2's, then DEMO-1's design
         // asks, the resolver passing the question on.
-        bench.reply(None, Some(&verdict("standard"))),
-        bench.reply(None, Some(&verdict("trivial"))),
+        declaring("standard", "app"),
+        declaring("trivial", "docs"),
         bench.read(TRADE_OFF),
         bench.read(&passed_on(&["Q1"])),
         // Pass 3: DEMO-2's Build and Verify pass, a major to fix.

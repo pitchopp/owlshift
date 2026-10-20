@@ -16,7 +16,7 @@
 //! | Gate | [`gate`]; an open gate is [`state::Status::NeedsInput`] |
 //! | Decider, who answers a ticket's gates | [`decider`] |
 //! | When the decider's reply counts: the quiet window, `go` | [`reply`] |
-//! | Resource | [`resource`] |
+//! | Resource; who holds back whom | [`resource`]; [`collision`] |
 //! | Scheduler | [`schedule`]; dependencies to relations, [`dependency`] |
 //! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
 //! | A follow-up proposal's title, for its fingerprint | [`proposal`] |
@@ -25,6 +25,7 @@
 //! | Per-ticket routing: harness, tier and effort of each run | [`routing`] |
 
 pub mod agent_env;
+pub mod collision;
 pub mod decider;
 pub mod dependency;
 pub mod floor;

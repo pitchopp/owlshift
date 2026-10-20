@@ -2,10 +2,12 @@
 //! section 5, "Parallel", "What a ticket holds").
 //!
 //! A ticket holds zones (folders of the repository), named resources (the
-//! keys of `stack.resources`, each a [`Pattern`] over repository paths) and,
-//! from P6's later parts, files. Intake declares its zones and named
+//! keys of `stack.resources`, each a [`Pattern`] over repository paths) and
+//! files, each the zone of its own path. Intake declares its zones and named
 //! resources; [`held`] adds the zones its `zone:` labels declare and the
-//! named resources its zones reach.
+//! named resources its zones reach; [`closed`] gives the collision rule
+//! everything a ticket holds, the files its branch changed included
+//! (OWL-403).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -43,6 +45,61 @@ impl Resource {
             _ => false,
         }
     }
+}
+
+/// How a reason names a resource: a zone by its path, a file being the zone
+/// of its own path; the empty zone as the whole repository; a named resource
+/// by its name.
+impl fmt::Display for Resource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Resource::Zone(zone) if segments(zone).is_empty() => {
+                f.write_str("the whole repository")
+            }
+            Resource::Zone(zone) => write!(f, "zone `{zone}`"),
+            Resource::Named(name) => write!(f, "resource `{name}`"),
+            Resource::Browser => f.write_str("the browser slot"),
+        }
+    }
+}
+
+/// Everything a ticket holds, as the collision rule weighs it (architecture
+/// section 5, "What a ticket holds"): each of `zones`, the whole repository
+/// when there is none; each of `files`, the zone of its own path; each of
+/// `resources`; then each named resource of `named` that a zone's path can
+/// reach ([`Pattern::reaches`]) or a file matches ([`Pattern::matches`]), so a
+/// named resource conflicts with any zone or file its pattern reaches. Each
+/// once, in that order.
+pub fn closed(
+    zones: &[String],
+    files: &[String],
+    resources: &[String],
+    named: &NamedResources,
+) -> Vec<Resource> {
+    let mut held: Vec<Resource> = Vec::new();
+    let push = |resource: Resource, held: &mut Vec<Resource>| {
+        if !held.contains(&resource) {
+            held.push(resource);
+        }
+    };
+    if zones.is_empty() {
+        push(Resource::Zone(String::new()), &mut held);
+    }
+    for zone in zones.iter().chain(files) {
+        push(Resource::Zone(zone.clone()), &mut held);
+    }
+    for name in resources {
+        push(Resource::Named(name.clone()), &mut held);
+    }
+    for (name, pattern) in named.iter() {
+        let reached = zones.is_empty()
+            || zones.iter().any(|zone| pattern.reaches(zone))
+            || files.iter().any(|file| pattern.matches(file));
+        if reached {
+            push(Resource::Named(name.to_owned()), &mut held);
+        }
+    }
+    held
 }
 
 /// A zone's segments, without the empty and `.` ones.
@@ -525,5 +582,40 @@ mod tests {
             held(&[], &[], &[], &NamedResources::default()),
             Held::default()
         );
+    }
+
+    /// OWL-403: what the collision rule weighs. A file reaches a named
+    /// resource only when it matches its pattern, a zone when a path inside
+    /// it can; no zone is the whole repository, which reaches them all.
+    #[test]
+    fn the_closed_set_adds_the_named_resources_zones_reach_and_files_match() {
+        let project =
+            NamedResources::new([("migrations", "db/*/migrations/**"), ("lock", "Cargo.lock")])
+                .unwrap();
+        // `db/main` as a file is no folder: nothing below it can match.
+        let found = closed(
+            &strings(&["web"]),
+            &strings(&["db/main", "Cargo.lock", "web/a.rs"]),
+            &strings(&["assets"]),
+            &project,
+        );
+        assert_eq!(
+            found,
+            [
+                zone("web"),
+                zone("db/main"),
+                zone("Cargo.lock"),
+                zone("web/a.rs"),
+                named("assets"),
+                named("lock"),
+            ]
+        );
+        let reached = closed(&strings(&["db/main"]), &[], &[], &project);
+        assert_eq!(reached, [zone("db/main"), named("migrations")]);
+        let whole = closed(&[], &[], &[], &project);
+        assert_eq!(whole, [zone(""), named("lock"), named("migrations")]);
+        assert_eq!(whole[0].to_string(), "the whole repository");
+        assert_eq!(reached[0].to_string(), "zone `db/main`");
+        assert_eq!(reached[1].to_string(), "resource `migrations`");
     }
 }

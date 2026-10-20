@@ -12,7 +12,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use owlshift_contracts::ids::SessionId;
-use owlshift_contracts::refs::{PersistedState, TicketCost, TicketSession, Waiting};
+use owlshift_contracts::refs::{
+    MAX_HELD_FILES, PersistedState, TicketCost, TicketHeld, TicketSession, Waiting,
+};
 use owlshift_contracts::{ContractError, PlanApproval, Stage, Variant};
 use owlshift_core::gate::{GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
@@ -347,4 +349,78 @@ fn a_ticket_session_reads_back_and_refuses_what_no_run_keeps() {
     assert_eq!(made.as_str(), "ffffffff-ffff-4fff-bfff-ffffffffffff");
     assert_eq!(SessionId::new(made.as_str()).unwrap(), made);
     assert!(SessionId::new("ffffffff-ffff-4fff-bfff-fffffffffff").is_err());
+}
+
+/// What a ticket holds (OWL-403): written and read back, valid against its
+/// schema; widened by the files its branch changed, each once and sorted,
+/// with the widening's time; the whole repository past its bounds; refused
+/// when a zone is no folder, a resource no name, the files unsorted or the
+/// mark no commit.
+#[test]
+fn a_ticket_held_widens_reads_back_and_refuses_what_it_cannot_hold() {
+    let at = |minute: i64| -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
+    };
+    let mut held = TicketHeld::dispatched(
+        vec!["app".to_owned()],
+        vec!["migrations".to_owned()],
+        Some(at(0)),
+    );
+    let files = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        held.widen(files(&["b.rs", "a.rs"]), at(1)),
+        ["b.rs", "a.rs"]
+    );
+    assert_eq!(held.widen(files(&["a.rs"]), at(2)), Vec::<String>::new());
+    assert_eq!(held.files, ["a.rs", "b.rs"]);
+    assert_eq!(held.widened_at, [at(1)]);
+    held.verified = Some("c".repeat(40));
+    let document: Value = serde_json::from_str(&held.render()).unwrap();
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/ticket-held.schema.json");
+    let schema: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&document)
+    );
+    assert_eq!(TicketHeld::parse(&held.render()).unwrap(), held);
+    for (field, value) in [
+        ("zones", json!(["../app"])),
+        ("zones", json!(["app/*"])),
+        ("resources", json!(["two words"])),
+        ("files", json!(["b.rs", "a.rs"])),
+        ("files", json!(["a.rs", "a.rs"])),
+        ("verified", json!("main")),
+    ] {
+        let mut broken = document.clone();
+        broken[field] = value.clone();
+        match TicketHeld::parse(&broken.to_string()) {
+            Err(ContractError::Invalid { contract, .. }) => assert_eq!(contract, "ticket held"),
+            other => panic!("{field} {value}: expected an invalid held, got {other:?}"),
+        }
+    }
+    // Past the files it lists, or a path it cannot keep: the whole
+    // repository, its declared resources kept.
+    let many: Vec<String> = (0..=MAX_HELD_FILES).map(|n| format!("f{n:05}")).collect();
+    let mut wide = held.clone();
+    wide.widen(many, at(3));
+    assert!(wide.whole() && wide.files.is_empty(), "{wide:?}");
+    assert_eq!(wide.resources, ["migrations"]);
+    let mut odd = held.clone();
+    odd.widen(files(&["x\0y"]), at(4));
+    assert!(odd.whole());
+    // Joined with a whole repository, a ticket holds it too.
+    let mut joined = TicketHeld::dispatched(vec!["docs".to_owned()], Vec::new(), Some(at(5)));
+    joined.join(&held);
+    assert_eq!(
+        (&joined.zones, &joined.files, joined.dispatched_at),
+        (
+            &files(&["docs", "app"]),
+            &files(&["a.rs", "b.rs"]),
+            Some(at(5))
+        )
+    );
+    joined.join(&wide);
+    assert!(joined.whole());
 }

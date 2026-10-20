@@ -12,7 +12,7 @@ use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    PersistedState, TicketCost, TicketDelivery, TicketQuestions, TicketSession,
+    PersistedState, TicketCost, TicketDelivery, TicketHeld, TicketQuestions, TicketSession,
 };
 use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_runner::events::{EventLog, EventSink};
@@ -112,7 +112,22 @@ fn record(state: &str, round: u32) -> TicketRecord {
         review: None,
         cost: None,
         session: None,
+        held: None,
     }
+}
+
+/// What a ticket dispatched at 09:00 holds, widened once (OWL-403).
+fn ticket_held() -> TicketHeld {
+    let mut held = TicketHeld::dispatched(
+        vec!["app".to_owned()],
+        Vec::new(),
+        Some("2026-10-20T09:00:00Z".parse().unwrap()),
+    );
+    held.widen(
+        ["app/x.rs".to_owned(), "docs/y.md".to_owned()],
+        "2026-10-20T09:30:00Z".parse().unwrap(),
+    );
+    held
 }
 
 /// What three runs cost, one restart after the first (OWL-378).
@@ -234,7 +249,21 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
         listed.lines().filter(|name| *name == "cost.json").count(),
         1
     );
-    ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&ten)).unwrap();
+    let eleven = ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&ten)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, second);
+
+    // So is what the ticket holds (OWL-403), which moves no progress either.
+    let holding = TicketRecord {
+        held: Some(ticket_held()),
+        ..second.clone()
+    };
+    let at_eleven = repo.read().unwrap().unwrap().progress();
+    let twelve =
+        ticket_ref::write(&repo.git, &repo.root, &ticket(), &holding, Some(&eleven)).unwrap();
+    let stored = repo.read().unwrap().unwrap();
+    assert_eq!(stored.record, holding);
+    assert_eq!(stored.progress(), at_eleven);
+    ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&twelve)).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().record, second);
 }
 
@@ -344,6 +373,33 @@ fn intake() -> TicketIntake {
     .unwrap()
 }
 
+/// OWL-403: what widens a ticket's `held.json` is what its branch changed
+/// against its merge-base with the base, a rename's two paths both, never a
+/// commit the base took since (the live check of 2026-10-20, kept).
+#[test]
+fn the_files_a_branch_changed_hold_both_paths_of_a_rename() {
+    let repo = Repo::new();
+    let commit = |message: &str| repo.git(&["commit", "--quiet", "--no-gpg-sign", "-m", message]);
+    fs::create_dir_all(repo.root.join("a")).unwrap();
+    fs::write(repo.root.join("a/old.txt"), "one\ntwo\nthree\n").unwrap();
+    repo.git(&["add", "."]);
+    commit("base");
+    repo.git(&["branch", "base"]);
+    repo.git(&["checkout", "--quiet", "-b", "feat"]);
+    fs::create_dir_all(repo.root.join("b")).unwrap();
+    repo.git(&["mv", "a/old.txt", "b/new.txt"]);
+    fs::write(repo.root.join("c d.txt"), "n\n").unwrap();
+    repo.git(&["add", "."]);
+    commit("feat");
+    repo.git(&["checkout", "--quiet", "base"]);
+    fs::write(repo.root.join("other.txt"), "y\n").unwrap();
+    repo.git(&["add", "."]);
+    commit("base moves on");
+    let files =
+        owlshift_runner::held::changed_files(&repo.git, &repo.root, "base", "feat").unwrap();
+    assert_eq!(files, ["a/old.txt", "b/new.txt", "c d.txt"]);
+}
+
 /// The hash of a ticket's text is the SHA-256 of its title, a NUL byte and
 /// its description (architecture section 5, "Intake").
 #[test]
@@ -372,6 +428,7 @@ fn record_of(len: usize) -> TicketRecord {
             review: None,
             cost: None,
             session: None,
+            held: None,
         }
     };
     let base = with(1).questions.render().len();
@@ -483,9 +540,10 @@ fn kept_everything() -> TicketRecord {
         review: Some(ticket_review()),
         // Forgetting keeps what the runs cost (OWL-378), and drops the
         // session of the latest asking run, the ticket starting over
-        // (OWL-394).
+        // (OWL-394), and what it held, at Ready again (OWL-403).
         cost: Some(ticket_cost()),
         session: Some(ticket_session()),
+        held: Some(ticket_held()),
     }
 }
 
@@ -519,6 +577,7 @@ fn forgotten(round: u32, questions: &TicketQuestions, cost: Option<TicketCost>) 
         review: None,
         cost,
         session: None,
+        held: None,
     }
 }
 

@@ -92,7 +92,7 @@ use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
     self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest,
     KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketCost,
-    TicketDelivery, TicketQuestions, TicketSession, cut_reason, cut_to,
+    TicketDelivery, TicketHeld, TicketQuestions, TicketSession, cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -100,10 +100,11 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
+use owlshift_core::collision::{Collision, InFlight, collision};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, ticket_zones};
 use owlshift_core::gate::{BudgetReached, Chain, ChainCost, GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
-use owlshift_core::resource::{self, Held, Resource};
+use owlshift_core::resource::{self, Held, NamedResources, Resource};
 use owlshift_core::routing::{
     PROJECT_DEFAULT, RunRouting, TicketRouting, resolver_routing, role_routing, ticket_routing,
 };
@@ -118,6 +119,7 @@ use crate::executor::{
 };
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
+use crate::held;
 use crate::project::{self, Base, ProjectDirs, ProjectLock};
 use crate::proposals::{self, Filing};
 use crate::quarantine;
@@ -1178,6 +1180,12 @@ struct Prepared {
     /// settled when its questions are, spent by the next run of its role.
     /// Every write of the ref carries it, as `intake`.
     session: Option<TicketSession>,
+    /// What the ticket holds against the project's other tickets (OWL-403),
+    /// as the ticket ref keeps it, as its dispatch wrote it or as a run of
+    /// this command widened it ([`OnDemand::widen`]): every write of the ref
+    /// carries it, as `intake`. `None` for a ticket dispatched before it was
+    /// kept, which holds the whole repository.
+    held: Option<TicketHeld>,
     /// What the ticket ref kept but its runs' cost when the command took
     /// the lock, `None` without a ref: a stage step of watch's that moved it
     /// keeps what it carries in `carry.json` ([`OnDemand::stepped`],
@@ -1273,6 +1281,50 @@ impl ProjectFile {
         match self {
             ProjectFile::Commit => "commit",
             ProjectFile::Local => "local",
+        }
+    }
+}
+
+/// What a run's branch widened of what its ticket holds (OWL-403,
+/// [`OnDemand::widen`]), for the event that follows `run_ended`.
+enum Widened {
+    /// These files, not held before; `whole` once the ticket holds the
+    /// whole repository.
+    Files { added: Vec<String>, whole: bool },
+    /// The files changed could not be read, for this reason: the whole
+    /// repository.
+    Unread(String),
+}
+
+/// The most files a widening's event names; it counts them all.
+const WIDENED_NAMED: usize = 100;
+
+impl Widened {
+    fn kind(&self) -> EventKind {
+        match self {
+            Widened::Files { .. } => EventKind::Decision,
+            Widened::Unread(_) => EventKind::Warning,
+        }
+    }
+
+    /// A `decision` (`held` = `widened`, the files added, at most
+    /// [`WIDENED_NAMED`], their count, `whole`), or a `warning`
+    /// (`widening_unread`, with the reason).
+    fn data(&self) -> Data {
+        match self {
+            Widened::Files { added, whole } => data([
+                ("held", json!("widened")),
+                (
+                    "files",
+                    json!(added.iter().take(WIDENED_NAMED).collect::<Vec<_>>()),
+                ),
+                ("count", json!(added.len())),
+                ("whole", json!(whole)),
+            ]),
+            Widened::Unread(reason) => data([
+                ("what", json!("widening_unread")),
+                ("reason", json!(reason)),
+            ]),
         }
     }
 }
@@ -1466,8 +1518,30 @@ impl OnDemand<'_> {
             .start_from_base(&p.checkout, &p.worktree, &p.branch, &p.base.commit)
             .map_err(|e| refused("starting the ticket's branch from the base", e))?;
         let dispatched = self.dispatch(p, command, sink)?;
+        p.held = Some(self.held_at_dispatch(p, &dispatched.rules));
         self.show_after(ticket, None, Event::Dispatched, sink);
         self.drive(p, command, dispatched, state, sink)
+    }
+
+    /// What the ticket holds from this dispatch (OWL-403; architecture
+    /// section 5, "Kept in the ticket ref"): the zones and resources its
+    /// intake record and labels declare ([`held_for`], at the configuring
+    /// commit's rules), the whole repository without a record, dispatched
+    /// now. A ticket that still holds from an earlier dispatch, one
+    /// restarted while in flight, keeps what it held and its dispatch time:
+    /// the held set never shrinks while the ticket holds.
+    fn held_at_dispatch(&self, p: &Prepared, rules: &ProjectRules) -> TicketHeld {
+        let Held { zones, resources } = match &p.intake {
+            Some(record) => held_for(&p.found, &record.zones, &record.resources, rules),
+            None => Held::default(),
+        };
+        let mut next = TicketHeld::dispatched(zones, resources, Some((self.clock)()));
+        if let Some(stored) = p.stored.as_ref().filter(|stored| held::holds(stored)) {
+            let earlier = stored.record.held.clone().unwrap_or_else(held::unrecorded);
+            next.join(&earlier);
+            next.dispatched_at = earlier.dispatched_at;
+        }
+        next
     }
 
     /// `owlshift continue`: picks `ticket` up where its ticket ref left it. A
@@ -1909,6 +1983,9 @@ impl OnDemand<'_> {
             session: stored
                 .as_ref()
                 .and_then(|stored| stored.record.session.clone()),
+            held: stored
+                .as_ref()
+                .and_then(|stored| stored.record.held.clone()),
             started: stored.as_ref().map(Stored::progress),
             stored,
             heeded: false,
@@ -2577,7 +2654,10 @@ impl OnDemand<'_> {
 
     /// Delivers the Build Verify passed: to the followed pull request in a
     /// review loop ([`Self::deliver_review`], OWL-307), else as a first
-    /// delivery ([`Self::deliver`]).
+    /// delivery ([`Self::deliver`]). Under watch a first delivery is
+    /// checked against what the project's other tickets hold first
+    /// (OWL-403, [`Self::delivery_collision`]): a collision holds it at
+    /// Verify ([`Self::hold_delivery`]).
     fn deliver_verified(
         &self,
         p: &mut Prepared,
@@ -2586,10 +2666,83 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         if in_review_loop(p) {
-            self.deliver_review(p, state, sink)
-        } else {
-            self.deliver(p, dispatched, state, sink)
+            return self.deliver_review(p, state, sink);
         }
+        if p.stepping
+            && let Some(found) = self.delivery_collision(p, &dispatched.rules)?
+        {
+            return Err(self.hold_delivery(p, state, &found, sink));
+        }
+        self.deliver(p, dispatched, state, sink)
+    }
+
+    /// Whether a delivery of `p`'s ticket, not yet delivered, collides with
+    /// what another ticket of the project holds (OWL-403; architecture
+    /// section 5, "The collision rule"): every other ticket ref read again
+    /// under the lock this step holds, one that cannot be read holding the
+    /// whole repository, against what this ticket holds, widened, closed
+    /// with the named resources of `rules`. Refused when the refs cannot be
+    /// listed: what cannot be read is never taken as free.
+    fn delivery_collision(
+        &self,
+        p: &Prepared,
+        rules: &ProjectRules,
+    ) -> Result<Option<Collision<String>>, Stop> {
+        let none = NamedResources::default();
+        let named = rules.resources().unwrap_or(&none);
+        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
+            .map_err(|e| refused("reading the project's ticket refs before the delivery", e))?;
+        let in_flight: Vec<InFlight<String>> = others
+            .iter()
+            .filter_map(|(ticket, read)| match read {
+                Ok(stored) => held::holds(stored).then(|| held::in_flight(ticket, stored, named)),
+                Err(_) => Some(held::unread(ticket, named)),
+            })
+            .collect();
+        let own = held::of(&p.ticket, p.held.as_ref(), false, named);
+        Ok(collision(&own, &in_flight))
+    }
+
+    /// A delivery `found` holds back (OWL-403): the Build Verify passed is
+    /// marked verified in what the ticket holds and kept with the pass, the
+    /// ticket staying at Verify in `state`, so its next step delivers that
+    /// commit with no Verify pass once nothing holds it ([`Self::verify_pass`]);
+    /// one `decision` event (`delivery` = `held`), and the step's stop. A
+    /// ticket from before P6 gets its record then, the whole repository with
+    /// no dispatch time.
+    fn hold_delivery(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        found: &Collision<String>,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let commit = p
+            .review
+            .as_ref()
+            .and_then(|review| review.build.as_ref())
+            .map(|built| built.commit.clone());
+        p.held.get_or_insert_with(held::unrecorded).verified = commit.clone();
+        let questions = p.questions();
+        if let Err(e) = self.store(p, state, questions) {
+            return refused(
+                "keeping the delivery a collision holds in the ticket's ref",
+                e,
+            );
+        }
+        sink.emit(
+            &p.ticket,
+            None,
+            EventKind::Decision,
+            data([
+                ("delivery", json!("held")),
+                ("reason", json!("collision")),
+                ("tickets", json!([found.holder])),
+                ("resource", held::resource_data(&found.resource)),
+                ("commit", json!(commit)),
+            ]),
+        );
+        self.stepped(p, state, sink)
     }
 
     /// One run of the build role from `brief` on `harness`, in `state`, for
@@ -3919,6 +4072,7 @@ impl OnDemand<'_> {
             review: p.review.clone(),
             cost: Some(TicketCost::from(p.cost)),
             session: p.session.clone(),
+            held: p.held.clone(),
         };
         let kept = p
             .stored
@@ -3969,21 +4123,25 @@ impl OnDemand<'_> {
         let cost = TicketCost::from(p.cost);
         // The run's session too (OWL-394): a run that asked leaves one, and
         // a run of its role spends the one it found, which watch does not
-        // read as progress either.
+        // read as progress either; and what the run's branch widened
+        // (OWL-403), neither.
         let record = match &p.stored {
             Some(stored)
                 if stored.record.cost.as_ref() == Some(&cost)
-                    && stored.record.session == p.session =>
+                    && stored.record.session == p.session
+                    && stored.record.held == p.held =>
             {
                 return;
             }
             Some(stored) => TicketRecord {
                 cost: Some(cost),
                 session: p.session.clone(),
+                held: p.held.clone(),
                 ..stored.record.clone()
             },
             None => TicketRecord {
                 session: p.session.clone(),
+                held: p.held.clone(),
                 ..ticket_ref::blank(Some(cost))
             },
         };
@@ -4015,6 +4173,34 @@ impl OnDemand<'_> {
                     data([("what", json!("cost_not_kept")), ("reason", json!(reason))]),
                 );
             }
+        }
+    }
+
+    /// Widens what the ticket holds by what a run of `role` left its branch
+    /// changing (OWL-403; architecture section 5, "Widened as its branch
+    /// moves"): after a Build or a rebase run, a fix, a correction and a
+    /// review loop's Build included, the files the branch changed against
+    /// its merge-base with the base this command fetched, kept by the write
+    /// of the run's spend that follows. Files that cannot be read widen it to
+    /// the whole repository. A ticket whose ref keeps no `held.json` holds
+    /// the whole repository already, and one with no branch changed nothing.
+    fn widen(&self, p: &mut Prepared, role: Role) -> Option<Widened> {
+        if !matches!(role, Role::Build | Role::Rebase) || p.held.is_none() {
+            return None;
+        }
+        let head = self.branch_head(p)?;
+        let read = held::changed_files(&self.executor.git, &p.checkout, &p.base.commit, &head);
+        let now = (self.clock)();
+        let held = p.held.as_mut()?;
+        match read {
+            Ok(files) => {
+                let added = held.widen(files, now);
+                (!added.is_empty()).then(|| Widened::Files {
+                    added,
+                    whole: held.whole(),
+                })
+            }
+            Err(reason) => held.widen_whole(now).then_some(Widened::Unread(reason)),
         }
     }
 
@@ -4199,6 +4385,7 @@ impl OnDemand<'_> {
         self.dirs
             .mark_unverified(&marker)
             .map_err(|e| refused("the project's marker", e))?;
+        let widened;
         let spec = RunSpec {
             main: &p.checkout,
             worktree: &p.worktree,
@@ -4225,8 +4412,12 @@ impl OnDemand<'_> {
                 {
                     p.session = self.asked_session(p, (brief.role, stage), key, &run, &report);
                 }
+                // What the run's branch now changes, before the step goes
+                // on (OWL-403).
+                widened = self.widen(p, brief.role);
                 // Kept before anything else the command does, so no stop
-                // after it, nor a crash, loses the run's cost (OWL-397).
+                // after it, nor a crash, loses the run's cost (OWL-397), nor
+                // what its branch widened.
                 self.keep_cost(p, &run, sink);
                 report
             }
@@ -4282,6 +4473,9 @@ impl OnDemand<'_> {
             }
         }
         sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
+        if let Some(widened) = widened {
+            sink.emit(ticket, Some(&run), widened.kind(), widened.data());
+        }
         // What the run's harness home left to say, such as a refreshed login
         // not written back (OWL-299): a warning each (OWL-303).
         for warning in run_warnings(brief.role, &report) {
@@ -4822,6 +5016,12 @@ impl OnDemand<'_> {
         if let Some(review) = p.review.as_mut() {
             review.build = None;
             review.last_fix = None;
+        }
+        // Delivered, its time kept with what it holds, and no delivery left
+        // to hold (OWL-403).
+        if let Some(held) = p.held.as_mut() {
+            held.delivered_at = Some((self.clock)());
+            held.verified = None;
         }
         // Its follow-ups are owed in the same write (OWL-253).
         let owed = self.owe(p, kept.owed.iter());
@@ -6993,14 +7193,20 @@ pub(super) fn held_for(
     resources: &[String],
     rules: &ProjectRules,
 ) -> Held {
-    let labels = brief_zones(ticket.labels.iter().map(String::as_str)).zones;
     let none = resource::NamedResources::default();
-    resource::held(
-        zones,
-        &labels,
-        resources,
-        rules.resources().unwrap_or(&none),
-    )
+    held_named(ticket, zones, resources, rules.resources().unwrap_or(&none))
+}
+
+/// [`held_for`] with the project's `named` resources as given: the drain's
+/// read of what a dispatch would hold (OWL-403).
+pub(crate) fn held_named(
+    ticket: &Ticket,
+    zones: &[String],
+    resources: &[String],
+    named: &NamedResources,
+) -> Held {
+    let labels = brief_zones(ticket.labels.iter().map(String::as_str)).zones;
+    resource::held(zones, &labels, resources, named)
 }
 
 /// Who decides a ticket, as far as the ticket alone tells.
@@ -7505,6 +7711,7 @@ mod tests {
                 review: None,
                 cost: None,
                 session: None,
+                held: None,
             },
             commit: "c".repeat(40),
             proposals: None,

@@ -109,6 +109,7 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{LandedKind, RefAfter, StepEnd, StepEnvelope, StepHold, StepKind};
+use owlshift_core::collision::{Collision, collision};
 use owlshift_core::follow::{Action, Decision};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
@@ -117,13 +118,14 @@ use owlshift_core::vocab::Stage;
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
-use crate::on_demand::{self, Delivered, OnDemand, PIPELINE, Stop};
+use crate::held;
+use crate::on_demand::{self, Delivered, OnDemand, PIPELINE, Stop, delivery_followed};
 use crate::pr_reviews;
 use crate::project::ProjectLock;
 use crate::quarantine::{self, Held, Record};
 use crate::reversal::{self, Current};
 use crate::step::{self, Children};
-use crate::ticket_ref::{self, Progress, RefAt, Stored, TicketRecord};
+use crate::ticket_ref::{self, Progress, RefAt, RefRead, Stored, TicketRecord};
 use crate::writer::VisibleStage;
 
 mod drain;
@@ -475,8 +477,13 @@ struct Memory<'c> {
     /// keeping it while its ref holds the slot, and taken during a pass by
     /// a ticket whose ref came to hold a free slot.
     turn: Option<Turn<TicketId>>,
-    /// The tickets told that they wait for the slot, with the holders told.
-    slot_waits: HashMap<TicketId, Vec<TicketId>>,
+    /// The tickets told that their next stage step waits, with what was
+    /// told: the slot's holders, or a collision (OWL-403).
+    waits: HashMap<TicketId, StepWait>,
+    /// The tickets whose next stage step a collision holds back, as this
+    /// pass's snapshot read them (OWL-403): they leave the slot's turn to
+    /// the others.
+    collisions: HashMap<TicketId, Collision<String>>,
     /// The tickets whose answer check watch ran into a stage that needs the
     /// slot, with their ref's progress after it: the tracker may still show
     /// them needs input when the move to working after the RESUME failed.
@@ -484,6 +491,15 @@ struct Memory<'c> {
     /// This pass took a step after which the next pass is due at once: a
     /// stage step whose ref moved, or a holder of the slot that left it.
     stepped: bool,
+}
+
+/// Why a ticket's next stage step waits, as told once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StepWait {
+    /// These tickets hold the slot's turn (OWL-367).
+    Slot(Vec<TicketId>),
+    /// A ticket holds what it would touch (OWL-403).
+    Collision(Collision<String>),
 }
 
 /// What watch knows of one marker: what its [`Record`] says, joined with
@@ -635,6 +651,9 @@ impl Watch<'_> {
         // The tickets whose ref holds the slot (OWL-367), one that does not
         // read among the unread, which may hold it.
         let mut holding = Vec::new();
+        // Which of them a collision holds back before their next stage step
+        // (OWL-403), from what the refs read hold.
+        memory.collisions = self.collisions(&read);
         for (ticket, stored) in read {
             let state = stored.and_then(|stored| {
                 TicketState::try_from(&stored.record.state)
@@ -736,15 +755,22 @@ impl Watch<'_> {
         memory
             .stale
             .retain(&[&followed[..], &read[..], &unread[..]].concat());
-        // The slot's turn for this pass's stage steps (OWL-367).
+        // The slot's turn for this pass's stage steps (OWL-367), among the
+        // holders no collision holds back (OWL-403): one that waits for a
+        // ticket that waits for the turn would hold both.
         let kept = match &memory.turn {
             Some(Turn::Holder(holder)) => Some(holder),
             _ => None,
         };
-        memory.turn = Some(schedule::slot_turn(&holding, &unread, kept));
+        let free: Vec<TicketId> = holding
+            .iter()
+            .filter(|ticket| !memory.collisions.contains_key(*ticket))
+            .cloned()
+            .collect();
+        memory.turn = Some(schedule::slot_turn(&free, &unread, kept));
         memory.resumed.retain(|ticket, _| holding.contains(ticket));
         memory
-            .slot_waits
+            .waits
             .retain(|ticket, _| holding.contains(ticket) || followed.contains(ticket));
         self.note(
             memory,
@@ -1873,8 +1899,13 @@ impl Watch<'_> {
             return;
         }
         // A stage that needs the slot runs in its ticket's turn (OWL-367):
-        // another ticket's turn holds it back, told once per holder.
+        // another ticket's turn holds it back, told once per holder. Before
+        // it, a ticket that would touch what another holds waits (OWL-403),
+        // told once per holder and resource.
         if shown == VisibleStage::Working {
+            if let Some(found) = memory.collisions.get(ticket).cloned() {
+                return self.wait_for_collision(memory, sink, out, ticket, found);
+            }
             match memory.turn.clone() {
                 Some(Turn::Holder(holder)) if holder != *ticket => {
                     return self.wait_for_slot(memory, sink, out, ticket, vec![holder]);
@@ -1883,7 +1914,7 @@ impl Watch<'_> {
                     return self.wait_for_slot(memory, sink, out, ticket, unread);
                 }
                 _ => {
-                    memory.slot_waits.remove(ticket);
+                    memory.waits.remove(ticket);
                 }
             }
         }
@@ -2004,11 +2035,11 @@ impl Watch<'_> {
         match memory.turn.clone().unwrap_or(Turn::Free) {
             Turn::Free if holds_now => {
                 memory.turn = Some(Turn::Holder(ticket.clone()));
-                memory.slot_waits.remove(ticket);
+                memory.waits.remove(ticket);
             }
             Turn::Holder(holder) if holder == *ticket => {
                 if holds_now {
-                    memory.slot_waits.remove(ticket);
+                    memory.waits.remove(ticket);
                 } else if moved {
                     memory.stepped = true;
                 }
@@ -2036,9 +2067,13 @@ impl Watch<'_> {
         ticket: &TicketId,
         holders: Vec<TicketId>,
     ) {
-        if memory.slot_waits.get(ticket) == Some(&holders) {
+        let told = StepWait::Slot(holders);
+        if memory.waits.get(ticket) == Some(&told) {
             return;
         }
+        let StepWait::Slot(holders) = told else {
+            unreachable!("made a slot's wait above")
+        };
         let names: Vec<&str> = holders.iter().map(TicketId::as_str).collect();
         sink.emit(
             ticket,
@@ -2058,7 +2093,77 @@ impl Watch<'_> {
                 names.join(", ")
             ),
         );
-        memory.slot_waits.insert(ticket.clone(), holders);
+        memory.waits.insert(ticket.clone(), StepWait::Slot(holders));
+    }
+
+    /// Tells that `ticket`'s next stage step waits for `found` (OWL-403;
+    /// architecture section 5, "The collision rule"): one `decision` event
+    /// (`watch` = `waits`, `reason` = `collision`, the holder in `tickets`,
+    /// its `resource`) and one line, unless the last told was the same.
+    fn wait_for_collision(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        found: Collision<String>,
+    ) {
+        let told = StepWait::Collision(found);
+        if memory.waits.get(ticket) == Some(&told) {
+            return;
+        }
+        let StepWait::Collision(found) = &told else {
+            unreachable!("made a collision's wait above")
+        };
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Decision,
+            data([
+                ("watch", json!("waits")),
+                ("reason", json!("collision")),
+                ("tickets", json!([found.holder])),
+                ("resource", held::resource_data(&found.resource)),
+            ]),
+        );
+        self.line(
+            out,
+            &format!(
+                "{ticket} waits: {} holds {}, which it would touch, and its next stage runs once \
+                 {} no longer holds it",
+                found.holder, found.resource, found.holder
+            ),
+        );
+        memory.waits.insert(ticket.clone(), told);
+    }
+
+    /// The tickets whose next stage step a collision holds back (OWL-403):
+    /// each ticket ref of `read` that holds the slot and whose pull request
+    /// is not open, against every other ref that holds what its ticket
+    /// holds ([`held::holds`]), closed with the named resources of the
+    /// project file watch loaded. A ref that cannot be read holds no
+    /// ticket back here: it stops every stage step already ([`Turn::Unknown`]).
+    fn collisions(&self, read: &[RefRead]) -> HashMap<TicketId, Collision<String>> {
+        let named = self
+            .on_demand
+            .config
+            .stack
+            .named_resources()
+            .unwrap_or_default();
+        let in_flight: Vec<_> = read
+            .iter()
+            .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
+            .filter(|(_, stored)| held::holds(stored))
+            .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
+            .collect();
+        read.iter()
+            .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
+            .filter(|(_, stored)| holds(stored) && !delivery_followed(stored))
+            .filter_map(|(ticket, stored)| {
+                let own = held::in_flight(ticket, stored, &named);
+                collision(&own, &in_flight).map(|found| (ticket.clone(), found))
+            })
+            .collect()
     }
 
     /// Moves `ticket` to working, under the project's lock while its ref is

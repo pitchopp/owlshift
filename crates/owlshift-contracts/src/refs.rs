@@ -25,8 +25,8 @@ use crate::brief::{
     ShortQuestion, ThreadEntry, validate_thread,
 };
 use crate::format::{
-    self, CLAIM_FORMAT, COST_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
-    SESSION_FORMAT, TICKET_STATE_FORMAT,
+    self, CLAIM_FORMAT, COST_FORMAT, ContractError, DELIVERY_FORMAT, Format, HELD_FORMAT,
+    QUESTIONS_FORMAT, SESSION_FORMAT, TICKET_STATE_FORMAT,
 };
 use crate::ids::{SessionId, TicketId, check_name, is_commit_id};
 use crate::result::{
@@ -72,6 +72,9 @@ pub const COST_FILE: &str = "cost.json";
 /// The session of the latest run that asked, in a ticket ref's tree once a
 /// Design or Build run asked (OWL-394, [`TicketSession`]).
 pub const SESSION_FILE: &str = "session.json";
+/// What the ticket holds against the project's other tickets, in a ticket
+/// ref's tree from its dispatch (OWL-403, [`TicketHeld`]).
+pub const HELD_FILE: &str = "held.json";
 
 /// The claim ref of a ticket: `refs/owlshift/claims/<ticket>`.
 pub fn claim_ref(ticket: &TicketId) -> String {
@@ -331,6 +334,224 @@ impl TryFrom<&TicketCost> for TicketSpend {
                 "more runs without a cost than runs, or a restart past the whole spend",
             )
         })
+    }
+}
+
+/// The most files a [`TicketHeld`] lists: past them, or past
+/// [`MAX_HELD_BYTES`], the ticket holds the whole repository (OWL-403), as a
+/// pull request whose files cannot be read whole does.
+pub const MAX_HELD_FILES: usize = 3_000;
+/// The most bytes a rendered [`TicketHeld`] takes before its files give way
+/// to the whole repository, far below the ticket ref's cap on a file.
+pub const MAX_HELD_BYTES: usize = 256 * 1024;
+/// The most bytes of one path a [`TicketHeld`] keeps.
+pub const MAX_HELD_PATH_BYTES: usize = 4_096;
+/// The widenings whose time a [`TicketHeld`] keeps: the latest ones.
+pub const MAX_WIDENINGS: usize = 100;
+
+/// What a ticket holds against the project's other tickets, in
+/// [`HELD_FILE`] (OWL-403, architecture section 5, "What a ticket holds"):
+/// written at its dispatch, widened by the files its branch changes, and
+/// never narrowed while the ticket holds anything, from its dispatch until
+/// its pull request ends. A ticket dispatched before it was kept has none and
+/// holds the whole repository. Not in `intake.json`, which belongs to the
+/// ticket's text and is replaced by the next intake.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket held")]
+pub struct TicketHeld {
+    pub format: Format<HELD_FORMAT>,
+    /// The zones declared at its dispatch, intake's and its `zone:` labels',
+    /// as written; none: the whole repository.
+    #[serde(default)]
+    pub zones: Vec<String>,
+    /// The named resources declared at its dispatch, by name: those its
+    /// files match are not kept, each check reaching them from the
+    /// project's list.
+    #[serde(default)]
+    pub resources: Vec<String>,
+    /// The files its branch changed against its merge-base with the base,
+    /// a rename's two paths both, each once, sorted: a file holds itself,
+    /// never its folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// When it was dispatched; none for a ticket dispatched before
+    /// `held.json` was kept, which came before any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<Timestamp>,
+    /// When widenings added files, oldest first, the latest
+    /// [`MAX_WIDENINGS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widened_at: Vec<Timestamp>,
+    /// When its pull request was opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<Timestamp>,
+    /// The commit, a full id, whose Verify pass passed and whose delivery a
+    /// collision held back: its next step delivers that commit with no
+    /// Verify pass while the branch is still there. Cleared by the delivery
+    /// and by a new dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<String>,
+}
+
+impl TicketHeld {
+    const CONTRACT: &str = "ticket held";
+
+    /// What a ticket dispatched at `at` holds: `zones` (none for the whole
+    /// repository) and `resources`, no file yet.
+    pub fn dispatched(zones: Vec<String>, resources: Vec<String>, at: Option<Timestamp>) -> Self {
+        Self {
+            format: Format,
+            zones,
+            resources,
+            files: Vec::new(),
+            dispatched_at: at,
+            widened_at: Vec::new(),
+            delivered_at: None,
+            verified: None,
+        }
+    }
+
+    /// Whether it holds the whole repository.
+    pub fn whole(&self) -> bool {
+        self.zones.is_empty()
+    }
+
+    /// Adds what `other` holds: a whole repository stays whole, and the
+    /// zones, resources and files are united, each once. Its times and its
+    /// mark stay this record's.
+    pub fn join(&mut self, other: &TicketHeld) {
+        if other.whole() {
+            self.zones.clear();
+        } else if !self.whole() {
+            gather_strings(&mut self.zones, &other.zones);
+        }
+        gather_strings(&mut self.resources, &other.resources);
+        self.widen_by(other.files.iter().cloned());
+    }
+
+    /// Adds the files its branch changed, at `at`, and gives those it did
+    /// not hold yet, in their order; a widening that adds one keeps its
+    /// time. Past [`MAX_HELD_FILES`] or [`MAX_HELD_BYTES`], or given a path
+    /// it cannot keep (empty, holding a NUL, longer than
+    /// [`MAX_HELD_PATH_BYTES`]), the ticket holds the whole repository and
+    /// lists no file.
+    pub fn widen(&mut self, files: impl IntoIterator<Item = String>, at: Timestamp) -> Vec<String> {
+        let added = self.widen_by(files);
+        if !added.is_empty() {
+            self.widened_at.push(at);
+            let over = self.widened_at.len().saturating_sub(MAX_WIDENINGS);
+            self.widened_at.drain(..over);
+        }
+        added
+    }
+
+    /// The whole repository from now, at `at`, for a widening whose files
+    /// could not be read: what cannot be read is never taken as free.
+    /// Whether that changed what it holds.
+    pub fn widen_whole(&mut self, at: Timestamp) -> bool {
+        if self.whole() && self.files.is_empty() {
+            return false;
+        }
+        self.zones.clear();
+        self.files.clear();
+        self.widened_at.push(at);
+        let over = self.widened_at.len().saturating_sub(MAX_WIDENINGS);
+        self.widened_at.drain(..over);
+        true
+    }
+
+    /// [`Self::widen`], without its time.
+    fn widen_by(&mut self, files: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut added: Vec<String> = Vec::new();
+        let mut unkept = false;
+        for file in files {
+            if !keepable_path(&file) {
+                unkept = true;
+            } else if !self.files.contains(&file) && !added.contains(&file) {
+                added.push(file);
+            }
+        }
+        self.files.extend(added.iter().cloned());
+        self.files.sort();
+        if unkept || self.files.len() > MAX_HELD_FILES || self.render().len() > MAX_HELD_BYTES {
+            self.zones.clear();
+            self.files.clear();
+        }
+        added
+    }
+
+    /// Parses and validates a `held.json`.
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let held: Self = format::parse_json(Self::CONTRACT, HELD_FORMAT, input)?;
+        held.validate()?;
+        Ok(held)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+
+    /// Checks each zone keeps the rules of a `zone:` label's, each resource
+    /// is a resource name, the files are paths it keeps, sorted, each once
+    /// and at most [`MAX_HELD_FILES`], the widenings at most
+    /// [`MAX_WIDENINGS`], and the mark is a full commit id.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
+        for zone in &self.zones {
+            let broken = if zone.contains('*') {
+                Err("holds `*`: a zone is a folder, not a pattern")
+            } else {
+                owlshift_core::decider::check_zone(zone)
+            };
+            if let Err(reason) = broken {
+                return invalid(format!("the zone {zone:?} {reason}"));
+            }
+        }
+        for name in &self.resources {
+            if let Err(reason) = owlshift_core::resource::check_resource_name(name) {
+                return invalid(format!("the resource {name:?} {reason}"));
+            }
+        }
+        if self.files.len() > MAX_HELD_FILES {
+            return invalid(format!(
+                "{} files are listed, past the {MAX_HELD_FILES} it keeps",
+                self.files.len()
+            ));
+        }
+        if let Some(file) = self.files.iter().find(|file| !keepable_path(file)) {
+            return invalid(format!("the file {file:?} is not a path it keeps"));
+        }
+        if self.files.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return invalid("the files are not sorted, each once".to_owned());
+        }
+        if self.widened_at.len() > MAX_WIDENINGS {
+            return invalid(format!(
+                "{} widenings are kept, past the {MAX_WIDENINGS} it keeps",
+                self.widened_at.len()
+            ));
+        }
+        if let Some(commit) = &self.verified
+            && !is_commit_id(commit)
+        {
+            return invalid(format!("verified {commit:?} is not a commit id"));
+        }
+        Ok(())
+    }
+}
+
+/// A path a [`TicketHeld`] keeps: not empty, no NUL, at most
+/// [`MAX_HELD_PATH_BYTES`].
+fn keepable_path(path: &str) -> bool {
+    !path.is_empty() && !path.contains('\0') && path.len() <= MAX_HELD_PATH_BYTES
+}
+
+/// Adds each of `items` that `into` lacks, in order.
+fn gather_strings(into: &mut Vec<String>, items: &[String]) {
+    for item in items {
+        if !into.contains(item) {
+            into.push(item.clone());
+        }
     }
 }
 

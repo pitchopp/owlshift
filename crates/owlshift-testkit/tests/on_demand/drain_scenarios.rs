@@ -694,6 +694,192 @@ fn the_owner_of_a_zone_intake_declared_decides_a_ticket_without_an_assignee() {
     );
 }
 
+/// Each `decision` event of `events` that `key` names `waits` with the reason
+/// `collision`: its ticket, the holder and the resource.
+fn collisions(events: &[Event], key: &str) -> Vec<(String, Value, Value)> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Decision && e.data.get(key) == Some(&json!("waits")))
+        .filter(|e| e.data["reason"] == json!("collision"))
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str().to_owned(),
+                e.data["tickets"].clone(),
+                e.data["resource"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// Scenario S5, "Collision with work in flight", its part between
+/// Owlshift's tickets (OWL-403), one step at a time. DEMO-1 declares `app`
+/// and asks its decider at Build: its ref holds `app` while it waits, so
+/// DEMO-2, which declares `app/sub`, waits for it at the dispatch, told once,
+/// and DEMO-3, which declares `docs`, is dispatched. DEMO-3's Build changes
+/// `app/x.md` too, which the widening after the run finds: its Verify pass
+/// passes, and its delivery waits at Verify for DEMO-1, dispatched first.
+/// DEMO-1, answered, takes the turn DEMO-3 gives up and delivers; DEMO-3 waits
+/// on while DEMO-1's pull request is open, and once it is merged DEMO-3
+/// delivers the verified commit with no second Verify pass.
+#[test]
+fn scenario_s5_collisions_between_owlshifts_tickets() {
+    let bench = Bench::draining("maintainer");
+    for (id, text) in [
+        ("DEMO-2", "Greet in the sub-app."),
+        ("DEMO-3", "Document it."),
+    ] {
+        bench.put_ticket(id, "maintainer", "Todo", &["agent"], "", text);
+    }
+    // The project's gate greps GREETING.md, so DEMO-3 writes it too.
+    let mut widening = bench.reply(Some("Hello"), Some(&done_for("DEMO-3")));
+    for (path, text) in [("app/x.md", "Touched.\n"), ("docs/y.md", "Documented.\n")] {
+        widening
+            .files
+            .insert(RelativePath::new(path).unwrap(), text.to_owned());
+    }
+    let replies = vec![
+        bench.reply(None, Some(&intake_declaring(&["app"], &[]))),
+        bench.reply(None, Some(&intake_declaring(&["app/sub"], &[]))),
+        bench.reply(None, Some(ROUND_1)),
+        bench.reply(None, Some(&intake_declaring(&["docs"], &[]))),
+        widening,
+        bench.reply(
+            None,
+            Some(&check(&[
+                ("Q1", "answered", "English."),
+                ("Q2", "answered", "Hello."),
+            ])),
+        ),
+        bench.reply(Some("Hello"), Some(DONE)),
+        // DEMO-2, free once DEMO-1's pull request is merged, asks too.
+        bench.reply(None, Some(ROUND_1)),
+    ];
+    let (answered, merged, reopened) = (Cell::new(false), Cell::new(false), Cell::new(false));
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 16, |_, _| {
+        let events = bench.events();
+        let held = events
+            .iter()
+            .any(|e| e.data.get("delivery") == Some(&json!("held")));
+        if held && !answered.get() {
+            bench.answer("Q1: English. Q2: Hello.");
+            answered.set(true);
+        }
+        let delivered = bench
+            .record_of(TICKET)
+            .and_then(|record| record.delivery)
+            .is_some_and(|delivery| delivery.followed());
+        if delivered && !merged.get() {
+            bench.merge(TICKET);
+            merged.set(true);
+        }
+        if merged.get() && !reopened.get() && merge_read(&events, TICKET).is_some() {
+            bench.reopened();
+            reopened.set(true);
+        }
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let events = bench.events();
+
+    // A held zone holds a dispatch: DEMO-2 waits for DEMO-1's `app`, told
+    // once, while DEMO-3 is dispatched; DEMO-2 goes once DEMO-1's pull
+    // request is merged and the slot DEMO-3 held is free.
+    let app = json!({ "zone": "app" });
+    let told = collisions(&events, "drain");
+    assert_eq!(
+        told,
+        [("DEMO-2".to_owned(), json!(["DEMO-1"]), app.clone())],
+        "{report}"
+    );
+    assert!(
+        lines.contains("DEMO-2 waits: DEMO-1 holds zone `app`"),
+        "{lines}"
+    );
+    let from_ready = |e: &Event| e.kind == EventKind::Dispatch && e.data["command"] == "drain";
+    let drained: Vec<&str> = events
+        .iter()
+        .filter(|e| from_ready(e))
+        .map(|e| e.ticket.as_ref().unwrap().as_str())
+        .collect();
+    assert_eq!(drained, ["DEMO-1", "DEMO-3", "DEMO-2"], "{report}");
+    let dispatch_of = |id: &str| {
+        events
+            .iter()
+            .position(|e| from_ready(e) && e.ticket.as_ref().is_some_and(|t| t.as_str() == id))
+    };
+    assert!(
+        merge_read(&events, TICKET) < dispatch_of("DEMO-2"),
+        "{report}"
+    );
+
+    // The widening found before delivery holds DEMO-3 at Verify, its
+    // verified commit kept.
+    let held: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.data.get("delivery") == Some(&json!("held")))
+        .collect();
+    assert_eq!(held.len(), 1, "{report}");
+    assert_eq!(held[0].ticket.as_ref().unwrap().as_str(), "DEMO-3");
+    assert_eq!(
+        (&held[0].data["tickets"], &held[0].data["resource"]),
+        (&json!(["DEMO-1"]), &app)
+    );
+    let widened: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.data.get("held") == Some(&json!("widened")))
+        .filter(|e| e.ticket.as_ref().unwrap().as_str() == "DEMO-3")
+        .collect();
+    assert_eq!(widened.len(), 1, "{report}");
+    assert_eq!(
+        widened[0].data["files"],
+        json!(["GREETING.md", "app/x.md", "docs/y.md"])
+    );
+    let waited = collisions(&events, "watch");
+    assert!(
+        waited.contains(&("DEMO-3".to_owned(), json!(["DEMO-1"]), app.clone())),
+        "{waited:?}\n{report}"
+    );
+
+    // DEMO-1 delivers first, then DEMO-3, once DEMO-1's pull request is
+    // merged, with no Verify pass after its hold.
+    let opened: Vec<String> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::TrackerWrite && e.data["action"] == json!("pull_request"))
+        .map(|e| e.ticket.as_ref().unwrap().as_str().to_owned())
+        .collect();
+    assert_eq!(opened, ["DEMO-1", "DEMO-3"], "{report}");
+    let verifies = |id: &str| {
+        bench
+            .runs()
+            .iter()
+            .filter(|(role, ticket)| *role == Role::Verify && ticket == id)
+            .count()
+    };
+    assert_eq!((verifies("DEMO-1"), verifies("DEMO-3")), (1, 1), "{report}");
+    let verified: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.data.get("review") == Some(&json!("verified")))
+        .collect();
+    assert_eq!(verified.len(), 1, "{report}");
+    assert_eq!(
+        verified[0].data["commit"], held[0].data["commit"],
+        "{report}"
+    );
+
+    // What DEMO-3's ref keeps of what it held: its declared zone, the files
+    // its branch changed, the times, and no mark once delivered.
+    let kept = bench.record_of("DEMO-3").unwrap().held.unwrap();
+    assert_eq!(kept.zones, ["docs"]);
+    assert_eq!(kept.files, ["GREETING.md", "app/x.md", "docs/y.md"]);
+    assert!(kept.dispatched_at.is_some() && kept.delivered_at.is_some());
+    assert_eq!(kept.widened_at.len(), 1);
+    assert_eq!(kept.verified, None);
+    let first = bench.record_of(TICKET).unwrap().held.unwrap();
+    assert!(
+        first.dispatched_at < kept.dispatched_at,
+        "{first:?} {kept:?}"
+    );
+}
+
 /// Scenario S6, "The human is the bottleneck", with `max_open_prs = 1`. The
 /// drain's Build of DEMO-1 stops at a usage limit, which tells the operator,
 /// and leaves DEMO-1 at Build: DEMO-2, taken in, waits for the one slot
@@ -829,7 +1015,8 @@ fn scenario_s6_the_human_is_the_bottleneck() {
 /// although its cost moved DEMO-1's ref, watch holds it for 10 minutes as a
 /// resume that changed nothing else. Meanwhile DEMO-1's ref holds the one
 /// slot: DEMO-2, taken in, waits for it, where it was built before. Once the
-/// hold ends, watch resumes DEMO-1 and delivers it, then DEMO-2 is built.
+/// hold ends, watch resumes DEMO-1 and delivers it; DEMO-2 then waits for
+/// DEMO-1's open pull request, which holds the whole repository (OWL-403).
 #[test]
 fn a_do_typed_by_hand_is_resumed_by_watch_and_holds_the_slot() {
     let bench = Bench::draining("maintainer");
@@ -860,12 +1047,7 @@ fn a_do_typed_by_hand_is_resumed_by_watch_and_holds_the_slot() {
 
     let before = bench.events().len();
     let intake = bench.reply(None, Some(&intake_result("done", None, "")));
-    let replies = vec![
-        cut(),
-        intake,
-        bench.reply(Some("Hello"), Some(DONE)),
-        bench.reply(Some("Hello there"), Some(&done_for("DEMO-2"))),
-    ];
+    let replies = vec![cut(), intake, bench.reply(Some("Hello"), Some(DONE))];
     let ends = RefCell::new(Vec::new());
     let after_cut = RefCell::new(None);
     let (outcomes, lines, printed) = bench.drain(replies, 3, |pass| {
@@ -907,10 +1089,25 @@ fn a_do_typed_by_hand_is_resumed_by_watch_and_holds_the_slot() {
         lines.contains("DEMO-1 is at Build as it was before that resume"),
         "{lines}"
     );
-    // DEMO-2 waited for the slot DEMO-1's ref held.
+    // DEMO-2 waited for the slot DEMO-1's ref held; then, DEMO-1 delivered,
+    // for DEMO-1's open pull request, which holds the whole repository: a
+    // `do` with no intake declares no zone (OWL-403).
     assert_eq!(
         waits(&passes[1]),
         [("DEMO-2".to_owned(), json!("slot"), json!(["DEMO-1"]))],
+        "{lines}"
+    );
+    assert_eq!(
+        collisions(&events, "drain"),
+        [(
+            "DEMO-2".to_owned(),
+            json!(["DEMO-1"]),
+            json!({ "zone": "" })
+        )],
+        "{lines}"
+    );
+    assert!(
+        lines.contains("DEMO-2 waits: DEMO-1 holds the whole repository"),
         "{lines}"
     );
     assert_eq!(
@@ -920,14 +1117,12 @@ fn a_do_typed_by_hand_is_resumed_by_watch_and_holds_the_slot() {
             (Role::Intake, "DEMO-2".to_owned()),
             (Role::Build, "DEMO-1".to_owned()),
             (Role::Verify, "DEMO-1".to_owned()),
-            (Role::Build, "DEMO-2".to_owned()),
-            (Role::Verify, "DEMO-2".to_owned()),
         ],
         "{lines}"
     );
     assert_eq!(
         outcomes.iter().filter(|o| o.is_ok()).count(),
-        2,
+        1,
         "{outcomes:?}"
     );
 }
@@ -1377,16 +1572,23 @@ fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
     let question = r#"[{"id":"Q1","category":"scope",
         "context":"The ticket does not say the greeting's language.",
         "text":"Which language?","recommendation":{"why":"The simplest reading of the ticket."}}]"#;
-    let mut breach = bench.reply(Some("Hello again"), Some(&done_for("DEMO-2")));
+    // DEMO-2, parked, keeps what it holds (OWL-403): its zone and its file
+    // are not DEMO-1's.
+    let mut breach = bench.reply(None, Some(&done_for("DEMO-2")));
+    breach.files.insert(
+        RelativePath::new("docs/again.md").unwrap(),
+        "Hello again.\n".to_owned(),
+    );
+    breach.commit = Some("Greet again".to_owned());
     breach
         .main_checkout
         .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
     let replies = vec![
         bench.reply(None, Some(&intake_result("questions", None, question))),
-        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(None, Some(&intake_declaring(&["docs"], &[]))),
         breach,
         bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
-        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(None, Some(&intake_declaring(&["app"], &[]))),
         bench.reply(Some("Hello"), Some(&done_for("DEMO-1"))),
     ];
     let (outcomes, lines, printed) = bench.drain(replies, 6, |pass| match pass {

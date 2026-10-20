@@ -1625,6 +1625,8 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
             TrackerWrite,
             RunStarted,
             RunEnded,
+            // The files the Build's branch changed, now held (OWL-403).
+            Decision,
             // The Verify pass: its one critic, then the pass (OWL-304).
             RunStarted,
             RunEnded,

@@ -209,30 +209,18 @@ impl OnDemand<'_> {
     /// deliveries of every ref, `p`'s own included, as watch's snapshot
     /// counts them. A ref gone since the listing neither holds nor counts.
     fn under_lock(&self, p: &Prepared) -> Locked {
-        let git = &self.executor.git;
-        let Ok(tickets) = ticket_ref::list(git, &p.checkout) else {
+        let Ok(others) = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket) else {
             return Locked::Held;
         };
-        let mut open_prs: u32 = 0;
-        for ticket in &tickets {
-            let own = *ticket == p.ticket;
-            let read = if own {
-                p.stored.clone()
-            } else {
-                match ticket_ref::read(git, &p.checkout, ticket) {
-                    Ok(read) => read,
-                    Err(_) => return Locked::Held,
-                }
+        let mut open_prs = u32::from(p.stored.as_ref().is_some_and(delivery_followed));
+        for (_, read) in &others {
+            let Ok(stored) = read else {
+                return Locked::Held;
             };
-            let Some(stored) = read else {
-                continue;
-            };
-            if !own
-                && holds_slot_or_unknown(TicketState::try_from(&stored.record.state).ok().as_ref())
-            {
+            if holds_slot_or_unknown(TicketState::try_from(&stored.record.state).ok().as_ref()) {
                 return Locked::Held;
             }
-            if delivery_followed(&stored) {
+            if delivery_followed(stored) {
                 open_prs = open_prs.saturating_add(1);
             }
         }

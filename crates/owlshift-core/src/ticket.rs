@@ -33,7 +33,10 @@ pub struct Ticket<K> {
     pub blocked_by: Vec<Blocker<K>>,
     /// The pipeline variant: picked at intake, or forced by a label.
     pub variant: Variant,
-    /// The resources declared at intake.
+    /// What a dispatch would make it hold (OWL-403): the zones and named
+    /// resources declared at intake with its labels' zones, closed with the
+    /// named resources they reach ([`crate::resource::closed`]), which the
+    /// ready set checks against the tickets in flight.
     pub resources: Vec<Resource>,
     /// The state its ticket ref keeps; [`TicketState::admitted`] for a ticket
     /// without a ref.
