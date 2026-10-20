@@ -6,8 +6,8 @@
 //! that person decides; otherwise nobody does, and [`NoDecider`] says why.
 //! Accounts are the tracker's identifiers, compared as written.
 //!
-//! Until intake declares zones (P6), a ticket declares them with labels
-//! `zone:<folder>` ([`declared_zones`]).
+//! A ticket declares zones with labels `zone:<folder>` ([`declared_zones`])
+//! and, once its intake ended, with its intake record ([`ticket_zones`]).
 
 use std::fmt;
 
@@ -45,6 +45,27 @@ pub fn declared_zones<'a>(
         zones.push(Resource::Zone(zone.to_owned()));
     }
     Ok(zones)
+}
+
+/// The zones a ticket declares to choose its decider (architecture section
+/// 4, OWL-412): `intake`'s, as its intake record keeps them, then those of
+/// its `zone:` labels ([`declared_zones`], whose refusal of a malformed
+/// label it keeps). Each zone counts for its own owner, a zone inside
+/// another included: unlike what the ticket holds
+/// ([`held`](crate::resource::held)), which keeps the outer zone of two
+/// for collisions and reads an intake without zones as the whole
+/// repository, a label is never dropped here, and the whole repository,
+/// which no one owns, adds no zone.
+pub fn ticket_zones<'a>(
+    intake: &[String],
+    labels: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<Resource>, ZoneLabelError> {
+    let labelled = declared_zones(labels)?;
+    Ok(intake
+        .iter()
+        .map(|zone| Resource::Zone(zone.clone()))
+        .chain(labelled)
+        .collect())
 }
 
 /// What a ticket's `zone:` labels give the brief ([`brief_zones`]).
@@ -476,6 +497,39 @@ mod tests {
             assert!(text.contains(reason), "{label}: {text}");
             assert!(text.contains(&format!("{label:?}")), "{text}");
         }
+    }
+
+    #[test]
+    fn intake_zones_join_the_labels_each_for_its_own_owner() {
+        let owned = owners(&[
+            ("docs", "owner"),
+            ("backend/billing", "bob"),
+            ("web", "ann"),
+        ]);
+        let decide = |intake: &[&str], labels: &[&str]| {
+            let intake: Vec<String> = intake.iter().map(|z| (*z).to_owned()).collect();
+            let declared = ticket_zones(&intake, labels.iter().copied()).unwrap();
+            decider(None, &declared, &owned).map(Decider::account)
+        };
+        // Intake's zone alone names its owner.
+        assert_eq!(decide(&["docs"], &[]), Ok("owner"));
+        // An intake without zones, the whole repository, adds no owner.
+        assert_eq!(decide(&[], &["zone:web"]), Ok("ann"));
+        // A label inside intake's unowned zone keeps its owner.
+        assert_eq!(decide(&["backend"], &["zone:backend/billing"]), Ok("bob"));
+        // Intake's zone of another owner leaves the ticket without one.
+        assert_eq!(
+            decide(&["docs"], &["zone:web"]),
+            Err(NoDecider::SeveralOwners(vec!["ann", "owner"]))
+        );
+        let nested = owners(&[("backend", "ann"), ("backend/billing", "bob")]);
+        let declared = ticket_zones(&["backend".to_owned()], ["zone:backend/billing"]).unwrap();
+        assert_eq!(
+            decider(None, &declared, &nested),
+            Err(NoDecider::SeveralOwners(vec!["ann", "bob"]))
+        );
+        // A malformed label is still refused.
+        assert!(ticket_zones(&["docs".to_owned()], ["zone:../x"]).is_err());
     }
 
     #[test]

@@ -646,6 +646,54 @@ fn intake_declares_zones_and_named_resources() {
     assert!(build.named_resources.is_empty());
 }
 
+/// OWL-412: the zones intake declared choose the decider of a ticket without
+/// an assignee, as its labels' do. Intake itself runs only on a ticket that
+/// its assignee or labels give a decider, so a ticket whose zones come from
+/// intake alone is one whose assignee left after its intake: DEMO-1, labelled
+/// with no zone, is taken in under its assignee, intake declares `docs`, and
+/// the assignee is removed before the dispatch. The drain still dispatches
+/// it, and its Build's round goes to the owner of `docs`.
+#[test]
+fn the_owner_of_a_zone_intake_declared_decides_a_ticket_without_an_assignee() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        DOCS_OWNED,
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    let replies = vec![
+        bench.reply(None, Some(&intake_declaring(&["docs"], &[]))),
+        bench.reply(None, Some(ROUND_1)),
+    ];
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 3, |pass, _| {
+        if pass == 1 {
+            let text = fs::read_to_string(bench.ticket_file()).unwrap();
+            fs::write(
+                bench.ticket_file(),
+                text.replace("assignee = \"maintainer\"\n", ""),
+            )
+            .unwrap();
+        }
+    });
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Err(Stop::NeedsInput { posted: Ok(_), .. }))),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.record().intake.unwrap().zones, ["docs"]);
+    let build = bench.last_of(Role::Build);
+    assert_eq!(build.decider, "owner");
+    assert_eq!(
+        bench.record().questions.asks[0].decider,
+        AskDecider {
+            account: "owner".to_owned(),
+            by: DeciderRule::ZoneOwner,
+        }
+    );
+}
+
 /// Scenario S6, "The human is the bottleneck", with `max_open_prs = 1`. The
 /// drain's Build of DEMO-1 stops at a usage limit, which tells the operator,
 /// and leaves DEMO-1 at Build: DEMO-2, taken in, waits for the one slot

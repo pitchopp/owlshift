@@ -165,7 +165,9 @@ impl Row {
             Status::Active(Stage::Watch) => !self.followed() && stale,
             _ => false,
         };
-        due && !self.excluded(exclude) && on_demand::has_decider(&self.listed.ticket)
+        // Intake runs only on a ticket its assignee or labels give a
+        // decider: the zones of its record count once it ended (OWL-412).
+        due && !self.excluded(exclude) && on_demand::has_decider(&self.listed.ticket, &[])
     }
 
     /// The core's order: priority, then the first created, then the
@@ -216,7 +218,10 @@ fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
             "it carries the exclusion label {:?}",
             exclude.unwrap_or_default()
         ),
-        Wait::NoDecider => "it has no decider: give it an assignee".to_owned(),
+        Wait::NoDecider => {
+            "it has no decider: give it an assignee, or a `zone:` label whose zone has an owner"
+                .to_owned()
+        }
         Wait::NoIntake => "its intake has not run yet".to_owned(),
         Wait::StaleIntake => "its text changed since its intake, which runs again".to_owned(),
         Wait::NotReady => {
@@ -692,7 +697,18 @@ impl Watch<'_> {
             priority: row.listed.ticket.priority,
             created_ms: row.listed.created_at.map_or(0, Timestamp::as_millisecond),
             admission,
-            has_decider: on_demand::has_decider(&row.listed.ticket),
+            // The zones of an intake record that holds the ticket's text
+            // join its labels' (OWL-412). A command counts a record kept for
+            // an earlier text too, but the drain takes in a ticket whose
+            // text changed again, so such a record is about to be replaced
+            // and its ticket waits for that intake, whose own check counts no
+            // record's zones.
+            has_decider: on_demand::has_decider(
+                &row.listed.ticket,
+                record
+                    .filter(|record| record.text_sha256 == row.text)
+                    .map_or(&[], |record| &record.zones),
+            ),
             text_hash: row.text.clone(),
             intake_hash: row.intake_hash().map(ToOwned::to_owned),
             blocked_by,
