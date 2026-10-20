@@ -879,7 +879,7 @@ impl Bench {
                 "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\n{admit}\n\
                  states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\"{states} }}\n\
                  [stack]\ngate = [\"git grep -q Hello -- GREETING.md\"]\n\
-                 [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n\
+                 [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\nfindings = \"arbiter\"\n[models]\n[policy]\nalways_human = []\n\
                  {zones}"
             ),
         )
