@@ -370,7 +370,7 @@
           }
         },
         "resources": {
-          "description": "Named resources and the path globs they cover.",
+          "description": "Named resources, such as a migration chain, each with the pattern of\nthe repository paths it covers: a path from the repository's root,\n`/` between its parts, where a part `*` stands for exactly one part\nand `**` for any number of them (`backend/*/migrations/**`). Names\nhold only ASCII letters, digits, `.`, `_` and `-`. Checked when the\nfile is loaded ([`owlshift_core::resource::Pattern::new`]). Intake\nnames the ones a ticket touches, and a zone a pattern reaches holds\nits resource (OWL-402).",
           "type": "object",
           "additionalProperties": {
             "type": "string"

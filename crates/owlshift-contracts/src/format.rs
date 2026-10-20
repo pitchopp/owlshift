@@ -36,8 +36,10 @@ use crate::Role;
 /// format 22 the author's `disagreed` and `deferred` answers, beside a
 /// confirmed ruling, in `earlier`, and answers to findings to `fix`
 /// (OWL-377); format 23 Build's `setup_failure`, beside its `gate_failure`
-/// (OWL-389).
-pub const BRIEF_FORMAT: u32 = 23;
+/// (OWL-389); format 24 intake's `named_resources` and `result_refusal`, and
+/// `zones` and `resources` as what the ticket holds once intake ran
+/// (OWL-402).
+pub const BRIEF_FORMAT: u32 = 24;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -51,8 +53,9 @@ pub const BRIEF_FORMAT: u32 = 23;
 /// decision, and its `quote` on a `ticket` one (OWL-337); format 12 the
 /// `judgment` basis kind and a decision's `option` (OWL-343); format 13
 /// `finding_responses` to findings to `fix` too, and their `disagreed` and
-/// `deferred` outcomes (OWL-377).
-pub const RESULT_FORMAT: u32 = 13;
+/// `deferred` outcomes (OWL-377); format 14 intake's `zones` and
+/// `resources` (OWL-402).
+pub const RESULT_FORMAT: u32 = 14;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -87,8 +90,9 @@ pub const QUESTIONS_FORMAT: u32 = 16;
 /// are still read.
 pub const DELIVERY_FORMAT: u32 = 5;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
-/// ref, OWL-245).
-pub const INTAKE_FORMAT: u32 = 1;
+/// ref, OWL-245). Format 2 adds the `zones` and `resources` intake declared
+/// (OWL-402); format 1 is still read, as holding the whole repository.
+pub const INTAKE_FORMAT: u32 = 2;
 /// The format version of a ticket's proposed follow-ups (`proposals.json` on
 /// a ticket ref, OWL-245). Format 2 lets a review loop's run propose
 /// (OWL-300); format 1 is still read.

@@ -46,7 +46,7 @@ const FORKED_WITH_ALTERNATIVE: &str = r#"{"goal":"Add GREETING.md saying Hello."
 
 /// A design run's `done` with `plan`.
 pub(super) fn designed(plan: &str) -> String {
-    format!(r#"{{"format":13,"status":"done","summary":"Planned the greeting.","plan":{plan}}}"#)
+    format!(r#"{{"format":14,"status":"done","summary":"Planned the greeting.","plan":{plan}}}"#)
 }
 
 /// The author's answers to the findings of its brief, one per (finding,
@@ -87,7 +87,7 @@ pub(super) fn reviewed(findings: &[(&str, &str)]) -> String {
             })
         })
         .collect();
-    json!({ "format": 13, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 14, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -104,13 +104,13 @@ pub(super) fn ruled(outcomes: &[&str]) -> String {
             })
         })
         .collect();
-    json!({ "format": 13, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+    json!({ "format": 14, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
 }
 
 /// A design run's answer to an approval round.
 pub(super) fn answered(approval: &str, plan: Option<&str>) -> String {
     let mut result = json!({
-        "format": 13,
+        "format": 14,
         "status": "done",
         "summary": "Read the decider's reply.",
         "approval": approval,
@@ -122,12 +122,12 @@ pub(super) fn answered(approval: &str, plan: Option<&str>) -> String {
 }
 
 /// A Build run that cannot follow its plan.
-pub(super) const REPLAN: &str = r#"{"format":13,"status":"questions",
+pub(super) const REPLAN: &str = r#"{"format":14,"status":"questions",
 "summary":"Step 1 cannot be followed as written.",
 "questions":[{"id":"Q1","category":"naming","context":"Step 1 names the file to write.",
 "text":"Which file should hold the greeting?","replan":true,"recommendation":{"why":"The simplest reading of the ticket."}}]}"#;
 
-const FAILED: &str = r#"{"format":13,"status":"failed","summary":"Could not read the plan."}"#;
+const FAILED: &str = r#"{"format":14,"status":"failed","summary":"Could not read the plan."}"#;
 
 impl Bench {
     /// A bench whose ticket carries `variant`'s label.
@@ -491,7 +491,7 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
     .unwrap();
     let answering = |responses: &str| {
         format!(
-            r#"{{"format":13,"status":"done","summary":"Revised.","plan":{REVISED},
+            r#"{{"format":14,"status":"done","summary":"Revised.","plan":{REVISED},
             "finding_responses":[{responses}]}}"#
         )
     };
@@ -1315,7 +1315,7 @@ fn a_reviewer_failing_twice_parks_the_ticket_at_design_review() {
 #[test]
 fn a_false_premise_at_design_is_a_round_to_the_decider() {
     let bench = Bench::of("standard");
-    let premise = r#"{"format":13,"status":"premise_false",
+    let premise = r#"{"format":14,"status":"premise_false",
 "summary":"The greeting file the ticket extends is not in the repository.",
 "questions":[{"id":"Q1","category":"naming","context":"The ticket extends GREETING.md; no such file exists.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
@@ -1352,7 +1352,7 @@ fn a_false_premise_at_design_is_a_round_to_the_decider() {
 #[test]
 fn a_false_premise_at_design_without_a_question_parks_the_ticket() {
     let bench = Bench::of("standard");
-    let premise = r#"{"format":13,"status":"premise_false","summary":"The file is not there."}"#;
+    let premise = r#"{"format":14,"status":"premise_false","summary":"The file is not there."}"#;
     let (outcome, printed) = bench.run(vec![bench.read(premise)], None);
     assert!(
         matches!(
@@ -1379,7 +1379,7 @@ fn a_false_premise_at_design_without_a_question_parks_the_ticket() {
 }
 
 /// A design run's question on a trade-off nothing settles.
-pub(super) const TRADE_OFF: &str = r#"{"format":13,"status":"questions",
+pub(super) const TRADE_OFF: &str = r#"{"format":14,"status":"questions",
 "summary":"The ticket leaves the greeting's format open.",
 "questions":[{"id":"Q1","category":"approach","context":"The ticket says Hello; nothing says Markdown or plain text.",
 "text":"Should GREETING.md be Markdown or plain text?",
@@ -1387,7 +1387,7 @@ pub(super) const TRADE_OFF: &str = r#"{"format":13,"status":"questions",
 "recommendation":{"option":"A","why":"The repository's docs are Markdown."}}]}"#;
 
 /// The resolver's decision on it, on its own weighing (OWL-343).
-const JUDGED: &str = r#"{"format":13,"status":"done","summary":"Weighed the format.",
+const JUDGED: &str = r#"{"format":14,"status":"done","summary":"Weighed the format.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"file_format","decision":"Markdown.",
 "basis":"Option A: the docs are Markdown, so a reader expects it; the cost is none, as nothing renders it.",
 "basis_kind":"judgment","option":"A"}]}"#;
@@ -1471,11 +1471,11 @@ fn a_design_question_is_decided_on_judgment_at_all_and_not_below() {
 #[test]
 fn a_finding_the_design_turns_into_a_scope_question_reaches_the_decider() {
     let bench = Bench::of("standard");
-    let asks = r#"{"format":13,"status":"questions","summary":"Weighed the reviewer's point.",
+    let asks = r#"{"format":14,"status":"questions","summary":"Weighed the reviewer's point.",
 "questions":[{"id":"Q1","category":"languages","context":"A reviewer wants the greeting in every language.",
 "text":"Should GREETING.md greet in every language, beyond the ticket's Hello?",
 "recommendation":{"why":"Hello alone, as the ticket says."}}]}"#;
-    let labelled = r#"{"format":13,"status":"done","summary":"The ticket says Hello.",
+    let labelled = r#"{"format":14,"status":"done","summary":"The ticket says Hello.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"scope",
 "decision":"Hello alone.","basis":"The ticket's description names Hello.","basis_kind":"settled"}]}"#;
     let replies = vec![
@@ -1561,7 +1561,7 @@ fn the_resolver_approves_a_forked_plan_under_on_fork() {
         text.replace("plan_approval = \"never\"", "plan_approval = \"on-fork\""),
     )
     .unwrap();
-    let approves = r#"{"format":13,"status":"done","summary":"The fork's choice is the repository's.",
+    let approves = r#"{"format":14,"status":"done","summary":"The fork's choice is the repository's.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"approval",
 "decision":"Approve the plan as it is.",
 "basis":"The plan's fork keeps Markdown, as the repository's docs are; plain text buys nothing.",
@@ -1617,14 +1617,14 @@ fn the_resolver_approves_a_forked_plan_under_on_fork() {
 /// runner's own last option, is refused and goes to the decider.
 #[test]
 fn a_false_premise_rescope_is_decided_and_its_closure_refused() {
-    let premise = r#"{"format":13,"status":"premise_false",
+    let premise = r#"{"format":14,"status":"premise_false",
 "summary":"The greeting file the ticket extends is not in the repository.",
 "questions":[{"id":"Q1","category":"premise","context":"The ticket extends GREETING.md; no such file exists.",
 "text":"Re-scope to create GREETING.md, or close the ticket?",
 "options":[{"label":"Re-scope: create GREETING.md."}],"recommendation":{"option":"A","why":"Re-scope"}}]}"#;
     let deciding = |option: &str| {
         format!(
-            r#"{{"format":13,"status":"done","summary":"Weighed the premise.",
+            r#"{{"format":14,"status":"done","summary":"Weighed the premise.",
 "resolutions":[{{"question":"Q1","outcome":"decided","category":"scope","decision":"Option {option}.",
 "basis":"The ticket wants a greeting; creating the file delivers it at no extra cost.",
 "basis_kind":"judgment","option":"{option}"}}]}}"#
@@ -2563,20 +2563,20 @@ fn a_plan_approved_by_a_thumbs_up_reaches_build() {
 }
 
 /// A design run's question the resolver settles, on the `approach`.
-const APPROACH: &str = r#"{"format":13,"status":"questions",
+const APPROACH: &str = r#"{"format":14,"status":"questions",
 "summary":"The ticket leaves the greeting's approach open.",
 "questions":[{"id":"Q1","category":"approach","context":"The ticket says Hello.",
 "text":"Should the greeting be a file of its own?",
 "recommendation":{"why":"The ticket names GREETING.md."}}]}"#;
 
 /// The resolver's decision on it, on what the ticket settles.
-const SETTLES_APPROACH: &str = r#"{"format":13,"status":"done","summary":"The ticket names the file.",
+const SETTLES_APPROACH: &str = r#"{"format":14,"status":"done","summary":"The ticket names the file.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"approach","decision":"A file of its own.",
 "basis":"The ticket's description names GREETING.md.","basis_kind":"settled"}]}"#;
 
 /// A design run's two questions, each with a recommendation, after the
 /// resolver settled its first (OWL-375).
-const TWO_ASKED: &str = r#"{"format":13,"status":"questions",
+const TWO_ASKED: &str = r#"{"format":14,"status":"questions",
 "summary":"Two points the ticket leaves open.",
 "questions":[
  {"id":"Q1","category":"naming","context":"The ticket says Hello.","text":"Which file holds the greeting?",
@@ -2586,7 +2586,7 @@ const TWO_ASKED: &str = r#"{"format":13,"status":"questions",
   "recommendation":{"why":"One file at the root."}}]}"#;
 
 /// A design run's two questions, the first filed under the floor.
-const FLOOR_ASKED: &str = r#"{"format":13,"status":"questions",
+const FLOOR_ASKED: &str = r#"{"format":14,"status":"questions",
 "summary":"Two points the ticket leaves open.",
 "questions":[
  {"id":"Q1","category":"security","context":"The greeting could load a remote font.","text":"May the greeting load a remote font?",

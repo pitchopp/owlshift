@@ -270,7 +270,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(14);
+            v["format"] = json!(15);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -329,20 +329,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 14, "status""#),
+        RunResult::parse(r#"{"format": 15, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 13, "status""#),
+        RunResult::parse(r#"{"format": 14, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(14));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(15));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 14,
-            supported: 13,
+            found: 15,
+            supported: 14,
             ..
         })
     ));
@@ -654,10 +654,14 @@ fn intake_comes_from_the_intake_role_only() {
         let input = edited("brief.json", |v| {
             v.as_object_mut().unwrap().remove("result_refusal");
             v["role"] = json!(role);
+            if role == "intake" {
+                v["named_resources"] = json!({ "migrations": "backend/*/migrations/**" });
+            }
         });
         Brief::parse(&input).unwrap()
     };
     let intake = brief("intake");
+    assert_eq!(intake.named_resources.len(), 1);
     let result = |edit: fn(&mut Value)| RunResult::parse(&edited("result-intake.json", edit));
 
     result(|_| {}).unwrap().validate_against(&intake).unwrap();
@@ -715,6 +719,26 @@ fn intake_comes_from_the_intake_role_only() {
         "an unknown effort",
         result(|v| v["intake"]["routing"]["effort"] = json!("minimal")),
         "unknown variant `minimal`",
+    );
+    // OWL-402: zones are folders, resources the brief's names.
+    rejects(
+        "a resource the brief does not list",
+        result(|v| v["intake"]["resources"] = json!(["migrations", "Migrations"]))
+            .unwrap()
+            .validate_against(&intake),
+        "the resource \"Migrations\" is not one the brief's named_resources lists (migrations)",
+    );
+    rejects(
+        "a zone written as a pattern",
+        result(|v| v["intake"]["zones"] = json!(["backend/**"])),
+        "the zone \"backend/**\" holds `*`",
+    );
+    rejects(
+        "named resources in another role's brief",
+        Brief::parse(&edited("brief.json", |v| {
+            v["named_resources"] = json!({ "migrations": "db/**" });
+        })),
+        "named resources are given but the role is",
     );
 
     // The drain's ticket-ref documents read their fixtures.
@@ -1545,7 +1569,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(24)),
+        parse(|v| v["format"] = json!(25)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1654,7 +1678,7 @@ fn brief_rejections() {
     rejects(
         "a refused result in a verifier's brief",
         parse(|v| v["role"] = json!("verify")),
-        "a refused result is given but the role is verify, not build, answer_check or resolver",
+        "a refused result is given but the role is verify, not build, answer_check, resolver or intake",
     );
     Brief::parse(&edited("brief.json", |v| v["role"] = json!("answer_check"))).unwrap();
     Brief::parse(&edited("brief.json", |v| {

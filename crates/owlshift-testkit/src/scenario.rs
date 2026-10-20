@@ -1268,6 +1268,7 @@ impl Driver {
             checkpoint: None,
             zones: brief_zones(ticket.labels.iter().map(String::as_str)).zones,
             resources: Vec::new(),
+            named_resources: Default::default(),
             rules: Vec::new(),
             permissions: Permissions {
                 level: if role == Role::Build {

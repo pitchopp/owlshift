@@ -1,5 +1,5 @@
 {
-  "format": 13,
+  "format": 14,
   "status": "done",
   "summary": "A standard ticket for the standard tier; it waits for OWL-41.",
   "intake": {
@@ -14,6 +14,12 @@
         "ticket": "OWL-41",
         "quote": "Blocked by OWL-41."
       }
+    ],
+    "zones": [
+      "backend/billing"
+    ],
+    "resources": [
+      "migrations"
     ]
   }
 }

@@ -1396,7 +1396,7 @@ mod tests {
             owlshift_contracts::format::BRIEF_FORMAT
         ))
         .unwrap();
-        let done = br#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+        let done = br#"{"format":14,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
         assert!(validate_result(done, "owlshift/T-1", &brief).is_ok());
 
         let other = validate_result(done, "owlshift/T-2", &brief)
@@ -1404,10 +1404,10 @@ mod tests {
             .to_string();
         assert!(other.contains("pr.branch"), "{other}");
         // A contract rule: questions needs a question.
-        let empty = br#"{"format":13,"status":"questions","summary":"s","questions":[]}"#;
+        let empty = br#"{"format":14,"status":"questions","summary":"s","questions":[]}"#;
         assert!(validate_result(empty, "owlshift/T-1", &brief).is_err());
         // A rule against the brief: verdicts come from the answer check only.
-        let verdicts = br#"{"format":13,"status":"done","summary":"s","verdicts":[{"question":"Q1","class":"answered","reason":"r"}]}"#;
+        let verdicts = br#"{"format":14,"status":"done","summary":"s","verdicts":[{"question":"Q1","class":"answered","reason":"r"}]}"#;
         let refused = validate_result(verdicts, "owlshift/T-1", &brief).unwrap_err();
         assert!(
             matches!(&refused, Failure::InvalidResult(reason) if reason.contains("role is build")),
@@ -1415,7 +1415,7 @@ mod tests {
         );
         // The build role's own decisions are a refusal of their own kind,
         // which its next run is told of (OWL-186).
-        let decided = br#"{"format":13,"status":"done","summary":"s","decisions":[{"question":"q","decision":"d","basis":"b"}]}"#;
+        let decided = br#"{"format":14,"status":"done","summary":"s","decisions":[{"question":"q","decision":"d","basis":"b"}]}"#;
         let refused = validate_result(decided, "owlshift/T-1", &brief).unwrap_err();
         assert!(
             matches!(
@@ -1431,7 +1431,7 @@ mod tests {
         // Questions past their byte bound are a refusal the retry is told
         // (OWL-213).
         let verbose = format!(
-            r#"{{"format":13,"status":"questions","summary":"s","questions":[{{"id":"Q1","category":"scope","context":"{}","text":"t","recommendation":{{"why":"r"}}}}]}}"#,
+            r#"{{"format":14,"status":"questions","summary":"s","questions":[{{"id":"Q1","category":"scope","context":"{}","text":"t","recommendation":{{"why":"r"}}}}]}}"#,
             "c".repeat(owlshift_contracts::result::MAX_QUESTION_BYTES)
         );
         let refused = validate_result(verbose.as_bytes(), "owlshift/T-1", &brief).unwrap_err();
@@ -1441,7 +1441,7 @@ mod tests {
             "{refused:?}"
         );
         // Unknown fields are refused, and so is text that is not UTF-8.
-        let unknown = br#"{"format":13,"status":"done","summary":"s","extra":1}"#;
+        let unknown = br#"{"format":14,"status":"done","summary":"s","extra":1}"#;
         assert!(validate_result(unknown, "owlshift/T-1", &brief).is_err());
         assert!(validate_result(b"\xff", "owlshift/T-1", &brief).is_err());
     }

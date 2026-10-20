@@ -192,6 +192,65 @@ pub struct IntakeVerdict {
     #[serde(default)]
     #[schemars(length(max = MAX_DEPENDENCIES))]
     pub dependencies: Vec<IntakeDependency>,
+    /// The folders the ticket will change, from the repository's root, at
+    /// the coarsest level the role can honestly name (format 14, OWL-402):
+    /// at most [`MAX_DECLARED`], each by the rules of a `zone:` label and
+    /// without `*`. None: the whole repository.
+    #[serde(default)]
+    #[schemars(length(max = MAX_DECLARED))]
+    pub zones: Vec<String>,
+    /// The named resources the ticket will touch, from those the brief's
+    /// `named_resources` lists (format 14, OWL-402): at most
+    /// [`MAX_DECLARED`].
+    #[serde(default)]
+    #[schemars(length(max = MAX_DECLARED))]
+    pub resources: Vec<String>,
+}
+
+/// The most zones, and the most named resources, one intake record declares
+/// (OWL-402): the record is kept in the ticket ref.
+pub const MAX_DECLARED: usize = 64;
+
+/// The most bytes a zone intake declares weighs (OWL-402).
+pub const MAX_ZONE_BYTES: usize = 512;
+
+/// The rules of an intake record's zones and resources, in `result.json`
+/// and in `intake.json` alike (OWL-402): at most [`MAX_DECLARED`] of each;
+/// each zone a folder by the rules of a `zone:` label
+/// ([`owlshift_core::decider::check_zone`]), without `*`, since a zone is a
+/// folder and not a pattern, and at most [`MAX_ZONE_BYTES`]; each resource a
+/// name by [`owlshift_core::resource::check_resource_name`].
+pub(crate) fn check_declaration(
+    contract: &'static str,
+    zones: &[String],
+    resources: &[String],
+) -> Result<(), ContractError> {
+    let invalid = |reason: String| Err(ContractError::invalid(contract, reason));
+    for (what, count) in [("zones", zones.len()), ("resources", resources.len())] {
+        if count > MAX_DECLARED {
+            return invalid(format!(
+                "{count} {what} are declared, past the {MAX_DECLARED} an intake record holds"
+            ));
+        }
+    }
+    for zone in zones {
+        let broken = if zone.len() > MAX_ZONE_BYTES {
+            Err(format!("weighs over {MAX_ZONE_BYTES} bytes"))
+        } else if zone.contains('*') {
+            Err("holds `*`: a zone is a folder, not a pattern".to_owned())
+        } else {
+            owlshift_core::decider::check_zone(zone).map_err(str::to_owned)
+        };
+        if let Err(reason) = broken {
+            return invalid(format!("the zone {zone:?} {reason}"));
+        }
+    }
+    for name in resources {
+        if let Err(reason) = owlshift_core::resource::check_resource_name(name) {
+            return invalid(format!("the resource {name:?} {reason}"));
+        }
+    }
+    Ok(())
 }
 
 /// A ticket the intake role found this one depends on: its identifier and
@@ -651,6 +710,7 @@ impl RunResult {
                     .iter()
                     .map(|d| (&d.ticket, d.quote.as_str())),
             )?;
+            check_declaration(CONTRACT, &intake.zones, &intake.resources)?;
         }
         self.check_quality_pipeline()?;
         check_verdicts(CONTRACT, &self.verdicts)?;
@@ -923,7 +983,8 @@ impl RunResult {
     }
 
     /// The intake record comes from the intake role only, which gives it
-    /// whenever it ends `done` or `questions` (OWL-245).
+    /// whenever it ends `done` or `questions` (OWL-245); the resources it
+    /// names are among those its brief lists (OWL-402), written exactly.
     fn intake_against(&self, brief: &Brief) -> Result<(), ContractError> {
         let ends_with_record = matches!(self.status, Status::Done | Status::Questions);
         match (brief.role, &self.intake) {
@@ -940,6 +1001,29 @@ impl RunResult {
                     Role::Intake.as_str()
                 ),
             )),
+            (_, Some(intake)) => match intake
+                .resources
+                .iter()
+                .find(|name| !brief.named_resources.contains_key(*name))
+            {
+                Some(unknown) => {
+                    let listed: Vec<&str> =
+                        brief.named_resources.keys().map(String::as_str).collect();
+                    Err(ContractError::invalid(
+                        CONTRACT,
+                        format!(
+                            "the resource {unknown:?} is not one the brief's named_resources \
+                             lists ({}): name only those, written exactly",
+                            if listed.is_empty() {
+                                "it lists none".to_owned()
+                            } else {
+                                listed.join(", ")
+                            }
+                        ),
+                    ))
+                }
+                None => Ok(()),
+            },
             _ => Ok(()),
         }
     }

@@ -17,7 +17,9 @@ use crate::Variant;
 use crate::format::{self, ContractError, Format, INTAKE_FORMAT, PROPOSALS_FORMAT};
 use crate::ids::{TicketId, check_name, is_lower_hex};
 use crate::refs::PushKind;
-use crate::result::{Followup, MAX_DEPENDENCIES, Routing, check_dependencies};
+use crate::result::{
+    Followup, MAX_DECLARED, MAX_DEPENDENCIES, Routing, check_declaration, check_dependencies,
+};
 
 /// The intake record of a ticket: the text intake read, the gesture that
 /// admitted the ticket, the verdict and the dependencies with what became of
@@ -39,6 +41,18 @@ pub struct TicketIntake {
     #[serde(default)]
     #[schemars(length(max = MAX_DEPENDENCIES))]
     pub dependencies: Vec<KeptDependency>,
+    /// The zones intake declared, as it wrote them (format 2, OWL-402): at
+    /// most [`MAX_DECLARED`]. None: the ticket holds the whole repository.
+    /// The zones the labels add and the resources the zones reach are not
+    /// kept: they are read again for each brief.
+    #[serde(default)]
+    #[schemars(length(max = MAX_DECLARED))]
+    pub zones: Vec<String>,
+    /// The named resources intake declared (format 2, OWL-402): at most
+    /// [`MAX_DECLARED`].
+    #[serde(default)]
+    #[schemars(length(max = MAX_DECLARED))]
+    pub resources: Vec<String>,
 }
 
 /// The admission gesture, read just before the ticket's first intake: the
@@ -104,11 +118,40 @@ pub enum DependencyOutcome {
 impl TicketIntake {
     const CONTRACT: &str = "ticket intake";
 
-    /// Parses and validates an `intake.json`.
+    /// Parses and validates an `intake.json`. A format-1 one, kept before
+    /// intake declared zones (OWL-402), is read as the current format with
+    /// no zone and no resource: its ticket holds the whole repository until
+    /// intake runs again, after an edit of its text or `owlshift forget`.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let intake: Self = format::parse_json(Self::CONTRACT, INTAKE_FORMAT, input)?;
+        let intake: Self = match Self::from_older_format(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, INTAKE_FORMAT, input)?,
+        };
         intake.validate()?;
         Ok(intake)
+    }
+
+    /// A format-1 document read as the current format, or `None` for any
+    /// other. Format 1 is format 2 without `zones` and `resources`, which
+    /// are refused in it.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        if document.get("zones").is_some() || document.get("resources").is_some() {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "format 1 keeps no zones or resources",
+            )));
+        }
+        document["format"] = INTAKE_FORMAT.into();
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {
@@ -117,8 +160,8 @@ impl TicketIntake {
 
     /// Checks the hash is a SHA-256 in lowercase hex, the gesture's name
     /// and account are names written exactly (not blank, unpadded, without
-    /// a control character), and the dependencies keep the rules of a
-    /// result's.
+    /// a control character), and the dependencies, zones and resources keep
+    /// the rules of a result's.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
         if !is_lower_hex(&self.text_sha256, 64) {
@@ -140,7 +183,8 @@ impl TicketIntake {
             self.dependencies
                 .iter()
                 .map(|d| (&d.ticket, d.quote.as_str())),
-        )
+        )?;
+        check_declaration(Self::CONTRACT, &self.zones, &self.resources)
     }
 }
 
@@ -276,13 +320,36 @@ mod tests {
 
     fn intake() -> serde_json::Value {
         json!({
-            "format": 1,
+            "format": 2,
             "text_sha256": "a".repeat(64),
             "gesture": { "kind": "label", "name": "agent", "account": "u-ann", "at": "2026-10-13T08:00:00Z" },
             "variant": "standard",
             "routing": { "harness": "claude", "tier": "standard", "effort": "high" },
-            "dependencies": [{ "ticket": "OWL-1", "quote": "Blocked by OWL-1.", "outcome": "written" }]
+            "dependencies": [{ "ticket": "OWL-1", "quote": "Blocked by OWL-1.", "outcome": "written" }],
+            "zones": ["backend/billing", "docs/"],
+            "resources": ["db.migrations"]
         })
+    }
+
+    /// OWL-402: a format-1 record, kept before intake declared zones, is
+    /// read with none, so its ticket holds the whole repository; one that
+    /// holds zones is refused.
+    #[test]
+    fn a_format_one_intake_record_is_read_as_holding_the_whole_repository() {
+        let mut older = intake();
+        older["format"] = 1.into();
+        let fields = older.as_object_mut().unwrap();
+        fields.remove("zones");
+        fields.remove("resources");
+        let read = TicketIntake::parse(&older.to_string()).unwrap();
+        assert!(read.zones.is_empty() && read.resources.is_empty());
+        assert!(read.render().contains("\"format\": 2"), "{}", read.render());
+        older["zones"] = json!(["docs"]);
+        let error = TicketIntake::parse(&older.to_string()).unwrap_err();
+        assert!(
+            error.to_string().contains("format 1 keeps no zones"),
+            "{error}"
+        );
     }
 
     fn proposals() -> serde_json::Value {
@@ -340,7 +407,27 @@ mod tests {
                 &|d| d["dependencies"][0]["outcome"] = "owed".into(),
                 "unknown variant",
             ),
-            (&|d| d["format"] = 2.into(), "upgrade Owlshift"),
+            (&|d| d["format"] = 3.into(), "upgrade Owlshift"),
+            (
+                &|d| d["zones"][1] = "../x".into(),
+                "the zone \"../x\" is not a folder's path",
+            ),
+            (
+                &|d| d["zones"][0] = "db/*/migrations".into(),
+                "holds `*`: a zone is a folder, not a pattern",
+            ),
+            (
+                &|d| d["zones"][0] = "".into(),
+                "the zone \"\" is the whole repository",
+            ),
+            (
+                &|d| d["resources"][0] = "db migrations".into(),
+                "the resource \"db migrations\" may hold only",
+            ),
+            (
+                &|d| d["zones"] = json!(vec!["docs"; MAX_DECLARED + 1]),
+                "65 zones are declared, past the 64",
+            ),
         ] {
             let error = refused(edit);
             assert!(error.contains(reason), "{reason}: {error}");
