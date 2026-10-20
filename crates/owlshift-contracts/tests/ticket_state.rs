@@ -422,5 +422,28 @@ fn a_ticket_held_widens_reads_back_and_refuses_what_it_cannot_hold() {
         )
     );
     joined.join(&wide);
-    assert!(joined.whole());
+    assert!(joined.whole() && joined.files.is_empty(), "{joined:?}");
+}
+
+/// A ticket that holds the whole repository, declared so or past its
+/// bounds, lists no file: a widening then adds none, keeps no time and
+/// changes nothing, and a record that lists files anyway is refused
+/// (OWL-403).
+#[test]
+fn a_ticket_holding_the_whole_repository_is_widened_by_nothing() {
+    let at = jiff::Timestamp::from_second(1_790_000_000).unwrap();
+    let mut whole = TicketHeld::dispatched(Vec::new(), Vec::new(), Some(at));
+    let before = whole.clone();
+    assert!(whole.widen(["src/lib.rs".to_owned()], at).is_empty());
+    assert!(!whole.widen_whole(at));
+    assert_eq!(whole, before);
+    let mut overflowed = TicketHeld::dispatched(vec!["app".to_owned()], Vec::new(), Some(at));
+    overflowed.widen(["".to_owned()], at);
+    assert!(overflowed.whole() && overflowed.files.is_empty());
+    let after = overflowed.clone();
+    assert!(overflowed.widen(["app/x.rs".to_owned()], at).is_empty());
+    assert_eq!(overflowed, after);
+    let mut listed: Value = serde_json::from_str(&whole.render()).unwrap();
+    listed["files"] = json!(["src/lib.rs"]);
+    assert!(TicketHeld::parse(&listed.to_string()).is_err());
 }

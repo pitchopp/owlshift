@@ -1985,7 +1985,7 @@ Designed on 2026-10-20 (OWL-398), with the maintainer. The rules are [architectu
     - No version of the ticket ref's layout exists, so "its format bumped" reads as the ref gaining a versioned file. Left out of `Progress`, as the spend is; `forget` drops it.
     - *Widened* by `execute`, after each Build or rebase run, in the write of its spend: `git diff --name-only --no-renames -z base...head`.
     - Checked on 2026-10-20 with git 2.54.0: it lists both paths of a rename and diffs from the merge-base.
-    - The named resources files match are reached at each check, not kept. Past 3,000 files or 256 KiB, or with files that cannot be read, the whole repository.
+    - The named resources files match are reached at each check, not kept. Past 3,000 files or 256 KiB, or with a branch head or files that cannot be read, the whole repository, which lists no file.
     - *The rule* (`owlshift_core::collision`) comes after the slot and before this machine's runs in the drain's order.
     - Watch checks a stage step from the pass's reads. A ticket that waits gives up the slot's turn, so that it and its holder never wait for each other, but keeps its capacity.
     - The delivery's check reads the refs under the step's lock; an unreadable ref holds the whole repository.

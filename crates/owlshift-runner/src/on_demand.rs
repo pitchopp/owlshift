@@ -4181,16 +4181,22 @@ impl OnDemand<'_> {
     /// moves"): after a Build or a rebase run, a fix, a correction and a
     /// review loop's Build included, the files the branch changed against
     /// its merge-base with the base this command fetched, kept by the write
-    /// of the run's spend that follows. Files that cannot be read widen it to
-    /// the whole repository. A ticket whose ref keeps no `held.json` holds
-    /// the whole repository already, and one with no branch changed nothing.
+    /// of the run's spend that follows. A branch head or files that cannot be
+    /// read widen it to the whole repository. A ticket whose ref keeps no
+    /// `held.json` holds the whole repository already, and one with no branch
+    /// changed nothing.
     fn widen(&self, p: &mut Prepared, role: Role) -> Option<Widened> {
         if !matches!(role, Role::Build | Role::Rebase) || p.held.is_none() {
             return None;
         }
-        let head = self.branch_head(p)?;
-        let read = held::changed_files(&self.executor.git, &p.checkout, &p.base.commit, &head);
         let now = (self.clock)();
+        let read = match self.read_branch_head(p) {
+            Ok(Some(head)) => {
+                held::changed_files(&self.executor.git, &p.checkout, &p.base.commit, &head)
+            }
+            Ok(None) => return None,
+            Err(reason) => Err(reason),
+        };
         let held = p.held.as_mut()?;
         match read {
             Ok(files) => {
@@ -6066,6 +6072,38 @@ impl OnDemand<'_> {
             .ok()
             .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
             .filter(|head| !head.is_empty())
+    }
+
+    /// [`Self::branch_head`], telling a branch the checkout has no ref of,
+    /// `Ok(None)`, from a head git could not read, `Err` with why (OWL-403):
+    /// `rev-parse --verify --quiet` exits 1 on an absent ref and 0 with the
+    /// commit on a present one (checked on 2026-10-20 with git 2.54.0).
+    fn read_branch_head(&self, p: &Prepared) -> Result<Option<String>, String> {
+        let name = format!("refs/heads/{}", p.branch);
+        let read = self
+            .executor
+            .git
+            .output(
+                &p.checkout,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "--end-of-options",
+                    &name,
+                ],
+                None,
+            )
+            .map_err(|e| format!("reading {name}: {e}"))?;
+        let head = String::from_utf8_lossy(&read.stdout).trim().to_owned();
+        match read.code {
+            Some(0) if CommitId::new(head.as_str()).is_ok() => Ok(Some(head)),
+            Some(1) => Ok(None),
+            code => Err(format!(
+                "reading {name}: git exited with {code:?}: {}",
+                String::from_utf8_lossy(&read.stderr).trim()
+            )),
+        }
     }
 
     /// Pushes a fix or rebase run's commit with a lease on `pushed`

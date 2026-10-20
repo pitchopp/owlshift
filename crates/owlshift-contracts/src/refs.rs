@@ -372,7 +372,7 @@ pub struct TicketHeld {
     pub resources: Vec<String>,
     /// The files its branch changed against its merge-base with the base,
     /// a rename's two paths both, each once, sorted: a file holds itself,
-    /// never its folder.
+    /// never its folder. None while it holds the whole repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     /// When it was dispatched; none for a ticket dispatched before
@@ -417,12 +417,13 @@ impl TicketHeld {
         self.zones.is_empty()
     }
 
-    /// Adds what `other` holds: a whole repository stays whole, and the
-    /// zones, resources and files are united, each once. Its times and its
-    /// mark stay this record's.
+    /// Adds what `other` holds: a whole repository stays whole, listing no
+    /// file, and the zones, resources and files are united, each once. Its
+    /// times and its mark stay this record's.
     pub fn join(&mut self, other: &TicketHeld) {
         if other.whole() {
             self.zones.clear();
+            self.files.clear();
         } else if !self.whole() {
             gather_strings(&mut self.zones, &other.zones);
         }
@@ -432,8 +433,9 @@ impl TicketHeld {
 
     /// Adds the files its branch changed, at `at`, and gives those it did
     /// not hold yet, in their order; a widening that adds one keeps its
-    /// time. Past [`MAX_HELD_FILES`] or [`MAX_HELD_BYTES`], or given a path
-    /// it cannot keep (empty, holding a NUL, longer than
+    /// time. A ticket that holds the whole repository already adds none.
+    /// Past [`MAX_HELD_FILES`] or [`MAX_HELD_BYTES`], or given a path it
+    /// cannot keep (empty, holding a NUL, longer than
     /// [`MAX_HELD_PATH_BYTES`]), the ticket holds the whole repository and
     /// lists no file.
     pub fn widen(&mut self, files: impl IntoIterator<Item = String>, at: Timestamp) -> Vec<String> {
@@ -450,7 +452,7 @@ impl TicketHeld {
     /// could not be read: what cannot be read is never taken as free.
     /// Whether that changed what it holds.
     pub fn widen_whole(&mut self, at: Timestamp) -> bool {
-        if self.whole() && self.files.is_empty() {
+        if self.whole() {
             return false;
         }
         self.zones.clear();
@@ -463,6 +465,9 @@ impl TicketHeld {
 
     /// [`Self::widen`], without its time.
     fn widen_by(&mut self, files: impl IntoIterator<Item = String>) -> Vec<String> {
+        if self.whole() {
+            return Vec::new();
+        }
         let mut added: Vec<String> = Vec::new();
         let mut unkept = false;
         for file in files {
@@ -493,8 +498,9 @@ impl TicketHeld {
     }
 
     /// Checks each zone keeps the rules of a `zone:` label's, each resource
-    /// is a resource name, the files are paths it keeps, sorted, each once
-    /// and at most [`MAX_HELD_FILES`], the widenings at most
+    /// is a resource name, the files are none for the whole repository and
+    /// otherwise paths it keeps, sorted, each once and at most
+    /// [`MAX_HELD_FILES`], the widenings at most
     /// [`MAX_WIDENINGS`], and the mark is a full commit id.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
@@ -512,6 +518,9 @@ impl TicketHeld {
             if let Err(reason) = owlshift_core::resource::check_resource_name(name) {
                 return invalid(format!("the resource {name:?} {reason}"));
             }
+        }
+        if self.whole() && !self.files.is_empty() {
+            return invalid("lists files while it holds the whole repository".to_owned());
         }
         if self.files.len() > MAX_HELD_FILES {
             return invalid(format!(

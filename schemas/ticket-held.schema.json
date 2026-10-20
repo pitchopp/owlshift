@@ -21,7 +21,7 @@
       "format": "date-time"
     },
     "files": {
-      "description": "The files its branch changed against its merge-base with the base,\na rename's two paths both, each once, sorted: a file holds itself,\nnever its folder.",
+      "description": "The files its branch changed against its merge-base with the base,\na rename's two paths both, each once, sorted: a file holds itself,\nnever its folder. None while it holds the whole repository.",
       "type": "array",
       "items": {
         "type": "string"
