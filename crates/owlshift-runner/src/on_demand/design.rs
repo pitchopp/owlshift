@@ -218,10 +218,17 @@ pub(crate) fn standing(
                 .ruling
                 .as_ref()
                 .is_none_or(|ruling| ruling.outcome == RulingOutcome::Confirmed),
-            FindingsConfirmation::Author => kept
-                .response
-                .as_ref()
-                .is_none_or(|response| response.outcome == ResponseOutcome::Fixed),
+            // A ruling kept before the mode changed (a record written under
+            // the arbiter, OWL-391) still stands as the arbiter's word.
+            FindingsConfirmation::Author => {
+                kept.ruling
+                    .as_ref()
+                    .is_none_or(|ruling| ruling.outcome == RulingOutcome::Confirmed)
+                    && kept
+                        .response
+                        .as_ref()
+                        .is_none_or(|response| response.outcome == ResponseOutcome::Fixed)
+            }
         })
         .map(|(n, kept)| {
             (
@@ -2330,6 +2337,9 @@ mod tests {
         assert_eq!(verdict.fates, [Fate::LastFix, Fate::Note]);
         let outcomes: Vec<_> = last.iter().map(|k| k.outcome).collect();
         assert_eq!(outcomes, [None, Some(FindingOutcome::Rejected), None]);
+        // A record kept under the arbiter, read under the author's mode
+        // after an upgrade (OWL-391): the rejected ruling still holds.
+        assert_eq!(standing(&last, FindingsConfirmation::Author).len(), 2);
         // The author answers after the pass: every finding stands at it.
         let mut authored = pass_findings(&seats, None);
         assert_eq!(standing(&authored, FindingsConfirmation::Author).len(), 3);
