@@ -87,6 +87,19 @@ pub trait Tracker {
         ))
     }
 
+    /// Every ticket of `team` (the project's `[tracker].team`, which Linear
+    /// requires) whose state is named `state` exactly, every page read: the
+    /// working state's, whose tickets a person works on unless Owlshift does
+    /// (OWL-410; architecture section 5, "The in-flight set", 3). An error
+    /// by default: the in-flight set then cannot be read, and nothing that
+    /// it checks starts.
+    fn working(&self, _team: Option<&str>, _state: &str) -> Result<Vec<Ticket>, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not list the tickets in a state",
+        ))
+    }
+
     /// Who made the admission gesture on a ticket: the actor of the latest
     /// history entry that added the label (or moved the ticket to the
     /// state), or the ticket's creator when none did (architecture section

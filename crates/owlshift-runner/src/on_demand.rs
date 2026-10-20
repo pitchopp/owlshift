@@ -120,6 +120,7 @@ use crate::executor::{
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::held;
+use crate::in_flight;
 use crate::project::{self, Base, ProjectDirs, ProjectLock, TicketLock};
 use crate::proposals::{self, Filing};
 use crate::quarantine;
@@ -129,7 +130,7 @@ use crate::resume::{self, Fresh};
 use crate::reversal;
 use crate::routing::{RouteLabels, Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
-use crate::ticket_ref::{self, ProposalsFile, RefAt, Stored, TicketRecord};
+use crate::ticket_ref::{self, ProposalsFile, RefAt, RefRead, Stored, TicketRecord};
 use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
     Gate, MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning,
@@ -2697,11 +2698,56 @@ impl OnDemand<'_> {
             return self.deliver_review(p, state, sink);
         }
         if p.stepping
-            && let Some(found) = self.delivery_collision(p, &dispatched.rules)?
+            && let Some(why) = self.delivery_hold(p, &dispatched.rules)?
         {
-            return Err(self.hold_delivery(p, state, &found, sink));
+            return Err(self.hold_delivery(p, state, why, sink));
         }
         self.deliver(p, dispatched, state, sink)
+    }
+
+    /// Why a delivery of `p`'s ticket waits, as the `decision` event's
+    /// fields: a collision ([`Self::delivery_collision`]) with the holder
+    /// named, or the work in flight outside Owlshift that could not be read
+    /// (OWL-410, `reason` = `in_flight_unread`), read here afresh. `None`
+    /// when it goes on.
+    fn delivery_hold(
+        &self,
+        p: &Prepared,
+        rules: &ProjectRules,
+    ) -> Result<Option<Vec<(&'static str, Value)>>, Stop> {
+        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
+            .map_err(|e| refused("reading the project's ticket refs before the delivery", e))?;
+        let read = in_flight::read(
+            self.forge,
+            self.tracker,
+            self.config,
+            &mut in_flight::PullCache::default(),
+        );
+        let outside = match read {
+            Ok(outside) => outside,
+            Err(reason) => {
+                return Ok(Some(vec![
+                    ("reason", json!("in_flight_unread")),
+                    ("why", json!(reason)),
+                ]));
+            }
+        };
+        let none = NamedResources::default();
+        let named = rules.resources().unwrap_or(&none);
+        let refs = others
+            .iter()
+            .map(|(ticket, read)| (ticket, read.as_ref().ok()))
+            .chain([(&p.ticket, None)]);
+        let holders = outside.holders(refs, named);
+        let Some(found) = self.delivery_collision(p, rules, &others, &holders)? else {
+            return Ok(None);
+        };
+        let mut why = vec![
+            ("reason", json!("collision")),
+            ("resource", held::resource_data(&found.resource)),
+        ];
+        why.extend(holders.named(&found.holder).data());
+        Ok(Some(why))
     }
 
     /// Whether a delivery of `p`'s ticket, not yet delivered, collides with
@@ -2709,29 +2755,33 @@ impl OnDemand<'_> {
     /// section 5, "The collision rule"): every other ticket ref read again
     /// under the lock this step holds, one that cannot be read holding the
     /// whole repository, against what this ticket holds, widened, closed
-    /// with the named resources of `rules`. Refused when the refs cannot be
-    /// listed: what cannot be read is never taken as free.
+    /// with the named resources of `rules`. The work in flight outside
+    /// Owlshift, `outside`, holds it too, and its pull requests' files join
+    /// the tickets that delivered them (OWL-410). Refused when the refs
+    /// cannot be listed: what cannot be read is never taken as free.
     fn delivery_collision(
         &self,
         p: &Prepared,
         rules: &ProjectRules,
+        others: &[RefRead],
+        outside: &in_flight::Holders,
     ) -> Result<Option<Collision<String>>, Stop> {
         let none = NamedResources::default();
         let named = rules.resources().unwrap_or(&none);
-        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
-            .map_err(|e| refused("reading the project's ticket refs before the delivery", e))?;
-        let in_flight: Vec<InFlight<String>> = others
+        let mut in_flight: Vec<InFlight<String>> = others
             .iter()
             .filter_map(|(ticket, read)| match read {
                 Ok(stored) => held::holds(stored).then(|| held::in_flight(ticket, stored, named)),
                 Err(_) => Some(held::unread(ticket, named)),
             })
             .collect();
+        outside.join(&mut in_flight, named);
         let own = held::of(&p.ticket, p.held.as_ref(), false, named);
         Ok(collision(&own, &in_flight))
     }
 
-    /// A delivery `found` holds back (OWL-403): the Build Verify passed is
+    /// A delivery held back for `why`, the `decision` event's fields
+    /// ([`Self::delivery_hold`]; OWL-403, OWL-410): the Build Verify passed is
     /// marked verified in what the ticket holds and kept with the pass, the
     /// ticket staying at Verify in `state`, so its next step delivers that
     /// commit with no Verify pass once nothing holds it ([`Self::verify_pass`]);
@@ -2742,7 +2792,7 @@ impl OnDemand<'_> {
         &self,
         p: &mut Prepared,
         state: &TicketState,
-        found: &Collision<String>,
+        why: Vec<(&'static str, Value)>,
         sink: &mut EventSink<'_>,
     ) -> Stop {
         let commit = p
@@ -2753,23 +2803,13 @@ impl OnDemand<'_> {
         p.held.get_or_insert_with(held::unrecorded).verified = commit.clone();
         let questions = p.questions();
         if let Err(e) = self.store(p, state, questions) {
-            return refused(
-                "keeping the delivery a collision holds in the ticket's ref",
-                e,
-            );
+            return refused("keeping a delivery held back in the ticket's ref", e);
         }
-        sink.emit(
-            &p.ticket,
-            None,
-            EventKind::Decision,
-            data([
-                ("delivery", json!("held")),
-                ("reason", json!("collision")),
-                ("tickets", json!([found.holder])),
-                ("resource", held::resource_data(&found.resource)),
-                ("commit", json!(commit)),
-            ]),
-        );
+        let mut event = data([("delivery", json!("held")), ("commit", json!(commit))]);
+        for (key, value) in why {
+            event.insert(key.to_owned(), value);
+        }
+        sink.emit(&p.ticket, None, EventKind::Decision, event);
         self.stepped(p, state, sink)
     }
 

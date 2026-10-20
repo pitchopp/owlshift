@@ -99,6 +99,14 @@ struct FakeGitHub {
     /// (OWL-340), and how many such reads were made, refused or not.
     refuse_open: Mutex<u32>,
     open_reads: Mutex<u32>,
+    /// The repository's other open pull requests, a person's (OWL-410):
+    /// each number with its head branch and the files it changes.
+    others: Mutex<Vec<(u64, String, Vec<String>)>>,
+    /// How many of the next listings of the open pull requests, and of the
+    /// next reads of a pull request's files, fail as a network that is
+    /// down.
+    fail_pulls: Mutex<u32>,
+    fail_files: Mutex<u32>,
 }
 
 /// What happens at the next read of a head's checks.
@@ -250,9 +258,47 @@ impl FakeGitHub {
                     },
                 } } }] },
             } } })
+        } else if query.starts_with("query RepositoryPulls") {
+            // The open pull requests (OWL-410): Owlshift's own while it is
+            // open, which changes no file the bench names, then the others.
+            let base = self
+                .env
+                .run(&self.bare, &["rev-parse", "refs/heads/main"])
+                .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
+                .unwrap();
+            let node = |number: u64, branch: &str, head: String, files: usize| {
+                json!({ "number": number, "isDraft": false, "changedFiles": files,
+                    "headRefName": branch, "headRefOid": head,
+                    "baseRefName": "main", "baseRefOid": base })
+            };
+            let mut nodes = Vec::new();
+            if let Some(number) = *self.open.lock().unwrap() {
+                let head = self.head.lock().unwrap().clone();
+                nodes.push(node(number, &head, self.tip(), 0));
+            }
+            for (number, branch, files) in self.others.lock().unwrap().iter() {
+                nodes.push(node(*number, branch, "e".repeat(40), files.len()));
+            }
+            json!({ "repository": { "pullRequests": {
+                "totalCount": nodes.len(),
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": nodes,
+            } } })
         } else {
             panic!("unexpected GitHub request: {query}")
         }
+    }
+
+    /// The files of pull request `number`, as REST's first page lists them
+    /// (OWL-410).
+    fn files(&self, number: u64) -> String {
+        let others = self.others.lock().unwrap();
+        let files: Vec<Value> = others
+            .iter()
+            .filter(|(n, _, _)| *n == number)
+            .flat_map(|(_, _, files)| files.iter().map(|file| json!({ "filename": file })))
+            .collect();
+        Value::Array(files).to_string()
     }
 }
 
@@ -273,6 +319,13 @@ impl Transport for Shared {
                 });
             }
         }
+        if query.starts_with("query RepositoryPulls") {
+            let mut fail = self.0.fail_pulls.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                return Err("the network is down".to_owned());
+            }
+        }
         if query.starts_with("query Checks") {
             let mut at_checks = self.0.at_checks.lock().unwrap();
             if matches!(*at_checks, Some(AtChecks::Fail)) {
@@ -288,8 +341,20 @@ impl Transport for Shared {
         })
     }
 
-    /// The red job's log, the one REST read of the bench.
+    /// The red job's log, and a pull request's files (OWL-410), the REST
+    /// reads of the bench.
     fn get(&self, path: &str) -> Result<RestAnswer, String> {
+        if let Some(number) = path
+            .strip_prefix("repos/demo/project/pulls/")
+            .and_then(|rest| rest.strip_suffix("/files?per_page=100&page=1"))
+        {
+            let mut fail = self.0.fail_files.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                return Err("the network is down".to_owned());
+            }
+            return Ok(RestAnswer::new(200, self.0.files(number.parse().unwrap())));
+        }
         assert_eq!(path, "repos/demo/project/actions/jobs/2/logs");
         let mut log = self.0.log.lock().unwrap();
         log.1 += 1;
@@ -779,6 +844,14 @@ impl Tracker for Clocked<'_> {
         Tracker::state_type(&self.inner, id)
     }
 
+    fn working(
+        &self,
+        team: Option<&str>,
+        state: &str,
+    ) -> Result<Vec<tracker::Ticket>, tracker::Error> {
+        Tracker::working(&self.inner, team, state)
+    }
+
     /// A tracker that notifies on a mention, as Linear does (OWL-157).
     fn mention(&self, account: &str) -> Result<Option<String>, tracker::Error> {
         if self.refuse_mention {
@@ -985,6 +1058,9 @@ impl Bench {
             reviews_reads: Mutex::new(0),
             refuse_open: Mutex::new(0),
             open_reads: Mutex::new(0),
+            others: Mutex::new(Vec::new()),
+            fail_pulls: Mutex::new(0),
+            fail_files: Mutex::new(0),
         });
         Self {
             data: tmp.path().join("data"),

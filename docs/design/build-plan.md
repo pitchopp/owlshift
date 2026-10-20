@@ -1950,7 +1950,7 @@ Designed on 2026-10-20 (OWL-398), with the maintainer. The rules are [architectu
 **Pending live checks,** each the first step of its part:
 
 - *(c) A real usage limit* (OWL-40): the exit status and the final record of a Claude Code run that reaches its limit. Opportunistic, it blocks no part: the adapter reads the limit from the stream (C7), and the usage file of part 8 takes its reset time from there.
-- *(d) The App's token reads a pull request's files,* part 6 (OWL-410): a pull request's files with the GitHub App's user token (D13: Pull requests write, Contents read), on Locary and on Owlshift, a renamed file among them, to see whether its old path is given (GraphQL's `PullRequestChangedFile` gives `path` and `changeType`; REST's files give `previous_filename`); run by the maintainer, whose sign-in holds the token.
+- *(d) The App's token reads a pull request's files,* part 6 (OWL-410): a pull request's files with the GitHub App's user token (D13: Pull requests write, Contents read), on Locary and on Owlshift, a renamed file among them, to see whether its old path is given (GraphQL's `PullRequestChangedFile` gives `path` and `changeType`; REST's files give `previous_filename`); run by the maintainer, whose sign-in holds the token. Run on 2026-10-20 on Owlshift; its result is under part 6, "As built".
 - *(e) Lock files across processes,* part 2 (OWL-409): on macOS and Linux, a `flock` try-lock on a slot or ticket file held by one process is refused to another; it is released when its holder is killed with SIGKILL; a file opened close-on-exec is not held by a child after its `exec`.
   - *Checked on 2026-10-20* at 19:31 UTC (OWL-409), by a probe on the standard library's `File::try_lock`, the primitive and open flags of `project::try_lock_file`, built with Rust 1.98.1, on macOS 26.6.2 (arm64) and on Linux 6.12.76-linuxkit (aarch64, Docker Desktop 29.4.0, image `rust:1.98.1-bookworm`), with the same result on both: a lock one process held was refused to a second; it was free again once the holder was killed with `kill -9`; the file the standard library opened had `FD_CLOEXEC` set, and with the holder killed, the `sleep` it had spawned, still alive, did not hold it; the control, the same file with `FD_CLOEXEC` cleared before the spawn, stayed held by that child until it ended. Unit tests keep the release and the close-on-exec (`project.rs`, `slots.rs`); Windows (`LockFileEx`) is not covered by (e).
 - *(f) Git under concurrent use,* part 3 (OWL-400): with git 2.54 in one repository, concurrent `worktree add`, `update-ref` of distinct refs, commits in two worktrees, a `fetch --no-tags --prune origin` and a `remote set-url` to the same address: which fail on a lock, and what each writes that the isolation check reads (`config`, `packed-refs`, `info/`, `worktrees/`, tags).
@@ -2000,6 +2000,31 @@ Designed on 2026-10-20 (OWL-398), with the maintainer. The rules are [architectu
     - *Events*: `decision` with `drain` or `watch` = `waits`, `reason` = `collision`, the holder in `tickets` and its `resource`; `held` = `widened`; `delivery` = `held`; `review` = `verified`; `warning` `widening_unread`.
     - *Accepted residual*: a delivery the step holds again with nothing new to keep is held 10 minutes, as any step that changed nothing.
 - **6 · Work in flight outside Owlshift.** (OWL-410) After 5, then check (d). Other open pull requests' files, Owlshift's own pull requests' files, people's tickets, the fail-closed pass; S5's parts for a pull request and a person's ticket.
+  - *As built* (OWL-410, 2026-10-20).
+    - *Check (d), checked on 2026-10-20* at 19:46 UTC by the maintainer with the GitHub App `owl-shift`'s user token, stored by `owlshift init` for pitchopp/owlshift (`owlshift-runner/tests/pull_files_live.rs`, read-only, through the Writer's refresh).
+      - The GraphQL listing answered with no errors; no pull request was open.
+      - On [#153](https://github.com/pitchopp/owlshift/pull/153), merged, 10 files: GraphQL's `files` listed its 3 renamed files by their new path only.
+      - REST's `pulls/153/files` answered HTTP 200 with the 10 files, each of the 3 renames with its `previous_filename`, the 4 removed files with none.
+      - Locary was not read: no App token is stored for it on that machine.
+      - Settled: the files are read through REST, the only one that gives a rename's old path.
+    - *The forge* (`GitHubForge::open_pull_requests`, `pull_request_files`). The open pull requests come from one GraphQL listing, drafts included, read whole and checked against GitHub's count. More than 1,000 open pull requests is a failed read.
+    - *A pull request's files* come from REST, 100 a page, each path once, sorted, both paths of a rename.
+      - Past 3,000 files, or a page past 16 MiB with its patches, the pull request holds the whole repository.
+      - A count that differs from `changedFiles` is a moved head, and so is a head or base that moved while more than one page was read (the pull request is read again after its pages). Either fails the read.
+    - *The tracker* gains `working(team, state)`, on Linear and on the Markdown tracker.
+    - *`in_flight.rs`.* Watch keeps each pull request's files by head commit, base branch and base commit from one pass to the next. The delivery's check reads them afresh, one REST read per open pull request.
+      - A pull request is Owlshift's own when a ref that holds delivered it, and its files join that ticket. Any other is held as `#<number>`, one an ended ref delivered included.
+      - A working ticket that no holding or unread ref owns is a person's. It holds its labels' zones, or the whole repository for a malformed `zone:` label.
+      - With no label it is counted only through an open pull request whose head branch names it (its identifier in any case, not touching a letter or a digit). Otherwise it is warned of once (`zones_unknown`), and again only once it stopped lacking zones and lacks them again.
+    - *The rule.* An outside holder is weighed as a ticket whose pull request is open (`delivered`): it holds every ticket not yet delivered and never waits. The core is unchanged.
+    - *Fail-closed.* The read is made at most once a pass, and only when a check needs it. Plain `owlshift watch` makes it too, for its stage steps.
+      - A failed read is one line, told again when its reason changes.
+      - Watch then starts no stage step the rule checks (`watch` = `waits`, `reason` = `in_flight_unread`) and dispatches nothing from Ready (`drain` = `waits`, same reason).
+      - Inside a step, the delivery is held at Verify with its verified commit kept (`delivery` = `held`, same reason, the read's words in `why`).
+    - *Events.* A collision with a pull request names it by `pull_request` (its number); one with a person's ticket by `tickets` and `person` = `true`. The lines say "pull request #7" and "DEMO-9, which a person works on,".
+    - *Tested* on the bench (scenario S5's pull request and person parts, and a failed read at a dispatch, a stage step and a delivery), with unit tests of the reads, the cache and the holders.
+    - *Accepted residuals.*
+      - A typed `do` whose first run has not yet written its ref shows working with no ref, so it counts as a person's ticket meanwhile; so does a ticket a person `forget`s.
 - **7 · Several tickets in flight.** (OWL-401) After 2, 3, 5 and 6. The project lock narrowed, the admission transaction, the three counts with `policy.max_in_flight`, the dispatch as a list, the order of steps; scenario S16 and S5 with three tickets in flight.
 - **8 · The usage pause.** (OWL-404) After 1, then check (g). The usage file with windows and episodes, the probe, the effective-harness function, the check before each run, the notification once per episode, watch's old hold removed; scenario S10's usage part, across two projects.
 - **9 · The usage cap.** (OWL-405) After 8. `usage_cap_percent` per window.

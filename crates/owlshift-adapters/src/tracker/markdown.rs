@@ -619,6 +619,23 @@ impl shared::Tracker for MarkdownTracker {
         Ok(listed)
     }
 
+    /// Every ticket of the folder at the stage `state` (OWL-410); the team
+    /// is ignored.
+    fn working(
+        &self,
+        _team: Option<&str>,
+        state: &str,
+    ) -> Result<Vec<shared::Ticket>, shared::Error> {
+        let mut working = Vec::new();
+        for id in self.ticket_ids().map_err(other)? {
+            let ticket = MarkdownTracker::ticket(self, &id).map_err(other)?;
+            if ticket.stage == state {
+                working.push(shared_ticket(ticket));
+            }
+        }
+        Ok(working)
+    }
+
     /// `Completed` at the stage `Done`, no type at any other; a ticket the
     /// folder lacks is not found (OWL-250).
     fn state_type(&self, id: &TicketId) -> Result<Option<shared::StateType>, shared::Error> {
@@ -1448,6 +1465,11 @@ mod tests {
 
         let error = tracker.admitted(&column(&Admit::Delegation)).unwrap_err();
         assert!(error.message.contains("not built"), "{error}");
+        // The tickets of a stage, the working state's (OWL-410).
+        let canceled = tracker.working(None, "Canceled").unwrap();
+        let ids: Vec<&str> = canceled.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["DEMO-4"]);
+        assert_eq!(canceled[0].labels, ["agent"]);
         fs::create_dir_all(tickets.join("drafts")).unwrap();
         let error = tracker.admitted(&column(&state)).unwrap_err();
         assert!(error.message.contains("drafts"), "{error}");

@@ -45,6 +45,8 @@ use crate::forge::{
 };
 pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
+pub mod open;
+
 /// GitHub's GraphQL endpoint.
 pub const ENDPOINT: &str = "https://api.github.com/graphql";
 

@@ -708,6 +708,31 @@ impl Tracker for LinearTracker {
         .collect()
     }
 
+    /// The issues of the team whose state has the name `state`, as the
+    /// ready column's listing reads a ticket (OWL-410).
+    fn working(&self, team: Option<&str>, state: &str) -> Result<Vec<Ticket>, Error> {
+        let Some(team) = team else {
+            return Err(invalid(
+                "listing the Linear working state needs the project's `[tracker].team`",
+            ));
+        };
+        let filter = json!({
+            "team": { "key": { "eq": team.to_ascii_uppercase() } },
+            "state": { "name": { "eq": state } },
+        });
+        let variables = json!({ "filter": filter, "first": self.page });
+        self.pages(
+            "the working state",
+            WORKING_QUERY,
+            variables,
+            |data: WorkingData| data.issues,
+            |_| false,
+        )?
+        .into_iter()
+        .map(Issue::into_ticket)
+        .collect()
+    }
+
     /// The history read newest first, page by page, up to the first page
     /// holding an entry that decides the gesture; two deciding entries of one
     /// time split by a page boundary are not both read, an accepted residual.
@@ -1218,6 +1243,15 @@ const ADMITTED_QUERY: &str = concat!(
     " } pageInfo { hasNextPage endCursor } } }"
 );
 
+/// The tickets in a state (OWL-410). The filter is built by
+/// [`Tracker::working`].
+const WORKING_QUERY: &str = concat!(
+    "query Working($filter: IssueFilter!, $first: Int!, $after: String) { \
+     issues(first: $first, after: $after, filter: $filter) { nodes { ",
+    issue_fields!(),
+    " } pageInfo { hasNextPage endCursor } } }"
+);
+
 /// A ticket as intake's dependency check reads it (OWL-249).
 const RELATIONS_QUERY: &str = concat!(
     "query Relations($id: String!) { issue(id: $id) { identifier description state { type } ",
@@ -1437,6 +1471,11 @@ impl Issue {
             author: ticket_author(self.creator, self.bot_actor, self.external_user_creator),
         })
     }
+}
+
+#[derive(Deserialize)]
+struct WorkingData {
+    issues: Connection<Issue>,
 }
 
 #[derive(Deserialize)]
@@ -3430,6 +3469,39 @@ mod tests {
             assert!(tracker(vec![page]).admitted(&column(Some("OWL"))).is_err());
         }
         assert!(tracker(vec![]).admitted(&column(None)).is_err());
+    }
+
+    /// The working state's tickets, every page, with their labels; the team
+    /// is required (OWL-410).
+    #[test]
+    fn the_working_state_lists_its_tickets_with_their_labels() {
+        let page = |id: &str, label: &str, next: Option<&str>| -> &'static str {
+            json!({ "data": { "issues": { "nodes": [{ "identifier": id, "title": "t",
+                "description": null, "priority": 0, "assignee": null, "creator": null,
+                "botActor": null, "externalUserCreator": null,
+                "labels": { "nodes": [{ "name": label }], "pageInfo": { "hasNextPage": false } } }],
+                "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next } } } })
+            .to_string()
+            .leak()
+        };
+        let working = tracker(vec![
+            page("OWL-7", "zone:app", Some("c1")),
+            page("OWL-8", "bug", None),
+        ])
+        .working(Some("owl"), "In Progress")
+        .unwrap();
+        let read: Vec<(&str, &[String])> = working
+            .iter()
+            .map(|t| (t.id.as_str(), t.labels.as_slice()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("OWL-7", &["zone:app".to_owned()][..]),
+                ("OWL-8", &["bug".to_owned()][..])
+            ]
+        );
+        assert!(tracker(vec![]).working(None, "In Progress").is_err());
     }
 
     #[test]
