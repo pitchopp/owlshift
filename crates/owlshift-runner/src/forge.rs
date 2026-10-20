@@ -5,17 +5,62 @@
 //! (architecture section 8). Pushing uses the user's own git credentials,
 //! as in their terminal.
 
+use jiff::Timestamp;
 use owlshift_adapters::forge::github::{GitHubForge, Token};
+use owlshift_adapters::forge::github_app::{self, UserToken};
 use owlshift_adapters::forge::{DefaultBranch, Error, Repo};
+use owlshift_contracts::config::PersonalConfig;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
-use crate::secrets::{self, ForgeSecret};
+use crate::secrets::{self, ForgeKind, ForgeSecret};
 
 /// The keychain account, under [`SERVICE`], that every project of a machine
 /// shared for the GitHub token before OWL-308, still read for a project with
 /// no token of its own; a project's own account ends with this name
 /// ([`crate::secrets`]). [`GITHUB_TOKEN_HELP`] says what the token needs.
 pub const GITHUB_ACCOUNT: &str = "github";
+
+/// The name of a project's keychain account, under [`SERVICE`], that holds
+/// the user token of Owlshift's GitHub App, its refresh token and expiries
+/// as one entry (OWL-336, architecture section 8): the project's account
+/// `github.com/<owner>/<repo>/github-app` ([`crate::secrets`]). No shared
+/// account of this name is read.
+pub const GITHUB_APP_ACCOUNT: &str = "github-app";
+
+/// The GitHub App `owlshift init` signs in through: Owlshift's own (D13),
+/// or the one the personal file names for a fork or a private app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHubApp {
+    /// The client ID the device flow and the refresh send.
+    pub client_id: String,
+    /// The slug the install link is made of.
+    pub slug: String,
+}
+
+impl GitHubApp {
+    /// The app of D13, each value replaced by its override in `personal`,
+    /// the loaded personal file, when it sets one.
+    pub fn from_personal(personal: Option<&PersonalConfig>) -> Self {
+        let set = |value: Option<&String>, default: &str| {
+            value.map_or_else(|| default.to_owned(), Clone::clone)
+        };
+        Self {
+            client_id: set(
+                personal.and_then(|p| p.github_app_client_id.as_ref()),
+                github_app::CLIENT_ID,
+            ),
+            slug: set(
+                personal.and_then(|p| p.github_app_slug.as_ref()),
+                github_app::SLUG,
+            ),
+        }
+    }
+
+    /// Where the app is installed on the user's repositories.
+    pub fn install_link(&self) -> String {
+        github_app::install_link(&self.slug)
+    }
+}
 
 /// What the GitHub token must allow, as `owlshift init` tells its user.
 /// Contents (read) lets GitHub read the branches a pull request is opened on
@@ -32,9 +77,39 @@ pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (wr
 /// [writer](crate::writer) reports with it; `owlshift init` stores the
 /// token.
 pub fn github(found: &ForgeSecret<Secret>, repo: Repo) -> Result<GitHubForge, String> {
-    match &found.token {
-        Some(token) => Ok(GitHubForge::new(Token::new(token.expose()), repo)),
-        None => Err(format!(
+    github_at(found, repo, Timestamp::now())
+}
+
+/// [`github`] at the instant `now`. A GitHub App entry gives its access token
+/// as stored: its refresh under the account lock is GA3's (architecture
+/// section 8). Until then a token past its stored expiry is not sent, and
+/// the error names `owlshift init`, which signs in again. A personal token
+/// is never tried in its place.
+fn github_at(
+    found: &ForgeSecret<Secret>,
+    repo: Repo,
+    now: Timestamp,
+) -> Result<GitHubForge, String> {
+    let sign_in_again = |what: &str| {
+        format!(
+            "the GitHub App's token under service `{SERVICE}`, account `{}`, {what}: run \
+             `owlshift init` in a terminal to sign in again",
+            found.account.token
+        )
+    };
+    match (&found.token, found.account.kind) {
+        (Some(entry), ForgeKind::App) => {
+            let token = UserToken::from_entry(entry.expose())
+                .map_err(|_| sign_in_again("does not read"))?;
+            if token.expired(now) {
+                return Err(sign_in_again("has expired"));
+            }
+            Ok(GitHubForge::new(Token::new(token.access()), repo))
+        }
+        (Some(token), ForgeKind::Personal) => {
+            Ok(GitHubForge::new(Token::new(token.expose()), repo))
+        }
+        (None, _) => Err(format!(
             "no GitHub token in the system keychain: run `owlshift init` in a terminal, or \
              store one under service `{SERVICE}`, account `{}`",
             found.account.token
@@ -86,6 +161,77 @@ mod tests {
 
         found.token = Some(Secret::new("ghp_test"));
         assert_eq!(github(&found, repo.clone()).unwrap().repo(), &repo);
+    }
+
+    /// OWL-382: an app entry gives its access token, unrefreshed until GA3;
+    /// one expired or unreadable names `owlshift init`, never repeats the
+    /// entry, and no personal token is tried instead.
+    #[test]
+    fn the_apps_token_is_sent_until_its_expiry_and_never_replaced() {
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let now = Timestamp::from_second(1_760_000_000).unwrap();
+        let entry = |expires_at: i64| {
+            UserToken::new(
+                "ghu_SENTINEL",
+                Some("ghr_SENTINEL".to_owned()),
+                Some(Timestamp::from_second(expires_at).unwrap()),
+                None,
+            )
+            .to_entry()
+        };
+        let found = |entry: String| ForgeSecret {
+            account: ForgeAccount::project_app(&repo),
+            token: Some(Secret::new(entry)),
+        };
+
+        let live = found(entry(now.as_second() + 1));
+        assert_eq!(github_at(&live, repo.clone(), now).unwrap().repo(), &repo);
+
+        for (dead, what) in [
+            (found(entry(now.as_second())), "has expired"),
+            (found("ghu_SENTINEL".to_owned()), "does not read"),
+        ] {
+            let error = github_at(&dead, repo.clone(), now).unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "account `github.com/pitchopp/owlshift/github-app`, {what}"
+                )),
+                "{error}"
+            );
+            assert!(error.contains("`owlshift init`"), "{error}");
+            assert!(!error.contains("SENTINEL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_app_is_owlshifts_unless_the_personal_file_names_another() {
+        let ours = GitHubApp::from_personal(None);
+        assert_eq!(
+            (ours.client_id.as_str(), ours.slug.as_str()),
+            ("Iv23li5EhBqiuljIPbiK", "owl-shift")
+        );
+        assert_eq!(
+            ours.install_link(),
+            "https://github.com/apps/owl-shift/installations/new"
+        );
+        let empty = PersonalConfig::parse("").unwrap();
+        assert_eq!(GitHubApp::from_personal(Some(&empty)), ours);
+
+        let personal = PersonalConfig::parse(
+            "github_app_client_id = \"Iv1.0123abcd\"\ngithub_app_slug = \"my-owlshift\"\n",
+        )
+        .unwrap();
+        let theirs = GitHubApp::from_personal(Some(&personal));
+        assert_eq!(theirs.client_id, "Iv1.0123abcd");
+        assert_eq!(
+            theirs.install_link(),
+            "https://github.com/apps/my-owlshift/installations/new"
+        );
+        let slug_only = PersonalConfig::parse("github_app_slug = \"my-owlshift\"\n").unwrap();
+        assert_eq!(
+            GitHubApp::from_personal(Some(&slug_only)).client_id,
+            "Iv23li5EhBqiuljIPbiK"
+        );
     }
 
     /// OWL-334: no token stored is said before any request.

@@ -3567,6 +3567,12 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
             .unstored(&secrets::ForgeAccount::project(&repo).token)
             .unstored(&secrets::ForgeAccount::shared().token);
         assert_eq!(access(&none).0, None);
+        // OWL-382: the project's GitHub App token alone is a credential.
+        let app_only = ready()
+            .app_token_stored()
+            .unstored(&secrets::ForgeAccount::project(&repo).token)
+            .unstored(&secrets::ForgeAccount::shared().token);
+        assert_eq!(access(&app_only).0.unwrap().status, Status::Ok);
     }
 
     #[test]

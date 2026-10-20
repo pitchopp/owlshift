@@ -102,8 +102,9 @@ impl HttpTransport {
 }
 
 /// An agent that follows no redirect: [`HttpTransport::get`] follows the
-/// one a log answers itself, without the token.
-fn agent(timeout: Duration) -> ureq::Agent {
+/// one a log answers itself, without the token. The GitHub App's sign-in
+/// ([`crate::forge::github_app`]) posts through one too.
+pub(super) fn agent(timeout: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         // A 401 or 403 carries a body worth reading.

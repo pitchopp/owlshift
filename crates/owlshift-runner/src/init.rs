@@ -716,6 +716,15 @@ mod tests {
         );
         // With a key of its own, the project reads no shared one.
         assert_eq!(wanted(&keychain, &[LINEAR_KEY])[0].shared, None);
+        // OWL-382: nor with a GitHub App token of its own, which it uses
+        // before any personal token.
+        keychain
+            .store(
+                &secrets::ForgeAccount::project_app(&repo()).token,
+                &Secret::new("{\"v\":1,\"access_token\":\"ghu_x\"}"),
+            )
+            .unwrap();
+        assert_eq!(wanted(&keychain, &[GITHUB_TOKEN])[0].shared, None);
     }
 
     /// Without a GitHub repository, only the machine's secret is wanted:

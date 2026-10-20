@@ -12,6 +12,7 @@
 //! the pull request open and free of conflicts ([`CheckSet::verdict`]).
 
 pub mod github;
+pub mod github_app;
 pub mod push;
 
 use std::fmt;
