@@ -130,6 +130,58 @@ impl FindingId {
     }
 }
 
+/// The JSON Schema pattern of a [`SessionId`]: a UUID in its lowercase text
+/// form.
+pub const SESSION_ID_PATTERN: &str =
+    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
+/// A harness session's identifier (OWL-394): a UUID in its lowercase text
+/// form, as `claude --session-id` takes it and its `init` event reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(id: impl Into<String>) -> Result<Self, IdError> {
+        let id = id.into();
+        let groups: Vec<&str> = id.split('-').collect();
+        let valid = groups.len() == 5
+            && groups
+                .iter()
+                .zip([8, 4, 4, 4, 12])
+                .all(|(group, len)| is_lower_hex(group, len));
+        if valid {
+            Ok(Self(id))
+        } else {
+            Err(IdError {
+                kind: "session id",
+                value: id,
+                pattern: SESSION_ID_PATTERN,
+            })
+        }
+    }
+
+    /// The id written from 16 bytes, with the version (4) and variant bits
+    /// of a random UUID set, whatever the bytes held.
+    pub fn from_bytes(mut bytes: [u8; 16]) -> Self {
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        Self(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A path relative to the worktree, from untrusted input, that cannot leave
 /// it: `/`-separated segments, none empty or `..`. A backslash or a colon is
 /// refused anywhere, which also rules out absolute, drive-prefixed and UNC
@@ -270,6 +322,11 @@ string_id!(
     FindingId,
     FINDING_ID_PATTERN,
     "A review finding's identifier: F1, F2, and so on."
+);
+string_id!(
+    SessionId,
+    SESSION_ID_PATTERN,
+    "A harness session's identifier: a UUID in its lowercase text form."
 );
 string_id!(
     RelativePath,

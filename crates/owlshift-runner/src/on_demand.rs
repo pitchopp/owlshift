@@ -92,7 +92,7 @@ use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
     self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest,
     KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketCost,
-    TicketDelivery, TicketQuestions, cut_reason, cut_to,
+    TicketDelivery, TicketQuestions, TicketSession, cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -114,7 +114,7 @@ use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
     DEFAULT_GATE_TIMEOUT, Executor, ExecutorError, Failure, Git, Harness, Outcome, RESULT_PATH,
-    RUN_DIR, RunReport, RunSpec,
+    RUN_DIR, ResumeFrom, RunReport, RunSpec, SESSION_DIR, SessionPlan,
 };
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
@@ -123,6 +123,7 @@ use crate::proposals::{self, Filing};
 use crate::quarantine;
 use crate::rebase;
 use crate::resolver::{self, Fallback, Quotable, Resolved};
+use crate::resume::{self, Fresh};
 use crate::reversal;
 use crate::routing::{RouteLabels, Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
@@ -448,8 +449,10 @@ pub struct OnDemand<'a> {
     pub dirs: &'a ProjectDirs,
     /// How long to wait between two reads of the pull request's head.
     pub head_wait: Duration,
-    /// This machine's clock, read for the quiet window alone
-    /// ([`answer_check::counts_at`]).
+    /// This machine's clock, read for the quiet window
+    /// ([`answer_check::counts_at`]) and, since OWL-394, for when a run that
+    /// asked ended, which says whether its session's resume is cold
+    /// ([`resume::decide`]).
     pub clock: &'a dyn Fn() -> Timestamp,
     /// Tells the operator of a quarantine as its marker is written, and
     /// watch's of one it finds ([`quarantine`], OWL-368); `None` when this
@@ -1178,6 +1181,11 @@ struct Prepared {
     slot_held_by: Option<TicketId>,
     /// The opt-in Codex reviewer for this command (OWL-348).
     codex: CodexSeat,
+    /// The session of the latest Design or Build run that asked, as the
+    /// ticket ref keeps it or as a run of this command left it (OWL-394):
+    /// settled when its questions are, spent by the next run of its role.
+    /// Every write of the ref carries it, as `intake`.
+    session: Option<TicketSession>,
 }
 
 impl Prepared {
@@ -1836,6 +1844,9 @@ impl OnDemand<'_> {
                 .and_then(|stored| stored.record.cost.as_ref())
                 .and_then(|cost| TicketSpend::try_from(cost).ok())
                 .unwrap_or_default(),
+            session: stored
+                .as_ref()
+                .and_then(|stored| stored.record.session.clone()),
             stored,
             heeded: false,
             repairing: false,
@@ -2319,6 +2330,7 @@ impl OnDemand<'_> {
                 };
                 match self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)? {
                     Routing::Settled(_) => {
+                        settle_session(p, &ran.run);
                         if replan {
                             return self.replanned(p, state, &ran.run, sink);
                         }
@@ -2519,7 +2531,8 @@ impl OnDemand<'_> {
     /// the report, and its core event ([`stage_event`], a quarantine for a
     /// breach). Only a Build run keeps a refused result for the next one.
     /// `setup` is the project's (OWL-330), from the rules the brief was
-    /// made with.
+    /// made with. A Design run at Design and a Build run at Build, but a
+    /// repair's, keep a session (OWL-394, [`Self::execute`]).
     #[allow(clippy::too_many_arguments)]
     fn run_role_once(
         &self,
@@ -2532,7 +2545,24 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<(Ran, Event), Stop> {
         self.within_budget(p, state, sink)?;
-        let ran = self.execute(p, self.executor, (harness, setup), brief, attempt, sink)?;
+        let session = match (brief.role, state.status()) {
+            (Role::Design, Status::Active(Stage::Design))
+            | (Role::Build, Status::Active(Stage::Build))
+                if !p.repairing =>
+            {
+                Some(state.stage())
+            }
+            _ => None,
+        };
+        let ran = self.execute(
+            p,
+            self.executor,
+            (harness, setup),
+            brief,
+            attempt,
+            session,
+            sink,
+        )?;
         if let Some(gate) = &ran.report.gate {
             gathered.gate_failure = gate.failure.clone();
         }
@@ -2660,6 +2690,11 @@ impl OnDemand<'_> {
         // The questions are on the ticket: it waits for the decider, even if
         // keeping them below fails.
         self.show_after(&ticket, Some(run), Event::Questions, sink);
+        // The session the asking run left waits for this round's answers
+        // (OWL-394): kept with it, the round named.
+        if let Some(session) = p.session.as_mut().filter(|session| session.run == run) {
+            session.round = Some(round);
+        }
         let mut asked = p.questions();
         // The run that asked heeded any refusal kept for Build: cleared with
         // the round that keeps its questions (OWL-192). A resolver refusal
@@ -2873,7 +2908,7 @@ impl OnDemand<'_> {
         let harness = self
             .resolver
             .harness(resolver_routing(level, read_routing(p).routing));
-        let ran = self.execute(p, &executor, (&*harness, &[]), &brief, 1, sink)?;
+        let ran = self.execute(p, &executor, (&*harness, &[]), &brief, 1, None, sink)?;
         p.chain.resolved(run_cost(&ran));
         if ran.breaches.is_empty() {
             self.keep_resolver_refusal(p, state, &ran.report.outcome)?;
@@ -3139,7 +3174,15 @@ impl OnDemand<'_> {
             ..self.executor.clone()
         };
         self.within_budget(p, &state, sink)?;
-        let ran = self.execute(p, &executor, (self.answer_check, &[]), &brief, 1, sink)?;
+        let ran = self.execute(
+            p,
+            &executor,
+            (self.answer_check, &[]),
+            &brief,
+            1,
+            None,
+            sink,
+        )?;
         let event = if ran.breaches.is_empty() {
             answer_check::event(&ran.report.outcome, &brief).0
         } else {
@@ -3358,6 +3401,15 @@ impl OnDemand<'_> {
             comment_written("RESUME", &posted),
         );
         self.fold(&ticket, run, &posted, sink);
+        // The round of the kept session is answered: the stage's next run
+        // resumes it (OWL-394), kept so in the same write as the answers.
+        if let Some(session) = p
+            .session
+            .as_mut()
+            .filter(|session| session.round == Some(round) && session.stage == next.stage())
+        {
+            session.settled = true;
+        }
         // The ref still waits for answers: nothing resumes Build but
         // a person, so the stop says the RESUME landed (OWL-169).
         self.store(p, &next, questions).map_err(|e| Stop::NotKept {
@@ -3798,6 +3850,7 @@ impl OnDemand<'_> {
             plan: p.plan.clone(),
             review: p.review.clone(),
             cost: Some(TicketCost::from(p.cost)),
+            session: p.session.clone(),
         };
         let kept = p
             .stored
@@ -3846,13 +3899,25 @@ impl OnDemand<'_> {
     /// rides on the next write that keeps something else.
     fn keep_cost(&self, p: &mut Prepared, run: &str, sink: &mut EventSink<'_>) {
         let cost = TicketCost::from(p.cost);
+        // The run's session too (OWL-394): a run that asked leaves one, and
+        // a run of its role spends the one it found, which watch does not
+        // read as progress either.
         let record = match &p.stored {
-            Some(stored) if stored.record.cost.as_ref() == Some(&cost) => return,
+            Some(stored)
+                if stored.record.cost.as_ref() == Some(&cost)
+                    && stored.record.session == p.session =>
+            {
+                return;
+            }
             Some(stored) => TicketRecord {
                 cost: Some(cost),
+                session: p.session.clone(),
                 ..stored.record.clone()
             },
-            None => ticket_ref::blank(Some(cost)),
+            None => TicketRecord {
+                session: p.session.clone(),
+                ..ticket_ref::blank(Some(cost))
+            },
         };
         let previous = p.stored.as_ref().map(|stored| stored.commit.as_str());
         let written = ticket_ref::write(
@@ -3894,6 +3959,17 @@ impl OnDemand<'_> {
     /// through here, so this is where the ticket's spend counts it, once, as
     /// soon as the executor gives its report (OWL-378), and where the ticket
     /// ref keeps it at once ([`Self::keep_cost`], OWL-397).
+    ///
+    /// A Design run at Design and a Build run at Build, `session` naming
+    /// that stage, keep a session on a harness that keeps them (OWL-394,
+    /// [`Self::session_plan`]): they resume the one the ticket ref keeps
+    /// when its questions are settled and nothing says otherwise, else
+    /// start one of their own, and spend the kept one either way; one that
+    /// asks leaves its own. `run_started` names the session (`session`),
+    /// the run it resumes (`resumes`), or why a due resume did not happen
+    /// (`fresh`); `run_ended` says whether a planned resume happened
+    /// (`resumed`).
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
         p: &mut Prepared,
@@ -3901,10 +3977,93 @@ impl OnDemand<'_> {
         (harness, setup): (&dyn Harness, &[String]),
         brief: &Brief,
         attempt: u32,
+        session: Option<Stage>,
         sink: &mut EventSink<'_>,
     ) -> Result<Ran, Stop> {
-        self.execute_or_unstarted(p, executor, (harness, setup), brief, attempt, sink)?
+        self.execute_or_unstarted(p, executor, (harness, setup), brief, attempt, session, sink)?
             .map_err(|error| refused("the run could not start", error))
+    }
+
+    /// The session a run of `role` at `stage` on `harness` is given, as run
+    /// `run` (OWL-394): `None` on a harness that keeps none; else its own
+    /// session, or the kept one to resume with the run that left it. The
+    /// reason a due resume does not happen comes with it.
+    fn session_plan(
+        &self,
+        p: &Prepared,
+        (role, stage): (Role, Stage),
+        harness: &dyn Harness,
+        run: &str,
+    ) -> (Option<(SessionPlan, String)>, Option<String>, Option<Fresh>) {
+        let Some(key) = harness.session_key() else {
+            return (None, None, None);
+        };
+        let own = resume::session_id(&p.ticket, run);
+        let mut fresh = None;
+        let mut resumes = None;
+        let resume = p.session.as_ref().and_then(|kept| {
+            let head = self.branch_head(p);
+            let next = resume::Next {
+                role,
+                stage,
+                harness: &key,
+                head: head.as_deref(),
+                now: (self.clock)(),
+            };
+            let folder = self.dirs.runs(&p.ticket).join(&kept.run).join(SESSION_DIR);
+            let decided = resume::decide(kept, &next).and_then(|()| {
+                if folder.is_dir() {
+                    Ok(())
+                } else {
+                    Err(Fresh::TranscriptMissing)
+                }
+            });
+            match (decided, kept.cost_micros) {
+                (Ok(()), Some(cost_micros)) => {
+                    resumes = Some(kept.run.clone());
+                    Some(ResumeFrom {
+                        id: kept.session.clone(),
+                        folder,
+                        cost_micros,
+                    })
+                }
+                (Err(why), _) => {
+                    fresh = why.due().then_some(why);
+                    None
+                }
+                (Ok(()), None) => None,
+            }
+        });
+        (Some((SessionPlan { own, resume }, key)), resumes, fresh)
+    }
+
+    /// The session `report` kept for a run of `role` at `stage` that asked,
+    /// as the ticket ref keeps it (OWL-394): unsettled, at the branch's head
+    /// and the clock's time now. `None` for a run that kept none, or when
+    /// the head cannot be read, which no resume could then check.
+    fn asked_session(
+        &self,
+        p: &Prepared,
+        (role, stage): (Role, Stage),
+        harness: String,
+        run: &str,
+        report: &RunReport,
+    ) -> Option<TicketSession> {
+        let kept = report.session.as_ref()?;
+        Some(TicketSession {
+            format: Format,
+            run: run.to_owned(),
+            session: kept.id.clone(),
+            role,
+            stage,
+            harness,
+            head: self.branch_head(p)?,
+            at: (self.clock)(),
+            cost_micros: kept.cost_micros,
+            context_tokens: kept.context_tokens,
+            round: None,
+            settled: false,
+        })
     }
 
     /// [`Self::execute`], with a run the executor could not start given
@@ -3912,6 +4071,7 @@ impl OnDemand<'_> {
     /// the opt-in Codex reviewer drops its seat when its own harness cannot
     /// start (OWL-348). The runner's own faults, the run directory and the
     /// project's marker, still stop the command.
+    #[allow(clippy::too_many_arguments)]
     fn execute_or_unstarted(
         &self,
         p: &mut Prepared,
@@ -3919,24 +4079,35 @@ impl OnDemand<'_> {
         (harness, setup): (&dyn Harness, &[String]),
         brief: &Brief,
         attempt: u32,
+        session: Option<Stage>,
         sink: &mut EventSink<'_>,
     ) -> Result<Result<Ran, ExecutorError>, Stop> {
         let ticket = &p.ticket.clone();
         let (run, run_dir) =
             new_run_dir(&self.dirs.runs(ticket)).map_err(|e| refused("the run directory", e))?;
-        sink.emit(
-            ticket,
-            Some(&run),
-            EventKind::RunStarted,
-            data([
-                ("role", json!(brief.role.as_str())),
-                ("attempt", json!(attempt)),
-                ("run_dir", path(&run_dir)),
-                ("resumes_plan", json!(brief.checkpoint.is_some())),
-                ("gate_failure", json!(brief.gate_failure.is_some())),
-                ("result_refusal", json!(brief.result_refusal.is_some())),
-            ]),
-        );
+        let (plan, resumes, fresh) = match session {
+            Some(stage) => self.session_plan(p, (brief.role, stage), harness, &run),
+            None => (None, None, None),
+        };
+        let mut started = data([
+            ("role", json!(brief.role.as_str())),
+            ("attempt", json!(attempt)),
+            ("run_dir", path(&run_dir)),
+            ("resumes_plan", json!(brief.checkpoint.is_some())),
+            ("gate_failure", json!(brief.gate_failure.is_some())),
+            ("result_refusal", json!(brief.result_refusal.is_some())),
+        ]);
+        if let Some((plan, _)) = &plan {
+            let id = plan.resume.as_ref().map_or(&plan.own, |from| &from.id);
+            started.insert("session".to_owned(), json!(id.as_str()));
+        }
+        if let Some(asking) = &resumes {
+            started.insert("resumes".to_owned(), json!(asking));
+        }
+        if let Some(why) = fresh {
+            started.insert("fresh".to_owned(), json!(why.as_str()));
+        }
+        sink.emit(ticket, Some(&run), EventKind::RunStarted, started);
         // The brief leaves a malformed `zone:` label out (`brief` takes the
         // same labels); the run log says so.
         let labels = brief.ticket.labels.iter().map(String::as_str);
@@ -3970,11 +4141,22 @@ impl OnDemand<'_> {
             run_dir: &run_dir,
             brief,
             setup,
+            session: plan.as_ref().map(|(plan, _)| plan),
         };
         let report = match executor.run(&spec, harness) {
             Ok(report) => {
+                // A resumed run's own cost: the executor counted out what
+                // the session had cost before it (OWL-394).
                 p.cost
                     .ran(report.usage.as_ref().and_then(|usage| usage.cost_usd));
+                // The kept session is spent; a run that asked leaves its own.
+                // A Build whose project setup failed before its harness ran
+                // spent nothing of it (OWL-330).
+                if let (Some((_, key)), Some(stage)) = (plan, session)
+                    && !matches!(report.outcome, Outcome::Failed(Failure::Setup(_)))
+                {
+                    p.session = self.asked_session(p, (brief.role, stage), key, &run, &report);
+                }
                 // Kept before anything else the command does, so no stop
                 // after it, nor a crash, loses the run's cost (OWL-397).
                 self.keep_cost(p, &run, sink);
@@ -6992,6 +7174,15 @@ fn drop_last_fix(p: &mut Prepared) -> bool {
         .is_some()
 }
 
+/// Every question of run `run` is decided (OWL-394): the session it left,
+/// when it is the one kept, may be resumed by the next run of its role. The
+/// next write of the ref keeps it so.
+fn settle_session(p: &mut Prepared, run: &str) {
+    if let Some(session) = p.session.as_mut().filter(|session| session.run == run) {
+        session.settled = true;
+    }
+}
+
 fn gather<T: Clone + PartialEq>(into: &mut Vec<T>, items: &[T]) {
     for item in items {
         if !into.contains(item) {
@@ -7145,6 +7336,10 @@ fn run_ended(report: &RunReport) -> Data {
     if let Some(error) = &report.log_error {
         details.insert("log_error".to_owned(), json!(error));
     }
+    // Whether a planned resume happened (OWL-394).
+    if let Some(resumed) = report.resumed {
+        details.insert("resumed".to_owned(), json!(resumed));
+    }
     details
 }
 
@@ -7215,6 +7410,8 @@ mod tests {
             gate: None,
             setup: None,
             warnings: Vec::new(),
+            resumed: None,
+            session: None,
         }
     }
 

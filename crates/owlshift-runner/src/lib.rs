@@ -27,6 +27,7 @@ pub mod proposals;
 pub mod quarantine;
 pub mod rebase;
 pub mod resolver;
+pub mod resume;
 pub mod reversal;
 pub mod roles;
 pub mod routing;

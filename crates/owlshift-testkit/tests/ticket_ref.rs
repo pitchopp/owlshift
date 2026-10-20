@@ -11,7 +11,9 @@ use owlshift_adapters::forge::Repo as ForgeRepo;
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{PersistedState, TicketCost, TicketDelivery, TicketQuestions};
+use owlshift_contracts::refs::{
+    PersistedState, TicketCost, TicketDelivery, TicketQuestions, TicketSession,
+};
 use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::executor::Git;
@@ -109,6 +111,7 @@ fn record(state: &str, round: u32) -> TicketRecord {
         plan: None,
         review: None,
         cost: None,
+        session: None,
     }
 }
 
@@ -236,8 +239,9 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
 }
 
 /// OWL-397: a ticket ref's progress, which watch reads, covers every file a
-/// write renders but `cost.json`: each part changed alone moves it, an
-/// optional one made included, and the spend alone never does.
+/// write renders but `cost.json` and, since OWL-394, `session.json`: each
+/// part changed alone moves it, an optional one made included, and the
+/// spend or the session alone never does.
 #[test]
 fn every_part_but_the_spend_moves_a_ticket_refs_progress() {
     let base = record(WAITING, 1);
@@ -249,6 +253,11 @@ fn every_part_but_the_spend_moves_a_ticket_refs_progress() {
         };
         assert_eq!(ticket_ref::progress(&spent, None), at);
     }
+    let with_session = TicketRecord {
+        session: Some(ticket_session()),
+        ..base.clone()
+    };
+    assert_eq!(ticket_ref::progress(&with_session, None), at);
     let resumed = r#"{"format":2,"stage":"build","round":1,"reasks":0,"failed_runs":0}"#;
     let delivery = TicketDelivery::parse(include_str!(
         "../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
@@ -362,6 +371,7 @@ fn record_of(len: usize) -> TicketRecord {
             plan: None,
             review: None,
             cost: None,
+            session: None,
         }
     };
     let base = with(1).questions.render().len();
@@ -471,9 +481,23 @@ fn kept_everything() -> TicketRecord {
         intake: Some(intake()),
         plan: Some(ticket_plan()),
         review: Some(ticket_review()),
-        // Forgetting keeps what the runs cost (OWL-378).
+        // Forgetting keeps what the runs cost (OWL-378), and drops the
+        // session of the latest asking run, the ticket starting over
+        // (OWL-394).
         cost: Some(ticket_cost()),
+        session: Some(ticket_session()),
     }
+}
+
+/// The session of a Build run that asked round 1, settled (OWL-394).
+fn ticket_session() -> TicketSession {
+    TicketSession::parse(
+        r#"{"format":1,"run":"20261020T121956Z","session":"75744e41-7eac-4fdf-aeea-df03acb72bff",
+            "role":"build","stage":"build","harness":"claude-code:sonnet",
+            "head":"0123456789abcdef0123456789abcdef01234567","at":"2026-10-20T12:20:10Z",
+            "cost_micros":233669,"context_tokens":118828,"round":1,"settled":true}"#,
+    )
+    .unwrap()
 }
 
 /// What forgetting a record of `round` whose questions are `questions` and
@@ -494,6 +518,7 @@ fn forgotten(round: u32, questions: &TicketQuestions, cost: Option<TicketCost>) 
         plan: None,
         review: None,
         cost,
+        session: None,
     }
 }
 

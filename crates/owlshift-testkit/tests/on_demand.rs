@@ -36,7 +36,7 @@ use owlshift_contracts::drain::{
     DependencyOutcome, Gesture, GestureKind, ProposalOutcome, TicketIntake,
 };
 use owlshift_contracts::event::{Event, EventKind};
-use owlshift_contracts::ids::{RelativePath, TicketId};
+use owlshift_contracts::ids::{RelativePath, SessionId, TicketId};
 use owlshift_contracts::refs::{AskDecider, PersistedState, Waiting};
 use owlshift_contracts::result::RefusedChoice;
 use owlshift_contracts::{DelegationLevel, Role, Stage};
@@ -48,7 +48,7 @@ use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{Data, EventLog, EventSink};
 use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
-    Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
+    Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog, SandboxNeeds,
 };
 use owlshift_runner::on_demand::{self, CodexReviewer, Delivered, Landed, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
@@ -326,6 +326,20 @@ struct Replies {
     started: Cell<usize>,
     /// The routing of each routed run, in order.
     routed: Rc<RefCell<Vec<RunRouting>>>,
+    /// The fake harness keeps sessions (OWL-394).
+    sessions: bool,
+}
+
+impl Replies {
+    /// The fake harness as each run gets it, but its reply.
+    fn fake(&self) -> FakeHarness {
+        FakeHarness {
+            program: self.program.clone(),
+            reply: PathBuf::new(),
+            readable: Vec::new(),
+            sessions: self.sessions,
+        }
+    }
 }
 
 /// The routed harnesses are the bench's one harness, which records the
@@ -378,9 +392,37 @@ impl Harness for Routed<'_> {
     ) -> io::Result<HarnessEnd> {
         self.0.drive(run, child, log)
     }
+
+    fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        self.0.sandbox_needs(agent)
+    }
+
+    fn session_key(&self) -> Option<String> {
+        self.0.session_key()
+    }
+
+    fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
+        self.0.session_transcript(folder, id)
+    }
 }
 
 impl Harness for Replies {
+    fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        let needs = self.fake().sandbox_needs(agent)?;
+        Ok(SandboxNeeds {
+            readable: Vec::new(),
+            ..needs
+        })
+    }
+
+    fn session_key(&self) -> Option<String> {
+        self.fake().session_key()
+    }
+
+    fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
+        self.fake().session_transcript(folder, id)
+    }
+
     fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         if let Some(agent) = self.first.borrow_mut().take() {
             agent(run.worktree);
@@ -397,10 +439,9 @@ impl Harness for Replies {
             .pop_front()
             .expect("a reply for every run");
         let harness = FakeHarness {
-            program: self.program.clone(),
             reply,
             // The bench runs `do` bare: see `Bench::run`.
-            readable: Vec::new(),
+            ..self.fake()
         };
         let command = harness.command(run);
         *self.current.borrow_mut() = Some(harness);
@@ -817,6 +858,8 @@ struct Bench {
     /// The verify seats play from the bench's reply queue, as every other
     /// run does; otherwise they review clean ([`CleanReview`], OWL-304).
     verify_plays: Cell<bool>,
+    /// The fake harness keeps sessions as Claude Code does (OWL-394).
+    sessions: Cell<bool>,
     /// The opt-in Codex reviewer (OWL-348): `None` when the project does
     /// not ask for it; else what its readiness check answers, a seat that
     /// plays from the bench's reply queue when ready.
@@ -963,6 +1006,7 @@ impl Bench {
             reactions: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
+            sessions: Cell::new(false),
             codex: RefCell::new(None),
             codex_unstartable: Cell::new(false),
             notified: Notified::default(),
@@ -1344,6 +1388,7 @@ impl Bench {
             during: RefCell::new(during),
             started: Cell::new(0),
             routed: self.routed.clone(),
+            sessions: self.sessions.get(),
         };
         let clean_result = self.tmp.path().join("clean-review.json");
         fs::write(&clean_result, CLEAN_REVIEW).unwrap();
@@ -1357,6 +1402,7 @@ impl Bench {
             program: harness.program.clone(),
             reply: clean_reply,
             readable: Vec::new(),
+            sessions: false,
         });
         let verify: &dyn Router = if self.verify_plays.get() {
             &harness
@@ -5008,6 +5054,196 @@ fn questions_all_decided_go_on_without_a_stop() {
         report.contains("**Which file should hold the greeting?**"),
         "{report}"
     );
+}
+
+/// A Build run's second discoverable question (OWL-394).
+const LINK: &str = r#"{"format":14,"status":"questions",
+"summary":"Whether the README links to the greeting is not said.",
+"questions":[
+  {"id":"Q1","category":"naming","context":"The README lists every file at the root.",
+   "text":"Should the README link to GREETING.md?","recommendation":{"why":"The README lists every file."}}]}"#;
+
+/// The resolver decides [`LINK`]'s Q1.
+const DECIDED_LINK: &str = r#"{"format":14,"status":"done","summary":"The README settles it.",
+"resolutions":[{"question":"Q1","outcome":"decided","category":"naming","decision":"Yes, in its list of files.",
+"basis":"The README lists every file at the root.","basis_kind":"fact"}]}"#;
+
+/// `reply`, reporting `micros` millionths of a dollar: the whole session's
+/// on a run of a session, as Claude Code reports it (OWL-394).
+fn costing(mut reply: Reply, micros: u64) -> Reply {
+    reply.cost_micros = Some(micros);
+    reply
+}
+
+/// The events of the build role's runs, in order: each `run_started`, with
+/// its run's `run_ended` and `usage` events (OWL-394).
+fn build_runs(bench: &Bench) -> Vec<(Event, Event, Option<Event>)> {
+    let events = bench.events();
+    let of = |kind: EventKind, run: &Option<String>| {
+        events
+            .iter()
+            .find(|event| event.kind == kind && &event.run == run)
+            .cloned()
+    };
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::RunStarted && event.data["role"] == "build")
+        .map(|started| {
+            (
+                started.clone(),
+                of(EventKind::RunEnded, &started.run).expect("every run ends"),
+                of(EventKind::Usage, &started.run),
+            )
+        })
+        .collect()
+}
+
+/// OWL-394's acceptance: a Build whose one question the resolver decides
+/// resumes its own session for its next run, and so does that run once its
+/// own question is decided: one session, each run naming the run it
+/// resumes, which `owlshift logs` prints, and the kept transcript holding
+/// both runs. Each run counts at its own cost in its `usage` event, the
+/// ticket's spend and `cost.json`, though the fake harness, as Claude Code,
+/// reports the whole session's: 1.00, then 1.30, then 1.50, where a total of
+/// what they reported would be 4.00.
+#[test]
+fn scenario_a_build_resumes_its_session_after_the_resolver_decides() {
+    let bench = Bench::new(true);
+    bench.sessions.set(true);
+    let (delivered, printed) = bench.run(
+        vec![
+            costing(bench.reply(None, Some(NAMING)), 1_000_000),
+            costing(bench.reply(None, Some(DECIDED_Q1)), 100_000),
+            costing(bench.reply(None, Some(LINK)), 300_000),
+            costing(bench.reply(None, Some(DECIDED_LINK)), 100_000),
+            costing(bench.reply(Some("Hello"), Some(DONE)), 200_000),
+        ],
+        None,
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let runs = build_runs(&bench);
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    let id = |(started, _, _): &(Event, Event, Option<Event>)| started.run.clone().unwrap();
+    let session = runs[0].0.data["session"].as_str().unwrap().to_owned();
+    assert!(SessionId::new(&session).is_ok(), "{session}");
+    for (started, _, _) in &runs {
+        assert_eq!(started.data["session"], json!(session));
+        assert_eq!(started.data.get("fresh"), None);
+    }
+    assert_eq!(runs[0].0.data.get("resumes"), None);
+    assert_eq!(runs[1].0.data["resumes"], json!(id(&runs[0])));
+    assert_eq!(runs[2].0.data["resumes"], json!(id(&runs[1])));
+    let line = owlshift_runner::events::format_line(&runs[1].0);
+    assert!(
+        line.contains(&format!(" session={session}"))
+            && line.contains(&format!(" resumes={} ", id(&runs[0]))),
+        "{line}"
+    );
+    let resumed: Vec<Option<&Value>> = runs
+        .iter()
+        .map(|(_, ended, _)| ended.data.get("resumed"))
+        .collect();
+    assert_eq!(resumed, [None, Some(&json!(true)), Some(&json!(true))]);
+
+    let own: Vec<Value> = runs
+        .iter()
+        .map(|(_, _, usage)| usage.as_ref().unwrap().data["cost_usd"].clone())
+        .collect();
+    assert_eq!(own, [json!(1.0), json!(0.3), json!(0.2)]);
+    let last = runs[2].2.as_ref().unwrap();
+    assert_eq!(last.data["ticket_spent_usd"], json!(1.7));
+    let record = bench.record();
+    assert_eq!(record.cost.unwrap().spent_micros, 1_700_000);
+    assert_eq!(record.session, None, "the Build that delivered spent it");
+    let kept = bench
+        .dirs()
+        .runs(&ticket())
+        .join(id(&runs[1]))
+        .join("session/sessions")
+        .join(format!("{session}.jsonl"));
+    assert_eq!(fs::read_to_string(kept).unwrap(), "1000000\n1300000\n");
+}
+
+/// OWL-394's acceptance: a session whose transcript is gone is not resumed.
+/// The next Build starts a session of its own, its `run_started` saying why,
+/// and counts at the whole cost it reports.
+#[test]
+fn scenario_a_build_whose_session_is_missing_starts_fresh() {
+    let bench = Bench::new(true);
+    bench.sessions.set(true);
+    let folder = bench.dirs().runs(&ticket());
+    let lose: During = (
+        2,
+        Box::new(move || {
+            for entry in fs::read_dir(&folder).unwrap() {
+                let kept = entry.unwrap().path().join("session");
+                if kept.exists() {
+                    fs::remove_dir_all(kept).unwrap();
+                }
+            }
+        }),
+    );
+    let (delivered, printed) = bench.invoke(
+        false,
+        vec![
+            costing(bench.reply(None, Some(NAMING)), 1_000_000),
+            bench.reply(None, Some(DECIDED_Q1)),
+            costing(bench.reply(Some("Hello"), Some(DONE)), 400_000),
+        ],
+        None,
+        vec![lose],
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let runs = build_runs(&bench);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    let (first, second) = (&runs[0].0.data, &runs[1].0.data);
+    assert_eq!(second["fresh"], json!("transcript_missing"));
+    assert_eq!(second.get("resumes"), None);
+    assert_ne!(second["session"], first["session"]);
+    assert_eq!(runs[1].1.data.get("resumed"), None);
+    let usage = runs[1].2.as_ref().unwrap();
+    assert_eq!(usage.data["cost_usd"], json!(0.4));
+    assert_eq!(bench.record().cost.unwrap().spent_micros, 1_400_000);
+}
+
+/// OWL-394: a Build whose round the decider answers resumes its session when
+/// `continue` runs it, the answer check between them, and counts at its own
+/// cost.
+#[test]
+fn a_build_resumes_its_session_after_the_decider_answers() {
+    let bench = Bench::new(true);
+    bench.sessions.set(true);
+    let (asked, printed) = bench.run(
+        vec![costing(bench.reply(None, Some(ROUND_1)), 1_000_000)],
+        None,
+    );
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    let kept = bench.record().session.unwrap();
+    assert_eq!(
+        (kept.round.map(|round| round.get()), kept.settled),
+        (Some(1), false)
+    );
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\" Go.\n");
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&check(&[
+                ("Q1", "answered", "English."),
+                ("Q2", "answered", "Hello, reader."),
+            ])),
+        ),
+        costing(bench.reply(Some("Hello"), Some(DONE)), 250_000),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let runs = build_runs(&bench);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1].0.data["resumes"], json!(runs[0].0.run));
+    assert_eq!(runs[1].0.data["session"], runs[0].0.data["session"]);
+    assert_eq!(runs[1].1.data["resumed"], json!(true));
+    assert_eq!(runs[1].2.as_ref().unwrap().data["cost_usd"], json!(0.25));
 }
 
 /// The questions a stop asked, by text.

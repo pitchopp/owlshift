@@ -1059,6 +1059,7 @@ fn run_live_seeded(
         run_dir: &paths.root.join("run"),
         brief: &brief,
         setup: &[],
+        session: None,
     };
     let report = executor.run(&spec, &harness).unwrap();
     Live {

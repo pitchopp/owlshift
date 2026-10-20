@@ -83,8 +83,9 @@ use jiff::Timestamp;
 use owlshift_adapters::harness::claude::Usage;
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::{Brief, GateFailure, PermissionLevel};
-use owlshift_contracts::ids::RelativePath;
+use owlshift_contracts::ids::{RelativePath, SessionId};
 use owlshift_contracts::result::{self, DecisionsRefusal, RunResult};
+use owlshift_core::gate::usd_micros;
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 use owlshift_platform::keychain::Secret;
 use owlshift_platform::sandbox;
@@ -98,7 +99,7 @@ pub use git::{Git, GitError, MINIMUM_GIT_VERSION};
 pub(crate) use git::{git_floor_reason, git_install_advice, git_recheck_note};
 pub use harness::{
     Harness, HarnessEnd, HarnessError, HarnessHome, HarnessLogin, HarnessRun, HarnessStatus,
-    SandboxNeeds,
+    RunSession, SandboxNeeds,
 };
 pub(crate) use isolation::own_entry;
 pub use isolation::{Violation, check_worktree_link};
@@ -214,6 +215,82 @@ pub struct RunSpec<'a> {
     /// harness and before the gate after a Build or a rebase `done`; empty
     /// for none, and for the other roles.
     pub setup: &'a [String],
+    /// The session the run starts or resumes (OWL-394), on a harness that
+    /// keeps sessions ([`Harness::session_key`]); `None` keeps none.
+    pub session: Option<&'a SessionPlan>,
+}
+
+/// The session a run is given (OWL-394, architecture section 4, "Resuming
+/// the asking run's session").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPlan {
+    /// The id the run's own session starts under, when it resumes none, or
+    /// its resume's transcript cannot be put in place.
+    pub own: SessionId,
+    /// The session to resume, when one is to be.
+    pub resume: Option<ResumeFrom>,
+}
+
+/// A session to resume: what an earlier run kept ([`KeptSession`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeFrom {
+    pub id: SessionId,
+    /// The folder holding its transcript, laid out as the harness's
+    /// configuration folder: [`SESSION_DIR`] of the earlier run's directory.
+    pub folder: PathBuf,
+    /// The session's whole cost at the earlier run's end, in millionths of a
+    /// dollar: the resumed run's own cost is what it reports less this.
+    pub cost_micros: u64,
+}
+
+/// A session's transcript the executor kept after a run that asked
+/// (OWL-394): what the next run of its role may resume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptSession {
+    pub id: SessionId,
+    /// [`SESSION_DIR`] of the run's directory, holding the transcript at the
+    /// place it had in the run's configuration folder.
+    pub folder: PathBuf,
+    /// The session's whole cost at the run's end, as its harness reported
+    /// it, in millionths of a dollar; `None` when it reported none.
+    pub cost_micros: Option<u64>,
+    /// The run's context at its end, in tokens ([`HarnessEnd::context_tokens`]).
+    pub context_tokens: Option<u64>,
+}
+
+/// The folder of a run's directory that keeps its session's transcript
+/// (OWL-394), out of every run's reach as the run directory is.
+pub const SESSION_DIR: &str = "session";
+
+/// The most bytes of a transcript the executor copies, kept or put back
+/// (OWL-394): a bound on what the runner reads and writes for a run, not a
+/// cost rule. A larger one is not kept, and its session is not resumed.
+pub const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A resumed run's own cost (OWL-394): its harness reports the whole
+/// session's, `total` dollars, and the session cost `prior` millionths of
+/// a dollar when the earlier run ended, so the run's own is the difference.
+/// A total below `prior` is counted whole, with a warning that says so: a
+/// harness that stopped counting the earlier runs would otherwise be
+/// counted at nothing. No total is no cost.
+pub fn own_cost(total: Option<f64>, prior: u64) -> (Option<f64>, Option<String>) {
+    let Some(total) = total else {
+        return (None, None);
+    };
+    let Some(micros) = usd_micros(total) else {
+        return (Some(total), None);
+    };
+    match micros.checked_sub(prior) {
+        Some(own) => (Some(own as f64 / 1_000_000.0), None),
+        None => (
+            Some(total),
+            Some(format!(
+                "the resumed session reported {total} USD, less than the {} USD it had cost when \
+                 its earlier run ended: counted whole",
+                prior as f64 / 1_000_000.0
+            )),
+        ),
+    }
 }
 
 /// What a run came to.
@@ -252,8 +329,16 @@ pub struct RunReport {
     /// What the run's harness home left to say: a changed login that was
     /// not written back, or a result that could not be written from the
     /// last message; and a read-only run's result read from its last
-    /// message, or not written from it (OWL-323).
+    /// message, or not written from it (OWL-323). Since OWL-394 also a
+    /// session not resumed, or not kept, and a resumed session's total
+    /// below its earlier one.
     pub warnings: Vec<String>,
+    /// For a run given a session to resume, whether it resumed it: `false`
+    /// when its transcript could not be put in place and the run started a
+    /// session of its own (OWL-394). `None` when none was to be resumed.
+    pub resumed: Option<bool>,
+    /// The session's transcript, kept for a run that asked ([`KeptSession`]).
+    pub session: Option<KeptSession>,
 }
 
 /// How a run ended.
@@ -476,6 +561,19 @@ impl Executor {
                     .to_owned(),
             ));
         }
+        // A session needs a harness that keeps them, in a folder of the
+        // run's own (OWL-394).
+        let session_variable = match spec.session {
+            None => None,
+            Some(_) => match (harness.session_key(), needs.session_variable) {
+                (Some(_), Some(variable)) if !needs.read_only => Some(variable),
+                _ => {
+                    return Err(ExecutorError::Spec(
+                        "the run is given a session, which its harness does not keep".to_owned(),
+                    ));
+                }
+            },
+        };
         worktree::prepare(&self.git, spec)?;
         let mut paths = self.run_paths(spec.worktree, spec.run_dir)?;
         if needs.read_only {
@@ -575,6 +673,8 @@ impl Executor {
                     gate: None,
                     setup: Some(ran.report),
                     warnings,
+                    resumed: None,
+                    session: None,
                 });
             }
             if let Some(failure) = &ran.report.failure {
@@ -597,14 +697,54 @@ impl Executor {
             setup = Some(ran.report);
         }
 
+        // An empty configuration folder of the run's own, in its temporary
+        // folder: no other login is found there, and nothing the harness
+        // writes outlives the run (OWL-94) but a session's transcript, which
+        // the executor keeps (OWL-394). It is bound read and written, as it
+        // was when bwrap made the temporary folder anew, empty, for each
+        // command; since OWL-330 the temporary folder is bound whole, so the
+        // folder is seen either way. Made before the command, so that a
+        // resumed session's transcript is in place, or known missing, when
+        // the command is built.
+        let login = needs.login;
+        let config = if login.is_some() || session_variable.is_some() {
+            let config = temp.path().join(HARNESS_CONFIG_DIR);
+            fs::create_dir(&config).map_err(|source| ExecutorError::RunDir {
+                path: config.clone(),
+                source,
+            })?;
+            Some(config)
+        } else {
+            None
+        };
+        // The session the run uses (OWL-394): a resume whose transcript
+        // cannot be put in place starts a session of the run's own, with its
+        // role's prompt and its whole cost, and a warning says so.
+        let (session, resumed) = match (spec.session, &config) {
+            (Some(plan), Some(config)) => match &plan.resume {
+                None => (Some(RunSession::Start(&plan.own)), None),
+                Some(from) => match home::seed_session(harness, from, config) {
+                    Ok(()) => (Some(RunSession::Resume(&from.id)), Some(true)),
+                    Err(why) => {
+                        warnings.push(format!(
+                            "the session {} could not be resumed: {why}; the run starts a \
+                             session of its own",
+                            from.id
+                        ));
+                        (Some(RunSession::Start(&plan.own)), Some(false))
+                    }
+                },
+            },
+            _ => (None, None),
+        };
         let context = HarnessRun {
             worktree: spec.worktree,
             brief: &brief,
             brief_file: &brief_file,
             result_file: &result_file,
             stop: None,
+            session,
         };
-        let login = needs.login;
         let inner = harness.command(&context).map_err(ExecutorError::Command)?;
         // The user's login is copied in as late as can be: an early refusal
         // leaves no copy behind.
@@ -632,24 +772,7 @@ impl Executor {
         paths.writable.extend(run_files.iter().cloned());
         paths.temp = Some(temp.path().to_owned());
         paths.read_only = needs.read_only;
-        // An empty configuration folder of the run's own, in its temporary
-        // folder: no other login is found there, and nothing the harness
-        // writes outlives the run (OWL-94). It is bound read and written, as
-        // it was when bwrap made the temporary folder anew, empty, for each
-        // command; since OWL-330 the temporary folder is bound whole, so the
-        // folder is seen either way.
-        let config = match &login {
-            Some(_) => {
-                let config = temp.path().join(HARNESS_CONFIG_DIR);
-                fs::create_dir(&config).map_err(|source| ExecutorError::RunDir {
-                    path: config.clone(),
-                    source,
-                })?;
-                paths.writable.push(config.clone());
-                Some(config)
-            }
-            None => None,
-        };
+        paths.writable.extend(config.iter().cloned());
         let mut command = self
             .agent
             .confine(inner, &paths)
@@ -661,6 +784,9 @@ impl Executor {
             login
                 .apply(&mut command, config)
                 .map_err(ExecutorError::Spawn)?;
+        }
+        if let (Some(variable), Some(config)) = (session_variable, &config) {
+            command.env(variable, config);
         }
         if let Some((variable, dir, _)) = &seeded {
             command.env(variable, dir);
@@ -751,6 +877,39 @@ impl Executor {
         {
             outcome = Outcome::Failed(Failure::InvalidResult(reason));
         }
+        // The session (OWL-394): a resumed one reports its whole cost, so the
+        // run's own is that less what it had cost before; the transcript of a
+        // run that asked, and broke no isolation, is kept for the next run.
+        let mut usage = end.as_ref().and_then(|end| end.usage.clone());
+        let total = usage.as_ref().and_then(|usage| usage.cost_usd);
+        if resumed == Some(true)
+            && let (Some(usage), Some(from)) = (
+                usage.as_mut(),
+                spec.session.and_then(|plan| plan.resume.as_ref()),
+            )
+        {
+            let (own, warning) = own_cost(total, from.cost_micros);
+            usage.cost_usd = own;
+            warnings.extend(warning);
+        }
+        let session = match (session, &config) {
+            (Some(session), Some(config)) if asked(&outcome) => {
+                let id = session.id();
+                match home::keep_session(harness, config, id, &spec.run_dir.join(SESSION_DIR)) {
+                    Ok(folder) => Some(KeptSession {
+                        id: id.clone(),
+                        folder,
+                        cost_micros: total.and_then(usd_micros),
+                        context_tokens: end.as_ref().and_then(|end| end.context_tokens),
+                    }),
+                    Err(why) => {
+                        warnings.push(format!("the session {id} was not kept: {why}"));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         let mut gate = None;
         if matches!(brief.role, Role::Build | Role::Rebase) && is_done(&outcome) {
             let report = self.project_gate(
@@ -772,7 +931,7 @@ impl Executor {
         Ok(RunReport {
             outcome,
             exit_code: end.as_ref().and_then(|end| end.exit_code),
-            usage: end.as_ref().and_then(|end| end.usage.clone()),
+            usage,
             model: end.as_ref().and_then(|end| end.model.clone()),
             harness_version: end.and_then(|end| end.harness_version),
             elapsed: started.elapsed(),
@@ -783,8 +942,16 @@ impl Executor {
             gate,
             setup,
             warnings,
+            resumed,
+            session,
         })
     }
+}
+
+/// Whether the role finished asking: questions, or a false premise with
+/// them, which a resumed session answers (OWL-394).
+fn asked(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Finished { result, .. } if result.asks())
 }
 
 impl Executor {
@@ -1331,6 +1498,23 @@ fn holds(haystack: &[u8], token: &Secret) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-394: a resumed run's own cost is the session's total less what
+    /// it had cost before; a total below that is counted whole, with a
+    /// warning; no total is no cost.
+    #[test]
+    fn a_resumed_runs_own_cost_is_the_sessions_less_its_earlier_cost() {
+        assert_eq!(own_cost(Some(1.3), 1_000_000), (Some(0.3), None));
+        assert_eq!(own_cost(Some(1.0), 1_000_000), (Some(0.0), None));
+        assert_eq!(own_cost(None, 1_000_000), (None, None));
+        let (own, warning) = own_cost(Some(0.25), 1_000_000);
+        assert_eq!(own, Some(0.25));
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("0.25 USD") && warning.contains("1 USD"),
+            "{warning}"
+        );
+    }
 
     /// OWL-298: the system's bundle reaches a read-only harness command on
     /// macOS alone, when the agent environment names no bundle.

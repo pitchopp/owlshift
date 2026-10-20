@@ -81,6 +81,7 @@ fn request(workdir: &Path, level: PermissionLevel, network: bool, result: &str) 
         json_schema: None,
         max_budget_usd: None,
         bash: false,
+        session: None,
     }
 }
 

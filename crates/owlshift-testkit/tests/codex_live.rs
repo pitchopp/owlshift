@@ -147,6 +147,7 @@ impl Live {
             run_dir: &self.tmp.path().join(format!("run-{id}")),
             brief: &brief,
             setup: &[],
+            session: None,
         };
         let report = self.executor.run(&spec, harness).unwrap();
         let after = fs::read(&self.login).unwrap();

@@ -11,7 +11,8 @@ use std::fmt::Debug;
 use std::fs;
 use std::path::PathBuf;
 
-use owlshift_contracts::refs::{PersistedState, TicketCost, Waiting};
+use owlshift_contracts::ids::SessionId;
+use owlshift_contracts::refs::{PersistedState, TicketCost, TicketSession, Waiting};
 use owlshift_contracts::{ContractError, PlanApproval, Stage, Variant};
 use owlshift_core::gate::{GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
@@ -295,4 +296,55 @@ fn a_ticket_cost_reads_back_and_refuses_parts_that_contradict() {
             other => panic!("{field}: expected an invalid ticket cost, got {other:?}"),
         }
     }
+}
+
+/// The session of the latest asking run (OWL-394): written and read back,
+/// valid against its schema, and refused when its run is no plain name of a
+/// run directory, its role and stage keep no session, its harness is blank
+/// or its head is no commit id. A session id is a lowercase UUID, and one
+/// made from bytes carries the version and variant of a random UUID.
+#[test]
+fn a_ticket_session_reads_back_and_refuses_what_no_run_keeps() {
+    let document = json!({
+        "format": 1, "run": "20261020T121956Z-2",
+        "session": "75744e41-7eac-4fdf-aeea-df03acb72bff", "role": "build", "stage": "build",
+        "harness": "claude-code:sonnet", "head": "a".repeat(40), "at": "2026-10-20T12:20:10Z",
+        "cost_micros": 233_669, "context_tokens": 118_828, "round": 1, "settled": false,
+    });
+    let read = TicketSession::parse(&document.to_string()).unwrap();
+    let rendered: Value = serde_json::from_str(&read.render()).unwrap();
+    assert_eq!(rendered, document);
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/ticket-session.schema.json");
+    let schema: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&document)
+    );
+    for (field, value) in [
+        ("run", json!("../20261020T121956Z")),
+        ("run", json!("")),
+        ("stage", json!("verify")),
+        ("role", json!("design")),
+        ("harness", json!(" ")),
+        ("head", json!("main")),
+    ] {
+        let mut broken = document.clone();
+        broken[field] = value.clone();
+        match TicketSession::parse(&broken.to_string()) {
+            Err(ContractError::Invalid { contract, .. }) => {
+                assert_eq!(contract, "ticket session");
+            }
+            other => panic!("{field} {value}: expected an invalid session, got {other:?}"),
+        }
+    }
+    let mut broken = document.clone();
+    broken["session"] = json!("75744E41-7EAC-4FDF-AEEA-DF03ACB72BFF");
+    assert!(TicketSession::parse(&broken.to_string()).is_err());
+
+    let made = SessionId::from_bytes([0xff; 16]);
+    assert_eq!(made.as_str(), "ffffffff-ffff-4fff-bfff-ffffffffffff");
+    assert_eq!(SessionId::new(made.as_str()).unwrap(), made);
+    assert!(SessionId::new("ffffffff-ffff-4fff-bfff-fffffffffff").is_err());
 }

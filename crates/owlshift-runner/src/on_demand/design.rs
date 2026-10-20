@@ -1247,14 +1247,21 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Result<(Ran, RunResult), String>, Stop> {
         self.within_budget(p, state, sink)?;
-        let ran =
-            match self.execute_or_unstarted(p, self.executor, (harness, &[]), brief, 1, sink)? {
-                Ok(ran) => ran,
-                Err(ExecutorError::Command(_) | ExecutorError::Spawn(_)) => {
-                    return Ok(Err("Codex's run could not start.".to_owned()));
-                }
-                Err(error) => return Err(refused("the run could not start", error)),
-            };
+        let ran = match self.execute_or_unstarted(
+            p,
+            self.executor,
+            (harness, &[]),
+            brief,
+            1,
+            None,
+            sink,
+        )? {
+            Ok(ran) => ran,
+            Err(ExecutorError::Command(_) | ExecutorError::Spawn(_)) => {
+                return Ok(Err("Codex's run could not start.".to_owned()));
+            }
+            Err(error) => return Err(refused("the run could not start", error)),
+        };
         let event = if ran.breaches.is_empty() {
             stage_event(&ran.report.outcome, brief).0
         } else {
@@ -1358,7 +1365,10 @@ impl OnDemand<'_> {
                     ..Asked::run(Role::Design, &ran, result, &[])
                 };
                 match self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)? {
-                    Routing::Settled(_) => continue,
+                    Routing::Settled(_) => {
+                        settle_session(p, &ran.run);
+                        continue;
+                    }
                     Routing::Ask(round) => {
                         let asked = match state.apply(p.pipeline, Event::Questions) {
                             Ok(Transition::To(asked)) => asked,

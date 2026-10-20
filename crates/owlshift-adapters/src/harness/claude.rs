@@ -36,6 +36,7 @@ use serde_json::Value;
 
 use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::ids::RelativePath;
+pub use owlshift_contracts::ids::SessionId;
 
 use super::stream::{self, Sink};
 pub use super::stream::{EXIT_GRACE, LINE_CAP, STDERR_CAP};
@@ -203,6 +204,63 @@ pub struct Request {
     /// its last message. Refused at the write-in-worktree level, which
     /// already allows every tool.
     pub bash: bool,
+    /// The session the run starts or resumes (OWL-394); `None` keeps no
+    /// session at all (`--no-session-persistence`).
+    pub session: Option<Session>,
+}
+
+/// How a run's session is kept (OWL-394). Checked live with Claude Code
+/// 2.1.302 (C18, recorded in `docs/design/build-plan.md`): a confined run
+/// started with `--session-id` keeps its transcript in [`transcript_path`]
+/// of its configuration folder, and a run given that file alone, in an
+/// empty configuration folder, at the same place, goes on with
+/// `--resume` under the same id, the guardrail flags holding. A resumed
+/// session's final record gives `total_cost_usd` and `modelUsage` for the
+/// whole session, the earlier runs included; its `usage`, `num_turns` and
+/// `duration_ms` are its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Session {
+    /// A new session under this id (`--session-id`).
+    Start(SessionId),
+    /// The session of this id, whose transcript the configuration folder
+    /// holds (`--resume`).
+    Resume(SessionId),
+}
+
+/// Where a session's transcript is, relative to the configuration folder,
+/// when `config` holds it: `projects/<folder>/<id>.jsonl`, the folder named
+/// after the run's working directory (C18). A folder or a file that is a
+/// link is never followed, so a run cannot point the runner at a file
+/// elsewhere. `Ok(None)` when no regular file of that name is there.
+pub fn transcript_path(config: &Path, id: &SessionId) -> io::Result<Option<String>> {
+    let projects = config.join("projects");
+    let entries = match std::fs::symlink_metadata(&projects) {
+        Ok(meta) if meta.is_dir() => std::fs::read_dir(&projects)?,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let name = format!("{id}.jsonl");
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let file = entry.path().join(&name);
+        match std::fs::symlink_metadata(&file) {
+            Ok(meta) if meta.is_file() => {
+                let folder = entry.file_name();
+                return Ok(Some(format!(
+                    "projects/{}/{name}",
+                    folder.to_string_lossy()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 /// Why a request cannot be turned into a command.
@@ -271,7 +329,8 @@ impl std::error::Error for CommandError {}
 /// in the worktree grants a permission or runs a hook (`GUARDRAIL_ARGS`), and
 /// no skill, Claude Code's own included, reaches the model (`SKILL_ARGS`).
 /// Messages from the user's other sessions are refused on every launch
-/// (`PEER_INBOX_ARGS`).
+/// (`PEER_INBOX_ARGS`). A run keeps no session unless the request names one
+/// ([`Request::session`]); every flag above holds on a resumed one too.
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
     if request.permissions.browser {
         return Err(CommandError::Unsupported("a browser"));
@@ -322,7 +381,11 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
     command.args(GUARDRAIL_ARGS);
     command.args(SKILL_ARGS);
     command.args(PEER_INBOX_ARGS);
-    command.arg("--no-session-persistence");
+    match &request.session {
+        None => command.arg("--no-session-persistence"),
+        Some(Session::Start(id)) => command.args(["--session-id", id.as_str()]),
+        Some(Session::Resume(id)) => command.args(["--resume", id.as_str()]),
+    };
     command
         .current_dir(&request.workdir)
         .stdin(Stdio::piped())
@@ -387,6 +450,15 @@ pub struct Run {
     pub permission_denials: Vec<String>,
     /// The final answer, when the request carried a JSON Schema.
     pub structured_output: Option<Value>,
+    /// The session id the `init` event reports (OWL-394).
+    pub session_id: Option<String>,
+    /// The run's context at its end: the input tokens of its last request,
+    /// uncached, read from the cache and written to it, from the last
+    /// assistant message of the main thread that reports its usage (a
+    /// subagent's, `parent_tool_use_id` set, is not the run's). What a cold
+    /// resume writes to the cache again (OWL-394); `None` when no such
+    /// message came.
+    pub context_tokens: Option<u64>,
     /// Output lines that were not JSON objects.
     pub malformed_lines: usize,
     /// Output lines longer than [`LINE_CAP`], not parsed.
@@ -532,6 +604,8 @@ pub struct Transcript {
     limit_message: bool,
     error_kind: Option<String>,
     result: Option<FinalRecord>,
+    session_id: Option<String>,
+    context_tokens: Option<u64>,
     malformed_lines: usize,
     oversized_lines: usize,
 }
@@ -568,6 +642,14 @@ impl Transcript {
                     self.limit_message |= kind == "rate_limit";
                     self.error_kind = Some(kind.to_owned());
                 }
+                let usage = &event["message"]["usage"];
+                if event["parent_tool_use_id"].is_null() && usage.is_object() {
+                    self.context_tokens = Some(
+                        count(usage, "input_tokens")
+                            .saturating_add(count(usage, "cache_read_input_tokens"))
+                            .saturating_add(count(usage, "cache_creation_input_tokens")),
+                    );
+                }
             }
             Some("result") => self.result = Some(final_record(&event)),
             _ => {}
@@ -577,6 +659,7 @@ impl Transcript {
     fn init(&mut self, event: &Value) {
         self.harness_version = str_field(event, "claude_code_version").map(str::to_owned);
         self.model = str_field(event, "model").map(str::to_owned);
+        self.session_id = str_field(event, "session_id").map(str::to_owned);
         self.permission_mode = str_field(event, "permissionMode").map(str::to_owned);
         let billing = match event.get("apiKeySource") {
             None => Billing::Unknown,
@@ -682,6 +765,8 @@ impl Transcript {
             permission_mode: self.permission_mode,
             permission_denials,
             structured_output,
+            session_id: self.session_id,
+            context_tokens: self.context_tokens,
             malformed_lines: self.malformed_lines,
             oversized_lines: self.oversized_lines,
             stderr,
@@ -779,6 +864,7 @@ mod tests {
             json_schema: None,
             max_budget_usd: None,
             bash: false,
+            session: None,
         }
     }
 
@@ -860,6 +946,99 @@ mod tests {
                 inbox()
             )
         );
+    }
+
+    /// OWL-394: a run starts a session under the id it is given, resumes
+    /// one, or keeps none, never two of these at once, and a resumed run
+    /// keeps every guardrail flag of a run that keeps none.
+    #[test]
+    fn a_session_is_started_resumed_or_not_kept() {
+        let id = SessionId::new("75744e41-7eac-4fdf-aeea-df03acb72bff").unwrap();
+        let with = |session: Option<Session>| {
+            let mut request = request(PermissionLevel::WriteWorktree);
+            request.session = session;
+            args(&request)
+        };
+        let none = with(None);
+        let started = with(Some(Session::Start(id.clone())));
+        let resumed = with(Some(Session::Resume(id.clone())));
+        let flags = ["--no-session-persistence", "--session-id", "--resume"];
+        let given = |args: &[String]| -> Vec<&str> {
+            flags
+                .into_iter()
+                .filter(|flag| args.iter().any(|arg| arg == flag))
+                .collect()
+        };
+        assert_eq!(given(&none), ["--no-session-persistence"]);
+        assert_eq!(given(&started), ["--session-id"]);
+        assert_eq!(given(&resumed), ["--resume"]);
+        assert!(started.ends_with(&["--session-id".to_owned(), id.to_string()]));
+        assert!(resumed.ends_with(&["--resume".to_owned(), id.to_string()]));
+        // Everything before the session flags is the same command.
+        assert_eq!(none[..none.len() - 1], resumed[..resumed.len() - 2]);
+        let joined = resumed.join(" ");
+        for kept in [guardrail(), skills(), inbox(), denied()] {
+            assert!(joined.contains(&kept), "{kept} missing from {joined}");
+        }
+    }
+
+    /// OWL-394: the session id comes from the `init` event, and the context
+    /// from the last assistant message of the main thread that reports its
+    /// usage, its uncached, cached and newly cached input added; a
+    /// subagent's message is not the run's.
+    #[test]
+    fn the_session_and_the_context_are_read_from_the_stream() {
+        let init = r#"{"type":"system","subtype":"init","session_id":"75744e41-7eac-4fdf-aeea-df03acb72bff","mcp_servers":[]}"#;
+        let first = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"usage":{"input_tokens":6,"cache_read_input_tokens":63854,"cache_creation_input_tokens":10,"output_tokens":5}}}"#;
+        let last = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"usage":{"input_tokens":2,"cache_read_input_tokens":100000,"cache_creation_input_tokens":18826,"output_tokens":740}}}"#;
+        let subagent = r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"usage":{"input_tokens":1,"cache_read_input_tokens":5,"cache_creation_input_tokens":0}}}"#;
+        let bare = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[]}}"#;
+        let run = replay(&[init, first, last, subagent, bare, OK], Some(0));
+        assert_eq!(
+            run.session_id.as_deref(),
+            Some("75744e41-7eac-4fdf-aeea-df03acb72bff")
+        );
+        assert_eq!(run.context_tokens, Some(118_828));
+        let run = replay(&[OK], Some(0));
+        assert_eq!((run.session_id, run.context_tokens), (None, None));
+    }
+
+    /// OWL-394: the transcript is found in the folder of the run's working
+    /// directory under `projects`, through no link.
+    #[test]
+    fn a_transcript_is_found_through_no_link() {
+        let id = SessionId::new("75744e41-7eac-4fdf-aeea-df03acb72bff").unwrap();
+        let config = tempfile::tempdir().unwrap();
+        assert_eq!(transcript_path(config.path(), &id).unwrap(), None);
+        let folder = config.path().join("projects/-work-DEMO-1");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("other.jsonl"), "{}\n").unwrap();
+        assert_eq!(transcript_path(config.path(), &id).unwrap(), None);
+        std::fs::write(folder.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        assert_eq!(
+            transcript_path(config.path(), &id).unwrap().as_deref(),
+            Some(format!("projects/-work-DEMO-1/{id}.jsonl").as_str())
+        );
+        #[cfg(unix)]
+        {
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::fs::write(elsewhere.path().join(format!("{id}.jsonl")), "secret\n").unwrap();
+            // A linked folder, then a linked file, are never followed.
+            let config = tempfile::tempdir().unwrap();
+            std::fs::create_dir(config.path().join("projects")).unwrap();
+            std::os::unix::fs::symlink(elsewhere.path(), config.path().join("projects/-work"))
+                .unwrap();
+            assert_eq!(transcript_path(config.path(), &id).unwrap(), None);
+            let config = tempfile::tempdir().unwrap();
+            let folder = config.path().join("projects/-work");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::os::unix::fs::symlink(
+                elsewhere.path().join(format!("{id}.jsonl")),
+                folder.join(format!("{id}.jsonl")),
+            )
+            .unwrap();
+            assert_eq!(transcript_path(config.path(), &id).unwrap(), None);
+        }
     }
 
     #[test]

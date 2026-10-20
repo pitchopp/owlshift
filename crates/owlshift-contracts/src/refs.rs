@@ -6,7 +6,8 @@
 //! [`DELIVERY_FILE`] (OWL-209), once the drain took it in or a run proposed a
 //! follow-up [`INTAKE_FILE`] and [`PROPOSALS_FILE`] (OWL-245), once a design
 //! or a review ran [`PLAN_FILE`] and [`REVIEW_FILE`] (OWL-300), once a write
-//! followed a run [`COST_FILE`] (OWL-378), and, later, the ticket's
+//! followed a run [`COST_FILE`] (OWL-378), once a Design or Build run asked
+//! [`SESSION_FILE`] (OWL-394), and, later, the ticket's
 //! artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
 //! checkout only; pushing it to the remote comes with claims (P7).
 
@@ -25,9 +26,9 @@ use crate::brief::{
 };
 use crate::format::{
     self, CLAIM_FORMAT, COST_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
-    TICKET_STATE_FORMAT,
+    SESSION_FORMAT, TICKET_STATE_FORMAT,
 };
-use crate::ids::{TicketId, check_name, is_commit_id};
+use crate::ids::{SessionId, TicketId, check_name, is_commit_id};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
@@ -68,6 +69,9 @@ pub const REVIEW_FILE: &str = "review.json";
 /// What the ticket's runs cost, in a ticket ref's tree once a write followed
 /// a run (OWL-378, [`TicketCost`]).
 pub const COST_FILE: &str = "cost.json";
+/// The session of the latest run that asked, in a ticket ref's tree once a
+/// Design or Build run asked (OWL-394, [`TicketSession`]).
+pub const SESSION_FILE: &str = "session.json";
 
 /// The claim ref of a ticket: `refs/owlshift/claims/<ticket>`.
 pub fn claim_ref(ticket: &TicketId) -> String {
@@ -327,6 +331,105 @@ impl TryFrom<&TicketCost> for TicketSpend {
                 "more runs without a cost than runs, or a restart past the whole spend",
             )
         })
+    }
+}
+
+/// The session of the latest run that asked, in [`SESSION_FILE`] (OWL-394,
+/// architecture section 4, "Resuming the asking run's session"): what the
+/// next run of its role at its stage needs to resume it once its questions
+/// are settled, and to count its own cost. The transcript itself stays in
+/// the run's directory, on the machine that ran it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket session")]
+pub struct TicketSession {
+    pub format: Format<SESSION_FORMAT>,
+    /// The run that asked: the name of its run directory, which keeps the
+    /// transcript.
+    #[schemars(regex(pattern = r"^[0-9A-Za-z][0-9A-Za-z_-]{0,63}$"))]
+    pub run: String,
+    /// The session the run started or resumed.
+    pub session: SessionId,
+    /// `design` or `build`.
+    pub role: Role,
+    /// The stage it ran at: Design for the design role, Build for the build
+    /// role.
+    pub stage: Stage,
+    /// What a resume must share with the run: its harness and the model it
+    /// asked for, as the harness names them.
+    #[schemars(regex(pattern = r"\S"))]
+    pub harness: String,
+    /// The ticket branch's head when the run ended.
+    #[schemars(regex(pattern = "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"))]
+    pub head: String,
+    /// When the run ended, by the runner's clock.
+    pub at: Timestamp,
+    /// The session's whole cost when the run ended, as its harness reported
+    /// it, in millionths of a dollar: a resumed run's own cost is what it
+    /// reports less this. `None` when the run reported none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+    /// The tokens of the run's last request, its context: what a cold resume
+    /// writes to the cache again. `None` when the run reported none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// The question round the run's questions opened, once one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<NonZeroU32>,
+    /// Every question of the run is decided or answered: the next run of its
+    /// role at its stage may resume the session.
+    pub settled: bool,
+}
+
+impl TicketSession {
+    const CONTRACT: &str = "ticket session";
+
+    /// Parses a `session.json`, refusing one that breaks [`Self::validate`].
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let session: Self = format::parse_json(Self::CONTRACT, SESSION_FORMAT, input)?;
+        session.validate()?;
+        Ok(session)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+
+    /// Refuses a run name that is not a plain name of a run directory, a
+    /// role other than design or build, a stage that is not its role's, a
+    /// blank harness, or a head that is not a full commit id.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let invalid = |reason: String| ContractError::invalid(Self::CONTRACT, reason);
+        let plain = self.run.len() <= 64
+            && self
+                .run
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && self
+                .run
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+        if !plain {
+            return Err(invalid(format!(
+                "run {:?} is not the name of a run directory",
+                self.run
+            )));
+        }
+        match (self.role, self.stage) {
+            (Role::Design, Stage::Design) | (Role::Build, Stage::Build) => {}
+            (role, stage) => {
+                return Err(invalid(format!(
+                    "a {} run at {stage:?} keeps no session",
+                    role.as_str()
+                )));
+            }
+        }
+        check_name(&self.harness).map_err(|why| invalid(format!("harness {why}")))?;
+        if !is_commit_id(&self.head) {
+            return Err(invalid(format!("head {:?} is not a commit id", self.head)));
+        }
+        Ok(())
     }
 }
 

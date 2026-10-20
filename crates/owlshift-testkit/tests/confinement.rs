@@ -179,6 +179,7 @@ impl Bench {
             run_dir: &self.run_dir(),
             brief,
             setup,
+            session: None,
         };
         executor.run(&spec, harness)
     }

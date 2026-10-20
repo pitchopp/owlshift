@@ -160,6 +160,18 @@ pub fn observed_line(entry: &str, content: Option<&[u8]>) -> String {
 /// millionths of a dollar (OWL-337).
 pub const COST_PREFIX: &str = "owlshift-fake-harness: cost in millionths of a dollar ";
 
+/// The variable naming the folder where the fake harness keeps its sessions
+/// (OWL-394): the executor sets it to the run's configuration folder.
+pub const FAKE_SESSION_ENV: &str = "OWLSHIFT_FAKE_SESSION_DIR";
+
+/// Where a session's transcript of the fake harness is in that folder: one
+/// line per run of the session, the session's whole cost so far in
+/// millionths of a dollar. A run of a session reports that whole cost, as
+/// a resumed Claude Code session does (C18).
+pub fn transcript_place(id: &str) -> String {
+    format!("sessions/{id}.jsonl")
+}
+
 /// The line the fake harness prints on standard error for a run's cost.
 pub fn cost_line(micros: u64) -> String {
     format!("{COST_PREFIX}{micros}")

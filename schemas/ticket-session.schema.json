@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket session",
+  "description": "The session of the latest run that asked, in [`SESSION_FILE`] (OWL-394,\narchitecture section 4, \"Resuming the asking run's session\"): what the\nnext run of its role at its stage needs to resume it once its questions\nare settled, and to count its own cost. The transcript itself stays in\nthe run's directory, on the machine that ran it.",
+  "type": "object",
+  "properties": {
+    "at": {
+      "description": "When the run ended, by the runner's clock.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "context_tokens": {
+      "description": "The tokens of the run's last request, its context: what a cold resume\nwrites to the cache again. `None` when the run reported none.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "cost_micros": {
+      "description": "The session's whole cost when the run ended, as its harness reported\nit, in millionths of a dollar: a resumed run's own cost is what it\nreports less this. `None` when the run reported none.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "harness": {
+      "description": "What a resume must share with the run: its harness and the model it\nasked for, as the harness names them.",
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "head": {
+      "description": "The ticket branch's head when the run ended.",
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "role": {
+      "description": "`design` or `build`.",
+      "$ref": "#/$defs/Role"
+    },
+    "round": {
+      "description": "The question round the run's questions opened, once one did.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
+    "run": {
+      "description": "The run that asked: the name of its run directory, which keeps the\ntranscript.",
+      "type": "string",
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z_-]{0,63}$"
+    },
+    "session": {
+      "description": "The session the run started or resumed.",
+      "$ref": "#/$defs/SessionId"
+    },
+    "settled": {
+      "description": "Every question of the run is decided or answered: the next run of its\nrole at its stage may resume the session.",
+      "type": "boolean"
+    },
+    "stage": {
+      "description": "The stage it ran at: Design for the design role, Build for the build\nrole.",
+      "$ref": "#/$defs/Stage"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "run",
+    "session",
+    "role",
+    "stage",
+    "harness",
+    "head",
+    "at",
+    "settled"
+  ],
+  "$defs": {
+    "Role": {
+      "description": "What a run executes: a stage's role, or one of the runner's helper roles.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "resolver",
+        "answer_check",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "rebase",
+        "arbiter"
+      ]
+    },
+    "SessionId": {
+      "description": "A harness session's identifier: a UUID in its lowercase text form.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "Stage": {
+      "description": "A stage of the pipeline, or `ready` for an admitted ticket not yet started.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "ready",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "deliver",
+        "watch"
+      ]
+    }
+  }
+}
