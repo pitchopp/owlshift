@@ -95,7 +95,7 @@ Owlshift picks its own work, one ticket at a time.
 **Readings and deviations** (OWL-244, 2026-10-13).
 
 - S6's "nothing new starts" at the pull request cap stops new Builds; intake goes on, since it opens no pull request and asks its questions early.
-- S3's intake records routing and dependencies; resources and zones wait for P6, as that step already says. The routing verdict is recorded and shown in P4, and followed from P5.
+- S3's intake records routing and dependencies; resources and zones wait for P6, as that step already says (declared at intake since its design, OWL-398). The routing verdict is recorded and shown in P4, and followed from P5.
 - S12's `owlshift pause` comes with the background service (P7): until then, stopping watch stops the drain. The exclusion label is P4's.
 - Admission by delegation waits: decision D8's Linear app takes no delegation scope. A label or the ready state admits.
 - A ticket left at Build by a usage limit, a failed delivery or a refused push holds the drain's one slot until watch resumes it ([architecture](architecture.md) section 5, "Which tickets"), or a person types `continue`. Watch did so with an answered round (round > 0) only (OWL-340), a Build left at round 0 needing `continue`, as P3 leaves those restarts to a person; since 2026-10-19 it does so whatever the round (OWL-367, "One step a pass"), since watch runs one stage step a pass and the drain's own tickets wait at their stage between two steps. S6's Build cut by a usage limit is resumed once the limit has reset, and a `do` typed by hand that a stop left there is picked up by a running watch too.
@@ -112,12 +112,12 @@ PR quality at least on par with the current `/parallel` workflow.
 
 **Readings and deviations** (OWL-296, 2026-10-15).
 
-- Verify reviews the diff before the pull request opens; the complete CI result stays Watch's, through P3's fix runs. Browser QA, "when declared", waits for P6, where the browser becomes a resource.
+- Verify reviews the diff before the pull request opens; the complete CI result stays Watch's, through P3's fix runs. Browser QA, "when declared", waits for P6, where the browser becomes a resource; P6 leaves it to a later step of its own (P6's readings, below).
 - S9's confirmed finding and its two review passes are P5's; a finding is confirmed by an arbiter run by default, or triaged by the author's own fix run when the project sets `pipeline.findings = "author"`.
 - Human review comments on the pull request, deferred by P3, are read from P5, from the forge accounts `[forge].reviewers` lists; P10's identity map replaces that list.
 - S8 stops on a premise the repository or its documents contradict. Intake stays without network: a premise only the outside world can check is a question. Recording the dated finding where the project keeps external facts waits for a key that names that place.
 - S17's rule that a reviewer runs on another family applies when one is available and configured. Decided by the maintainer on 2026-10-18 (OWL-347): P5's reviewers all run on Claude Code, on another model than the author's when the configuration names one, so that no second subscription is required; the Codex critic P5 first built is unwired, and a reviewer of another family comes back as an opt-in complement (OWL-348).
-- S17's routing part: the routing verdict's tier and effort are followed; the authoring roles stay on Claude Code (D4), so a verdict naming Codex for them is shown and not followed. Its fallback part, a harness at its usage limit switching to another, is P6's, as that step says.
+- S17's routing part: the routing verdict's tier and effort are followed; the authoring roles stay on Claude Code (D4), so a verdict naming Codex for them is shown and not followed. Its fallback part, a harness at its usage limit switching to another, is P6's, as that step says, for the review roles only (P6's readings, below).
 - Locary is in a Linear workspace of its own, while a machine kept one Linear key and one GitHub credential for all its projects (keychain accounts `linear` and `github`): its first tickets need secrets per project, named by the project's GitHub repository since OWL-308 ([build plan](build-plan.md), "P5 · Quality pipeline", part K).
 - Locary's first delivery (2026-10-17) showed that a fine-grained token cannot read the status check rollup watch follows. Since OWL-336 `owlshift init` signs in through Owlshift's own GitHub App with the device flow, its token kept per project under `github-app`, and a personal token is the expert option ([architecture](architecture.md), D13; [build plan](build-plan.md), "GitHub App sign-in (OWL-336)").
 
@@ -129,8 +129,22 @@ Owlshift replaces `/parallel` on Locary.
 
 - Zones and resources declared at intake; collisions checked against every ticket in flight, human work and open PRs included; `owlshift why`.
 - Machine-wide caps across projects; usage-limit detection, pause until reset, fallback harness. Scenarios S5, S10, S16, S17.
+- The rules are [architecture](architecture.md) section 5, "Parallel", and section 8, "Isolation among steps" (OWL-398), and the [build plan](build-plan.md), "P6 · Parallel", says who builds what and how the exit gate is run.
 
-**Exit gate.** A week on Locary with three concurrent tickets and no collision.
+**Readings and deviations** (OWL-398, decided with the maintainer on 2026-10-20).
+
+- One `owlshift watch --drain` per project, each step of a ticket in a child process, the machine's caps shared through files: P7's single runner is not brought forward. Section 5's "Deployment" stays P7's, and what P7 keeps of P6 is written there ("What P7 keeps").
+- S5: tickets in flight never hold conflicting resources as declared and read, against Owlshift's tickets, other open pull requests and people's tickets. Zones declared at intake are a prediction: a run's changes outside them are found once its step ends, the later ticket then waits, and a conflict is repaired by a rebase run. So two tickets can change the same folder for one step, a deviation from "never hold overlapping code zones"; the exit gate judges outcomes. The single browser slot is not taken by anything in P6 (below), and the digest that shows waits is P7's.
+- S5 and S12: a ticket a person works with neither a pull request nor a `zone:` label is not counted in flight, and is warned of in `owlshift why` and by an event. Holding the whole repository for it would stop the drain whenever a person works a ticket by hand.
+- S6: the configurable cap on concurrent runs is built (`concurrent_runs`, and `policy.max_in_flight` per project); the digest stays P7's.
+- S10: the usage part is built, a harness paused until its reset, checked before each run, the operator notified once per limit. "Its roles switch to their declared fallback" holds for the review roles only, as S17 below.
+- S16: machine-wide caps on concurrent runs and on each subscription's usage are built; an idle project costs nothing, as from P3. Priorities compared across projects wait for P7's single runner: the first watch to take a free slot runs. Port ranges and the browser slot come with browser QA.
+- S17's fallback part: a declared fallback harness takes over Design review's and Verify's reviewers only. The authoring roles stay on Claude Code (D4) and wait for the reset, and so do the arbiter, the resolver, intake and the answer check.
+- Browser QA, which P5 left here, and port ranges are a later step of their own: P6's gate is about collisions, and browser QA is a role with its own tooling. `Resource::Browser` stays modelled and untaken.
+- Path-scoped rules, which the build plan tied to zones at intake: zones arrive, but injecting a project's rules per zone needs a project-file key and brief changes no collision depends on, so they are left for a later ticket.
+- Claims with leases on git refs stay P7's, as that step says: on one machine, a lock per ticket keeps two commands off one ticket.
+
+**Exit gate.** A week on Locary with three concurrent tickets and no collision. Judged on outcomes ([build plan](build-plan.md), "P6 tasks & exit gate"): no file changed by two Owlshift pull requests in flight together, no rebase run caused by a sibling's merge on the same files, no isolation breach caused by a sibling step; the week's throughput and cost are compared with a `/parallel` lot of like size.
 
 ## P7 · Background service
 
@@ -175,7 +189,7 @@ A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, a
 | S9 | P3 (red checks and conflicts; findings and review passes in P5) |
 | S3, S4, S6, S12, S13 | P4 |
 | S8 | P5 |
-| S5, S10, S16, S17 | P6 |
+| S5, S10, S16, S17 | P6 (S17's fallback for the review roles only; S5's browser slot, S16's ports and priorities across projects later: P6's readings) |
 | S11 | P7 |
 | S15 | P9 |
 | S14 | P10 |
