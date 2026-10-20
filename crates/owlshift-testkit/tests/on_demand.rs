@@ -43,6 +43,7 @@ use owlshift_contracts::{DelegationLevel, Role, Stage};
 use owlshift_core::decider::DeciderRule;
 use owlshift_core::routing::RunRouting;
 use owlshift_core::state::{ParkReason, Status, TicketState};
+use owlshift_core::vocab::Harness as HarnessKind;
 use owlshift_core::vocab::{Effort, Tier};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{Data, EventLog, EventSink};
@@ -55,6 +56,7 @@ use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::quarantine;
 use owlshift_runner::routing::{ClaudeRouter, Router};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
+use owlshift_runner::usage::UsageStore;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_testkit::gh;
 use owlshift_testkit::git::{GitEnv, Remote, seed};
@@ -469,9 +471,20 @@ impl Harness for Routed<'_> {
     fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
         self.0.session_transcript(folder, id)
     }
+
+    /// The routed harness's usage, as the machine's usage state keeps it
+    /// (OWL-404).
+    fn usage_harness(&self) -> Option<HarnessKind> {
+        Some(self.1.harness)
+    }
 }
 
 impl Harness for Replies {
+    /// Intake and the answer check, on Claude Code (OWL-404).
+    fn usage_harness(&self) -> Option<HarnessKind> {
+        Some(HarnessKind::Claude)
+    }
+
     fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
         let needs = self.fake().sandbox_needs(agent)?;
         Ok(SandboxNeeds {
@@ -941,6 +954,9 @@ struct Bench {
     codex_unstartable: Cell<bool>,
     /// Each line the runner's notifier showed (OWL-368).
     notified: Notified,
+    /// The machine's usage state (OWL-404): the bench's data directory's,
+    /// or another bench's to play a second project on the same machine.
+    usage: RefCell<PathBuf>,
 }
 
 /// A notifier that records each line instead of showing it.
@@ -1062,8 +1078,9 @@ impl Bench {
             fail_pulls: Mutex::new(0),
             fail_files: Mutex::new(0),
         });
+        let tmp_data = tmp.path().join("data");
         Self {
-            data: tmp.path().join("data"),
+            data: tmp_data.clone(),
             tmp,
             env,
             remote,
@@ -1086,6 +1103,7 @@ impl Bench {
             codex: RefCell::new(None),
             codex_unstartable: Cell::new(false),
             notified: Notified::default(),
+            usage: RefCell::new(tmp_data.join("usage")),
         }
     }
 
@@ -1532,6 +1550,7 @@ impl Bench {
         let dirs = self.dirs();
         let remote_url = self.remote.bare.to_string_lossy().into_owned();
         let now = || self.clock.get().checked_add(self.waited.get()).unwrap();
+        let usage = UsageStore::new(self.usage.borrow().clone());
         let on_demand = OnDemand {
             executor: &executor,
             tracker: &tracker,
@@ -1553,6 +1572,7 @@ impl Bench {
             head_wait: Duration::ZERO,
             clock: &now,
             notifier: Some(&self.notified),
+            usage: &usage,
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
@@ -2058,7 +2078,9 @@ fn a_decisions_refusal_is_told_across_commands() {
         r#""decisions":[{"question":"Which file","decision":"GREETING.md","basis":"b"}],"pr":"#,
     );
     let mut limited = bench.reply(None, None);
-    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    // Already past (OWL-404): the limit cuts the run and holds its harness no
+    // longer, which the next command needs.
+    limited.usage_limit = Some("2026-10-01T18:00:00Z".parse().unwrap());
     let (stopped, printed) = bench.run(vec![bench.reply(None, Some(&decided)), limited], None);
     assert!(
         matches!(&stopped, Err(Stop::UsageLimit { .. })),
@@ -2419,7 +2441,9 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
                 vec![reply]
             }),
             |s| matches!(s, Stop::UsageLimit { resets_at: Some(_) }),
-            Some(EventKind::RunEnded),
+            // The machine's usage state keeps the limit after the run's end
+            // (OWL-404).
+            Some(EventKind::Decision),
         ),
         (
             "quarantine",
@@ -2843,6 +2867,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         head_wait: Duration::ZERO,
         clock: &on_demand::system_clock,
         notifier: None,
+        usage: &UsageStore::in_data_dir(&bench.data),
     };
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
@@ -2924,6 +2949,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         head_wait: Duration::ZERO,
         clock: &on_demand::system_clock,
         notifier: None,
+        usage: &UsageStore::in_data_dir(&bench.data),
     };
     for command in ["do", "continue"] {
         let mut out = Vec::new();
@@ -5134,7 +5160,9 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
 fn questions_all_decided_go_on_without_a_stop() {
     let bench = Bench::new(true);
     let mut limited = bench.reply(None, None);
-    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    // Already past (OWL-404): the limit cuts the run and holds its harness no
+    // longer, which the next command needs.
+    limited.usage_limit = Some("2026-10-01T18:00:00Z".parse().unwrap());
     let (outcome, printed) = bench.run(
         vec![
             bench.reply(None, Some(NAMING)),
@@ -6424,6 +6452,8 @@ fn a_ticket_without_a_ref_gets_one_at_its_first_runs_end() {
     let cost = kept.cost.expect("cost.json");
     assert_eq!((cost.runs, cost.spent_micros), (2, 2_500_000));
 
+    // The limit's reset passed (OWL-404).
+    bench.clock.set("2026-10-02T12:00:00Z".parse().unwrap());
     let (parked, printed) =
         bench.continue_ticket(vec![costed(&bench, Some("Hi"), DONE, Some(1_000_000))]);
     assert!(
@@ -9284,7 +9314,9 @@ fn a_reply_to_a_decision_starts_a_correction_run_under_watch() {
 fn a_reply_followed_before_delivery_starts_nothing_and_one_already_followed_is_reported() {
     let bench = Bench::new(true);
     let mut limited = bench.reply(None, None);
-    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    // Already past (OWL-404): the limit cuts the run and holds its harness no
+    // longer, which the next command needs.
+    limited.usage_limit = Some("2026-10-01T18:00:00Z".parse().unwrap());
     let (stopped, printed) = bench.run(
         vec![
             bench.reply(None, Some(NAMING)),
@@ -9781,7 +9813,9 @@ fn a_dependency_named_only_in_an_answer_becomes_a_relation() {
     bench.answer(answer);
 
     let mut limited = bench.reply(None, None);
-    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    // Already past (OWL-404): the limit cuts the run and holds its harness no
+    // longer, which the next command needs.
+    limited.usage_limit = Some("2026-10-01T18:00:00Z".parse().unwrap());
     let (outcome, _) = bench.continue_ticket(vec![
         bench.reply(None, Some(&check(&[("Q1", "answered", "DEMO-2.")]))),
         limited,
@@ -10894,7 +10928,10 @@ fn watch_resumes_an_intake_cut_off_after_its_answered_round() {
         "{outcomes:?}"
     );
     assert!(
-        lines.contains("no ticket is continued before the usage limit resets"),
+        lines.contains(
+            "Claude Code is at its usage limit until 2026-10-03T18:00:00Z: no step that runs it \
+             starts before then"
+        ),
         "{lines}"
     );
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
@@ -11013,7 +11050,8 @@ fn watch_holds_a_pause_until_the_reset_time_read_from_a_codex_message() {
     );
     assert!(
         lines.contains(&format!(
-            "no ticket is continued before the usage limit resets at {reset}"
+            "Claude Code is at its usage limit until {reset}: no step that runs it starts before \
+             then"
         )),
         "{lines}"
     );
@@ -11045,7 +11083,9 @@ fn a_resume_of_an_intake_is_held_and_one_shown_ready_is_left() {
         .expect_err("questions");
     bench.answer("English.");
     let mut limited = bench.reply(None, None);
-    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    // Already past (OWL-404): the limit cuts the run and holds its harness no
+    // longer, which the next command needs.
+    limited.usage_limit = Some("2026-10-01T18:00:00Z".parse().unwrap());
     let (outcome, _) = bench.continue_ticket(vec![
         bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
         limited,
@@ -11233,7 +11273,9 @@ fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
         .expect_err("questions");
     bench.answer("English.");
     let mut limited = bench.reply(None, None);
-    limited.usage_limit = Some("2026-10-03T18:00:00Z".parse().unwrap());
+    // Already past (OWL-404): the limit cuts the run and holds its harness no
+    // longer, which the next command needs.
+    limited.usage_limit = Some("2026-10-01T18:00:00Z".parse().unwrap());
     let (outcome, _) = bench.continue_ticket(vec![
         bench.reply(None, Some(&check(&[("Q1", "answered", "English.")]))),
         limited,
@@ -11286,6 +11328,10 @@ mod reversal_scenarios;
 
 #[path = "on_demand/verify_scenarios.rs"]
 mod verify_scenarios;
+
+/// Scenario S10's usage part, across two projects (OWL-404).
+#[path = "on_demand/usage_scenarios.rs"]
+mod usage_scenarios;
 
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every

@@ -806,7 +806,8 @@ fn a_pass_run_again_after_a_failed_delivery_takes_its_records_place() {
 fn a_verify_pass_cut_short_runs_again_under_continue_and_delivers() {
     let bench = Bench::verifying();
     let mut limited = bench.reply(None, None);
-    limited.usage_limit = Some("2026-10-02T15:00:00Z".parse().unwrap());
+    // Already past (OWL-404): the next command's runs start.
+    limited.usage_limit = Some("2026-10-02T08:00:00Z".parse().unwrap());
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE)), limited], None);
     assert!(
         matches!(outcome, Err(Stop::UsageLimit { .. })),

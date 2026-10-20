@@ -87,10 +87,16 @@
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
-//! continue that left the ticket ref as it was is held for [`RETRY_AFTER`],
-//! and a usage limit with a reset time holds every continue until then
+//! continue that left the ticket ref as it was is held for [`RETRY_AFTER`]
 //! ([`Holds`]), so a tracker that refuses writes does not cost an answer
-//! check every pass. A continue that left a comment on the ticket whose
+//! check every pass.
+//!
+//! Since OWL-404, a usage limit holds its harness on the whole machine, in
+//! the usage file every command reads (`crate::usage`): each pass reads it,
+//! and no step whose first run would use a limited harness starts; a step
+//! that runs no model first goes on. A step that ended at the limit holds
+//! its own ticket until the limit's end, which only matters when the usage
+//! file could not be kept. A continue that left a comment on the ticket whose
 //! state was not kept ([`Stop::NotKept`]) is held until a person acts
 //! (OWL-158, OWL-169 for a RESUME), so the comment is not posted again at
 //! each retry.
@@ -105,6 +111,7 @@ use serde_json::json;
 
 use owlshift_adapters::forge::ReviewsRead;
 use owlshift_adapters::tracker::Person;
+use owlshift_contracts::Role;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
@@ -113,7 +120,8 @@ use owlshift_core::collision::{Collision, collision};
 use owlshift_core::follow::{Action, Decision};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
-use owlshift_core::vocab::Stage;
+use owlshift_core::usage::Standing;
+use owlshift_core::vocab::{Harness, Stage};
 
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data, printable};
@@ -130,6 +138,7 @@ use crate::ticket_ref::{self, Progress, RefAt, RefRead, Stored, TicketRecord};
 use crate::writer::VisibleStage;
 
 mod drain;
+mod limits;
 mod outside;
 
 pub use drain::refusal as drain_refusal;
@@ -217,6 +226,12 @@ pub(crate) fn stage_label(stage: Stage) -> &'static str {
     }
 }
 
+/// Whether a step that ended `end` is held by its usage limit at `now`, which
+/// the usage file's line says (OWL-404): one whose reset is still ahead.
+fn usage_held(end: &StepEnd, now: Timestamp) -> bool {
+    matches!(end, StepEnd::UsageLimit { resets_at: Some(at) } if *at > now)
+}
+
 /// The line for a resume of `ticket` at `stage` that left the ticket ref as
 /// it was, held until `until`.
 fn held_text(ticket: &TicketId, stage: Stage, until: Timestamp) -> String {
@@ -259,10 +274,6 @@ pub enum Admit {
     Held {
         until: Until,
     },
-    /// The harness reached its usage limit, which resets then.
-    Paused {
-        until: Timestamp,
-    },
 }
 
 /// Until when a ticket is held, unless its decider edits a comment or its
@@ -291,7 +302,6 @@ impl Until {
 /// clock and the ticket refs.
 #[derive(Debug, Default)]
 pub struct Holds {
-    paused_until: Option<Timestamp>,
     held: HashMap<TicketId, (Seen, Until)>,
 }
 
@@ -300,12 +310,6 @@ impl Holds {
     /// another answer, or from a ticket ref whose progress has changed, is
     /// lifted; one whose ref moved by its spend alone stands (OWL-397).
     pub fn admit(&mut self, ticket: &TicketId, seen: &Seen, now: Timestamp) -> Admit {
-        if let Some(until) = self.paused_until {
-            if now < until {
-                return Admit::Paused { until };
-            }
-            self.paused_until = None;
-        }
         match self.held.get(ticket) {
             Some((held, until))
                 if held.progress == seen.progress
@@ -324,12 +328,14 @@ impl Holds {
 
     /// Records what a continue of `ticket` from `seen` did: `outcome`, then
     /// `progress`, its ticket ref's progress read after it (`None` when gone
-    /// or unreadable), at `now`. Returns the hold or the pause it set, if
-    /// any.
+    /// or unreadable), at `now`. Returns the hold it set, if any.
     ///
     /// A busy project or ticket, or no free run slot (OWL-409), ran
-    /// nothing: no hold. A usage limit with a reset time
-    /// pauses every continue until then. A comment, a RESUME included, or a
+    /// nothing: no hold. A usage limit with a reset time holds this ticket
+    /// until then, whatever its ref did (OWL-404): the usage file holds
+    /// every other step of its harness, and this hold keeps the ticket back
+    /// should that file not have been kept. A comment, a RESUME included, or
+    /// a
     /// park whose comment could not be posted, whose state was not kept
     /// ([`Stop::NotKept`]) holds the ticket until a person acts, unless the
     /// ref was read moved: an unreadable ref is no reason to post the comment
@@ -350,17 +356,11 @@ impl Holds {
         if matches!(outcome, StepEnd::Busy | StepEnd::NoSlot) {
             return None;
         }
-        if let StepEnd::UsageLimit {
-            resets_at: Some(at),
-        } = outcome
-            && *at > now
-        {
-            let until = self.paused_until.map_or(*at, |paused| paused.max(*at));
-            self.paused_until = Some(until);
-            return Some(Admit::Paused { until });
-        }
         let as_it_was = progress == Some(&seen.progress);
         let until = match outcome {
+            StepEnd::UsageLimit {
+                resets_at: Some(at),
+            } if *at > now => Until::At(*at),
             StepEnd::NotKept { .. } if as_it_was || progress.is_none() => Until::Person,
             _ if as_it_was => Until::At(now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX)),
             _ => {
@@ -381,15 +381,9 @@ impl Holds {
     /// [`Self::after`] would have set it (OWL-399): a record a predecessor
     /// left.
     pub fn restore(&mut self, ticket: &TicketId, seen: Seen, hold: &StepHold) {
-        match hold {
-            StepHold::Paused { until } => {
-                self.paused_until = Some(self.paused_until.map_or(*until, |at| at.max(*until)));
-            }
-            StepHold::Held { until } => {
-                let until = until.map_or(Until::Person, Until::At);
-                self.held.insert(ticket.clone(), (seen, until));
-            }
-        }
+        let StepHold::Held { until } = hold;
+        let until = until.map_or(Until::Person, Until::At);
+        self.held.insert(ticket.clone(), (seen, until));
     }
 }
 
@@ -406,7 +400,6 @@ pub(crate) fn hold_for(
 ) -> Option<StepHold> {
     match Holds::default().after(ticket, seen, end, progress, now)? {
         Admit::Go => None,
-        Admit::Paused { until } => Some(StepHold::Paused { until }),
         Admit::Held {
             until: Until::At(until),
         } => Some(StepHold::Held { until: Some(until) }),
@@ -496,6 +489,8 @@ struct Memory<'c> {
     /// This pass took a step after which the next pass is due at once: a
     /// stage step whose ref moved, or a holder of the slot that left it.
     stepped: bool,
+    /// Each harness's usage standing as last told (OWL-404).
+    usage: HashMap<Harness, Standing>,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -651,6 +646,8 @@ impl Watch<'_> {
             Ok(snapshot) => snapshot.refs,
             Err(project) => return self.note(memory, out, project),
         };
+        // A harness's usage limit, told when it changed (OWL-404).
+        self.read_usage(memory, sink, out);
         let mut waiting = Vec::new();
         let mut following = Vec::new();
         let mut resumable = Vec::new();
@@ -1046,6 +1043,18 @@ impl Watch<'_> {
         let failing_for_ms = seen
             .failing_for
             .map(|failing| u64::try_from(failing.as_millis()).unwrap_or(u64::MAX));
+        // A park runs no model: a usage limit never holds it (OWL-404).
+        let first = match &seen.decision {
+            Decision::Follow {
+                action: Action::Park,
+                ..
+            } => None,
+            Decision::Follow {
+                action: Action::Rebase { .. } | Action::RebaseFailed { .. },
+                ..
+            } => Some(Role::Rebase),
+            _ => Some(Role::Build),
+        };
         self.held_run(
             memory,
             sink,
@@ -1053,7 +1062,7 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            StepKind::Repair { failing_for_ms },
+            (StepKind::Repair { failing_for_ms }, first),
             None,
         );
     }
@@ -1064,7 +1073,8 @@ impl Watch<'_> {
     /// reviews watch read ([`Self::step`]): a step that found the ref moved
     /// ran nothing. Its outcome is told, then what it did is held as a
     /// continue is ([`Holds::after`]), from the ticket ref read after it.
-    /// Returns whether it ran.
+    /// A step whose first run, of `first`, has no harness for a usage limit
+    /// does not start (OWL-404). Returns whether it ran.
     #[allow(clippy::too_many_arguments)]
     fn held_run(
         &self,
@@ -1074,12 +1084,14 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         held: Seen,
-        kind: StepKind,
+        (kind, first): (StepKind, Option<Role>),
         reviews: Option<ReviewsRead>,
     ) -> bool {
         let on_demand = self.on_demand;
         let now = (on_demand.clock)();
-        if memory.holds.admit(ticket, &held, now) != Admit::Go {
+        if memory.holds.admit(ticket, &held, now) != Admit::Go
+            || self.usage_waits(memory, sink, out, first)
+        {
             return false;
         }
         let envelope = self.envelope(memory, ticket, kind, &held);
@@ -1331,7 +1343,7 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            StepKind::Review,
+            (StepKind::Review, Some(Role::Build)),
             Some(read),
         );
     }
@@ -1653,7 +1665,7 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            StepKind::Correct,
+            (StepKind::Correct, Some(Role::Build)),
             None,
         )
     }
@@ -1810,7 +1822,9 @@ impl Watch<'_> {
             stored.at(),
             answer_check::new_answer(&comments, &decider, questions),
         );
-        if memory.holds.admit(ticket, &seen, now) != Admit::Go {
+        if memory.holds.admit(ticket, &seen, now) != Admit::Go
+            || self.usage_waits(memory, sink, out, Some(Role::AnswerCheck))
+        {
             return;
         }
         // The RESUME names the ticket whose turn the slot is (OWL-367).
@@ -1850,6 +1864,8 @@ impl Watch<'_> {
             progress.as_ref(),
             holds_now,
         ) {
+            // The usage limit's own line says it (OWL-404).
+            Some(Admit::Held { .. }) if usage_held(&end, now) => {}
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(
@@ -1884,10 +1900,6 @@ impl Watch<'_> {
                     ),
                 )
             }
-            Some(Admit::Paused { until }) => self.line(
-                out,
-                &format!("no ticket is continued before the usage limit resets at {until}"),
-            ),
             Some(Admit::Go) | None => {}
         }
     }
@@ -1947,7 +1959,9 @@ impl Watch<'_> {
             }
         }
         let seen = Seen::at(at, None);
-        if memory.holds.admit(ticket, &seen, now) != Admit::Go {
+        if memory.holds.admit(ticket, &seen, now) != Admit::Go
+            || self.usage_waits(memory, sink, out, limits::resume_role(stage, stored))
+        {
             return;
         }
         let found = match on_demand.tracker.stage(ticket) {
@@ -2002,6 +2016,8 @@ impl Watch<'_> {
             progress.as_ref(),
             holds_now,
         ) {
+            // The usage limit's own line says it (OWL-404).
+            Some(Admit::Held { .. }) if usage_held(&end, now) => {}
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(out, &held_text(ticket, stage, until)),
@@ -2014,10 +2030,6 @@ impl Watch<'_> {
                      `owlshift continue` once the ticket ref can be written; watch resumes it \
                      again only once a command moves its ticket ref"
                 ),
-            ),
-            Some(Admit::Paused { until }) => self.line(
-                out,
-                &format!("no ticket is continued before the usage limit resets at {until}"),
             ),
             Some(Admit::Go) | None => {}
         }
@@ -2547,10 +2559,11 @@ mod tests {
         assert_eq!(holds.admit(&ticket, &seen("c3", 0), at(13)), Admit::Go);
     }
 
-    /// A usage limit with a reset time holds every ticket until then; one
+    /// OWL-404: a usage limit with a reset time holds its own ticket until
+    /// then, never another one: the usage file holds the harness; one
     /// without falls under the ref rule.
     #[test]
-    fn a_usage_limit_pauses_every_continue_until_it_resets() {
+    fn a_usage_limit_holds_its_own_ticket_until_it_resets() {
         let (one, two) = (
             TicketId::new("DEMO-1").unwrap(),
             TicketId::new("DEMO-2").unwrap(),
@@ -2561,11 +2574,16 @@ mod tests {
         });
         assert_eq!(
             holds.after(&one, seen("c1", 0), &end(limited), Some(&p("c1")), at(1)),
-            Some(Admit::Paused { until: at(30) })
+            Some(Admit::Held {
+                until: Until::At(at(30))
+            })
         );
+        assert_eq!(holds.admit(&two, &seen("d1", 0), at(29)), Admit::Go);
         assert_eq!(
-            holds.admit(&two, &seen("d1", 0), at(29)),
-            Admit::Paused { until: at(30) }
+            holds.admit(&one, &seen("c1", 0), at(29)),
+            Admit::Held {
+                until: Until::At(at(30))
+            }
         );
         assert_eq!(holds.admit(&one, &seen("c1", 0), at(30)), Admit::Go);
 

@@ -80,7 +80,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use jiff::Timestamp;
 
-use owlshift_adapters::harness::claude::Usage;
+use owlshift_adapters::harness::claude::{Usage, UsageWindow};
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::{Brief, GateFailure, PermissionLevel};
 use owlshift_contracts::ids::{RelativePath, SessionId};
@@ -339,6 +339,9 @@ pub struct RunReport {
     pub resumed: Option<bool>,
     /// The session's transcript, kept for a run that asked ([`KeptSession`]).
     pub session: Option<KeptSession>,
+    /// The usage windows its harness reported (OWL-404): what the
+    /// machine-wide usage state keeps.
+    pub windows: Vec<UsageWindow>,
 }
 
 /// How a run ended.
@@ -675,6 +678,7 @@ impl Executor {
                     warnings,
                     resumed: None,
                     session: None,
+                    windows: Vec::new(),
                 });
             }
             if let Some(failure) = &ran.report.failure {
@@ -933,6 +937,10 @@ impl Executor {
             exit_code: end.as_ref().and_then(|end| end.exit_code),
             usage,
             model: end.as_ref().and_then(|end| end.model.clone()),
+            windows: end
+                .as_ref()
+                .map(|end| end.windows.clone())
+                .unwrap_or_default(),
             harness_version: end.and_then(|end| end.harness_version),
             elapsed: started.elapsed(),
             wall_elapsed: wall_span(wall_started, SystemTime::now()),

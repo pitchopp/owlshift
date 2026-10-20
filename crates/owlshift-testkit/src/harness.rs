@@ -15,7 +15,9 @@ use owlshift_runner::executor::{
 
 use owlshift_adapters::harness::Usage;
 
-use crate::reply::{FAKE_SESSION_ENV, cost_usd, transcript_place, usage_limit};
+use crate::reply::{
+    FAKE_SESSION_ENV, cost_usd, transcript_place, usage_limit, usage_limit_unknown,
+};
 
 /// `owlshift-fake-harness`, playing one reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,13 +63,14 @@ impl Harness for FakeHarness {
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
         let run = drive_plain(child, log)?;
-        let status = match (
-            usage_limit(&String::from_utf8_lossy(&run.stderr)),
-            run.exit_code,
-        ) {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let status = match (usage_limit(&stderr), run.exit_code) {
             (Some(reset), _) => HarnessStatus::UsageLimit {
                 resets_at: Some(reset),
             },
+            (None, _) if usage_limit_unknown(&stderr) => {
+                HarnessStatus::UsageLimit { resets_at: None }
+            }
             (None, Some(0)) => HarnessStatus::Completed,
             (None, Some(code)) => HarnessStatus::Failed(format!("exit status {code}")),
             (None, None) => HarnessStatus::Failed("ended by a signal".to_owned()),

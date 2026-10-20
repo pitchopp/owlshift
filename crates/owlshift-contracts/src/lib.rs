@@ -18,6 +18,7 @@ pub mod result;
 pub mod review;
 pub mod schema;
 pub mod step;
+pub mod usage;
 
 pub use format::ContractError;
 pub use owlshift_core::vocab::{

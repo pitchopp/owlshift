@@ -23,6 +23,7 @@
 //! | A review pass settled: each finding's fate, where the ticket goes | [`review`] |
 //! | Who reviews, per variant, and on which model | [`roster`] |
 //! | Per-ticket routing: harness, tier and effort of each run | [`routing`] |
+//! | A harness's usage limits: windows, episodes, the probe, the effective harness | [`usage`] |
 
 pub mod agent_env;
 pub mod collision;
@@ -41,4 +42,5 @@ pub mod routing;
 pub mod schedule;
 pub mod state;
 pub mod ticket;
+pub mod usage;
 pub mod vocab;

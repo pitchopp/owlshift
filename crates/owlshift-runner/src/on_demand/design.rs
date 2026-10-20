@@ -1241,7 +1241,8 @@ impl OnDemand<'_> {
     /// failed review run, which the core parks. What every run shares stops
     /// the command as for any run: a credential within the agent's reach,
     /// the worktree, the run's files, the run directory, the project's
-    /// marker.
+    /// marker. Codex held by the machine's usage state drops the seat too,
+    /// told nothing: it stands in no ticket's way (OWL-404).
     fn codex_review_run(
         &self,
         p: &mut Prepared,
@@ -1251,21 +1252,22 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Result<(Ran, RunResult), String>, Stop> {
         self.within_budget(p, state, sink)?;
-        let ran = match self.execute_or_unstarted(
-            p,
-            self.executor,
-            (harness, &[]),
-            brief,
-            1,
-            None,
-            sink,
-        )? {
-            Ok(ran) => ran,
-            Err(ExecutorError::Command(_) | ExecutorError::Spawn(_)) => {
-                return Ok(Err("Codex's run could not start.".to_owned()));
-            }
-            Err(error) => return Err(refused("the run could not start", error)),
-        };
+        let ran =
+            match self.execute_or_unstarted(p, self.executor, (harness, &[]), brief, 1, None, sink)
+            {
+                Err(Stop::UsageLimit { resets_at }) => {
+                    let reason =
+                        codex_drop_reason(&Outcome::UsageLimit { resets_at }, Event::Interrupted);
+                    p.codex = CodexSeat::Dropped(reason.clone());
+                    return Ok(Err(reason));
+                }
+                Err(stop) => return Err(stop),
+                Ok(Ok(ran)) => ran,
+                Ok(Err(ExecutorError::Command(_) | ExecutorError::Spawn(_))) => {
+                    return Ok(Err("Codex's run could not start.".to_owned()));
+                }
+                Ok(Err(error)) => return Err(refused("the run could not start", error)),
+            };
         let event = if ran.breaches.is_empty() {
             stage_event(&ran.report.outcome, brief).0
         } else {

@@ -111,6 +111,10 @@ impl fmt::Display for CodexRefusal {
 impl std::error::Error for CodexRefusal {}
 
 impl Harness for CodexHarness {
+    fn usage_harness(&self) -> Option<owlshift_core::vocab::Harness> {
+        Some(owlshift_core::vocab::Harness::Codex)
+    }
+
     fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         let files = run_files(run)?;
         let schema = files.join(SCHEMA_FILE);

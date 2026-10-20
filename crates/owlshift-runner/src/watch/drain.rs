@@ -17,8 +17,10 @@
 //! = `waits`) and one line; a gesture that does not admit is one `warning`
 //! event (`not_admitted`) and one line per ticket and account, and the ticket
 //! is tried again after [`RETRY_AFTER`]. An intake or a dispatch is held as
-//! a continue is, in watch's own [`Holds`](super::Holds), so a usage limit
-//! anywhere pauses both.
+//! a continue is, in watch's own [`Holds`](super::Holds). Neither starts
+//! while the harness its first run needs is held by a usage limit, which
+//! the machine's usage state says (OWL-404): the drain then takes nothing in
+//! and dispatches nothing.
 //!
 //! The open pull request cap (OWL-251, part H): the pull requests counted
 //! are the ticket refs whose delivery is still followed, whatever their
@@ -37,12 +39,12 @@ use jiff::Timestamp;
 use serde_json::json;
 
 use owlshift_adapters::tracker::{Column, Error, ErrorKind, Listed, StateType};
-use owlshift_contracts::Variant;
 use owlshift_contracts::config::{Admit as Gesture, ProjectConfig};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::EndedWhy;
 use owlshift_contracts::step::{StepEnd, StepKind};
+use owlshift_contracts::{Role, Variant};
 use owlshift_core::resource::{self, Held as HeldSet, NamedResources};
 use owlshift_core::schedule::{self, Caps, Load, Wait, natural_cmp};
 use owlshift_core::state::{Status, TicketState};
@@ -255,14 +257,6 @@ fn said(wait: &Wait<String>, exclude: Option<&str>, kinds: &HashMap<String, Kind
     }
 }
 
-/// Where the pass's intake left the drain.
-enum Intake {
-    /// No intake ran, or one ran on this ticket.
-    Done(Option<TicketId>),
-    /// A usage limit pauses every run: nothing is dispatched either.
-    Paused,
-}
-
 impl Watch<'_> {
     /// The drain's part of a pass, after watch's own work.
     pub(super) fn drain(
@@ -352,10 +346,7 @@ impl Watch<'_> {
         let taken = if quarantined {
             None
         } else {
-            match self.take_in(memory, &rows, sink, out, continued) {
-                Intake::Done(taken) => taken,
-                Intake::Paused => return,
-            }
+            self.take_in(memory, &rows, sink, out, continued)
         };
         let exclude = tracker.exclude.as_deref();
         // The project's named resources, by which a zone or a file holds
@@ -531,7 +522,8 @@ impl Watch<'_> {
     }
 
     /// The pass's intake: the first candidate, in the core's order, that its
-    /// gesture admits and no hold keeps back.
+    /// gesture admits and no hold keeps back. Returns the ticket it ran on,
+    /// if any.
     fn take_in(
         &self,
         memory: &mut WatchMemory,
@@ -539,7 +531,7 @@ impl Watch<'_> {
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
-    ) -> Intake {
+    ) -> Option<TicketId> {
         let on_demand = self.on_demand;
         let exclude = on_demand.config.tracker.exclude.as_deref();
         for row in rows.iter().filter(|row| row.intake_due(exclude)) {
@@ -555,27 +547,30 @@ impl Watch<'_> {
             }
             let at = row.stored.as_ref().map_or_else(RefAt::none, Stored::at);
             let seen = Seen::at(at, None);
-            match memory.holds.admit(ticket, &seen, now) {
-                Admit::Go => {}
-                Admit::Held { .. } => continue,
-                Admit::Paused { .. } => return Intake::Paused,
+            if memory.holds.admit(ticket, &seen, now) != Admit::Go {
+                continue;
+            }
+            // Intake's harness held by a usage limit holds every intake
+            // (OWL-404).
+            if self.usage_waits(memory, sink, out, Some(Role::Intake)) {
+                return None;
             }
             let envelope = self.envelope(memory, ticket, StepKind::Intake, &seen);
             match self.step(memory, sink, out, continued, envelope, None) {
                 // The ref moved, or the ticket left the column: the next
                 // pass reads it again.
-                StepEnd::Stale => return Intake::Done(None),
+                StepEnd::Stale => return None,
                 StepEnd::NotAdmitted { account, reason } => {
                     self.not_admitted(memory, ticket, account, &reason, sink, out);
                 }
                 end => {
                     memory.drain.warned.remove(ticket);
                     self.ran(memory, ticket, seen, &end, sink, out);
-                    return Intake::Done(Some(ticket.clone()));
+                    return Some(ticket.clone());
                 }
             }
         }
-        Intake::Done(None)
+        None
     }
 
     /// The dispatch of `ticket`, its ref at `at`, held as a continue is.
@@ -590,7 +585,11 @@ impl Watch<'_> {
     ) {
         let on_demand = self.on_demand;
         let seen = Seen::at(at, None);
-        if memory.holds.admit(ticket, &seen, (on_demand.clock)()) != Admit::Go {
+        // A dispatch's first run, Design or Build, an authoring role's on
+        // Claude Code, waits for its usage limit (OWL-404).
+        if memory.holds.admit(ticket, &seen, (on_demand.clock)()) != Admit::Go
+            || self.usage_waits(memory, sink, out, Some(Role::Build))
+        {
             return;
         }
         let envelope = self.envelope(memory, ticket, StepKind::Dispatch, &seen);

@@ -45,6 +45,7 @@ use owlshift_runner::routing::{ClaudeRouter, CodexRouter, claude_model};
 use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::system::System;
+use owlshift_runner::usage::UsageStore;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
 use owlshift_runner::{forge, secrets, tracker};
 
@@ -336,6 +337,9 @@ fn run_with(
         .then(|| DesktopNotifier::for_this_machine(system))
         .flatten();
     let desktop = desktop.as_ref().map(|d| d as &dyn Notifier);
+    // Every project's commands on this machine share each harness's usage
+    // state (OWL-404).
+    let usage = UsageStore::in_data_dir(&data_dir);
     let on_demand = OnDemand {
         executor: &executor,
         tracker: tracker.as_ref(),
@@ -356,8 +360,10 @@ fn run_with(
         head_wait: HEAD_WAIT,
         clock: &on_demand::system_clock,
         // The quarantine's notification, sent as its marker is written
-        // (OWL-368); the others are `report`'s.
+        // (OWL-368), and a usage limit's, once per outage (OWL-404); the
+        // others are `report`'s.
         notifier: desktop,
+        usage: &usage,
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);

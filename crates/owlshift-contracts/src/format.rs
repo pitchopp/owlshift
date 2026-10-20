@@ -121,11 +121,16 @@ pub const HELD_FORMAT: u32 = 1;
 pub const STEP_ENVELOPE_FORMAT: u32 = 1;
 /// The format version of a step's outcome record (`outcome-<attempt>.json`
 /// in a ticket's folder, OWL-399). Format 2 adds the `no_slot` end
-/// (OWL-409); format 1 is still read.
-pub const STEP_OUTCOME_FORMAT: u32 = 2;
+/// (OWL-409); format 3 drops the `paused` hold, a usage limit holding its
+/// harness machine-wide instead (OWL-404). Formats 1 and 2 are still read, a
+/// `paused` hold read as none.
+pub const STEP_OUTCOME_FORMAT: u32 = 3;
 /// The format version of what a step carries to the next (`carry.json` in a
 /// ticket's folder, OWL-399).
 pub const CARRY_FORMAT: u32 = 1;
+/// The format version of a harness's usage state on one machine
+/// (`<data>/usage/<harness>.json`, OWL-404).
+pub const USAGE_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

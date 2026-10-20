@@ -2228,15 +2228,15 @@ fn watch_resumes_design_review_build_and_verify_cut_off_after_a_round() {
 }
 
 /// OWL-340, a usage limit met again by the resume. With a reset still ahead,
-/// every continue is paused until it: the next pass starts no harness and
-/// reads no stage, and a pass after the reset resumes. With a reset already
-/// past, nothing pauses: the resume is held ten minutes like any continue
-/// that left the ref as it was.
+/// the harness is held until it on the whole machine (OWL-404): no pass
+/// starts the resume or reads its stage, and a pass after the reset resumes.
+/// With a reset already past, nothing holds: the resume meets the limit
+/// again and is held ten minutes like any continue that left the ref as it
+/// was.
 #[test]
 fn a_resume_meeting_the_usage_limit_again_waits_for_its_reset_or_ten_minutes() {
     // A reset ahead.
-    let (bench, mut replies) = cut_off_at(Stage::Build, FAR_AHEAD);
-    replies.insert(0, bench.limited_until(FAR_AHEAD));
+    let (bench, replies) = cut_off_at(Stage::Build, FAR_AHEAD);
     let (mut ran, mut reads) = (0, 0);
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
@@ -2259,11 +2259,14 @@ fn a_resume_meeting_the_usage_limit_again_waits_for_its_reset_or_ten_minutes() {
         true
     });
     assert!(
-        matches!(&outcomes[..], [Err(Stop::UsageLimit { .. }), Ok(_)]),
+        matches!(&outcomes[..], [Ok(_)]),
         "{outcomes:?}\n{lines}\n{printed}"
     );
-    assert!(lines.contains("no ticket is continued before the usage limit resets"));
-    assert_eq!(bench.watch_resumes(), ["build", "build"]);
+    assert!(lines.contains(
+        "Claude Code is at its usage limit until 2026-10-03T18:00:00Z: no step that runs it starts \
+         before then"
+    ));
+    assert_eq!(bench.watch_resumes(), ["build"]);
 
     // A reset already past.
     let (bench, mut replies) = cut_off_at(Stage::Build, LONG_PAST);

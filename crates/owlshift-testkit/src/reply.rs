@@ -6,7 +6,8 @@
 //! commits them (`commit`, dated `date`); writes files in the main checkout
 //! (`main_checkout`); copies a prepared `result.json`, valid or not, to the
 //! brief's result path (`result`); prints `stdout` and `stderr`, then the
-//! usage-limit line if `usage_limit` is set and the cost line if `cost_micros`
+//! usage-limit line if `usage_limit` is set, or the one without a reset time
+//! if `usage_limit_unknown` is (OWL-404), and the cost line if `cost_micros`
 //! is (OWL-337); and exits with `exit_code`, 0
 //! by default or 1 with a usage limit. `switch_branch` and `main_checkout`
 //! break isolation on purpose.
@@ -25,6 +26,10 @@ pub const OWN_FAILURE: i32 = 2;
 
 /// The start of the line that reports a usage limit, on standard error.
 pub const USAGE_LIMIT_PREFIX: &str = "owlshift-fake-harness: usage limit reached · resets ";
+
+/// The line that reports a usage limit with no reset time, on standard error
+/// (OWL-404).
+pub const USAGE_LIMIT_UNKNOWN: &str = "owlshift-fake-harness: usage limit reached, no reset time";
 
 /// One run of the fake harness.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +75,10 @@ pub struct Reply {
     /// A usage limit reached, with its reset time: no result is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_limit: Option<Timestamp>,
+    /// A usage limit reached with no reset time (OWL-404): no result is
+    /// written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_limit_unknown: bool,
     /// The cost the run reports, in millionths of a dollar (OWL-337): the
     /// fake harness prints it on standard error, and [`crate::harness::FakeHarness`]
     /// reports it as the run's usage, as Claude Code reports its own.
@@ -126,18 +135,27 @@ impl Reply {
             RelativePath::new(path)
                 .map_err(|e| format!("invalid reply: `observe` entry {entry:?}: {e}"))?;
         }
-        if self.usage_limit.is_some() && self.result.is_some() {
+        if self.limited() && self.result.is_some() {
             return Err(
                 "invalid reply: a run stopped by a usage limit leaves no `result`".to_owned(),
+            );
+        }
+        if self.usage_limit.is_some() && self.usage_limit_unknown {
+            return Err(
+                "invalid reply: a usage limit has a reset time or none, not both".to_owned(),
             );
         }
         Ok(())
     }
 
+    /// Whether the run stops at a usage limit.
+    fn limited(&self) -> bool {
+        self.usage_limit.is_some() || self.usage_limit_unknown
+    }
+
     /// The exit status: `exit_code`, else 1 with a usage limit and 0 without.
     pub fn exit_code(&self) -> i32 {
-        self.exit_code
-            .unwrap_or(if self.usage_limit.is_some() { 1 } else { 0 })
+        self.exit_code.unwrap_or(if self.limited() { 1 } else { 0 })
     }
 }
 
@@ -196,6 +214,11 @@ pub fn usage_limit(stderr: &str) -> Option<Timestamp> {
     stderr
         .lines()
         .find_map(|line| line.strip_prefix(USAGE_LIMIT_PREFIX)?.trim().parse().ok())
+}
+
+/// Whether a run reported a usage limit with no reset time.
+pub fn usage_limit_unknown(stderr: &str) -> bool {
+    stderr.lines().any(|line| line == USAGE_LIMIT_UNKNOWN)
 }
 
 #[cfg(test)]
