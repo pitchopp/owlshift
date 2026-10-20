@@ -824,7 +824,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
 }
 
 /// The build role's `done`, as a prepared result.
-const DONE: &str = r#"{"format":12,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+const DONE: &str = r#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
 
 impl Bench {
     /// The fake harness playing `reply`, its prepared result `DONE`.

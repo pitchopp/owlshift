@@ -78,7 +78,7 @@ const PYTHON: Fixture = Fixture {
     missing: ".venv/bin/python",
 };
 
-const DONE: &str = r#"{"format":12,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+const DONE: &str = r#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

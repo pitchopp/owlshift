@@ -367,7 +367,7 @@ fn a_declared_cache_is_read_and_never_written() {
     bench.run(bench.agent(), CACHE_PROBE).unwrap();
     assert_eq!(lines()[0], "read=1", "without the cache: {:?}", lines());
 
-    let done = r#"{"format":12,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+    let done = r#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
     let script = format!("{CACHE_PROBE}\nprintf '%s' '{done}' > \"$1\"\n");
     let mut brief = brief();
     brief.gate = CACHE_GATE.iter().map(|line| (*line).to_owned()).collect();
@@ -1118,6 +1118,7 @@ impl Bench {
                 base: "origin/main",
                 run_dir: &run_dir,
                 commands: &commands,
+                setup: &[],
             })
             .unwrap()
     }
