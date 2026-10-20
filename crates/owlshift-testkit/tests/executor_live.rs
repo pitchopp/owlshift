@@ -449,7 +449,7 @@ fn run_live_seeded(
     let runner = env.clone();
     let executor = Executor {
         git: Git::with_setup("git", move |command| runner.apply(command)),
-        agent: AgentEnv::from_runner(&[], &[]).unwrap(),
+        agent: AgentEnv::from_runner(&[], &[], &[]).unwrap(),
         forge_hosts: vec!["github.com".into()],
         timeout: Duration::from_secs(300),
         gate_timeout: Duration::from_secs(300),
@@ -516,6 +516,7 @@ fn run_live_seeded(
         base: "origin/main",
         run_dir: &paths.root.join("run"),
         brief: &brief,
+        setup: &[],
     };
     let report = executor.run(&spec, &harness).unwrap();
     Live {

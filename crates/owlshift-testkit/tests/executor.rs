@@ -16,6 +16,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use owlshift_contracts::Role;
+use owlshift_contracts::brief::GateFailure;
 use owlshift_contracts::brief::{
     Author, Brief, PermissionLevel, Permissions, RebaseBrief, Relation, TicketBrief,
 };
@@ -25,10 +26,13 @@ use owlshift_platform::keychain::Secret;
 use owlshift_runner::agent_env::{AgentEnv, CredentialFinding};
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
-    Executor, ExecutorError, Failure, Git, Harness, HarnessEnd, HarnessError, HarnessLogin,
-    HarnessRun, HarnessStatus, Outcome, RunLog, RunReport, RunSpec, SandboxNeeds, Violation,
+    Executor, ExecutorError, Failure, GateReport, Git, Harness, HarnessEnd, HarnessError,
+    HarnessLogin, HarnessRun, HarnessStatus, Outcome, RunLog, RunReport, RunSpec, SETUP_LOG,
+    SandboxNeeds, Violation,
 };
 use owlshift_testkit::git::{GitEnv, seed};
+use owlshift_testkit::harness::FakeHarness;
+use owlshift_testkit::reply::Reply;
 
 const BRANCH: &str = "owlshift/T-1";
 
@@ -151,6 +155,7 @@ impl Bench {
             base: "origin/main",
             run_dir: &self.tmp.path().join("run"),
             brief,
+            setup: &[],
         };
         executor.run(&spec, harness)
     }
@@ -169,6 +174,7 @@ impl Bench {
             base,
             run_dir: &self.tmp.path().join("run"),
             brief: &self.brief,
+            setup: &[],
         };
         self.executor
             .run(&spec, &NeverRuns)
@@ -817,6 +823,66 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
     }
 }
 
+/// The build role's `done`, as a prepared result.
+const DONE: &str = r#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+
+impl Bench {
+    /// The fake harness playing `reply`, its prepared result `DONE`.
+    fn fake(&self, mut reply: Reply) -> FakeHarness {
+        let replies = self.tmp.path().join("replies");
+        fs::create_dir_all(&replies).unwrap();
+        let done = replies.join("done.json");
+        fs::write(&done, DONE).unwrap();
+        reply.result = Some(done);
+        let path = replies.join("reply.toml");
+        fs::write(&path, reply.render()).unwrap();
+        FakeHarness {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
+            reply: path,
+            readable: Vec::new(),
+        }
+    }
+
+    /// What the fake harness observed in the last run.
+    fn observed(&self) -> String {
+        fs::read_to_string(self.worktree.join(".owlshift/run/observed.txt")).unwrap()
+    }
+}
+
+/// OWL-330: the fake harness writes what it observes, a committed file, a
+/// missing one and a missing file of its temporary folder, in order, into
+/// the run's own folder, which git ignores, so the gate after its `done`
+/// finds the worktree clean.
+#[test]
+fn the_fake_harness_observes_the_worktree_and_its_temporary_folder() {
+    let bench = Bench::new();
+    let harness = bench.fake(Reply {
+        observe: vec![
+            "README.md".to_owned(),
+            "missing.txt".to_owned(),
+            "$TMPDIR/none".to_owned(),
+        ],
+        observe_into: Some(RelativePath::new(".owlshift/run/observed.txt").unwrap()),
+        ..Reply::default()
+    });
+    let mut brief = bench.brief.clone();
+    brief.gate = vec!["git status --porcelain".to_owned()];
+    let report = bench.run_with(&bench.executor, &harness, &brief).unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Finished { .. }),
+        "{:?}",
+        report.outcome
+    );
+    assert!(
+        report.gate.as_ref().is_some_and(|gate| gate.passed()),
+        "{report:?}"
+    );
+    assert_eq!(
+        bench.observed(),
+        "README.md=hello\nmissing.txt absent\n$TMPDIR/none absent\n"
+    );
+}
+
 /// OWL-369: a run that amends a commit its branch held at the start is
 /// quarantined, its valid result notwithstanding, and the breach names the
 /// rewrite.
@@ -1081,4 +1147,404 @@ fn a_branch_without_a_worktree_moves_and_a_missing_one_is_left() {
     bench.start(&base).unwrap();
     assert_eq!(bench.branch_head(), base);
     assert!(!bench.worktree.exists());
+}
+
+/// OWL-330: the project's setup before a Build's harness and in its gate.
+mod setup {
+    use super::*;
+
+    /// A harness that leaves a mark in the run's own files, out of git, and
+    /// no result.
+    const MARKS: &str = "echo ran > .owlshift/run/harness-ran";
+
+    /// `unix`, or `windows` where the setup and the gate run through `cmd`,
+    /// which expands `%TMPDIR%` and not `$TMPDIR`. A line both shells run
+    /// alike needs neither: `&&` rather than `;`.
+    fn by_shell(unix: &'static str, windows: &'static str) -> &'static str {
+        if cfg!(windows) { windows } else { unix }
+    }
+
+    /// `text` with the line ends `cmd`'s `echo` writes made `\n`.
+    fn lf(text: String) -> String {
+        text.replace("\r\n", "\n")
+    }
+
+    impl Bench {
+        /// A run of `harness` with `setup`, from `base`.
+        fn run_set_up(
+            &self,
+            executor: &Executor,
+            harness: &dyn Harness,
+            brief: &Brief,
+            setup: &[&str],
+            base: &str,
+        ) -> RunReport {
+            let setup: Vec<String> = setup.iter().map(|line| (*line).to_owned()).collect();
+            let spec = RunSpec {
+                main: &self.main,
+                worktree: &self.worktree,
+                branch: BRANCH,
+                base,
+                run_dir: &self.tmp.path().join("run"),
+                brief,
+                setup: &setup,
+            };
+            executor.run(&spec, harness).unwrap()
+        }
+
+        /// A Build run of the marking harness with `setup`.
+        fn build_set_up(&self, setup: &[&str], base: &str) -> RunReport {
+            self.run_set_up(
+                &self.executor,
+                &Script(MARKS.to_owned()),
+                &self.brief,
+                setup,
+                base,
+            )
+        }
+
+        fn harness_ran(&self) -> bool {
+            self.worktree.join(".owlshift/run/harness-ran").exists()
+        }
+
+        fn worktree_brief(&self) -> String {
+            fs::read_to_string(self.worktree.join(".owlshift/run/brief.json")).unwrap()
+        }
+
+        /// A commit of the branch's own in the worktree, writing `files`.
+        fn own_commit(&self, files: &[(&str, &str)]) {
+            for (path, text) in files {
+                fs::write(self.worktree.join(path), text).unwrap();
+            }
+            let mut add = vec!["add", "--"];
+            add.extend(files.iter().map(|(path, _)| *path));
+            self.env.run(&self.worktree, &add).unwrap();
+            self.env
+                .run(
+                    &self.worktree,
+                    &["commit", "--quiet", "--allow-empty", "-m", "own"],
+                )
+                .unwrap();
+        }
+
+        /// `origin/main` moved to a new commit, as a fetch moves it.
+        fn origin_ahead(&self) -> String {
+            let ahead = self.new_base(&[("other.txt", "other\n")]);
+            self.env
+                .run(
+                    &self.main,
+                    &["update-ref", "refs/remotes/origin/main", &ahead],
+                )
+                .unwrap();
+            ahead
+        }
+    }
+
+    /// The setup failed and the harness never started.
+    fn failed_before_the_harness(bench: &Bench, report: &RunReport) -> GateFailure {
+        let Outcome::Failed(Failure::Setup(failure)) = &report.outcome else {
+            panic!("{:?}", report.outcome);
+        };
+        assert!(!bench.harness_ran(), "the harness ran");
+        assert!(report.exit_code.is_none() && report.usage.is_none());
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(!bench.worktree_brief().contains("gate_failure"));
+        (**failure).clone()
+    }
+
+    /// A red setup on a worktree with no work of the Build's own ends the
+    /// run before the harness, whether the base is a full id or
+    /// `origin/main`, and whether the kept branch sits at the base or at an
+    /// older one the remote has moved past; once the branch holds a commit
+    /// of its own, the same setup lets the harness start, told.
+    #[test]
+    fn a_red_setup_fails_a_pristine_worktree_and_tells_a_resumed_build() {
+        for by_name in [false, true] {
+            let bench = Bench::new();
+            let base = |bench: &Bench| {
+                if by_name {
+                    "origin/main".to_owned()
+                } else {
+                    bench.commit("refs/remotes/origin/main")
+                }
+            };
+            let report = bench.build_set_up(&["echo partial && exit 1"], &base(&bench));
+            let failure = failed_before_the_harness(&bench, &report);
+            assert_eq!(failure.command.as_deref(), Some("echo partial && exit 1"));
+            assert_eq!(failure.reason, "setup: exit status 1");
+            assert!(failure.output.contains("partial"));
+            assert!(bench.tmp.path().join("run").join(SETUP_LOG).exists());
+            assert_eq!(report.setup.as_ref().unwrap().setup.len(), 1);
+
+            // The kept branch, with no commit of its own, behind the base.
+            bench.origin_ahead();
+            let report = bench.build_set_up(&["exit 1"], &base(&bench));
+            failed_before_the_harness(&bench, &report);
+
+            bench.own_commit(&[("own.txt", "own\n")]);
+            let report = bench.build_set_up(&["exit 1"], &base(&bench));
+            assert!(bench.harness_ran(), "{report:?}");
+            assert_eq!(
+                report.warnings,
+                ["the project setup failed before the harness: exit 1"]
+            );
+            assert!(
+                bench.worktree_brief().contains("setup: exit status 1"),
+                "{}",
+                bench.worktree_brief()
+            );
+        }
+    }
+
+    /// A setup that breaks isolation quarantines the run before the harness,
+    /// whatever its exit status: a branch made, a hook written.
+    #[test]
+    fn a_setup_that_breaks_isolation_is_quarantined_before_the_harness() {
+        for setup in [
+            "git branch other && exit 1",
+            "git branch other",
+            by_shell(
+                "echo 'touch hooked' > \"$(git rev-parse --git-common-dir)/hooks/post-checkout\"",
+                // The main checkout's, beside the worktree.
+                "echo touch hooked> ..\\checkout\\.git\\hooks\\post-checkout",
+            ),
+        ] {
+            let bench = Bench::new();
+            let base = bench.commit("refs/remotes/origin/main");
+            let report = bench.build_set_up(&[setup], &base);
+            assert!(
+                matches!(report.outcome, Outcome::Quarantined(_)),
+                "{setup}: {:?}",
+                report.outcome
+            );
+            assert!(!bench.harness_ran(), "{setup}");
+        }
+    }
+
+    /// What the setup leaves in the run's temporary folder is the
+    /// harness's and the gate's, and the gate runs the setup again.
+    #[test]
+    fn the_setup_shares_the_runs_temporary_folder_and_runs_again_in_the_gate() {
+        let bench = Bench::new();
+        let base = bench.commit("refs/remotes/origin/main");
+        let harness = bench.fake(Reply {
+            observe: vec!["$TMPDIR/x".to_owned(), ".owlshift/run/count".to_owned()],
+            observe_into: Some(RelativePath::new(".owlshift/run/observed.txt").unwrap()),
+            ..Reply::default()
+        });
+        let mut brief = bench.brief.clone();
+        brief.gate = vec![
+            by_shell(
+                "test \"$(cat \"$TMPDIR/x\")\" = set",
+                "findstr set \"%TMPDIR%\\x\"",
+            )
+            .to_owned(),
+        ];
+        let report = bench.run_set_up(
+            &bench.executor,
+            &harness,
+            &brief,
+            &[
+                by_shell("echo set > \"$TMPDIR/x\"", "echo set> \"%TMPDIR%\\x\""),
+                "echo ran>> .owlshift/run/count",
+            ],
+            &base,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Finished { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.setup.as_ref().is_some_and(GateReport::passed));
+        let gate = report.gate.as_ref().unwrap();
+        assert!(gate.passed(), "{gate:?}");
+        assert_eq!(gate.setup.len(), 2);
+        assert_eq!(
+            lf(bench.observed()),
+            "$TMPDIR/x=set\n.owlshift/run/count=ran\n"
+        );
+        assert_eq!(
+            lf(fs::read_to_string(bench.worktree.join(".owlshift/run/count")).unwrap()),
+            "ran\nran\n"
+        );
+    }
+
+    /// A resumed Build's unfinished work, tracked, staged and untracked,
+    /// comes out of a setup as it went in, and its harness starts.
+    #[test]
+    fn a_resumed_builds_unfinished_work_survives_the_setup() {
+        let bench = Bench::new();
+        let base = bench.commit("refs/remotes/origin/main");
+        bench.kept();
+        fs::write(bench.worktree.join("README.md"), "edited\n").unwrap();
+        fs::write(bench.worktree.join("staged.txt"), "staged\n").unwrap();
+        bench
+            .env
+            .run(&bench.worktree, &["add", "staged.txt"])
+            .unwrap();
+        fs::write(bench.worktree.join("new.txt"), "new\n").unwrap();
+        let setup = by_shell(
+            "echo set up > \"$TMPDIR/x\"",
+            "echo set up> \"%TMPDIR%\\x\"",
+        );
+        let report = bench.build_set_up(&[setup], &base);
+        assert!(bench.harness_ran(), "{report:?}");
+        assert!(report.setup.as_ref().is_some_and(GateReport::passed));
+        let read = |path: &str| fs::read_to_string(bench.worktree.join(path)).unwrap();
+        assert_eq!(
+            (read("README.md"), read("staged.txt"), read("new.txt")),
+            ("edited\n".into(), "staged\n".into(), "new\n".into())
+        );
+    }
+
+    /// A Build that broke its setup script in an earlier run is told by its
+    /// brief, repairs it and passes the gate; a script stopped at the
+    /// setup's deadline, a third of the gate's and not of the run's, is
+    /// told the same way.
+    #[test]
+    fn a_build_that_broke_its_setup_repairs_it() {
+        for (script, said) in [
+            ("exit 1\n", "setup: exit status 1"),
+            (
+                "sleep 20\n",
+                "setup: stopped at the setup's deadline, a third of the gate's, 1 s",
+            ),
+        ] {
+            let bench = Bench::new();
+            let base = bench.commit("refs/remotes/origin/main");
+            bench.kept();
+            bench.own_commit(&[("setup.sh", script)]);
+            let executor = Executor {
+                gate_timeout: Duration::from_secs(3),
+                ..bench.executor.clone()
+            };
+            let mut files = std::collections::BTreeMap::new();
+            files.insert(RelativePath::new("setup.sh").unwrap(), "true\n".to_owned());
+            let harness = bench.fake(Reply {
+                observe: vec![".owlshift/run/brief.json".to_owned()],
+                observe_into: Some(RelativePath::new(".owlshift/run/observed.txt").unwrap()),
+                files,
+                commit: Some("Repair the setup".to_owned()),
+                ..Reply::default()
+            });
+            let mut brief = bench.brief.clone();
+            brief.gate = vec!["true".to_owned()];
+            let report = bench.run_set_up(&executor, &harness, &brief, &["sh setup.sh"], &base);
+            assert!(
+                matches!(report.outcome, Outcome::Finished { .. }),
+                "{script}: {:?}",
+                report.outcome
+            );
+            assert_eq!(
+                report.warnings,
+                ["the project setup failed before the harness: sh setup.sh"]
+            );
+            assert!(bench.observed().contains(said), "{}", bench.observed());
+            let gate = report.gate.as_ref().unwrap();
+            assert!(gate.passed() && gate.setup.len() == 1, "{gate:?}");
+        }
+    }
+
+    /// A setup that fails for something other than its command's own
+    /// failure fails a resumed Build too: one that changes the work, one
+    /// whose log cannot be written, one whose process kept the output open
+    /// past the setup's deadline, a third of the gate's 6 s. The last leaves
+    /// its process group with `setpgrp`, which Windows has not.
+    #[test]
+    fn a_setup_failure_a_build_cannot_repair_fails_the_run() {
+        let cases: &[&str] = if cfg!(unix) {
+            &["changes", "log", "holds"]
+        } else {
+            &["changes", "log"]
+        };
+        for &case in cases {
+            let bench = Bench::new();
+            let base = bench.commit("refs/remotes/origin/main");
+            bench.kept();
+            bench.own_commit(&[("own.txt", "own\n")]);
+            let setup = match case {
+                "changes" => "echo changed > README.md && exit 1",
+                "log" => {
+                    fs::create_dir_all(bench.tmp.path().join("run").join(SETUP_LOG)).unwrap();
+                    "exit 1"
+                }
+                // Out of the tree's group before the shell ends, so stopping
+                // the tree does not stop it.
+                _ => "perl -e 'setpgrp(0, 0); sleep 8' & sleep 0.5; exit 1",
+            };
+            let executor = Executor {
+                gate_timeout: Duration::from_secs(6),
+                ..bench.executor.clone()
+            };
+            let harness = Script(MARKS.to_owned());
+            let report = bench.run_set_up(&executor, &harness, &bench.brief, &[setup], &base);
+            let failure = failed_before_the_harness(&bench, &report);
+            match case {
+                "changes" => assert_eq!(
+                    failure.reason,
+                    "the setup changed unfinished work: README.md"
+                ),
+                "log" => assert!(
+                    failure
+                        .reason
+                        .starts_with("the runner could not write the setup log"),
+                    "{failure:?}"
+                ),
+                _ => assert_eq!(failure.reason, "setup: exit status 1"),
+            }
+        }
+    }
+
+    /// A rebase runs no setup before its harness, but its gate does; a
+    /// role other than Build or rebase runs none at all.
+    #[test]
+    fn only_a_builds_harness_waits_for_the_setup() {
+        let bench = Bench::new();
+        let onto = bench.commit("refs/remotes/origin/main");
+        let mut brief = bench.brief.clone();
+        brief.role = Role::Rebase;
+        brief.gate = vec!["true".to_owned()];
+        brief.rebase = Some(RebaseBrief {
+            pull_request: 1,
+            url: "https://github.com/demo/project/pull/1".into(),
+            branch: BRANCH.into(),
+            head: onto.clone(),
+            base_branch: "main".into(),
+            onto: onto.clone(),
+            refresh: false,
+            conflicting: Vec::new(),
+        });
+        let harness = bench.fake(Reply {
+            observe: vec![".owlshift/run/count".to_owned()],
+            observe_into: Some(RelativePath::new(".owlshift/run/observed.txt").unwrap()),
+            ..Reply::default()
+        });
+        let count = ["echo ran>> .owlshift/run/count"];
+        let report = bench.run_set_up(&bench.executor, &harness, &brief, &count, &onto);
+        assert!(
+            matches!(report.outcome, Outcome::Finished { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.setup.is_none());
+        assert_eq!(bench.observed(), ".owlshift/run/count absent\n");
+        assert!(report.gate.as_ref().is_some_and(GateReport::passed));
+        assert_eq!(
+            lf(fs::read_to_string(bench.worktree.join(".owlshift/run/count")).unwrap()),
+            "ran\n"
+        );
+
+        let bench = Bench::new();
+        let base = bench.commit("refs/remotes/origin/main");
+        let brief = bench.read_only_brief();
+        let report = bench.run_set_up(
+            &bench.executor,
+            &Script(MARKS.to_owned()),
+            &brief,
+            &count,
+            &base,
+        );
+        assert!(report.setup.is_none() && report.gate.is_none());
+        assert!(!bench.worktree.join(".owlshift/run/count").exists());
+    }
 }

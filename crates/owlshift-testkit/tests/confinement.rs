@@ -152,6 +152,17 @@ impl Bench {
         harness: &dyn Harness,
         brief: &Brief,
     ) -> Result<RunReport, ExecutorError> {
+        self.run_set_up(agent, harness, brief, &[])
+    }
+
+    /// A run with the project's `setup` (OWL-330).
+    fn run_set_up(
+        &self,
+        agent: AgentEnv,
+        harness: &dyn Harness,
+        brief: &Brief,
+        setup: &[String],
+    ) -> Result<RunReport, ExecutorError> {
         let runner = self.env.clone();
         let executor = Executor {
             git: Git::with_setup("git", move |command| runner.apply(command)),
@@ -167,6 +178,7 @@ impl Bench {
             base: "origin/main",
             run_dir: &self.run_dir(),
             brief,
+            setup,
         };
         executor.run(&spec, harness)
     }
@@ -305,6 +317,121 @@ fn a_confined_run_and_its_descendants_reach_no_planted_secret() {
         "{:?}",
         report.outcome
     );
+}
+
+/// What the cache probe of OWL-330 reads and writes, its lines in the run's
+/// own files, out of git: the harness's view of a declared cache and of a
+/// home folder beside it.
+#[cfg(unix)]
+const CACHE_PROBE: &str = r#"
+probe=.owlshift/run/probe.txt
+cat "$HOME/Library/pnpm/store/pkg" > .owlshift/run/cache.txt 2>/dev/null; echo "read=$?" > $probe
+touch "$HOME/Library/pnpm/store/planted" 2>/dev/null; echo "write=$?" >> $probe
+cat "$HOME/Library/other/file" > /dev/null 2>&1; echo "sibling=$?" >> $probe
+"#;
+
+/// The gate's view of the same folders: it passes only when the cache reads
+/// and neither the write nor the sibling's read succeeds.
+#[cfg(unix)]
+const CACHE_GATE: [&str; 3] = [
+    "grep -q CACHED_owl330 \"$HOME/Library/pnpm/store/pkg\"",
+    "! touch \"$HOME/Library/pnpm/store/planted-by-gate\" 2>/dev/null",
+    "! cat \"$HOME/Library/other/file\" > /dev/null 2>&1",
+];
+
+/// OWL-330: a cache the project declares and the operator allows is read by
+/// the harness and by the gate, never written; a folder of the home beside
+/// it stays closed. Without the cache the harness reads nothing there.
+#[cfg(unix)]
+#[test]
+fn a_declared_cache_is_read_and_never_written() {
+    let bench = Bench::new();
+    let home = bench.tmp.path().join("home");
+    let store = home.join("Library/pnpm/store");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("pkg"), "CACHED_owl330\n").unwrap();
+    fs::create_dir_all(home.join("Library/other")).unwrap();
+    fs::write(home.join("Library/other/file"), "FAKE_owl330\n").unwrap();
+    let agent = bench.agent().with_caches(&["Library/pnpm"]);
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let lines = || {
+        fs::read_to_string(bench.worktree.join(".owlshift/run/probe.txt"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    bench.run(bench.agent(), CACHE_PROBE).unwrap();
+    assert_eq!(lines()[0], "read=1", "without the cache: {:?}", lines());
+
+    let done = r#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+    let script = format!("{CACHE_PROBE}\nprintf '%s' '{done}' > \"$1\"\n");
+    let mut brief = brief();
+    brief.gate = CACHE_GATE.iter().map(|line| (*line).to_owned()).collect();
+    let harness = Script {
+        line: script,
+        login: None,
+        temp_variable: None,
+        read_only: false,
+    };
+    let report = bench.run_brief(agent, &harness, &brief).unwrap();
+    let probe = lines();
+    assert_eq!(probe[0], "read=0", "{probe:?}");
+    assert!(
+        !probe[1].ends_with("=0") && !probe[2].ends_with("=0"),
+        "{probe:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(bench.worktree.join(".owlshift/run/cache.txt")).unwrap(),
+        "CACHED_owl330\n"
+    );
+    let gate = report.gate.as_ref().expect("the gate ran after the done");
+    assert!(gate.passed(), "{gate:?}");
+    assert!(!store.join("planted").exists() && !store.join("planted-by-gate").exists());
+}
+
+/// OWL-330: a setup command that writes into a declared cache is refused by
+/// the sandbox, so the setup of a Build on a pristine worktree fails the
+/// run before its harness, naming that command.
+#[cfg(unix)]
+#[test]
+fn a_setup_command_cannot_write_into_a_declared_cache() {
+    use owlshift_runner::executor::{Failure, Outcome};
+    let bench = Bench::new();
+    let store = bench.tmp.path().join("home/Library/pnpm/store");
+    fs::create_dir_all(&store).unwrap();
+    let agent = bench.agent().with_caches(&["Library/pnpm"]);
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let write = "touch \"$HOME/Library/pnpm/store/x\"".to_owned();
+    let harness = Script {
+        line: "echo ran > .owlshift/run/harness-ran".to_owned(),
+        login: None,
+        temp_variable: None,
+        read_only: false,
+    };
+    let report = bench
+        .run_set_up(
+            agent,
+            &harness,
+            &brief(),
+            &["true".to_owned(), write.clone()],
+        )
+        .unwrap();
+    let Outcome::Failed(Failure::Setup(failure)) = &report.outcome else {
+        panic!("{:?}", report.outcome);
+    };
+    assert_eq!(failure.command.as_deref(), Some(write.as_str()));
+    assert!(
+        failure.reason.starts_with("setup: exit status"),
+        "{failure:?}"
+    );
+    assert!(!store.join("x").exists());
+    assert!(!bench.worktree.join(".owlshift/run/harness-ran").exists());
 }
 
 /// The token of OWL-94's bench test, made up.
@@ -991,6 +1118,7 @@ impl Bench {
                 base: "origin/main",
                 run_dir: &run_dir,
                 commands: &commands,
+                setup: &[],
             })
             .unwrap()
     }

@@ -135,7 +135,16 @@ fn run_with(
     // The personal file is valid here; were it not, no name would be allowed.
     // The names are those allowed for the repository this run delivers to.
     let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
-    let agent = AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed)
+    // The caches declared, as far as the operator allows them for this
+    // repository: the load refused any other (OWL-330).
+    let allowed_caches = config.allowed_caches(Some(&repo)).unwrap_or_default();
+    let caches: Vec<&str> = project
+        .stack
+        .cache_folders()
+        .into_iter()
+        .filter(|cache| allowed_caches.contains(cache))
+        .collect();
+    let agent = AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed, &caches)
         .map_err(|error| format!("the agent environment: {error}"))?;
 
     // From here on, the credentials: the runner's own, never an agent's.

@@ -1,6 +1,7 @@
 //! What the fake harness does in one run: its reply file, in TOML.
 //!
-//! The fake harness acts in this order: it waits (`delay_ms`); creates and
+//! The fake harness acts in this order: it waits (`delay_ms`); writes what
+//! it observes (`observe`, into `observe_into`, OWL-330); creates and
 //! switches to another branch (`switch_branch`); writes files (`files`) and
 //! commits them (`commit`, dated `date`); writes files in the main checkout
 //! (`main_checkout`); copies a prepared `result.json`, valid or not, to the
@@ -32,6 +33,17 @@ pub struct Reply {
     /// How long to wait before anything else, in milliseconds.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub delay_ms: u64,
+    /// Files to look at before any other step (OWL-330): each a path in the
+    /// worktree, or `$TMPDIR/` and a path in the run's temporary folder.
+    /// What each holds is written to `observe_into`, one line each, in
+    /// order: `<entry>=<content>`, the content read as UTF-8 with its last
+    /// newline dropped and every other written `\n`, or `<entry> absent`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observe: Vec<String>,
+    /// Where in the worktree the observation goes, such as
+    /// `.owlshift/run/observed.txt`, which the run folder keeps out of git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observe_into: Option<RelativePath>,
     /// Files to write in the worktree, by path relative to it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<RelativePath, String>,
@@ -106,6 +118,14 @@ impl Reply {
         {
             return Err("invalid reply: `switch_branch` is not a branch name".to_owned());
         }
+        if self.observe.is_empty() != self.observe_into.is_none() {
+            return Err("invalid reply: `observe` and `observe_into` go together".to_owned());
+        }
+        for entry in &self.observe {
+            let path = entry.strip_prefix(TMPDIR_PREFIX).unwrap_or(entry);
+            RelativePath::new(path)
+                .map_err(|e| format!("invalid reply: `observe` entry {entry:?}: {e}"))?;
+        }
         if self.usage_limit.is_some() && self.result.is_some() {
             return Err(
                 "invalid reply: a run stopped by a usage limit leaves no `result`".to_owned(),
@@ -118,6 +138,21 @@ impl Reply {
     pub fn exit_code(&self) -> i32 {
         self.exit_code
             .unwrap_or(if self.usage_limit.is_some() { 1 } else { 0 })
+    }
+}
+
+/// The start of an `observe` entry in the run's temporary folder.
+pub const TMPDIR_PREFIX: &str = "$TMPDIR/";
+
+/// One line of an observation: what `entry` holds, `None` when absent.
+pub fn observed_line(entry: &str, content: Option<&[u8]>) -> String {
+    match content {
+        Some(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            format!("{entry}={}", text.replace('\n', "\\n"))
+        }
+        None => format!("{entry} absent"),
     }
 }
 
@@ -179,6 +214,31 @@ mod tests {
         let stderr = format!("working\n{}\n", usage_limit_line(reset));
         assert_eq!(usage_limit(&stderr), Some(reset));
         assert_eq!(usage_limit("working\n"), None);
+    }
+
+    /// OWL-330: what a reply observes round-trips; an entry outside the
+    /// worktree or the temporary folder, or one key without the other, is
+    /// refused.
+    #[test]
+    fn an_observation_is_checked_and_its_lines_are_one_per_entry() {
+        let reply = Reply::parse(
+            "observe = [\"$TMPDIR/x\", \"node_modules/.marker\"]\n\
+             observe_into = \".owlshift/run/observed.txt\"\n",
+        )
+        .unwrap();
+        assert_eq!(reply.observe, ["$TMPDIR/x", "node_modules/.marker"]);
+        assert_eq!(Reply::parse(&reply.render()).unwrap(), reply);
+        for refused in [
+            "observe = [\"x\"]\n",
+            "observe_into = \"o.txt\"\n",
+            "observe = [\"../x\"]\nobserve_into = \"o.txt\"\n",
+            "observe = [\"$TMPDIR/../x\"]\nobserve_into = \"o.txt\"\n",
+            "observe = [\"/x\"]\nobserve_into = \"o.txt\"\n",
+        ] {
+            assert!(Reply::parse(refused).is_err(), "{refused}");
+        }
+        assert_eq!(observed_line("a", Some(b"one\ntwo\n")), "a=one\\ntwo");
+        assert_eq!(observed_line("a", None), "a absent");
     }
 
     /// OWL-337: the cost a reply sets is printed and read back in dollars.

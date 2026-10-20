@@ -72,12 +72,19 @@ pub struct Plan {
     pub name: String,
     pub source: Source,
     pub commands: Vec<String>,
+    /// The project's setup, run before the commands (OWL-330), from the same
+    /// project file.
+    pub setup: Vec<String>,
     /// The gate log.
     pub log: PathBuf,
     /// The names the commit's `stack.gate_env` declares, when they differ
     /// from those the agent environment passes, the operator's: a Build
     /// warns of it too (`gate_env_differs`).
     pub gate_env_differs: Option<Vec<String>>,
+    /// The folders the commit's `stack.caches` declares, when they differ
+    /// from those the agent environment opens, the operator's file's: a
+    /// Build warns of it too (`caches_differ`, OWL-330).
+    pub caches_differ: Option<Vec<String>>,
 }
 
 impl fmt::Display for Plan {
@@ -92,6 +99,12 @@ impl fmt::Display for Plan {
             short(&self.commit),
             self.name
         )?;
+        if !self.setup.is_empty() {
+            writeln!(f, "  after its setup:")?;
+            for command in &self.setup {
+                writeln!(f, "    {command}")?;
+            }
+        }
         for command in &self.commands {
             writeln!(f, "  {command}")?;
         }
@@ -103,8 +116,23 @@ impl fmt::Display for Plan {
                 declared.join(", ")
             )?;
         }
+        if let Some(declared) = &self.caches_differ {
+            writeln!(
+                f,
+                "Note: the commit's stack.caches declares [{}]; the gate reads the caches \
+                 your owlshift.toml declares, as a Build's does.",
+                declared.join(", ")
+            )?;
+        }
         writeln!(f, "Its whole output goes to {}.", self.log.display())
     }
+}
+
+/// `declared`, sorted, when it differs from `passed` once both are sorted.
+fn differs(mut declared: Vec<&str>, mut passed: Vec<&str>) -> Option<Vec<String>> {
+    declared.sort_unstable();
+    passed.sort_unstable();
+    (declared != passed).then(|| declared.iter().map(|n| (*n).to_owned()).collect())
 }
 
 /// What `owlshift gate` came to.
@@ -243,15 +271,22 @@ impl GateOnce<'_> {
         passed.sort_unstable();
         let gate_env_differs =
             (declared != passed).then(|| declared.iter().map(|n| (*n).to_owned()).collect());
+        let caches_differ = differs(
+            config.stack.cache_folders(),
+            self.local.stack.cache_folders(),
+        );
         let commands = config.stack.gate.clone();
+        let setup = config.stack.setup.clone();
         let run_dir = run_dir(dirs);
         let plan = Plan {
             commit,
             name,
             source,
             commands,
+            setup,
             log: run_dir.join(GATE_LOG),
             gate_env_differs,
+            caches_differ,
         };
         let checked = |run, marker, warnings| Checked {
             plan: plan.clone(),
@@ -282,6 +317,7 @@ impl GateOnce<'_> {
             base: &plan.commit,
             run_dir: &run_dir,
             commands: &plan.commands,
+            setup: &plan.setup,
         };
         let discard = || executor.discard_worktree(&checkout, &worktree, GATE_BRANCH);
         let run = match executor.run_gate(&spec) {
@@ -335,8 +371,14 @@ pub fn render(checked: &Checked) -> String {
         return out;
     };
     let report = &run.report;
-    for step in &report.steps {
-        out.push_str(&format!("$ {}\n", step.command));
+    for (step, setup) in report
+        .setup
+        .iter()
+        .map(|step| (step, true))
+        .chain(report.steps.iter().map(|step| (step, false)))
+    {
+        let kind = if setup { "setup " } else { "" };
+        out.push_str(&format!("{kind}$ {}\n", step.command));
         let lines: Vec<&str> = step.output.lines().collect();
         let shown = &lines[lines.len().saturating_sub(TAIL_LINES)..];
         if step.truncated || shown.len() < lines.len() {
@@ -472,7 +514,17 @@ mod tests {
 
     impl Bench {
         fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
+            Self::with_root(tempfile::tempdir().unwrap())
+        }
+
+        /// A bench whose data directory lies under `/tmp`, as one that
+        /// `OWLSHIFT_DATA_DIR` puts there, whatever the system temp folder.
+        #[cfg(unix)]
+        fn under_tmp() -> Self {
+            Self::with_root(tempfile::tempdir_in("/tmp").unwrap())
+        }
+
+        fn with_root(tmp: tempfile::TempDir) -> Self {
             // Resolved on Unix, where macOS's temporary folder is a link; not
             // on Windows, where it would take the `\\?\` form git cannot read
             // a configuration file through.
@@ -736,14 +788,123 @@ mod tests {
         assert!(!bench.left_over());
     }
 
+    /// OWL-330: `owlshift gate` runs the commit's setup before its gate, in
+    /// the same temporary folder, lists it first and fails on a red one; a
+    /// setup alone is no gate.
+    #[test]
+    fn the_gate_runs_the_setup_first_and_fails_on_a_red_one() {
+        let bench = Bench::new();
+        let with = |gate: &str, setup: &str| project_file(&format!("{gate}]\nsetup = [{setup}"));
+        // `cmd`'s on Windows, which expands `%TMPDIR%` and not `$TMPDIR`.
+        let (gate, setup) = if cfg!(windows) {
+            (r#"type "%TMPDIR%\x""#, r#"type nul > "%TMPDIR%\x""#)
+        } else {
+            (r#"test -f "$TMPDIR/x""#, r#"touch "$TMPDIR/x""#)
+        };
+        let literal = |line: &str| format!("'{line}'");
+        bench.push("main", Some(&with(&literal(gate), &literal(setup))));
+        bench.push(
+            "red",
+            Some(&with(r#""echo never""#, r#""echo partial && exit 4""#)),
+        );
+        bench.push("alone", Some(&with("", r#""true""#)));
+        let executor = bench.executor(bench.agent().without_confinement());
+
+        let mut told = None;
+        let origin = bench.origin.to_string_lossy().into_owned();
+        let green = GateOnce {
+            executor: &executor,
+            dirs: &bench.dirs,
+            remote_url: &origin,
+            local: &local_config(&["true"]),
+            at: None,
+        }
+        .run(&mut |plan| told = Some(plan.clone()))
+        .unwrap();
+        assert!(green.passed(), "{}", render(&green));
+        let told = told.unwrap();
+        assert_eq!(told.setup, [setup]);
+        let shown = told.to_string();
+        let setup_at = shown.find("after its setup:").unwrap();
+        assert!(setup_at < shown.find(gate).unwrap(), "{shown}");
+        let text = render(&green);
+        let setup_at = text.find(&format!("setup $ {setup}")).unwrap();
+        assert!(
+            setup_at < text.find(&format!("$ {gate}")).unwrap(),
+            "{text}"
+        );
+
+        let red = bench.gate(&executor, &[], Some("origin/red")).unwrap();
+        assert!(!red.passed());
+        let report = &red.run.as_ref().unwrap().report;
+        let failure = report.failure.as_ref().unwrap();
+        assert_eq!(failure.command.as_deref(), Some("echo partial && exit 4"));
+        assert_eq!(failure.reason, "setup: exit status 4");
+        assert!(report.steps.is_empty());
+        assert!(
+            render(&red).contains("Gate red: `echo partial && exit 4`: setup: exit status 4."),
+            "{}",
+            render(&red)
+        );
+
+        let alone = bench.gate(&executor, &[], Some("origin/alone")).unwrap();
+        assert!(alone.passed() && alone.run.is_none(), "{alone:?}");
+        assert!(!bench.left_over());
+    }
+
+    /// OWL-330: a commit whose `stack.caches` differ from the operator's file
+    /// is noted, as a Build warns of it (`caches_differ`): the gate reads the
+    /// caches the operator's file declares.
+    #[test]
+    fn caches_that_differ_from_the_operators_file_are_noted() {
+        let bench = Bench::new();
+        bench.push(
+            "main",
+            Some(&project_file("\"true\"]\ncaches = [\"Library/pnpm\"")),
+        );
+        let executor = bench.executor(bench.agent().without_confinement());
+        let checked = bench.gate(&executor, &["true"], None).unwrap();
+        assert!(checked.passed(), "{}", render(&checked));
+        assert_eq!(
+            checked.plan.caches_differ,
+            Some(vec!["Library/pnpm".to_owned()])
+        );
+        assert!(
+            checked.plan.to_string().contains(
+                "Note: the commit's stack.caches declares [Library/pnpm]; the gate reads the \
+                 caches your owlshift.toml declares"
+            ),
+            "{}",
+            checked.plan
+        );
+        bench.push("main", Some(&project_file("\"true\"")));
+        let checked = bench.gate(&executor, &["true"], None).unwrap();
+        assert_eq!(checked.plan.caches_differ, None);
+    }
+
     /// Confined as a Build's gate: the home's files and the gate log are out
     /// of reach, `TMPDIR` is the run's own folder, and what one command
-    /// leaves there is seen by the next exactly as in a Build: not under
-    /// bwrap, which makes a folder in `/tmp` anew for each command, but on
-    /// macOS, where the folder itself is opened.
+    /// leaves there is seen by the next exactly as in a Build, on Linux as on
+    /// macOS: bwrap binds the folder itself, even inside its private `/tmp`
+    /// (OWL-330).
     #[cfg(unix)]
     #[test]
     fn the_gate_is_confined_as_a_builds() {
+        confined_as_a_builds(Bench::new);
+    }
+
+    /// The same with the data directory, and so the worktree and the gate
+    /// log, under `/tmp`, as `OWLSHIFT_DATA_DIR` may put them: inside the
+    /// private `/tmp` bwrap mounts, into which the run's folders are bound
+    /// back (OWL-330).
+    #[cfg(unix)]
+    #[test]
+    fn the_gate_is_confined_as_a_builds_with_its_data_under_tmp() {
+        confined_as_a_builds(Bench::under_tmp);
+    }
+
+    #[cfg(unix)]
+    fn confined_as_a_builds(bench: fn() -> Bench) {
         if let Err(error) = owlshift_platform::sandbox::available() {
             assert!(
                 std::env::var_os("OWLSHIFT_REQUIRE_CONFINEMENT").is_none(),
@@ -752,7 +913,7 @@ mod tests {
             eprintln!("skipped: agent runs cannot be confined here: {error}");
             return;
         }
-        let bench = Bench::new();
+        let bench = bench();
         bench.push("main", None);
         std::fs::write(bench.root.join("home/secret.txt"), "FAKE_owl329\n").unwrap();
         let log = run_dir(&bench.dirs).join(GATE_LOG);
@@ -777,16 +938,7 @@ mod tests {
             "{}",
             steps[0].output
         );
-        let under_bwrap_tmp = cfg!(target_os = "linux")
-            && std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .starts_with("/tmp");
-        assert_eq!(
-            steps[1].output.contains("probe"),
-            !under_bwrap_tmp,
-            "{}",
-            steps[1].output
-        );
+        assert!(steps[1].output.contains("probe"), "{}", steps[1].output);
     }
 
     /// Native Windows has no sandbox (D9): refused before anything is made.

@@ -108,6 +108,7 @@ impl Effective {
         };
         let mut effective = Self { project, personal };
         effective.check_gate_env(system);
+        effective.check_caches(system);
         effective
     }
 
@@ -123,6 +124,45 @@ impl Effective {
             FileState::Loaded { config, .. } => Some(config.allow_gate_env_names(key.as_deref())),
             FileState::Absent(_) | FileState::NotApplicable(_) => Some(Vec::new()),
             FileState::Unavailable(_) | FileState::Invalid { .. } => None,
+        }
+    }
+
+    /// The cache folders the operator lets a project of `repository` open
+    /// read-only to its agents: the personal `allow_caches`, and that of the
+    /// repository's entry (OWL-330), as for [`Effective::allowed_gate_env`].
+    pub fn allowed_caches(&self, repository: Option<&Repo>) -> Option<Vec<&str>> {
+        let key = repository.map(repository_key);
+        match &self.personal {
+            FileState::Loaded { config, .. } => Some(config.allow_caches_names(key.as_deref())),
+            FileState::Absent(_) | FileState::NotApplicable(_) => Some(Vec::new()),
+            FileState::Unavailable(_) | FileState::Invalid { .. } => None,
+        }
+    }
+
+    /// Refuses, as invalid, a project that declares a cache folder the
+    /// operator does not allow for this repository (OWL-330), as
+    /// [`Effective::check_gate_env`] refuses a variable: no run and no gate
+    /// starts with it. A project already invalid is left as it is.
+    fn check_caches(&mut self, system: &dyn System) {
+        let FileState::Loaded { path, config, .. } = &self.project else {
+            return;
+        };
+        if config.stack.caches.is_empty() {
+            return;
+        }
+        let repository = origin_repo(system, path.parent().unwrap_or(path));
+        let Some(allowed) = self.allowed_caches(repository.as_ref().ok()) else {
+            return;
+        };
+        if let Err(error) = config.check_caches(&allowed) {
+            let note = match &repository {
+                Ok(repo) => format!("this repository is {}", repository_key(repo)),
+                Err(reason) => format!("folders scoped to a repository do not apply: {reason}"),
+            };
+            self.project = FileState::Invalid {
+                path: path.clone(),
+                error: format!("{error}; {note}"),
+            };
         }
     }
 
@@ -517,6 +557,66 @@ mod tests {
         // An invalid personal file makes the configuration invalid on its own.
         fs::write(&personal, "allow_gate_env = \"DATABASE_URL\"\n").unwrap();
         assert!(!load().is_valid());
+    }
+
+    /// OWL-330: a project that declares a cache folder the operator does not
+    /// allow for its repository is refused when the configuration is loaded,
+    /// naming `allow_caches`; listed for that repository it loads, and listed
+    /// for another it is refused again.
+    #[test]
+    fn a_declared_cache_needs_the_operators_allowance_for_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaring = PROJECT.replace(
+            "gate = [\"cargo test\"]",
+            "gate = [\"cargo test\"]\ncaches = [\"Library/pnpm\"]",
+        );
+        fs::write(dir.path().join(PROJECT_FILE), declaring).unwrap();
+        let personal = dir.path().join("personal.toml");
+        let load = || {
+            let system = repository_from(
+                dir.path(),
+                Answer::Exit(0, "git@github.com:acme/api.git\n", ""),
+            );
+            Effective::load(&system, dir.path(), Some(personal.clone()))
+        };
+        let refusal = |effective: Effective| match effective.project {
+            FileState::Invalid { error, .. } => error,
+            _ => panic!("{effective}"),
+        };
+
+        let error = refusal(load());
+        assert!(
+            error.starts_with(
+                "invalid owlshift.toml: stack.caches: \"Library/pnpm\" may not be read by an agent"
+            ) && error.contains("`allow_caches`")
+                && error.ends_with("; this repository is github.com/acme/api"),
+            "{error}"
+        );
+
+        fs::write(
+            &personal,
+            "[repositories.\"github.com/acme/api\"]\nallow_caches = [\"Library/pnpm\"]\n",
+        )
+        .unwrap();
+        let effective = load();
+        assert!(effective.is_valid(), "{effective}");
+        let api = Repo::parse("acme/api").unwrap();
+        let web = Repo::parse("acme/web").unwrap();
+        assert_eq!(
+            effective.allowed_caches(Some(&api)),
+            Some(vec!["Library/pnpm"])
+        );
+        assert_eq!(effective.allowed_caches(Some(&web)), Some(vec![]));
+
+        fs::write(
+            &personal,
+            "[repositories.\"github.com/acme/web\"]\nallow_caches = [\"Library/pnpm\"]\n",
+        )
+        .unwrap();
+        assert!(refusal(load()).contains("`allow_caches`"));
+
+        fs::write(&personal, "allow_caches = [\"Library/pnpm\"]\n").unwrap();
+        assert!(load().is_valid());
     }
 
     /// OWL-75's acceptance: a name the operator allows for one repository

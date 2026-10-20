@@ -16,7 +16,9 @@ use std::time::Duration;
 use clap::Parser;
 use owlshift_contracts::brief::Brief;
 use owlshift_contracts::ids::RelativePath;
-use owlshift_testkit::reply::{OWN_FAILURE, Reply, cost_line, usage_limit_line};
+use owlshift_testkit::reply::{
+    OWN_FAILURE, Reply, TMPDIR_PREFIX, cost_line, observed_line, usage_limit_line,
+};
 
 /// Plays one scripted run in the current directory, the worktree.
 #[derive(Parser)]
@@ -50,6 +52,28 @@ fn play(args: &Args) -> Result<i32, String> {
     let worktree = std::env::current_dir().map_err(|e| format!("current directory: {e}"))?;
 
     thread::sleep(Duration::from_millis(reply.delay_ms));
+
+    if let Some(into) = &reply.observe_into {
+        let mut lines = String::new();
+        for entry in &reply.observe {
+            let path = match entry.strip_prefix(TMPDIR_PREFIX) {
+                Some(rest) => PathBuf::from(
+                    std::env::var_os("TMPDIR")
+                        .ok_or_else(|| format!("{entry}: TMPDIR is not set"))?,
+                )
+                .join(rest),
+                None => worktree.join(entry),
+            };
+            let content = match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            lines.push_str(&observed_line(entry, content.as_deref()));
+            lines.push('\n');
+        }
+        write(&worktree.join(into.as_str()), lines.as_bytes())?;
+    }
 
     if let Some(branch) = &reply.switch_branch {
         git(&["switch", "--quiet", "-c", branch], None)?;

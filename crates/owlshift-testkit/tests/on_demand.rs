@@ -8012,7 +8012,9 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
     let delivered_events = bench.events().len();
     let first_push = bench.remote_branch().unwrap();
     // The merge also adds a gate command only the rebased code passes: the
-    // rebase run takes the gate of the base it rebases onto (OWL-331).
+    // rebase run takes the gate of the base it rebases onto (OWL-331). It
+    // adds a setup too, which the runner's gate runs, never the rebase's
+    // harness (OWL-330): it counts its runs in the run's own files.
     let config = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let onto_gate = [
         "git grep -q Hello -- GREETING.md",
@@ -8020,20 +8022,29 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
     ];
     let gated = config.replace(
         GATE_LINE,
-        &format!("gate = [\"{}\", \"{}\"]", onto_gate[0], onto_gate[1]),
+        &format!(
+            "gate = [\"{}\", \"{}\"]\nsetup = [\"echo ran >> .owlshift/run/setup-runs\"]",
+            onto_gate[0], onto_gate[1]
+        ),
     );
+    let setup_runs = bench.worktree().join(".owlshift/run/setup-runs");
     let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED), ("owlshift.toml", &gated)]);
     bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
-    let (outcome, printed) = bench.continue_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![rebase_in(
-            &bench,
-            main.clone(),
-            vec![("AGENTS.md", AGENTS_RESOLVED)],
-        )],
+    let (_, rebase) = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_RESOLVED)]);
+    let before_harness = setup_runs.clone();
+    let rebase_unset: During = (
+        1,
+        Box::new(move || {
+            assert!(!before_harness.exists(), "the setup ran before the rebase");
+            rebase();
+        }),
     );
+    let (outcome, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED))], vec![rebase_unset]);
     let delivered = outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(!delivered.opened);
+    // The gate after the rebase ran the new base's setup, once.
+    assert_eq!(fs::read_to_string(&setup_runs).unwrap(), "ran\n");
     // Working while the rebase run worked, review once pushed (OWL-259).
     assert_eq!(stage_moves(&bench, delivered_events), ["working", "review"]);
     assert_eq!(bench.stage(), "In Review");

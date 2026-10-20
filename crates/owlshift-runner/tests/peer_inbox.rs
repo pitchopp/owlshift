@@ -30,7 +30,7 @@ fn inbox(agent: &AgentEnv) -> (Option<&OsStr>, usize) {
 #[test]
 fn the_runner_switches_claude_codes_inbox_off() {
     let (name, value) = PEER_INBOX_ENV;
-    let agent = AgentEnv::from_runner(&[], &[]).unwrap();
+    let agent = AgentEnv::from_runner(&[], &[], &[]).unwrap();
     assert_eq!(inbox(&agent), (Some(OsStr::new(value)), 1));
 
     // The command the executor spawns carries it, whatever the harness's own
@@ -92,13 +92,13 @@ fn helper_reports_the_agent_value() {
     let (name, _) = PEER_INBOX_ENV;
     assert_eq!(std::env::var(name).as_deref(), Ok("1"));
     assert_eq!(
-        AgentEnv::from_runner(&[name], &[name]),
+        AgentEnv::from_runner(&[name], &[name], &[]),
         Err(AgentEnvError::Harness {
             harness: Harness::Claude,
             name: name.to_owned()
         })
     );
-    let agent = AgentEnv::from_runner(&[], &[]).unwrap();
+    let agent = AgentEnv::from_runner(&[], &[], &[]).unwrap();
     let (value, entries) = inbox(&agent);
     println!(
         "inbox={} entries={entries};",

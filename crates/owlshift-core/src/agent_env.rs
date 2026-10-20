@@ -430,6 +430,100 @@ fn contains_name(names: &[&str], name: &str) -> bool {
     names.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
+/// Credential files and folders under the home, closed even when a folder
+/// that holds them is opened. Paths are relative to the home, `/` between
+/// their parts.
+pub const HIDDEN_IN_HOME: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".gnupg",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".config/gh",
+    ".config/gcloud",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".local/share/keyrings",
+    // Maven's and Gradle's repository passwords.
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
+    ".gradle/gradle.properties",
+    // The Keychain, which the macOS sandbox closes itself: listed so that no
+    // folder holding it, `~/Library`, is opened for a variable.
+    "Library/Keychains",
+];
+
+/// The most home folders a project may declare as caches (OWL-330).
+pub const MAX_CACHES: usize = 16;
+
+/// Checks the home folders a project declares as read-only caches, or the
+/// operator allows as such (`stack.caches`, `allow_caches`, OWL-330): at most
+/// [`MAX_CACHES`], each a path from the home with `/` between its parts, no
+/// part empty, `.`, `..` or starting with `~`, no `\` or control character,
+/// none named twice (compared as written), and none that is, lies in or
+/// holds a credential path of [`HIDDEN_IN_HOME`], compared in any letter
+/// case, as a case-insensitive volume would.
+pub fn check_home_folders(paths: &[&str]) -> Result<(), String> {
+    if paths.len() > MAX_CACHES {
+        return Err(format!(
+            "{} folders named, over the {MAX_CACHES} a run opens as caches",
+            paths.len()
+        ));
+    }
+    for (i, path) in paths.iter().enumerate() {
+        if path.chars().any(char::is_control) {
+            return Err(format!(
+                "{path:?} holds a control character: name a folder by its path"
+            ));
+        }
+        if path.contains('\\') {
+            return Err(format!("{path:?} holds `\\`: separate folders with `/`"));
+        }
+        if path.starts_with('/') {
+            return Err(format!(
+                "{path:?} starts with `/`: name a folder from the home, such as \"Library/pnpm\""
+            ));
+        }
+        if path
+            .split('/')
+            .any(|part| matches!(part, "" | "." | "..") || part.starts_with('~'))
+        {
+            return Err(format!(
+                "{path:?} is not a folder's path from the home: no part of it may be empty, \
+                 `.` or `..`, or start with `~`"
+            ));
+        }
+        if paths[..i].contains(path) {
+            return Err(format!("{path:?} is named twice"));
+        }
+        if let Some(hidden) = touched_credential(path) {
+            return Err(format!(
+                "{path:?} would open the credential path ~/{hidden}, which agents never read"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The entry of [`HIDDEN_IN_HOME`] that `path`, from the home, is, lies in or
+/// holds, in any letter case; `None` when it touches none.
+fn touched_credential(path: &str) -> Option<&'static str> {
+    let parts: Vec<&str> = path.split('/').collect();
+    HIDDEN_IN_HOME.iter().copied().find(|hidden| {
+        let hidden: Vec<&str> = hidden.split('/').collect();
+        let shared = parts.len().min(hidden.len());
+        parts[..shared]
+            .iter()
+            .zip(&hidden[..shared])
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
 /// Checks an environment an agent would get: every credential variable in
 /// it is reported, except a token variable set to [`NO_CREDENTIAL`].
 ///
@@ -808,6 +902,49 @@ mod tests {
                 "GH_TOKEN".to_owned(),
                 "aws_secret_access_key".to_owned(),
             ]))
+        );
+    }
+
+    /// OWL-330: a cache is a plain folder of the home that opens no
+    /// credential path, whichever list names it.
+    #[test]
+    fn home_folders_are_plain_and_open_no_credential() {
+        assert_eq!(
+            check_home_folders(&["Library/pnpm", ".cache/uv", ".local/share/uv/python"]),
+            Ok(())
+        );
+        for (path, says) in [
+            ("../x", "no part of it may be empty"),
+            ("/abs", "starts with `/`"),
+            ("~/x", "start with `~`"),
+            ("", "no part of it may be empty"),
+            ("a//b", "no part of it may be empty"),
+            ("a/./b", "no part of it may be empty"),
+            ("a\\b", "separate folders with `/`"),
+            ("a\nb", "control character"),
+            (".ssh", "~/.ssh"),
+            (".SSH/keys", "~/.ssh"),
+            (".config", "~/.config/gh"),
+            (".config/gh/hosts.yml", "~/.config/gh"),
+            ("Library", "~/Library/Keychains"),
+            ("Library/Keychains", "~/Library/Keychains"),
+            (".m2", "~/.m2/settings.xml"),
+        ] {
+            let error = check_home_folders(&[path]).unwrap_err();
+            assert!(error.contains(says), "{path:?}: {error}");
+        }
+        assert!(
+            check_home_folders(&["a", "a"])
+                .unwrap_err()
+                .contains("named twice")
+        );
+        let many: Vec<String> = (0..=MAX_CACHES).map(|i| format!("c{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(check_home_folders(&many).unwrap_err().contains("over the"));
+        // A folder beside a credential path is fine.
+        assert_eq!(
+            check_home_folders(&[".config/git", ".cargo/registry"]),
+            Ok(())
         );
     }
 }

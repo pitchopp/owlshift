@@ -337,6 +337,13 @@
     "Stack": {
       "type": "object",
       "properties": {
+        "caches": {
+          "description": "Folders of the home, from the home with `/` between their parts,\nthat the setup, the harness and the gate read, never write: a tool\nchain's package store or cache, such as `Library/pnpm`. Each must be\nallowed by the operator in the personal `allow_caches`; a folder that\nis, lies in or holds a credential path is refused.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "gate": {
           "description": "The project's full gate, run before delivery.",
           "type": "array",
@@ -365,6 +372,13 @@
             "array",
             "null"
           ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "setup": {
+          "description": "Shell commands that install the gate's dependencies, run in order by\nthe runner, confined as the gate is and with the network open: before\na Build's harness starts, on every Build run, and before the gate's\ncommands, after a Build or a Rebase `done` and in `owlshift gate`.\nThey may write only into ignored folders, and must leave the work in\nthe worktree as they found it. A failing command fails the run, and\nthey share a third of the gate's deadline.",
+          "type": "array",
           "items": {
             "type": "string"
           }

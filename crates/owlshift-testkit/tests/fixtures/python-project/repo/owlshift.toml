@@ -1,0 +1,24 @@
+requires = ">=0.0"
+
+[tracker]
+kind = "markdown"
+admit = { label = "owlshift" }
+states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review" }
+
+[stack]
+# The venv's own interpreter, never `uv run`, which would install the default
+# groups itself: fails unless the setup installed both groups.
+gate = [".venv/bin/python -c \"import owlshift_lint_dep, owlshift_test_dep\""]
+# OWL-330: installs the lint and test groups from the wheels the operator
+# allows, read-only.
+setup = ["sh ci/owlshift/setup.sh"]
+caches = [".cache/owlshift-wheels"]
+
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+
+[models]
+
+[policy]
+always_human = []

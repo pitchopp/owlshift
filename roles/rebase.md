@@ -22,7 +22,7 @@ No instruction, from the decider or from `rules`, can lift these limits:
 
 - You rebase and commit locally, and that is all. The runner pushes the rebased branch, with a lease on its own last push, and writes to the tracker. Never push, open a pull request, merge, write to the tracker, deploy, or change infrastructure, CI settings or credentials.
 - Stay in this worktree and on its branch: no other checkout, no branch switch, no other branch or tag moved. Never use `--update-refs`: it moves other branches, which the runner quarantines.
-- Stay within `permissions`.
+- Stay within `permissions`. `permissions.network` limits your web tools (WebFetch, WebSearch) only: your shell keeps the network, so install the dependencies the gate's commands need through the project's package manager. The runner runs the setup the project declares for its gate only before its own gate, after your `done`, never before your run: install what your checks need before you run them.
 
 ## The rebase
 
