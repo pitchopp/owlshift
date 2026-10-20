@@ -2813,7 +2813,6 @@ impl OnDemand<'_> {
                 let (decided, unposted) = self.log_decisions(
                     p,
                     state,
-                    asked.role,
                     &sorted.logged,
                     (raised_by, DecidedBy::Recommendation(fallback)),
                     sink,
@@ -2920,7 +2919,6 @@ impl OnDemand<'_> {
         let (decided, unposted) = self.log_decisions(
             p,
             state,
-            asked.role,
             &sorted.logged,
             (&ran.run, DecidedBy::Resolver),
             sink,
@@ -2959,7 +2957,7 @@ impl OnDemand<'_> {
 
     /// Posts the decisions `logged` of one run as one DECISION comment
     /// (OWL-351), their reasoning in the ticket's decisions document, then
-    /// keeps them in the ticket ref with the role that asked them: the
+    /// keeps them in the ticket ref: the
     /// resolver's decisions, or, at the resolver's bound at `all`, the asking
     /// run's recommendations (OWL-375), as `by` says; `run` names the run in
     /// the comment's footer and the events. Returns the decisions kept and
@@ -2970,7 +2968,6 @@ impl OnDemand<'_> {
         &self,
         p: &mut Prepared,
         state: &TicketState,
-        role: Role,
         logged: &[resolver::Logged<'_>],
         (run, by): (&str, DecidedBy),
         sink: &mut EventSink<'_>,
@@ -3017,7 +3014,6 @@ impl OnDemand<'_> {
                             decision: shown.decision,
                             basis: shown.basis,
                             basis_kind: shown.kind,
-                            asked_by: Some(role),
                             number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
                             reversed: None,
                         });
@@ -7425,7 +7421,6 @@ mod tests {
             decision: decided.into(),
             basis: "the ticket".into(),
             basis_kind: None,
-            asked_by: None,
             number: None,
             reversed: None,
         };
@@ -7581,7 +7576,6 @@ mod tests {
             decision: "Yes, as the ticket says.".into(),
             basis: "The ticket.".into(),
             basis_kind: None,
-            asked_by: None,
             number: None,
             reversed: None,
         };
@@ -8450,7 +8444,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 16,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 17,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

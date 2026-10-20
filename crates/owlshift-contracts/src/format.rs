@@ -79,8 +79,9 @@ pub const TICKET_STATE_FORMAT: u32 = 4;
 /// `basis_kind` (OWL-343); format 14 a decision's `asked_by` (OWL-345);
 /// format 15 a decision's `number` in its DECISION comment and the
 /// `decisions_document` (OWL-351); format 16 a decision's `recommendation`
-/// basis kind (OWL-375); formats 2 to 15 are still read.
-pub const QUESTIONS_FORMAT: u32 = 16;
+/// basis kind (OWL-375); format 17 drops a decision's `asked_by`
+/// (OWL-379); formats 2 to 16 are still read, formats 14 to 16 without it.
+pub const QUESTIONS_FORMAT: u32 = 17;
 /// The format version of a ticket's delivery (`delivery.json` on a ticket
 /// ref, OWL-209). Format 2 adds the `owed` report and the push's kept
 /// `report` (OWL-218); format 3 a correction run's push (OWL-146); format 4

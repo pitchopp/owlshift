@@ -286,7 +286,6 @@ mod tests {
             decision: "GREETING.md".into(),
             basis: "the ticket".into(),
             basis_kind: None,
-            asked_by: None,
             number: None,
             reversed: None,
         }

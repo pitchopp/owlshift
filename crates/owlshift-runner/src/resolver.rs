@@ -1057,7 +1057,6 @@ mod tests {
             decision: format!("decision {n}"),
             basis: format!("basis {n}"),
             basis_kind: kind,
-            asked_by: None,
             number: None,
             reversed: None,
         };
