@@ -552,7 +552,8 @@ fn the_resolvers_bash_reads_and_never_writes() {
     ] {
         let (failed, text) = bash(command(label));
         assert!(!failed && text.contains(shows), "{label}: {text}\n{report}");
-        println!("{label}: allowed, {}", first_line(&text));
+        let last = text.lines().rfind(|line| !line.trim().is_empty());
+        println!("{label}: allowed, {}", first_line(last.unwrap_or("")));
     }
     // Refused by the sandbox. The redirection into `.git` may be refused by
     // Claude Code first, as on OWL-344; any other write that Claude Code
@@ -608,7 +609,10 @@ fn the_resolvers_bash_reads_and_never_writes() {
             "inconclusive, rerun: {label} was refused by Claude Code, the sandbox not probed\n{report}"
         );
         assert!(by_sandbox(&text), "{label}: {text}\n{report}");
-        println!("{label}: refused, {}", first_line(&text));
+        println!(
+            "{label}: refused, {}",
+            first_line(refusal_line(&text).unwrap_or(""))
+        );
     }
 
     // No credential reaches Bash. The run's log hides the token, so a token
@@ -799,15 +803,26 @@ impl Transcript {
     }
 }
 
-/// Whether `text` is the sandbox's refusal, not Claude Code's: Seatbelt says
-/// `EPERM`, a read-only bind under bwrap `EROFS`.
+/// Whether `text` holds the sandbox's refusal, not Claude Code's: Seatbelt
+/// says `EPERM`, a read-only bind under bwrap `EROFS`. The line of a refused
+/// write; the Xcode shim's warning that it could not write its cache in the
+/// closed shared temporary folder, which every `git` call prints on macOS
+/// under the read-only profile, is no such line.
 fn by_sandbox(text: &str) -> bool {
-    let text = text.to_lowercase();
+    refusal_line(text).is_some()
+}
+
+/// The first line of `text` that is the sandbox's refusal ([`by_sandbox`]).
+fn refusal_line(text: &str) -> Option<&str> {
     let mut shapes = vec!["eperm", "operation not permitted"];
     if cfg!(target_os = "linux") {
         shapes.extend(["erofs", "read-only file system"]);
     }
-    shapes.iter().any(|shape| text.contains(shape))
+    text.lines().find(|line| {
+        let line = line.to_lowercase();
+        !line.contains("couldn't create cache file")
+            && shapes.iter().any(|shape| line.contains(shape))
+    })
 }
 
 /// `path` quoted for a POSIX shell: the test's folder has spaces.
