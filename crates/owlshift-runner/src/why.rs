@@ -7,7 +7,9 @@
 //! quarantine marker and the run slots. It takes no lock the writers hold:
 //! the project's lock and the tickets' locks are never tried, so it runs
 //! while `owlshift watch` does. [`fold`] and [`render`] are pure; [`gather`]
-//! does the reading.
+//! does the reading. The one thing it touches that a writer can notice is
+//! the slot files: counting the slots held tries each free one for a
+//! moment, as watch's own count does (`MachineSlots::held`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -117,6 +119,10 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
         event.data.get("reason")?.as_str()?.to_owned()
     } else if says("usage") {
         "usage_limit".to_owned()
+    } else if event.data.get("drain").and_then(Value::as_str) == Some("pr_cap") {
+        // The drain tells the cap once, for the first ticket it holds
+        // (`tell_cap`), with the counts and no `waits`.
+        "pr_cap".to_owned()
     } else {
         return None;
     };
@@ -164,7 +170,30 @@ pub fn phrase(wait: &Waiting) -> String {
             let resource = data.get("resource").map_or_else(String::new, resource_text);
             format!("{holder} holds {resource}, which it would touch")
         }
-        "pr_cap" => "the open pull requests reached their cap".to_owned(),
+        "pr_cap" => match (
+            data.get("open_prs").and_then(Value::as_u64),
+            data.get("max_open_prs").and_then(Value::as_u64),
+        ) {
+            (Some(open), Some(cap)) => {
+                format!("the open pull requests reached their cap ({open} of {cap})")
+            }
+            _ => "the open pull requests reached their cap".to_owned(),
+        },
+        "duplicate" => "the column lists it twice; the first is taken".to_owned(),
+        "not_admitted" => {
+            "its admission gesture is not from an account `[tracker].admitters` lists".to_owned()
+        }
+        "excluded" => "it carries the exclusion label".to_owned(),
+        "no_decider" => {
+            "it has no decider: give it an assignee, or a `zone:` label whose zone has an owner"
+                .to_owned()
+        }
+        "no_intake" => "its intake has not run yet".to_owned(),
+        "stale_intake" => "its text changed since its intake, which runs again".to_owned(),
+        "not_ready" => {
+            "it is being worked, waits for an answer, is parked, or its pull request is followed"
+                .to_owned()
+        }
         "run_cap" => "every run slot of this machine is taken".to_owned(),
         "in_flight_unread" => "the work in flight outside Owlshift could not be read".to_owned(),
         "quarantine" => "the project is quarantined (`owlshift unquarantine`)".to_owned(),
@@ -286,6 +315,11 @@ pub fn gather(
             false
         }
     };
+    // A quarantine lifted since is not a reason any more.
+    let mut folded = folded;
+    if !quarantined {
+        folded.current.retain(|_, wait| wait.reason != "quarantine");
+    }
     let store = UsageStore::in_data_dir(data_dir);
     let limits = [Harness::Claude, Harness::Codex]
         .into_iter()
@@ -368,10 +402,30 @@ pub fn render(report: &Report) -> String {
             for (ticket, wait) in &folded.current {
                 let _ = writeln!(
                     out,
-                    "  {ticket}{} waits since {}: {}",
+                    "  {ticket}{} last told {}: {}",
                     stage(ticket),
                     wait.at,
                     phrase(wait)
+                );
+            }
+            // A ticket that waits for a person keeps what it holds
+            // (architecture, section 5): named from its ref.
+            for (ticket, stage) in &report.stages {
+                if !folded.current.contains_key(ticket)
+                    && (stage.ends_with("needs input") || stage.ends_with("parked"))
+                {
+                    let _ = writeln!(
+                        out,
+                        "  {ticket} [{stage}]: waits for a person (an answer, or \
+                         `owlshift continue`) and keeps what it holds"
+                    );
+                }
+            }
+            if !folded.current.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  (reasons are read from the events: the latest one told, until the \
+                     ticket is dispatched or runs)"
                 );
             }
         }
@@ -382,9 +436,14 @@ pub fn render(report: &Report) -> String {
             "quarantine: a marker stands; every command refuses the project"
         );
     }
-    if report.only.is_none() && !folded.people.is_empty() {
+    let people: Vec<_> = folded
+        .people
+        .iter()
+        .filter(|(ticket, _)| report.only.as_ref().is_none_or(|only| only == *ticket))
+        .collect();
+    if !people.is_empty() {
         let _ = writeln!(out, "people's tickets left out for want of zones:");
-        for (ticket, at) in &folded.people {
+        for (ticket, at) in people {
             let _ = writeln!(
                 out,
                 "  {ticket}: in the working state with neither a pull request nor a `zone:` \
@@ -611,5 +670,71 @@ mod tests {
             phrase(wait),
             "claude is at its usage limit until 2026-10-20T15:00:00Z"
         );
+    }
+
+    #[test]
+    fn the_cap_is_read_as_the_drain_tells_it() {
+        // `tell_cap`'s shape: no `waits`, the counts.
+        let events = [waits(
+            "2026-10-20T10:00:00Z",
+            "OWL-1",
+            data([
+                ("drain", json!("pr_cap")),
+                ("open_prs", json!(3)),
+                ("max_open_prs", json!(3)),
+            ]),
+        )];
+        let folded = fold(&events, "o/r");
+        let wait = &folded.current[&TicketId::new("OWL-1").unwrap()];
+        assert_eq!(
+            phrase(wait),
+            "the open pull requests reached their cap (3 of 3)"
+        );
+    }
+
+    #[test]
+    fn render_names_the_marker_the_slots_the_limits_and_a_waiting_person() {
+        let id = |t| TicketId::new(t).unwrap();
+        let mut report = Report {
+            project: "o/r".to_owned(),
+            only: None,
+            folded: Folded::default(),
+            stages: HashMap::from([(id("OWL-4"), "verify, parked".to_owned())]),
+            quarantined: true,
+            notes: vec!["a note".to_owned()],
+            limits: vec![
+                (
+                    Harness::Claude,
+                    Limit::Until("2026-10-20T15:00:00Z".parse().unwrap()),
+                ),
+                (Harness::Codex, Limit::ProbeDue),
+            ],
+            slots: Some((1, 2)),
+        };
+        report.folded.started = vec![
+            (
+                "o/r".to_owned(),
+                id("OWL-8"),
+                "2026-10-20T09:00:00Z".parse().unwrap(),
+            ),
+            (
+                "o/r".to_owned(),
+                id("OWL-9"),
+                "2026-10-20T09:30:00Z".parse().unwrap(),
+            ),
+        ];
+        let text = render(&report);
+        assert!(text.contains("quarantine: a marker stands"), "{text}");
+        assert!(
+            text.contains("OWL-4 [verify, parked]: waits for a person"),
+            "{text}"
+        );
+        assert!(text.contains("machine slots: 1 of 2 in use"), "{text}");
+        // One slot held: the latest started run only.
+        assert!(text.contains("o/r OWL-9 since"), "{text}");
+        assert!(!text.contains("OWL-8"), "{text}");
+        assert!(text.contains("until 2026-10-20T15:00:00Z"), "{text}");
+        assert!(text.contains("deadline passed"), "{text}");
+        assert!(text.contains("note: a note"), "{text}");
     }
 }

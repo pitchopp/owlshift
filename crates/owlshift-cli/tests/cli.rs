@@ -1643,7 +1643,7 @@ fn why_tells_each_waiting_ticket_its_reason_while_the_project_is_locked() {
     assert!(all.status.success(), "{}", stderr(&all));
     let text = stdout(&all);
     assert!(
-        text.contains("OWL-1 waits since 2026-10-20T10:01:00Z: OWL-2 holds zone `leases/`"),
+        text.contains("OWL-1 last told 2026-10-20T10:01:00Z: OWL-2 holds zone `leases/`"),
         "{text}"
     );
     assert!(!text.contains("OWL-3 waits"), "{text}");
