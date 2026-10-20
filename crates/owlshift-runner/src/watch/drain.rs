@@ -697,8 +697,12 @@ impl Watch<'_> {
             priority: row.listed.ticket.priority,
             created_ms: row.listed.created_at.map_or(0, Timestamp::as_millisecond),
             admission,
-            // The zones of an intake record that holds the ticket's text,
-            // which a dispatch reads, join its labels' (OWL-412).
+            // The zones of an intake record that holds the ticket's text
+            // join its labels' (OWL-412). A command counts a record kept for
+            // an earlier text too, but the drain takes in a ticket whose
+            // text changed again, so such a record is about to be replaced
+            // and its ticket waits for that intake, whose own check counts no
+            // record's zones.
             has_decider: on_demand::has_decider(
                 &row.listed.ticket,
                 record

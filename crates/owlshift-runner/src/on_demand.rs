@@ -7428,6 +7428,45 @@ mod tests {
 
     use super::*;
 
+    /// OWL-412: an intake record's zones choose a decider once its intake
+    /// ended, the record kept for an earlier text of the ticket included,
+    /// until an intake replaces it; never for an intake run, nor at Intake.
+    #[test]
+    fn an_ended_intake_records_zones_count_until_an_intake_replaces_it() {
+        let mut intake = TicketIntake::parse(include_str!(
+            "../../owlshift-contracts/tests/fixtures/ticket-intake.json"
+        ))
+        .unwrap();
+        intake.zones = vec!["docs".to_owned()];
+        // A hash of no text the ticket has now.
+        intake.text_sha256 = "0".repeat(64);
+        let at = |stage: Stage| Stored {
+            record: TicketRecord {
+                state: PersistedState::from(
+                    &TicketState::restore(Status::Active(stage), 1, 0, 0, 0, 0).unwrap(),
+                ),
+                questions: TicketQuestions::default(),
+                delivery: None,
+                intake: Some(intake.clone()),
+                plan: None,
+                review: None,
+                cost: None,
+                session: None,
+            },
+            commit: "c".repeat(40),
+            proposals: None,
+        };
+        let built = at(Stage::Build);
+        assert_eq!(decider_zones(Command::Continue, Some(&built)), ["docs"]);
+        assert_eq!(
+            decider_zones(Command::Drain, Some(&at(Stage::Ready))),
+            ["docs"]
+        );
+        assert!(decider_zones(Command::Intake, Some(&built)).is_empty());
+        assert!(decider_zones(Command::Continue, Some(&at(Stage::Intake))).is_empty());
+        assert!(decider_zones(Command::Do, None).is_empty());
+    }
+
     fn report(wall_elapsed: Option<Duration>) -> RunReport {
         RunReport {
             outcome: Outcome::UsageLimit { resets_at: None },
