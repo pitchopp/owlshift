@@ -143,11 +143,7 @@ mod imp {
 
         /// Waits until the root exits, `true`, or the deadline passes,
         /// `false`. The `true` is given once: the answer is consumed.
-        pub fn exited_by(
-            &self,
-            _child: &Child,
-            deadline: Instant,
-        ) -> io::Result<bool> {
+        pub fn exited_by(&self, _child: &Child, deadline: Instant) -> io::Result<bool> {
             match self
                 .0
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -327,11 +323,7 @@ mod imp {
 
         /// Waits until the root exits, `true`, or the deadline passes,
         /// `false`.
-        pub fn exited_by(
-            &self,
-            child: &Child,
-            deadline: Instant,
-        ) -> io::Result<bool> {
+        pub fn exited_by(&self, child: &Child, deadline: Instant) -> io::Result<bool> {
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 // Whole milliseconds, rounded up, short of `INFINITE`.

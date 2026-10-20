@@ -81,7 +81,7 @@
   ],
   "$defs": {
     "KeptFollowing": {
-      "description": "What watch keeps of a ticket's pull request that a repair or a\ncorrection updates (OWL-219, OWL-232), and the forge's pause: handed to\nthe child and merged back from its outcome.",
+      "description": "What watch keeps of a ticket's pull request that a repair or a\ncorrection updates (OWL-219, OWL-232), and the forge's pause, which a\nread of the reviews may set: handed to the child and merged back from\nits outcome.",
       "type": "object",
       "properties": {
         "moved": {

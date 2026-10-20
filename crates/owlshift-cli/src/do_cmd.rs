@@ -765,7 +765,10 @@ mod refusals {
         let other = envelope("OWL-2").render();
         for (text, said) in [
             ("{", "the step's envelope: invalid step envelope"),
-            (other.as_str(), "the step's envelope is OWL-2's, not OWL-1's"),
+            (
+                other.as_str(),
+                "the step's envelope is OWL-2's, not OWL-1's",
+            ),
         ] {
             let refusal =
                 run_with(&NoSandbox, &config, Mode::Step("OWL-1", text), no_keychain).unwrap_err();

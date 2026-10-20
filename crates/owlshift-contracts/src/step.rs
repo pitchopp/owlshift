@@ -137,7 +137,9 @@ impl StepEnvelope {
 fn check_attempt(contract: &'static str, attempt: &str) -> Result<(), ContractError> {
     let ok = !attempt.is_empty()
         && attempt.len() <= MAX_ATTEMPT
-        && attempt.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        && attempt
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if ok {
         Ok(())
     } else {

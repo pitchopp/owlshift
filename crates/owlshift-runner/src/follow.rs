@@ -24,10 +24,10 @@ use owlshift_adapters::forge::{
     PrState, PullRequestRead, ReviewsRead, Verdict,
 };
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::step::{KeptFollowing, KeptUnposted};
 use owlshift_contracts::refs::{
     DeliveredPullRequest, Ended, EndedWhy, OwedReport, PushKind, Pushing, TicketDelivery,
 };
+use owlshift_contracts::step::{KeptFollowing, KeptUnposted};
 use owlshift_core::follow::{
     self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
 };

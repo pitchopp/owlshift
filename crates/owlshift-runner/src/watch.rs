@@ -1172,11 +1172,13 @@ impl Watch<'_> {
                     continue;
                 }
             };
-            let current = ticket_ref::read(
-                &on_demand.executor.git,
-                &on_demand.dirs.checkout(),
-                &record.ticket,
-            );
+            // No dedicated checkout yet: no ticket has a ref.
+            let checkout = on_demand.dirs.checkout();
+            let current = if fs::symlink_metadata(&checkout).is_ok() {
+                ticket_ref::read(&on_demand.executor.git, &checkout, &record.ticket)
+            } else {
+                Ok(None)
+            };
             let at_ref = match (&record.after, current) {
                 (RefAfter::Present { commit, .. }, Ok(Some(stored))) => stored.commit == *commit,
                 (RefAfter::Absent, Ok(None)) => true,
@@ -2526,7 +2528,13 @@ mod tests {
             landed: Landed::Reask,
             message: "the ticket's ref is locked".to_owned(),
         });
-        holds.after(&ticket, seen("p1", 0), &end(not_kept), Some(&p("p1")), at(6));
+        holds.after(
+            &ticket,
+            seen("p1", 0),
+            &end(not_kept),
+            Some(&p("p1")),
+            at(6),
+        );
         assert_eq!(
             holds.admit(&ticket, &seen_at("spent", "p1", 0), at(24 * 60)),
             Admit::Held {

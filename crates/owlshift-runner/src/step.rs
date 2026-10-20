@@ -36,8 +36,8 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{
-    KeptChain, LandedKind, RefAfter, Shown, StepEnd, StepEnvelope, StepHold, StepKind,
-    StepOutcome, TicketCarry,
+    KeptChain, LandedKind, RefAfter, Shown, StepEnd, StepEnvelope, StepHold, StepKind, StepOutcome,
+    TicketCarry,
 };
 
 use crate::events::{Data, EventSink, data};
@@ -88,11 +88,14 @@ fn step(
     sink: &mut EventSink<'_>,
 ) -> Stepped {
     let ticket = &envelope.ticket;
-    let ran = |outcome: Option<Result<Delivered, Stop>>| outcome.map_or(Stepped::Stale, Stepped::Ran);
+    let ran =
+        |outcome: Option<Result<Delivered, Stop>>| outcome.map_or(Stepped::Stale, Stepped::Ran);
     if let StepKind::Intake = envelope.step {
         return match on_demand.intake_seen(ticket, envelope.commit.as_deref(), sink) {
             None => Stepped::Stale,
-            Some(Taken::NotAdmitted { account, reason }) => Stepped::NotAdmitted { account, reason },
+            Some(Taken::NotAdmitted { account, reason }) => {
+                Stepped::NotAdmitted { account, reason }
+            }
             Some(Taken::Ran(outcome)) => Stepped::Ran(as_reported(ticket, outcome)),
         };
     }
@@ -172,7 +175,10 @@ fn decision(envelope: &StepEnvelope) -> Data {
             ("watch", json!("continue")),
             ("stage", json!(on_demand::stage_name(*stage))),
         ]),
-        _ => data([("watch", json!("continue")), ("answer", json!(envelope.answer))]),
+        _ => data([
+            ("watch", json!("continue")),
+            ("answer", json!(envelope.answer)),
+        ]),
     }
 }
 
@@ -235,7 +241,8 @@ fn read_reviews(
 /// `continue`'s: every one but a busy project at the drain's intake or
 /// dispatch, which the drain never told.
 pub fn reported(step: &StepKind, outcome: &Result<Delivered, Stop>) -> bool {
-    !(matches!(step, StepKind::Intake | StepKind::Dispatch) && matches!(outcome, Err(Stop::Busy(_))))
+    !(matches!(step, StepKind::Intake | StepKind::Dispatch)
+        && matches!(outcome, Err(Stop::Busy(_))))
 }
 
 /// How a step ended, as watch tells ends apart. Every way to stop is named,
@@ -864,10 +871,7 @@ mod tests {
         let not_kept = StepEnd::NotKept {
             landed: LandedKind::Reask,
         };
-        assert_eq!(
-            hold(not_kept, None),
-            Some(StepHold::Held { until: None })
-        );
+        assert_eq!(hold(not_kept, None), Some(StepHold::Held { until: None }));
         let limited = StepEnd::UsageLimit {
             resets_at: Some(at(30)),
         };
@@ -901,4 +905,3 @@ mod tests {
         );
     }
 }
-

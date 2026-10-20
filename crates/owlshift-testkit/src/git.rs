@@ -67,6 +67,17 @@ impl GitEnv {
         Ok(Self { home, date: None })
     }
 
+    /// The environment [`GitEnv::create`] wrote into `home` before, for
+    /// another process of the same test: a step's child (OWL-399).
+    pub fn existing(home: PathBuf) -> Self {
+        Self { home, date: None }
+    }
+
+    /// The bench's home.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
     /// The runner's environment as the bench stands it in, for building the
     /// agent environment: this process's variables with every `GIT_*` one
     /// removed, and the home and configuration folder in the bench's home.

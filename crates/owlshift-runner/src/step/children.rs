@@ -82,8 +82,8 @@ impl<'a> Children<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (mut child, tree) =
-            ProcessTree::spawn(&mut command).map_err(|error| format!("it could not start: {error}"))?;
+        let (mut child, tree) = ProcessTree::spawn(&mut command)
+            .map_err(|error| format!("it could not start: {error}"))?;
         drop(command);
         let (sender, lines) = mpsc::channel();
         read_lines(child.stdout.take(), Stream::Out, sender.clone());
@@ -146,7 +146,9 @@ impl<'a> Children<'a> {
             .reap(&mut child)
             .map_err(|error| format!("its end could not be read: {error}"))?;
         if let Some(error) = watch_error {
-            return Err(format!("its end could not be watched ({error}), so it was stopped"));
+            return Err(format!(
+                "its end could not be watched ({error}), so it was stopped"
+            ));
         }
         let path = super::outcome_file(dirs, ticket, &envelope.attempt);
         match super::take_outcome(&path) {
