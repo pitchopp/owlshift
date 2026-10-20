@@ -216,7 +216,7 @@ pub enum Mandate {
 pub enum DelegationLevel {
     /// Nothing: no resolver run, every question goes to the decider.
     None,
-    /// What the resolver observes offline in the worktree.
+    /// What the resolver checks in the repository and its history.
     Facts,
     /// Facts, and what the ticket, the decider's comments, earlier
     /// decisions and the project's rules settle.
@@ -272,8 +272,8 @@ impl DelegationLevel {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum BasisKind {
-    /// Observed in the worktree, offline: a file, an existing pattern, a
-    /// documented behaviour.
+    /// Checked in the repository and its history: a file, an existing
+    /// pattern, a documented behaviour.
     Fact,
     /// Settled by the ticket, the decider's comments, earlier decisions or
     /// the project's rules.
