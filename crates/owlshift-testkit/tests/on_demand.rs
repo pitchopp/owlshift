@@ -1168,6 +1168,15 @@ impl Bench {
         String::from_utf8(out).unwrap().trim().to_owned()
     }
 
+    /// Whether the ticket has a ticket ref.
+    fn has_ref(&self) -> bool {
+        let env = self.env.clone();
+        let git = Git::with_setup("git", move |command| env.apply(command));
+        ticket_ref::read(&git, &self.dirs().checkout(), &ticket())
+            .unwrap()
+            .is_some()
+    }
+
     /// What the ticket ref holds.
     fn record(&self) -> TicketRecord {
         let env = self.env.clone();
@@ -2170,9 +2179,10 @@ type Check = fn(&Stop) -> bool;
 
 /// Every way a run stops short of a delivery, questions aside (they are
 /// posted: see the `continue` tests): nothing reaches the ticket but a park's
-/// PARKED comment, which says to run `do` again since no question round
-/// kept a ticket ref, and the remote's branch moves only when the push
-/// itself went through.
+/// PARKED comment, and the remote's branch moves only when the push itself
+/// went through. Since OWL-397 the first run's end makes the ticket ref,
+/// which keeps the park, so the PARKED comment says to run `continue`, no
+/// longer `do`; a stop before any run, the rules too long, makes none.
 #[test]
 fn every_stop_before_delivery_leaves_the_ticket_untouched() {
     let blocked = r#"{"format":13,"status":"blocked","summary":"The gate needs network."}"#;
@@ -2303,10 +2313,24 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
                 parked.starts_with("[owlshift] PARKED\n"),
                 "{name}: {parked}"
             );
-            assert!(parked.contains("`owlshift do DEMO-1`"), "{name}: {parked}");
+            // Changed by OWL-397: the park is kept in the ref its run made.
+            // A quarantine's names both, as it always did.
+            assert!(
+                parked.contains("`owlshift continue DEMO-1`")
+                    && (name == "quarantine" || !parked.contains("`owlshift do DEMO-1`")),
+                "{name}: {parked}"
+            );
             assert!(!parked.contains("planted"), "{name}: {parked}");
         } else {
             assert!(comments.is_empty(), "{name}: {comments:?}");
+        }
+        // Every run's cost is kept, whatever the stop (OWL-397).
+        let runs = bench.briefs().len();
+        if runs > 0 {
+            let cost = bench.record().cost.expect("cost.json");
+            assert_eq!(cost.runs, u32::try_from(runs).unwrap(), "{name}");
+        } else {
+            assert!(!bench.has_ref(), "{name}");
         }
         assert_eq!(
             kinds(&bench.events()).last().copied(),
@@ -3525,13 +3549,26 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
     ] {
         assert!(message.contains(part), "{part}\n{message}");
     }
-    assert_eq!(bench.ref_commit(), full);
+    // The round was not kept; since OWL-397 the Build run's cost was, right
+    // after the run, on top of the full ref: the ref moved, by its spend
+    // alone.
+    let spent = bench.ref_commit();
+    assert_ne!(spent, full);
+    let kept = bench.record();
+    assert_eq!(kept.cost.as_ref().map(|cost| cost.runs), Some(2));
+    assert_eq!(
+        TicketRecord { cost: None, ..kept },
+        TicketRecord {
+            cost: None,
+            ..record
+        }
+    );
 
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
     let forgotten = forget::forget(&git, &bench.dirs(), &ticket(), &mut sink).unwrap();
     assert!(
-        matches!(&forgotten.forgot, Forgot::Rewritten { previous, .. } if *previous == full),
+        matches!(&forgotten.forgot, Forgot::Rewritten { previous, .. } if *previous == spent),
         "{forgotten:?}"
     );
     let kept = bench.record();
@@ -5837,6 +5874,155 @@ fn at_all_the_budget_takes_the_recommendation_then_parks_before_the_next_run() {
     );
     assert!(comments.last().unwrap().starts_with("[owlshift] PARKED"));
     assert_eq!(bench.record().questions.decisions.len(), 1);
+}
+
+/// A usage-limit reply that reports `micros` millionths of a dollar.
+fn cut_off(bench: &Bench, micros: u64) -> Reply {
+    let mut reply = bench.reply(None, None);
+    reply.usage_limit = Some("2026-10-02T12:00:00Z".parse().unwrap());
+    reply.cost_micros = Some(micros);
+    reply
+}
+
+/// OWL-397's acceptance: a run cut by a usage limit is counted on the next
+/// command. Under a $5 budget, a Build's `security` question goes to the
+/// decider at $2; the answer's check, at $0.50, resumes Build, whose run a
+/// usage limit cuts at $3. That command writes nothing after the run, yet
+/// the ticket ref keeps its cost, its state as the RESUME left it: the next
+/// `continue` reads $5.50 back and starts no run, the ticket parked for its
+/// budget. Before OWL-397 the cut run's cost was lost and the Build ran.
+#[test]
+fn a_run_cut_by_a_usage_limit_is_counted_on_the_next_command() {
+    let bench = Bench::parking();
+    bench.policy("ticket_budget_usd = 5");
+    let security = NAMING.replace(r#""category":"naming""#, r#""category":"security""#);
+    let (asked, printed) = bench.run(vec![costed(&bench, None, &security, Some(2_000_000))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{asked:?}\n{printed}"
+    );
+    bench.answer("Q1: GREETING.md. Go.\n");
+    let answered = check(&[("Q1", "answered", "GREETING.md.")]);
+    let (stopped, printed) = bench.continue_ticket(vec![
+        costed(&bench, None, &answered, Some(500_000)),
+        cut_off(&bench, 3_000_000),
+    ]);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::AnswerCheck, Role::Build]);
+    let kept = bench.record();
+    let cost = kept.cost.clone().expect("cost.json");
+    assert_eq!((cost.runs, cost.spent_micros), (3, 5_500_000));
+    assert_eq!(
+        state_of(&bench).status(),
+        Status::Active(Stage::Build),
+        "{kept:?}"
+    );
+
+    let (parked, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(
+            &parked,
+            Err(Stop::Parked {
+                reason: ParkReason::TicketBudget,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 3, "no run started");
+    assert!(
+        bench
+            .comments()
+            .pop()
+            .unwrap()
+            .contains("Its runs cost 5.50 USD since it started"),
+        "{printed}"
+    );
+}
+
+/// OWL-397: a ticket without a ticket ref gets one at its first run's end,
+/// holding what `owlshift forget` leaves (Ready, round 0, nothing asked) and
+/// the run's cost, so the rest of the command keeps its state as any ticket
+/// with a ref does. Each change this makes to a `do` typed by hand is
+/// pinned here: its Build fails once at the gate, then a usage limit cuts
+/// it, and the ref keeps Build with its failed run and both runs' cost,
+/// where it kept nothing before; `continue` resumes that Build, where it
+/// said that Owlshift keeps nothing; the run that fails again parks the
+/// ticket, the ref keeping the park and the PARKED comment naming `owlshift
+/// continue`, where it named `owlshift do`, which started over; the restart
+/// delivers, every run counted.
+#[test]
+fn a_ticket_without_a_ref_gets_one_at_its_first_runs_end() {
+    let bench = Bench::parking();
+    let (stopped, printed) = bench.run(
+        vec![
+            costed(&bench, Some("Helo"), DONE, Some(1_000_000)),
+            cut_off(&bench, 1_500_000),
+        ],
+        None,
+    );
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    let state = state_of(&bench);
+    assert_eq!(
+        (state.status(), state.round(), state.failed_runs()),
+        (Status::Active(Stage::Build), 0, 1)
+    );
+    let kept = bench.record();
+    assert!(kept.questions.asks.is_empty());
+    let cost = kept.cost.expect("cost.json");
+    assert_eq!((cost.runs, cost.spent_micros), (2, 2_500_000));
+
+    let (parked, printed) =
+        bench.continue_ticket(vec![costed(&bench, Some("Hi"), DONE, Some(1_000_000))]);
+    assert!(
+        matches!(
+            &parked,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 3);
+    assert_eq!(
+        state_of(&bench).status(),
+        Status::Parked {
+            at: Stage::Build,
+            awaiting_input: false
+        }
+    );
+    let comment = bench.comments().pop().unwrap();
+    assert!(
+        comment.contains("`owlshift continue DEMO-1`") && !comment.contains("`owlshift do DEMO-1`"),
+        "{comment}"
+    );
+
+    let (delivered, printed) = bench.continue_ticket(vec![bench.reply(Some("Hello"), Some(DONE))]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(
+        roles,
+        [
+            Role::Build,
+            Role::Build,
+            Role::Build,
+            Role::Build,
+            Role::Verify
+        ]
+    );
+    let cost = bench.record().cost.expect("cost.json");
+    assert_eq!(
+        (cost.runs, cost.unreported_runs, cost.spent_micros),
+        (5, 2, 3_500_000)
+    );
 }
 
 /// The role of each run of a bench and whether its brief was told of a
