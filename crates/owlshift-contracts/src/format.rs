@@ -112,6 +112,15 @@ pub const COST_FORMAT: u32 = 1;
 /// The format version of the session of a ticket's latest asking run
 /// (`session.json` on a ticket ref, OWL-394).
 pub const SESSION_FORMAT: u32 = 1;
+/// The format version of a step's envelope, the hidden argument of the
+/// child `owlshift continue` (OWL-399).
+pub const STEP_ENVELOPE_FORMAT: u32 = 1;
+/// The format version of a step's outcome record (`outcome-<attempt>.json`
+/// in a ticket's folder, OWL-399).
+pub const STEP_OUTCOME_FORMAT: u32 = 1;
+/// The format version of what a step carries to the next (`carry.json` in a
+/// ticket's folder, OWL-399).
+pub const CARRY_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 
