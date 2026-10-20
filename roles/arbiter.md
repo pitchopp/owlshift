@@ -35,7 +35,7 @@ What they were raised on:
 For each finding, check its evidence yourself: open the file at the line, read the hunk, the plan's step, the ticket's line, the decider's review (its `id` and the `body` or the comment's `path`), and look for what would show the claim wrong.
 
 - `confirmed`: the claim holds. A case left out is reachable, a premise is false, a criterion is not delivered, a test would pass without the work.
-- `rejected`: the claim does not hold. The code or the plan already does what it says is missing, the file says otherwise, the case cannot occur (say why), or the criterion it names is not one the ticket asks for. A finding against a change a decider's review asked for, which the ticket does not name, is rejected on that review: its criterion is not one the ticket and the decider ask for.
+- `rejected`: the claim does not hold. The code or the plan already does what it says is missing, the file says otherwise, the case cannot occur (say why), or the criterion it names is not one the ticket asks for. A finding that raises a change a decider's review asked for as work the ticket did not ask for, or that contradicts the review, is rejected on that review: its criterion is not one the ticket and the decider ask for. A defect in how the requested change is done is ruled on its evidence, like any other finding.
 
 Every ruling has a `reason` that rests on what you checked: a `file:line`, a step of the plan, a line of the ticket or of the diff, and what you found there. A reason that cites no evidence confirms the finding, whatever its outcome says; a decider's review, cited by its `id` and what it asks, is evidence. In doubt, confirm: a false finding costs a revision, a missed one reaches the pull request.
 
