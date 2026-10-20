@@ -502,11 +502,14 @@ fn a_run_its_driver_stopped_did_not_time_out() {
 /// A harness that is a shell script, run in the worktree, whose driver
 /// reports a completed run ending on `message` with one `Write` refused, as
 /// Claude Code's driver reports a read-only run (OWL-323); logged in with
-/// `login` when given.
+/// `login` when given; asking for the read-only profile and giving its
+/// result as its last message with `in_message`, as Codex and the
+/// resolver's Claude Code run with Bash do (OWL-344).
 struct EndsOn {
     script: String,
     message: String,
     login: Option<Secret>,
+    in_message: bool,
 }
 
 impl Harness for EndsOn {
@@ -536,6 +539,8 @@ impl Harness for EndsOn {
                 token,
                 config_variable: "OWLSHIFT_TEST_CONFIG_DIR",
             }),
+            read_only: self.in_message,
+            result_in_message: self.in_message,
             ..SandboxNeeds::default()
         })
     }
@@ -561,6 +566,7 @@ impl Bench {
             script: script.to_owned(),
             message: message.to_owned(),
             login: None,
+            in_message: false,
         };
         self.run_with(&self.executor, &harness, brief).unwrap()
     }
@@ -629,6 +635,7 @@ fn a_read_only_run_without_a_result_is_read_from_its_last_message() {
         script: "sleep 30".into(),
         message,
         login: None,
+        in_message: false,
     };
     let report = bench.run_with(&late, &harness, &read_only).unwrap();
     assert!(
@@ -638,6 +645,48 @@ fn a_read_only_run_without_a_result_is_read_from_its_last_message() {
     );
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert!(!bench.worktree.join(".owlshift/run/result.json").exists());
+}
+
+/// OWL-344: the executor writes the last message of a run whose result it
+/// is whole, as Codex's: JSON is its result, with no warning; prose, even
+/// ending on a closing JSON block, is refused as an invalid result. Reading
+/// such a block is the Claude Code harness's (`claude_end`), not the
+/// executor's.
+#[test]
+fn a_result_given_as_the_last_message_is_written_whole() {
+    let bench = Bench::new();
+    let read_only = bench.read_only_brief();
+    let run = |message: String| {
+        let harness = EndsOn {
+            script: "true".into(),
+            message,
+            login: None,
+            in_message: true,
+        };
+        bench
+            .run_with(&bench.executor, &harness, &read_only)
+            .unwrap()
+    };
+
+    let report = run(format!("\n{}\n", blocked("bare")));
+    assert_eq!(summary(&report), "bare");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    for prose in [
+        format!(
+            "I checked the history.\n\n```json\n{}\n```\n",
+            blocked("from the block")
+        ),
+        "I could not decide.".to_owned(),
+    ] {
+        let report = run(prose);
+        assert!(
+            matches!(report.outcome, Outcome::Failed(Failure::InvalidResult(_))),
+            "{:?}",
+            report.outcome
+        );
+        assert!(!bench.worktree.join(".owlshift/run/result.json").exists());
+    }
 }
 
 /// OWL-323: a result read from the last message goes through the secret
@@ -654,6 +703,7 @@ fn a_result_from_the_last_message_holds_no_secret_and_follows_no_link() {
         script: "true".into(),
         message: blocked(token),
         login: Some(Secret::new(token)),
+        in_message: false,
     };
     let report = bench
         .run_with(&bench.executor, &harness, &read_only)

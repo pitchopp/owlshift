@@ -26,6 +26,7 @@ use owlshift_contracts::brief::{Brief, PermissionLevel};
 use owlshift_platform::keychain::Secret;
 use owlshift_platform::process::{find_executable_in, hand_over_on_descriptor};
 
+use super::message::last_message_result;
 use super::{BRIEF_PATH, RunLog, RunStop};
 use crate::agent_env::{AgentEnv, CredentialFinding, billing_finding, mcp_findings};
 
@@ -385,6 +386,11 @@ pub struct ClaudeHarness {
     /// The token agent runs log in with, made by `claude setup-token` and
     /// read by the runner from the keychain ([`CLAUDE_AGENT_ACCOUNT`]).
     pub login: Option<Secret>,
+    /// The resolver's run (OWL-344): bare Bash allowed
+    /// ([`claude::Request::bash`]), inside the read-only profile, which
+    /// bounds what its commands read and write, the result given as the
+    /// run's last message.
+    pub bash: bool,
 }
 
 impl Harness for ClaudeHarness {
@@ -397,24 +403,27 @@ impl Harness for ClaudeHarness {
             result_path: run.brief.result_path.clone(),
             json_schema: None,
             max_budget_usd: self.max_budget_usd,
+            bash: self.bash,
         };
         Ok(claude::command(&self.program, &request)?)
     }
 
     /// Drives `claude -p`; a read-only run's last message comes with its
     /// end, for the executor to read the result from when the role left no
-    /// result file (OWL-323).
+    /// result file (OWL-323), or, with [`ClaudeHarness::bash`], as its
+    /// result. A run with Bash is told where its brief is in the run's own
+    /// files, and to give its result as its last message.
     fn drive(
         &self,
         run: &HarnessRun<'_>,
         child: &mut Child,
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
-        let ran = claude::drive(child, &prompt_with_brief(&self.prompt), |line| {
+        let ran = claude::drive(child, &self.prompt_with(run.brief_file), |line| {
             log.stdout(line);
         })?;
         log.stderr(&ran.stderr);
-        Ok(claude_end(ran, run.brief.permissions.level))
+        Ok(claude_end(ran, run.brief.permissions.level, self.bash))
     }
 
     /// The folders `claude` is installed in (the one on the `PATH` and the
@@ -422,9 +431,15 @@ impl Harness for ClaudeHarness {
     /// with a configuration folder of the run's own; and, confined, a
     /// temporary folder of the run's own, clear of the user's
     /// `/tmp/claude-<uid>` (OWL-100). A confined run without a token, or with
-    /// one that is not one word, is refused with the fix.
+    /// one that is not one word, is refused with the fix. With
+    /// [`ClaudeHarness::bash`], the read-only profile and the result from
+    /// the last message (OWL-344).
     fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
-        let mut needs = SandboxNeeds::default();
+        let mut needs = SandboxNeeds {
+            read_only: self.bash,
+            result_in_message: self.bash,
+            ..SandboxNeeds::default()
+        };
         if agent.is_confined() {
             needs.temp_variable = Some(claude::TMPDIR_ENV);
         }
@@ -442,6 +457,19 @@ impl Harness for ClaudeHarness {
             None => {}
         }
         Ok(needs)
+    }
+}
+
+impl ClaudeHarness {
+    /// The role's prompt, then where its brief is: `brief_file`, in the
+    /// run's own files, for a run with Bash, which gives its result as its
+    /// last message; [`BRIEF_PATH`] in the worktree otherwise.
+    fn prompt_with(&self, brief_file: &Path) -> String {
+        if self.bash {
+            prompt_with_brief_file(&self.prompt, brief_file, "")
+        } else {
+            prompt_with_brief(&self.prompt)
+        }
     }
 }
 
@@ -474,10 +502,27 @@ pub fn prompt_with_brief(prompt: &str) -> String {
     )
 }
 
+/// The role's prompt, then where its brief is and how the run ends: a run
+/// that cannot write `result.json` gives it as its last message, `how`
+/// saying more of that message's shape (Codex's output schema), or nothing.
+pub fn prompt_with_brief_file(prompt: &str, brief_file: &Path, how: &str) -> String {
+    format!(
+        "{}\n\nThe brief of this run is the file `{}`. This harness gives you no way to write \
+         `result.json`: do not write it, and make your last message that JSON, whole{how}, with \
+         nothing after it.\n",
+        prompt.trim_end(),
+        brief_file.display()
+    )
+}
+
 /// What a Claude Code run at `level` reported, as the executor reads it: an
 /// MCP server or an API-key source in its `init` event is a credential
 /// finding. The final message of a completed read-only run comes along, and
-/// the refused tools always.
+/// the refused tools always. With `in_message`, a run whose result is its
+/// last message ([`ClaudeHarness::bash`], OWL-344), that message is read as
+/// the executor reads a read-only run's message (OWL-323): bare JSON, or the
+/// body of a closing fenced block after prose; any other message comes whole,
+/// for the result's validation to refuse.
 ///
 /// A run that completed in another permission mode than the one asked,
 /// as its `init` event reports it, failed (OWL-346): under managed settings
@@ -486,7 +531,7 @@ pub fn prompt_with_brief(prompt: &str) -> String {
 /// that failed keeps its own reason, and a mode the run did not report is
 /// not judged. A failed write-in-worktree run that Claude Code refused to
 /// start as root says so (`ROOT_REFUSAL`).
-fn claude_end(run: claude::Run, level: PermissionLevel) -> HarnessEnd {
+fn claude_end(run: claude::Run, level: PermissionLevel, in_message: bool) -> HarnessEnd {
     let read_only = level == PermissionLevel::ReadOnly;
     let mut permission_denials: Vec<String> = Vec::new();
     for tool in &run.permission_denials {
@@ -495,6 +540,9 @@ fn claude_end(run: claude::Run, level: PermissionLevel) -> HarnessEnd {
         }
     }
     let message = match &run.outcome {
+        claude::Outcome::Completed { text } if read_only && in_message => {
+            Some(last_message_result(text).unwrap_or(text).to_owned())
+        }
         claude::Outcome::Completed { text } if read_only => Some(text.clone()),
         _ => None,
     };
@@ -609,9 +657,39 @@ mod tests {
     const INIT: &str = r#"{"type":"system","subtype":"init","claude_code_version":"2.1.283","model":"claude-haiku","apiKeySource":"none","mcp_servers":[]}"#;
     const DONE: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
 
+    /// OWL-344: a run whose result is its last message gives bare JSON,
+    /// trimmed, or the body of a closing fenced block after prose, and any
+    /// other message whole; without the flag, a read-only run's message
+    /// comes whole, for the OWL-323 tolerance to read.
+    #[test]
+    fn a_bash_run_gives_the_json_of_its_last_message() {
+        let message = |text: &str, in_message| {
+            let line = serde_json::json!({
+                "type": "result", "subtype": "success", "is_error": false, "result": text,
+            })
+            .to_string();
+            claude_end(
+                run(&[INIT, &line], 0),
+                PermissionLevel::ReadOnly,
+                in_message,
+            )
+            .message
+        };
+        let result = r#"{"status":"blocked"}"#;
+        let block = format!("I checked the history.\n\n```json\n{result}\n```\n");
+
+        assert_eq!(message(&format!("\n{result}\n"), true), Some(result.into()));
+        assert_eq!(message(&block, true), Some(format!("{result}\n")));
+        assert_eq!(
+            message("I could not decide.", true),
+            Some("I could not decide.".into())
+        );
+        assert_eq!(message(&block, false), Some(block.clone()));
+    }
+
     #[test]
     fn a_claude_run_is_read_as_the_executor_needs_it() {
-        let end = claude_end(run(&[INIT, DONE], 0), PermissionLevel::WriteWorktree);
+        let end = claude_end(run(&[INIT, DONE], 0), PermissionLevel::WriteWorktree, false);
         assert_eq!(end.status, HarnessStatus::Completed);
         assert_eq!(end.findings, []);
         assert_eq!(end.harness_version.as_deref(), Some("2.1.283"));
@@ -620,7 +698,7 @@ mod tests {
         // OWL-323: a completed read-only run gives its final message, and
         // the tools refused, each once, in the order of their first refusal.
         let denied = r#"{"type":"result","is_error":false,"result":"ok","permission_denials":[{"tool_name":"Bash"},{"tool_name":"Write"},{"tool_name":"Bash"}]}"#;
-        let read_only = claude_end(run(&[INIT, denied], 0), PermissionLevel::ReadOnly);
+        let read_only = claude_end(run(&[INIT, denied], 0), PermissionLevel::ReadOnly, false);
         assert_eq!(read_only.message.as_deref(), Some("ok"));
         assert_eq!(read_only.permission_denials, ["Bash", "Write"]);
 
@@ -633,6 +711,7 @@ mod tests {
                 1,
             ),
             PermissionLevel::ReadOnly,
+            false,
         );
         assert_eq!(failed.message, None, "a failed run gives no result");
         let HarnessStatus::Failed(reason) = failed.status else {
@@ -651,6 +730,7 @@ mod tests {
                 1,
             ),
             PermissionLevel::WriteWorktree,
+            false,
         );
         let HarnessStatus::Failed(reason) = refused.status else {
             panic!("{refused:?}");
@@ -667,6 +747,7 @@ mod tests {
                 1,
             ),
             PermissionLevel::WriteWorktree,
+            false,
         );
         assert!(
             matches!(
@@ -678,7 +759,7 @@ mod tests {
 
         // An MCP server in `init` is a finding, even on a completed run.
         let init = r#"{"type":"system","subtype":"init","mcp_servers":[{"name":"claude.ai Linear","status":"connected"}]}"#;
-        let loaded = claude_end(run(&[init, DONE], 0), PermissionLevel::WriteWorktree);
+        let loaded = claude_end(run(&[init, DONE], 0), PermissionLevel::WriteWorktree, false);
         assert_eq!(
             loaded.findings,
             [CredentialFinding::McpServers(vec![
@@ -690,7 +771,7 @@ mod tests {
         // finding too; a run that does not say has none.
         let init =
             r#"{"type":"system","subtype":"init","mcp_servers":[],"apiKeySource":"apiKeyHelper"}"#;
-        let keyed = claude_end(run(&[init, DONE], 0), PermissionLevel::WriteWorktree);
+        let keyed = claude_end(run(&[init, DONE], 0), PermissionLevel::WriteWorktree, false);
         assert_eq!(
             keyed.findings,
             [CredentialFinding::ApiKey {
@@ -704,7 +785,12 @@ mod tests {
         );
         let silent = r#"{"type":"system","subtype":"init","mcp_servers":[]}"#;
         assert_eq!(
-            claude_end(run(&[silent, DONE], 0), PermissionLevel::WriteWorktree).findings,
+            claude_end(
+                run(&[silent, DONE], 0),
+                PermissionLevel::WriteWorktree,
+                false
+            )
+            .findings,
             []
         );
     }
@@ -719,7 +805,7 @@ mod tests {
                 r#"{{"type":"system","subtype":"init","mcp_servers":[],"apiKeySource":"none","permissionMode":"{mode}"}}"#
             )
         };
-        let end = |mode: &str, level| claude_end(run(&[&init(mode), DONE], 0), level);
+        let end = |mode: &str, level| claude_end(run(&[&init(mode), DONE], 0), level, false);
         let write = PermissionLevel::WriteWorktree;
 
         // As recorded on 2026-10-18 under managed-style settings disabling
@@ -749,7 +835,7 @@ mod tests {
 
         let refused = r#"{"type":"result","is_error":true,"api_error_status":401,"result":"x"}"#;
         let HarnessStatus::Failed(reason) =
-            claude_end(run(&[&init("default"), refused], 1), write).status
+            claude_end(run(&[&init("default"), refused], 1), write, false).status
         else {
             panic!("a failed run completed");
         };
@@ -762,7 +848,7 @@ mod tests {
                        for security reasons\n";
         let as_root = |level| {
             let run = claude::Transcript::default().finish(Some(1), stderr.to_vec());
-            claude_end(run, level).status
+            claude_end(run, level, false).status
         };
         let HarnessStatus::Failed(reason) = as_root(write) else {
             panic!("a run that never started completed");
@@ -785,6 +871,7 @@ mod tests {
             effort: None,
             max_budget_usd: None,
             login: login.map(Secret::new),
+            bash: false,
         }
     }
 
@@ -829,6 +916,76 @@ mod tests {
         let bare = AgentEnv::new(parent).unwrap().without_confinement();
         let needs = claude(None).sandbox_needs(&bare).unwrap();
         assert_eq!((needs.login, needs.temp_variable), (None, None));
+    }
+
+    /// OWL-344: with Bash, the read-only profile and the result from the
+    /// last message, bare `Bash` allowed and no result rule, and a prompt
+    /// naming the brief in the run's own files that mentions no schema;
+    /// without it, the needs, the rule and the prompt as before.
+    #[test]
+    fn a_bash_run_is_read_only_and_gives_its_result_as_its_last_message() {
+        let agent = AgentEnv::new([(OsString::from("PATH"), OsString::from("/usr/bin"))])
+            .unwrap()
+            .without_confinement();
+        let brief = Brief::parse(&format!(
+            r#"{{"format":{},"role":"intake","project":"p",
+                "ticket":{{"id":"T-1","title":"t","author":{{"name":"a","relation":"decider"}},"description":"d"}},
+                "decider":"a","permissions":{{"level":"read_only","network":false,"browser":false}},
+                "gate":[],"always_human":[],"result_path":"result.json"}}"#,
+            owlshift_contracts::format::BRIEF_FORMAT
+        ))
+        .unwrap();
+        let brief_file = Path::new("/tmp/run/run-files/brief.json");
+        let run = HarnessRun {
+            worktree: Path::new("/work"),
+            brief: &brief,
+            brief_file,
+            result_file: Path::new("/tmp/run/run-files/result.json"),
+            stop: None,
+        };
+        let allowed = |harness: &ClaudeHarness| {
+            let command = harness.command(&run).unwrap();
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let at = args.iter().position(|arg| arg == "--allowedTools").unwrap();
+            args[at + 1].clone()
+        };
+
+        let mut harness = claude(None);
+        let needs = harness.sandbox_needs(&agent).unwrap();
+        assert!(!needs.read_only && !needs.result_in_message, "{needs:?}");
+        assert_eq!(allowed(&harness), "Edit(/result.json)");
+        assert_eq!(harness.prompt_with(brief_file), prompt_with_brief(""));
+
+        harness.bash = true;
+        let needs = harness.sandbox_needs(&agent).unwrap();
+        assert!(needs.read_only && needs.result_in_message, "{needs:?}");
+        assert_eq!(allowed(&harness), "Bash");
+        let prompt = harness.prompt_with(brief_file);
+        assert!(
+            prompt.contains("The brief of this run is the file `/tmp/run/run-files/brief.json`.")
+                && !prompt.contains(BRIEF_PATH),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not write it, and make your last message that JSON, whole, with")
+                && !prompt.contains("schema"),
+            "{prompt}"
+        );
+    }
+
+    /// Codex's prompt is the shared one with its schema's words, as it was
+    /// before the text moved here (OWL-344).
+    #[test]
+    fn the_codex_prompt_keeps_its_text() {
+        assert_eq!(
+            super::super::codex::prompt_with_brief_file("# Verify\n\n", Path::new("/tmp/b.json")),
+            "# Verify\n\nThe brief of this run is the file `/tmp/b.json`. This harness gives you \
+             no way to write `result.json`: do not write it, and make your last message that \
+             JSON, whole, as the output schema describes, with nothing after it.\n"
+        );
     }
 
     #[test]

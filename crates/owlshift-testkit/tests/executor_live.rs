@@ -462,6 +462,7 @@ fn run_live_seeded(
         effort: Some(Effort::Low),
         max_budget_usd: None,
         login: Some(agent_login()),
+        bash: false,
     };
     let brief = Brief {
         format: Format,

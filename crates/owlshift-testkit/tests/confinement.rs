@@ -644,7 +644,10 @@ fn a_read_only_run_reads_its_result_from_its_own_files_alone() {
 /// What a read-only run tries, one `name=status` line each on its standard
 /// output: read the worktree, change a file there, create one, write in the
 /// repository's git folder, ask `git status`, read its brief, write in its
-/// own files folder; then it writes its result.
+/// own files folder; then what the resolver's Bash does to check a fact
+/// (OWL-344): `git log`, `git blame` and `grep`, and a write outside the
+/// worktree and the git folder, beside the worktree; then it writes its
+/// result.
 #[cfg(unix)]
 const READ_ONLY_PROBE: &str = r#"
 cat README.md > /dev/null 2>&1; echo "read=$?"
@@ -655,6 +658,10 @@ common=$(git rev-parse --path-format=absolute --git-common-dir)
 git --no-optional-locks status --porcelain > /dev/null 2>&1; echo "status=$?"
 test -r "$2"; echo "brief=$?"
 (echo own > "$(dirname "$1")/own") 2> /dev/null; echo "own=$?"
+git log --oneline > /dev/null 2>&1; echo "log=$?"
+git blame README.md > /dev/null 2>&1; echo "blame=$?"
+grep -rn hello README.md > /dev/null 2>&1; echo "grep=$?"
+(echo outside > "$(dirname "$PWD")/outside.txt") 2> /dev/null; echo "outside=$?"
 "#;
 
 /// OWL-298's acceptance through the executor, with the real sandbox
@@ -662,6 +669,16 @@ test -r "$2"; echo "brief=$?"
 /// run reads the worktree and git answers, but every write to the worktree
 /// and to the repository's git folder is refused; it reads its brief and
 /// writes its own files folder, where its result is read from.
+///
+/// It also stands for the confinement of the resolver's run with Bash
+/// (OWL-344), whose harness asks for the same profile: `git log`, `git
+/// blame` and `grep` succeed, and a write beside the worktree leaves
+/// nothing there. It checks the profile, not the resolver: a shell script
+/// stands in for Claude Code, whose run under the profile is the live check
+/// recorded in `docs/design/build-plan.md`, and the test is skipped where
+/// there is no sandbox. On macOS the outside write is refused; under bwrap,
+/// where the bench's folder can lie in the sandbox's private `/tmp`, it may
+/// land there and vanish with the run.
 #[cfg(unix)]
 #[test]
 fn a_read_only_run_reads_the_worktree_and_writes_only_its_own_files() {
@@ -688,7 +705,7 @@ fn a_read_only_run_reads_the_worktree_and_writes_only_its_own_files() {
                 .is_some_and(|rest| rest.starts_with('=') && rest != "=0")
         })
     };
-    for name in ["read", "status", "brief", "own"] {
+    for name in ["read", "status", "brief", "own", "log", "blame", "grep"] {
         assert!(
             probe.contains(&format!("{name}=0").as_str()),
             "{name}: {probe:?}"
@@ -697,6 +714,13 @@ fn a_read_only_run_reads_the_worktree_and_writes_only_its_own_files() {
     for name in ["edit", "create", "git"] {
         assert!(refused(name), "{name} was not refused: {probe:?}");
     }
+    if cfg!(target_os = "macos") {
+        assert!(refused("outside"), "outside was not refused: {probe:?}");
+    }
+    assert!(
+        !bench.tmp.path().join("outside.txt").exists(),
+        "a write beside the worktree reached it"
+    );
     assert_eq!(
         fs::read_to_string(bench.worktree.join("README.md")).unwrap(),
         "hello\n"

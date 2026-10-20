@@ -7,7 +7,7 @@
 //! adds, goes to the decider and never to the resolver, and so does the
 //! plan-approval question under `plan_approval = "always"`. Since OWL-342
 //! every other question every role raises goes to a run of the `resolver`
-//! role (`roles/resolver.md`), read-only and without network, whose brief
+//! role (`roles/resolver.md`), read-only with Bash (OWL-344), whose brief
 //! lists them in `resolve` beside the asking run's own output. Its outcome
 //! ([`outcome`])
 //! either decides or passes on each question, or, when the run gave no usable
@@ -41,9 +41,11 @@ use owlshift_core::gate::{ChainEnd, GatePolicy, Route};
 use crate::executor::Outcome;
 use crate::writer::{ReopenedChoice, flatten};
 
-/// The executor's deadline for a resolver run: a short role, like the answer
-/// check, that reads what it needs and decides.
-pub const RESOLVER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// The executor's deadline for a resolver run, the ticket's
+/// `resolver::DEADLINE` (OWL-344): longer than the answer check's, since the
+/// resolver reads the code and its history with Bash and, at delegation
+/// level `all`, weighs a trade-off on the deep tier.
+pub const RESOLVER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// The questions of a run, split by who settles them, each list in the run's
 /// order.

@@ -14,7 +14,7 @@ use std::time::Duration;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::config::{ProjectConfig, TrackerKind};
+use owlshift_contracts::config::{Models, ProjectConfig, TrackerKind};
 use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::{Role, Tier};
@@ -188,8 +188,8 @@ fn run_with(
             .and_then(|claude| claude.budget_usd),
         _ => None,
     };
-    // The standard tier without an effort, as section 9 routes intake, the
-    // resolver and the answer check.
+    // The standard tier without an effort, as section 9 routes intake and
+    // the answer check; the resolver's router routes each of its runs.
     let harness = ClaudeHarness {
         program: claude,
         prompt,
@@ -197,6 +197,7 @@ fn run_with(
         effort: None,
         max_budget_usd: budget,
         login,
+        bash: false,
     };
     // Build on the ticket's routing (OWL-305): the tier of each run picks
     // its model from `[models]`.
@@ -210,10 +211,7 @@ fn run_with(
         prompt: check_prompt,
         ..harness.clone()
     };
-    let resolver = ClaudeHarness {
-        prompt: resolver_prompt,
-        ..harness.clone()
-    };
+    let resolver = resolver_router(&harness, resolver_prompt, &project.models);
     // Intake (OWL-248) on the standard tier.
     let intake = ClaudeHarness {
         prompt: intake_prompt,
@@ -321,6 +319,20 @@ fn run_with(
         &outcome,
         &mut sink,
     ))
+}
+
+/// The resolver's router (OWL-344): the shared harness with the resolver's
+/// prompt and Bash, inside the read-only profile, on the tier and effort
+/// `OnDemand::resolve` routes each run to.
+fn resolver_router(harness: &ClaudeHarness, prompt: String, models: &Models) -> ClaudeRouter {
+    ClaudeRouter {
+        harness: ClaudeHarness {
+            prompt,
+            bash: true,
+            ..harness.clone()
+        },
+        models: models.clone(),
+    }
 }
 
 /// The project file `command` works with, and its path, from a valid
@@ -452,6 +464,38 @@ mod tests {
         fn sentinel(&self) -> SentinelStatus {
             self.0.clone()
         }
+    }
+
+    /// OWL-344: the resolver runs with Bash, on its own prompt, the shared
+    /// harness's program, login and budget kept.
+    #[test]
+    fn the_resolver_is_built_with_bash() {
+        let shared = ClaudeHarness {
+            program: PathBuf::from("/opt/claude"),
+            prompt: "# Build".to_owned(),
+            model: Some("sonnet".to_owned()),
+            effort: None,
+            max_budget_usd: Some(3.0),
+            login: None,
+            bash: false,
+        };
+        let models = Models {
+            deep: None,
+            standard: None,
+            fast: None,
+        };
+        let router = resolver_router(&shared, "# Resolver".to_owned(), &models);
+        assert_eq!(
+            router,
+            ClaudeRouter {
+                harness: ClaudeHarness {
+                    prompt: "# Resolver".to_owned(),
+                    bash: true,
+                    ..shared.clone()
+                },
+                models,
+            }
+        );
     }
 
     /// What the end of a refused run writes, on stdout and on stderr.

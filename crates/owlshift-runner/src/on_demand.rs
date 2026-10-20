@@ -105,7 +105,7 @@ use owlshift_core::gate::{Chain, ChainCost, GatePolicy};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::Resource;
 use owlshift_core::routing::{
-    PROJECT_DEFAULT, RunRouting, TicketRouting, role_routing, ticket_routing,
+    PROJECT_DEFAULT, RunRouting, TicketRouting, resolver_routing, role_routing, ticket_routing,
 };
 use owlshift_core::state::{Event, MAX_REASKS, ParkReason, Status, TicketState, Transition};
 
@@ -124,7 +124,7 @@ use crate::quarantine;
 use crate::rebase;
 use crate::resolver::{self, Fallback, Quotable, Resolved};
 use crate::reversal;
-use crate::routing::{Router, claude_model, route_labels, ticket_variant};
+use crate::routing::{RouteLabels, Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
@@ -427,8 +427,11 @@ pub struct OnDemand<'a> {
     pub arbiter: &'a dyn Router,
     /// Runs the answer check (`roles/answer_check.md`).
     pub answer_check: &'a dyn Harness,
-    /// Runs the resolver (`roles/resolver.md`).
-    pub resolver: &'a dyn Harness,
+    /// Runs the resolver (`roles/resolver.md`) with Bash inside the
+    /// read-only profile, on the deep tier at the ticket's effort at
+    /// delegation level `all`, the standard tier without an effort below
+    /// (OWL-344).
+    pub resolver: &'a dyn Router,
     /// Runs the rebase role (`roles/rebase.md`), without an effort: on the
     /// fast tier for a trivial conflict's first run, on the ticket's tier for
     /// a non-trivial conflict or a retry after a failed fast run (OWL-210,
@@ -1188,6 +1191,29 @@ struct Dispatched {
     build: RunRouting,
 }
 
+/// A ticket's routing as read now, and what it was read from: its labels
+/// and intake's verdict, none for a ticket intake never ran on.
+struct RoutingReading {
+    labels: RouteLabels,
+    verdict: Option<result::Routing>,
+    routing: TicketRouting,
+}
+
+/// Reads a ticket's routing (OWL-305): intake's verdict from the ticket's
+/// record under the `tier:` and `effort:` labels the ticket carries now.
+/// No event: [`OnDemand::route`] tells a dispatch's, and the resolver takes
+/// the routing alone (OWL-344).
+fn read_routing(p: &Prepared) -> RoutingReading {
+    let labels = route_labels(p.found.labels.iter().map(String::as_str));
+    let verdict = p.intake.as_ref().map(|record| record.routing);
+    let routing = ticket_routing(verdict, labels.tier, labels.effort);
+    RoutingReading {
+        labels,
+        verdict,
+        routing,
+    }
+}
+
 /// Where a dispatch's project file came from (OWL-331): the commit its
 /// runs are configured at, or, when that commit has none, the person's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1606,10 +1632,11 @@ impl OnDemand<'_> {
         let reviewer = self.design_review.harness(PROJECT_DEFAULT);
         let verifier = self.verify.harness(PROJECT_DEFAULT);
         let arbiter = self.arbiter.harness(PROJECT_DEFAULT);
+        let resolver = self.resolver.harness(PROJECT_DEFAULT);
         for harness in [
             &*build,
             self.answer_check,
-            self.resolver,
+            &*resolver,
             self.intake,
             &*design,
             &*reviewer,
@@ -2013,7 +2040,11 @@ impl OnDemand<'_> {
         command: Command,
         sink: &mut EventSink<'_>,
     ) -> (TicketRouting, RunRouting) {
-        let labels = route_labels(p.found.labels.iter().map(String::as_str));
+        let RoutingReading {
+            labels,
+            verdict,
+            routing,
+        } = read_routing(p);
         for left_out in &labels.ignored {
             sink.emit(
                 &p.ticket,
@@ -2026,8 +2057,6 @@ impl OnDemand<'_> {
                 ]),
             );
         }
-        let verdict = p.intake.as_ref().map(|record| record.routing);
-        let routing = ticket_routing(verdict, labels.tier, labels.effort);
         let build = role_routing(Role::Build, routing).expect("the build role follows the ticket");
         let from = |label: bool| match (label, verdict.is_some()) {
             (true, _) => "label",
@@ -2710,7 +2739,12 @@ impl OnDemand<'_> {
             timeout: resolver::RESOLVER_TIMEOUT,
             ..self.executor.clone()
         };
-        let ran = self.execute(p, &executor, self.resolver, &brief, 1, sink)?;
+        // At `all`, deep at the ticket's effort (OWL-344); the routing read
+        // as a dispatch reads it, at Intake and Watch too, which hold none.
+        let harness = self
+            .resolver
+            .harness(resolver_routing(level, read_routing(p).routing));
+        let ran = self.execute(p, &executor, &*harness, &brief, 1, sink)?;
         p.chain.resolved(run_cost(&ran));
         if ran.breaches.is_empty() {
             self.keep_resolver_refusal(p, state, &ran.report.outcome)?;

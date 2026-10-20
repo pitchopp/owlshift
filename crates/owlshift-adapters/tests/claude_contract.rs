@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use owlshift_adapters::harness::claude::{
-    Billing, EXIT_GRACE, Failure, Outcome, RateLimitStatus, Request, Run, Transcript, command,
-    drive,
+    Billing, CommandError, EXIT_GRACE, Effort, Failure, Outcome, RateLimitStatus, Request, Run,
+    Transcript, command, drive,
 };
 use owlshift_adapters::harness::tested::is_tested;
 use owlshift_contracts::Harness;
@@ -188,6 +188,7 @@ fn the_read_only_result_survives_a_cd() {
         result_path: RelativePath::new(".owlshift/result.json").unwrap(),
         json_schema: None,
         max_budget_usd: None,
+        bash: false,
     };
     let args: Vec<String> = command(Path::new("claude"), &request)
         .unwrap()
@@ -196,6 +197,8 @@ fn the_read_only_result_survives_a_cd() {
         .collect();
     let at = args.iter().position(|arg| arg == "--allowedTools").unwrap();
     assert_eq!(args[at + 1], "Edit(/.owlshift/result.json)");
+    // Bash is the resolver's alone (OWL-344).
+    assert!(!args.iter().any(|arg| arg == "Bash"), "{args:?}");
 
     let name = "read_only_after_cd.jsonl";
     assert_eq!(writes_after_cd(name), (false, true));
@@ -301,34 +304,122 @@ fn sorted<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     names
 }
 
-/// The command line of every kind of launch: both permission levels, with
-/// and without network, with a JSON Schema.
+/// The command line of every kind of launch: both permission levels and the
+/// resolver's read-only launch with Bash (OWL-344), with and without network,
+/// with a JSON Schema.
 fn every_launch() -> Vec<(PermissionLevel, bool, Vec<String>)> {
     let mut launches = Vec::new();
-    for level in [PermissionLevel::ReadOnly, PermissionLevel::WriteWorktree] {
+    for (level, bash) in [
+        (PermissionLevel::ReadOnly, false),
+        (PermissionLevel::ReadOnly, true),
+        (PermissionLevel::WriteWorktree, false),
+    ] {
         for network in [true, false] {
-            let request = Request {
-                workdir: PathBuf::from("/work"),
-                model: None,
-                effort: None,
-                permissions: Permissions {
-                    level,
-                    network,
-                    browser: false,
-                },
-                result_path: RelativePath::new(".owlshift/result.json").unwrap(),
-                json_schema: Some(r#"{"type":"object"}"#.into()),
-                max_budget_usd: None,
-            };
-            let args = command(Path::new("claude"), &request)
-                .unwrap()
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect();
+            let args = launch_args(&launch(level, network, bash)).unwrap();
             launches.push((level, network, args));
         }
     }
     launches
+}
+
+/// A launch at `level`, with or without network and Bash, with a JSON
+/// Schema.
+fn launch(level: PermissionLevel, network: bool, bash: bool) -> Request {
+    Request {
+        workdir: PathBuf::from("/work"),
+        model: None,
+        effort: None,
+        permissions: Permissions {
+            level,
+            network,
+            browser: false,
+        },
+        result_path: RelativePath::new(".owlshift/result.json").unwrap(),
+        json_schema: Some(r#"{"type":"object"}"#.into()),
+        max_budget_usd: None,
+        bash,
+    }
+}
+
+/// The arguments `command` gives a request.
+fn launch_args(request: &Request) -> Result<Vec<String>, CommandError> {
+    Ok(command(Path::new("claude"), request)?
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// The resolver's launch (OWL-344): `dontAsk` with bare `Bash` as its one
+/// allowed tool and no `Edit(...)` rule, with or without network, the argv
+/// of the live check recorded in `docs/design/build-plan.md`. Bash is a
+/// flag of the read-only level only: a run that writes the worktree already
+/// allows every tool, so the flag there is refused.
+#[test]
+fn the_resolver_argv_allows_bash_without_an_edit_rule() {
+    for network in [true, false] {
+        let args = launch_args(&launch(PermissionLevel::ReadOnly, network, true)).unwrap();
+        let case = format!("network {network}: {args:?}");
+        let mode = positions(&args, "--permission-mode");
+        assert_eq!(mode.len(), 1, "{case}");
+        assert_eq!(args[mode[0] + 1], "dontAsk", "{case}");
+        let allowed = positions(&args, "--allowedTools");
+        assert_eq!(allowed.len(), 1, "{case}");
+        let tools: Vec<&String> = args[allowed[0] + 1..]
+            .iter()
+            .take_while(|arg| !arg.starts_with("--"))
+            .collect();
+        assert_eq!(tools, ["Bash"], "{case}");
+        assert!(!args.iter().any(|arg| arg.starts_with("Edit(")), "{case}");
+    }
+
+    let mut resolver = launch(PermissionLevel::ReadOnly, false, true);
+    resolver.json_schema = None;
+    resolver.model = Some("claude-sonnet-5-5".into());
+    resolver.effort = Some(Effort::Low);
+    let expected = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "claude-sonnet-5-5",
+        "--effort",
+        "low",
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools",
+        "Bash",
+        "--permission-prompts",
+        "none",
+        "--disallowedTools",
+        "RemoteTrigger",
+        "PushNotification",
+        "DesignSync",
+        "Workflow",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "SendMessage",
+        "ListAgents",
+        "EnterWorktree",
+        "ExitWorktree",
+        "Agent",
+        "WebFetch",
+        "WebSearch",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--settings",
+        r#"{"crossSessionInbound":"refuse"}"#,
+        "--no-session-persistence",
+    ];
+    assert_eq!(launch_args(&resolver).unwrap(), expected);
+
+    assert!(matches!(
+        launch_args(&launch(PermissionLevel::WriteWorktree, true, true)),
+        Err(CommandError::Unsupported(_))
+    ));
 }
 
 /// Where `flag` stands in `args`.

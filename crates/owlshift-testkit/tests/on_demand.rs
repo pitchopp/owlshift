@@ -2578,6 +2578,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         effort: None,
         max_budget_usd: None,
         login: None,
+        bash: false,
     };
     let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let config = ProjectConfig::parse(&config_text).unwrap();
@@ -2601,7 +2602,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         verify: &router,
         arbiter: &router,
         answer_check: &harness,
-        resolver: &harness,
+        resolver: &router,
         rebase: &router,
         remote_url: &remote_url,
         config: &config,
@@ -2657,6 +2658,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         effort: None,
         max_budget_usd: None,
         login: None,
+        bash: false,
     };
     let config_text = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let config = ProjectConfig::parse(&config_text).unwrap();
@@ -2680,7 +2682,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         verify: &router,
         arbiter: &router,
         answer_check: &harness,
-        resolver: &harness,
+        resolver: &router,
         rebase: &router,
         remote_url: &remote_url,
         config: &config,
@@ -10549,6 +10551,71 @@ fn a_bad_role_table_does_not_refuse_a_rebase() {
         )],
     );
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+}
+
+/// OWL-344: at delegation level `all` the resolver run is routed to the deep
+/// tier at the ticket's effort, none without an `effort:` label; at
+/// `discoverable` to the standard tier without an effort. At Intake, which
+/// has no verdict yet, the effort is the label's.
+#[test]
+fn the_resolver_runs_deep_at_the_tickets_effort_at_all() {
+    for (level, labels, resolver) in [
+        (
+            "all",
+            &["effort:high"][..],
+            claude(Tier::Deep, Some(Effort::High)),
+        ),
+        (
+            "discoverable",
+            &["effort:high"][..],
+            claude(Tier::Standard, None),
+        ),
+        ("all", &[][..], claude(Tier::Deep, None)),
+    ] {
+        let bench = Bench::new(true);
+        bench.policy(&format!("resolver_delegation = \"{level}\""));
+        bench.add_labels(labels);
+        let (delivered, printed) = bench.run(
+            vec![
+                bench.reply(None, Some(TWO_NAMINGS)),
+                bench.reply(None, Some(DECIDED_BOTH)),
+                bench.reply(Some("Hello"), Some(DONE)),
+            ],
+            None,
+        );
+        delivered.unwrap_or_else(|stop| panic!("{level} {labels:?}: {stop}\n{printed}"));
+        let build = claude(Tier::Standard, labels.first().map(|_| Effort::High));
+        assert_eq!(
+            bench.routed(),
+            [build, resolver, build],
+            "{level} {labels:?}: the Build, its resolver, the Build"
+        );
+    }
+
+    let bench = Bench::drained();
+    bench.policy("resolver_delegation = \"all\"");
+    bench.add_labels(&["effort:high"]);
+    let asks = bench.reply(
+        None,
+        Some(&intake_result(
+            "questions",
+            None,
+            r#"[{"id":"Q1","category":"naming","context":"The repository has no greeting yet.",
+                "text":"Which file should hold the greeting?","recommendation":{"why":"The simplest reading of the ticket."}}]"#,
+        )),
+    );
+    let done = bench.reply(None, Some(&intake_result("done", None, "[]")));
+    bench
+        .intake(
+            vec![asks, bench.reply(None, Some(DECIDED_Q1)), done],
+            gesture("maintainer"),
+        )
+        .unwrap();
+    assert_eq!(
+        bench.routed(),
+        [claude(Tier::Deep, Some(Effort::High))],
+        "intake's resolver alone is routed"
+    );
 }
 
 /// OWL-312: the resolver an intake pass runs for the questions intake raises
