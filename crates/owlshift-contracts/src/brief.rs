@@ -206,8 +206,10 @@ pub struct Brief {
     pub review: Option<ReviewBrief>,
     /// Reviews submitted on the delivered pull request (format 15): what a
     /// review loop's Build run follows when its author is the decider, and
-    /// quoted data otherwise. In Build's brief only, at most
-    /// [`MAX_PULL_REQUEST_REVIEW_BYTES`] each.
+    /// quoted data otherwise; a review loop's Verify reviewers and arbiter
+    /// are given them too (format 25, OWL-396), as the decider's word on
+    /// the change they judge. In the build, verify and arbiter briefs only,
+    /// at most [`MAX_PULL_REQUEST_REVIEW_BYTES`] each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pull_request_reviews: Vec<PullRequestReview>,
     /// Where the role writes `result.json`, relative to the worktree.
@@ -1191,8 +1193,13 @@ impl Brief {
             None if !reviews => {}
             _ => return mismatch("a review", "the design review and verify roles, always"),
         }
-        if !self.pull_request_reviews.is_empty() && role != Role::Build {
-            return mismatch("pull request reviews", "build only");
+        if !self.pull_request_reviews.is_empty()
+            && !matches!(role, Role::Build | Role::Verify | Role::Arbiter)
+        {
+            return mismatch(
+                "pull request reviews",
+                "the build, verify and arbiter roles",
+            );
         }
         for review in &self.pull_request_reviews {
             if let Some(broken) = pull_request_review_problem(review) {

@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 24
+      "const": 25
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -138,7 +138,7 @@
       "type": "string"
     },
     "pull_request_reviews": {
-      "description": "Reviews submitted on the delivered pull request (format 15): what a\nreview loop's Build run follows when its author is the decider, and\nquoted data otherwise. In Build's brief only, at most\n[`MAX_PULL_REQUEST_REVIEW_BYTES`] each.",
+      "description": "Reviews submitted on the delivered pull request (format 15): what a\nreview loop's Build run follows when its author is the decider, and\nquoted data otherwise; a review loop's Verify reviewers and arbiter\nare given them too (format 25, OWL-396), as the decider's word on\nthe change they judge. In the build, verify and arbiter briefs only,\nat most [`MAX_PULL_REQUEST_REVIEW_BYTES`] each.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/PullRequestReview"
