@@ -1,11 +1,11 @@
 //! `owlshift init`'s GitHub sign-in through Owlshift's GitHub App (OWL-336,
 //! GA2; build plan, "`init`", "The GitHub sign-in").
 //!
-//! A stored app token that works is kept: one that reads, is not past its
-//! stored expiry, and is not refused. Its refresh is the Writer's, under the
-//! account lock, which GA3 brings; until then a token past its expiry counts
-//! as none, as `owlshift do` reads it ([`crate::forge`]), and `init` signs in
-//! again. The sign-in shows the device code and polls at GitHub's interval
+//! A stored app token that works is kept: one that reads and that GitHub
+//! accepts, refreshed first through the Writer's refresh under the account
+//! lock when past its stored expiry or refused ([`crate::github_token`],
+//! OWL-384). One whose refresh is refused or whose rotation is lost counts
+//! as none, and `init` signs in again. The sign-in shows the device code and polls at GitHub's interval
 //! until the code's life ends; then C12's installation lookup must list the
 //! repository, or the install link is shown and the lookup made again every
 //! [`INSTALL_POLL`] for [`INSTALL_WAIT`]. The token is stored only once an
@@ -14,16 +14,18 @@
 //! nothing of an answer's body is ever said: GitHub's failures are told by
 //! their kind alone.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
-use owlshift_adapters::forge::github::{GitHubForge, Token};
+use owlshift_adapters::forge::github::{GitHubForge, Installation, Token};
 use owlshift_adapters::forge::github_app::{AppError, DeviceCode, DeviceFlow, Login, Poll};
 use owlshift_adapters::forge::{Error, ErrorKind, Repo};
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
-use crate::forge::{GitHubApp, token_at};
-use crate::secrets::{ForgeAccount, ForgeSecret};
+use crate::forge::GitHubApp;
+use crate::github_token::AppToken;
+use crate::secrets::ForgeAccount;
 
 /// How often the installation is looked up again once the install link is
 /// shown.
@@ -54,20 +56,24 @@ impl Wait for SystemWait {
     }
 }
 
-/// GitHub, as the sign-in reaches it: the app's device flow, and the REST
-/// API through a token (`connect`), which the installation lookup reads.
+/// GitHub, as the sign-in reaches it: the app's device flow, which also
+/// refreshes a stored token under the account lock file `lock`
+/// ([`crate::github_token`]), and the REST API through a token (`connect`),
+/// which the installation lookup reads.
 pub struct GitHub<L: Login> {
     pub flow: DeviceFlow<L>,
     pub connect: Box<dyn Fn(Token) -> GitHubForge>,
+    pub lock: PathBuf,
 }
 
 impl<L: Login> GitHub<L> {
-    /// GitHub over HTTPS for `repo`, through `flow`.
-    pub fn live(flow: DeviceFlow<L>, repo: &Repo) -> Self {
+    /// GitHub over HTTPS for `repo`, through `flow`, refreshing under `lock`.
+    pub fn live(flow: DeviceFlow<L>, repo: &Repo, lock: PathBuf) -> Self {
         let repo = repo.clone();
         Self {
             flow,
             connect: Box::new(move |token| GitHubForge::new(token, repo.clone())),
+            lock,
         }
     }
 }
@@ -111,8 +117,9 @@ pub struct Ask {
 }
 
 /// Makes sure the project of `repo` holds a working app token under its
-/// account `github-app`, signing in through `app` on `github` when it does
-/// not; `say` is told each step a person must act on or wait for.
+/// account `github-app`, a stored one refreshed under `github`'s account
+/// lock, signing in through `app` on `github` when it does not; `say` is
+/// told each step a person must act on or wait for.
 pub fn step<L: Login>(
     keychain: &Keychain,
     repo: &Repo,
@@ -129,32 +136,23 @@ pub fn step<L: Login>(
             Err(error) => return Outcome::Failed(error.to_string()),
         };
         if let Some(entry) = stored {
-            let found = ForgeSecret {
-                account: account.clone(),
-                token: Some(entry),
-            };
-            match token_at(&found, wait.now()) {
-                Ok(token) => {
-                    let forge = (github.connect)(token);
-                    match forge.app_installation(&app.slug) {
-                        Ok(Some(_)) => return Outcome::Kept,
-                        Ok(None) => {
-                            return match installed(&forge, repo, app, wait, ask.terminal, say) {
-                                Ok(()) => Outcome::Kept,
-                                Err(outcome) => outcome,
-                            };
-                        }
-                        Err(error) if error.kind == ErrorKind::Unauthorized => say(
-                            "GitHub refuses the GitHub App's token stored for this project: \
-                             signing in again.",
-                        ),
-                        Err(error) => return Outcome::Failed(words(&error)),
-                    }
+            match stored_installation(keychain, &account.token, &entry, app, github, wait) {
+                Ok((_, Some(_))) => return Outcome::Kept,
+                Ok((forge, None)) => {
+                    return match installed(&forge, repo, app, wait, ask.terminal, say) {
+                        Ok(()) => Outcome::Kept,
+                        Err(outcome) => outcome,
+                    };
                 }
-                Err(_) => say(
-                    "The GitHub App's token stored for this project has expired or does not \
-                     read: signing in again.",
+                Err(error) if error.kind == ErrorKind::SignInAgain => say(
+                    "The GitHub App's token stored for this project can no longer be refreshed \
+                     or does not read: signing in again.",
                 ),
+                Err(error) if error.kind == ErrorKind::Unauthorized => say(
+                    "GitHub refuses the GitHub App's token stored for this project: signing in \
+                     again.",
+                ),
+                Err(error) => return Outcome::Failed(words(&error)),
             }
         }
     }
@@ -182,6 +180,37 @@ pub fn step<L: Login>(
              `{}` failed: {error}",
             account.token
         )),
+    }
+}
+
+/// The installation lookup made with the app token stored as `entry`
+/// under `account`, through the Writer's refresh ([`AppToken`], OWL-384):
+/// refreshed first when past its stored expiry, and once more when GitHub
+/// refuses it (`forge::Error` does not tell a 401 from a 403 here, so
+/// either gets the one refresh). The forge it was made with, for the
+/// install wait.
+fn stored_installation<L: Login>(
+    keychain: &Keychain,
+    account: &str,
+    entry: &Secret,
+    app: &GitHubApp,
+    github: &GitHub<L>,
+    wait: &dyn Wait,
+) -> Result<(GitHubForge, Option<Installation>), Error> {
+    let mut source = AppToken::new(keychain, account, github.lock.clone(), &github.flow, entry)?;
+    let token = source.token_at(wait.now())?;
+    let forge = (github.connect)(token.clone());
+    match forge.app_installation(&app.slug) {
+        Err(error) if error.kind == ErrorKind::Unauthorized => {
+            let Some(next) = source.refused_at(&token, wait.now())? else {
+                return Err(error);
+            };
+            let forge = (github.connect)(next);
+            forge
+                .app_installation(&app.slug)
+                .map(|found| (forge, found))
+        }
+        looked => looked.map(|found| (forge, found)),
     }
 }
 
@@ -292,7 +321,9 @@ fn ended(error: AppError) -> Outcome {
 /// message, which is not repeated.
 fn words(error: &Error) -> String {
     match error.kind {
-        ErrorKind::Unauthorized => "GitHub refused the GitHub App's token".to_owned(),
+        ErrorKind::Unauthorized | ErrorKind::SignInAgain => {
+            "GitHub refused the GitHub App's token".to_owned()
+        }
         ErrorKind::RateLimited => "GitHub's rate limit is spent: try again later".to_owned(),
         ErrorKind::NotFound | ErrorKind::HeadMoved | ErrorKind::Other => {
             "the GitHub App's installations could not be read from GitHub".to_owned()
@@ -403,6 +434,8 @@ mod tests {
         rest: Arc<Rest>,
         wait: FakeWait,
         said: Vec<String>,
+        /// Holds the account lock's file.
+        dir: tempfile::TempDir,
     }
 
     impl Run {
@@ -415,6 +448,7 @@ mod tests {
                 }),
                 wait: FakeWait(Cell::new(start())),
                 said: Vec::new(),
+                dir: tempfile::tempdir().unwrap(),
             }
         }
 
@@ -425,6 +459,7 @@ mod tests {
                 connect: Box::new(move |_: Token| {
                     GitHubForge::with_transport(Shared(Arc::clone(&rest)), repo())
                 }),
+                lock: self.dir.path().join("github-app.lock"),
             };
             let said = &mut self.said;
             let outcome = step(
@@ -450,6 +485,23 @@ mod tests {
 
         fn store_app(&self, expires_at: Timestamp) {
             let entry = UserToken::new("ghu_SENTINEL_old", None, Some(expires_at), None);
+            self.keychain
+                .store(
+                    &ForgeAccount::project_app(&repo()).token,
+                    &Secret::new(entry.to_entry()),
+                )
+                .unwrap();
+        }
+
+        /// An app token with a refresh token, as user-token expiration
+        /// stores it (C13).
+        fn store_refreshable(&self, expires_at: Timestamp) {
+            let entry = UserToken::new(
+                "ghu_SENTINEL_old",
+                Some("ghr_SENTINEL_old".to_owned()),
+                Some(expires_at),
+                None,
+            );
             self.keychain
                 .store(
                     &ForgeAccount::project_app(&repo()).token,
@@ -598,6 +650,42 @@ mod tests {
         };
         assert_eq!(run.step(replace), Outcome::Stored);
         assert_eq!(stored_access(&run.app_entry().unwrap()), "ghu_SENTINEL_new");
+    }
+
+    /// OWL-384: a stored token past its expiry goes through the Writer's
+    /// refresh and is kept, the rotated pair stored; one GitHub refuses is
+    /// refreshed once and kept; one whose refresh is refused counts as
+    /// none, and a new sign-in replaces it.
+    #[test]
+    fn a_stored_token_is_refreshed_and_kept_or_replaced_once_its_refresh_is_refused() {
+        let refreshed = r#"{"access_token":"ghu_SENTINEL_rotated","expires_in":28800,"refresh_token":"ghr_SENTINEL_rotated","refresh_token_expires_in":15724800,"token_type":"bearer"}"#;
+        let later = Timestamp::from_second(start().as_second() + 3600).unwrap();
+        for (expires_at, installations) in [
+            (start(), vec![INSTALLED]),
+            (later, vec![REFUSED, INSTALLED]),
+        ] {
+            let mut run = Run::new(&[refreshed], &installations);
+            run.store_refreshable(expires_at);
+            assert_eq!(run.step(ON_A_TERMINAL), Outcome::Kept);
+            assert_eq!(
+                stored_access(&run.app_entry().unwrap()),
+                "ghu_SENTINEL_rotated"
+            );
+            assert!(run.said.is_empty(), "{:?}", run.said);
+        }
+
+        let mut run = Run::new(
+            &[r#"{"error":"bad_refresh_token"}"#, CODE, GRANTED],
+            &[INSTALLED],
+        );
+        run.store_refreshable(start());
+        assert_eq!(run.step(ON_A_TERMINAL), Outcome::Stored);
+        assert_eq!(stored_access(&run.app_entry().unwrap()), "ghu_SENTINEL_new");
+        assert!(
+            run.said[0].contains("can no longer be refreshed"),
+            "{:?}",
+            run.said
+        );
     }
 
     /// A stored token that no installation lists gets the install link, not

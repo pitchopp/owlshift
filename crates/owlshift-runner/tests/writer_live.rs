@@ -18,6 +18,7 @@
 //! as `owlshift do` will use them. Neither is ever printed.
 
 use std::process::Command;
+use std::sync::Arc;
 
 use owlshift_adapters::forge::{Branch, Repo};
 use owlshift_adapters::tracker::Tracker;
@@ -25,7 +26,7 @@ use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::result::Decision;
 use owlshift_platform::keychain::{Keychain, Secret};
-use owlshift_runner::forge::{GITHUB_ACCOUNT, github};
+use owlshift_runner::forge::{AppAccess, GITHUB_ACCOUNT, GitHubApp, github};
 use owlshift_runner::secrets;
 use owlshift_runner::tracker::{LINEAR_ACCOUNT, linear};
 use owlshift_runner::writer::{DeliveryReport, Gate, Writer};
@@ -66,7 +67,7 @@ fn posts_the_delivery_report_on_a_real_ticket() {
     let repo = Repo::parse(&required("OWLSHIFT_LIVE_GITHUB")).unwrap();
     let branch = Branch::new(required("OWLSHIFT_LIVE_BRANCH")).unwrap();
 
-    let keychain = Keychain::in_memory();
+    let keychain = Arc::new(Keychain::in_memory());
     keychain.store(LINEAR_ACCOUNT, &linear_key()).unwrap();
     keychain.store(GITHUB_ACCOUNT, &github_token()).unwrap();
     // No Linear app is stored here: the report goes through the key.
@@ -74,7 +75,14 @@ fn posts_the_delivery_report_on_a_real_ticket() {
     // Resolved as `owlshift do` resolves them: the shared accounts here.
     let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
     let tracker = linear(&secrets::tracker(&repo, &mut look).unwrap(), team).unwrap();
-    let forge = github(&secrets::forge(&repo, &mut look).unwrap(), repo).unwrap();
+    // A personal token: the app's account lock is never taken.
+    let dir = tempfile::tempdir().unwrap();
+    let access = AppAccess {
+        keychain: keychain.clone(),
+        lock: dir.path().join("github-app.lock"),
+        app: GitHubApp::from_personal(None),
+    };
+    let forge = github(&secrets::forge(&repo, &mut look).unwrap(), repo, &access).unwrap();
 
     assert_eq!(tracker.ticket(&ticket).unwrap().id, ticket);
     let pull_request = forge

@@ -22,6 +22,7 @@ use owlshift_runner::init::{
     AppStored, GITHUB_TOKEN, InitOptions, SecretsReport, Wanted, Written, project_file,
     required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_project_file,
 };
+use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::secrets::{ForgeAccount, TrackerAccounts};
 use owlshift_runner::tracker::{self, app_credentials};
 use owlshift_runner::{on_demand, project};
@@ -218,7 +219,15 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                 FileState::Loaded { config, .. } => Some(config),
                 _ => None,
             });
-            let github = GitHub::live(DeviceFlow::new(HttpLogin::new(), &app.client_id), repo);
+            // A stored token is refreshed under the project's account lock,
+            // as `owlshift do` refreshes it (OWL-384). Without a data
+            // directory no `do` runs to share it with, so any lock file does.
+            let lock = crate::data_dir().map_or_else(
+                |_| std::env::temp_dir().join("owlshift-github-app.lock"),
+                |dir| ProjectDirs::new(&dir, repo).account_lock_file(),
+            );
+            let flow = DeviceFlow::new(HttpLogin::new(), &app.client_id);
+            let github = GitHub::live(flow, repo, lock);
             let ask = Ask {
                 replace: args.replace_secrets,
                 terminal,

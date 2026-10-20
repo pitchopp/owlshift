@@ -409,6 +409,13 @@ pub enum ErrorKind {
     /// 403 or 429 with no budget left or a `Retry-After`. Nothing is read
     /// again before [`Error::resets_at`], when the answer gave it.
     RateLimited,
+    /// The GitHub App's token can no longer be refreshed: GitHub refused
+    /// its refresh (a revoked authorization, a refresh token past its life
+    /// or already used), or a rotation was lost before its keychain write
+    /// (architecture section 8, the refresh-failure rule). Trying again
+    /// cannot help, and no other credential is tried: the message names
+    /// `owlshift init`, which signs in again.
+    SignInAgain,
     /// Anything else: transport, a refused request, a malformed or
     /// incomplete answer.
     Other,
