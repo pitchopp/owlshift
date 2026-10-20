@@ -28,7 +28,9 @@ use crate::Role;
 /// `pull_request_reviews`, and a question's `replan` (OWL-300); format 16 a
 /// question's lettered options and structured recommendation (OWL-324);
 /// format 17 the resolver's `delegation` (OWL-337); format 18 the
-/// resolver's `asked_by` and a question's `finding` in `resolve` (OWL-343);
+/// resolver's `asked_by` and a question's `finding` in `resolve` (OWL-343),
+/// the latter removed in format 23 without a bump, as no runner wrote it
+/// since OWL-377 (OWL-379);
 /// format 19 the thread's `answered` entries and a decision's short
 /// question (OWL-359); format 20 leaves the plan's `forks` and
 /// `alternatives` out of Build's brief (OWL-365); format 21 adds a review

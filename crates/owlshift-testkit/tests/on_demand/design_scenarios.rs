@@ -1586,7 +1586,6 @@ fn a_finding_the_design_turns_into_a_scope_question_reaches_the_decider() {
     let resolver = bench.last_of(Role::Resolver);
     let asked = resolver.asked_by.as_ref().unwrap();
     assert_eq!(asked.role, Role::Design);
-    assert!(resolver.resolve[0].finding.is_none(), "no residue question");
     let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
     assert_eq!(resolved[0]["refused"], json!(["Q1"]));
     let record = bench.record();

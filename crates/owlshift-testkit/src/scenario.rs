@@ -1260,7 +1260,7 @@ impl Driver {
                 &current,
             ),
             resolve: if role == Role::Resolver {
-                resolver::unlabelled(&self.resolving, &[])
+                resolver::unlabelled(&self.resolving)
             } else {
                 Vec::new()
             },

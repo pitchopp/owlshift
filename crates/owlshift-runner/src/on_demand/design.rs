@@ -2133,7 +2133,6 @@ impl OnDemand<'_> {
             questions: &asked,
             reopened: &[],
             direct: &direct,
-            findings: &[],
             kept_findings: &findings,
             plan: Some(GivenPlan {
                 base: kept.base.clone(),

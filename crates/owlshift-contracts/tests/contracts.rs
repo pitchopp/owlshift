@@ -1250,14 +1250,13 @@ fn resolutions_against_the_brief() {
          level is given",
     );
     // The asking run (format 18, OWL-343): in the resolver's brief, always,
-    // and only there, its plan's and diff's bases full commit ids; a
-    // residue question names its finding.
+    // and only there, its plan's and diff's bases full commit ids.
     let asking = |asked_by: Option<Value>| {
         Brief::parse(&edited("brief.json", |v| {
             v["role"] = json!("resolver");
             v["delegation"] = json!("all");
             v["resolve"] = json!([{ "id": "Q1", "context": "c", "text": "t",
-                "recommendation": { "why": "r" }, "finding": "F2" }]);
+                "recommendation": { "why": "r" } }]);
             v["permissions"]["level"] = json!("read_only");
             v.as_object_mut().unwrap().remove("result_refusal");
             match asked_by {
@@ -1276,7 +1275,15 @@ fn resolutions_against_the_brief() {
     .unwrap();
     let asked = given.asked_by.as_ref().unwrap();
     assert_eq!((asked.role, asked.run.as_str()), (Role::Verify, "r9"));
-    assert_eq!(given.resolve[0].finding.as_ref().unwrap().as_str(), "F2");
+    assert_eq!(given.resolve[0].id.as_str(), "Q1");
+    // A question's `finding` is no longer read (OWL-379).
+    let mut with_finding = serde_json::to_value(&given).unwrap();
+    with_finding["resolve"][0]["finding"] = json!("F2");
+    rejects(
+        "a resolver question naming a finding",
+        Brief::parse(&with_finding.to_string()),
+        "unknown field `finding`",
+    );
     rejects(
         "a resolver's brief without its asking run",
         asking(None),

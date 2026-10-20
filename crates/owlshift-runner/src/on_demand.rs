@@ -88,7 +88,7 @@ use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::{FindingId, QuestionId, RelativePath, TicketId};
+use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
     self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest,
     KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketCost,
@@ -932,7 +932,7 @@ struct DecidedOn {
 /// The run whose questions go through the resolver (OWL-342), as
 /// [`OnDemand::resolve`] routes them and tells the resolver of it
 /// ([`owlshift_contracts::brief::AskedBy`]): a role's run, or, for the
-/// residue and approval rounds a review pass asks, the pass's last run.
+/// approval round a review pass asks, the pass's last run.
 struct Asked<'a> {
     role: Role,
     run: &'a str,
@@ -949,8 +949,6 @@ struct Asked<'a> {
     /// Questions the decider answers without a resolver run: the plan's
     /// approval under `plan_approval = "always"`.
     direct: &'a [QuestionId],
-    /// The finding each residue question asks about, by the questions' ids.
-    findings: &'a [(QuestionId, FindingId)],
     /// The asking review pass's findings, with their rulings.
     kept_findings: &'a [KeptFinding],
     /// The ticket's plan, when Design or Design review asks.
@@ -975,7 +973,6 @@ impl<'a> Asked<'a> {
             questions: &result.questions,
             reopened,
             direct: &[],
-            findings: &[],
             kept_findings: &[],
             plan: None,
         }
@@ -2850,7 +2847,7 @@ impl OnDemand<'_> {
         let diff = self.branch_diff(p)?;
         let comments = self.comments(&ticket)?;
         let mut brief = self.brief(p, Role::Resolver, &comments, rules, None, current);
-        brief.resolve = resolver::unlabelled(&routed.to_resolver, asked.findings);
+        brief.resolve = resolver::unlabelled(&routed.to_resolver);
         brief.delegation = Some(level);
         brief.asked_by = Some(AskedBy {
             role: asked.role,
