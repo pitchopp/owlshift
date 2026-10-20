@@ -47,7 +47,13 @@ pub fn forget(
     }
     // `Stop::Busy` names `do`, `continue` and `watch`: forget holds the lock
     // for the moment of one ref write, so a command typed meanwhile reads
-    // that message only for that moment.
+    // that message only for that moment. The ticket's own lock comes first
+    // and, declared first, is let go last (OWL-409).
+    let _ticket_lock = match dirs.ticket_lock(ticket) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Err(Stop::TicketBusy(ticket.clone())),
+        Err(error) => return Err(Stop::Refused(format!("the ticket's lock: {error}"))),
+    };
     let _lock = match dirs.lock() {
         Ok(Some(lock)) => lock,
         Ok(None) => return Err(Stop::Busy(dirs.root().to_owned())),

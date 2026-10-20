@@ -121,7 +121,7 @@ use crate::follow::{self, Following, Look};
 use crate::held;
 use crate::on_demand::{self, Delivered, OnDemand, PIPELINE, Stop, delivery_followed};
 use crate::pr_reviews;
-use crate::project::ProjectLock;
+use crate::project::{ProjectLock, TicketLock};
 use crate::quarantine::{self, Held, Record};
 use crate::reversal::{self, Current};
 use crate::step::{self, Children};
@@ -325,7 +325,8 @@ impl Holds {
     /// or unreadable), at `now`. Returns the hold or the pause it set, if
     /// any.
     ///
-    /// A busy project ran nothing: no hold. A usage limit with a reset time
+    /// A busy project or ticket, or no free run slot (OWL-409), ran
+    /// nothing: no hold. A usage limit with a reset time
     /// pauses every continue until then. A comment, a RESUME included, or a
     /// park whose comment could not be posted, whose state was not kept
     /// ([`Stop::NotKept`]) holds the ticket until a person acts, unless the
@@ -344,7 +345,7 @@ impl Holds {
         progress: Option<&Progress>,
         now: Timestamp,
     ) -> Option<Admit> {
-        if matches!(outcome, StepEnd::Busy) {
+        if matches!(outcome, StepEnd::Busy | StepEnd::NoSlot) {
             return None;
         }
         if let StepEnd::UsageLimit {
@@ -1150,6 +1151,15 @@ impl Watch<'_> {
             }
             return step::end(&stepped);
         };
+        // Every run slot of the machine taken (OWL-409): no child is
+        // started, and a later pass tries again. A count that cannot be
+        // read leaves it to the child, whose own take decides.
+        if children
+            .slots()
+            .is_some_and(|slots| slots.full().unwrap_or(false))
+        {
+            return StepEnd::NoSlot;
+        }
         match children.run(on_demand.dirs, &envelope, out) {
             Ok(record) => {
                 memory.following.keep(&ticket, record.kept);
@@ -1666,15 +1676,20 @@ impl Watch<'_> {
         }))
     }
 
-    /// The project's lock, once the ticket ref read under it is still
-    /// `seen`, the commit the snapshot read: `None` when the project is busy
-    /// or the ref moved.
-    fn locked_at(&self, ticket: &TicketId, seen: &str) -> Result<Option<ProjectLock>, String> {
+    /// The project's lock, then the ticket's without waiting (OWL-409),
+    /// once the ticket ref read under them is still `seen`, the commit the
+    /// snapshot read: `None` when the project or the ticket is busy or the
+    /// ref moved.
+    fn locked_at(
+        &self,
+        ticket: &TicketId,
+        seen: &str,
+    ) -> Result<Option<(ProjectLock, TicketLock)>, String> {
         let dirs = self.on_demand.dirs;
-        let lock = match dirs.lock() {
+        let lock = match dirs.lock_for_write(ticket) {
             Ok(Some(lock)) => lock,
             Ok(None) => return Ok(None),
-            Err(e) => return Err(format!("the project's lock: {e}")),
+            Err(e) => return Err(format!("the project's or the ticket's lock: {e}")),
         };
         let current = ticket_ref::read(&self.on_demand.executor.git, &dirs.checkout(), ticket)?;
         if current.map(|stored| stored.commit).as_deref() != Some(seen) {

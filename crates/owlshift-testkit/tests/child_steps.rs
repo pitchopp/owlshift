@@ -21,11 +21,12 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{RefAfter, StepEnd, StepEnvelope, StepHold, StepKind, StepOutcome};
 use owlshift_runner::events::EventLog;
 use owlshift_runner::executor::Git;
+use owlshift_runner::slots::{MachineSlots, Slot};
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::ticket_ref::{self, RefAt};
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_testkit::reply::Reply;
-use owlshift_testkit::step_child::{ChildProject, TICKET};
+use owlshift_testkit::step_child::{ChildProject, ChildSlots, TICKET};
 
 /// The step's child.
 const CHILD: &str = env!("CARGO_BIN_EXE_owlshift-step-child");
@@ -237,6 +238,164 @@ fn a_restarted_watch_applies_a_hold_only_at_its_records_ref() {
             .is_some_and(|c| c.starts_with("[owlshift] INTAKE")),
         "{comments:?}\n{lines}"
     );
+}
+
+/// Passes of one `owlshift watch --drain` over `project`, its steps in
+/// `children`, `between(pass)` called after each and ending the watch when
+/// it says so: watch's lines.
+fn drain_passes(
+    project: &ChildProject,
+    children: &Children<'_>,
+    mut between: impl FnMut(u32) -> bool,
+) -> String {
+    let (mut lines, mut events, mut pass) = (Vec::new(), Vec::new(), 0);
+    project.with_on_demand(&mut events, |on_demand, sink| {
+        let watch = Watch {
+            on_demand,
+            interval: POLL_INTERVAL,
+        };
+        watch.run_with_children(
+            true,
+            children,
+            sink,
+            &mut lines,
+            &mut |_, _, _| {},
+            &mut |_| {
+                pass += 1;
+                between(pass)
+            },
+        );
+    });
+    String::from_utf8(lines).unwrap()
+}
+
+/// Takes the machine's slot `n` in `data` as another project's step would,
+/// tried again for the moment a child forked by another test's thread
+/// keeps a lock it inherited (`ProjectDirs::lock`).
+fn hold_slot(data: &Path) -> Slot {
+    let slots = MachineSlots::new(data, 1);
+    (0..100)
+        .find_map(|_| {
+            let slot = slots.take().unwrap();
+            if slot.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            slot
+        })
+        .expect("a free slot")
+}
+
+/// OWL-409, "Machine run slots": while every slot of the machine is
+/// taken, watch starts no child, and a child that finds none after watch's
+/// count ends with its "no slot" record, its ticket untouched; either way
+/// nothing holds the ticket, so a pass after the slot frees runs the step,
+/// with no wait for `RETRY_AFTER`.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "native Windows runs no agent (D9): built, not run, as on_demand's tests"
+)]
+fn a_step_waits_for_a_free_run_slot_and_is_not_held() {
+    // Watch's count: one slot, held elsewhere.
+    let s = setup(None);
+    let machine = s.tmp.path().join("machine");
+    let dirs = s.project.dirs();
+    let ran = || dirs.runs(&ticket()).exists();
+    let counted = children(&s.file).with_slots(MachineSlots::new(&machine, 1));
+    let mut held = Some(hold_slot(&machine));
+    let lines = drain_passes(&s.project, &counted, |pass| {
+        if pass == 1 {
+            assert!(!ran(), "a run started with no free slot");
+            drop(held.take());
+        }
+        pass < 5 && !ran()
+    });
+    assert!(ran(), "{lines}");
+    assert!(step::leftovers(&dirs).is_empty());
+
+    // The child's own take: watch counts two slots, one held, so it starts
+    // the child; the child takes from one, the one held, so it ends with
+    // its "no slot" record, read and removed.
+    let s = setup(None);
+    let machine = s.tmp.path().join("machine");
+    let mut project = s.project.clone();
+    project.slots = Some(ChildSlots {
+        data: machine.clone(),
+        count: 1,
+    });
+    project.save(&s.file);
+    let dirs = project.dirs();
+    let ran = || dirs.runs(&ticket()).exists();
+    let wider = children(&s.file).with_slots(MachineSlots::new(&machine, 2));
+    let mut held = Some(hold_slot(&machine));
+    let lines = drain_passes(&project, &wider, |pass| {
+        if pass == 1 {
+            assert!(!ran(), "a run started with no free slot");
+            assert!(comments(&project).is_empty());
+            drop(held.take());
+        }
+        pass < 5 && !ran()
+    });
+    assert!(ran(), "{lines}");
+    assert!(step::leftovers(&dirs).is_empty());
+}
+
+/// OWL-409, the acceptance's own case: two watches of two projects, each
+/// step in a child taking one of the machine's slots, `concurrent_runs` 1.
+/// Each project's intake sleeps a second in its harness, which counts the
+/// runs under way: never more than one, and both intakes end up run.
+#[cfg(unix)]
+#[test]
+fn two_watches_of_two_projects_share_the_machine_s_slots() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let machine = tmp.path().join("machine");
+    let running = tmp.path().join("running");
+    let counts = tmp.path().join("counts");
+    fs::create_dir_all(&running).unwrap();
+    let script = tmp.path().join("harness.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nmkdir '{running}/'$$\nls '{running}' | wc -l >> '{counts}'\nsleep 1\n\
+             rmdir '{running}/'$$\nexec '{FAKE}' \"$@\"\n",
+            running = running.display(),
+            counts = counts.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let projects: Vec<Setup> = (0..2)
+        .map(|_| {
+            let s = setup(Some(script.clone()));
+            let mut project = s.project.clone();
+            project.slots = Some(ChildSlots {
+                data: machine.clone(),
+                count: 1,
+            });
+            project.save(&s.file);
+            Setup { project, ..s }
+        })
+        .collect();
+    thread::scope(|scope| {
+        for s in &projects {
+            let machine = &machine;
+            scope.spawn(move || {
+                let counted = children(&s.file).with_slots(MachineSlots::new(machine, 1));
+                let ran = || s.project.dirs().runs(&ticket()).exists();
+                let lines = drain_passes(&s.project, &counted, |pass| {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    pass < 100 && !ran()
+                });
+                assert!(ran(), "{lines}");
+            });
+        }
+    });
+    let counts = fs::read_to_string(&counts).unwrap();
+    let counts: Vec<u32> = counts.lines().map(|n| n.trim().parse().unwrap()).collect();
+    assert_eq!(counts, [1, 1], "runs under way as each started");
 }
 
 /// What a watch process and its step left running, by pid.

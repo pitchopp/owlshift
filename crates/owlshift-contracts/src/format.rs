@@ -120,8 +120,9 @@ pub const HELD_FORMAT: u32 = 1;
 /// child `owlshift continue` (OWL-399).
 pub const STEP_ENVELOPE_FORMAT: u32 = 1;
 /// The format version of a step's outcome record (`outcome-<attempt>.json`
-/// in a ticket's folder, OWL-399).
-pub const STEP_OUTCOME_FORMAT: u32 = 1;
+/// in a ticket's folder, OWL-399). Format 2 adds the `no_slot` end
+/// (OWL-409); format 1 is still read.
+pub const STEP_OUTCOME_FORMAT: u32 = 2;
 /// The format version of what a step carries to the next (`carry.json` in a
 /// ticket's folder, OWL-399).
 pub const CARRY_FORMAT: u32 = 1;

@@ -19,12 +19,13 @@
       }
     },
     "concurrent_runs": {
-      "description": "How many runs this machine runs at once.",
+      "description": "How many steps of `owlshift watch --drain` run at once on this\nmachine, over every project: a whole number from 1 to 16. Absent: 2\n(OWL-409, [`PersonalConfig::concurrent_runs`]).",
       "type": [
         "integer",
         "null"
       ],
       "format": "uint32",
+      "maximum": 16,
       "minimum": 1
     },
     "github_app_client_id": {

@@ -832,6 +832,19 @@ fn forget_holds_the_project_lock_and_says_what_it_dropped() {
     let stop = forget::forget(&git, &dirs, &ticket(), &mut sink).unwrap_err();
     assert!(matches!(stop, Stop::Busy(_)), "{stop:?}");
     drop(held);
+    // Another command holds the ticket (OWL-409): refused the same way.
+    let held = (0..100)
+        .find_map(|_| {
+            let lock = dirs.ticket_lock(&ticket()).unwrap();
+            if lock.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            lock
+        })
+        .expect("the ticket's lock");
+    let stop = forget::forget(&git, &dirs, &ticket(), &mut sink).unwrap_err();
+    assert!(matches!(stop, Stop::TicketBusy(_)), "{stop:?}");
+    drop(held);
     assert_eq!(
         &ticket_ref::read(&git, &checkout, &ticket())
             .unwrap()

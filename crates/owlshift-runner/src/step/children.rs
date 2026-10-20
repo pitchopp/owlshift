@@ -22,6 +22,7 @@ use owlshift_platform::process::{ExitWatch, ProcessTree};
 
 use crate::events::printable;
 use crate::project::ProjectDirs;
+use crate::slots::MachineSlots;
 
 /// How often watch looks at a running child between two lines.
 const POLL: Duration = Duration::from_millis(100);
@@ -38,6 +39,9 @@ pub type ChildCommand<'a> = dyn Fn(&TicketId, &str) -> Command + 'a;
 /// with `continue <TICKET> --step <envelope>`.
 pub struct Children<'a> {
     command: Box<ChildCommand<'a>>,
+    /// The machine's run slots, which watch counts before it starts a
+    /// child (OWL-409): none for children that take none.
+    slots: Option<MachineSlots>,
 }
 
 /// Which of the child's streams a line came from.
@@ -58,7 +62,22 @@ impl<'a> Children<'a> {
     pub fn new(command: impl Fn(&TicketId, &str) -> Command + 'a) -> Self {
         Self {
             command: Box::new(command),
+            slots: None,
         }
+    }
+
+    /// These children, each of which takes one of `slots` before its step
+    /// (OWL-409): watch counts them before it starts one.
+    pub fn with_slots(self, slots: MachineSlots) -> Self {
+        Self {
+            slots: Some(slots),
+            ..self
+        }
+    }
+
+    /// The machine's run slots the children take, if they take any.
+    pub fn slots(&self) -> Option<&MachineSlots> {
+        self.slots.as_ref()
     }
 
     /// The command of `envelope`'s child.

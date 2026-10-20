@@ -120,7 +120,7 @@ use crate::executor::{
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::held;
-use crate::project::{self, Base, ProjectDirs, ProjectLock};
+use crate::project::{self, Base, ProjectDirs, ProjectLock, TicketLock};
 use crate::proposals::{self, Filing};
 use crate::quarantine;
 use crate::rebase;
@@ -581,6 +581,9 @@ pub struct Carried {
 pub enum Stop {
     /// Another `owlshift do`, `continue` or `watch` holds the project.
     Busy(PathBuf),
+    /// Another command holds the ticket's own lock (OWL-409): two commands
+    /// never work one ticket.
+    TicketBusy(TicketId),
     /// Nothing ran, or nothing more could: the reason and its fix.
     Refused(String),
     /// A previous run's isolation check did not pass, or never ran.
@@ -675,6 +678,15 @@ pub enum Stop {
     },
 }
 
+impl Stop {
+    /// Whether another command held the project or the ticket, so that
+    /// nothing ran (OWL-409): every place that tells a busy stop apart asks
+    /// this.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Busy(_) | Self::TicketBusy(_))
+    }
+}
+
 impl fmt::Display for Stop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -683,6 +695,11 @@ impl fmt::Display for Stop {
                 "Another `owlshift do`, `continue` or `watch` is working this project ({}); run \
                  again once it ends.",
                 root.display()
+            ),
+            Self::TicketBusy(ticket) => write!(
+                f,
+                "Another `owlshift do`, `continue` or `watch` is working {ticket}; run again once \
+                 it ends."
             ),
             Self::Refused(reason) => write!(f, "Not run: {reason}"),
             Self::NotKept { message, .. } => write!(f, "Not run: {message}"),
@@ -1105,6 +1122,9 @@ fn empty_gate(at: &Base, base: &Base, file: ProjectFile) -> String {
 /// What a command holds once the project is its own and the ticket read.
 struct Prepared {
     _lock: ProjectLock,
+    /// The ticket's own lock (OWL-409), taken before the project's and,
+    /// declared after it, let go after it.
+    _ticket_lock: TicketLock,
     ticket: TicketId,
     found: Ticket,
     /// The ticket's decider when the command started ([`pending_decider`],
@@ -1798,6 +1818,13 @@ impl OnDemand<'_> {
             .git
             .require_minimum_version()
             .map_err(Stop::Refused)?;
+        // The ticket's lock first, then the project's (OWL-409): two commands
+        // never work one ticket, and a busy one runs nothing.
+        let ticket_lock = match self.dirs.ticket_lock(ticket) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return Err(Stop::TicketBusy(ticket.clone())),
+            Err(error) => return Err(refused("the ticket's lock", error)),
+        };
         // The lock before the marker: every run writes the marker when it
         // starts, so while another `do` works the project the marker only
         // says a run is in flight. Once the lock is ours, a marker means a
@@ -1949,6 +1976,7 @@ impl OnDemand<'_> {
         let labels = route_labels(found.labels.iter().map(String::as_str));
         Ok(Prepared {
             _lock: lock,
+            _ticket_lock: ticket_lock,
             ticket: ticket.clone(),
             found,
             decider,
@@ -4697,6 +4725,7 @@ impl OnDemand<'_> {
                 Stop::Parked { .. } | Stop::NotKept { .. } => true,
                 Stop::NeedsInput { posted, .. } => posted.is_ok(),
                 Stop::Busy(_)
+                | Stop::TicketBusy(_)
                 | Stop::Refused(_)
                 | Stop::Unverified { .. }
                 | Stop::Waiting { .. }
@@ -5322,7 +5351,7 @@ impl OnDemand<'_> {
     ) -> Option<Result<Prepared, Stop>> {
         let p = match self.prepare(ticket, command) {
             Ok(p) => p,
-            Err(Stop::Busy(_)) => return None,
+            Err(stop) if stop.is_busy() => return None,
             Err(stop) => return Some(Err(stop)),
         };
         let stored = p.stored.as_ref()?;
@@ -6754,7 +6783,9 @@ impl OnDemand<'_> {
         if !owes && !matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
             return Some(at);
         }
-        let Ok(Some(_lock)) = self.dirs.lock() else {
+        // Watch's write of the ticket's ref: the project's lock, then the
+        // ticket's without waiting (OWL-409).
+        let Ok(Some(_locks)) = self.dirs.lock_for_write(ticket) else {
             return Some(at);
         };
         if !matches!(self.dirs.unverified(), Ok(None)) {

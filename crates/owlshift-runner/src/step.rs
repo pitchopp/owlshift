@@ -31,6 +31,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jiff::Timestamp;
 use serde_json::json;
 
 use owlshift_adapters::forge::ReviewsRead;
@@ -46,6 +47,7 @@ use crate::events::{Data, EventSink, data};
 use crate::follow::Following;
 use crate::on_demand::{self, Carried, Delivered, DispatchSeen, Landed, OnDemand, Stop, Taken};
 use crate::project::ProjectDirs;
+use crate::slots::{MachineSlots, Slot};
 use crate::ticket_ref::{self, Progress, RefAt};
 use crate::watch::{self, Seen};
 use crate::writer::VisibleStage;
@@ -244,7 +246,7 @@ fn read_reviews(
 /// dispatch, which the drain never told.
 pub fn reported(step: &StepKind, outcome: &Result<Delivered, Stop>) -> bool {
     !(matches!(step, StepKind::Intake | StepKind::Dispatch)
-        && matches!(outcome, Err(Stop::Busy(_))))
+        && matches!(outcome, Err(stop) if stop.is_busy()))
 }
 
 /// How a step ended, as watch tells ends apart. Every way to stop is named,
@@ -271,7 +273,7 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         Stepped::Ran(Err(stop)) => stop,
     };
     match stop {
-        Stop::Busy(_) => StepEnd::Busy,
+        Stop::Busy(_) | Stop::TicketBusy(_) => StepEnd::Busy,
         Stop::UsageLimit { resets_at } => StepEnd::UsageLimit {
             resets_at: *resets_at,
         },
@@ -310,13 +312,11 @@ fn landed_kind(landed: Landed) -> LandedKind {
 
 /// Whether a step ran nothing: what it carried stands, and no hold is due.
 fn ran_nothing(stepped: &Stepped) -> bool {
-    matches!(
-        stepped,
-        Stepped::Stale
-            | Stepped::Capped { .. }
-            | Stepped::NotAdmitted { .. }
-            | Stepped::Ran(Err(Stop::Busy(_)))
-    )
+    match stepped {
+        Stepped::Stale | Stepped::Capped { .. } | Stepped::NotAdmitted { .. } => true,
+        Stepped::Ran(Err(stop)) => stop.is_busy(),
+        Stepped::Ran(Ok(_)) => false,
+    }
 }
 
 /// The ticket's `carry.json`.
@@ -561,6 +561,47 @@ pub fn child(
         at: now,
     };
     write_outcome(on_demand.dirs, &record)?;
+    Ok(record)
+}
+
+/// Takes one of the machine's run slots for `envelope`'s step (OWL-409),
+/// before anything else of the step: the slot, kept to the step's end;
+/// or, when every slot is taken, `None` once the step's "no slot" outcome
+/// record is written ([`no_slot_record`]), its ticket untouched.
+pub fn take_slot(
+    slots: &MachineSlots,
+    dirs: &ProjectDirs,
+    envelope: &StepEnvelope,
+    now: Timestamp,
+) -> io::Result<Option<Slot>> {
+    match slots.take()? {
+        Some(slot) => Ok(Some(slot)),
+        None => no_slot_record(dirs, envelope, now).map(|_| None),
+    }
+}
+
+/// Writes the outcome record of a step that found no free run slot: it
+/// ran and read nothing, so it calls for no hold and keeps watch's memory
+/// of the ticket's pull request as the envelope gave it.
+pub fn no_slot_record(
+    dirs: &ProjectDirs,
+    envelope: &StepEnvelope,
+    now: Timestamp,
+) -> io::Result<StepOutcome> {
+    let record = StepOutcome {
+        format: Format,
+        ticket: envelope.ticket.clone(),
+        attempt: envelope.attempt.clone(),
+        commit: envelope.commit.clone(),
+        progress: envelope.progress.clone(),
+        answer: envelope.answer,
+        end: StepEnd::NoSlot,
+        after: RefAfter::Unread,
+        hold: None,
+        kept: envelope.kept.clone(),
+        at: now,
+    };
+    write_outcome(dirs, &record)?;
     Ok(record)
 }
 

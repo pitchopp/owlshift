@@ -34,6 +34,7 @@ pub mod roles;
 pub mod routing;
 pub mod rules;
 pub mod secrets;
+pub mod slots;
 pub mod step;
 pub mod system;
 pub mod ticket_ref;
