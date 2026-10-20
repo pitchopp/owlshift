@@ -65,3 +65,12 @@ always_human = []
 resolver_delegation = "all"   # none | facts | discoverable (par défaut) | ticket | all
 resolver_passes = "unlimited"              # 1 à 50, ou "unlimited"
 resolver_budget_usd = 100.0        # obligatoire avec "unlimited"
+
+[forge.reviewers]
+# The forge logins whose reviews on a delivered pull request Owlshift reads,
+# each mapped to its Linear user id. A review of the ticket's decider with a
+# body or an inline comment, submitted after the delivery, sends the ticket
+# back to Build; another listed reviewer's is quoted as data. Without this
+# table no review is read. The maintainer's account, for the P5 exit gate
+# (OWL-311).
+pitchopp = "782fed6b-e07e-4647-9d70-961856bdf80c"
