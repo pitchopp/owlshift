@@ -50,7 +50,7 @@ use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
 };
-use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Stop};
+use owlshift_runner::on_demand::{self, CodexReviewer, Delivered, Landed, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::quarantine;
 use owlshift_runner::routing::{ClaudeRouter, Router};
@@ -338,6 +338,31 @@ impl Router for Replies {
 
 /// [`Replies`] given as a routed harness.
 struct Routed<'a>(&'a Replies, RunRouting);
+
+/// A Codex seat whose harness cannot build its command, as when its login
+/// file cannot be copied into the run's home (OWL-348).
+struct Unstartable;
+
+impl Router for Unstartable {
+    fn harness(&self, _routing: RunRouting) -> Box<dyn Harness + '_> {
+        Box::new(Unstartable)
+    }
+}
+
+impl Harness for Unstartable {
+    fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        Err("the login file could not be copied".into())
+    }
+
+    fn drive(
+        &self,
+        _run: &HarnessRun<'_>,
+        _child: &mut Child,
+        _log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        unreachable!("an unstartable harness is never spawned")
+    }
+}
 
 impl Harness for Routed<'_> {
     fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
@@ -792,6 +817,12 @@ struct Bench {
     /// The verify seats play from the bench's reply queue, as every other
     /// run does; otherwise they review clean ([`CleanReview`], OWL-304).
     verify_plays: Cell<bool>,
+    /// The opt-in Codex reviewer (OWL-348): `None` when the project does
+    /// not ask for it; else what its readiness check answers, a seat that
+    /// plays from the bench's reply queue when ready.
+    codex: RefCell<Option<Result<(), String>>>,
+    /// The Codex seat's harness cannot start ([`Unstartable`], OWL-348).
+    codex_unstartable: Cell<bool>,
     /// Each line the runner's notifier showed (OWL-368).
     notified: Notified,
 }
@@ -932,6 +963,8 @@ impl Bench {
             reactions: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
+            codex: RefCell::new(None),
+            codex_unstartable: Cell::new(false),
             notified: Notified::default(),
         }
     }
@@ -1330,6 +1363,17 @@ impl Bench {
         } else {
             &clean
         };
+        let codex_ready = || self.codex.borrow().clone().unwrap_or(Ok(()));
+        let codex_router: &dyn Router = if self.codex_unstartable.get() {
+            &Unstartable
+        } else {
+            &harness
+        };
+        let codex = self.codex.borrow().is_some().then_some(CodexReviewer {
+            design_review: codex_router,
+            verify: codex_router,
+            ready: &codex_ready,
+        });
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
         let env = self.env.clone();
@@ -1376,6 +1420,7 @@ impl Bench {
             design: &harness,
             design_review: &harness,
             verify,
+            codex,
             arbiter: &harness,
             answer_check: &harness,
             resolver: &harness,
@@ -2624,6 +2669,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         design: &router,
         design_review: &router,
         verify: &router,
+        codex: None,
         arbiter: &router,
         answer_check: &harness,
         resolver: &router,
@@ -2704,6 +2750,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         design: &router,
         design_review: &router,
         verify: &router,
+        codex: None,
         arbiter: &router,
         answer_check: &harness,
         resolver: &router,

@@ -1033,6 +1033,12 @@ fn findings_and_forge_keys_are_read_and_checked() {
     assert_eq!(author.pipeline.findings(), FindingsConfirmation::Author);
     let arbiter = ProjectConfig::parse(&with("findings = \"arbiter\"", "")).unwrap();
     assert_eq!(arbiter.pipeline.findings(), FindingsConfirmation::Arbiter);
+    // OWL-348: the opt-in Codex reviewer, off when absent.
+    assert!(!parsed.pipeline.codex_reviewer());
+    let codex = ProjectConfig::parse(&with("codex_reviewer = true", "")).unwrap();
+    assert!(codex.pipeline.codex_reviewer());
+    assert_eq!(ProjectConfig::parse(&codex.render()).unwrap(), codex);
+    assert!(ProjectConfig::parse(&with("codex_reviewer = \"yes\"", "")).is_err());
     let forge = ProjectConfig::parse(&with(
         "",
         "\n[forge]\nreviewers = { pitchopp = \"u-ann\", Octo-Cat = \"u-bob\" }\n",

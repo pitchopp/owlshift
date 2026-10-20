@@ -167,6 +167,110 @@ fn a_trivial_ticket_is_verified_before_its_pull_request_opens() {
     assert!(!report.contains("standing in"), "{report}");
 }
 
+/// OWL-348: a Codex reviewer at its usage limit leaves the pass to the
+/// Claude Code critic: no run again, no failed run counted, no stop. The
+/// pass's major goes to its fix run, and the next pass of the same command
+/// runs without Codex too; each pass keeps why, a warning says it, and the
+/// DELIVERY report lists both passes.
+#[test]
+fn a_codex_reviewer_at_its_usage_limit_leaves_the_passes_to_claude_code() {
+    let bench = Bench::verifying();
+    *bench.codex.borrow_mut() = Some(Ok(()));
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[("major", "The greeting has no full stop.")])),
+        cut_off(&bench, 0),
+        bench.reviewing(&ruled(&["confirmed"])),
+        bench.reply(Some("Hello, again"), Some(&fixed_build(&[("F1", "fixed")]))),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(
+        bench.run_roles(),
+        [
+            Role::Build,
+            Role::Verify,
+            Role::Verify,
+            Role::Arbiter,
+            Role::Build,
+            Role::Verify
+        ],
+        "Codex once, cut by its limit, then never again in this command"
+    );
+    let reason = "Codex reached its usage limit, until 2026-10-02T12:00:00Z.";
+    let review = bench.record().review.unwrap();
+    for pass in &review.passes {
+        assert_eq!(pass.reviewers.len(), 1);
+        assert_eq!(pass.reviewers[0].harness, HarnessKind::Claude);
+        let dropped = pass.dropped.as_ref().expect("Codex dropped");
+        assert_eq!(
+            (
+                dropped.harness,
+                dropped.mandates.as_slice(),
+                dropped.reason.as_str()
+            ),
+            (HarnessKind::Codex, &[Mandate::Critic][..], reason)
+        );
+    }
+    let warnings: Vec<Value> = data_of(&bench.events(), EventKind::Warning, "what")
+        .into_iter()
+        .filter(|data| data["what"] == "codex_reviewer_dropped")
+        .collect();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert_eq!(warnings[0]["reason"], reason);
+    assert_eq!(bench.reviews("pass")[0]["dropped"]["reason"], reason);
+    let report = bench.comments().pop().unwrap();
+    let listed = format!(
+        "**Passes without the Codex reviewer,** each run by its other reviewers alone:\n\
+         - Pass 1: {reason}\n- Pass 2: {reason}"
+    );
+    assert!(report.contains(&listed), "{report}");
+}
+
+/// OWL-348: a Codex that is not ready when the command starts runs no seat;
+/// the pass keeps why, and the DELIVERY report says it.
+#[test]
+fn a_codex_not_ready_at_the_start_drops_its_seat_and_says_why() {
+    let bench = Bench::verifying();
+    *bench.codex.borrow_mut() = Some(Err("`codex` is not on the PATH".to_owned()));
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.run_roles(), [Role::Build, Role::Verify]);
+    let reason = "Codex is not ready here: `codex` is not on the PATH";
+    let review = bench.record().review.unwrap();
+    assert_eq!(review.passes[0].dropped.as_ref().unwrap().reason, reason);
+    let report = bench.comments().pop().unwrap();
+    assert!(report.contains(&format!("- Pass 1: {reason}")), "{report}");
+}
+
+/// OWL-348: a Codex seat whose harness cannot start drops the seat, with
+/// the runner's reason, and the ticket is delivered: no stop.
+#[test]
+fn a_codex_reviewer_that_cannot_start_drops_its_seat_and_never_stops() {
+    let bench = Bench::verifying();
+    *bench.codex.borrow_mut() = Some(Ok(()));
+    bench.codex_unstartable.set(true);
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let reason = "Codex's run could not start.";
+    let review = bench.record().review.unwrap();
+    assert_eq!(review.passes[0].reviewers.len(), 1);
+    assert_eq!(review.passes[0].dropped.as_ref().unwrap().reason, reason);
+    let report = bench.comments().pop().unwrap();
+    assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
+    assert!(report.contains(&format!("- Pass 1: {reason}")), "{report}");
+    assert!(!report.contains("login file"), "{report}");
+}
+
 /// OWL-321: `[roles.verify]` is accepted, and its file reaches the brief of
 /// the Verify reviewer after `stack.rules`, and no other role's.
 #[test]

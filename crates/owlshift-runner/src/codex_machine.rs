@@ -8,8 +8,9 @@
 //! Codex's sandbox off.
 //!
 //! This module reads text only; the caller reads the files, but for
-//! [`codex_critic`], which `owlshift do` asked once per command from OWL-303
-//! to OWL-347 and which is kept for an opt-in Codex reviewer (OWL-348). A
+//! [`codex_critic`], which each command asks when the project adds the
+//! opt-in Codex reviewer (OWL-348), as it asked for the Codex critic from
+//! OWL-303 to OWL-347. A
 //! value whose shape Codex's own files do not have is never guessed at: it
 //! makes the whole file [`Unreadable::Shape`], so a report says it cannot tell
 //! what the file does rather than naming a server or a mode that may not be
@@ -197,10 +198,10 @@ pub struct CodexCritic {
     pub login: PathBuf,
 }
 
-/// Whether Codex can run the critic of the review roles on this machine
-/// (OWL-303). No command asks since OWL-347, every reviewer running on
-/// Claude Code; it is kept for an opt-in Codex reviewer (OWL-348). It
-/// looks for `codex` on the `PATH`, the
+/// Whether Codex can run the opt-in Codex reviewer of the review passes on
+/// this machine (OWL-348; the Codex critic's check from OWL-303 to
+/// OWL-347), asked at each command's start and by `owlshift doctor`'s
+/// `codex reviewer` line. It looks for `codex` on the `PATH`, the
 /// login file a run copies ([`crate::executor::codex::user_login`]), and no
 /// [`REQUIREMENTS`] that refuses [`FULL_ACCESS`]; otherwise it says why not.
 /// A requirements file that cannot be read
@@ -227,10 +228,12 @@ pub fn critic_readiness(
     let program = program.ok_or("`codex` is not on the PATH")?;
     let login = login.ok_or("neither `CODEX_HOME` nor `HOME` names Codex's folder")?;
     if !is_file(&login) {
-        return Err(format!(
-            "Codex has no login file at {}: run `codex login`",
-            login.display()
-        ));
+        // Never the path: this reason reaches the ticket (OWL-348).
+        return Err(
+            "Codex has no login file (`auth.json` in `CODEX_HOME` or `~/.codex`): run `codex \
+             login`"
+                .to_owned(),
+        );
     }
     match requirements_text {
         Ok(None) => {}

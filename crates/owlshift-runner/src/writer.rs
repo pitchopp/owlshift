@@ -72,8 +72,8 @@ use owlshift_contracts::result::{
     Verdict as AnswerVerdict, option_index, option_letter,
 };
 use owlshift_contracts::review::{
-    FindingOutcome, KeptFinding, Mandate, Plan, PlanChange, PlanPart, Reviewer, RulingOutcome,
-    Severity,
+    DroppedReviewer, FindingOutcome, KeptFinding, Mandate, Plan, PlanChange, PlanPart, Reviewer,
+    RulingOutcome, Severity,
 };
 use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
@@ -161,6 +161,9 @@ pub struct ReportedReview {
     /// runner's gate checked and no Verify pass reviewed after it (OWL-356,
     /// OWL-377), each with its pass.
     pub last_fixed: Vec<(u32, KeptFinding)>,
+    /// The passes of the loop that ran without the opt-in Codex reviewer,
+    /// each with why (OWL-348), oldest first.
+    pub dropped: Vec<(u32, DroppedReviewer)>,
 }
 
 /// A follow-up a DELIVERY report names, with what became of it (OWL-253,
@@ -2060,6 +2063,9 @@ pub struct PlanComment {
     /// The pass that ended is Design's last revision, which no reviewer
     /// reviews (OWL-377).
     pub revision: bool,
+    /// The passes of the loop that ran without the opt-in Codex reviewer,
+    /// each with why (OWL-348), oldest first.
+    pub dropped: Vec<(u32, DroppedReviewer)>,
     pub next: PlanNext,
     /// The design run that wrote the plan.
     pub run: Option<String>,
@@ -2166,6 +2172,7 @@ impl PlanComment {
                 format!("Reviewers:\n{}", bullets(&reviewers))
             }
         ));
+        sections.extend(dropped_section(&self.dropped));
         if !left.is_empty() {
             let lines: Vec<String> = left
                 .iter()
@@ -2468,6 +2475,8 @@ pub struct DocumentPass {
     /// The pass is Design's last revision, which no reviewer reviews
     /// (OWL-377).
     pub revision: bool,
+    /// The opt-in Codex reviewer the pass ran without, and why (OWL-348).
+    pub dropped: Option<DroppedReviewer>,
 }
 
 /// The plan's document (OWL-350, architecture section 5, "Kept and shown"):
@@ -2559,6 +2568,9 @@ impl PlanDocument {
                 } else {
                     format!("Reviewers:\n{}", bullets(&reviewers))
                 });
+                if let Some(dropped) = &pass.dropped {
+                    lines.push(dropped_line(dropped));
+                }
                 if !left.is_empty() {
                     let found: Vec<String> = left
                         .iter()
@@ -2858,6 +2870,9 @@ impl ReportedReview {
                 format!("Reviewers of the last pass:\n{}", bullets(&reviewers))
             }
         );
+        if let Some(dropped) = dropped_section(&self.dropped) {
+            section.push_str(&format!("\n\n{dropped}"));
+        }
         if !self.rejected.is_empty() {
             let lines: Vec<String> = self
                 .rejected
@@ -2929,6 +2944,36 @@ impl ReportedReview {
         }
         section
     }
+}
+
+/// The passes that ran without the opt-in Codex reviewer (OWL-348), as a
+/// PLAN comment and a DELIVERY report list them: none when every pass had
+/// it, or the project does not ask for it.
+fn dropped_section(dropped: &[(u32, DroppedReviewer)]) -> Option<String> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = dropped
+        .iter()
+        .map(|(pass, dropped)| format!("Pass {pass}: {}", flatten(&dropped.reason)))
+        .collect();
+    let harness = harness_name(dropped[0].1.harness);
+    Some(format!(
+        "**Passes without the {harness} reviewer,** each run by its other reviewers alone:\n{}",
+        bullets(&lines)
+    ))
+}
+
+/// A pass's line for the opt-in Codex reviewer it ran without (OWL-348), in
+/// the plan's document.
+fn dropped_line(dropped: &DroppedReviewer) -> String {
+    let mandates: Vec<&str> = dropped.mandates.iter().map(|m| mandate_name(*m)).collect();
+    format!(
+        "Not run: {} on {}. {}",
+        mandates.join(" and "),
+        harness_name(dropped.harness),
+        flatten(&dropped.reason)
+    )
 }
 
 /// A finding's id, severity and reviewer, as a PLAN comment lists it.
@@ -4939,6 +4984,7 @@ Merge state reported by the forge: `CLEAN`.
                 2,
                 kept_finding(4, Severity::Minor, Some(FindingOutcome::Fixed), None),
             )],
+            dropped: vec![(1, codex_dropped())],
         });
         let body = report.render();
         assert!(!body.contains("Seen at GREETING.md:1."), "{body}");
@@ -4957,6 +5003,9 @@ Merge state reported by the forge: `CLEAN`.
             "**Findings proposed as follow-ups,** listed in what remains:\n- Pass 2, F3, minor, \
              critic and conformance on Claude Code\n",
             "Proposed follow-up, not filed: **Edit the previous report**",
+            // OWL-348: the passes without the opt-in Codex reviewer.
+            "configured)\n\n**Passes without the Codex reviewer,** each run by its other \
+             reviewers alone:\n- Pass 1: Codex reached its usage limit.\n\n",
         ] {
             assert!(body.contains(text), "{text}\n---\n{body}");
         }
@@ -5010,6 +5059,7 @@ Merge state reported by the forge: `CLEAN`.
                 ),
             )],
             revision: false,
+            dropped: Vec::new(),
             next: PlanNext::Approval,
             run: Some("r1".to_owned()),
         };
@@ -5053,6 +5103,27 @@ Merge state reported by the forge: `CLEAN`.
         .render();
         assert!(!quiet.contains("**Findings"), "{quiet}");
         assert!(quiet.contains("**Next.** The Build follows this plan."));
+        assert!(!quiet.contains("Codex"), "{quiet}");
+        // OWL-348: a Codex reviewer is named as any, and the passes that
+        // ran without it are listed with why.
+        let codex = PlanComment {
+            reviewers: vec![
+                comment.reviewers[0].clone(),
+                PlanReviewer {
+                    mandates: vec![Mandate::Critic],
+                    harness: Harness::Codex,
+                    model: Some("gpt-x".to_owned()),
+                    same_model: false,
+                },
+            ],
+            dropped: vec![(1, codex_dropped())],
+            ..comment.clone()
+        }
+        .render();
+        let line = "- critic on Claude Code (its default model)\n- critic on Codex (`gpt-x`)\n\n\
+                    **Passes without the Codex reviewer,** each run by its other reviewers \
+                    alone:\n- Pass 1: Codex reached its usage limit.\n\n";
+        assert!(codex.contains(line), "{line}\n---\n{codex}");
         // The last revision's pass (OWL-377): no reviewer, and the findings
         // of the pass before as the revision answered them.
         let revision = PlanComment {
@@ -5114,6 +5185,7 @@ Merge state reported by the forge: `CLEAN`.
             findings,
             earlier: Vec::new(),
             revision: false,
+            dropped: Vec::new(),
             next: PlanNext::Build,
             run: None,
         }
@@ -5228,6 +5300,15 @@ Merge state reported by the forge: `CLEAN`.
     /// OWL-350: the plan's document holds the plan whole and a review log
     /// of every pass, with its reviewers, the findings left and those
     /// rejected with their reason; it holds no marker.
+    /// The opt-in Codex reviewer a pass ran without (OWL-348).
+    fn codex_dropped() -> DroppedReviewer {
+        DroppedReviewer {
+            harness: Harness::Codex,
+            mandates: vec![Mandate::Critic],
+            reason: "Codex reached its usage limit.".to_owned(),
+        }
+    }
+
     #[test]
     fn a_plan_document_logs_every_pass() {
         let reviewer = PlanReviewer {
@@ -5254,6 +5335,7 @@ Merge state reported by the forge: `CLEAN`.
                         ),
                     ],
                     revision: false,
+                    dropped: None,
                 },
                 DocumentPass {
                     pass: 2,
@@ -5263,6 +5345,8 @@ Merge state reported by the forge: `CLEAN`.
                         disagreed(3),
                     ],
                     revision: false,
+                    // OWL-348.
+                    dropped: Some(codex_dropped()),
                 },
                 // The last revision (OWL-377).
                 DocumentPass {
@@ -5270,6 +5354,7 @@ Merge state reported by the forge: `CLEAN`.
                     reviewers: Vec::new(),
                     findings: Vec::new(),
                     revision: true,
+                    dropped: None,
                 },
             ],
         };
@@ -5277,6 +5362,7 @@ Merge state reported by the forge: `CLEAN`.
         let body = document.render();
         for text in [
             "Version 2, after design review pass 3.\n\n**Goal.** Greet all",
+            "Not run: critic on Codex. Codex reached its usage limit.",
             "**Steps.**\n1. Add GREETING.md. - injected Test: The gate's grep.",
             "## Review log\n\n### Design review, pass 1\n\nReviewers:\n- critic on Claude Code \
              (its default model)\n\n**Findings rejected.**\n- F2, minor, critic and conformance \
@@ -5325,6 +5411,7 @@ Merge state reported by the forge: `CLEAN`.
                 reviewers: Vec::new(),
                 findings: findings.clone(),
                 revision: false,
+                dropped: None,
             }],
         }
         .render();
@@ -5348,6 +5435,7 @@ Merge state reported by the forge: `CLEAN`.
                     reviewers: Vec::new(),
                     findings: short.clone(),
                     revision: false,
+                    dropped: None,
                 })
                 .collect(),
         }
@@ -7436,6 +7524,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 })
                 .collect(),
             last_fixed: Vec::new(),
+            dropped: Vec::new(),
         });
         report
     }

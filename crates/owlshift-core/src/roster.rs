@@ -3,7 +3,8 @@
 //!
 //! Every reviewer runs on Claude Code (OWL-347), each on another model than
 //! the author's when the configuration has one ([`other_model`]); the
-//! seats differ by their mandates.
+//! seats differ by their mandates. A project may add one Codex reviewer
+//! after them ([`CODEX_REVIEWER`], OWL-348).
 
 use crate::vocab::{Mandate, Stage, Tier, Variant};
 
@@ -19,6 +20,13 @@ const CRITIC_ALONE: &[Mandate] = &[Mandate::Critic, Mandate::Conformance];
 const CRITIC: &[Mandate] = &[Mandate::Critic];
 const CONFORMANCE: &[Mandate] = &[Mandate::Conformance];
 const DEBT: &[Mandate] = &[Mandate::Debt];
+
+/// The opt-in Codex reviewer (OWL-348, `pipeline.codex_reviewer`): one
+/// more seat after the roster's, on the critic's mandate, a reviewer of
+/// another model family than the author's (scenario S17). It is never part
+/// of [`roster`]: a Codex that cannot serve a pass drops it, and the pass
+/// keeps the roster's seats.
+pub const CODEX_REVIEWER: Seat = Seat { mandates: CRITIC };
 
 /// The reviewers of a pass at `stage` for a ticket of `variant`, the critic
 /// first; none at a stage that is not Design review or Verify, nor at
