@@ -236,12 +236,11 @@ pub enum RefAfter {
     Unread,
 }
 
-/// A hold a step calls for.
+/// A hold a step calls for. A usage limit holds its harness machine-wide
+/// (`<data>/usage/`, OWL-404), never every step of a watch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "hold", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StepHold {
-    /// Every step waits until the usage limit resets.
-    Paused { until: Timestamp },
     /// The ticket is held until `until`, or until a person acts when none,
     /// unless its decider edits a comment or its ref makes progress.
     Held {
@@ -253,9 +252,12 @@ pub enum StepHold {
 impl StepOutcome {
     const CONTRACT: &str = "step outcome";
 
-    /// Parses an outcome record. A format-1 one, which a watch that ran
-    /// before OWL-409 may have left for its successor, is read as the
-    /// current format: format 2 only adds the `no_slot` end, refused in it.
+    /// Parses an outcome record. A format-1 or format-2 one, which a watch
+    /// that ran before OWL-409 or OWL-404 may have left for its successor,
+    /// is read as the current format: format 2 only adds the `no_slot` end,
+    /// refused in format 1, and format 3 only drops the `paused` hold, read
+    /// as none, since the machine's usage state now holds a harness at its
+    /// limit.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let outcome: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -265,22 +267,32 @@ impl StepOutcome {
         Ok(outcome)
     }
 
-    /// A format-1 record read as the current format, or `None` for any
-    /// other.
+    /// A format-1 or format-2 record read as the current format, or `None`
+    /// for any other.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
-        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+        let format = document.get("format").and_then(serde_json::Value::as_u64)?;
+        if !matches!(format, 1 | 2) {
             return None;
         }
-        if document
-            .pointer("/end/end")
-            .and_then(serde_json::Value::as_str)
-            == Some("no_slot")
+        if format == 1
+            && document
+                .pointer("/end/end")
+                .and_then(serde_json::Value::as_str)
+                == Some("no_slot")
         {
             return Some(Err(ContractError::invalid(
                 Self::CONTRACT,
                 "format 1 has no `no_slot` end",
             )));
+        }
+        if document
+            .pointer("/hold/hold")
+            .and_then(serde_json::Value::as_str)
+            == Some("paused")
+            && let Some(record) = document.as_object_mut()
+        {
+            record.remove("hold");
         }
         document["format"] = STEP_OUTCOME_FORMAT.into();
         Some(
@@ -492,7 +504,7 @@ mod tests {
         };
         let as_format_1 = |outcome: &StepOutcome| {
             let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
-            assert_eq!(document["format"], 2);
+            assert_eq!(document["format"], 3);
             document["format"] = 1.into();
             document.to_string()
         };
@@ -504,5 +516,45 @@ mod tests {
             ..outcome
         };
         assert_eq!(StepOutcome::parse(&as_format_1(&busy)).unwrap(), busy);
+    }
+
+    /// OWL-404: format 3 drops the `paused` hold; a format-1 or format-2
+    /// record that calls for one reads with no hold, the machine's usage
+    /// state holding the harness instead, and `no_slot` reads in format 2.
+    #[test]
+    fn an_older_outcome_reads_with_its_paused_hold_dropped() {
+        let outcome = StepOutcome {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            attempt: "1-2-3".to_owned(),
+            commit: None,
+            progress: "p".to_owned(),
+            answer: None,
+            end: StepEnd::UsageLimit {
+                resets_at: Some("2026-10-20T12:00:00Z".parse().unwrap()),
+            },
+            after: RefAfter::Unread,
+            hold: None,
+            kept: KeptFollowing::default(),
+            at: "2026-10-20T09:00:00Z".parse().unwrap(),
+        };
+        for format in [1, 2] {
+            let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
+            document["format"] = format.into();
+            document["hold"] =
+                serde_json::json!({"hold": "paused", "until": "2026-10-20T12:00:00Z"});
+            assert_eq!(
+                StepOutcome::parse(&document.to_string()).unwrap(),
+                outcome,
+                "format {format}"
+            );
+        }
+        let mut no_slot: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
+        no_slot["format"] = 2.into();
+        no_slot["end"] = serde_json::json!({"end": "no_slot"});
+        assert_eq!(
+            StepOutcome::parse(&no_slot.to_string()).unwrap().end,
+            StepEnd::NoSlot
+        );
     }
 }

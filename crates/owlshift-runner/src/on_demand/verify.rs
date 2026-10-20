@@ -136,6 +136,20 @@ pub(crate) fn delivery_held(
             })
 }
 
+/// Whether a ticket at Verify in `state`, its ref keeping `record`, delivers
+/// with no Verify pass, what watch asks before it starts a step (OWL-404): a
+/// last fix's Build ([`last_fix_done`]), or a commit whose pass passed and
+/// whose delivery a collision held back ([`delivery_held`]), that commit
+/// taken as the branch's head, which the step checks again.
+pub(crate) fn delivers_without_pass(state: &TicketState, record: &TicketRecord) -> bool {
+    let review = record.review.as_ref();
+    let held = record.held.as_ref();
+    last_fix_done(state, review)
+        || held
+            .and_then(|held| held.verified.as_deref())
+            .is_some_and(|commit| delivery_held(state, held, review, commit))
+}
+
 /// The follow-ups of the findings a Verify pass proposed, before OWL-377
 /// (architecture section 5, "Verify", The residue): each with the reviewer
 /// as its source,
@@ -743,6 +757,37 @@ mod tests {
         assert!(!last_fix_done(&at_build(1), Some(&record)));
         assert!(!last_fix_done(&at_verify(0), Some(&record)));
         assert!(!last_fix_done(&at_verify(1), None));
+    }
+
+    /// OWL-404: watch starts a Verify that delivers with no pass whatever a
+    /// usage limit holds: a last fix's, or a commit whose pass passed and
+    /// whose delivery a collision held back, read from the ref alone.
+    #[test]
+    fn a_verify_that_delivers_with_no_pass_is_read_from_the_ref() {
+        let at_verify = |passes: u32| {
+            TicketState::restore(Status::Active(Stage::Verify), 0, 0, 0, 0, 0)
+                .unwrap()
+                .with_review_passes(passes)
+                .unwrap()
+        };
+        let mut record = crate::ticket_ref::blank(None);
+        let state = at_verify(1);
+        assert!(!delivers_without_pass(&state, &record));
+        let mut last = review(vec![pass(Stage::Verify, 1, Vec::new())]);
+        last.last_fix = NonZeroU32::new(1);
+        record.review = Some(last);
+        assert!(delivers_without_pass(&state, &record));
+
+        let commit = "c".repeat(40);
+        let mut passed = pass(Stage::Verify, state.review_pass_due(), Vec::new());
+        passed.head = Some(commit.clone());
+        record.review = Some(review(vec![passed]));
+        assert!(!delivers_without_pass(&state, &record), "no mark");
+        let mut held = TicketHeld::dispatched(Vec::new(), Vec::new(), None);
+        held.verified = Some(commit);
+        record.held = Some(held);
+        assert!(delivers_without_pass(&state, &record));
+        assert!(!delivers_without_pass(&at_build(1), &record));
     }
 
     /// A proposed finding becomes a follow-up from the reviewer; the others

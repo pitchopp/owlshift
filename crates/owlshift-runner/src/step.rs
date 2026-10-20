@@ -422,7 +422,7 @@ pub(crate) fn write_carry(
 
 /// Writes `text` at `path` whole or not at all: to a file beside it, then
 /// renamed over it, its folder made first.
-fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -868,9 +868,18 @@ mod tests {
         let limited = StepEnd::UsageLimit {
             resets_at: Some(at(30)),
         };
+        // OWL-404: its own ticket, until the reset, whatever the ref did.
         assert_eq!(
-            hold(limited, Some(&p1)),
-            Some(StepHold::Paused { until: at(30) })
+            hold(limited.clone(), Some(&p1)),
+            Some(StepHold::Held {
+                until: Some(at(30))
+            })
+        );
+        assert_eq!(
+            hold(limited, Some(&p2)),
+            Some(StepHold::Held {
+                until: Some(at(30))
+            })
         );
         assert_eq!(hold(StepEnd::Busy, Some(&p1)), None);
     }

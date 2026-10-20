@@ -431,6 +431,9 @@ pub struct Run {
     pub usage: Option<Usage>,
     /// The last rate-limit report of the stream.
     pub rate_limit: Option<RateLimit>,
+    /// Every usage window the stream's rate-limit reports named, each as its
+    /// latest report gave it, in the order first named (OWL-404).
+    pub windows: Vec<UsageWindow>,
     /// The Claude Code version, to record with every run.
     pub harness_version: Option<String>,
     /// The main model, as the CLI resolved it.
@@ -526,6 +529,20 @@ pub struct RateLimit {
     pub seven_day_utilization: Option<f64>,
 }
 
+/// One usage window of the subscription, as a rate-limit report gave it
+/// (OWL-404, check (g)): every report names each window in
+/// `rate_limit_info.unifiedWindows`, `five_hour` and `seven_day` so far.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageWindow {
+    /// The window's name, such as `five_hour`.
+    pub name: String,
+    /// The share used, from 0 to 1 (`utilization`).
+    pub share: f64,
+    pub resets_at: Timestamp,
+    /// When the report was read from the stream, not when the run ended.
+    pub read_at: Timestamp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RateLimitStatus {
     Allowed,
@@ -597,6 +614,7 @@ pub struct Transcript {
     mcp_servers: Vec<String>,
     permission_mode: Option<String>,
     rate_limit: Option<RateLimit>,
+    windows: Vec<UsageWindow>,
     /// The latest rejection, cleared by a later report that allows again.
     rejection: Option<RateLimit>,
     /// An assistant message reported a rate limit, and no later report
@@ -623,9 +641,15 @@ struct FinalRecord {
 }
 
 impl Transcript {
-    /// Reads one output line. Events of an unknown type are skipped; a line
-    /// that is not a JSON object is counted.
+    /// Reads one output line, read now. Events of an unknown type are
+    /// skipped; a line that is not a JSON object is counted.
     pub fn feed(&mut self, line: &[u8]) {
+        self.feed_at(line, Timestamp::now());
+    }
+
+    /// [`Transcript::feed`] for a line read at `at`, the read time its usage
+    /// windows are kept with.
+    pub fn feed_at(&mut self, line: &[u8], at: Timestamp) {
         let event = match serde_json::from_slice::<Value>(line) {
             Ok(event) if event.is_object() => event,
             _ if line.iter().all(u8::is_ascii_whitespace) => return,
@@ -636,7 +660,7 @@ impl Transcript {
         };
         match str_field(&event, "type") {
             Some("system") if str_field(&event, "subtype") == Some("init") => self.init(&event),
-            Some("rate_limit_event") => self.rate_limit_event(&event),
+            Some("rate_limit_event") => self.rate_limit_event(&event, at),
             Some("assistant") => {
                 if let Some(kind) = str_field(&event, "error") {
                     self.limit_message |= kind == "rate_limit";
@@ -684,9 +708,14 @@ impl Transcript {
             .unwrap_or_default();
     }
 
-    fn rate_limit_event(&mut self, event: &Value) {
+    fn rate_limit_event(&mut self, event: &Value, at: Timestamp) {
         let info = &event["rate_limit_info"];
         let windows = &info["unifiedWindows"];
+        if let Some(named) = windows.as_object() {
+            for (name, window) in named {
+                self.window(name, window, at);
+            }
+        }
         let report = RateLimit {
             status: match str_field(info, "status") {
                 Some("allowed") => RateLimitStatus::Allowed,
@@ -710,6 +739,31 @@ impl Transcript {
             RateLimitStatus::Unknown => {}
         }
         self.rate_limit = Some(report);
+    }
+
+    /// Keeps the report of window `name` read at `at`, unless the one kept
+    /// resets later: within a run every report is read later than the last.
+    fn window(&mut self, name: &str, window: &Value, at: Timestamp) {
+        let share = window["utilization"]
+            .as_f64()
+            .filter(|share| share.is_finite());
+        let resets_at = window["resetsAt"]
+            .as_i64()
+            .and_then(|second| Timestamp::from_second(second).ok());
+        let (Some(share), Some(resets_at)) = (share, resets_at) else {
+            return;
+        };
+        let report = UsageWindow {
+            name: name.to_owned(),
+            share,
+            resets_at,
+            read_at: at,
+        };
+        match self.windows.iter_mut().find(|kept| kept.name == name) {
+            Some(kept) if kept.resets_at <= resets_at => *kept = report,
+            Some(_) => {}
+            None => self.windows.push(report),
+        }
     }
 
     /// Classifies the run once the process has exited.
@@ -758,6 +812,7 @@ impl Transcript {
             outcome,
             usage,
             rate_limit: self.rate_limit,
+            windows: self.windows,
             harness_version: self.harness_version,
             model: self.model,
             billing: self.billing.unwrap_or(Billing::Unknown),

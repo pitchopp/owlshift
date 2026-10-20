@@ -1152,7 +1152,9 @@ fn scenario_s6_the_human_is_the_bottleneck() {
     assert_eq!(held.len(), 4, "{held:?}\n{lines}\n{printed}");
     let stop = held[2].as_ref().expect_err("the usage limit");
     assert!(matches!(stop, Stop::UsageLimit { .. }), "{stop}");
-    assert!(notify::blocker_line(&ticket(), stop).is_some());
+    // The runner told it, once (OWL-404): the command's line says nothing.
+    assert_eq!(notify::blocker_line(&ticket(), stop), None);
+    assert_eq!(bench.notified.0.borrow().len(), 1);
     assert!(held[3].is_ok(), "{held:?}\n{lines}");
     let at = TicketState::try_from(&bench.record().state).unwrap();
     assert_eq!(at.status(), Status::Active(Stage::Watch));

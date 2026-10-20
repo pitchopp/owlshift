@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift harness usage",
+  "description": "One harness's usage state.",
+  "type": "object",
+  "properties": {
+    "episodes": {
+      "description": "The times it is held.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/KeptEpisode"
+      }
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "harness": {
+      "$ref": "#/$defs/Harness"
+    },
+    "probe": {
+      "description": "The run probing it past a deadline.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KeptProbe"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "windows": {
+      "description": "The usage windows its runs reported, by name, such as `five_hour`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/KeptWindow"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "harness"
+  ],
+  "$defs": {
+    "Harness": {
+      "description": "A harness: a vendor CLI that runs one role headless.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex"
+      ]
+    },
+    "KeptEpisode": {
+      "description": "A time the harness is held.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/KeptKind"
+        },
+        "since": {
+          "description": "When the outage was first seen.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "told": {
+          "description": "The operator was notified of it.",
+          "type": "boolean",
+          "default": false
+        },
+        "until": {
+          "description": "Its end: the reset time the harness reported, a deadline, or a\ncap's window reset.",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "since",
+        "until"
+      ]
+    },
+    "KeptKind": {
+      "description": "What holds the harness.",
+      "oneOf": [
+        {
+          "description": "The provider's usage limit; `reset` when `until` is the reset time it\nreported, otherwise a deadline after which a probe runs.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "limit"
+            },
+            "reset": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "reset"
+          ]
+        },
+        {
+          "description": "A cap's pause on `window` (OWL-405).",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cap"
+            },
+            "window": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "window"
+          ]
+        }
+      ]
+    },
+    "KeptProbe": {
+      "description": "The run probing the harness.",
+      "type": "object",
+      "properties": {
+        "deadline": {
+          "description": "Until when every other run waits for it.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "deadline"
+      ]
+    },
+    "KeptWindow": {
+      "description": "A usage window as the latest report that counts gave it.",
+      "type": "object",
+      "properties": {
+        "read_at": {
+          "description": "When the report was read from its run's stream.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "share": {
+          "description": "The share used, from 0 to 1.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "share",
+        "resets_at",
+        "read_at"
+      ]
+    }
+  }
+}

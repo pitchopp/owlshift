@@ -17,8 +17,8 @@ use clap::Parser;
 use owlshift_contracts::brief::Brief;
 use owlshift_contracts::ids::RelativePath;
 use owlshift_testkit::reply::{
-    FAKE_SESSION_ENV, OWN_FAILURE, Reply, TMPDIR_PREFIX, cost_line, observed_line,
-    transcript_place, usage_limit_line,
+    FAKE_SESSION_ENV, OWN_FAILURE, Reply, TMPDIR_PREFIX, USAGE_LIMIT_UNKNOWN, cost_line,
+    observed_line, transcript_place, usage_limit_line,
 };
 
 /// Plays one scripted run in the current directory, the worktree.
@@ -162,6 +162,9 @@ fn play(args: &Args) -> Result<i32, String> {
     }
     if let Some(reset) = reply.usage_limit {
         eprintln!("{}", usage_limit_line(reset));
+    }
+    if reply.usage_limit_unknown {
+        eprintln!("{USAGE_LIMIT_UNKNOWN}");
     }
     // A session's run reports the whole session's cost, as a resumed Claude
     // Code session does (C18), and its transcript keeps it.

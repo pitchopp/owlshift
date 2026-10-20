@@ -131,6 +131,7 @@ use crate::reversal;
 use crate::routing::{RouteLabels, Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, RefAt, RefRead, Stored, TicketRecord};
+use crate::usage::{self as machine_usage, UsageStore};
 use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
     Gate, MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning,
@@ -157,6 +158,7 @@ mod correction;
 mod design;
 mod drain;
 mod intake;
+mod limits;
 mod review_loop;
 mod verify;
 
@@ -168,6 +170,7 @@ pub(crate) use design::APPROVAL_CATEGORY;
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
+pub(crate) use verify::delivers_without_pass;
 
 /// The pipeline of the paths at Watch and of intake: their moves are the
 /// same in every variant. From Ready to delivery a command follows the
@@ -460,8 +463,14 @@ pub struct OnDemand<'a> {
     /// Tells the operator of a quarantine as its marker is written, and
     /// watch's of one it finds ([`quarantine`], OWL-368); `None` when this
     /// machine shows no notification. Every other notification is the
-    /// command's, from its outcome ([`crate::notify`]).
+    /// command's, from its outcome ([`crate::notify`]), but a harness's usage
+    /// limit, told once per outage as a run meets it or is refused for it
+    /// ([`crate::usage`], OWL-404).
     pub notifier: Option<&'a dyn Notifier>,
+    /// This machine's usage state of each harness (OWL-404): checked before
+    /// each run, a limited harness ending the step with nothing spent, and
+    /// kept up to date with what each run reported.
+    pub usage: &'a UsageStore,
 }
 
 /// The opt-in Codex reviewer (OWL-348, architecture section 5, "Codex"):
@@ -4296,7 +4305,9 @@ impl OnDemand<'_> {
     /// asks leaves its own. `run_started` names the session (`session`),
     /// the run it resumes (`resumes`), or why a due resume did not happen
     /// (`fresh`); `run_ended` says whether a planned resume happened
-    /// (`resumed`).
+    /// (`resumed`). A run of the ticket's own that met its harness's usage
+    /// limit, or that the machine's usage state refused before it started,
+    /// tells the operator, once per outage (OWL-404).
     #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
@@ -4308,8 +4319,20 @@ impl OnDemand<'_> {
         session: Option<Stage>,
         sink: &mut EventSink<'_>,
     ) -> Result<Ran, Stop> {
-        self.execute_or_unstarted(p, executor, (harness, setup), brief, attempt, session, sink)?
-            .map_err(|error| refused("the run could not start", error))
+        let executed =
+            self.execute_or_unstarted(p, executor, (harness, setup), brief, attempt, session, sink);
+        let limited = match &executed {
+            Err(Stop::UsageLimit { resets_at }) => Some(*resets_at),
+            Ok(Ok(ran)) => match ran.report.outcome {
+                Outcome::UsageLimit { resets_at } => Some(resets_at),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(resets_at) = limited {
+            self.tell_usage(&p.ticket, harness, resets_at, sink);
+        }
+        executed?.map_err(|error| refused("the run could not start", error))
     }
 
     /// The session a run of `role` at `stage` on `harness` is given, as run
@@ -4398,7 +4421,11 @@ impl OnDemand<'_> {
     /// back with why, its `run_ended` event emitted, rather than refused:
     /// the opt-in Codex reviewer drops its seat when its own harness cannot
     /// start (OWL-348). The runner's own faults, the run directory and the
-    /// project's marker, still stop the command.
+    /// project's marker, still stop the command. Before anything of the run
+    /// is made, its harness is checked against the machine's usage state,
+    /// a limited one stopping with [`Stop::UsageLimit`] and nothing spent;
+    /// what the run reported is kept there after it (OWL-404); the operator
+    /// is told by [`Self::execute`] alone.
     #[allow(clippy::too_many_arguments)]
     fn execute_or_unstarted(
         &self,
@@ -4411,6 +4438,7 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Result<Ran, ExecutorError>, Stop> {
         let ticket = &p.ticket.clone();
+        let admitted = self.admit_usage(ticket, harness, brief.role, sink)?;
         let (run, run_dir) =
             new_run_dir(&self.dirs.runs(ticket)).map_err(|e| refused("the run directory", e))?;
         let (plan, resumes, fresh) = match session {
@@ -4496,7 +4524,9 @@ impl OnDemand<'_> {
                 report
             }
             Err(error) => {
-                // Nothing was spawned: nothing to verify.
+                // Nothing was spawned: nothing to verify. A probe's mark goes
+                // with `admitted` (OWL-404).
+                drop(admitted);
                 let _ = self.dirs.clear_unverified();
                 sink.emit(
                     ticket,
@@ -4547,6 +4577,9 @@ impl OnDemand<'_> {
             }
         }
         sink.emit(ticket, Some(&run), EventKind::RunEnded, run_ended(&report));
+        if let Some(admitted) = &admitted {
+            self.record_usage(ticket, &run, admitted, &report, sink);
+        }
         if let Some(widened) = widened {
             sink.emit(ticket, Some(&run), widened.kind(), widened.data());
         }
@@ -7853,6 +7886,7 @@ mod tests {
             warnings: Vec::new(),
             resumed: None,
             session: None,
+            windows: Vec::new(),
         }
     }
 

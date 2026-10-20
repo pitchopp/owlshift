@@ -5,8 +5,9 @@
 //! [`notify_blocker`] once it is printed. Only the outcomes where a person
 //! must act notify: a question round, a re-ask, a reply to the decider's
 //! counter-question, a parked ticket, any of those whose comment reached the
-//! ticket although keeping Owlshift's state then failed, the harness at its
-//! usage limit. Never
+//! ticket although keeping Owlshift's state then failed. A harness at its
+//! usage limit is told by the runner itself, once per outage, as a run meets
+//! it or is refused for it (OWL-404, [`crate::usage`]). Never
 //! progress, a delivery or a green check. A notification that cannot be
 //! shown is a warning event, never an error: the run's outcome and exit code
 //! stay as they were.
@@ -82,7 +83,11 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// The park of an isolation breach, its state kept or not
 /// ([`Landed::Quarantined`]), shows nothing here: the runner notified the
 /// operator of the quarantine as it wrote the marker (OWL-368,
-/// [`crate::quarantine`]), a line that says the ticket broke isolation.
+/// [`crate::quarantine`]), a line that says the ticket broke isolation. Nor
+/// does a usage limit ([`Stop::UsageLimit`]): the runner told it once per
+/// outage as the run met it or was refused for it (OWL-404,
+/// [`crate::usage`]), so a command stopped by an outage already told says
+/// nothing more.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
     Some(match stop {
         Stop::Parked {
@@ -140,13 +145,8 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
             };
             format!("{ticket}: {what}, but {lost}; see the terminal")
         }
-        Stop::UsageLimit { resets_at } => match resets_at {
-            Some(at) => {
-                format!("{ticket}: stopped at the harness's usage limit, which resets at {at}")
-            }
-            None => format!("{ticket}: stopped at the harness's usage limit"),
-        },
-        Stop::Busy(_)
+        Stop::UsageLimit { .. }
+        | Stop::Busy(_)
         | Stop::TicketBusy(_)
         | Stop::Refused(_)
         | Stop::Unverified { .. }
@@ -539,17 +539,6 @@ mod tests {
                 "OWL-7: a resume is on the ticket, but Owlshift's state was not kept, so Build \
                  did not resume; see the terminal",
             ),
-            (
-                Stop::UsageLimit {
-                    resets_at: Some(at()),
-                },
-                "OWL-7: stopped at the harness's usage limit, which resets at \
-                 2026-10-03T20:00:00Z",
-            ),
-            (
-                Stop::UsageLimit { resets_at: None },
-                "OWL-7: stopped at the harness's usage limit",
-            ),
         ];
         for (stop, line) in cases {
             assert_eq!(shown(stop), [format!("{line} {LINK}")]);
@@ -598,6 +587,11 @@ mod tests {
             }),
             Err(Stop::Delivery("d".to_owned())),
             Err(Stop::Ready { ticket: owl_7() }),
+            // Told by the runner, once per outage (OWL-404).
+            Err(Stop::UsageLimit {
+                resets_at: Some(at()),
+            }),
+            Err(Stop::UsageLimit { resets_at: None }),
             // The runner notified the quarantine as it wrote the marker
             // (OWL-368): the breach's park, its state kept or not, adds none.
             Err(Stop::Parked {
@@ -632,14 +626,23 @@ mod tests {
         assert!(desktop_enabled(&FileState::Absent(PathBuf::from("/c"))));
 
         // Silenced, a blocker shows nothing and asks nothing of the tracker.
-        let stop = Stop::UsageLimit { resets_at: None };
+        let stop = parked();
         let (asked, events, _) = notify(None, Some(LINK), &Err(stop));
         assert_eq!((asked, events.len()), (0, 0));
     }
 
+    /// A parked ticket, a blocker any machine notifies.
+    fn parked() -> Stop {
+        Stop::Parked {
+            reason: ParkReason::Reasks,
+            detail: "d".to_owned(),
+            unposted: None,
+        }
+    }
+
     #[test]
     fn a_notification_not_shown_is_a_warning_event() {
-        let stop = Stop::UsageLimit { resets_at: None };
+        let stop = parked();
         let (_, events, out) = notify(Some(&Failing), None, &Err(stop));
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].kind, EventKind::Warning);
@@ -665,11 +668,10 @@ mod tests {
             Some(long.as_str()),
         ] {
             let recording = Recording::default();
-            let stop = Stop::UsageLimit { resets_at: None };
-            notify(Some(&recording), url, &Err(stop));
+            notify(Some(&recording), url, &Err(parked()));
             assert_eq!(
                 recording.0.into_inner(),
-                ["OWL-7: stopped at the harness's usage limit"],
+                ["OWL-7 is parked: a person must look"],
                 "{url:?}"
             );
         }

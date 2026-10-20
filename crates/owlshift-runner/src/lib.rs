@@ -40,5 +40,6 @@ pub mod step;
 pub mod system;
 pub mod ticket_ref;
 pub mod tracker;
+pub mod usage;
 pub mod watch;
 pub mod writer;

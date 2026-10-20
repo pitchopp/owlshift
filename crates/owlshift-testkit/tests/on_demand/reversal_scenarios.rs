@@ -29,9 +29,11 @@ impl Bench {
         .unwrap();
     }
 
-    /// A run cut off by a usage limit.
+    /// A run cut off by a usage limit whose reset is already past
+    /// (OWL-404): it holds its harness no longer, which the next command
+    /// needs.
     pub(super) fn limited(&self) -> Reply {
-        self.limited_until("2026-10-02T15:00:00Z")
+        self.limited_until("2026-10-02T08:00:00Z")
     }
 
     /// A run cut off by a usage limit that resets at `resets`.

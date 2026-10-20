@@ -39,7 +39,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "hold": {
       "description": "The hold the step calls for, by watch's rule, none when it calls for\nnone.",
@@ -385,27 +385,8 @@
       ]
     },
     "StepHold": {
-      "description": "A hold a step calls for.",
+      "description": "A hold a step calls for. A usage limit holds its harness machine-wide\n(`<data>/usage/`, OWL-404), never every step of a watch.",
       "oneOf": [
-        {
-          "description": "Every step waits until the usage limit resets.",
-          "type": "object",
-          "properties": {
-            "hold": {
-              "type": "string",
-              "const": "paused"
-            },
-            "until": {
-              "type": "string",
-              "format": "date-time"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "hold",
-            "until"
-          ]
-        },
         {
           "description": "The ticket is held until `until`, or until a person acts when none,\nunless its decider edits a comment or its ref makes progress.",
           "type": "object",

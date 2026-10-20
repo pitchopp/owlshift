@@ -86,6 +86,50 @@ fn success() {
     assert_eq!(limit.seven_day_utilization, Some(0.34));
 }
 
+/// OWL-404, check (g): every rate-limit report names both windows, and the
+/// run keeps each with its share, its reset and the time its report was read
+/// from the stream; a later report of a window replaces it unless it resets
+/// earlier.
+#[test]
+fn usage_windows() {
+    let recorded = std::fs::read(fixture("success.jsonl")).unwrap();
+    let read_at = Timestamp::from_second(1792410000).unwrap();
+    let mut transcript = Transcript::default();
+    for line in recorded.split_inclusive(|&byte| byte == b'\n') {
+        transcript.feed_at(line, read_at);
+    }
+    let run = transcript.finish(Some(0), Vec::new());
+    let windows: Vec<_> = run
+        .windows
+        .iter()
+        .map(|w| (w.name.as_str(), w.share, w.resets_at.as_second(), w.read_at))
+        .collect();
+    assert_eq!(
+        windows,
+        [
+            ("five_hour", 0.31, 1792425600, read_at),
+            ("seven_day", 0.34, 1792562400, read_at)
+        ]
+    );
+
+    let report = |share: f64, five: i64| {
+        format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed","unifiedWindows":{{"five_hour":{{"utilization":{share},"resetsAt":{five}}}}}}}}}"#
+        )
+    };
+    let mut transcript = Transcript::default();
+    let at = |second| Timestamp::from_second(second).unwrap();
+    transcript.feed_at(report(0.5, 2000).as_bytes(), at(10));
+    transcript.feed_at(report(0.1, 1000).as_bytes(), at(11));
+    transcript.feed_at(report(0.6, 2000).as_bytes(), at(12));
+    let run = transcript.finish(Some(0), Vec::new());
+    assert_eq!(run.windows.len(), 1);
+    assert_eq!(
+        (run.windows[0].share, run.windows[0].read_at),
+        (0.6, at(12))
+    );
+}
+
 /// Constructed: the warning a run reported on 2.1.284, when the seven-day
 /// window passed its threshold (the success run of OWL-77). The 2.1.302
 /// recording reports a plain `allowed`, so this line keeps the warning read.

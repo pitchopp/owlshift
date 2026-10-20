@@ -32,6 +32,7 @@ use owlshift_runner::on_demand::{self, OnDemand};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::routing::Router;
 use owlshift_runner::slots::MachineSlots;
+use owlshift_runner::usage::UsageStore;
 
 use crate::gh;
 use crate::git::{GitEnv, seed};
@@ -183,6 +184,7 @@ impl ChildProject {
         let forge = GitHubForge::with_transport(NoForge, Repo::parse(REPO).unwrap());
         let dirs = self.dirs();
         let remote_url = self.bare.to_string_lossy().into_owned();
+        let usage = UsageStore::in_data_dir(&self.data);
         let on_demand = OnDemand {
             executor: &executor,
             tracker: &tracker,
@@ -203,6 +205,7 @@ impl ChildProject {
             head_wait: Duration::ZERO,
             clock: &on_demand::system_clock,
             notifier: None,
+            usage: &usage,
         };
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), out);
         act(&on_demand, &mut sink)

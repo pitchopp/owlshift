@@ -21,9 +21,12 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 
-use owlshift_adapters::harness::claude::{self, EXIT_GRACE, Effort, STDERR_CAP, Usage};
+use owlshift_adapters::harness::claude::{
+    self, EXIT_GRACE, Effort, STDERR_CAP, Usage, UsageWindow,
+};
 use owlshift_contracts::brief::{Brief, PermissionLevel};
 use owlshift_contracts::ids::SessionId;
+use owlshift_core::vocab::Harness as HarnessKind;
 use owlshift_platform::keychain::Secret;
 use owlshift_platform::process::{find_executable_in, hand_over_on_descriptor};
 
@@ -150,6 +153,13 @@ pub trait Harness {
     fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
         let _ = (folder, id);
         Ok(None)
+    }
+
+    /// The harness whose usage this run spends, which the machine-wide
+    /// usage state holds and checks before the run (OWL-404); `None`, the
+    /// default, for one whose usage nothing tracks, such as a stand-in.
+    fn usage_harness(&self) -> Option<HarnessKind> {
+        None
     }
 }
 
@@ -310,6 +320,9 @@ pub struct HarnessEnd {
     /// session writes to the cache again (OWL-394); `None` when the harness
     /// reports none.
     pub context_tokens: Option<u64>,
+    /// The usage windows the harness reported, each as its latest report
+    /// gave it (OWL-404); empty when it reports none.
+    pub windows: Vec<UsageWindow>,
 }
 
 impl HarnessEnd {
@@ -325,6 +338,7 @@ impl HarnessEnd {
             message: None,
             permission_denials: Vec::new(),
             context_tokens: None,
+            windows: Vec::new(),
         }
     }
 }
@@ -503,6 +517,10 @@ impl Harness for ClaudeHarness {
             .map(|_| format!("claude-code:{}", self.model.as_deref().unwrap_or("default")))
     }
 
+    fn usage_harness(&self) -> Option<HarnessKind> {
+        Some(HarnessKind::Claude)
+    }
+
     fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
         claude::transcript_path(folder, id)
     }
@@ -676,6 +694,7 @@ fn claude_end(run: claude::Run, level: PermissionLevel, in_message: bool) -> Har
         message,
         permission_denials,
         context_tokens: run.context_tokens,
+        windows: run.windows,
     }
 }
 
