@@ -294,7 +294,7 @@ impl Bench {
 #[test]
 fn a_kept_branch_with_commits_of_its_own_is_dispatched_as_it_is() {
     let bench = Bench::new(true);
-    let blocked = r#"{"format":13,"status":"blocked","summary":"Waiting."}"#;
+    let blocked = r#"{"format":14,"status":"blocked","summary":"Waiting."}"#;
     let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], None);
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
@@ -566,6 +566,84 @@ fn scenario_s3_questions_at_intake() {
         "{}",
         intakes[2]
     );
+}
+
+/// An intake result `done` that declares `zones` and `resources` (OWL-402).
+fn intake_declaring(zones: &[&str], resources: &[&str]) -> String {
+    let mut result: Value = serde_json::from_str(&intake_result("done", None, "")).unwrap();
+    result["intake"]["zones"] = json!(zones);
+    result["intake"]["resources"] = json!(resources);
+    result.to_string()
+}
+
+/// OWL-402, part 4 of P6: intake declares zones and named resources. The
+/// project names two resources; DEMO-1 carries a `zone:web` label. A first
+/// intake run names a resource the project does not list: its result is
+/// refused, and the next run is told why. The second declares the zone
+/// `db/main` and the resource `assets`: the record keeps that declaration,
+/// and the INTAKE comment and the Build's brief show what the ticket holds,
+/// the label's zone added and `migrations` held through `db/main`.
+#[test]
+fn intake_declares_zones_and_named_resources() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\", \"zone:web\"]\n",
+        "[stack.resources]\nmigrations = \"db/*/migrations/**\"\nassets = \"static/**\"\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    let replies = vec![
+        bench.reply(None, Some(&intake_declaring(&["db/main"], &["nope"]))),
+        bench.reply(None, Some(&intake_declaring(&["db/main"], &["assets"]))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let (outcomes, lines, printed) = bench.drain(replies, 2, |_| {});
+    assert!(
+        outcomes.iter().any(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+
+    let intakes: Vec<Brief> = bench
+        .briefs()
+        .into_iter()
+        .filter(|brief| brief.role == Role::Intake)
+        .collect();
+    assert_eq!(intakes.len(), 2, "{lines}\n{printed}");
+    let patterns: Vec<(&str, &str)> = intakes[0]
+        .named_resources
+        .iter()
+        .map(|(name, pattern)| (name.as_str(), pattern.as_str()))
+        .collect();
+    assert_eq!(
+        patterns,
+        [
+            ("assets", "static/**"),
+            ("migrations", "db/*/migrations/**")
+        ]
+    );
+    assert_eq!(intakes[0].result_refusal, None);
+    let told = intakes[1].result_refusal.as_deref().unwrap_or_default();
+    assert!(
+        told.contains("the resource \"nope\" is not one the brief's named_resources lists"),
+        "{told}"
+    );
+
+    let record = bench.record().intake.unwrap();
+    assert_eq!(
+        (record.zones, record.resources),
+        (vec!["db/main".to_owned()], vec!["assets".to_owned()])
+    );
+    let comments = intake_comments(&bench, TICKET);
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("**Zones:** `db/main`, `web`\n**Resources:** `assets`, `migrations`"),
+        "{}",
+        comments[0]
+    );
+    let build = bench.last_of(Role::Build);
+    assert_eq!(build.zones, ["db/main", "web"]);
+    assert_eq!(build.resources, ["assets", "migrations"]);
+    assert!(build.named_resources.is_empty());
 }
 
 /// Scenario S6, "The human is the bottleneck", with `max_open_prs = 1`. The

@@ -220,6 +220,7 @@ fn brief() -> Brief {
         checkpoint: None,
         zones: Vec::new(),
         resources: Vec::new(),
+        named_resources: Default::default(),
         rules: Vec::new(),
         permissions: Permissions {
             level: PermissionLevel::WriteWorktree,
@@ -368,7 +369,7 @@ fn a_declared_cache_is_read_and_never_written() {
     bench.run(bench.agent(), CACHE_PROBE).unwrap();
     assert_eq!(lines()[0], "read=1", "without the cache: {:?}", lines());
 
-    let done = r#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+    let done = r#"{"format":14,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
     let script = format!("{CACHE_PROBE}\nprintf '%s' '{done}' > \"$1\"\n");
     let mut brief = brief();
     brief.gate = CACHE_GATE.iter().map(|line| (*line).to_owned()).collect();
@@ -485,7 +486,7 @@ echo written > "$CLAUDE_CONFIG_DIR/session"
 env
 printf 'token: %s\n' "$tok" >&2
 mkdir -p .owlshift/run
-printf '{"format":13,"status":"blocked","summary":"%s"}' "${LEAK:+$tok}" > .owlshift/run/result.json
+printf '{"format":14,"status":"blocked","summary":"%s"}' "${LEAK:+$tok}" > .owlshift/run/result.json
 "#;
 
 /// OWL-94's acceptance through the executor: a confined harness logs in
@@ -600,7 +601,7 @@ case "$out" in
 esac >> probe.txt
 echo "path=$d" >> probe.txt
 mkdir -p .owlshift/run
-printf '{"format":13,"status":"blocked","summary":"probed"}' > .owlshift/run/result.json
+printf '{"format":14,"status":"blocked","summary":"probed"}' > .owlshift/run/result.json
 "#;
 
 /// The user's own `/tmp/claude-<uid>`, made for the test when it is absent
@@ -698,7 +699,7 @@ fn read_only(line: &str) -> Script {
 
 /// A review run's result, valid against [`review_brief`].
 #[cfg(unix)]
-const REVIEW_RESULT: &str = r#"{"format":13,"status":"done","summary":"no finding"}"#;
+const REVIEW_RESULT: &str = r#"{"format":14,"status":"done","summary":"no finding"}"#;
 
 /// OWL-298: the read-only profile is refused for a brief that lets its role
 /// write the worktree, before anything is written, on every platform.
@@ -1220,7 +1221,7 @@ fn codex_login(account: &str, access: &str) -> String {
 /// The critic's answer, as Codex's last message.
 #[cfg(unix)]
 const CRITIC_MESSAGE: &str =
-    r#"{"format":13,"status":"done","summary":"no finding","findings":[]}"#;
+    r#"{"format":14,"status":"done","summary":"no finding","findings":[]}"#;
 
 /// A stand-in for `codex exec`, run by `CodexHarness` through the executor:
 /// it reads its prompt, reports what its `CODEX_HOME` holds on standard
@@ -1238,7 +1239,7 @@ cat > /dev/null
 echo "home=$(ls -A "$CODEX_HOME" | tr '\n' ' ')" >&2
 case "$CODEX_HOME" in "$HOME"/*) echo "home=the user's" >&2;; esac
 cat "$CODEX_HOME/auth.json"; echo
-printf '%s' '{{"format":13,"status":"failed","summary":"planted"}}' > "$(dirname "$out")/result.json"
+printf '%s' '{{"format":14,"status":"failed","summary":"planted"}}' > "$(dirname "$out")/result.json"
 {script}
 echo '{{"type":"thread.started","thread_id":"t"}}'
 echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"{message}"}}}}'

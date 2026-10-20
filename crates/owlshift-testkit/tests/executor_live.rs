@@ -1025,6 +1025,7 @@ fn run_live_seeded(
         checkpoint: None,
         zones: Vec::new(),
         resources: Vec::new(),
+        named_resources: Default::default(),
         rules: Vec::new(),
         permissions: Permissions {
             level,

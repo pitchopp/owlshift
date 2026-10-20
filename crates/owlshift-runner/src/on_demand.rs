@@ -58,7 +58,7 @@
 //! branch, then through Verify to a push to the same pull request (OWL-307);
 //! see the `review_loop` module.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -103,7 +103,7 @@ use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::{BudgetReached, Chain, ChainCost, GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
-use owlshift_core::resource::Resource;
+use owlshift_core::resource::{self, Held, Resource};
 use owlshift_core::routing::{
     PROJECT_DEFAULT, RunRouting, TicketRouting, resolver_routing, role_routing, ticket_routing,
 };
@@ -4273,6 +4273,10 @@ impl OnDemand<'_> {
     /// `current` is the ticket's decider now, which the ticket's author and
     /// the comments before any ask are judged against ([`thread`]); the
     /// brief's `decider` is the one in force at the end of the thread.
+    /// Once intake kept its record, `zones` and `resources` give what the
+    /// ticket holds ([`held`], OWL-402), from its labels now and the named
+    /// resources of `rules`; a brief told no project file, such as the
+    /// answer check's, keeps the labels' zones alone.
     fn brief(
         &self,
         p: &Prepared,
@@ -4290,6 +4294,7 @@ impl OnDemand<'_> {
             || current.name.clone(),
             |ask| name_of(&ask.decider, &p.found),
         );
+        let (zones, resources) = held_by(p, rules);
         Brief {
             format: Format,
             role,
@@ -4306,8 +4311,15 @@ impl OnDemand<'_> {
             thread: thread(comments, &asks, &decisions, current),
             resolve: Vec::new(),
             checkpoint: if build { checkpoint(&p.worktree) } else { None },
-            zones: brief_zones(p.found.labels.iter().map(String::as_str)).zones,
-            resources: Vec::new(),
+            zones,
+            resources,
+            named_resources: match (role, rules.resources()) {
+                (Role::Intake, Some(named)) => named
+                    .iter()
+                    .map(|(name, pattern)| (name.to_owned(), pattern.as_str().to_owned()))
+                    .collect(),
+                _ => BTreeMap::new(),
+            },
             rules: rules.for_role(role),
             permissions: Permissions {
                 level: if build || role == Role::Rebase {
@@ -6625,6 +6637,44 @@ impl Kept<'_> {
     }
 }
 
+/// The zones and resources a brief of `p`'s ticket gives (OWL-402): what
+/// the ticket holds ([`held_for`]) once intake kept its record and `rules`
+/// were read from a project file; otherwise its `zone:` labels' zones and
+/// no resource.
+fn held_by(p: &Prepared, rules: &ProjectRules) -> (Vec<String>, Vec<String>) {
+    match (&p.intake, rules.resources()) {
+        (Some(record), Some(_)) => {
+            let Held { zones, resources } =
+                held_for(&p.found, &record.zones, &record.resources, rules);
+            (zones, resources)
+        }
+        _ => (
+            brief_zones(p.found.labels.iter().map(String::as_str)).zones,
+            Vec::new(),
+        ),
+    }
+}
+
+/// What `ticket` holds when intake declared `zones` and `resources`
+/// (architecture section 5, "Declared at intake"): its `zone:` labels add
+/// zones, a malformed one left out as the brief leaves it, and the named
+/// resources of `rules` that its zones reach are held too.
+pub(super) fn held_for(
+    ticket: &Ticket,
+    zones: &[String],
+    resources: &[String],
+    rules: &ProjectRules,
+) -> Held {
+    let labels = brief_zones(ticket.labels.iter().map(String::as_str)).zones;
+    let none = resource::NamedResources::default();
+    resource::held(
+        zones,
+        &labels,
+        resources,
+        rules.resources().unwrap_or(&none),
+    )
+}
+
 /// Who decides a ticket, as far as the ticket alone tells.
 enum Pending {
     /// Its decider: the assignee.
@@ -8023,12 +8073,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":13,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":14,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t","recommendation":{{"why":"r"}}}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":13,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":14,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -8112,7 +8162,7 @@ mod tests {
         // A `premise_false` with no question asks nothing either (OWL-193).
         let unasked_premise = Outcome::Finished {
             result: Box::new(
-                RunResult::parse(r#"{"format":13,"status":"premise_false","summary":"s"}"#)
+                RunResult::parse(r#"{"format":14,"status":"premise_false","summary":"s"}"#)
                     .unwrap(),
             ),
             artifacts: crate::artifact::ArtifactContents::default(),
@@ -8212,7 +8262,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":13,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":14,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -8249,7 +8299,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":13,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":14,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());
@@ -8336,7 +8386,7 @@ mod tests {
         };
         let asking = |named: &str| {
             format!(
-                r#"{{"format":13,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":14,"status":"questions","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"Which file, and every key?",
                 "recommendation":{{"why":"r"}}}}]{named}}}"#
             )
@@ -8353,7 +8403,7 @@ mod tests {
             (true, 0, Some(held))
         );
         // Its `done` is refused, and the hold kept with the latest reason.
-        let done = validated(r#"{"format":13,"status":"done","summary":"s"}"#, &text_only);
+        let done = validated(r#"{"format":14,"status":"done","summary":"s"}"#, &text_only);
         let refused = done.unwrap_err();
         assert!(
             matches!(
@@ -8374,7 +8424,7 @@ mod tests {
 
         // Mixed with typed choices, a later refusal's: only those have a
         // place, and an ask naming them all clears the text lists too.
-        let listing = r#"{"format":13,"status":"done","summary":"s","decisions":[
+        let listing = r#"{"format":14,"status":"done","summary":"s","decisions":[
             {"question":"Where the README lists it","decision":"d","basis":"b"},
             {"question":"Which default","decision":"d","basis":"b"}]}"#;
         let refused = validated(listing, &text_only).unwrap_err();

@@ -1909,17 +1909,23 @@ pub struct IntakeComment {
     pub variant: Variant,
     pub routing: Routing,
     pub dependencies: Vec<KeptDependency>,
+    /// The zones the ticket holds (OWL-402): intake's and its labels';
+    /// empty, the whole repository.
+    pub zones: Vec<String>,
+    /// The named resources the ticket holds (OWL-402).
+    pub resources: Vec<String>,
     /// The intake run that found them.
     pub run: Option<String>,
 }
 
 impl IntakeComment {
     /// The comment body: the `[owlshift] INTAKE` header, the verdict, each
-    /// dependency with the words that name it and what became of it, and the
-    /// footer. A quote comes from the ticket's text through a model: it is
-    /// flattened to one line inside a code span, so no mention, link or
-    /// marker in it acts. A record holds at most 64 quotes of 512 bytes, far
-    /// within [`MAX_COMMENT_CHARS`].
+    /// dependency with the words that name it and what became of it, the
+    /// zones and resources the ticket holds, and the footer. A quote, and a
+    /// zone, comes from the ticket's text through a model: it is flattened
+    /// to one line inside a code span, so no mention, link or marker in it
+    /// acts. A record holds at most 64 quotes of 512 bytes, 64 zones of 512
+    /// bytes and 64 resource names, far within [`MAX_COMMENT_CHARS`].
     pub fn render(&self) -> String {
         let header = Header {
             kind: MarkerKind::Intake,
@@ -1971,9 +1977,28 @@ impl IntakeComment {
                 .collect();
             sections.push(format!("**Dependencies:**\n{}", bullets(&lines)));
         }
+        let spans = |items: &[String]| {
+            items
+                .iter()
+                .map(|item| code(&flatten(item)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let zones = if self.zones.is_empty() {
+            "**Zones:** none named, so the ticket holds the whole repository.".to_owned()
+        } else {
+            format!("**Zones:** {}", spans(&self.zones))
+        };
+        let resources = if self.resources.is_empty() {
+            "**Resources:** none.".to_owned()
+        } else {
+            format!("**Resources:** {}", spans(&self.resources))
+        };
+        sections.push(format!("{zones}\n{resources}"));
         sections.push(
             "The variant and the routing are followed from the ticket's dispatch; a `variant:`, \
-             `tier:` or `effort:` label on the ticket overrides them."
+             `tier:` or `effort:` label on the ticket overrides them. A `zone:` label adds a \
+             zone, and a zone that a named resource's pattern reaches holds the resource."
                 .to_owned(),
         );
         sections.push(
@@ -4747,6 +4772,8 @@ Merge state reported by the forge: `CLEAN`.
                 quote: format!("Blocked by OWL-2 `@someone` {forged}"),
                 outcome: DependencyOutcome::Pending,
             }],
+            zones: vec!["backend/billing".to_owned(), "web/`@x`".to_owned()],
+            resources: vec!["migrations".to_owned()],
             run: Some("r1".to_owned()),
         };
         let body = comment.render();
@@ -4758,6 +4785,8 @@ Merge state reported by the forge: `CLEAN`.
             "**Routing:** claude on the standard tier, effort high",
             "- OWL-2, named by `Blocked by OWL-2 '@someone' <!-- owlshift:",
             ": not checked yet",
+            // OWL-402: what the ticket holds, a zone quoted inertly.
+            "**Zones:** `backend/billing`, `web/'@x'`\n**Resources:** `migrations`",
         ] {
             assert!(body.contains(line), "{line}\n---\n{body}");
         }
@@ -4784,9 +4813,17 @@ Merge state reported by the forge: `CLEAN`.
 
         let none = IntakeComment {
             dependencies: Vec::new(),
+            zones: Vec::new(),
+            resources: Vec::new(),
             ..comment
-        };
-        assert!(none.render().contains("**Dependencies:** none found."));
+        }
+        .render();
+        for line in [
+            "**Dependencies:** none found.",
+            "**Zones:** none named, so the ticket holds the whole repository.\n**Resources:** none.",
+        ] {
+            assert!(none.contains(line), "{line}\n---\n{none}");
+        }
     }
 
     fn plan_of(text: &str) -> Plan {

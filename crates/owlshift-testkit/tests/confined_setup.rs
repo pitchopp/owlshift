@@ -78,7 +78,7 @@ const PYTHON: Fixture = Fixture {
     missing: ".venv/bin/python",
 };
 
-const DONE: &str = r#"{"format":13,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+const DONE: &str = r#"{"format":14,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -401,6 +401,7 @@ fn brief() -> Brief {
         checkpoint: None,
         zones: Vec::new(),
         resources: Vec::new(),
+        named_resources: Default::default(),
         rules: Vec::new(),
         permissions: Permissions {
             level: PermissionLevel::WriteWorktree,

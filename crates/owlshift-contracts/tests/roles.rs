@@ -79,6 +79,9 @@ const INTAKE_ONLY: &[&str] = &[
     "dependencies",
     "ticket",
     "quote",
+    // OWL-402.
+    "zones",
+    "resources",
 ];
 
 /// `result.json` fields and values of the quality pipeline (OWL-300) that

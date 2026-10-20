@@ -15,7 +15,7 @@ use super::*;
 
 /// The resolver's approval of the forked plan, as it decides it under
 /// `on-fork`.
-const APPROVES: &str = r#"{"format":13,"status":"done","summary":"The fork's choice is the repository's.",
+const APPROVES: &str = r#"{"format":14,"status":"done","summary":"The fork's choice is the repository's.",
 "resolutions":[{"question":"Q1","outcome":"decided","category":"approval",
 "decision":"Approve the plan as it is.",
 "basis":"The plan's fork keeps Markdown, as the repository's docs are; plain text buys nothing.",

@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 23
+      "const": 24
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -111,6 +111,13 @@
           "type": "null"
         }
       ]
+    },
+    "named_resources": {
+      "description": "The project's named resources, each with the pattern of the\nrepository paths it covers (`stack.resources`, format 24, OWL-402):\n`*` one part, `**` any number of parts. In intake's brief only, which\nnames from it the resources the ticket touches.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
     },
     "permissions": {
       "$ref": "#/$defs/Permissions"
@@ -164,7 +171,7 @@
       }
     },
     "resources": {
-      "description": "The resources the ticket holds.",
+      "description": "The named resources the ticket holds (format 24, OWL-402): once\nintake kept its record, those it named that the project still lists,\nthen those a zone of `zones` reaches, every one for the whole\nrepository; empty before, and in the answer check's brief.",
       "type": "array",
       "default": [],
       "items": {
@@ -176,7 +183,7 @@
       "$ref": "#/$defs/RelativePath"
     },
     "result_refusal": {
-      "description": "Why the runner refused an earlier run's `result.json`, or a file\nits `artifacts` name: what this run fixes in its own, such as\nquestions not numbered from Q1. In Build's brief, the latest refused\nBuild result since one was accepted (OWL-180), whatever command ran\nit, as the ticket ref keeps it (OWL-192), with every list of choices\nrefused since no Build run asked before it, oldest first (OWL-195);\nin the answer check's, the previous check on the same ask, whatever\ncommand ran it, as the ticket ref keeps it (OWL-184); in the\nresolver's, the latest refused\nresolver result, whatever command ran it, until a resolver result is\naccepted or a round is kept, as the ticket ref keeps it (OWL-191): a\nround whose post or keeping failed is replayed by a later command,\nwhose questions may differ. The runner's message, at most\n[`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result\nis data. Absent when no such refusal is kept. Since OWL-198 it quotes\nno choice kept typed: those are in `refused_choices`.",
+      "description": "Why the runner refused an earlier run's `result.json`, or a file\nits `artifacts` name: what this run fixes in its own, such as\nquestions not numbered from Q1. In Build's brief, the latest refused\nBuild result since one was accepted (OWL-180), whatever command ran\nit, as the ticket ref keeps it (OWL-192), with every list of choices\nrefused since no Build run asked before it, oldest first (OWL-195);\nin the answer check's, the previous check on the same ask, whatever\ncommand ran it, as the ticket ref keeps it (OWL-184); in the\nresolver's, the latest refused\nresolver result, whatever command ran it, until a resolver result is\naccepted or a round is kept, as the ticket ref keeps it (OWL-191): a\nround whose post or keeping failed is replayed by a later command,\nwhose questions may differ; in intake's (format 24, OWL-402), why\nthe previous intake run of the same command was refused, its result\nor a dependency it named, kept nowhere else. The runner's message, at most\n[`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result\nis data. Absent when no such refusal is kept. Since OWL-198 it quotes\nno choice kept typed: those are in `refused_choices`.",
       "type": [
         "string",
         "null"
@@ -227,7 +234,7 @@
       "$ref": "#/$defs/TicketBrief"
     },
     "zones": {
-      "description": "The code zones the ticket declares: its `zone:` labels until intake.",
+      "description": "The code zones the ticket holds (format 24, OWL-402): once intake\nkept its record, the zones it declared and those the ticket's `zone:`\nlabels add, each once, a zone another contains left out, and empty\nwhen intake named none, as the ticket then holds the whole\nrepository; before, and in the answer check's brief, the zones its\n`zone:` labels declare.",
       "type": "array",
       "default": [],
       "items": {

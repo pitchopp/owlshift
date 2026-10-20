@@ -291,10 +291,15 @@ impl OnDemand<'_> {
         // runs is a text intake did not read, which the next pass takes in.
         let text = text_sha256(&p.found.title, &p.found.description);
         let mut attempt = 0u32;
+        // Why the previous run of this loop was refused, which the next one
+        // is told (OWL-402), so that a resource name misspelled once is not
+        // misspelled again before the ticket parks.
+        let mut told: Option<String> = None;
         loop {
             attempt += 1;
             let comments = self.comments(&p.ticket)?;
-            let brief = self.brief(p, Role::Intake, &comments, &rules, None, &current);
+            let mut brief = self.brief(p, Role::Intake, &comments, &rules, None, &current);
+            brief.result_refusal = told.take();
             let (ran, mut event) = self.run_role_once(
                 p,
                 (self.intake, &[]),
@@ -304,6 +309,7 @@ impl OnDemand<'_> {
                 &mut Gathered::default(),
                 sink,
             )?;
+            told = result_refusal(&ran.report.outcome);
             let mut result = ran.result();
             if let Some(found) = result {
                 // A dependency the ticket's text does not name is refused: a
@@ -313,6 +319,7 @@ impl OnDemand<'_> {
                     .as_ref()
                     .and_then(|verdict| unfounded(verdict, &p.found, &comments));
                 if let Some(reason) = refusal {
+                    told = Some(reason.clone());
                     sink.emit(
                         &p.ticket,
                         Some(&ran.run),
@@ -376,10 +383,10 @@ impl OnDemand<'_> {
                         Ok(dependencies) => {
                             let record = self.keep_intake(
                                 p,
-                                &text,
-                                &gesture,
+                                (&text, &gesture),
                                 verdict,
                                 dependencies,
+                                &rules,
                                 &ran,
                                 sink,
                             )?;
@@ -447,8 +454,15 @@ impl OnDemand<'_> {
                             "an intake run done without its record".to_owned(),
                         ));
                     };
-                    let record =
-                        self.keep_intake(p, &text, &gesture, verdict, dependencies, &ran, sink)?;
+                    let record = self.keep_intake(
+                        p,
+                        (&text, &gesture),
+                        verdict,
+                        dependencies,
+                        &rules,
+                        &ran,
+                        sink,
+                    )?;
                     p.intake = Some(record.clone());
                     let questions = p.questions();
                     if let Err(error) = self.store(p, &state, questions) {
@@ -473,17 +487,19 @@ impl OnDemand<'_> {
         }
     }
 
-    /// The record of an intake run whose `verdict` is accepted, with its
+    /// The record of an intake run whose `verdict` is accepted, under the
+    /// ticket's `text` hash and the admission `gesture`, with its
     /// `dependencies` as [`Self::relate_dependencies`] left them, posted as
-    /// the INTAKE comment; the caller keeps it.
+    /// the INTAKE comment, which shows what the ticket holds with the named
+    /// resources of `rules` (OWL-402); the caller keeps it.
     #[allow(clippy::too_many_arguments)]
     fn keep_intake(
         &self,
         p: &Prepared,
-        text: &str,
-        gesture: &Gesture,
+        (text, gesture): (&str, &Gesture),
         verdict: &IntakeVerdict,
         dependencies: Vec<KeptDependency>,
+        rules: &ProjectRules,
         ran: &Ran,
         sink: &mut EventSink<'_>,
     ) -> Result<TicketIntake, Stop> {
@@ -494,7 +510,10 @@ impl OnDemand<'_> {
             variant: verdict.variant,
             routing: verdict.routing,
             dependencies,
+            zones: verdict.zones.clone(),
+            resources: verdict.resources.clone(),
         };
+        let holds = held_for(&p.found, &record.zones, &record.resources, rules);
         record
             .validate()
             .map_err(|e| refused("the intake record", e))?;
@@ -514,6 +533,8 @@ impl OnDemand<'_> {
             variant: record.variant,
             routing: record.routing,
             dependencies: record.dependencies.clone(),
+            zones: holds.zones,
+            resources: holds.resources,
             run: Some(ran.run.clone()),
         };
         let posted = Writer::new(self.tracker)

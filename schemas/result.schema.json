@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 13
+      "const": 14
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -734,11 +734,29 @@
           },
           "maxItems": 64
         },
+        "resources": {
+          "description": "The named resources the ticket will touch, from those the brief's\n`named_resources` lists (format 14, OWL-402): at most\n[`MAX_DECLARED`].",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
         "routing": {
           "$ref": "#/$defs/Routing"
         },
         "variant": {
           "$ref": "#/$defs/Variant"
+        },
+        "zones": {
+          "description": "The folders the ticket will change, from the repository's root, at\nthe coarsest level the role can honestly name (format 14, OWL-402):\nat most [`MAX_DECLARED`], each by the rules of a `zone:` label and\nwithout `*`. None: the whole repository.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
         }
       },
       "additionalProperties": false,

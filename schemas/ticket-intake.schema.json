@@ -16,10 +16,19 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "gesture": {
       "$ref": "#/$defs/Gesture"
+    },
+    "resources": {
+      "description": "The named resources intake declared (format 2, OWL-402): at most\n[`MAX_DECLARED`].",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64
     },
     "routing": {
       "$ref": "#/$defs/Routing"
@@ -31,6 +40,15 @@
     },
     "variant": {
       "$ref": "#/$defs/Variant"
+    },
+    "zones": {
+      "description": "The zones intake declared, as it wrote them (format 2, OWL-402): at\nmost [`MAX_DECLARED`]. None: the ticket holds the whole repository.\nThe zones the labels add and the resources the zones reach are not\nkept: they are read again for each brief.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64
     }
   },
   "additionalProperties": false,

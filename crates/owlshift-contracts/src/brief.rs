@@ -63,12 +63,26 @@ pub struct Brief {
     /// Where an interrupted or resumed ticket starts again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Checkpoint>,
-    /// The code zones the ticket declares: its `zone:` labels until intake.
+    /// The code zones the ticket holds (format 24, OWL-402): once intake
+    /// kept its record, the zones it declared and those the ticket's `zone:`
+    /// labels add, each once, a zone another contains left out, and empty
+    /// when intake named none, as the ticket then holds the whole
+    /// repository; before, and in the answer check's brief, the zones its
+    /// `zone:` labels declare.
     #[serde(default)]
     pub zones: Vec<String>,
-    /// The resources the ticket holds.
+    /// The named resources the ticket holds (format 24, OWL-402): once
+    /// intake kept its record, those it named that the project still lists,
+    /// then those a zone of `zones` reaches, every one for the whole
+    /// repository; empty before, and in the answer check's brief.
     #[serde(default)]
     pub resources: Vec<String>,
+    /// The project's named resources, each with the pattern of the
+    /// repository paths it covers (`stack.resources`, format 24, OWL-402):
+    /// `*` one part, `**` any number of parts. In intake's brief only, which
+    /// names from it the resources the ticket touches.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub named_resources: BTreeMap<String, String>,
     /// The project rules injected for the ticket's zones.
     #[serde(default)]
     pub rules: Vec<Rule>,
@@ -123,7 +137,9 @@ pub struct Brief {
     /// resolver result, whatever command ran it, until a resolver result is
     /// accepted or a round is kept, as the ticket ref keeps it (OWL-191): a
     /// round whose post or keeping failed is replayed by a later command,
-    /// whose questions may differ. The runner's message, at most
+    /// whose questions may differ; in intake's (format 24, OWL-402), why
+    /// the previous intake run of the same command was refused, its result
+    /// or a dependency it named, kept nowhere else. The runner's message, at most
     /// [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result
     /// is data. Absent when no such refusal is kept. Since OWL-198 it quotes
     /// no choice kept typed: those are in `refused_choices`.
@@ -835,16 +851,26 @@ impl Brief {
     /// questions to `resolve`, in increasing order, a `delegation` level and
     /// the run that asked (`asked_by`, its plan's and diff's bases full
     /// commit ids), and no other brief has any; only Build's, the answer
-    /// check's and the resolver's briefs have
+    /// check's, the resolver's and, since format 24, intake's briefs have
     /// a `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
     /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
     /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
     /// `rebase`; only Build's has a `setup_failure`, and a `correction`,
     /// which reverses at least one decision, each with a reply of at most
-    /// [`MAX_REPLY_BYTES`].
+    /// [`MAX_REPLY_BYTES`]; only intake's has `named_resources`.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
+        if !self.named_resources.is_empty() && self.role != Role::Intake {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "named resources are given but the role is {}, not {}",
+                    self.role.as_str(),
+                    Role::Intake.as_str()
+                ),
+            ));
+        }
         if let Some(failure) = &self.check_failure {
             if self.role != Role::Build {
                 return Err(ContractError::invalid(
@@ -958,15 +984,19 @@ impl Brief {
             }
         }
         if let Some(reason) = &self.result_refusal {
-            if !matches!(self.role, Role::Build | Role::AnswerCheck | Role::Resolver) {
+            if !matches!(
+                self.role,
+                Role::Build | Role::AnswerCheck | Role::Resolver | Role::Intake
+            ) {
                 return Err(ContractError::invalid(
                     CONTRACT,
                     format!(
-                        "a refused result is given but the role is {}, not {}, {} or {}",
+                        "a refused result is given but the role is {}, not {}, {}, {} or {}",
                         self.role.as_str(),
                         Role::Build.as_str(),
                         Role::AnswerCheck.as_str(),
-                        Role::Resolver.as_str()
+                        Role::Resolver.as_str(),
+                        Role::Intake.as_str()
                     ),
                 ));
             }

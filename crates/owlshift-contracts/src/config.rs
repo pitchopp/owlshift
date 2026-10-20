@@ -13,6 +13,7 @@ use owlshift_core::agent_env::{check_declared, check_home_folders, check_names};
 use owlshift_core::decider::ZoneOwners;
 use owlshift_core::gate::{GatePolicy, PassLimit, ResolverPolicy, usd_micros};
 use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
+use owlshift_core::resource::NamedResources;
 use owlshift_core::vocab::DelegationLevel;
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
@@ -229,7 +230,14 @@ pub struct States {
 pub struct Stack {
     /// The project's full gate, run before delivery.
     pub gate: Vec<String>,
-    /// Named resources and the path globs they cover.
+    /// Named resources, such as a migration chain, each with the pattern of
+    /// the repository paths it covers: a path from the repository's root,
+    /// `/` between its parts, where a part `*` stands for exactly one part
+    /// and `**` for any number of them (`backend/*/migrations/**`). Names
+    /// hold only ASCII letters, digits, `.`, `_` and `-`. Checked when the
+    /// file is loaded ([`owlshift_core::resource::Pattern::new`]). Intake
+    /// names the ones a ticket touches, and a zone a pattern reaches holds
+    /// its resource (OWL-402).
     #[serde(default)]
     pub resources: BTreeMap<String, String>,
     /// Names of variables of the runner's environment the gate needs, such as
@@ -283,6 +291,12 @@ impl Stack {
     /// The folders of [`Stack::caches`], from the home.
     pub fn cache_folders(&self) -> Vec<&str> {
         names(&self.caches)
+    }
+
+    /// The named resources of [`Stack::resources`], checked; `Err` names
+    /// the entry and what is wrong with it.
+    pub fn named_resources(&self) -> Result<NamedResources, String> {
+        NamedResources::new(&self.resources).map_err(|error| error.to_string())
     }
 
     /// Checks [`Stack::setup`]: no command blank.
@@ -887,6 +901,9 @@ impl ProjectConfig {
                 .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         }
         self.zone_owners()?;
+        self.stack.named_resources().map_err(|reason| {
+            ContractError::invalid(PROJECT, format!("stack.resources: {reason}"))
+        })?;
         self.stack
             .check_setup()
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.setup: {reason}")))?;
@@ -1703,6 +1720,54 @@ mod tests {
         }
         let error = project("", "max_open_prs = 0").unwrap_err().to_string();
         assert!(error.contains("from 1 to 20"), "{error}");
+    }
+
+    /// OWL-402: `stack.resources` is checked when the file is loaded, the
+    /// core's refusal named under its key; a bad entry refuses the whole
+    /// file, so every reading of it (gate, rules, intake) stops alike.
+    #[test]
+    fn named_resources_are_checked_when_the_file_is_loaded() {
+        let config = project_with_stack(
+            r#"resources = { migrations = "backend/*/migrations/**", "db.lock" = "db.lock" }"#,
+        )
+        .unwrap();
+        let named = config.stack.named_resources().unwrap();
+        let listed: Vec<(&str, &str)> = named.iter().map(|(n, p)| (n, p.as_str())).collect();
+        assert_eq!(
+            listed,
+            [
+                ("db.lock", "db.lock"),
+                ("migrations", "backend/*/migrations/**")
+            ]
+        );
+        assert!(
+            project_with_stack("")
+                .unwrap()
+                .stack
+                .named_resources()
+                .unwrap()
+                .is_empty()
+        );
+        for (entry, error) in [
+            (
+                r#"resources = { sql = "db/*.sql" }"#,
+                "stack.resources: \"sql\": the name or its pattern has a part holding `*`",
+            ),
+            (
+                r#"resources = { "a b" = "db" }"#,
+                "stack.resources: \"a b\": the name or its pattern may hold only",
+            ),
+            (
+                r#"resources = { m = "db/migrations/" }"#,
+                "stack.resources: \"m\": the name or its pattern ends with `/`",
+            ),
+        ] {
+            let actual = project_with_stack(entry).unwrap_err().to_string();
+            assert!(
+                actual.starts_with(&format!("invalid owlshift.toml: {error}")),
+                "{entry}: {actual}"
+            );
+        }
     }
 
     #[test]

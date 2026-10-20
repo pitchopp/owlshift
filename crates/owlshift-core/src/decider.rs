@@ -14,7 +14,7 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{Resource, contains, segments};
+use crate::resource::{Resource, contains, same_zone, segments};
 
 /// The prefix of a label that declares a zone, such as
 /// `zone:backend/billing`; its case does not matter.
@@ -26,7 +26,6 @@ pub const ZONE_LABEL_PREFIX: &str = "zone:";
 /// folder is not one by the [rules of an owned zone][`check_zone`] is
 /// refused rather than left out, since a dropped declaration would change
 /// who decides unseen.
-#[allow(rustdoc::private_intra_doc_links)]
 pub fn declared_zones<'a>(
     labels: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<Resource>, ZoneLabelError> {
@@ -68,7 +67,6 @@ pub struct BriefZones {
 /// chooses no decider: a ticket with an assignee is not refused for a label
 /// its decider never reads. The labels it left out come back in
 /// [`BriefZones::left_out`], so that the omission is not silent.
-#[allow(rustdoc::private_intra_doc_links)]
 pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> BriefZones {
     let mut found = BriefZones::default();
     for label in labels {
@@ -97,11 +95,6 @@ pub fn brief_zones<'a>(labels: impl IntoIterator<Item = &'a str>) -> BriefZones 
         }
     }
     found
-}
-
-fn same_zone(a: &str, b: &str) -> bool {
-    let key = |zone: &str| zone.trim_end_matches('/').to_ascii_lowercase();
-    key(a) == key(b)
 }
 
 /// A `zone:` label that names no folder.
@@ -151,11 +144,7 @@ impl ZoneOwners {
             if owner.trim().is_empty() || owner.trim() != owner {
                 return Err(ZoneOwnersError::BadOwner { zone, owner });
             }
-            let same = segments(&zone);
-            if let Some((first, _)) = owned.iter().find(|(other, _)| {
-                let other = segments(other);
-                contains(&other, &same) && contains(&same, &other)
-            }) {
+            if let Some((first, _)) = owned.iter().find(|(other, _)| same_zone(other, &zone)) {
                 return Err(ZoneOwnersError::SameZone {
                     first: first.clone(),
                     second: zone,
@@ -179,8 +168,10 @@ impl ZoneOwners {
     }
 }
 
-/// Checks the path of an owned zone, see [`ZoneOwners::new`].
-fn check_zone(zone: &str) -> Result<(), &'static str> {
+/// Checks the path of a zone a ticket declares or a project owns, see
+/// [`ZoneOwners::new`]: `Err` says what is wrong, to follow the zone's
+/// quoted name.
+pub fn check_zone(zone: &str) -> Result<(), &'static str> {
     if zone.chars().any(char::is_control) {
         return Err("holds a control character: name a folder by its path");
     }

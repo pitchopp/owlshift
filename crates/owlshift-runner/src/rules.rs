@@ -14,6 +14,7 @@ use std::path::Path;
 
 use owlshift_contracts::brief::Rule;
 use owlshift_contracts::config::{ProjectConfig, RULE_ROLES};
+use owlshift_core::resource::NamedResources;
 use owlshift_core::vocab::Role;
 
 use crate::executor::Git;
@@ -26,9 +27,9 @@ const MAX_RULE_BYTES: u64 = 64 * 1024;
 const RULES: &str = "the project's rules";
 
 /// The rules a project gives its briefs: those of every brief, and those of
-/// one role's alone (OWL-312); and its gate, `stack.gate`, from the same
-/// project file, so that a run's rules and gate always come from one commit
-/// (OWL-331).
+/// one role's alone (OWL-312); and its gate, `stack.gate`, its setup and its
+/// named resources, from the same project file, so that a run's rules and
+/// gate always come from one commit (OWL-331).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectRules {
     /// The rules of `stack.rules`, in order.
@@ -39,20 +40,31 @@ pub struct ProjectRules {
     gate: Vec<String>,
     /// The commands of `stack.setup`, in order (OWL-330).
     setup: Vec<String>,
+    /// The named resources of `stack.resources` (OWL-402); `None` when no
+    /// project file was read ([`Self::none`]).
+    resources: Option<NamedResources>,
 }
 
 impl ProjectRules {
     /// No rule and no gate: for the brief of a role told neither, such as
     /// the answer check (architecture section 9), whose run never runs a
     /// gate. Never for a Build, whose dispatch refuses an empty gate
-    /// (OWL-332), or a rebase, where one passes.
+    /// (OWL-332), or a rebase, where one passes. It reads no named
+    /// resource either, so such a brief is told no held set.
     pub fn none() -> Self {
         Self {
             common: Vec::new(),
             roles: BTreeMap::new(),
             gate: Vec::new(),
             setup: Vec::new(),
+            resources: None,
         }
+    }
+
+    /// The project's named resources (OWL-402): `stack.resources` of the
+    /// same project file as the gate; `None` for [`Self::none`].
+    pub fn resources(&self) -> Option<&NamedResources> {
+        self.resources.as_ref()
     }
 
     /// The project's gate: `stack.gate` of the project file the rules were
@@ -149,6 +161,12 @@ pub fn project_rules(
         roles: BTreeMap::new(),
         gate: config.stack.gate.clone(),
         setup: config.stack.setup.clone(),
+        resources: Some(
+            config
+                .stack
+                .named_resources()
+                .map_err(|e| format!("`stack.resources`: {e}"))?,
+        ),
     };
     for (role, listed) in own {
         let read = read_all(git, checkout, base, &listed)?;

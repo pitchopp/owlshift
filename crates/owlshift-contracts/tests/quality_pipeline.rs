@@ -65,7 +65,7 @@ fn brief(role: &str) -> Value {
 }
 
 fn base_result(status: &str) -> Value {
-    json!({ "format": 13, "status": status, "summary": "s" })
+    json!({ "format": 14, "status": status, "summary": "s" })
 }
 
 fn question(replan: bool) -> Value {
@@ -589,7 +589,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 24.into()),
+            with(brief("build"), "format", 25.into()),
             "upgrade Owlshift",
         ),
     ] {
@@ -891,7 +891,7 @@ fn a_later_pass_is_told_what_changed_and_the_last_fix_is_kept() {
     let mut build = brief("build");
     build["findings"] = notes.clone();
     let parsed = Brief::parse(&build.to_string()).unwrap();
-    let done = json!({ "format": 13, "status": "done", "summary": "s",
+    let done = json!({ "format": 14, "status": "done", "summary": "s",
         "finding_responses": [{ "finding": "F1", "outcome": "fixed", "reason": "r" }] });
     assert!(
         RunResult::parse_against(&done.to_string(), &parsed).is_err(),

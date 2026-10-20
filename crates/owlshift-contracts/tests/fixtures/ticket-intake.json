@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "text_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "gesture": {
     "kind": "label",
@@ -24,5 +24,11 @@
       "quote": "after OWL-40 lands",
       "outcome": "done"
     }
+  ],
+  "zones": [
+    "backend/billing"
+  ],
+  "resources": [
+    "migrations"
   ]
 }

@@ -1,5 +1,5 @@
 {
-  "format": 13,
+  "format": 14,
   "status": "done",
   "summary": "Added GREETING.md; its check passes: git grep -q Hello -- GREETING.md."
 }
