@@ -108,7 +108,7 @@ use crate::pr_reviews;
 use crate::project::ProjectLock;
 use crate::quarantine::{self, Held, Record};
 use crate::reversal::{self, Current};
-use crate::ticket_ref::{self, Stored, TicketRecord};
+use crate::ticket_ref::{self, Progress, RefAt, Stored, TicketRecord};
 use crate::writer::VisibleStage;
 
 mod drain;
@@ -208,12 +208,27 @@ fn held_text(ticket: &TicketId, stage: Stage, until: Timestamp) -> String {
     )
 }
 
-/// What a continue starts from: the ticket ref's commit and the decider's
-/// newest edit when watch decided to continue.
+/// What a continue starts from: the ticket ref's commit, which the continue
+/// checks under the lock, its progress, which the holds compare (OWL-397:
+/// the runner keeps the spend in the ref after every run, a move watch does
+/// not read as progress), and the decider's newest edit when watch decided
+/// to continue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
     pub commit: String,
+    pub progress: Progress,
     pub answer: Option<Timestamp>,
+}
+
+impl Seen {
+    /// What a continue from the ref at `at`, with `answer`, starts from.
+    pub fn at(at: RefAt, answer: Option<Timestamp>) -> Self {
+        Seen {
+            commit: at.commit,
+            progress: at.progress,
+            answer,
+        }
+    }
 }
 
 /// Whether a ticket whose reply counts may be continued now.
@@ -232,7 +247,7 @@ pub enum Admit {
 }
 
 /// Until when a ticket is held, unless its decider edits a comment or its
-/// ticket ref moves first.
+/// ticket ref moves first, a move of its spend alone aside (OWL-397).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Until {
     /// [`RETRY_AFTER`] past the continue.
@@ -263,7 +278,8 @@ pub struct Holds {
 
 impl Holds {
     /// Whether `ticket`, at `seen`, may be continued at `now`. A hold from
-    /// another ticket ref or answer is lifted.
+    /// another answer, or from a ticket ref whose progress has changed, is
+    /// lifted; one whose ref moved by its spend alone stands (OWL-397).
     pub fn admit(&mut self, ticket: &TicketId, seen: &Seen, now: Timestamp) -> Admit {
         if let Some(until) = self.paused_until {
             if now < until {
@@ -272,7 +288,11 @@ impl Holds {
             self.paused_until = None;
         }
         match self.held.get(ticket) {
-            Some((held, until)) if held == seen && until.holds_at(now) => {
+            Some((held, until))
+                if held.progress == seen.progress
+                    && held.answer == seen.answer
+                    && until.holds_at(now) =>
+            {
                 Admit::Held { until: *until }
             }
             Some(_) => {
@@ -284,8 +304,9 @@ impl Holds {
     }
 
     /// Records what a continue of `ticket` from `seen` did: `outcome`, then
-    /// `commit`, its ticket ref's commit read after it (`None` when gone or
-    /// unreadable), at `now`. Returns the hold or the pause it set, if any.
+    /// `progress`, its ticket ref's progress read after it (`None` when gone
+    /// or unreadable), at `now`. Returns the hold or the pause it set, if
+    /// any.
     ///
     /// A busy project ran nothing: no hold. A usage limit with a reset time
     /// pauses every continue until then. A comment, a RESUME included, or a
@@ -294,14 +315,16 @@ impl Holds {
     /// ref was read moved: an unreadable ref is no reason to post the comment
     /// or park again. Otherwise a ticket ref left as it was holds the ticket for
     /// [`RETRY_AFTER`]; one that moved is progress, which the next pass reads.
-    /// No other way to stop is told apart, so a way added later is held
-    /// exactly when it leaves the ref as it was.
+    /// A ref that moved by its spend alone, which the runner keeps after
+    /// every run, is left as it was (OWL-397). No other way to stop is told
+    /// apart, so a way added later is held exactly when it leaves the ref as
+    /// it was.
     pub fn after(
         &mut self,
         ticket: &TicketId,
         seen: Seen,
         outcome: &Result<Delivered, Stop>,
-        commit: Option<&str>,
+        progress: Option<&Progress>,
         now: Timestamp,
     ) -> Option<Admit> {
         if matches!(outcome, Err(Stop::Busy(_))) {
@@ -316,9 +339,9 @@ impl Holds {
             self.paused_until = Some(until);
             return Some(Admit::Paused { until });
         }
-        let as_it_was = commit == Some(seen.commit.as_str());
+        let as_it_was = progress == Some(&seen.progress);
         let until = match outcome {
-            Err(Stop::NotKept { .. }) if as_it_was || commit.is_none() => Until::Person,
+            Err(Stop::NotKept { .. }) if as_it_was || progress.is_none() => Until::Person,
             _ if as_it_was => Until::At(now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX)),
             _ => {
                 self.held.remove(ticket);
@@ -378,9 +401,9 @@ struct Memory {
     /// The tickets a stop left in a stage watch resumes, found shown in
     /// another stage than that stage must show (OWL-273 at Intake, which must
     /// show needs input; OWL-340 at Design, Design review, Build and Verify,
-    /// which must show working): the commit their ref was at, and until when
+    /// which must show working): their ref's progress then, and until when
     /// their stage is not read again unless the ref moves.
-    elsewhere: HashMap<TicketId, (String, Timestamp)>,
+    elsewhere: HashMap<TicketId, (Progress, Timestamp)>,
     /// What watch knows of the marker that quarantines the project, while
     /// one stands (OWL-368).
     quarantine: Option<Quarantine>,
@@ -395,9 +418,9 @@ struct Memory {
     /// The tickets told that they wait for the slot, with the holders told.
     slot_waits: HashMap<TicketId, Vec<TicketId>>,
     /// The tickets whose answer check watch ran into a stage that needs the
-    /// slot, with their ref's commit after it: the tracker may still show
+    /// slot, with their ref's progress after it: the tracker may still show
     /// them needs input when the move to working after the RESUME failed.
-    resumed: HashMap<TicketId, String>,
+    resumed: HashMap<TicketId, Progress>,
     /// This pass took a step after which the next pass is due at once: a
     /// stage step whose ref moved, or a holder of the slot that left it.
     stepped: bool,
@@ -429,9 +452,9 @@ struct Snapshot {
 /// (OWL-265, architecture section 5, "The stage while a repair runs").
 #[derive(Default)]
 struct Stale {
-    /// The ticket ref's commit when watch last moved its stage: no stage is
-    /// read again, nor a person's working moved, until the ref moves.
-    moved: HashMap<TicketId, String>,
+    /// The ticket ref's progress when watch last moved its stage: no stage
+    /// is read again, nor a person's working moved, until the ref moves.
+    moved: HashMap<TicketId, Progress>,
     /// Until when a move the tracker refused is not tried again.
     held: HashMap<TicketId, Timestamp>,
     /// Why the stage could not be read or moved, as last warned of.
@@ -839,12 +862,12 @@ impl Watch<'_> {
             follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
                 Some(changed) => {
                     replaced = changed.replaced;
-                    self.write_seen(ticket, &stored.commit, &changed.record)
+                    self.write_seen(ticket, stored, &changed.record)
                 }
-                None => Ok(Some(stored.commit.clone())),
+                None => Ok(Some(stored.at())),
             });
-        let commit = match change {
-            Ok(Some(commit)) => commit,
+        let at = match change {
+            Ok(Some(at)) => at,
             // Busy, or the ref moved: the next pass reads it again.
             Ok(None) => return,
             Err(reason) => {
@@ -866,8 +889,8 @@ impl Watch<'_> {
             self.line(out, &format!("{ticket}: {seen}"));
         }
         // A head moved since the read ends the pass: the next read decides.
-        let Some(commit) =
-            on_demand.post_owed_report(ticket, stored, &seen, commit, &mut memory.following, sink)
+        let Some(at) =
+            on_demand.post_owed_report(ticket, stored, &seen, at, &mut memory.following, sink)
         else {
             return;
         };
@@ -890,16 +913,13 @@ impl Watch<'_> {
                     adopt: false,
                     action: Action::Green | Action::WaitChecks | Action::WaitBaseRed,
                 }
-            ) && !self.correct(memory, sink, out, continued, ticket, stored, commit.clone())
+            ) && !self.correct(memory, sink, out, continued, ticket, stored, at.clone())
             {
-                self.review(memory, sink, out, continued, ticket, stored, commit);
+                self.review(memory, sink, out, continued, ticket, stored, at);
             }
             return;
         }
-        let held = Seen {
-            commit,
-            answer: None,
-        };
+        let held = Seen::at(at, None);
         let failing_for = seen.failing_for;
         self.held_run(
             memory,
@@ -943,16 +963,25 @@ impl Watch<'_> {
         // A review loop's ref at Build holds the slot from its start, run or
         // refused after it (OWL-367).
         let after = self.read_after(ticket);
-        let commit = after.as_ref().map(|stored| stored.commit.as_str());
+        let progress = after.as_ref().map(Stored::progress);
         let holds_now = after.as_ref().is_some_and(holds);
-        self.after(memory, sink, out, ticket, held, &outcome, commit, holds_now);
+        self.after(
+            memory,
+            sink,
+            out,
+            ticket,
+            held,
+            &outcome,
+            progress.as_ref(),
+            holds_now,
+        );
         true
     }
 
     /// The reviews on a followed pull request whose read asked for no
     /// repair (OWL-307, architecture section 5, "Review comments on the
-    /// pull request"): one read of them, at `commit`, the ticket ref after
-    /// the look. Those due ([`pr_reviews::due`], by `[forge].reviewers` as
+    /// pull request"): one read of them, at `at`, the ticket ref after the
+    /// look. Those due ([`pr_reviews::due`], by `[forge].reviewers` as
     /// watch loaded it) that the ticket's decider wrote start a review loop
     /// ([`OnDemand::review_seen`]), held as a continue is, the hold lifted
     /// by a newer review. The decider is the ticket's assignee, read only
@@ -969,7 +998,7 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         stored: &Stored,
-        commit: String,
+        at: RefAt,
     ) {
         let on_demand = self.on_demand;
         let Some(forge) = &on_demand.config.forge else {
@@ -983,7 +1012,7 @@ impl Watch<'_> {
         };
         let now = (on_demand.clock)();
         let Some(delivered_at) = delivery.delivered_at else {
-            if let Err(reason) = self.date_delivery(ticket, &commit, now) {
+            if let Err(reason) = self.date_delivery(ticket, &at.commit, now) {
                 self.unreadable(
                     memory,
                     sink,
@@ -1036,10 +1065,7 @@ impl Watch<'_> {
             }
             Some(Turn::Free) | None => {}
         }
-        let held = Seen {
-            commit,
-            answer: pr_reviews::newest(&due),
-        };
+        let held = Seen::at(at, pr_reviews::newest(&due));
         self.held_run(
             memory,
             sink,
@@ -1126,12 +1152,12 @@ impl Watch<'_> {
                 return true;
             }
             follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
-                Some(changed) => self.write_seen(ticket, &stored.commit, &changed.record),
+                Some(changed) => self.write_seen(ticket, stored, &changed.record),
                 None => Ok(None),
             })
         };
-        let commit = match change {
-            Ok(Some(commit)) => commit,
+        let at = match change {
+            Ok(Some(at)) => at,
             // Busy, or the ref moved: the next pass reads it again.
             Ok(None) => return true,
             Err(reason) => {
@@ -1154,7 +1180,7 @@ impl Watch<'_> {
         }
         // Dropped, the following having ended; posted, a review loop's
         // push adopted.
-        on_demand.post_owed_report(ticket, stored, &seen, commit, &mut memory.following, sink);
+        on_demand.post_owed_report(ticket, stored, &seen, at, &mut memory.following, sink);
         true
     }
 
@@ -1165,7 +1191,7 @@ impl Watch<'_> {
     /// busy, the ref moved or a run left the project unverified, nothing is
     /// moved or written (`Ok(None)`), and the next pass reads it again.
     /// Otherwise the stage moves to review, while it shows what `status`
-    /// set, then the ref keeps what the read changed; its new commit is
+    /// set, then the ref keeps what the read changed; where it is then is
     /// returned.
     #[allow(clippy::too_many_arguments)]
     fn close_loop(
@@ -1176,7 +1202,7 @@ impl Watch<'_> {
         status: Status,
         seen: &follow::Seen,
         now: Timestamp,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<RefAt>, String> {
         let on_demand = self.on_demand;
         let Some(_lock) = self.locked_at(ticket, &stored.commit)? else {
             return Ok(None);
@@ -1209,7 +1235,10 @@ impl Watch<'_> {
                 .and_then(|delivery| delivery.pushed.as_deref());
             on_demand.replaced(ticket, replaced, pushed, sink);
         }
-        Ok(Some(written))
+        Ok(Some(RefAt {
+            commit: written,
+            progress: ticket_ref::progress(&changed.record, stored.proposals.as_ref()),
+        }))
     }
 
     /// A ticket in `status` at Watch whose delivery is followed, its stage
@@ -1240,7 +1269,7 @@ impl Watch<'_> {
         };
         let stale = &memory.stale;
         let now = (on_demand.clock)();
-        if stale.moved.get(ticket) == Some(&stored.commit)
+        if stale.moved.get(ticket) == Some(&stored.progress())
             || stale.held.get(ticket).is_some_and(|until| now < *until)
         {
             return;
@@ -1268,10 +1297,7 @@ impl Watch<'_> {
             Ok(moved) => {
                 memory.stale.warned.remove(ticket);
                 if moved {
-                    memory
-                        .stale
-                        .moved
-                        .insert(ticket.clone(), stored.commit.clone());
+                    memory.stale.moved.insert(ticket.clone(), stored.progress());
                     self.line(
                         out,
                         &format!(
@@ -1324,7 +1350,7 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         stored: &Stored,
-        commit: String,
+        at: RefAt,
     ) -> bool {
         let on_demand = self.on_demand;
         let questions = &stored.record.questions;
@@ -1357,10 +1383,10 @@ impl Watch<'_> {
         if reversed.is_empty() || reversal::counts_at(&reversed, now, window).is_some() {
             return false;
         }
-        let held = Seen {
-            commit,
-            answer: reversal::newest(&reversed).map(|reply| reply.last_edit()),
-        };
+        let held = Seen::at(
+            at,
+            reversal::newest(&reversed).map(|reply| reply.last_edit()),
+        );
         self.held_run(
             memory,
             sink,
@@ -1373,27 +1399,31 @@ impl Watch<'_> {
     }
 
     /// Writes `record` as the ticket ref of `ticket` under the project's
-    /// lock, only while the ref is still `seen`, the commit the snapshot
-    /// read, and returns the ref's new commit: `None`, with nothing written,
-    /// when the project is busy or the ref moved.
+    /// lock, only while the ref is still at `seen`'s commit, the one the
+    /// snapshot read, and returns where the ref is then: `None`, with
+    /// nothing written, when the project is busy or the ref moved. The write
+    /// keeps `seen`'s proposals.
     fn write_seen(
         &self,
         ticket: &TicketId,
-        seen: &str,
+        seen: &Stored,
         record: &TicketRecord,
-    ) -> Result<Option<String>, String> {
-        let Some(_lock) = self.locked_at(ticket, seen)? else {
+    ) -> Result<Option<RefAt>, String> {
+        let Some(_lock) = self.locked_at(ticket, &seen.commit)? else {
             return Ok(None);
         };
         let git = &self.on_demand.executor.git;
-        ticket_ref::write(
+        let commit = ticket_ref::write(
             git,
             &self.on_demand.dirs.checkout(),
             ticket,
             record,
-            Some(seen),
-        )
-        .map(Some)
+            Some(&seen.commit),
+        )?;
+        Ok(Some(RefAt {
+            commit,
+            progress: ticket_ref::progress(record, seen.proposals.as_ref()),
+        }))
     }
 
     /// The project's lock, once the ticket ref read under it is still
@@ -1511,10 +1541,10 @@ impl Watch<'_> {
         }
         // The answer's time: a new comment or a thumbs-up (OWL-371) lifts a
         // hold alike.
-        let seen = Seen {
-            commit: stored.commit.clone(),
-            answer: answer_check::new_answer(&comments, &decider, questions),
-        };
+        let seen = Seen::at(
+            stored.at(),
+            answer_check::new_answer(&comments, &decider, questions),
+        );
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
         }
@@ -1539,11 +1569,20 @@ impl Watch<'_> {
         if matches!(outcome, Err(Stop::Stepped { .. }))
             && let Some(stored) = after.as_ref().filter(|stored| holds(stored))
         {
-            memory.resumed.insert(ticket.clone(), stored.commit.clone());
+            memory.resumed.insert(ticket.clone(), stored.progress());
         }
-        let commit = after.as_ref().map(|stored| stored.commit.as_str());
+        let progress = after.as_ref().map(Stored::progress);
         let holds_now = after.as_ref().is_some_and(holds);
-        match self.after(memory, sink, out, ticket, seen, &outcome, commit, holds_now) {
+        match self.after(
+            memory,
+            sink,
+            out,
+            ticket,
+            seen,
+            &outcome,
+            progress.as_ref(),
+            holds_now,
+        ) {
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(
@@ -1610,10 +1649,11 @@ impl Watch<'_> {
     ) {
         let on_demand = self.on_demand;
         let now = (on_demand.clock)();
+        let at = stored.at();
         if memory
             .elsewhere
             .get(ticket)
-            .is_some_and(|(commit, until)| *commit == stored.commit && now < *until)
+            .is_some_and(|(progress, until)| *progress == at.progress && now < *until)
         {
             return;
         }
@@ -1632,10 +1672,7 @@ impl Watch<'_> {
                 }
             }
         }
-        let seen = Seen {
-            commit: stored.commit.clone(),
-            answer: None,
-        };
+        let seen = Seen::at(at, None);
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
         }
@@ -1653,12 +1690,12 @@ impl Watch<'_> {
             // RESUME failed: moved now, then resumed (OWL-367).
             let resumed = shown == VisibleStage::Working
                 && found == VisibleStage::NeedsInput.state(states)
-                && memory.resumed.get(ticket) == Some(&stored.commit);
+                && memory.resumed.get(ticket) == Some(&seen.progress);
             if !(resumed && self.show_working(sink, ticket, &stored.commit)) {
                 let until = now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX);
                 memory
                     .elsewhere
-                    .insert(ticket.clone(), (stored.commit.clone(), until));
+                    .insert(ticket.clone(), (seen.progress.clone(), until));
                 return;
             }
         }
@@ -1679,9 +1716,18 @@ impl Watch<'_> {
         };
         continued(ticket, &outcome, sink);
         let after = self.read_after(ticket);
-        let commit = after.as_ref().map(|stored| stored.commit.as_str());
+        let progress = after.as_ref().map(Stored::progress);
         let holds_now = after.as_ref().is_some_and(holds);
-        match self.after(memory, sink, out, ticket, seen, &outcome, commit, holds_now) {
+        match self.after(
+            memory,
+            sink,
+            out,
+            ticket,
+            seen,
+            &outcome,
+            progress.as_ref(),
+            holds_now,
+        ) {
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(out, &held_text(ticket, stage, until)),
@@ -1713,11 +1759,12 @@ impl Watch<'_> {
     }
 
     /// What a command of watch's on `ticket` from `seen` left, once its
-    /// `outcome` is told, `commit` being its ticket ref's commit read after
-    /// it (`None` when gone or unreadable) and `holds_now` whether that ref
-    /// holds the slot: held as a continue is ([`Holds::after`]), and, since
-    /// OWL-367, what a stage step carries, the slot's turn, and whether the
-    /// next pass is due at once. Returns the hold or the pause it set.
+    /// `outcome` is told, `progress` being its ticket ref's progress read
+    /// after it (`None` when gone or unreadable; a move of the spend alone is
+    /// none, OWL-397) and `holds_now` whether that ref holds the slot: held
+    /// as a continue is ([`Holds::after`]), and, since OWL-367, what a stage
+    /// step carries, the slot's turn, and whether the next pass is due at
+    /// once. Returns the hold or the pause it set.
     #[allow(clippy::too_many_arguments)]
     fn after(
         &self,
@@ -1727,10 +1774,10 @@ impl Watch<'_> {
         ticket: &TicketId,
         seen: Seen,
         outcome: &Result<Delivered, Stop>,
-        commit: Option<&str>,
+        progress: Option<&Progress>,
         holds_now: bool,
     ) -> Option<Admit> {
-        let moved = commit != Some(seen.commit.as_str());
+        let moved = progress != Some(&seen.progress);
         // A stage step whose ref moved: its next step is due at once.
         if keep_carried(&mut memory.carried, ticket, outcome, moved) {
             memory.stepped = true;
@@ -1759,7 +1806,7 @@ impl Watch<'_> {
             _ => {}
         }
         let now = (self.on_demand.clock)();
-        memory.holds.after(ticket, seen, outcome, commit, now)
+        memory.holds.after(ticket, seen, outcome, progress, now)
     }
 
     /// Tells that `ticket` waits for the project's slot, which `holders`
@@ -1964,9 +2011,22 @@ mod tests {
         Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
     }
 
-    fn seen(commit: &str, answer: i64) -> Seen {
+    /// The progress `key` stands for.
+    fn p(key: &str) -> Progress {
+        Progress(key.to_owned())
+    }
+
+    /// A ticket ref at progress `key`, whose commit is `key`'s own, and the
+    /// decider's edit at minute `answer`.
+    fn seen(key: &str, answer: i64) -> Seen {
+        seen_at(key, key, answer)
+    }
+
+    /// [`seen`], its commit `commit`.
+    fn seen_at(commit: &str, key: &str, answer: i64) -> Seen {
         Seen {
             commit: commit.to_owned(),
+            progress: p(key),
             answer: Some(at(answer)),
         }
     }
@@ -2136,12 +2196,12 @@ mod tests {
 
         let busy = Err(Stop::Busy(PathBuf::from("/p")));
         assert_eq!(
-            holds.after(&ticket, seen("c1", 0), &busy, Some("c1"), at(1)),
+            holds.after(&ticket, seen("c1", 0), &busy, Some(&p("c1")), at(1)),
             None
         );
         assert_eq!(holds.admit(&ticket, &seen("c1", 0), at(2)), Admit::Go);
 
-        let held = holds.after(&ticket, seen("c1", 0), &refused(), Some("c1"), at(2));
+        let held = holds.after(&ticket, seen("c1", 0), &refused(), Some(&p("c1")), at(2));
         assert_eq!(
             held,
             Some(Admit::Held {
@@ -2157,16 +2217,16 @@ mod tests {
         // A newer edit of the decider's, or a ref moved by a typed command,
         // lifts the hold.
         assert_eq!(holds.admit(&ticket, &seen("c1", 5), at(11)), Admit::Go);
-        holds.after(&ticket, seen("c1", 0), &refused(), Some("c1"), at(2));
+        holds.after(&ticket, seen("c1", 0), &refused(), Some(&p("c1")), at(2));
         assert_eq!(holds.admit(&ticket, &seen("c2", 0), at(3)), Admit::Go);
         // And the hold ends.
-        holds.after(&ticket, seen("c1", 0), &refused(), Some("c1"), at(2));
+        holds.after(&ticket, seen("c1", 0), &refused(), Some(&p("c1")), at(2));
         assert_eq!(holds.admit(&ticket, &seen("c1", 0), at(12)), Admit::Go);
 
         // A continue that moved the ref, a failed check kept for one, is
         // progress.
         assert_eq!(
-            holds.after(&ticket, seen("c1", 0), &refused(), Some("c3"), at(13)),
+            holds.after(&ticket, seen("c1", 0), &refused(), Some(&p("c3")), at(13)),
             None
         );
         assert_eq!(holds.admit(&ticket, &seen("c3", 0), at(13)), Admit::Go);
@@ -2185,7 +2245,7 @@ mod tests {
             resets_at: Some(at(30)),
         });
         assert_eq!(
-            holds.after(&one, seen("c1", 0), &limited, Some("c1"), at(1)),
+            holds.after(&one, seen("c1", 0), &limited, Some(&p("c1")), at(1)),
             Some(Admit::Paused { until: at(30) })
         );
         assert_eq!(
@@ -2196,7 +2256,7 @@ mod tests {
 
         let unknown = Err(Stop::UsageLimit { resets_at: None });
         assert_eq!(
-            holds.after(&one, seen("c1", 0), &unknown, Some("c1"), at(31)),
+            holds.after(&one, seen("c1", 0), &unknown, Some(&p("c1")), at(31)),
             Some(Admit::Held {
                 until: Until::At(at(41))
             })
@@ -2228,12 +2288,12 @@ mod tests {
             Landed::Parked,
             Landed::ParkedUnposted,
         ] {
-            for commit in [Some("c1"), None] {
+            for progress in [Some(&p("c1")), None] {
                 let outcome = not_kept(landed);
                 assert_eq!(
-                    holds.after(&ticket, seen("c1", 0), &outcome, commit, at(1)),
+                    holds.after(&ticket, seen("c1", 0), &outcome, progress, at(1)),
                     person,
-                    "{landed:?} {commit:?}"
+                    "{landed:?} {progress:?}"
                 );
                 // A day later, as at once.
                 assert_eq!(
@@ -2261,11 +2321,48 @@ mod tests {
                 &ticket,
                 seen("c1", 0),
                 &not_kept(Landed::Questions),
-                Some("c3"),
+                Some(&p("c3")),
                 at(4)
             ),
             None
         );
         assert_eq!(holds.admit(&ticket, &seen("c1", 0), at(5)), Admit::Go);
+    }
+
+    /// OWL-397: the runner keeps the spend in the ticket ref after every
+    /// run, so a continue that changed nothing else leaves a new commit at
+    /// the same progress. Its hold stands at the next pass, which reads that
+    /// commit, a 10-minute one as one until a person acts; a ref whose
+    /// progress changed lifts either.
+    #[test]
+    fn a_ref_moved_by_its_spend_alone_keeps_the_hold() {
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let mut holds = Holds::default();
+        assert_eq!(
+            holds.after(&ticket, seen("p1", 0), &refused(), Some(&p("p1")), at(1)),
+            Some(Admit::Held {
+                until: Until::At(at(11))
+            })
+        );
+        assert_eq!(
+            holds.admit(&ticket, &seen_at("spent", "p1", 0), at(5)),
+            Admit::Held {
+                until: Until::At(at(11))
+            }
+        );
+        assert_eq!(holds.admit(&ticket, &seen("p2", 0), at(5)), Admit::Go);
+
+        let not_kept = Err(Stop::NotKept {
+            landed: Landed::Reask,
+            message: "the ticket's ref is locked".to_owned(),
+        });
+        holds.after(&ticket, seen("p1", 0), &not_kept, Some(&p("p1")), at(6));
+        assert_eq!(
+            holds.admit(&ticket, &seen_at("spent", "p1", 0), at(24 * 60)),
+            Admit::Held {
+                until: Until::Person
+            }
+        );
+        assert_eq!(holds.admit(&ticket, &seen("p2", 0), at(24 * 60)), Admit::Go);
     }
 }

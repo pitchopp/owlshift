@@ -219,8 +219,13 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
         cost: Some(more),
         ..second.clone()
     };
+    let at_nine = repo.read().unwrap().unwrap().progress();
     let ten = ticket_ref::write(&repo.git, &repo.root, &ticket(), &recosted, Some(&nine)).unwrap();
-    assert_eq!(repo.read().unwrap().unwrap().record, recosted);
+    let stored = repo.read().unwrap().unwrap();
+    assert_eq!(stored.record, recosted);
+    // A write of the spend alone moves the ref, never its progress (OWL-397).
+    assert_ne!(ten, nine);
+    assert_eq!(stored.progress(), at_nine);
     let listed = repo.git(&["ls-tree", "--name-only", &ten]);
     assert_eq!(
         listed.lines().filter(|name| *name == "cost.json").count(),
@@ -228,6 +233,63 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
     );
     ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&ten)).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().record, second);
+}
+
+/// OWL-397: a ticket ref's progress, which watch reads, covers every file a
+/// write renders but `cost.json`: each part changed alone moves it, an
+/// optional one made included, and the spend alone never does.
+#[test]
+fn every_part_but_the_spend_moves_a_ticket_refs_progress() {
+    let base = record(WAITING, 1);
+    let at = ticket_ref::progress(&base, None);
+    for cost in [None, Some(ticket_cost())] {
+        let spent = TicketRecord {
+            cost,
+            ..base.clone()
+        };
+        assert_eq!(ticket_ref::progress(&spent, None), at);
+    }
+    let resumed = r#"{"format":2,"stage":"build","round":1,"reasks":0,"failed_runs":0}"#;
+    let delivery = TicketDelivery::parse(include_str!(
+        "../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
+    ))
+    .unwrap();
+    let changed: [(&str, TicketRecord); 6] = [
+        ("state", record(resumed, 1)),
+        ("questions", record(WAITING, 2)),
+        (
+            "delivery",
+            TicketRecord {
+                delivery: Some(delivery),
+                ..base.clone()
+            },
+        ),
+        (
+            "intake",
+            TicketRecord {
+                intake: Some(intake()),
+                ..base.clone()
+            },
+        ),
+        (
+            "plan",
+            TicketRecord {
+                plan: Some(ticket_plan()),
+                ..base.clone()
+            },
+        ),
+        (
+            "review",
+            TicketRecord {
+                review: Some(ticket_review()),
+                ..base.clone()
+            },
+        ),
+    ];
+    for (part, record) in &changed {
+        assert_ne!(ticket_ref::progress(record, None), at, "{part}");
+    }
+    assert_ne!(ticket_ref::progress(&base, Some(&proposals())), at);
 }
 
 fn ticket_plan() -> TicketPlan {
@@ -482,6 +544,23 @@ fn forget_keeps_the_round_count_and_the_refusals_and_drops_the_rest() {
         })
     );
     assert_eq!(repo.read().unwrap().unwrap().commit, commit);
+
+    // The ref a ticket's first run makes for its cost (OWL-397) is the
+    // record forget leaves at round 0: nothing to forget either.
+    let blank = ticket_ref::blank(Some(ticket_cost()));
+    assert_eq!(
+        blank,
+        forgotten(0, &TicketQuestions::new(), Some(ticket_cost()))
+    );
+    let fresh = Repo::new();
+    let made = ticket_ref::write(&fresh.git, &fresh.root, &ticket(), &blank, None).unwrap();
+    assert_eq!(
+        ticket_ref::forget(&fresh.git, &fresh.root, &ticket()).unwrap(),
+        Some(Forgot::Unchanged {
+            commit: made,
+            kept: blank
+        })
+    );
 }
 
 /// OWL-202: a ticket ref that cannot be read gets a record of what still
