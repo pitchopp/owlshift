@@ -99,7 +99,7 @@ use owlshift_contracts::result::{
     Verdict as AnswerVerdict,
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
-use owlshift_contracts::{Role, Stage, Variant};
+use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
 use owlshift_core::gate::{Chain, ChainCost, GatePolicy};
 use owlshift_core::pipeline::Pipeline;
@@ -128,10 +128,10 @@ use crate::routing::{Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
 use crate::writer::{
-    self, Corrected, Decided, DecisionComment, DecisionGroup, DeliveryReport, FixPass, Gate,
-    MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning, Rebased,
-    ReopenedChoice, ReplyComment, Reported, Restart, ResumeComment, Reviewed, VisibleStage,
-    WriteError, Writer, park_reason, rebase_keeps_delivery,
+    self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
+    Gate, MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning,
+    Rebased, ReopenedChoice, ReplyComment, Reported, Restart, ResumeComment, Reviewed,
+    VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
 
@@ -887,6 +887,9 @@ struct DecidedOn {
     question: QuestionId,
     comment: String,
     option: Option<String>,
+    /// The kind of its basis: the runner's `recommendation` for an approval
+    /// taken at the resolver's bound (OWL-375).
+    kind: BasisKind,
 }
 
 /// The run whose questions go through the resolver (OWL-342), as
@@ -946,7 +949,8 @@ impl<'a> Asked<'a> {
 struct Round {
     /// What is left, numbered Q1..Qn, each with the id the run gave it.
     questions: Vec<(QuestionId, Question)>,
-    /// How many of the run's questions the resolver decided.
+    /// How many of the run's questions the resolver decided, or the runner
+    /// took on their recommendations at the resolver's bound (OWL-375).
     decided: usize,
     /// Why the questions meant for the resolver are in the round, when
     /// they are.
@@ -2563,7 +2567,12 @@ impl OnDemand<'_> {
     /// runs ended ([`GatePolicy::chain_end`]): the project's pass limit
     /// reached, or, with a ceiling, the cost of the chain's resolver runs
     /// reaching it or not reported (OWL-376); each `gate` event says what
-    /// they cost so far. The resolver is told of the asking run
+    /// they cost so far. At `all`, the chain ended, the runner takes the
+    /// asking run's recommendations instead (OWL-375, [`resolver::recommended`]),
+    /// once per asking role and chain and never on a false premise, held by
+    /// [`resolver::settle`] to the rules a resolver's decisions are: those
+    /// posted and kept leave the round and mark the role, with no settled pass
+    /// counted. The resolver is told of the asking run
     /// (`asked_by`): its role, run and summary, the plan and the findings it
     /// was about, and the branch's diff from its base, written beside the
     /// brief when the branch has commits of its own. A
@@ -2625,6 +2634,49 @@ impl OnDemand<'_> {
         p.chain.asked(asked.cost);
         if let Some(end) = p.policy.chain_end(p.chain) {
             let fallback = Fallback::from(end);
+            // At `all`, the asking run's recommendations, once per role and
+            // chain, instead of the resolver (OWL-375).
+            if level == DelegationLevel::All
+                && !premise_false
+                && !p.chain.recommendations_taken(asked.role)
+            {
+                let built = resolver::recommended(&routed.to_resolver, asked.reopened);
+                let sorted = resolver::settle(
+                    &p.policy,
+                    &routed.to_resolver,
+                    &built,
+                    &Quotable::default(),
+                    false,
+                );
+                let (decided, unposted) = self.log_decisions(
+                    p,
+                    state,
+                    asked.role,
+                    &sorted.logged,
+                    (raised_by, DecidedBy::Recommendation(fallback)),
+                    sink,
+                )?;
+                let decided_ids: Vec<QuestionId> =
+                    decided.iter().map(|d| d.question.clone()).collect();
+                // Only decisions posted and kept count: they mark the role,
+                // and no settled pass is counted.
+                if !decided.is_empty() {
+                    p.chain.took_recommendations(asked.role);
+                }
+                let mut event = resolved_event(fallback.as_str(), None, &decided_ids);
+                event.insert("recommended".to_owned(), question_ids(&decided_ids));
+                event.insert("unposted".to_owned(), question_ids(&unposted));
+                add_spend(&mut event, p.chain, &p.policy);
+                if let Some(reason) = fallback.reason() {
+                    event.insert("reason".to_owned(), json!(reason));
+                }
+                sink.emit(&ticket, Some(raised_by), EventKind::Gate, event);
+                let left = Round::of(&raised, &decided_ids, asked.reopened, Some(fallback));
+                if left.questions.is_empty() {
+                    return Ok(Routing::Settled(decided));
+                }
+                return Ok(Routing::Ask(left));
+            }
             let mut event = resolved_event(fallback.as_str(), None, &[]);
             add_spend(&mut event, p.chain, &p.policy);
             if let Some(reason) = fallback.reason() {
@@ -2686,8 +2738,6 @@ impl OnDemand<'_> {
             };
         };
 
-        let mut decided: Vec<DecidedOn> = Vec::new();
-        let mut unposted: Vec<QuestionId> = Vec::new();
         // A decision whose two labels do not both route to the resolver
         // (OWL-144), whose basis kind the level does not allow or whose
         // quote is not in the ticket (OWL-328), or which takes a false
@@ -2700,74 +2750,14 @@ impl OnDemand<'_> {
             &quotable,
             premise_false,
         );
-        // One DECISION comment for the run's decisions (OWL-351), its
-        // reasoning in the ticket's decisions document, published first so
-        // the comment links to it.
-        if !sorted.logged.is_empty() {
-            let run_decided = Decided::of_run(&sorted.logged);
-            let (reasoning, document) = self.publish_decisions(p, &run_decided, &ran.run, sink);
-            let comment = DecisionComment {
-                ticket: ticket.clone(),
-                decisions: run_decided,
-                level,
-                reasoning,
-                run: Some(ran.run.clone()),
-            };
-            let ids: Vec<QuestionId> = sorted
-                .logged
-                .iter()
-                .map(|l| l.question.id.clone())
-                .collect();
-            // Never an unlogged decision: those whose comment is not on the
-            // ticket go to the decider.
-            match Writer::new(self.tracker).post_decision(&comment) {
-                Err(_) => unposted.extend(ids),
-                Ok(posted) => {
-                    let mut written = comment_written("DECISION", &posted);
-                    written.insert("questions".to_owned(), question_ids(&ids));
-                    sink.emit(&ticket, Some(&ran.run), EventKind::TrackerWrite, written);
-                    let mut kept = p.questions();
-                    // As a round does, a kept decision keeps what the asking
-                    // run asked: Build's kept refusal is cleared with it
-                    // (OWL-192).
-                    kept.build_refusal = None;
-                    if document.is_some() {
-                        kept.decisions_document = document;
-                    }
-                    for (n, (logged, shown)) in
-                        sorted.logged.iter().zip(comment.decisions).enumerate()
-                    {
-                        kept.decisions.push(KeptDecision {
-                            at: posted.created_at,
-                            comment: posted.id.clone(),
-                            question: shown.question,
-                            decision: shown.decision,
-                            basis: shown.basis,
-                            basis_kind: shown.kind,
-                            asked_by: Some(asked.role),
-                            number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
-                            reversed: None,
-                        });
-                        decided.push(DecidedOn {
-                            question: logged.question.id.clone(),
-                            comment: posted.id.clone(),
-                            option: logged.option.map(str::to_owned),
-                        });
-                    }
-                    self.store(p, state, kept).map_err(|e| {
-                        Stop::Refused(format!(
-                            "the decisions on {} are on the ticket (comment {}), but keeping them \
-                             in the ticket's ref failed: {e}",
-                            ids.iter()
-                                .map(QuestionId::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            posted.id
-                        ))
-                    })?;
-                }
-            }
-        }
+        let (decided, unposted) = self.log_decisions(
+            p,
+            state,
+            asked.role,
+            &sorted.logged,
+            (&ran.run, DecidedBy::Resolver),
+            sink,
+        )?;
         let decided_ids: Vec<QuestionId> = decided.iter().map(|d| d.question.clone()).collect();
         let mut event = resolved_event("done", Some(&ran.run), &decided_ids);
         event.insert(
@@ -2798,6 +2788,94 @@ impl OnDemand<'_> {
             return Ok(Routing::Settled(decided));
         }
         Ok(Routing::Ask(left))
+    }
+
+    /// Posts the decisions `logged` of one run as one DECISION comment
+    /// (OWL-351), their reasoning in the ticket's decisions document, then
+    /// keeps them in the ticket ref with the role that asked them: the
+    /// resolver's decisions, or, at the resolver's bound at `all`, the asking
+    /// run's recommendations (OWL-375), as `by` says; `run` names the run in
+    /// the comment's footer and the events. Returns the decisions kept and
+    /// the questions whose comment could not be posted, which go to the
+    /// decider; a post whose keeping failed stops the command, naming the
+    /// comment. Nothing is posted when `logged` is empty.
+    fn log_decisions(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        role: Role,
+        logged: &[resolver::Logged<'_>],
+        (run, by): (&str, DecidedBy),
+        sink: &mut EventSink<'_>,
+    ) -> Result<(Vec<DecidedOn>, Vec<QuestionId>), Stop> {
+        let ticket = p.ticket.clone();
+        let mut decided: Vec<DecidedOn> = Vec::new();
+        let mut unposted: Vec<QuestionId> = Vec::new();
+        // One DECISION comment for the run's decisions (OWL-351), its
+        // reasoning in the ticket's decisions document, published first so
+        // the comment links to it.
+        if !logged.is_empty() {
+            let run_decided = Decided::of_run(logged);
+            let (reasoning, document) = self.publish_decisions(p, &run_decided, run, sink);
+            let comment = DecisionComment {
+                ticket: ticket.clone(),
+                decisions: run_decided,
+                level: p.policy.level(),
+                reasoning,
+                run: Some(run.to_owned()),
+                by,
+            };
+            let ids: Vec<QuestionId> = logged.iter().map(|l| l.question.id.clone()).collect();
+            // Never an unlogged decision: those whose comment is not on the
+            // ticket go to the decider.
+            match Writer::new(self.tracker).post_decision(&comment) {
+                Err(_) => unposted.extend(ids),
+                Ok(posted) => {
+                    let mut written = comment_written("DECISION", &posted);
+                    written.insert("questions".to_owned(), question_ids(&ids));
+                    sink.emit(&ticket, Some(run), EventKind::TrackerWrite, written);
+                    let mut kept = p.questions();
+                    // As a round does, a kept decision keeps what the asking
+                    // run asked: Build's kept refusal is cleared with it
+                    // (OWL-192).
+                    kept.build_refusal = None;
+                    if document.is_some() {
+                        kept.decisions_document = document;
+                    }
+                    for (n, (logged, shown)) in logged.iter().zip(comment.decisions).enumerate() {
+                        kept.decisions.push(KeptDecision {
+                            at: posted.created_at,
+                            comment: posted.id.clone(),
+                            question: shown.question,
+                            decision: shown.decision,
+                            basis: shown.basis,
+                            basis_kind: shown.kind,
+                            asked_by: Some(role),
+                            number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
+                            reversed: None,
+                        });
+                        decided.push(DecidedOn {
+                            question: logged.question.id.clone(),
+                            comment: posted.id.clone(),
+                            option: logged.option.map(str::to_owned),
+                            kind: logged.kind,
+                        });
+                    }
+                    self.store(p, state, kept).map_err(|e| {
+                        Stop::Refused(format!(
+                            "the decisions on {} are on the ticket (comment {}), but keeping them \
+                             in the ticket's ref failed: {e}",
+                            ids.iter()
+                                .map(QuestionId::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            posted.id
+                        ))
+                    })?;
+                }
+            }
+        }
+        Ok((decided, unposted))
     }
 
     /// Runs the answer check once the decider has answered, and acts on its
@@ -5616,6 +5694,9 @@ impl OnDemand<'_> {
             checks,
             gate,
             decisions,
+            // Those taken on a recommendation at the resolver's bound, under
+            // their own heading (OWL-375).
+            recommended: resolver::reported_recommended(&questions.decisions, corrected),
             // The level in force for this command, said once when the
             // resolver's decisions are listed (OWL-337).
             level: (!questions.decisions.is_empty()).then(|| self.config.policy.resolver().level),
@@ -7985,7 +8066,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 15,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 16,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

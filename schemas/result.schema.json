@@ -524,31 +524,6 @@
       },
       "additionalProperties": false
     },
-    "BasisKind": {
-      "description": "What a resolver's decision rests on (OWL-328): the runner allows a kind\nby the project's delegation level ([`DelegationLevel::allows`]).",
-      "oneOf": [
-        {
-          "description": "Observed in the worktree, offline: a file, an existing pattern, a\ndocumented behaviour.",
-          "type": "string",
-          "const": "fact"
-        },
-        {
-          "description": "Settled by the ticket, the decider's comments, earlier decisions or\nthe project's rules.",
-          "type": "string",
-          "const": "settled"
-        },
-        {
-          "description": "The ticket's own text, which the decision quotes.",
-          "type": "string",
-          "const": "ticket"
-        },
-        {
-          "description": "The resolver's own weighing where nothing settles the question: a\ntrade-off, a priority, an intent the ticket does not state\n(OWL-342). At `all` only.",
-          "type": "string",
-          "const": "judgment"
-        }
-      ]
-    },
     "Decision": {
       "description": "A decision the role took on its own.",
       "type": "object",
@@ -1023,8 +998,14 @@
               "pattern": "\\S"
             },
             "basis_kind": {
-              "description": "The kind of that basis (format 11, OWL-337): `fact`, `settled`,\n`ticket` or, since format 12, `judgment` (OWL-343), its `basis`\nthen holding the reasons and the cost of the choice. The runner\nrefuses a kind the project's delegation level does not allow.",
-              "$ref": "#/$defs/BasisKind"
+              "description": "The kind of that basis (format 11, OWL-337): `fact`, `settled`,\n`ticket` or, since format 12, `judgment` (OWL-343), its `basis`\nthen holding the reasons and the cost of the choice. The runner\nrefuses a kind the project's delegation level does not allow, and\n`recommendation`, its own kind at the resolver's bound (OWL-375),\nalways, which the schema leaves out.",
+              "type": "string",
+              "enum": [
+                "fact",
+                "settled",
+                "ticket",
+                "judgment"
+              ]
             },
             "category": {
               "description": "The resolver's own label for the question, read from its text and\ncontext: a floor token when the question touches a floor topic.\nThe runner logs the decision only when this label is a token and\nit and the raising run's category both route to the resolver,\nand otherwise sends the question to the decider\n(`owlshift_core::gate::GatePolicy::route_decided`).",

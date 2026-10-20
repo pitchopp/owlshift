@@ -137,7 +137,7 @@ use owlshift_runner::on_demand::{
 };
 use owlshift_runner::resolver::{self, Fallback, Quotable, Resolved};
 use owlshift_runner::writer::{
-    Decided, DecisionComment, ParkedComment, QuestionsComment, ReaskComment, Reasoning,
+    Decided, DecidedBy, DecisionComment, ParkedComment, QuestionsComment, ReaskComment, Reasoning,
     ReopenedChoice, ReplyComment, Restart, ResumeComment, VisibleStage, Writer,
 };
 
@@ -955,6 +955,7 @@ impl Driver {
                         level: self.policy.level(),
                         reasoning: Reasoning::Folded,
                         run: None,
+                        by: DecidedBy::Resolver,
                     };
                     let posted = self.post(&comment.render())?;
                     self.has_ref = true;
