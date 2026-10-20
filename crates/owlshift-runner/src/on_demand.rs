@@ -664,14 +664,12 @@ pub enum Stop {
     Watched { ticket: TicketId, seen: Box<Seen> },
     /// `owlshift watch` ran one stage step of the ticket and kept its state
     /// (OWL-367): it is now at `stage`, and its next step runs at a later
-    /// pass, going on from `carried`. Nobody is the blocker. `commit` is the
-    /// ticket ref the step left, as it read it under its lock, which
-    /// `carry.json` is tied to (OWL-399); `None` when it kept none.
+    /// pass, going on from `carried`, which `carry.json` keeps (OWL-399).
+    /// Nobody is the blocker.
     Stepped {
         ticket: TicketId,
         stage: Stage,
         carried: Carried,
-        commit: Option<String>,
     },
 }
 
@@ -882,17 +880,6 @@ fn nothing_to_continue(ticket: &TicketId) -> Stop {
 struct Watched {
     carried: Carried,
     slot_held_by: Option<TicketId>,
-}
-
-/// The stop of a stage step of watch's whose ticket is now in `state`
-/// (OWL-367): its state is kept, and its next step runs at a later pass.
-fn stepped(p: &Prepared, state: &TicketState) -> Stop {
-    Stop::Stepped {
-        ticket: p.ticket.clone(),
-        stage: state.stage(),
-        carried: p.carried(),
-        commit: p.stored.as_ref().map(|stored| stored.commit.clone()),
-    }
 }
 
 /// Whether the ticket waits for its decider's answers, parked or not.
@@ -1190,6 +1177,11 @@ struct Prepared {
     /// settled when its questions are, spent by the next run of its role.
     /// Every write of the ref carries it, as `intake`.
     session: Option<TicketSession>,
+    /// What the ticket ref kept but its runs' cost when the command took
+    /// the lock, `None` without a ref: a stage step of watch's that moved it
+    /// keeps what it carries in `carry.json` ([`OnDemand::stepped`],
+    /// OWL-399).
+    started: Option<ticket_ref::Progress>,
 }
 
 impl Prepared {
@@ -1356,6 +1348,41 @@ impl OnDemand<'_> {
         let mut p = self.prepare(ticket, Command::Do)?;
         self.drop_carry(ticket, sink);
         self.run_prepared(&mut p, Command::Do, sink)
+    }
+
+    /// The stop of a stage step of watch's whose ticket is now in `state`
+    /// (OWL-367): its state is kept, and its next step runs at a later pass.
+    /// What it carries to that step is kept in `carry.json` here, while the
+    /// step still holds the project's lock, so that a person's `do` or
+    /// `continue` after it, which removes the file, always has the last word
+    /// (OWL-399): tied to the ticket ref the step left when the step moved
+    /// what the ref keeps, removed otherwise. A write or removal that fails
+    /// is a `warning` event (`carry_not_kept`).
+    fn stepped(&self, p: &Prepared, state: &TicketState, sink: &mut EventSink<'_>) -> Stop {
+        let ticket = &p.ticket;
+        let carried = p.carried();
+        let kept = match &p.stored {
+            Some(stored) if Some(stored.progress()) != p.started => {
+                crate::step::write_carry(self.dirs, ticket, &stored.commit, carried)
+            }
+            _ => crate::step::remove_carry(self.dirs, ticket),
+        };
+        if let Err(error) = kept {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("carry_not_kept")),
+                    ("reason", json!(error.to_string())),
+                ]),
+            );
+        }
+        Stop::Stepped {
+            ticket: ticket.clone(),
+            stage: state.stage(),
+            carried,
+        }
     }
 
     /// A person's `do` or `continue` starts its ticket afresh, as before
@@ -1628,7 +1655,7 @@ impl OnDemand<'_> {
             // round asked before OWL-269, goes back to the ready column now,
             // which runs nothing.
             if p.stepping && state.status() != Status::Active(Stage::Ready) {
-                return Err(stepped(&p, &state));
+                return Err(self.stepped(&p, &state, sink));
             }
         }
         // At Intake, intake runs again (OWL-248): after a park, a usage
@@ -1872,6 +1899,7 @@ impl OnDemand<'_> {
             session: stored
                 .as_ref()
                 .and_then(|stored| stored.record.session.clone()),
+            started: stored.as_ref().map(Stored::progress),
             stored,
             heeded: false,
             repairing: false,
@@ -2514,7 +2542,7 @@ impl OnDemand<'_> {
                         // the integration of late comments carried.
                         Verified::Revise(next) if p.stepping => {
                             p.integrated |= integrating.is_some();
-                            return Err(stepped(p, &next));
+                            return Err(self.stepped(p, &next, sink));
                         }
                         // A Verify fix run follows, its findings given, and
                         // what the pass proposed kept for the delivery (a

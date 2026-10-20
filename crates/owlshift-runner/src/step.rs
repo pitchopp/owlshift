@@ -17,8 +17,10 @@
 //! `carry.json` beside the records ([`TicketCarry`]), tied to the ticket-ref
 //! commit the step left and a generation; a resume uses it only while both
 //! are those its envelope names. A step that ran nothing leaves it as it is;
-//! one that stopped [`Stop::Stepped`] with the ref's progress moved writes
-//! it; any other removes it, as `do` and a person's `continue` do.
+//! one that stopped [`Stop::Stepped`] keeps it while it still holds the
+//! project's lock, written when it moved the ref's progress, so that a
+//! person's `do` or `continue` after it, which removes it, has the last
+//! word; any other removes it.
 
 mod children;
 
@@ -361,42 +363,24 @@ pub fn remove_carry(dirs: &ProjectDirs, ticket: &TicketId) -> io::Result<()> {
     }
 }
 
-/// Keeps what a step carries after it: as it was when the step ran
-/// nothing; written, tied to the commit the step left, when it stopped
-/// [`Stop::Stepped`] with the ref's progress moved and that commit still the
-/// ref; removed otherwise. A write or removal that fails is a `warning`
-/// event (`carry_not_kept`): the next step then starts afresh, or goes on
-/// from a carry no longer tied to its ref, which it does not use.
+/// Keeps what a step carries after it, once its lock is released: as it
+/// was when the step ran nothing, or when it stopped [`Stop::Stepped`],
+/// which kept it under its lock ([`OnDemand::stepped`]); removed otherwise,
+/// which changes nothing to a person's command that took the lock since,
+/// none of them writing it. A removal that fails is a `warning` event
+/// (`carry_not_kept`): the carry left is tied to a ref the step moved, or
+/// was the step's own to go on from.
 fn keep_carry(
     on_demand: &OnDemand<'_>,
     envelope: &StepEnvelope,
     stepped: &Stepped,
     sink: &mut EventSink<'_>,
 ) {
-    let dirs = on_demand.dirs;
+    if !removes_carry(stepped) {
+        return;
+    }
     let ticket = &envelope.ticket;
-    let now = || {
-        ticket_ref::read(&on_demand.executor.git, &dirs.checkout(), ticket)
-            .ok()
-            .flatten()
-            .map(|stored| (stored.commit.clone(), stored.progress().0))
-    };
-    let kept = match carry_after(envelope, stepped, now) {
-        CarryAfter::Leave => return,
-        CarryAfter::Remove => remove_carry(dirs, ticket),
-        CarryAfter::Write { commit, carried } => {
-            let generation = read_carry(dirs, ticket).map_or(0, |carry| carry.generation);
-            let carry = TicketCarry {
-                format: Format,
-                commit,
-                generation: generation.saturating_add(1),
-                chain: KeptChain::from(carried.chain),
-                integrated: carried.integrated,
-            };
-            write_atomically(&carry_file(dirs, ticket), &carry.render())
-        }
-    };
-    if let Err(error) = kept {
+    if let Err(error) = remove_carry(on_demand.dirs, ticket) {
         sink.emit(
             ticket,
             None,
@@ -409,46 +393,31 @@ fn keep_carry(
     }
 }
 
-/// What becomes of `carry.json` after a step.
-#[derive(Debug, PartialEq, Eq)]
-enum CarryAfter {
-    /// The step ran nothing: what it carried stands.
-    Leave,
-    /// The step stopped at its next stage with the ref's progress moved:
-    /// its chain is tied to the commit it left.
-    Write { commit: String, carried: Carried },
-    /// Anything else starts the next step afresh.
-    Remove,
+/// Whether `carry.json` goes after a step that ended `stepped`: not when
+/// it ran nothing, nor when it stopped at its next stage, which kept it
+/// under its lock.
+fn removes_carry(stepped: &Stepped) -> bool {
+    !ran_nothing(stepped) && !matches!(stepped, Stepped::Ran(Err(Stop::Stepped { .. })))
 }
 
-/// What becomes of `carry.json` after `envelope`'s step ended `stepped`,
-/// `ref_now` giving the ticket ref's commit and progress now, read only for
-/// a step that stopped at its next stage.
-fn carry_after(
-    envelope: &StepEnvelope,
-    stepped: &Stepped,
-    ref_now: impl FnOnce() -> Option<(String, String)>,
-) -> CarryAfter {
-    if ran_nothing(stepped) {
-        return CarryAfter::Leave;
-    }
-    let Stepped::Ran(Err(Stop::Stepped {
-        carried,
-        commit: Some(commit),
-        ..
-    })) = stepped
-    else {
-        return CarryAfter::Remove;
+/// Ties `carried` to `commit`, the ticket ref a stage step left, its
+/// generation one more than the last one's: done under the step's lock
+/// ([`OnDemand::stepped`], OWL-399).
+pub(crate) fn write_carry(
+    dirs: &ProjectDirs,
+    ticket: &TicketId,
+    commit: &str,
+    carried: Carried,
+) -> io::Result<()> {
+    let generation = read_carry(dirs, ticket).map_or(0, |carry| carry.generation);
+    let carry = TicketCarry {
+        format: Format,
+        commit: commit.to_owned(),
+        generation: generation.saturating_add(1),
+        chain: KeptChain::from(carried.chain),
+        integrated: carried.integrated,
     };
-    match ref_now() {
-        Some((now, progress)) if now == *commit && progress != envelope.progress => {
-            CarryAfter::Write {
-                commit: commit.clone(),
-                carried: *carried,
-            }
-        }
-        _ => CarryAfter::Remove,
-    }
+    write_atomically(&carry_file(dirs, ticket), &carry.render())
 }
 
 /// Writes `text` at `path` whole or not at all: to a file beside it, then
@@ -645,12 +614,11 @@ mod tests {
         }
     }
 
-    fn stepped(commit: Option<&str>) -> Stepped {
+    fn stepped() -> Stepped {
         Stepped::Ran(Err(Stop::Stepped {
             ticket: ticket(),
             stage: Stage::Build,
             carried: chain(),
-            commit: commit.map(ToOwned::to_owned),
         }))
     }
 
@@ -658,18 +626,13 @@ mod tests {
         Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
     }
 
-    /// OWL-399: a step that ran nothing leaves what it carried; one that
-    /// stopped at its next stage with the ref's progress moved ties its
-    /// chain to the commit it left, while that commit is the ref; anything
-    /// else starts the next step afresh.
+    /// OWL-399: once a step's lock is released, what it carried stays when
+    /// it ran nothing, or when it stopped at its next stage, which kept it
+    /// under that lock; anything else starts the next step afresh. A write
+    /// raises the generation.
     #[test]
-    fn a_step_carries_its_chain_only_past_a_stage_it_kept() {
-        let resume = envelope(StepKind::Resume {
-            shown: Shown::Working,
-            stage: Stage::Design,
-        });
-        let unread = || -> Option<(String, String)> { panic!("the ref is not read") };
-        for nothing in [
+    fn a_step_leaves_its_carry_only_when_it_ran_nothing_or_kept_its_stage() {
+        for kept in [
             Stepped::Stale,
             Stepped::Capped {
                 open_prs: 3,
@@ -680,35 +643,24 @@ mod tests {
                 reason: "not listed".to_owned(),
             },
             Stepped::Ran(Err(Stop::Busy(PathBuf::from("/p")))),
+            stepped(),
         ] {
-            assert_eq!(carry_after(&resume, &nothing, unread), CarryAfter::Leave);
+            assert!(!removes_carry(&kept), "{kept:?}");
         }
-        let moved = || Some(("c2".to_owned(), "p2".to_owned()));
-        assert_eq!(
-            carry_after(&resume, &stepped(Some("c2")), moved),
-            CarryAfter::Write {
-                commit: "c2".to_owned(),
-                carried: chain(),
-            }
-        );
-        // The ref left at the same progress, moved since by another
-        // command, or gone: afresh.
-        for now in [
-            Some(("c2".to_owned(), "p1".to_owned())),
-            Some(("c3".to_owned(), "p3".to_owned())),
-            None,
+        for gone in [
+            Stepped::Ran(Err(Stop::Refused("no".to_owned()))),
+            Stepped::Ran(Err(Stop::Ready { ticket: ticket() })),
         ] {
-            assert_eq!(
-                carry_after(&resume, &stepped(Some("c2")), || now),
-                CarryAfter::Remove
-            );
+            assert!(removes_carry(&gone), "{gone:?}");
         }
-        assert_eq!(
-            carry_after(&resume, &stepped(None), moved),
-            CarryAfter::Remove
-        );
-        let refused = Stepped::Ran(Err(Stop::Refused("no".to_owned())));
-        assert_eq!(carry_after(&resume, &refused, unread), CarryAfter::Remove);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = ProjectDirs::new(tmp.path(), &Repo::parse("acme/app").unwrap());
+        write_carry(&dirs, &ticket(), "c1", chain()).unwrap();
+        write_carry(&dirs, &ticket(), "c2", chain()).unwrap();
+        let carry = read_carry(&dirs, &ticket()).unwrap();
+        assert_eq!((carry.commit.as_str(), carry.generation), ("c2", 2));
+        assert_eq!(carry.chain.chain(), chain().chain);
     }
 
     /// A resume goes on from `carry.json` only while its commit and
@@ -824,7 +776,7 @@ mod tests {
                 },
             ),
             (
-                stepped(Some("c2")),
+                stepped(),
                 StepEnd::Stepped {
                     stage: Stage::Build,
                 },
