@@ -80,6 +80,7 @@ fn a_real_agent_run_keeps_the_login_and_nothing_else() {
         json_schema: None,
         max_budget_usd: None,
         bash: false,
+        session: None,
     };
     let built = command(Path::new("claude"), &request).unwrap();
     let mut inner = Command::new(built.get_program());

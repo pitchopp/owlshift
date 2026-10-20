@@ -1180,11 +1180,13 @@ impl Driver {
             run_dir: &dir,
             brief: &brief,
             setup: &self.setup,
+            session: None,
         };
         let harness = FakeHarness {
             program: self.fake_harness.clone(),
             reply: reply_path,
             readable: self.git.agent_readable(),
+            sessions: false,
         };
         let report = self
             .executor

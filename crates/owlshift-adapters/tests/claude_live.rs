@@ -59,6 +59,7 @@ fn a_tiny_real_run_completes_on_the_users_login() {
         json_schema: None,
         max_budget_usd: None,
         bash: false,
+        session: None,
     };
     let prompt = "Use the Write tool to create the file result.json containing exactly \
                   {\"ok\": true}. Then reply with the single word done.";

@@ -9,7 +9,9 @@
 //! plan, the plan ([`PLAN_FILE`]) and its review passes ([`REVIEW_FILE`],
 //! OWL-303); once a run ended, what the ticket's runs cost ([`COST_FILE`],
 //! OWL-378, written right after each run since OWL-397, which watch's
-//! [`Progress`] leaves out); and once a run proposed a follow-up, the
+//! [`Progress`] leaves out); once a Design or Build run asked, its session
+//! ([`SESSION_FILE`], OWL-394, which [`Progress`] leaves out too and
+//! [`forget`] drops); and once a run proposed a follow-up, the
 //! proposals and what became of them ([`PROPOSALS_FILE`], OWL-253), which no
 //! write drops but [`forget`]'s of an invalid one.
 //!
@@ -42,8 +44,8 @@ use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
     COST_FILE, DELIVERY_FILE, INTAKE_FILE, PLAN_FILE, PROPOSALS_FILE, PersistedState,
-    QUESTIONS_FILE, REVIEW_FILE, STATE_FILE, TICKETS_PREFIX, TicketCost, TicketDelivery,
-    TicketQuestions, ticket_ref,
+    QUESTIONS_FILE, REVIEW_FILE, SESSION_FILE, STATE_FILE, TICKETS_PREFIX, TicketCost,
+    TicketDelivery, TicketQuestions, TicketSession, ticket_ref,
 };
 use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_core::state::{Status, TicketState};
@@ -77,6 +79,10 @@ pub struct TicketRecord {
     /// What the ticket's runs cost, once a write followed a run: `None` when
     /// the tree holds no [`COST_FILE`] (OWL-378).
     pub cost: Option<TicketCost>,
+    /// The session of the latest Design or Build run that asked, until the
+    /// next run of its role spends it: `None` when the tree holds no
+    /// [`SESSION_FILE`] (OWL-394).
+    pub session: Option<TicketSession>,
 }
 
 /// The hash an intake record keeps of a ticket's text (architecture section
@@ -151,7 +157,8 @@ impl RefAt {
 pub struct Progress(pub(crate) String);
 
 /// The [`Progress`] of `record` with `proposals`: the SHA-256, in lowercase
-/// hex, of each file a write renders but [`COST_FILE`], in a fixed order,
+/// hex, of each file a write renders but [`COST_FILE`] and [`SESSION_FILE`]
+/// (OWL-394), which runs write and spend beside what they keep, in a fixed order,
 /// each as its name, then a 0 byte when absent, or a 1 byte, its length as
 /// eight little-endian bytes and its text. Entries Owlshift never writes are
 /// left out: no command changes them.
@@ -212,7 +219,7 @@ pub enum ProposalsFile<'a> {
 /// that does not parse, or asks that do not match the state (a ticket
 /// waiting for answers to a round the asks do not end with) is an error.
 /// [`DELIVERY_FILE`], [`INTAKE_FILE`], [`PLAN_FILE`], [`REVIEW_FILE`],
-/// [`COST_FILE`] and [`PROPOSALS_FILE`] are optional, checked like the two
+/// [`COST_FILE`], [`SESSION_FILE`] and [`PROPOSALS_FILE`] are optional, checked like the two
 /// others when present.
 /// Other entries of the tree are left alone.
 pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stored>, String> {
@@ -299,6 +306,7 @@ fn read_listed(
         PLAN_FILE,
         REVIEW_FILE,
         COST_FILE,
+        SESSION_FILE,
         PROPOSALS_FILE,
     ]
     .into_iter()
@@ -369,6 +377,15 @@ fn read_listed(
     } else {
         None
     };
+    let session = if has(SESSION_FILE) {
+        let text = next(SESSION_FILE)?;
+        Some(
+            TicketSession::parse(&text)
+                .map_err(|e| broken(format!("holds an invalid {SESSION_FILE}: {e}")))?,
+        )
+    } else {
+        None
+    };
     let proposals = if has(PROPOSALS_FILE) {
         let text = next(PROPOSALS_FILE)?;
         Some(
@@ -388,6 +405,7 @@ fn read_listed(
             plan,
             review,
             cost,
+            session,
         },
         commit: listed.oid.clone(),
         proposals,
@@ -554,9 +572,9 @@ pub fn states(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, RefState)>, S
 /// the new commit. `previous` is the commit the ref was read at, `None` when
 /// it did not exist: the ref moves only from there, and the new commit has
 /// it as its parent and keeps every other entry of its tree but
-/// [`DELIVERY_FILE`], [`INTAKE_FILE`], [`PLAN_FILE`], [`REVIEW_FILE`] and
-/// [`COST_FILE`], each written when the record has it and left out when it
-/// has none.
+/// [`DELIVERY_FILE`], [`INTAKE_FILE`], [`PLAN_FILE`], [`REVIEW_FILE`],
+/// [`COST_FILE`] and [`SESSION_FILE`], each written when the record has it
+/// and left out when it has none.
 /// [`PROPOSALS_FILE`] is kept as it is:
 /// [`write_proposals`] writes it.
 ///
@@ -605,6 +623,9 @@ pub fn write_proposals(
     if let Some(cost) = &record.cost {
         files.push((COST_FILE, cost.render()));
     }
+    if let Some(session) = &record.session {
+        files.push((SESSION_FILE, session.render()));
+    }
     if let ProposalsFile::Write(proposals) = proposals {
         files.push((PROPOSALS_FILE, proposals.render()));
     }
@@ -638,6 +659,7 @@ pub fn write_proposals(
                     PLAN_FILE,
                     REVIEW_FILE,
                     COST_FILE,
+                    SESSION_FILE,
                 ]
                 .contains(&entry.name.as_str())
             {
@@ -800,8 +822,9 @@ pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Fo
 
 /// The record [`forget`] leaves: Ready, `round` kept, every other counter
 /// at zero, of `questions` only the refusals the next runs are told, and
-/// `cost` as it was. Ready with any round is a state the machine can be in,
-/// and the one `owlshift do` starts from.
+/// `cost` as it was; no session, the ticket starting over (OWL-394). Ready
+/// with any round is a state the machine can be in, and the one `owlshift
+/// do` starts from.
 fn kept(
     round: u32,
     questions: Option<&TicketQuestions>,
@@ -821,6 +844,7 @@ fn kept(
         plan: None,
         review: None,
         cost,
+        session: None,
     })
 }
 

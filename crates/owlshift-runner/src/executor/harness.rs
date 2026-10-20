@@ -23,6 +23,7 @@ use jiff::Timestamp;
 
 use owlshift_adapters::harness::claude::{self, EXIT_GRACE, Effort, STDERR_CAP, Usage};
 use owlshift_contracts::brief::{Brief, PermissionLevel};
+use owlshift_contracts::ids::SessionId;
 use owlshift_platform::keychain::Secret;
 use owlshift_platform::process::{find_executable_in, hand_over_on_descriptor};
 
@@ -59,6 +60,31 @@ pub struct HarnessRun<'a> {
     /// stopped so is judged by the harness's end, never as timed out
     /// (OWL-319).
     pub stop: Option<&'a RunStop>,
+    /// The session the run starts or resumes (OWL-394), as the executor
+    /// settled it: a resume whose transcript could not be put in place
+    /// starts a session of the run's own instead. `None`: the run keeps no
+    /// session.
+    pub session: Option<RunSession<'a>>,
+}
+
+/// The session a run uses (OWL-394), as the executor settled it
+/// ([`HarnessRun::session`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunSession<'a> {
+    /// A new session under this id.
+    Start(&'a SessionId),
+    /// The session of this id, its transcript in the run's configuration
+    /// folder: the harness tells the run so.
+    Resume(&'a SessionId),
+}
+
+impl RunSession<'_> {
+    /// The session's id.
+    pub fn id(&self) -> &SessionId {
+        match self {
+            Self::Start(id) | Self::Resume(id) => id,
+        }
+    }
 }
 
 /// A harness CLI, or a stand-in for one.
@@ -104,6 +130,27 @@ pub trait Harness {
         let _ = (original, updated);
         Err("this harness writes no login back".to_owned())
     }
+
+    /// What a resumed session must share with the run that started it, its
+    /// harness and the model its runs ask for, when this harness keeps
+    /// sessions (OWL-394); `None`, the default, when it keeps none. A
+    /// harness that keeps them names the folder they live in
+    /// ([`SandboxNeeds::session_variable`]), finds a session's transcript
+    /// there ([`Harness::session_transcript`]), resumes the session the
+    /// run's [`HarnessRun::session`] names, and reports on a resumed
+    /// session the whole session's cost, which the executor counts down to
+    /// the run's own ([`super::own_cost`]).
+    fn session_key(&self) -> Option<String> {
+        None
+    }
+
+    /// Where the transcript of session `id` is in `folder`, a configuration
+    /// folder of this harness or a copy of its layout, relative to it,
+    /// through no link; `Ok(None)` when it holds none, as by default.
+    fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
+        let _ = (folder, id);
+        Ok(None)
+    }
 }
 
 /// What a harness needs inside the sandbox.
@@ -146,6 +193,12 @@ pub struct SandboxNeeds {
     /// result file once the run's processes are stopped, over whatever the
     /// run left there. Read-only runs only.
     pub result_in_message: bool,
+    /// The variable naming the folder where the harness keeps its sessions
+    /// (OWL-394), such as `CLAUDE_CONFIG_DIR`: for a run given a session,
+    /// the executor sets it on the harness command alone to the run's
+    /// configuration folder, [`HarnessLogin::config_variable`]'s when the
+    /// harness has one, empty but for a resumed session's transcript.
+    pub session_variable: Option<&'static str>,
 }
 
 /// A harness's home folder of one run ([`SandboxNeeds::home`]).
@@ -253,6 +306,10 @@ pub struct HarnessEnd {
     /// The tools the harness's permissions refused, each once, in the order
     /// of their first refusal; empty when it reports none.
     pub permission_denials: Vec<String>,
+    /// The run's context at its end, in tokens: what a cold resume of its
+    /// session writes to the cache again (OWL-394); `None` when the harness
+    /// reports none.
+    pub context_tokens: Option<u64>,
 }
 
 impl HarnessEnd {
@@ -267,6 +324,7 @@ impl HarnessEnd {
             harness_version: None,
             message: None,
             permission_denials: Vec::new(),
+            context_tokens: None,
         }
     }
 }
@@ -404,6 +462,10 @@ impl Harness for ClaudeHarness {
             json_schema: None,
             max_budget_usd: self.max_budget_usd,
             bash: self.bash,
+            session: run.session.map(|session| match session {
+                RunSession::Start(id) => claude::Session::Start(id.clone()),
+                RunSession::Resume(id) => claude::Session::Resume(id.clone()),
+            }),
         };
         Ok(claude::command(&self.program, &request)?)
     }
@@ -412,18 +474,37 @@ impl Harness for ClaudeHarness {
     /// end, for the executor to read the result from when the role left no
     /// result file (OWL-323), or, with [`ClaudeHarness::bash`], as its
     /// result. A run with Bash is told where its brief is in the run's own
-    /// files, and to give its result as its last message.
+    /// files, and to give its result as its last message. A resumed session
+    /// is told only to read its brief again and carry on ([`resume_prompt`],
+    /// OWL-394): its role's prompt is already in the session.
     fn drive(
         &self,
         run: &HarnessRun<'_>,
         child: &mut Child,
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
-        let ran = claude::drive(child, &self.prompt_with(run.brief_file), |line| {
+        let prompt = match run.session {
+            Some(RunSession::Resume(_)) => resume_prompt(),
+            _ => self.prompt_with(run.brief_file),
+        };
+        let ran = claude::drive(child, &prompt, |line| {
             log.stdout(line);
         })?;
         log.stderr(&ran.stderr);
         Ok(claude_end(ran, run.brief.permissions.level, self.bash))
+    }
+
+    /// A confined run keeps its sessions in its configuration folder,
+    /// under the model it asks for (OWL-394); a bare one, on the user's own
+    /// login, keeps none.
+    fn session_key(&self) -> Option<String> {
+        self.login
+            .as_ref()
+            .map(|_| format!("claude-code:{}", self.model.as_deref().unwrap_or("default")))
+    }
+
+    fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
+        claude::transcript_path(folder, id)
     }
 
     /// The folders `claude` is installed in (the one on the `PATH` and the
@@ -452,6 +533,7 @@ impl Harness for ClaudeHarness {
                     token: token.clone(),
                     config_variable: claude::CONFIG_DIR_ENV,
                 });
+                needs.session_variable = Some(claude::CONFIG_DIR_ENV);
             }
             None if agent.is_confined() => return Err(NoAgentLogin::Missing.into()),
             None => {}
@@ -492,6 +574,19 @@ pub(super) fn program_folders(program: &Path, agent: &AgentEnv) -> Vec<PathBuf> 
         }
     }
     folders
+}
+
+/// The prompt of a resumed session (OWL-394): the questions it asked are
+/// settled, its brief, [`BRIEF_PATH`], is written anew, and it carries on
+/// as its role says.
+pub fn resume_prompt() -> String {
+    format!(
+        "Owlshift resumes this session: the questions you asked are now decided or answered. \
+         The brief of this run is the file `{BRIEF_PATH}` in the working directory, written \
+         anew. Read it again: its thread holds the decisions and the answers. Then carry on from \
+         where you stopped, as your role's instructions say, and end as they say, with a new \
+         `result.json`.\n"
+    )
 }
 
 /// The role's prompt, then where its brief is.
@@ -580,6 +675,7 @@ fn claude_end(run: claude::Run, level: PermissionLevel, in_message: bool) -> Har
         harness_version: run.harness_version,
         message,
         permission_denials,
+        context_tokens: run.context_tokens,
     }
 }
 
@@ -942,6 +1038,7 @@ mod tests {
             brief_file,
             result_file: Path::new("/tmp/run/run-files/result.json"),
             stop: None,
+            session: None,
         };
         let allowed = |harness: &ClaudeHarness| {
             let command = harness.command(&run).unwrap();

@@ -8,13 +8,21 @@
 //! back to the user's file only under the harness's own check and only when
 //! the user's file has not changed since: a refreshed login is kept, and
 //! nothing else the run wrote there outlives it.
+//!
+//! The same way, a session's transcript (OWL-394): kept out of a run's
+//! configuration folder once its processes are stopped ([`keep_session`]),
+//! and put back in a later run's empty one ([`seed_session`]), through no
+//! link either way and nothing else of the folder.
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use owlshift_contracts::ids::SessionId;
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
+
+use super::{Harness, MAX_SESSION_BYTES, ResumeFrom};
 
 /// The most bytes a login file may hold, read back or copied in.
 pub const MAX_LOGIN_BYTES: u64 = 64 * 1024;
@@ -151,6 +159,70 @@ pub(super) fn result_from_message(file: &Path, message: Option<&str>) -> io::Res
     Ok(())
 }
 
+/// Puts the transcript of the session `from` names in the run's empty
+/// configuration folder `config`, at the place it has in the kept folder
+/// (OWL-394). Says why not when the kept folder holds none or it cannot be
+/// copied ([`copy_confined`]).
+pub(super) fn seed_session(
+    harness: &dyn Harness,
+    from: &ResumeFrom,
+    config: &Path,
+) -> Result<(), String> {
+    let relative = harness
+        .session_transcript(&from.folder, &from.id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("no transcript of it is kept in {}", from.folder.display()))?;
+    copy_confined(&from.folder, &relative, config)
+}
+
+/// Keeps the transcript of session `id` the run left in its configuration
+/// folder `config` in `folder`, at the same place, once the run's processes
+/// are stopped (OWL-394); returns `folder`.
+pub(super) fn keep_session(
+    harness: &dyn Harness,
+    config: &Path,
+    id: &SessionId,
+    folder: &Path,
+) -> Result<PathBuf, String> {
+    let relative = harness
+        .session_transcript(config, id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the run left no transcript of it".to_owned())?;
+    copy_confined(config, &relative, folder)?;
+    Ok(folder.to_owned())
+}
+
+/// Copies the file `relative` of `from` to the same place in `to`, at most
+/// [`MAX_SESSION_BYTES`]: read through no link ([`read_confined`]), written
+/// as a new file private to the user, in folders made private to the user.
+/// A file cut off by a failed write is removed.
+fn copy_confined(from: &Path, relative: &str, to: &Path) -> Result<(), String> {
+    let bytes =
+        read_confined(from, relative, MAX_SESSION_BYTES).map_err(|error| error.to_string())?;
+    let target = to.join(relative);
+    let written = (|| {
+        let mut dir = to.to_owned();
+        let parent = Path::new(relative).parent().unwrap_or(Path::new(""));
+        for segment in [None].into_iter().chain(parent.components().map(Some)) {
+            if let Some(segment) = segment {
+                dir.push(segment);
+            }
+            match create_private_dir(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut file = create_private_file(&target)?;
+        file.write_all(&bytes)?;
+        file.sync_all()
+    })();
+    written.map_err(|error| {
+        let _ = fs::remove_file(&target);
+        format!("{}: {error}", target.display())
+    })
+}
+
 fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     if bytes.len() as u64 > MAX_LOGIN_BYTES {
@@ -187,7 +259,87 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::harness::ClaudeHarness;
     use super::*;
+
+    /// OWL-394: a session's transcript is kept out of the run's
+    /// configuration folder at the place it had there, private to the user,
+    /// and put back in a fresh one at the same place; nothing else of the
+    /// folder goes either way, and a transcript the folder holds through a
+    /// link is never followed.
+    #[test]
+    fn a_sessions_transcript_alone_is_kept_and_put_back() {
+        let claude = ClaudeHarness {
+            program: PathBuf::from("claude"),
+            prompt: String::new(),
+            model: None,
+            effort: None,
+            max_budget_usd: None,
+            login: None,
+            bash: false,
+        };
+        let id = SessionId::new("75744e41-7eac-4fdf-aeea-df03acb72bff").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let place = format!("projects/-work-DEMO-1/{id}.jsonl");
+        fs::create_dir_all(config.join("projects/-work-DEMO-1")).unwrap();
+        fs::write(config.join(&place), "{\"type\":\"user\"}\n").unwrap();
+        fs::write(config.join(".claude.json"), "{}").unwrap();
+
+        let kept = dir.path().join("run/session");
+        fs::create_dir(dir.path().join("run")).unwrap();
+        assert_eq!(keep_session(&claude, &config, &id, &kept).unwrap(), kept);
+        assert_eq!(
+            fs::read_to_string(kept.join(&place)).unwrap(),
+            "{\"type\":\"user\"}\n"
+        );
+        assert!(!kept.join(".claude.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&kept.join(&place)), 0o600);
+            assert_eq!(mode(&kept), 0o700);
+        }
+
+        let fresh = dir.path().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        let from = ResumeFrom {
+            id: id.clone(),
+            folder: kept.clone(),
+            cost_micros: 0,
+        };
+        seed_session(&claude, &from, &fresh).unwrap();
+        assert_eq!(
+            fs::read_to_string(fresh.join(&place)).unwrap(),
+            "{\"type\":\"user\"}\n"
+        );
+        let entries: Vec<_> = fs::read_dir(&fresh).unwrap().collect();
+        assert_eq!(entries.len(), 1, "the projects folder alone");
+
+        // A kept folder without the transcript gives nothing to resume.
+        let other = ResumeFrom {
+            folder: dir.path().join("nothing"),
+            ..from
+        };
+        assert!(seed_session(&claude, &other, &fresh).is_err());
+
+        #[cfg(unix)]
+        {
+            let planted = dir.path().join("planted");
+            let folder = planted.join("projects/-work");
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(dir.path().join("secret"), "secret\n").unwrap();
+            std::os::unix::fs::symlink(
+                dir.path().join("secret"),
+                folder.join(format!("{id}.jsonl")),
+            )
+            .unwrap();
+            let refused = keep_session(&claude, &planted, &id, &dir.path().join("kept2"));
+            assert!(refused.is_err());
+            assert!(!dir.path().join("kept2").exists());
+        }
+    }
 
     struct Setup {
         _dir: tempfile::TempDir,

@@ -780,6 +780,7 @@ mod tests {
             brief_file: &brief_file,
             result_file: &result_file,
             stop: Some(&stop),
+            session: None,
         };
         let mut log = RunLog::create(dir.path()).unwrap();
         let started = Instant::now();

@@ -17,7 +17,8 @@ use clap::Parser;
 use owlshift_contracts::brief::Brief;
 use owlshift_contracts::ids::RelativePath;
 use owlshift_testkit::reply::{
-    OWN_FAILURE, Reply, TMPDIR_PREFIX, cost_line, observed_line, usage_limit_line,
+    FAKE_SESSION_ENV, OWN_FAILURE, Reply, TMPDIR_PREFIX, cost_line, observed_line,
+    transcript_place, usage_limit_line,
 };
 
 /// Plays one scripted run in the current directory, the worktree.
@@ -30,6 +31,55 @@ struct Args {
     /// What to do: a reply file.
     #[arg(long)]
     reply: PathBuf,
+    /// Starts a session under this id, kept in the folder
+    /// `FAKE_SESSION_ENV` names (OWL-394).
+    #[arg(long, conflicts_with = "resume")]
+    session_id: Option<String>,
+    /// Resumes the session of this id from that folder, as Claude Code
+    /// does: refused, exit status 1, when the folder does not hold it.
+    #[arg(long)]
+    resume: Option<String>,
+}
+
+/// A session of the fake harness (OWL-394): its transcript, one line per
+/// run, each the session's whole cost so far, and that cost before this
+/// run.
+struct Session {
+    transcript: PathBuf,
+    prior_micros: u64,
+}
+
+/// The session `args` name, or the exit status of a resume the folder does
+/// not hold, as Claude Code's (C18).
+fn session(args: &Args) -> Result<Result<Option<Session>, i32>, String> {
+    let (id, resuming) = match (&args.session_id, &args.resume) {
+        (Some(id), None) => (id, false),
+        (None, Some(id)) => (id, true),
+        _ => return Ok(Ok(None)),
+    };
+    let folder = std::env::var_os(FAKE_SESSION_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("a session without {FAKE_SESSION_ENV}"))?;
+    let transcript = folder.join(transcript_place(id));
+    if !resuming {
+        return Ok(Ok(Some(Session {
+            transcript,
+            prior_micros: 0,
+        })));
+    }
+    let Ok(text) = fs::read_to_string(&transcript) else {
+        eprintln!("No conversation found with session ID: {id}");
+        return Ok(Err(1));
+    };
+    let prior_micros = text
+        .lines()
+        .last()
+        .and_then(|line| line.parse().ok())
+        .ok_or_else(|| format!("{}: no cost on its last line", transcript.display()))?;
+    Ok(Ok(Some(Session {
+        transcript,
+        prior_micros,
+    })))
 }
 
 fn main() {
@@ -49,6 +99,10 @@ fn main() {
 fn play(args: &Args) -> Result<i32, String> {
     let brief = Brief::parse(&read(&args.brief)?).map_err(|e| e.to_string())?;
     let reply = Reply::parse(&read(&args.reply)?)?;
+    let session = match session(args)? {
+        Ok(session) => session,
+        Err(code) => return Ok(code),
+    };
     let worktree = std::env::current_dir().map_err(|e| format!("current directory: {e}"))?;
 
     thread::sleep(Duration::from_millis(reply.delay_ms));
@@ -109,7 +163,19 @@ fn play(args: &Args) -> Result<i32, String> {
     if let Some(reset) = reply.usage_limit {
         eprintln!("{}", usage_limit_line(reset));
     }
-    if let Some(micros) = reply.cost_micros {
+    // A session's run reports the whole session's cost, as a resumed Claude
+    // Code session does (C18), and its transcript keeps it.
+    let reported = match &session {
+        Some(session) => {
+            let total = session.prior_micros + reply.cost_micros.unwrap_or(0);
+            let mut lines = fs::read_to_string(&session.transcript).unwrap_or_default();
+            lines.push_str(&format!("{total}\n"));
+            write(&session.transcript, lines.as_bytes())?;
+            reply.cost_micros.map(|_| total)
+        }
+        None => reply.cost_micros,
+    };
+    if let Some(micros) = reported {
         eprintln!("{}", cost_line(micros));
     }
     Ok(reply.exit_code())

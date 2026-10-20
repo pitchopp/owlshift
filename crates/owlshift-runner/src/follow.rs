@@ -1143,6 +1143,7 @@ mod tests {
             plan: None,
             review: None,
             cost: None,
+            session: None,
         }
     }
 

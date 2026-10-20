@@ -21,14 +21,14 @@ use owlshift_contracts::brief::{
     Author, Brief, PermissionLevel, Permissions, RebaseBrief, Relation, TicketBrief,
 };
 use owlshift_contracts::format::{Format, RESULT_FORMAT};
-use owlshift_contracts::ids::{RelativePath, TicketId};
+use owlshift_contracts::ids::{RelativePath, SessionId, TicketId};
 use owlshift_platform::keychain::Secret;
 use owlshift_runner::agent_env::{AgentEnv, CredentialFinding};
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
     Executor, ExecutorError, Failure, GateReport, Git, Harness, HarnessEnd, HarnessError,
-    HarnessLogin, HarnessRun, HarnessStatus, Outcome, RunLog, RunReport, RunSpec, SETUP_LOG,
-    SandboxNeeds, Violation,
+    HarnessLogin, HarnessRun, HarnessStatus, Outcome, ResumeFrom, RunLog, RunReport, RunSpec,
+    SETUP_LOG, SandboxNeeds, SessionPlan, Violation,
 };
 use owlshift_testkit::git::{GitEnv, seed};
 use owlshift_testkit::harness::FakeHarness;
@@ -158,6 +158,7 @@ impl Bench {
             run_dir: &self.tmp.path().join("run"),
             brief,
             setup: &[],
+            session: None,
         };
         executor.run(&spec, harness)
     }
@@ -177,6 +178,7 @@ impl Bench {
             run_dir: &self.tmp.path().join("run"),
             brief: &self.brief,
             setup: &[],
+            session: None,
         };
         self.executor
             .run(&spec, &NeverRuns)
@@ -842,6 +844,7 @@ impl Bench {
             program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
             reply: path,
             readable: Vec::new(),
+            sessions: false,
         }
     }
 
@@ -883,6 +886,59 @@ fn the_fake_harness_observes_the_worktree_and_its_temporary_folder() {
         bench.observed(),
         "README.md=hello\nmissing.txt absent\n$TMPDIR/none absent\n"
     );
+}
+
+/// OWL-394: a resume whose transcript cannot be put in place starts a
+/// session of the run's own, said in a warning, and its run counts at the
+/// whole cost it reports, never less what the other session had cost; a
+/// session given to a harness that keeps none is refused before anything
+/// runs.
+#[test]
+fn a_resume_without_its_transcript_starts_the_runs_own_session() {
+    let bench = Bench::new();
+    let mut harness = bench.fake(Reply {
+        cost_micros: Some(300_000),
+        ..Reply::default()
+    });
+    let own = SessionId::new("11111111-1111-4111-8111-111111111111").unwrap();
+    let plan = SessionPlan {
+        own: own.clone(),
+        resume: Some(ResumeFrom {
+            id: SessionId::new("22222222-2222-4222-8222-222222222222").unwrap(),
+            folder: bench.tmp.path().join("no-such-session"),
+            cost_micros: 5_000_000,
+        }),
+    };
+    let run = |harness: &FakeHarness| {
+        let spec = RunSpec {
+            main: &bench.main,
+            worktree: &bench.worktree,
+            branch: BRANCH,
+            base: "origin/main",
+            run_dir: &bench.tmp.path().join("run"),
+            brief: &bench.brief,
+            setup: &[],
+            session: Some(&plan),
+        };
+        bench.executor.run(&spec, harness)
+    };
+    assert!(matches!(run(&harness), Err(ExecutorError::Spec(_))));
+
+    harness.sessions = true;
+    let report = run(&harness).unwrap();
+    assert_eq!(report.resumed, Some(false));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("could not be resumed")
+                && warning.contains("starts a session of its own")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(report.usage.and_then(|usage| usage.cost_usd), Some(0.3));
+    // A `done` keeps no transcript: only a run that asked does.
+    assert_eq!(report.session, None);
 }
 
 /// OWL-369: a run that amends a commit its branch held at the start is
@@ -1190,6 +1246,7 @@ mod setup {
                 run_dir: &self.tmp.path().join("run"),
                 brief,
                 setup: &setup,
+                session: None,
             };
             executor.run(&spec, harness).unwrap()
         }

@@ -36,7 +36,9 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
     /// The CLI's cost estimate at list price. On a subscription it measures
-    /// consumption, not a bill.
+    /// consumption, not a bill. On a resumed Claude Code session, the whole
+    /// session's, as are `models` (OWL-394, `claude::Session`): the runner
+    /// counts the run's own.
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
     pub num_turns: Option<u32>,

@@ -109,6 +109,9 @@ pub const REVIEW_FORMAT: u32 = 1;
 /// The format version of what a ticket's runs cost (`cost.json` on a ticket
 /// ref, OWL-378).
 pub const COST_FORMAT: u32 = 1;
+/// The format version of the session of a ticket's latest asking run
+/// (`session.json` on a ticket ref, OWL-394).
+pub const SESSION_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

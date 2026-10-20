@@ -189,6 +189,7 @@ fn the_read_only_result_survives_a_cd() {
         json_schema: None,
         max_budget_usd: None,
         bash: false,
+        session: None,
     };
     let args: Vec<String> = command(Path::new("claude"), &request)
         .unwrap()
@@ -338,6 +339,7 @@ fn launch(level: PermissionLevel, network: bool, bash: bool) -> Request {
         json_schema: Some(r#"{"type":"object"}"#.into()),
         max_budget_usd: None,
         bash,
+        session: None,
     }
 }
 

@@ -277,6 +277,7 @@ impl Bench {
             program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
             reply: replies.join("reply.toml"),
             readable: self.env.agent_readable(),
+            sessions: false,
         };
         let mut brief = brief();
         brief.gate = self.config.stack.gate.clone();
@@ -293,6 +294,7 @@ impl Bench {
                     run_dir: &run_dir,
                     brief: &brief,
                     setup: &self.config.stack.setup,
+                    session: None,
                 },
                 &harness,
             )
