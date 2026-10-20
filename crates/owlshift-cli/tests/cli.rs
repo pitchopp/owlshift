@@ -1070,6 +1070,33 @@ fn init_writes_a_commented_project_file_once() {
     );
 }
 
+/// OWL-383: `--github-token` asks for a personal token, so it goes with the
+/// secrets and is refused with `--skip-secrets`, before any file is written.
+#[test]
+fn init_refuses_github_token_without_the_secrets() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let output = owlshift(
+        repo.path(),
+        config_dir.path(),
+        &[
+            "init",
+            "--tracker",
+            "markdown",
+            "--github-token",
+            "--skip-secrets",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("--github-token"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!repo.path().join("owlshift.toml").exists());
+}
+
 /// OWL-250: `watch --drain` on a project whose file lists no admitters is
 /// refused before any credential, `watch` alone is not refused for it.
 #[test]
