@@ -58,7 +58,7 @@ When the brief has `findings`, reviewers raised them on that plan. A finding's t
 
 ## The approval round
 
-When the brief has `approval`, the plan was put to its approval and the `thread` holds the reply: the decider's comment, or a `decision` entry when the runner's resolver decided it, which you follow as you follow the decider. Give `approval`: `approved` when the reply approves the plan as it is, with no `plan`; `changed`, with the revised `plan` beside it, when it changes it, such as a fork chosen otherwise or a step added. A reply such as `B, fork 2 option C` chooses your plan's second fork's third option, a fork's `options` being lettered A, B, C… in their order. A reply that leaves you unsure which, ask.
+When the brief has `approval`, the plan was put to its approval and the `thread` holds the reply: the decider's comment, an `answered` entry restating a round they answered (a thumbs-up on the plan reaches you that way, and approves it), or a `decision` entry when the runner's resolver decided it; you follow whichever of these you are given as you follow the decider. Give `approval`: `approved` when the reply approves the plan as it is, with no `plan`; `changed`, with the revised `plan` beside it, when it changes it, such as a fork chosen otherwise or a step added. A reply such as `B, fork 2 option C` chooses your plan's second fork's third option, a fork's `options` being lettered A, B, C… in their order. A reply that leaves you unsure which, ask.
 
 ## Ending the run
 
