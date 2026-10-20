@@ -4,10 +4,14 @@
 //! continues the tickets whose questions wait until Ctrl-C. What any of them
 //! can refuse without a credential, a host where agent runs cannot be
 //! confined included, is refused before the keychain is opened.
+//!
+//! `owlshift watch --drain` runs each step in a child, this binary with
+//! `continue TICKET --step ENVELOPE` (OWL-399), which opens what a run needs
+//! as `continue` does and hands the step to `owlshift_runner::step::child`.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -18,6 +22,7 @@ use owlshift_adapters::tracker::{Capability, Tracker};
 use owlshift_contracts::config::{Models, ProjectConfig, TrackerKind};
 use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::step::StepEnvelope;
 use owlshift_contracts::{Role, Tier};
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
@@ -35,6 +40,7 @@ use owlshift_runner::roles::{
     REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
 use owlshift_runner::routing::{ClaudeRouter, CodexRouter, claude_model};
+use owlshift_runner::step::{self, Children};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
 use owlshift_runner::{forge, secrets, tracker};
@@ -48,20 +54,22 @@ const HEAD_WAIT: Duration = Duration::from_secs(2);
 /// Which command runs: `owlshift do` from Ready, `owlshift continue` from
 /// where the ticket's ref left it, each on its ticket, or `owlshift watch`
 /// over the project's tickets whose questions wait, also draining the ready
-/// column with `--drain` (OWL-250).
+/// column with `--drain` (OWL-250); or a step of `--drain`'s, `owlshift
+/// continue` with the step's envelope (OWL-399).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode<'a> {
     Do(&'a str),
     Continue(&'a str),
     Watch,
     Drain,
+    Step(&'a str, &'a str),
 }
 
 impl<'a> Mode<'a> {
     fn command(self) -> &'static str {
         match self {
             Mode::Do(_) => "`owlshift do`",
-            Mode::Continue(_) => "`owlshift continue`",
+            Mode::Continue(_) | Mode::Step(..) => "`owlshift continue`",
             Mode::Watch => "`owlshift watch`",
             Mode::Drain => "`owlshift watch --drain`",
         }
@@ -70,7 +78,7 @@ impl<'a> Mode<'a> {
     /// The ticket a command names; `watch` names none.
     fn ticket(self) -> Option<&'a str> {
         match self {
-            Mode::Do(ticket) | Mode::Continue(ticket) => Some(ticket),
+            Mode::Do(ticket) | Mode::Continue(ticket) | Mode::Step(ticket, _) => Some(ticket),
             Mode::Watch | Mode::Drain => None,
         }
     }
@@ -93,6 +101,10 @@ fn run_with(
         .map(TicketId::new)
         .transpose()
         .map_err(|error| error.to_string())?;
+    let envelope = match (mode, &ticket) {
+        (Mode::Step(_, text), Some(ticket)) => Some(envelope_of(text, ticket)?),
+        _ => None,
+    };
     let (project_file, project) = loaded_project(config, mode.command())?;
     if mode == Mode::Drain
         && let Some(refusal) = drain_refusal(project)
@@ -161,11 +173,13 @@ fn run_with(
         TrackerKind::Markdown => None,
     };
     let forge_secret = secrets::forge(&repo, &mut read)?;
+    // A step's child does not say again what its watch said at its start.
     if let Some(notice) = secrets::shared_notice(
         &repo,
         tracker_secrets.as_ref().map(|found| &found.accounts),
         &forge_secret.account,
-    ) {
+    ) && envelope.is_none()
+    {
         eprintln!("owlshift: {notice}");
     }
     // With the Linear app stored, its token is requested here, before any
@@ -328,6 +342,19 @@ fn run_with(
     let (ticket, outcome) = match (mode, &ticket) {
         (Mode::Do(_), Some(ticket)) => (ticket, on_demand.run(ticket, &mut sink)),
         (Mode::Continue(_), Some(ticket)) => (ticket, on_demand.continue_ticket(ticket, &mut sink)),
+        (Mode::Step(..), Some(ticket)) => {
+            let envelope = envelope.ok_or("a step without its envelope")?;
+            // Reported as `continue`'s, then the record written last, which
+            // its watch reads once this process has ended.
+            let mut code = ExitCode::SUCCESS;
+            let mut reported = |outcome: &_, sink: &mut EventSink<'_>| {
+                code = report(system, desktop, tracker.as_ref(), ticket, outcome, sink);
+            };
+            step::child(&on_demand, &envelope, &mut sink, &mut reported).map_err(|error| {
+                format!("the step's outcome record could not be written: {error}")
+            })?;
+            return Ok(code);
+        }
         _ => {
             // OWL-152: until Ctrl-C ends the process; each continue's outcome
             // is reported as `continue`'s, and so is each intake and dispatch
@@ -358,7 +385,20 @@ fn run_with(
                 true
             };
             if mode == Mode::Drain {
-                watch.run_drain(&mut sink, &mut io::stdout(), &mut continued, &mut sleep);
+                // Each step in a child, this binary itself (OWL-399).
+                let program = std::env::current_exe().map_err(|error| {
+                    format!("this program's own path, which runs each step: {error}")
+                })?;
+                let children =
+                    Children::new(move |ticket, envelope| step_command(&program, ticket, envelope));
+                watch.run_with_children(
+                    true,
+                    &children,
+                    &mut sink,
+                    &mut io::stdout(),
+                    &mut continued,
+                    &mut sleep,
+                );
             } else {
                 watch.run(&mut sink, &mut io::stdout(), &mut continued, &mut sleep);
             }
@@ -373,6 +413,29 @@ fn run_with(
         &outcome,
         &mut sink,
     ))
+}
+
+/// The step `text` names for `ticket`: refused, before anything is read,
+/// when it does not read or names another ticket.
+fn envelope_of(text: &str, ticket: &TicketId) -> Result<StepEnvelope, String> {
+    let envelope =
+        StepEnvelope::parse(text).map_err(|error| format!("the step's envelope: {error}"))?;
+    if envelope.ticket != *ticket {
+        return Err(format!(
+            "the step's envelope is {}'s, not {ticket}'s",
+            envelope.ticket
+        ));
+    }
+    Ok(envelope)
+}
+
+/// The child that runs a step of `ticket` for `owlshift watch --drain`:
+/// `program`, this binary, as `owlshift continue <TICKET> --step
+/// <ENVELOPE>` (OWL-399).
+fn step_command(program: &Path, ticket: &TicketId, envelope: &str) -> Command {
+    let mut command = Command::new(program);
+    command.args(["continue", ticket.as_str(), "--step", envelope]);
+    command
 }
 
 /// The resolver's router (OWL-344): the shared harness with the resolver's
@@ -686,9 +749,57 @@ mod refusals {
             personal: FileState::Absent(repo.path().join("config.toml")),
         };
 
-        for mode in [Mode::Do("OWL-1"), Mode::Continue("OWL-1"), Mode::Watch] {
+        let step = envelope("OWL-1").render();
+        for mode in [
+            Mode::Do("OWL-1"),
+            Mode::Continue("OWL-1"),
+            Mode::Watch,
+            Mode::Step("OWL-1", &step),
+        ] {
             let refusal = run_with(&NoSandbox, &config, mode, no_keychain).unwrap_err();
             assert_eq!(refusal, SandboxError::Unsupported.to_string(), "{mode:?}");
         }
+
+        // OWL-399: a step whose envelope does not read, or is another
+        // ticket's, is refused before anything else.
+        let other = envelope("OWL-2").render();
+        for (text, said) in [
+            ("{", "the step's envelope: invalid step envelope"),
+            (other.as_str(), "the step's envelope is OWL-2's, not OWL-1's"),
+        ] {
+            let refusal =
+                run_with(&NoSandbox, &config, Mode::Step("OWL-1", text), no_keychain).unwrap_err();
+            assert!(refusal.starts_with(said), "{refusal}");
+        }
+    }
+
+    /// An intake's envelope for `ticket`.
+    fn envelope(ticket: &str) -> StepEnvelope {
+        StepEnvelope {
+            format: owlshift_contracts::format::Format,
+            ticket: TicketId::new(ticket).unwrap(),
+            attempt: "1-2-3".to_owned(),
+            step: owlshift_contracts::step::StepKind::Intake,
+            commit: None,
+            progress: "p".to_owned(),
+            answer: None,
+            generation: 0,
+            kept: Default::default(),
+        }
+    }
+
+    /// OWL-399: the drain's child is this binary, continuing the ticket with
+    /// the step's envelope as one argument.
+    #[test]
+    fn the_drains_child_continues_the_ticket_with_its_envelope() {
+        let text = envelope("OWL-1").render();
+        let command = step_command(
+            Path::new("/opt/owlshift"),
+            &TicketId::new("OWL-1").unwrap(),
+            &text,
+        );
+        assert_eq!(command.get_program(), "/opt/owlshift");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["continue", "OWL-1", "--step", text.as_str()]);
     }
 }

@@ -1125,6 +1125,29 @@ fn watch_drain_refuses_a_project_without_admitters_before_any_credential() {
     );
 }
 
+/// OWL-399: `continue --step`, the child of a step of `watch --drain`, is
+/// not shown in the help, and an envelope that does not read is refused
+/// before any project, configuration or credential is read.
+#[test]
+fn continue_hides_its_step_and_refuses_an_envelope_that_does_not_read() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let help = owlshift(dir.path(), config_dir.path(), &["continue", "--help"]);
+    assert!(help.status.success());
+    assert!(!stdout(&help).contains("--step"), "{}", stdout(&help));
+    let output = owlshift(
+        dir.path(),
+        config_dir.path(),
+        &["continue", "OWL-1", "--step", "{"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).starts_with("owlshift: the step's envelope: invalid step envelope"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// What `do` refuses before it opens the keychain.
 #[test]
 fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
