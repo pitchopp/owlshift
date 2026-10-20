@@ -413,8 +413,10 @@ struct Memory {
     /// a ticket whose ref came to hold a free slot.
     turn: Option<Turn<TicketId>>,
     /// What each ticket's last stage step left for its next one
-    /// ([`Stop::Stepped`]), while its ref holds the slot.
-    carried: HashMap<TicketId, Carried>,
+    /// ([`Stop::Stepped`]), while its ref holds the slot, with the ref's
+    /// progress then: a ref that made progress since, as a person's `do`
+    /// between two steps does, starts afresh (OWL-411).
+    carried: HashMap<TicketId, (Progress, Carried)>,
     /// The tickets told that they wait for the slot, with the holders told.
     slot_waits: HashMap<TicketId, Vec<TicketId>>,
     /// The tickets whose answer check watch ran into a stage that needs the
@@ -1706,7 +1708,14 @@ impl Watch<'_> {
             ("watch", json!("continue")),
             ("stage", json!(on_demand::stage_name(stage))),
         ]);
-        let carried = memory.carried.get(ticket).copied().unwrap_or_default();
+        // What the last step left stands only while the ref is where that
+        // step left it (OWL-411).
+        let carried = memory
+            .carried
+            .get(ticket)
+            .filter(|(left_at, _)| *left_at == seen.progress)
+            .map(|(_, carried)| *carried)
+            .unwrap_or_default();
         let Some(outcome) =
             on_demand.continue_shown(ticket, &seen.commit, shown, carried, decision, sink)
         else {
@@ -1779,7 +1788,7 @@ impl Watch<'_> {
     ) -> Option<Admit> {
         let moved = progress != Some(&seen.progress);
         // A stage step whose ref moved: its next step is due at once.
-        if keep_carried(&mut memory.carried, ticket, outcome, moved) {
+        if keep_carried(&mut memory.carried, ticket, outcome, progress, moved) {
             memory.stepped = true;
         }
         // A ref that holds the slot now takes a free turn, or waits for the
@@ -1940,17 +1949,23 @@ impl Watch<'_> {
 
 /// Keeps in `carried` what a stage step of `ticket` whose `outcome` is
 /// [`Stop::Stepped`] and whose ref `moved` left for its next step (OWL-367),
-/// and returns `true`; any other outcome drops what an earlier step left, as
-/// a person's `continue` starts afresh, and returns `false`.
+/// with the ref's `progress` after it (OWL-411; an unreadable ref keeps
+/// nothing), and returns `true`; any
+/// other outcome drops what an earlier step left, as a person's `continue`
+/// starts afresh, and returns `false`.
 fn keep_carried(
-    carried: &mut HashMap<TicketId, Carried>,
+    carried: &mut HashMap<TicketId, (Progress, Carried)>,
     ticket: &TicketId,
     outcome: &Result<Delivered, Stop>,
+    progress: Option<&Progress>,
     moved: bool,
 ) -> bool {
     match outcome {
         Err(Stop::Stepped { carried: left, .. }) if moved => {
-            carried.insert(ticket.clone(), *left);
+            match progress {
+                Some(progress) => carried.insert(ticket.clone(), (progress.clone(), *left)),
+                None => carried.remove(ticket),
+            };
             true
         }
         _ => {
@@ -2121,13 +2136,26 @@ mod tests {
             stage: Stage::Build,
             carried: left,
         });
+        let at = p("c2");
         let mut carried = HashMap::new();
-        assert!(keep_carried(&mut carried, &ticket, &step, true));
-        assert_eq!(carried.get(&ticket), Some(&left));
-        assert!(!keep_carried(&mut carried, &ticket, &step, false));
+        assert!(keep_carried(&mut carried, &ticket, &step, Some(&at), true));
+        assert_eq!(carried.get(&ticket), Some(&(at.clone(), left)));
+        assert!(!keep_carried(
+            &mut carried,
+            &ticket,
+            &step,
+            Some(&at),
+            false
+        ));
         assert!(carried.is_empty());
-        carried.insert(ticket.clone(), left);
-        assert!(!keep_carried(&mut carried, &ticket, &refused(), true));
+        carried.insert(ticket.clone(), (at.clone(), left));
+        assert!(!keep_carried(
+            &mut carried,
+            &ticket,
+            &refused(),
+            Some(&at),
+            true
+        ));
         assert!(carried.is_empty());
     }
 

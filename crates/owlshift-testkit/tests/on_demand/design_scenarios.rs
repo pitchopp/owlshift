@@ -2369,6 +2369,77 @@ fn a_stage_step_goes_on_from_the_chain_its_last_step_left() {
     );
 }
 
+/// OWL-411: the chain a stage step left is kept for the next step only while
+/// the ticket ref is where that step left it. Design settles a question with
+/// the resolver, which a project allowing one pass has spent, so the Build
+/// that follows sends its own question to the decider with no resolver run.
+/// A ref moved by another command after the Design step, as a `do` typed
+/// between two steps does, drops that chain: the step after the move starts
+/// afresh, so the Build that follows gets a fresh chain and the resolver
+/// settles its question.
+#[test]
+fn a_chain_is_not_carried_past_a_move_of_the_ticket_ref() {
+    let run = |typed: bool| {
+        let bench = answered_design();
+        bench.policy("resolver_passes = 1");
+        let before = bench.roles().len();
+        let mut replies = vec![
+            bench.read(&check(&[("Q1", "answered", "Markdown.")])),
+            bench.read(NAMING),
+            bench.read(DECIDED_Q1),
+            bench.read(&designed(PLAN)),
+            bench.read(&reviewed(&[])),
+            bench.read(&reviewed(&[])),
+            bench.read(NAMING),
+        ];
+        if typed {
+            replies.extend([bench.read(DECIDED_Q1), bench.built()]);
+        }
+        let mut moved = false;
+        let (outcomes, lines, printed) = bench.watch_passes(replies, &mut |interval| {
+            // After the Design step, which left its chain.
+            if typed && !moved && bench.state().0 == Status::Active(Stage::DesignReview) {
+                moved = true;
+                let mut record = bench.record();
+                record
+                    .plan
+                    .as_mut()
+                    .unwrap()
+                    .plan
+                    .approach
+                    .push_str(" Edited.");
+                bench.write_record(&record);
+            }
+            interval.is_zero()
+        });
+        (bench, before, outcomes, lines, printed)
+    };
+    let resolvers = |bench: &Bench, before: usize| {
+        let ran = bench.roles()[before..].to_vec();
+        (
+            ran.iter().filter(|role| **role == Role::Resolver).count(),
+            ran,
+        )
+    };
+
+    let (bench, before, outcomes, lines, printed) = run(false);
+    let stop = outcomes.last().expect("a Build step");
+    assert!(
+        matches!(stop, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let (settled, ran) = resolvers(&bench, before);
+    assert_eq!(settled, 1, "{ran:?}");
+
+    let (bench, before, outcomes, lines, printed) = run(true);
+    assert!(
+        matches!(outcomes.last(), Some(Ok(_))),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let (settled, ran) = resolvers(&bench, before);
+    assert_eq!(settled, 2, "{ran:?}");
+}
+
 /// OWL-367: the move to working after a RESUME fails once. The answer
 /// check's step ends there, the ticket shown needs input with its ref at
 /// Design; the next pass, at once, moves it to working, since this watch ran
