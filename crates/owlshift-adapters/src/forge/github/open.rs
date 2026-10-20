@@ -89,9 +89,8 @@ impl GitHubForge {
         let mut pages = 0u64;
         loop {
             pages += 1;
-            let mut answer = self.rest(&format!(
-                "{base}/files?per_page={MAX_PAGE}&page={pages}"
-            ))?;
+            let mut answer =
+                self.rest(&format!("{base}/files?per_page={MAX_PAGE}&page={pages}"))?;
             let mut body = Vec::new();
             (&mut answer.body)
                 .take(MAX_FILES_PAGE_BYTES + 1)
@@ -100,9 +99,8 @@ impl GitHubForge {
             if body.len() as u64 > MAX_FILES_PAGE_BYTES {
                 return Ok(PullFiles::Whole);
             }
-            let files: Vec<RestFile> = serde_json::from_slice(&body).map_err(|_| {
-                invalid(format!("unexpected answer for the files of #{number}"))
-            })?;
+            let files: Vec<RestFile> = serde_json::from_slice(&body)
+                .map_err(|_| invalid(format!("unexpected answer for the files of #{number}")))?;
             let full = files.len() as u64 == u64::from(MAX_PAGE);
             entries += files.len() as u64;
             for file in files {
@@ -134,8 +132,12 @@ impl GitHubForge {
             .take(MAX_REST_BYTES)
             .read_to_string(&mut body)
             .map_err(|_| invalid(format!("reading #{} failed", pull.number)))?;
-        let read: RestPull = serde_json::from_str(&body)
-            .map_err(|_| invalid(format!("unexpected answer for #{} from GitHub", pull.number)))?;
+        let read: RestPull = serde_json::from_str(&body).map_err(|_| {
+            invalid(format!(
+                "unexpected answer for #{} from GitHub",
+                pull.number
+            ))
+        })?;
         if read.head.sha != pull.head.as_str()
             || read.base.sha != pull.base.as_str()
             || read.base.branch != pull.base_branch
@@ -282,7 +284,7 @@ mod tests {
     }
 
     fn node(number: u64, files: u64) -> Value {
-        json!({ "number": number, "isDraft": number % 2 == 0, "changedFiles": files,
+        json!({ "number": number, "isDraft": number.is_multiple_of(2), "changedFiles": files,
                 "headRefName": format!("topic-{number}"), "headRefOid": sha('a'),
                 "baseRefName": "main", "baseRefOid": sha('b') })
     }
@@ -374,7 +376,11 @@ mod tests {
         assert_eq!(short.kind, ErrorKind::HeadMoved);
         let refused = forge(
             vec![],
-            vec![(files_path(1), 403, r#"{"message":"Resource not accessible"}"#.to_owned())],
+            vec![(
+                files_path(1),
+                403,
+                r#"{"message":"Resource not accessible"}"#.to_owned(),
+            )],
         )
         .pull_request_files(&pull(1))
         .unwrap_err();

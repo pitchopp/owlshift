@@ -256,7 +256,9 @@ impl Outside {
             holders
                 .kinds
                 .insert(id.clone(), Kind::PullRequest(pull.number));
-            holders.others.push(outside(id, files_held(&pull.files, named)));
+            holders
+                .others
+                .push(outside(id, files_held(&pull.files, named)));
         }
         for ticket in &self.working {
             let id = ticket.id.as_str();
@@ -474,10 +476,7 @@ mod tests {
         );
         assert_eq!(holders.unknown, [id("DEMO-22"), id("DEMO-6")]);
         assert!(holders.others.iter().all(|entry| entry.delivered));
-        assert_eq!(
-            holders.named("#7").to_string(),
-            "pull request #7",
-        );
+        assert_eq!(holders.named("#7").to_string(), "pull request #7",);
         assert_eq!(
             holders.named("DEMO-20").data(),
             [("tickets", json!(["DEMO-20"])), ("person", json!(true))]
@@ -507,10 +506,7 @@ mod tests {
     }
 
     impl owlshift_adapters::graphql::Transport for Forge {
-        fn send(
-            &self,
-            _request: &Value,
-        ) -> Result<owlshift_adapters::graphql::Response, String> {
+        fn send(&self, _request: &Value) -> Result<owlshift_adapters::graphql::Response, String> {
             let nodes: Vec<Value> = self
                 .pulls
                 .lock()
@@ -569,7 +565,11 @@ mod tests {
         {
             unreachable!()
         }
-        fn set_stage(&self, _: &TicketId, _: &str) -> Result<(), owlshift_adapters::tracker::Error> {
+        fn set_stage(
+            &self,
+            _: &TicketId,
+            _: &str,
+        ) -> Result<(), owlshift_adapters::tracker::Error> {
             unreachable!()
         }
         fn working(
@@ -613,10 +613,7 @@ mod tests {
         let tracker = Working(Some(vec![person("DEMO-9", &["zone:app"])]));
         let mut cache = PullCache::default();
         let first = read(&forge, &tracker, &config, &mut cache).unwrap();
-        assert_eq!(
-            first.pulls,
-            [pull(7, "topic", &["app/x.rs"])],
-        );
+        assert_eq!(first.pulls, [pull(7, "topic", &["app/x.rs"])],);
         assert_eq!(first.working.len(), 1);
         read(&forge, &tracker, &config, &mut cache).unwrap();
         assert_eq!(*reads.lock().unwrap(), 1);
@@ -624,10 +621,18 @@ mod tests {
         read(&forge, &tracker, &config, &mut cache).unwrap();
         assert_eq!(*reads.lock().unwrap(), 2);
         pulls.lock().unwrap().clear();
-        assert!(read(&forge, &tracker, &config, &mut cache).unwrap().pulls.is_empty());
+        assert!(
+            read(&forge, &tracker, &config, &mut cache)
+                .unwrap()
+                .pulls
+                .is_empty()
+        );
         assert!(cache.0.is_empty());
         let error = read(&forge, &Working(None), &config, &mut cache).unwrap_err();
-        assert!(error.contains("working state could not be read: down"), "{error}");
+        assert!(
+            error.contains("working state could not be read: down"),
+            "{error}"
+        );
     }
 
     #[test]

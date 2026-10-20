@@ -78,20 +78,14 @@ impl Watch<'_> {
                 if kept.told.as_ref() != Some(&reason) {
                     self.line(
                         out,
-                        &format!(
-                            "nothing that would touch work in flight starts while {reason}"
-                        ),
+                        &format!("nothing that would touch work in flight starts while {reason}"),
                     );
                     kept.told = Some(reason.clone());
                 }
                 return Err(reason);
             }
         };
-        let named = on_demand
-            .config
-            .stack
-            .named_resources()
-            .unwrap_or_default();
+        let named = on_demand.config.stack.named_resources().unwrap_or_default();
         let holders = outside.holders(refs, &named);
         if kept.told.take().is_some() {
             self.line(out, "the work in flight outside Owlshift reads again");

@@ -94,6 +94,39 @@ impl Bench {
         self.github.followed.lock().unwrap().state = "OPEN";
     }
 
+    /// [`Self::drain_passes`], with what happens while given runs work.
+    fn drain_during(
+        &self,
+        replies: Vec<Reply>,
+        during: Vec<During>,
+        passes: usize,
+        mut between: impl FnMut(usize),
+    ) -> (Vec<Result<Delivered, Stop>>, String, String) {
+        let mut done = 0;
+        let ((outcomes, lines), printed) =
+            self.with_on_demand(replies, None, during, |on_demand, sink| {
+                let (mut outcomes, mut lines) = (Vec::new(), Vec::new());
+                let watch = Watch {
+                    on_demand,
+                    interval: POLL_INTERVAL,
+                };
+                watch.run_drain(
+                    sink,
+                    &mut lines,
+                    &mut |_, outcome, _| outcomes.push(outcome.clone()),
+                    &mut |_| {
+                        done += 1;
+                        if done < passes {
+                            between(done);
+                        }
+                        done < passes
+                    },
+                );
+                (outcomes, String::from_utf8(lines).unwrap())
+            });
+        (outcomes, lines, printed)
+    }
+
     /// Each run's role and ticket, oldest first.
     fn runs(&self) -> Vec<(Role, String)> {
         self.briefs()
@@ -877,6 +910,201 @@ fn scenario_s5_collisions_between_owlshifts_tickets() {
     assert!(
         first.dispatched_at < kept.dispatched_at,
         "{first:?} {kept:?}"
+    );
+}
+
+/// The `drain` = `waits` decisions of `events` for a collision: each
+/// ticket, the event's holder fields and the resource.
+fn collisions_with(events: &[Event]) -> Vec<(String, Value, Value)> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("waits")))
+        .filter(|e| e.data["reason"] == json!("collision"))
+        .map(|e| {
+            let holder = ["tickets", "person", "pull_request"]
+                .into_iter()
+                .filter_map(|key| e.data.get(key).map(|value| (key.to_owned(), value.clone())))
+                .collect::<serde_json::Map<_, _>>();
+            (
+                e.ticket.as_ref().unwrap().as_str().to_owned(),
+                Value::Object(holder),
+                e.data["resource"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// Scenario S5, "Collision with work in flight", its parts for a pull
+/// request and a person's ticket (OWL-410). DEMO-1 declares `app`. A
+/// person's pull request #7 changes `app/x.md`, and DEMO-9, which a person
+/// works on, carries `zone:app`: DEMO-1 waits for the pull request, then,
+/// once it is closed, for DEMO-9, then, once DEMO-9 left the working state,
+/// is dispatched and delivered. DEMO-8, worked on with neither a pull
+/// request nor a `zone:` label, is not counted, and told once.
+#[test]
+fn scenario_s5_a_persons_pull_request_and_ticket() {
+    let bench = Bench::draining("maintainer");
+    bench.put_ticket(
+        "DEMO-9",
+        "maintainer",
+        "In Progress",
+        &["zone:app"],
+        "",
+        "By hand.",
+    );
+    bench.put_ticket(
+        "DEMO-8",
+        "maintainer",
+        "In Progress",
+        &[],
+        "",
+        "By hand too.",
+    );
+    bench.github.others.lock().unwrap().push((
+        7,
+        "someone/topic".to_owned(),
+        vec!["app/x.md".to_owned()],
+    ));
+    let replies = vec![
+        bench.reply(None, Some(&intake_declaring(&["app"], &[]))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let (closed, left) = (Cell::new(false), Cell::new(false));
+    let (outcomes, lines, printed) = bench.drain_during(replies, Vec::new(), 8, |_| {
+        let told = collisions_with(&bench.events());
+        if !closed.get()
+            && told
+                .iter()
+                .any(|(_, holder, _)| holder["pull_request"] == 7)
+        {
+            bench.github.others.lock().unwrap().clear();
+            closed.set(true);
+        }
+        if !left.get()
+            && told
+                .iter()
+                .any(|(_, holder, _)| holder["tickets"] == json!(["DEMO-9"]))
+        {
+            bench.put_ticket(
+                "DEMO-9",
+                "maintainer",
+                "Done",
+                &["zone:app"],
+                "",
+                "By hand.",
+            );
+            left.set(true);
+        }
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let events = bench.events();
+    assert_eq!(
+        collisions_with(&events),
+        [
+            (
+                TICKET.to_owned(),
+                json!({ "pull_request": 7 }),
+                json!({ "zone": "app/x.md" })
+            ),
+            (
+                TICKET.to_owned(),
+                json!({ "tickets": ["DEMO-9"], "person": true }),
+                json!({ "zone": "app" })
+            ),
+        ],
+        "{report}"
+    );
+    assert!(
+        lines.contains("DEMO-1 waits: pull request #7 holds zone `app/x.md`"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("DEMO-1 waits: DEMO-9, which a person works on, holds zone `app`"),
+        "{lines}"
+    );
+    let unknown: Vec<&str> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("zones_unknown"))
+        .map(|e| e.ticket.as_ref().unwrap().as_str())
+        .collect();
+    assert_eq!(unknown, ["DEMO-8"], "{report}");
+    assert_eq!(dispatched(&events), [TICKET], "{report}");
+    let record = bench.record_of(TICKET).unwrap();
+    assert!(
+        record.delivery.is_some_and(|delivery| delivery.followed()),
+        "{report}"
+    );
+}
+
+/// A pass whose read of the work in flight outside Owlshift fails starts
+/// nothing that the collision rule checks (OWL-410). The listing of the
+/// open pull requests fails once as DEMO-1 is ready: it waits, then is
+/// dispatched. A pull request's files fail to read while its Build works:
+/// its delivery is held at Verify, its verified commit kept. The next
+/// listing fails too: its stage step waits. Once the reads answer, it
+/// delivers the verified commit with no second Verify pass.
+#[test]
+fn an_unread_in_flight_set_holds_dispatches_stage_steps_and_deliveries() {
+    let bench = Bench::draining("maintainer");
+    bench.github.others.lock().unwrap().push((
+        7,
+        "someone/docs".to_owned(),
+        vec!["docs/z.md".to_owned()],
+    ));
+    let replies = vec![
+        bench.reply(None, Some(&intake_declaring(&["app"], &[]))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let github = bench.github.clone();
+    let during: Vec<During> = vec![(2, Box::new(move || *github.fail_files.lock().unwrap() = 1))];
+    let (listing, stepping) = (Cell::new(false), Cell::new(false));
+    let (outcomes, lines, printed) = bench.drain_during(replies, during, 8, |pass| {
+        if pass == 1 && !listing.get() {
+            *bench.github.fail_pulls.lock().unwrap() = 1;
+            listing.set(true);
+        }
+        let held = bench
+            .events()
+            .iter()
+            .any(|e| e.data.get("delivery") == Some(&json!("held")));
+        if held && !stepping.get() {
+            *bench.github.fail_pulls.lock().unwrap() = 1;
+            stepping.set(true);
+        }
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let events = bench.events();
+    let unread = |key: &str| {
+        events
+            .iter()
+            .filter(|e| e.data.get(key).is_some())
+            .filter(|e| e.data.get("reason") == Some(&json!("in_flight_unread")))
+            .count()
+    };
+    assert_eq!(
+        (unread("drain"), unread("delivery"), unread("watch")),
+        (1, 1, 1),
+        "{report}"
+    );
+    assert!(
+        lines.contains("nothing that would touch work in flight starts while the open pull requests could not be read"),
+        "{lines}"
+    );
+    let held = events
+        .iter()
+        .find(|e| e.data.get("delivery") == Some(&json!("held")))
+        .unwrap();
+    assert!(held.data.get("tickets").is_none(), "{held:?}");
+    let verifies = bench
+        .runs()
+        .iter()
+        .filter(|(role, _)| *role == Role::Verify)
+        .count();
+    assert_eq!(verifies, 1, "{report}");
+    let record = bench.record_of(TICKET).unwrap();
+    assert!(
+        record.delivery.is_some_and(|delivery| delivery.followed()),
+        "{report}"
     );
 }
 
