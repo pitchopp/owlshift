@@ -113,6 +113,9 @@ pub const COST_FORMAT: u32 = 1;
 /// The format version of the session of a ticket's latest asking run
 /// (`session.json` on a ticket ref, OWL-394).
 pub const SESSION_FORMAT: u32 = 1;
+/// The format version of what a ticket holds against the project's other
+/// tickets (`held.json` on a ticket ref, OWL-403).
+pub const HELD_FORMAT: u32 = 1;
 /// The format version of a step's envelope, the hidden argument of the
 /// child `owlshift continue` (OWL-399).
 pub const STEP_ENVELOPE_FORMAT: u32 = 1;

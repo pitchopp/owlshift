@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket held",
+  "description": "What a ticket holds against the project's other tickets, in\n[`HELD_FILE`] (OWL-403, architecture section 5, \"What a ticket holds\"):\nwritten at its dispatch, widened by the files its branch changes, and\nnever narrowed while the ticket holds anything, from its dispatch until\nits pull request ends. A ticket dispatched before it was kept has none and\nholds the whole repository. Not in `intake.json`, which belongs to the\nticket's text and is replaced by the next intake.",
+  "type": "object",
+  "properties": {
+    "delivered_at": {
+      "description": "When its pull request was opened.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "dispatched_at": {
+      "description": "When it was dispatched; none for a ticket dispatched before\n`held.json` was kept, which came before any other.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "files": {
+      "description": "The files its branch changed against its merge-base with the base,\na rename's two paths both, each once, sorted: a file holds itself,\nnever its folder. None while it holds the whole repository.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "resources": {
+      "description": "The named resources declared at its dispatch, by name: those its\nfiles match are not kept, each check reaching them from the\nproject's list.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "verified": {
+      "description": "The commit, a full id, whose Verify pass passed and whose delivery a\ncollision held back: its next step delivers that commit with no\nVerify pass while the branch is still there. Cleared by the delivery\nand by a new dispatch.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "widened_at": {
+      "description": "When widenings added files, oldest first, the latest\n[`MAX_WIDENINGS`].",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "date-time"
+      }
+    },
+    "zones": {
+      "description": "The zones declared at its dispatch, intake's and its `zone:` labels',\nas written; none: the whole repository.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ]
+}

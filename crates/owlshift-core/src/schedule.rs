@@ -1,10 +1,13 @@
 //! The scheduler: which admitted ticket of the ready column the drain
 //! dispatches now, and why each other one waits (architecture, section 5,
-//! "The drain"). Resource collisions come with parallelism (P6).
+//! "The drain"). A ticket that would touch what one in flight holds waits
+//! (OWL-403, [`collision`](crate::collision)).
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
+use crate::collision::{Collision, Dispatched, InFlight, collision};
+use crate::resource::Resource;
 use crate::state::{Status, TicketState};
 use crate::ticket::{Admission, Blocker, BlockerState, Ticket};
 use crate::vocab::Stage;
@@ -31,6 +34,10 @@ pub struct Load<K> {
     /// ([`holds_slot_or_unknown`]), in any order. [`ready_set`] adds those
     /// of the tickets it is given whose state holds it, once each.
     pub slot_held_by: Vec<K>,
+    /// The project's Owlshift tickets from their dispatch until their pull
+    /// request ends, with what each holds (OWL-403): a ticket a dispatch
+    /// would make collide with one waits.
+    pub in_flight: Vec<InFlight<K>>,
 }
 
 impl<K> Default for Load<K> {
@@ -39,6 +46,7 @@ impl<K> Default for Load<K> {
             runs: 0,
             open_prs: 0,
             slot_held_by: Vec::new(),
+            in_flight: Vec::new(),
         }
     }
 }
@@ -78,6 +86,9 @@ pub enum Wait<K> {
     /// These tickets of the project hold the one slot, in identifier order,
     /// or this one takes it in this pass (OWL-291).
     Slot(Vec<K>),
+    /// What the ticket would hold conflicts with what a ticket in flight
+    /// holds (OWL-403): the holder and its resource.
+    Collision(Collision<K>),
     /// Every run slot of this machine is taken.
     RunCap,
 }
@@ -100,19 +111,30 @@ impl<K> Wait<K> {
             Wait::BlockedBy(_) => "blocked_by",
             Wait::PrCap => "pr_cap",
             Wait::Slot(_) => "slot",
+            Wait::Collision(_) => "collision",
             Wait::RunCap => "run_cap",
         }
     }
 
-    /// The tickets the reason names: the blockers that hold the ticket, or
-    /// the tickets that hold the slot; none for any other reason.
+    /// The tickets the reason names: the blockers that hold the ticket, the
+    /// tickets that hold the slot, or the holder it collides with; none for
+    /// any other reason.
     pub fn tickets(&self) -> &[K] {
         match self {
             Wait::BlockerCanceled(ids)
             | Wait::BlockerUnknown(ids)
             | Wait::BlockedBy(ids)
             | Wait::Slot(ids) => ids,
+            Wait::Collision(collision) => std::slice::from_ref(&collision.holder),
             _ => &[],
+        }
+    }
+
+    /// The resource a collision names; none for any other reason.
+    pub fn resource(&self) -> Option<&Resource> {
+        match self {
+            Wait::Collision(collision) => Some(&collision.resource),
+            _ => None,
         }
     }
 }
@@ -292,7 +314,9 @@ fn dispatchable<K>(ticket: &Ticket<K>) -> bool {
 /// admitted and not excluded, has a decider, its intake record holds its
 /// current text, its ref is at Ready (or at Watch with its following ended),
 /// every blocker but itself released it, the open pull requests are under their cap, the
-/// slot is free and this machine has a run free.
+/// slot is free, what it would hold (its `resources`) conflicts with nothing a
+/// ticket of `load.in_flight` holds ([`collision`], as a ticket dispatched
+/// now) and this machine has a run free.
 pub fn ready_set<K: Clone + Ord + AsRef<str>>(
     tickets: &[Ticket<K>],
     caps: Caps,
@@ -308,9 +332,10 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
 
     let pr_cap_reached = caps.open_prs.is_some_and(|cap| load.open_prs >= cap);
     // What holds back a ticket that passed every other check: the slot, then
-    // this machine's runs. Once one ticket is dispatched, the slot is taken.
-    // The holders the load names and those of the tickets given, which a
-    // caller may name in both.
+    // a collision, then this machine's runs. Once one ticket is dispatched,
+    // the slot is taken. The holders the load names and those of the
+    // tickets given, which a caller may name in both.
+    let in_flight = load.in_flight;
     let mut holders = load.slot_held_by;
     holders.extend(
         tickets
@@ -320,13 +345,8 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
     );
     holders.sort_by(|a, b| natural_cmp(a.as_ref(), b.as_ref()).then_with(|| a.cmp(b)));
     holders.dedup();
-    let mut capacity = if !holders.is_empty() {
-        Some(Wait::Slot(holders))
-    } else if load.runs >= caps.concurrent_runs {
-        Some(Wait::RunCap)
-    } else {
-        None
-    };
+    let mut slot = (!holders.is_empty()).then_some(holders);
+    let run_cap = load.runs >= caps.concurrent_runs;
     let mut seen = BTreeSet::new();
     let mut ready = ReadySet {
         dispatch: None,
@@ -358,14 +378,28 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
                 Some(Wait::BlockedBy(held.open))
             } else if pr_cap_reached {
                 Some(Wait::PrCap)
+            } else if let Some(ids) = &slot {
+                Some(Wait::Slot(ids.clone()))
+            } else if let Some(found) = collision(
+                &InFlight {
+                    id: ticket.id.clone(),
+                    dispatched: Dispatched::Now,
+                    delivered: false,
+                    held: ticket.resources.clone(),
+                },
+                &in_flight,
+            ) {
+                Some(Wait::Collision(found))
+            } else if run_cap {
+                Some(Wait::RunCap)
             } else {
-                capacity.clone()
+                None
             }
         };
         match wait {
             Some(wait) => ready.waiting.push((ticket.id.clone(), wait)),
             None => {
-                capacity = Some(Wait::Slot(vec![ticket.id.clone()]));
+                slot = Some(vec![ticket.id.clone()]);
                 ready.dispatch = Some(ticket.id.clone());
             }
         }
@@ -386,6 +420,7 @@ mod tests {
         runs: 0,
         open_prs: 0,
         slot_held_by: Vec::new(),
+        in_flight: Vec::new(),
     };
 
     fn restore(status: Status, round: u32) -> TicketState {
@@ -522,6 +557,7 @@ mod tests {
                 runs: 1,
                 open_prs: 2,
                 slot_held_by: vec!["Z-1"],
+                in_flight: Vec::new(),
             },
         );
         assert_eq!(ready.dispatch, None);
@@ -819,6 +855,49 @@ mod tests {
             (open.key(), open.tickets()),
             ("blocked_by", &["X-1", "X-2"][..])
         );
+    }
+
+    /// OWL-403: a ticket whose resources conflict with a ticket in flight
+    /// waits, after the slot and before this machine's runs, and the next
+    /// one goes.
+    #[test]
+    fn a_collision_holds_a_ticket_once_the_slot_is_free_and_the_next_goes() {
+        let zone = |path: &str| Resource::Zone(path.to_owned());
+        let mut app = ticket("A-1", Priority::High);
+        app.resources = vec![zone("app")];
+        let mut docs = ticket("A-2", Priority::Low);
+        docs.resources = vec![zone("docs")];
+        let waiting = InFlight {
+            id: "W-1",
+            dispatched: Dispatched::At(5),
+            delivered: false,
+            held: vec![zone("app/x.rs")],
+        };
+        let load = || Load {
+            in_flight: vec![waiting.clone()],
+            ..IDLE
+        };
+        let ready = ready_set(&[app.clone(), docs.clone()], ROOMY, load());
+        assert_eq!(ready.dispatch, Some("A-2"));
+        let collided = Wait::Collision(Collision {
+            holder: "W-1",
+            resource: zone("app/x.rs"),
+        });
+        assert_eq!(ready.waiting, [("A-1", collided.clone())]);
+        assert_eq!(
+            (collided.key(), collided.tickets(), collided.resource()),
+            ("collision", &["W-1"][..], Some(&zone("app/x.rs")))
+        );
+        // A held slot comes first; a full machine after.
+        let held = Load {
+            slot_held_by: vec!["X-1"],
+            ..load()
+        };
+        let ready = ready_set(std::slice::from_ref(&app), ROOMY, held);
+        assert_eq!(ready.waiting, [("A-1", Wait::Slot(vec!["X-1"]))]);
+        let full = Load { runs: 10, ..load() };
+        let ready = ready_set(&[app, docs], ROOMY, full);
+        assert_eq!(ready.waiting, [("A-1", collided), ("A-2", Wait::RunCap)]);
     }
 
     #[test]

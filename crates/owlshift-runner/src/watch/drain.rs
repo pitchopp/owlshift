@@ -43,6 +43,7 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::EndedWhy;
 use owlshift_contracts::step::{StepEnd, StepKind};
+use owlshift_core::resource::{self, Held as HeldSet, NamedResources};
 use owlshift_core::schedule::{self, Caps, Load, Wait, natural_cmp};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::ticket::{Admission, Blocker, BlockerState, Ticket, text_blockers};
@@ -50,6 +51,7 @@ use owlshift_core::vocab::Stage;
 
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Watch};
 use crate::events::{EventSink, data};
+use crate::held;
 use crate::on_demand::{self, delivery_followed};
 use crate::quarantine::Held;
 use crate::ticket_ref::{self, RefAt, Stored, text_sha256};
@@ -241,6 +243,10 @@ fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
             "the project's slot is held by {} (`owlshift doctor` says how to clear a stale one)",
             list(ids)
         ),
+        Wait::Collision(found) => format!(
+            "{} holds {}, which it would touch: it goes once {} no longer holds it",
+            found.holder, found.resource, found.holder
+        ),
         Wait::RunCap => "every run of this machine is taken".to_owned(),
     }
 }
@@ -348,11 +354,14 @@ impl Watch<'_> {
             }
         };
         let exclude = tracker.exclude.as_deref();
+        // The project's named resources, by which a zone or a file holds
+        // one (OWL-403), from the project file watch loaded.
+        let named = on_demand.config.stack.named_resources().unwrap_or_default();
         let mut reads = HashMap::new();
         let tickets: Vec<Ticket<String>> = rows
             .iter()
             .filter(|row| Some(row.id()) != taken.as_ref() && row.state.is_some())
-            .map(|row| self.core_ticket(memory, row, &refs, exclude, &mut reads))
+            .map(|row| self.core_ticket(memory, row, &refs, exclude, &named, &mut reads))
             .collect();
         // The slot's holders, named in the reasons (OWL-291): every ref read
         // that holds it, and every ref that could not be read, which stops
@@ -377,6 +386,13 @@ impl Watch<'_> {
                 .count(),
         )
         .unwrap_or(u32::MAX);
+        // What the project's tickets hold from their dispatch until their
+        // pull request ends (OWL-403); an unread ref stops every dispatch.
+        let in_flight = refs
+            .iter()
+            .filter(|(_, stored)| held::holds(stored))
+            .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
+            .collect();
         let ready = schedule::ready_set(
             &tickets,
             Caps {
@@ -387,6 +403,7 @@ impl Watch<'_> {
                 runs: 0,
                 open_prs,
                 slot_held_by,
+                in_flight,
             },
         );
         // A pass with an unread ref counts short: it neither re-arms nor
@@ -406,13 +423,16 @@ impl Watch<'_> {
             let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
                 continue;
             };
-            let told = format!("{}{:?}", wait.key(), wait.tickets());
+            let told = format!("{}{:?}{:?}", wait.key(), wait.tickets(), wait.resource());
             if memory.drain.waits.get(row.id()) == Some(&told) {
                 continue;
             }
             let mut event = data([("drain", json!("waits")), ("reason", json!(wait.key()))]);
             if !wait.tickets().is_empty() {
                 event.insert("tickets".to_owned(), json!(wait.tickets()));
+            }
+            if let Some(resource) = wait.resource() {
+                event.insert("resource".to_owned(), held::resource_data(resource));
             }
             sink.emit(row.id(), None, EventKind::Decision, event);
             self.line(out, &format!("{} waits: {}", row.id(), said(wait, exclude)));
@@ -638,16 +658,18 @@ impl Watch<'_> {
     }
 
     /// The core's view of a row: its admission, decider, text and intake,
-    /// state and blockers. The blockers are read only for a ticket whose
-    /// intake record holds its current text, the only one the core reads
-    /// them of; each "Blocked by" identifier not among its relations is read
-    /// on the tracker, once a pass (`reads`).
+    /// what a dispatch would make it hold, state and blockers. The blockers
+    /// are read only for a ticket whose intake record holds its current
+    /// text, the only one the core reads them of; each "Blocked by"
+    /// identifier not among its relations is read on the tracker, once a
+    /// pass (`reads`).
     fn core_ticket(
         &self,
         memory: &WatchMemory,
         row: &Row,
         refs: &HashMap<TicketId, Stored>,
         exclude: Option<&str>,
+        named: &NamedResources,
         reads: &mut HashMap<String, BlockerState>,
     ) -> Ticket<String> {
         let record = row
@@ -696,7 +718,19 @@ impl Watch<'_> {
             intake_hash: row.intake_hash().map(ToOwned::to_owned),
             blocked_by,
             variant: record.map_or(Variant::Standard, |record| record.variant),
-            resources: Vec::new(),
+            // What its dispatch would hold (OWL-403): the whole repository
+            // without a record.
+            resources: {
+                let HeldSet { zones, resources } = record.map_or_else(HeldSet::default, |record| {
+                    on_demand::held_named(
+                        &row.listed.ticket,
+                        &record.zones,
+                        &record.resources,
+                        named,
+                    )
+                });
+                resource::closed(&zones, &[], &resources, named)
+            },
             state: row.state.unwrap_or_else(TicketState::admitted),
             delivery_followed: row.followed(),
         }

@@ -1180,6 +1180,7 @@ mod tests {
             review: None,
             cost: None,
             session: None,
+            held: None,
         }
     }
 

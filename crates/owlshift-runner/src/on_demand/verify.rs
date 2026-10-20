@@ -110,6 +110,32 @@ pub(crate) fn last_fix_done(state: &TicketState, review: Option<&TicketReview>) 
             .is_some_and(|pass| pass.get() == state.review_passes())
 }
 
+/// Whether the Verify pass of the ticket at Verify in `state` already passed
+/// on `commit`, its delivery held back by a collision (OWL-403, `held`'s
+/// mark): `review`'s last Verify pass is the one due, on that commit, and
+/// the mark names it. Its delivery then follows with no Verify pass;
+/// `continue` checked before that the branch is still there
+/// ([`OnDemand::verify_resumable`]).
+pub(crate) fn delivery_held(
+    state: &TicketState,
+    held: Option<&TicketHeld>,
+    review: Option<&TicketReview>,
+    commit: &str,
+) -> bool {
+    state.status() == Status::Active(Stage::Verify)
+        && held.and_then(|held| held.verified.as_deref()) == Some(commit)
+        && review
+            .and_then(|review| {
+                review
+                    .passes
+                    .iter()
+                    .rfind(|pass| pass.stage == Stage::Verify)
+            })
+            .is_some_and(|last| {
+                last.pass.get() == state.review_pass_due() && last.head.as_deref() == Some(commit)
+            })
+}
+
 /// The follow-ups of the findings a Verify pass proposed, before OWL-377
 /// (architecture section 5, "Verify", The residue): each with the reviewer
 /// as its source,
@@ -406,6 +432,21 @@ impl OnDemand<'_> {
                     ("stage", json!("verify")),
                     ("pass", json!(state.review_passes())),
                     ("fixed", given),
+                    ("next", json!("deliver")),
+                ]),
+            );
+            return Ok(Verified::Passed(state));
+        }
+        if delivery_held(&state, p.held.as_ref(), p.review.as_ref(), &built.commit) {
+            sink.emit(
+                &ticket,
+                None,
+                EventKind::Decision,
+                data([
+                    ("review", json!("verified")),
+                    ("stage", json!("verify")),
+                    ("pass", json!(state.review_pass_due())),
+                    ("commit", json!(built.commit)),
                     ("next", json!("deliver")),
                 ]),
             );

@@ -1625,7 +1625,9 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
             TrackerWrite,
             RunStarted,
             RunEnded,
-            // The Verify pass: its one critic, then the pass (OWL-304).
+            // The Verify pass: its one critic, then the pass (OWL-304). No
+            // widening: dispatched with no intake, the ticket holds the whole
+            // repository (OWL-403).
             RunStarted,
             RunEnded,
             Decision,
