@@ -294,6 +294,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
     checks.extend(codex_reviewer_check(system, config));
+    checks.extend(review_fallback_check(system, config));
     checks.extend(budget_check(config));
     checks.extend(drain_slot_check(system, config));
     checks.extend(quarantine_check(system, config, home));
@@ -818,7 +819,8 @@ fn required_harnesses(config: &Effective) -> Vec<Harness> {
     let codex = matches!(
         &config.personal,
         FileState::Loaded { config, .. } if config.harnesses.codex.is_some()
-    ) || codex_reviewer_asked(config);
+    ) || codex_reviewer_asked(config)
+        || review_fallback(config).is_some();
     let mut harnesses = vec![Harness::Claude];
     if codex {
         harnesses.push(Harness::Codex);
@@ -836,7 +838,9 @@ fn harness_why(harness: Harness) -> &'static str {
         Harness::Codex => {
             "No role needs Codex: every agent runs in Claude Code. With \
              `pipeline.codex_reviewer` on, each review pass adds a Codex reviewer while Codex \
-             is ready, and runs without it otherwise."
+             is ready, and runs without it otherwise. A `fallback = \"codex\"` under \
+             `[harnesses.claude]` runs the review roles on it while Claude Code is at its usage \
+             limit."
         }
     }
 }
@@ -1335,6 +1339,56 @@ fn codex_reviewer_check(system: &dyn System, config: &Effective) -> Option<Check
             format!(
                 "{DOES_NOT_BLOCK} each review pass runs with its Claude Code reviewers alone \
                  and says so on the ticket. The `codex` lines say how to get Codex ready."
+            ),
+        ),
+    })
+}
+
+/// The harness the personal file names as Claude Code's fallback
+/// (`[harnesses.claude].fallback`), if any (OWL-406).
+fn review_fallback(config: &Effective) -> Option<Harness> {
+    match &config.personal {
+        FileState::Loaded { config, .. } => config
+            .harnesses
+            .claude
+            .as_ref()
+            .and_then(|claude| claude.fallback),
+        _ => None,
+    }
+}
+
+/// The fallback of `[harnesses.claude]` (OWL-406): which roles it serves,
+/// the review roles alone, and whether it can serve here, by the check each
+/// command makes at its start. A warning when it cannot: the review then
+/// waits for Claude Code's reset like any other run. None when the personal
+/// file names none.
+fn review_fallback_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "review fallback";
+    let fallback = review_fallback(config)?;
+    let name = harness_name(fallback);
+    let scope = "used by the review roles only: Design review's and Verify's reviewers run on it \
+                 while Claude Code is at its usage limit; the authoring roles, the arbiter, the \
+                 resolver, intake and the answer check wait for the reset";
+    let ready = match fallback {
+        Harness::Codex => codex_machine::critic_readiness(
+            system.locate("codex"),
+            system.codex_login_file(),
+            |path| system.is_file(path),
+            system.read_text_file(Path::new(codex_machine::REQUIREMENTS)),
+        )
+        .map(|_| ()),
+        // Claude Code never falls back to itself (the personal file refuses it).
+        Harness::Claude => Ok(()),
+    };
+    Some(match ready {
+        Ok(()) => Check::ok(Section::Project, SUBJECT, format!("{name}, {scope}")),
+        Err(why) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("{name}, {scope}, but it cannot serve here: {why}"),
+            format!(
+                "{DOES_NOT_BLOCK} a review at Claude Code's limit waits for its reset. The \
+                 `codex` lines say how to get Codex ready."
             ),
         ),
     })
@@ -3982,6 +4036,58 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 .why
                 .as_deref()
                 .is_some_and(|why| why.contains("its Claude Code reviewers alone")),
+            "{report}"
+        );
+    }
+
+    /// OWL-406: a `[harnesses.claude].fallback` in the personal file adds the
+    /// `review fallback` line, which says the review roles alone use it and
+    /// whether Codex can serve here, a warning when it cannot; none named,
+    /// no line.
+    #[test]
+    fn the_review_fallback_line_says_who_uses_it_and_whether_it_can_serve() {
+        let personal = |text: &str| Effective {
+            project: FileState::NotApplicable("no project here".into()),
+            personal: FileState::Loaded {
+                path: PathBuf::from("/home/ada/.config/owlshift/config.toml"),
+                config: owlshift_contracts::config::PersonalConfig::parse(text).unwrap(),
+                entries: Vec::new(),
+            },
+        };
+        let named = personal("[harnesses.claude]\nfallback = \"codex\"\n");
+        let ready = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let report = run(&ready, &personal("[harnesses.claude]\nbudget_usd = 5\n"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.subject != "review fallback")
+        );
+
+        let report = run(&ready, &named);
+        assert_eq!(line(&report, "codex").status, Status::Ok, "{report}");
+        let fallback = line(&report, "review fallback");
+        assert_eq!(fallback.status, Status::Ok, "{report}");
+        assert!(
+            fallback
+                .detail
+                .starts_with("Codex, used by the review roles only"),
+            "{report}"
+        );
+        assert!(fallback.detail.contains("wait for the reset"), "{report}");
+
+        let missing = logged_in(with_git(FakeSystem::default()).install("claude").answer(
+            "claude --version",
+            Answer::Exit(0, "2.1.283 (Claude Code)\n", ""),
+        ));
+        let report = run(&missing, &named);
+        assert!(report.ready(), "{report}");
+        let fallback = line(&report, "review fallback");
+        assert_eq!(fallback.status, Status::Warn, "{report}");
+        assert!(
+            fallback
+                .detail
+                .ends_with("but it cannot serve here: `codex` is not on the PATH"),
             "{report}"
         );
     }

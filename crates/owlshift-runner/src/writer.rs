@@ -2038,6 +2038,9 @@ pub struct PlanReviewer {
     /// A reviewer that ran on the design run's own model, no other one being
     /// configured.
     pub same_model: bool,
+    /// A reviewer that ran on the harness declared as Claude Code's
+    /// fallback, Claude Code being at its usage limit (OWL-406).
+    pub fallback: bool,
 }
 
 /// The PLAN comment (OWL-303, architecture section 5, "Kept and shown"):
@@ -2828,8 +2831,13 @@ fn reviewer_line(reviewer: &PlanReviewer, author: &str) -> String {
     } else {
         String::new()
     };
+    let fallback = if reviewer.fallback {
+        ", in place of Claude Code, at its usage limit"
+    } else {
+        ""
+    };
     format!(
-        "{} on {} ({model}{same})",
+        "{} on {} ({model}{same}{fallback})",
         mandates.join(" and "),
         harness_name(reviewer.harness)
     )
@@ -2844,6 +2852,7 @@ impl From<&Reviewer> for PlanReviewer {
             harness: reviewer.harness,
             model: (reviewer.model != "default").then(|| reviewer.model.clone()),
             same_model: reviewer.same_model,
+            fallback: reviewer.fallback,
         }
     }
 }
@@ -4918,6 +4927,7 @@ Merge state reported by the forge: `CLEAN`.
                 harness: Harness::Claude,
                 model: "default".to_owned(),
                 same_model: false,
+                fallback: false,
             },
             ruling: Some(KeptRuling {
                 outcome: if rejected.is_some() {
@@ -4955,6 +4965,7 @@ Merge state reported by the forge: `CLEAN`.
             harness,
             model: model.to_owned(),
             same_model,
+            fallback: false,
         };
         // A disagreement of a fix Build (OWL-377): its own reason shows, never
         // the arbiter's confirmation.
@@ -5030,12 +5041,14 @@ Merge state reported by the forge: `CLEAN`.
                     harness: Harness::Claude,
                     model: None,
                     same_model: false,
+                    fallback: false,
                 },
                 PlanReviewer {
                     mandates: vec![Mandate::Conformance],
                     harness: Harness::Claude,
                     model: Some("opus".to_owned()),
                     same_model: true,
+                    fallback: false,
                 },
             ],
             findings: vec![
@@ -5114,6 +5127,7 @@ Merge state reported by the forge: `CLEAN`.
                     harness: Harness::Codex,
                     model: Some("gpt-x".to_owned()),
                     same_model: false,
+                    fallback: false,
                 },
             ],
             dropped: vec![(1, codex_dropped())],
@@ -5316,6 +5330,7 @@ Merge state reported by the forge: `CLEAN`.
             harness: Harness::Claude,
             model: None,
             same_model: false,
+            fallback: false,
         };
         let document = PlanDocument {
             ticket: TicketId::new("OWL-1").unwrap(),

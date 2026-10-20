@@ -1542,6 +1542,11 @@
       "description": "The reviewer that raised a finding.",
       "type": "object",
       "properties": {
+        "fallback": {
+          "description": "A reviewer that ran on the harness declared as Claude Code's\nfallback, Claude Code being at its usage limit (OWL-406): the\nreports say so.",
+          "type": "boolean",
+          "default": false
+        },
         "harness": {
           "$ref": "#/$defs/Harness"
         },

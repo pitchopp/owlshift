@@ -610,6 +610,7 @@ mod tests {
                 harness: HarnessKind::Claude,
                 model: "default".to_owned(),
                 same_model: false,
+                fallback: false,
             },
             ruling: ruling.map(|outcome| KeptRuling {
                 outcome,

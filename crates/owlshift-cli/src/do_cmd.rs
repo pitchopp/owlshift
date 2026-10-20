@@ -25,7 +25,7 @@ use owlshift_contracts::config::{
 use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::StepEnvelope;
-use owlshift_contracts::{Role, Tier};
+use owlshift_contracts::{Harness, Role, Tier};
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::codex_machine::codex_critic;
@@ -328,11 +328,23 @@ fn run_with(
         Some(_) => codex_critic(system, &executor.agent).map(|_| ()),
         None => Err("`codex` was not on the PATH when this command started".to_owned()),
     };
-    let codex = project.pipeline.codex_reviewer().then_some(CodexReviewer {
+    let codex_reviewer = CodexReviewer {
         design_review: &codex_design_review,
         verify: &codex_verify,
         ready: &codex_ready,
-    });
+    };
+    let codex = project.pipeline.codex_reviewer().then_some(codex_reviewer);
+    // The review roles' fallback while Claude Code is at its usage limit
+    // (OWL-406): Codex, on the same routers and readiness check, when the
+    // personal file declares it; the fallback of a role other than a
+    // reviewer is never used.
+    let review_fallback = matches!(
+        &config.personal,
+        FileState::Loaded { config, .. }
+            if config.harnesses.claude.as_ref().and_then(|claude| claude.fallback)
+                == Some(Harness::Codex)
+    )
+    .then_some(codex_reviewer);
     let desktop = notify::desktop_enabled(&config.personal)
         .then(|| DesktopNotifier::for_this_machine(system))
         .flatten();
@@ -350,6 +362,7 @@ fn run_with(
         design_review: &reviewer,
         verify: &verifier,
         codex,
+        review_fallback,
         arbiter: &arbiter,
         answer_check: &check,
         resolver: &resolver,

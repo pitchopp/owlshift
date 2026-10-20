@@ -195,6 +195,7 @@ impl ChildProject {
             design_review: &harness,
             verify: &harness,
             codex: None,
+            review_fallback: None,
             arbiter: &harness,
             answer_check: &harness.0,
             resolver: &harness,

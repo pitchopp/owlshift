@@ -68,7 +68,10 @@ impl Watch<'_> {
         let standing = self.usage_standing(sink, own, now);
         self.tell_usage(memory, sink, out, own, standing);
         let store = self.on_demand.usage;
-        let effective = effective_harness(role, own, |harness| {
+        // A review role at Claude Code's limit goes on the declared fallback
+        // when it can serve (OWL-406): its step starts.
+        let fallback = self.on_demand.review_fallback(role).map(|_| Harness::Codex);
+        let effective = effective_harness(role, own, fallback, |harness| {
             if harness == own {
                 return standing;
             }

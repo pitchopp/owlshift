@@ -300,7 +300,8 @@ fn prune(state: &mut State, now: i64) {
 
 /// The harness a run of `role` uses when nothing is limited: Claude Code
 /// for every role (D4). The opt-in Codex reviewer is a seat beside a pass,
-/// never a role's own run.
+/// never a role's own run; a review role on the fallback harness is
+/// [`effective_harness`]'s.
 pub fn own_harness(role: Role) -> Harness {
     let _ = role;
     Harness::Claude
@@ -316,20 +317,37 @@ pub enum Effective {
     },
 }
 
+/// Whether `role` is one of the two review roles, Design review and Verify:
+/// the only ones a harness at its limit hands over (D4, OWL-406).
+pub fn is_review_role(role: Role) -> bool {
+    matches!(role, Role::DesignReview | Role::Verify)
+}
+
 /// The harness a run of `role`, on `own` when nothing is limited, gets,
 /// given each harness's standing: its own when it may start, a probe
-/// included; otherwise none. The review roles' fallback
-/// (`[harnesses.<name>].fallback`) is OWL-406's: until then no role falls
-/// back.
+/// included. When `own` is limited, a review role gets `fallback` (the
+/// harness the personal file names, `[harnesses.<name>].fallback`, which
+/// the caller offers only when it is installed and logged in for agent runs)
+/// while that one is not limited (a probe due is served by the run itself); otherwise none. No
+/// other role falls back (OWL-406).
 pub fn effective_harness(
     role: Role,
     own: Harness,
+    fallback: Option<Harness>,
     standing_of: impl Fn(Harness) -> Standing,
 ) -> Effective {
-    let _ = role;
     match standing_of(own) {
         Standing::Free | Standing::ProbeDue => Effective::Run(own),
-        Standing::Limited { until_ms } => Effective::Wait { until_ms },
+        Standing::Limited { until_ms } => match fallback {
+            Some(other)
+                if other != own
+                    && is_review_role(role)
+                    && matches!(standing_of(other), Standing::Free | Standing::ProbeDue) =>
+            {
+                Effective::Run(other)
+            }
+            _ => Effective::Wait { until_ms },
+        },
     }
 }
 
@@ -616,22 +634,91 @@ mod tests {
             Harness::Claude => Standing::Limited { until_ms: 7 },
             Harness::Codex => Standing::Free,
         };
-        for role in [Role::Build, Role::Verify, Role::Resolver, Role::AnswerCheck] {
+        let all = [
+            Role::Intake,
+            Role::Resolver,
+            Role::AnswerCheck,
+            Role::Design,
+            Role::DesignReview,
+            Role::Build,
+            Role::Verify,
+            Role::Rebase,
+            Role::Arbiter,
+        ];
+        for role in all {
             assert_eq!(own_harness(role), Harness::Claude);
+            for fallback in [None, Some(Harness::Codex)] {
+                assert_eq!(
+                    effective_harness(role, own_harness(role), fallback, free),
+                    Effective::Run(Harness::Claude)
+                );
+            }
+            // No fallback offered: every role waits, even with Codex free.
             assert_eq!(
-                effective_harness(role, own_harness(role), free),
-                Effective::Run(Harness::Claude)
-            );
-            // No fallback before OWL-406, even with Codex free.
-            assert_eq!(
-                effective_harness(role, Harness::Claude, held),
+                effective_harness(role, Harness::Claude, None, held),
                 Effective::Wait { until_ms: 7 }
             );
         }
         let due = |_| Standing::ProbeDue;
         assert_eq!(
-            effective_harness(Role::Build, Harness::Codex, due),
+            effective_harness(Role::Build, Harness::Codex, None, due),
             Effective::Run(Harness::Codex)
+        );
+    }
+
+    #[test]
+    fn only_the_review_roles_fall_back_and_only_to_a_free_harness() {
+        let codex = Some(Harness::Codex);
+        let held = |harness| match harness {
+            Harness::Claude => Standing::Limited { until_ms: 7 },
+            Harness::Codex => Standing::Free,
+        };
+        for role in [Role::DesignReview, Role::Verify] {
+            assert!(is_review_role(role));
+            assert_eq!(
+                effective_harness(role, Harness::Claude, codex, held),
+                Effective::Run(Harness::Codex)
+            );
+        }
+        for role in [
+            Role::Intake,
+            Role::Resolver,
+            Role::AnswerCheck,
+            Role::Design,
+            Role::Build,
+            Role::Rebase,
+            Role::Arbiter,
+        ] {
+            assert!(!is_review_role(role));
+            assert_eq!(
+                effective_harness(role, Harness::Claude, codex, held),
+                Effective::Wait { until_ms: 7 },
+                "{role:?}"
+            );
+        }
+        // The fallback held too: the review waits for its own harness.
+        let both = |harness| match harness {
+            Harness::Claude => Standing::Limited { until_ms: 7 },
+            Harness::Codex => Standing::Limited { until_ms: 9 },
+        };
+        assert_eq!(
+            effective_harness(Role::Verify, Harness::Claude, codex, both),
+            Effective::Wait { until_ms: 7 }
+        );
+        // Only due a probe: the review's run is that probe, or the fallback
+        // would never be tried again after an outage without a reset time.
+        let due = |harness| match harness {
+            Harness::Claude => Standing::Limited { until_ms: 7 },
+            Harness::Codex => Standing::ProbeDue,
+        };
+        assert_eq!(
+            effective_harness(Role::Verify, Harness::Claude, codex, due),
+            Effective::Run(Harness::Codex)
+        );
+        // A harness never falls back to itself.
+        assert_eq!(
+            effective_harness(Role::Verify, Harness::Claude, Some(Harness::Claude), held),
+            Effective::Wait { until_ms: 7 }
         );
     }
 }
