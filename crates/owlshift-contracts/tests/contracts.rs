@@ -3026,6 +3026,23 @@ fn personal_config_rejections() {
         "nonzero",
     );
     rejects(
+        "17 concurrent runs",
+        parse("concurrent_runs = 2", "concurrent_runs = 17"),
+        "concurrent_runs must be a whole number from 1 to 16",
+    );
+    assert_eq!(
+        parse("concurrent_runs = 2", "concurrent_runs = 16")
+            .unwrap()
+            .concurrent_runs(),
+        16
+    );
+    assert_eq!(
+        parse("concurrent_runs = 2\n", "")
+            .unwrap()
+            .concurrent_runs(),
+        2
+    );
+    rejects(
         "unknown notification setting",
         parse("desktop = false", "desktop = false\nsound = true"),
         "unknown field `sound`",

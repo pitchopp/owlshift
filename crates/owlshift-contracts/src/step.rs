@@ -190,8 +190,11 @@ pub enum StepEnd {
     Capped { open_prs: u32, max_open_prs: u32 },
     /// The admission gesture is not an admitter's: nothing ran.
     NotAdmitted { account: String, reason: String },
-    /// Another command held the project: nothing ran.
+    /// Another command held the project or the ticket: nothing ran.
     Busy,
+    /// Every run slot of the machine was taken (OWL-409): nothing ran, and
+    /// watch tries again at a later pass. Format 2.
+    NoSlot,
     /// The harness reached its usage limit.
     UsageLimit {
         #[serde(default)]
@@ -250,10 +253,42 @@ pub enum StepHold {
 impl StepOutcome {
     const CONTRACT: &str = "step outcome";
 
+    /// Parses an outcome record. A format-1 one, which a watch that ran
+    /// before OWL-409 may have left for its successor, is read as the
+    /// current format: format 2 only adds the `no_slot` end, refused in it.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let outcome: Self = format::parse_json(Self::CONTRACT, STEP_OUTCOME_FORMAT, input)?;
+        let outcome: Self = match Self::from_older_format(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, STEP_OUTCOME_FORMAT, input)?,
+        };
         check_attempt(Self::CONTRACT, &outcome.attempt)?;
         Ok(outcome)
+    }
+
+    /// A format-1 record read as the current format, or `None` for any
+    /// other.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        if document
+            .pointer("/end/end")
+            .and_then(serde_json::Value::as_str)
+            == Some("no_slot")
+        {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "format 1 has no `no_slot` end",
+            )));
+        }
+        document["format"] = STEP_OUTCOME_FORMAT.into();
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {
@@ -436,5 +471,38 @@ mod tests {
         let read = TicketCarry::parse(&carry.render()).unwrap();
         assert_eq!(read, carry);
         assert_eq!(read.chain.chain(), chain);
+    }
+
+    /// OWL-409: format 2 adds `no_slot`; a format-1 record a predecessor
+    /// watch left still reads, as format 2, but never with that end.
+    #[test]
+    fn a_format_1_outcome_reads_and_no_slot_is_format_2s() {
+        let outcome = StepOutcome {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            attempt: "1-2-3".to_owned(),
+            commit: None,
+            progress: "p".to_owned(),
+            answer: None,
+            end: StepEnd::NoSlot,
+            after: RefAfter::Unread,
+            hold: None,
+            kept: KeptFollowing::default(),
+            at: "2026-10-20T09:00:00Z".parse().unwrap(),
+        };
+        let as_format_1 = |outcome: &StepOutcome| {
+            let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
+            assert_eq!(document["format"], 2);
+            document["format"] = 1.into();
+            document.to_string()
+        };
+        assert_eq!(StepOutcome::parse(&outcome.render()).unwrap(), outcome);
+        let error = StepOutcome::parse(&as_format_1(&outcome)).unwrap_err();
+        assert!(error.to_string().contains("no `no_slot`"), "{error}");
+        let busy = StepOutcome {
+            end: StepEnd::Busy,
+            ..outcome
+        };
+        assert_eq!(StepOutcome::parse(&as_format_1(&busy)).unwrap(), busy);
     }
 }

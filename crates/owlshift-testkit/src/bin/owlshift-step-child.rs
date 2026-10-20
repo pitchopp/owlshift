@@ -11,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use jiff::Timestamp;
 use owlshift_contracts::step::StepEnvelope;
 use owlshift_platform::process;
 use owlshift_runner::events::printable;
@@ -44,6 +45,21 @@ fn main() -> ExitCode {
         }
     };
     let project = ChildProject::load(Path::new(project));
+    // A run slot first, as `owlshift continue --step` takes one (OWL-409):
+    // with none free, the "no slot" record is the step's outcome.
+    let _slot = match project.machine_slots() {
+        Some(slots) => {
+            match step::take_slot(&slots, &project.dirs(), &envelope, Timestamp::now()) {
+                Ok(Some(slot)) => Some(slot),
+                Ok(None) => return ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("the machine's run slots: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
     let written = project.with_on_demand(&mut io::stdout(), |on_demand, sink| {
         step::child(on_demand, &envelope, sink, &mut |outcome, _| {
             let said = match outcome {

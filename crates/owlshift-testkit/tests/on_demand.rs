@@ -1581,6 +1581,45 @@ fn the_bench_forge_refuses_a_counted_number_of_reads_with_a_401() {
     assert!(*bench.github.open_reads.lock().unwrap() > 1);
 }
 
+/// OWL-409, "The ticket lock": while another command holds DEMO-1's own
+/// lock, `do` and `continue` stop at once, busy, naming the ticket, with
+/// nothing read, run or written; once it is let go, `do` runs.
+#[test]
+fn two_commands_on_one_ticket_the_second_busy() {
+    let bench = Bench::new(true);
+    let dirs = bench.dirs();
+    // Tried again for the moment a child forked by another test's thread
+    // keeps a lock it inherited (`ProjectDirs::lock`).
+    let held = (0..100)
+        .find_map(|_| {
+            let lock = dirs.ticket_lock(&ticket()).unwrap();
+            if lock.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            lock
+        })
+        .expect("the ticket's lock");
+    let (outcome, printed) = bench.run(Vec::new(), None);
+    assert!(
+        matches!(&outcome, Err(Stop::TicketBusy(id)) if *id == ticket()),
+        "{outcome:?}\n{printed}"
+    );
+    let message = outcome.unwrap_err().to_string();
+    assert!(message.contains("is working DEMO-1"), "{message}");
+    assert!(!dirs.checkout().exists(), "nothing cloned");
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::TicketBusy(_))),
+        "{outcome:?}\n{printed}"
+    );
+    assert!(!dirs.runs(&ticket()).exists());
+    assert!(bench.comments().is_empty());
+    drop(held);
+
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+}
+
 #[test]
 fn a_ticket_becomes_a_pull_request_with_its_report() {
     let bench = Bench::new(true);

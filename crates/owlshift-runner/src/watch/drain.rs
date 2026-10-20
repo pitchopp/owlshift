@@ -393,14 +393,22 @@ impl Watch<'_> {
             .filter(|(_, stored)| held::holds(stored))
             .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
             .collect();
+        // The machine's run slots every project's drain shares (OWL-409):
+        // those held now, by a probe, against `concurrent_runs`; a dispatch
+        // that would find none waits. Without slots, or with a count that
+        // cannot be read, the child's own take decides.
+        let (concurrent_runs, runs) = memory
+            .children
+            .and_then(|c| c.slots())
+            .map_or((1, 0), |slots| (slots.count(), slots.held().unwrap_or(0)));
         let ready = schedule::ready_set(
             &tickets,
             Caps {
-                concurrent_runs: 1,
+                concurrent_runs,
                 open_prs: Some(cap),
             },
             Load {
-                runs: 0,
+                runs,
                 open_prs,
                 slot_held_by,
                 in_flight,
@@ -594,8 +602,9 @@ impl Watch<'_> {
         out: &mut dyn Write,
     ) {
         let on_demand = self.on_demand;
-        // Another command took the project: the next pass tries again.
-        if matches!(outcome, StepEnd::Busy) {
+        // Another command took the project or the ticket, or every run slot
+        // of the machine was taken (OWL-409): the next pass tries again.
+        if matches!(outcome, StepEnd::Busy | StepEnd::NoSlot) {
             return;
         }
         let git = &on_demand.executor.git;

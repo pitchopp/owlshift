@@ -39,7 +39,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "hold": {
       "description": "The hold the step calls for, by watch's rule, none when it calls for\nnone.",
@@ -283,12 +283,26 @@
           ]
         },
         {
-          "description": "Another command held the project: nothing ran.",
+          "description": "Another command held the project or the ticket: nothing ran.",
           "type": "object",
           "properties": {
             "end": {
               "type": "string",
               "const": "busy"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end"
+          ]
+        },
+        {
+          "description": "Every run slot of the machine was taken (OWL-409): nothing ran, and\nwatch tries again at a later pass. Format 2.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "no_slot"
             }
           },
           "additionalProperties": false,

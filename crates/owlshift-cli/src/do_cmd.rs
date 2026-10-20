@@ -19,7 +19,9 @@ use std::time::Duration;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::config::{Models, ProjectConfig, TrackerKind};
+use owlshift_contracts::config::{
+    DEFAULT_CONCURRENT_RUNS, Models, PersonalConfig, ProjectConfig, TrackerKind,
+};
 use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::StepEnvelope;
@@ -40,6 +42,7 @@ use owlshift_runner::roles::{
     REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
 use owlshift_runner::routing::{ClaudeRouter, CodexRouter, claude_model};
+use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
@@ -124,6 +127,25 @@ fn run_with(
     // their agents (`AgentEnv::from_runner`); `OnDemand` checks again.
     system.sandbox().map_err(|error| error.to_string())?;
     let data_dir = crate::data_dir()?;
+    // The machine's run slots every project's drain shares (OWL-409), in
+    // Owlshift's data directory, which is the user's state directory the
+    // design names. A step's child takes one before anything else, the
+    // keychain included, and keeps it to its end; with none free, it writes
+    // its "no slot" record and ends, its ticket untouched.
+    let slots = MachineSlots::new(&data_dir, concurrent_runs(&config.personal));
+    let _slot = match &envelope {
+        Some(envelope) => {
+            let dirs = ProjectDirs::new(&data_dir, &repo);
+            let now = on_demand::system_clock();
+            match step::take_slot(&slots, &dirs, envelope, now)
+                .map_err(|error| format!("the machine's run slots: {error}"))?
+            {
+                Some(slot) => Some(slot),
+                None => return Ok(ExitCode::SUCCESS),
+            }
+        }
+        None => None,
+    };
     let Some(claude) = system.locate("claude") else {
         return Err(
             "`claude` is not on the PATH: install Claude Code (agent runs log in with the token `owlshift init` stores; `owlshift doctor` checks it)"
@@ -389,8 +411,10 @@ fn run_with(
                 let program = std::env::current_exe().map_err(|error| {
                     format!("this program's own path, which runs each step: {error}")
                 })?;
+                // Each takes one of the machine's run slots (OWL-409).
                 let children =
-                    Children::new(move |ticket, envelope| step_command(&program, ticket, envelope));
+                    Children::new(move |ticket, envelope| step_command(&program, ticket, envelope))
+                        .with_slots(slots);
                 watch.run_with_children(
                     true,
                     &children,
@@ -413,6 +437,17 @@ fn run_with(
         &outcome,
         &mut sink,
     ))
+}
+
+/// How many steps of `owlshift watch --drain` this machine runs at once
+/// (OWL-409): the personal file's `concurrent_runs`, its default when the
+/// file is absent. An invalid file never gets here: `loaded_project`
+/// refuses it.
+fn concurrent_runs(personal: &FileState<PersonalConfig>) -> u32 {
+    match personal {
+        FileState::Loaded { config, .. } => config.concurrent_runs(),
+        _ => DEFAULT_CONCURRENT_RUNS,
+    }
 }
 
 /// The step `text` names for `ticket`: refused, before anything is read,

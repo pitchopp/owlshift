@@ -147,6 +147,7 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
             None => format!("{ticket}: stopped at the harness's usage limit"),
         },
         Stop::Busy(_)
+        | Stop::TicketBusy(_)
         | Stop::Refused(_)
         | Stop::Unverified { .. }
         | Stop::Waiting { .. }

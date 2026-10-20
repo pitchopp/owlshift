@@ -989,6 +989,12 @@ fn gate_env_error(error: owlshift_core::agent_env::AgentEnvError) -> ContractErr
     ContractError::invalid(PROJECT, format!("stack.gate_env: {error}"))
 }
 
+/// `concurrent_runs` when the personal file does not set it (OWL-409).
+pub const DEFAULT_CONCURRENT_RUNS: u32 = 2;
+/// The most `concurrent_runs` may be: the number of machine slot files a
+/// watch counts (OWL-409).
+pub const MAX_CONCURRENT_RUNS: u32 = 16;
+
 /// The personal file, in the user's configuration directory, never committed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1004,8 +1010,11 @@ pub struct PersonalConfig {
     /// The installed harnesses.
     #[serde(default)]
     pub harnesses: Harnesses,
-    /// How many runs this machine runs at once.
+    /// How many steps of `owlshift watch --drain` run at once on this
+    /// machine, over every project: a whole number from 1 to 16. Absent: 2
+    /// (OWL-409, [`PersonalConfig::concurrent_runs`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 16))]
     pub concurrent_runs: Option<NonZeroU32>,
     /// Whether to keep the machine awake while runs are in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1229,7 +1238,23 @@ impl PersonalConfig {
             .collect()
     }
 
+    /// How many steps of `owlshift watch --drain` this machine runs at once,
+    /// over every project: `concurrent_runs`, [`DEFAULT_CONCURRENT_RUNS`]
+    /// when absent (OWL-409).
+    pub fn concurrent_runs(&self) -> u32 {
+        self.concurrent_runs
+            .map_or(DEFAULT_CONCURRENT_RUNS, NonZeroU32::get)
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
+        if let Some(runs) = self.concurrent_runs
+            && runs.get() > MAX_CONCURRENT_RUNS
+        {
+            return Err(ContractError::invalid(
+                PERSONAL,
+                format!("concurrent_runs must be a whole number from 1 to {MAX_CONCURRENT_RUNS}"),
+            ));
+        }
         check_names(&names(&self.allow_gate_env)).map_err(|error| {
             ContractError::invalid(PERSONAL, format!("allow_gate_env: {error}"))
         })?;

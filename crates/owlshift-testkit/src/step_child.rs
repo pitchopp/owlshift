@@ -31,6 +31,7 @@ use owlshift_runner::executor::{Git, Harness};
 use owlshift_runner::on_demand::{self, OnDemand};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::routing::Router;
+use owlshift_runner::slots::MachineSlots;
 
 use crate::gh;
 use crate::git::{GitEnv, seed};
@@ -57,6 +58,20 @@ pub struct ChildProject {
     pub harness: PathBuf,
     /// The reply file every run plays.
     pub reply: PathBuf,
+    /// The machine's run slots the child takes one of before its step, as
+    /// `owlshift continue --step` does (OWL-409): the data directory they
+    /// live in and their count. None: the child takes none.
+    #[serde(default)]
+    pub slots: Option<ChildSlots>,
+}
+
+/// The machine's run slots of [`ChildProject::slots`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChildSlots {
+    /// The data directory whose `slots` folder holds them.
+    pub data: PathBuf,
+    /// `concurrent_runs`.
+    pub count: u32,
 }
 
 impl ChildProject {
@@ -96,7 +111,15 @@ impl ChildProject {
             home: env.home().to_owned(),
             harness,
             reply,
+            slots: None,
         }
+    }
+
+    /// The machine's run slots this project's children take, if any.
+    pub fn machine_slots(&self) -> Option<MachineSlots> {
+        self.slots
+            .as_ref()
+            .map(|slots| MachineSlots::new(&slots.data, slots.count))
     }
 
     /// Writes this project's paths to `path`.

@@ -155,6 +155,39 @@ impl ProjectDirs {
         self.root.join("lock")
     }
 
+    /// The ticket lock's file, `lock` in the ticket's folder (OWL-409,
+    /// architecture section 5, "Locks"). Never removed, so that two
+    /// processes always lock the same file.
+    pub fn ticket_lock_file(&self, ticket: &TicketId) -> PathBuf {
+        self.ticket_dir(ticket).join("lock")
+    }
+
+    /// Takes the lock of `ticket`, held until the returned value is dropped
+    /// or the process ends; `None` when another open file description holds
+    /// it, in this process or another: two commands never work one ticket.
+    /// A command takes it before the project's lock and lets it go after
+    /// ([`ProjectDirs::lock_for_write`] is watch's reverse order). The
+    /// window of [`ProjectDirs::lock`] after a fork applies to it too.
+    pub fn ticket_lock(&self, ticket: &TicketId) -> io::Result<Option<TicketLock>> {
+        fs::create_dir_all(self.ticket_dir(ticket))?;
+        Ok(try_lock_file(&self.ticket_lock_file(ticket))?.map(|file| TicketLock { _file: file }))
+    }
+
+    /// The project's lock, then the lock of `ticket` without waiting: what
+    /// watch holds for a write of that ticket's ref (OWL-409). `None` when
+    /// either is held elsewhere; the project's lock is then let go at once,
+    /// so watch's reverse order never waits on a command. Dropped in order:
+    /// the project's lock first.
+    pub fn lock_for_write(
+        &self,
+        ticket: &TicketId,
+    ) -> io::Result<Option<(ProjectLock, TicketLock)>> {
+        let Some(project) = self.lock()? else {
+            return Ok(None);
+        };
+        Ok(self.ticket_lock(ticket)?.map(|ticket| (project, ticket)))
+    }
+
     /// The marker of a run whose isolation check has not passed.
     pub fn unverified_file(&self) -> PathBuf {
         self.root.join("unverified")
@@ -282,6 +315,12 @@ fn exists(path: &Path) -> io::Result<bool> {
 /// The project's lock: see [`ProjectDirs::lock`].
 #[derive(Debug)]
 pub struct ProjectLock {
+    _file: File,
+}
+
+/// A ticket's lock: see [`ProjectDirs::ticket_lock`].
+#[derive(Debug)]
+pub struct TicketLock {
     _file: File,
 }
 
@@ -751,7 +790,51 @@ mod tests {
             "taken once released"
         );
         release.join().unwrap();
-        let _project = dirs.lock().unwrap().expect("the two locks are apart");
+        let project = dirs.lock().unwrap().expect("the two locks are apart");
+
+        // A ticket's lock (OWL-409): one holder, the ticket's own file,
+        // the same whatever the case of its id, apart from the project's.
+        let ticket = TicketId::new("OWL-1").unwrap();
+        let other = TicketId::new("OWL-2").unwrap();
+        assert_eq!(
+            dirs.ticket_lock_file(&ticket),
+            dirs.root().join("tickets/owl-1/lock")
+        );
+        let held = dirs.ticket_lock(&ticket).unwrap().expect("a free ticket");
+        let lower = TicketId::new("owl-1").unwrap();
+        assert!(dirs.ticket_lock(&lower).unwrap().is_none(), "one holder");
+        assert!(dirs.ticket_lock(&other).unwrap().is_some(), "per ticket");
+        // Watch's reverse order: nothing while the project or the ticket is
+        // held elsewhere, and the project's lock let go when the ticket's
+        // was busy.
+        assert!(
+            dirs.lock_for_write(&other).unwrap().is_none(),
+            "project held"
+        );
+        drop(project);
+        assert!(
+            dirs.lock_for_write(&ticket).unwrap().is_none(),
+            "ticket held"
+        );
+        assert!(dirs.lock().unwrap().is_some(), "the project's lock let go");
+        drop(held);
+        let both = dirs.lock_for_write(&ticket).unwrap().expect("both free");
+        assert!(dirs.ticket_lock(&ticket).unwrap().is_none());
+        assert!(dirs.lock().unwrap().is_none());
+        drop(both);
+
+        // Close-on-exec (architecture section 5, "Locks", check (e)): a
+        // child that execs while the lock is held does not keep it.
+        #[cfg(unix)]
+        {
+            let held = dirs.ticket_lock(&ticket).unwrap().expect("free again");
+            let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+            drop(held);
+            let free = dirs.ticket_lock(&ticket).unwrap().is_some();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(free, "a child that exec'd kept the ticket's lock");
+        }
     }
 
     #[test]
