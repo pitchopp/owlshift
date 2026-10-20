@@ -27,8 +27,8 @@ use owlshift_platform::keychain::Secret;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::harness::drive_plain;
 use owlshift_runner::executor::{
-    Executor, ExecutorError, Failure, Git, Harness, HarnessEnd, HarnessError, HarnessLogin,
-    HarnessRun, HarnessStatus, RunLog, RunReport, RunSpec, SandboxNeeds,
+    Executor, ExecutorError, Git, Harness, HarnessEnd, HarnessError, HarnessLogin, HarnessRun,
+    HarnessStatus, RunLog, RunReport, RunSpec, SandboxNeeds,
 };
 use owlshift_testkit::git::{GitEnv, seed};
 
@@ -399,6 +399,7 @@ fn a_declared_cache_is_read_and_never_written() {
 #[cfg(unix)]
 #[test]
 fn a_setup_command_cannot_write_into_a_declared_cache() {
+    use owlshift_runner::executor::{Failure, Outcome};
     let bench = Bench::new();
     let store = bench.tmp.path().join("home/Library/pnpm/store");
     fs::create_dir_all(&store).unwrap();
@@ -421,8 +422,7 @@ fn a_setup_command_cannot_write_into_a_declared_cache() {
             &["true".to_owned(), write.clone()],
         )
         .unwrap();
-    let owlshift_runner::executor::Outcome::Failed(Failure::Setup(failure)) = &report.outcome
-    else {
+    let Outcome::Failed(Failure::Setup(failure)) = &report.outcome else {
         panic!("{:?}", report.outcome);
     };
     assert_eq!(failure.command.as_deref(), Some(write.as_str()));
