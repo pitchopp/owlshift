@@ -1157,6 +1157,18 @@ mod setup {
     /// no result.
     const MARKS: &str = "echo ran > .owlshift/run/harness-ran";
 
+    /// `unix`, or `windows` where the setup and the gate run through `cmd`,
+    /// which expands `%TMPDIR%` and not `$TMPDIR`. A line both shells run
+    /// alike needs neither: `&&` rather than `;`.
+    fn by_shell(unix: &'static str, windows: &'static str) -> &'static str {
+        if cfg!(windows) { windows } else { unix }
+    }
+
+    /// `text` with the line ends `cmd`'s `echo` writes made `\n`.
+    fn lf(text: String) -> String {
+        text.replace("\r\n", "\n")
+    }
+
     impl Bench {
         /// A run of `harness` with `setup`, from `base`.
         fn run_set_up(
@@ -1256,9 +1268,9 @@ mod setup {
                     bench.commit("refs/remotes/origin/main")
                 }
             };
-            let report = bench.build_set_up(&["echo partial; exit 1"], &base(&bench));
+            let report = bench.build_set_up(&["echo partial && exit 1"], &base(&bench));
             let failure = failed_before_the_harness(&bench, &report);
-            assert_eq!(failure.command.as_deref(), Some("echo partial; exit 1"));
+            assert_eq!(failure.command.as_deref(), Some("echo partial && exit 1"));
             assert_eq!(failure.reason, "setup: exit status 1");
             assert!(failure.output.contains("partial"));
             assert!(bench.tmp.path().join("run").join(SETUP_LOG).exists());
@@ -1289,9 +1301,13 @@ mod setup {
     #[test]
     fn a_setup_that_breaks_isolation_is_quarantined_before_the_harness() {
         for setup in [
-            "git branch other; exit 1",
+            "git branch other && exit 1",
             "git branch other",
-            "echo 'touch hooked' > \"$(git rev-parse --git-common-dir)/hooks/post-checkout\"",
+            by_shell(
+                "echo 'touch hooked' > \"$(git rev-parse --git-common-dir)/hooks/post-checkout\"",
+                // The main checkout's, beside the worktree.
+                "echo touch hooked> ..\\checkout\\.git\\hooks\\post-checkout",
+            ),
         ] {
             let bench = Bench::new();
             let base = bench.commit("refs/remotes/origin/main");
@@ -1317,12 +1333,21 @@ mod setup {
             ..Reply::default()
         });
         let mut brief = bench.brief.clone();
-        brief.gate = vec!["test \"$(cat \"$TMPDIR/x\")\" = set".to_owned()];
+        brief.gate = vec![
+            by_shell(
+                "test \"$(cat \"$TMPDIR/x\")\" = set",
+                "findstr set \"%TMPDIR%\\x\"",
+            )
+            .to_owned(),
+        ];
         let report = bench.run_set_up(
             &bench.executor,
             &harness,
             &brief,
-            &["echo set > \"$TMPDIR/x\"", "echo 1 >> .owlshift/run/count"],
+            &[
+                by_shell("echo set > \"$TMPDIR/x\"", "echo set> \"%TMPDIR%\\x\""),
+                "echo ran>> .owlshift/run/count",
+            ],
             &base,
         );
         assert!(
@@ -1334,10 +1359,13 @@ mod setup {
         let gate = report.gate.as_ref().unwrap();
         assert!(gate.passed(), "{gate:?}");
         assert_eq!(gate.setup.len(), 2);
-        assert_eq!(bench.observed(), "$TMPDIR/x=set\n.owlshift/run/count=1\n");
         assert_eq!(
-            fs::read_to_string(bench.worktree.join(".owlshift/run/count")).unwrap(),
-            "1\n1\n"
+            lf(bench.observed()),
+            "$TMPDIR/x=set\n.owlshift/run/count=ran\n"
+        );
+        assert_eq!(
+            lf(fs::read_to_string(bench.worktree.join(".owlshift/run/count")).unwrap()),
+            "ran\nran\n"
         );
     }
 
@@ -1355,7 +1383,11 @@ mod setup {
             .run(&bench.worktree, &["add", "staged.txt"])
             .unwrap();
         fs::write(bench.worktree.join("new.txt"), "new\n").unwrap();
-        let report = bench.build_set_up(&["echo set up > \"$TMPDIR/x\""], &base);
+        let setup = by_shell(
+            "echo set up > \"$TMPDIR/x\"",
+            "echo set up> \"%TMPDIR%\\x\"",
+        );
+        let report = bench.build_set_up(&[setup], &base);
         assert!(bench.harness_ran(), "{report:?}");
         assert!(report.setup.as_ref().is_some_and(GateReport::passed));
         let read = |path: &str| fs::read_to_string(bench.worktree.join(path)).unwrap();
@@ -1416,16 +1448,22 @@ mod setup {
     /// A setup that fails for something other than its command's own
     /// failure fails a resumed Build too: one that changes the work, one
     /// whose log cannot be written, one whose process kept the output open
-    /// past the setup's deadline, a third of the gate's 6 s.
+    /// past the setup's deadline, a third of the gate's 6 s. The last leaves
+    /// its process group with `setpgrp`, which Windows has not.
     #[test]
     fn a_setup_failure_a_build_cannot_repair_fails_the_run() {
-        for case in ["changes", "log", "holds"] {
+        let cases: &[&str] = if cfg!(unix) {
+            &["changes", "log", "holds"]
+        } else {
+            &["changes", "log"]
+        };
+        for &case in cases {
             let bench = Bench::new();
             let base = bench.commit("refs/remotes/origin/main");
             bench.kept();
             bench.own_commit(&[("own.txt", "own\n")]);
             let setup = match case {
-                "changes" => "echo changed > README.md; exit 1",
+                "changes" => "echo changed > README.md && exit 1",
                 "log" => {
                     fs::create_dir_all(bench.tmp.path().join("run").join(SETUP_LOG)).unwrap();
                     "exit 1"
@@ -1481,7 +1519,7 @@ mod setup {
             observe_into: Some(RelativePath::new(".owlshift/run/observed.txt").unwrap()),
             ..Reply::default()
         });
-        let count = ["echo 1 >> .owlshift/run/count"];
+        let count = ["echo ran>> .owlshift/run/count"];
         let report = bench.run_set_up(&bench.executor, &harness, &brief, &count, &onto);
         assert!(
             matches!(report.outcome, Outcome::Finished { .. }),
@@ -1492,8 +1530,8 @@ mod setup {
         assert_eq!(bench.observed(), ".owlshift/run/count absent\n");
         assert!(report.gate.as_ref().is_some_and(GateReport::passed));
         assert_eq!(
-            fs::read_to_string(bench.worktree.join(".owlshift/run/count")).unwrap(),
-            "1\n"
+            lf(fs::read_to_string(bench.worktree.join(".owlshift/run/count")).unwrap()),
+            "ran\n"
         );
 
         let bench = Bench::new();

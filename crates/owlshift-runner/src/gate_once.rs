@@ -795,16 +795,17 @@ mod tests {
     fn the_gate_runs_the_setup_first_and_fails_on_a_red_one() {
         let bench = Bench::new();
         let with = |gate: &str, setup: &str| project_file(&format!("{gate}]\nsetup = [{setup}"));
-        bench.push(
-            "main",
-            Some(&with(
-                r#""test -f \"$TMPDIR/x\"""#,
-                r#""touch \"$TMPDIR/x\"""#,
-            )),
-        );
+        // `cmd`'s on Windows, which expands `%TMPDIR%` and not `$TMPDIR`.
+        let (gate, setup) = if cfg!(windows) {
+            (r#"type "%TMPDIR%\x""#, r#"type nul > "%TMPDIR%\x""#)
+        } else {
+            (r#"test -f "$TMPDIR/x""#, r#"touch "$TMPDIR/x""#)
+        };
+        let literal = |line: &str| format!("'{line}'");
+        bench.push("main", Some(&with(&literal(gate), &literal(setup))));
         bench.push(
             "red",
-            Some(&with(r#""echo never""#, r#""echo partial; exit 4""#)),
+            Some(&with(r#""echo never""#, r#""echo partial && exit 4""#)),
         );
         bench.push("alone", Some(&with("", r#""true""#)));
         let executor = bench.executor(bench.agent().without_confinement());
@@ -822,23 +823,26 @@ mod tests {
         .unwrap();
         assert!(green.passed(), "{}", render(&green));
         let told = told.unwrap();
-        assert_eq!(told.setup, ["touch \"$TMPDIR/x\""]);
+        assert_eq!(told.setup, [setup]);
         let shown = told.to_string();
         let setup_at = shown.find("after its setup:").unwrap();
-        assert!(setup_at < shown.find("test -f").unwrap(), "{shown}");
+        assert!(setup_at < shown.find(gate).unwrap(), "{shown}");
         let text = render(&green);
-        let setup_at = text.find("setup $ touch").unwrap();
-        assert!(setup_at < text.find("$ test -f").unwrap(), "{text}");
+        let setup_at = text.find(&format!("setup $ {setup}")).unwrap();
+        assert!(
+            setup_at < text.find(&format!("$ {gate}")).unwrap(),
+            "{text}"
+        );
 
         let red = bench.gate(&executor, &[], Some("origin/red")).unwrap();
         assert!(!red.passed());
         let report = &red.run.as_ref().unwrap().report;
         let failure = report.failure.as_ref().unwrap();
-        assert_eq!(failure.command.as_deref(), Some("echo partial; exit 4"));
+        assert_eq!(failure.command.as_deref(), Some("echo partial && exit 4"));
         assert_eq!(failure.reason, "setup: exit status 4");
         assert!(report.steps.is_empty());
         assert!(
-            render(&red).contains("Gate red: `echo partial; exit 4`: setup: exit status 4."),
+            render(&red).contains("Gate red: `echo partial && exit 4`: setup: exit status 4."),
             "{}",
             render(&red)
         );
