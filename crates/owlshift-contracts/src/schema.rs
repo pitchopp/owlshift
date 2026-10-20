@@ -7,7 +7,7 @@ use crate::comment::Footer;
 use crate::config::{PersonalConfig, ProjectConfig};
 use crate::drain::{TicketIntake, TicketProposals};
 use crate::event::Event;
-use crate::refs::{Claim, PersistedState, TicketDelivery, TicketQuestions};
+use crate::refs::{Claim, PersistedState, TicketCost, TicketDelivery, TicketQuestions};
 use crate::result::RunResult;
 use crate::review::{TicketPlan, TicketReview};
 
@@ -27,6 +27,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("ticket-proposals", schema::<TicketProposals>()),
         ("ticket-plan", schema::<TicketPlan>()),
         ("ticket-review", schema::<TicketReview>()),
+        ("ticket-cost", schema::<TicketCost>()),
         ("comment-footer", schema::<Footer>()),
     ]
 }

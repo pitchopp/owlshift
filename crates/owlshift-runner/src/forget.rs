@@ -219,6 +219,11 @@ fn kept_parts(kept: &TicketRecord) -> Vec<String> {
     if kept.questions.resolver_refusal.is_some() {
         parts.push("the resolver's refusal".to_owned());
     }
+    // OWL-378: the runs were paid for; a ticket past its budget still parks
+    // until a person's `owlshift continue`.
+    if kept.cost.is_some() {
+        parts.push("what its runs cost, against its budget".to_owned());
+    }
     parts
 }
 

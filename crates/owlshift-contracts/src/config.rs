@@ -536,6 +536,15 @@ pub struct Policy {
     /// file using it requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolver_budget_usd: Option<Usd>,
+    /// A budget, in dollars, on what one ticket's runs cost (OWL-378,
+    /// architecture section 4, "Ticket budget"): every run counted once,
+    /// across every command and stop, since the ticket's first run or a
+    /// person's last restart of it; reached, no run of the ticket starts and
+    /// it parks. A positive number. Absent: no budget. Independent of
+    /// `resolver_budget_usd`. A file using it requires an Owlshift that
+    /// reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_budget_usd: Option<Usd>,
 }
 
 /// `policy.resolver_passes`: a whole number of runs, or `"unlimited"`
@@ -613,8 +622,9 @@ impl JsonSchema for ResolverPasses {
     }
 }
 
-/// An amount in dollars, as `policy.resolver_budget_usd` writes it: a
-/// positive finite number once [`ProjectConfig::validate`] passed it.
+/// An amount in dollars, as `policy.resolver_budget_usd` and
+/// `policy.ticket_budget_usd` write it: a positive finite number of at least
+/// [`MIN_USD`] once [`ProjectConfig::validate`] passed it.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Usd(pub f64);
@@ -635,6 +645,33 @@ impl JsonSchema for Usd {
             "exclusiveMinimum": 0
         })
     }
+}
+
+/// The smallest dollar amount a `policy` key takes: the millionth of a
+/// dollar the runner counts in, below which a ceiling would round to
+/// nothing.
+pub const MIN_USD: f64 = 0.000_001;
+
+/// Checks the dollar amount of `policy.<key>`, when set: a finite number of
+/// at least [`MIN_USD`], read as written, never rounded first.
+fn check_usd(key: &str, amount: Option<Usd>) -> Result<(), String> {
+    match amount {
+        Some(Usd(usd)) if !(usd.is_finite() && usd >= MIN_USD) => Err(format!(
+            "policy.{key} must be a positive number of dollars, at least 0.000001"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A dollar amount in millionths of a dollar, for a ceiling: none for an
+/// amount that is not a positive number, and an amount below a millionth,
+/// possible only in a configuration built in code, raised to that
+/// millionth.
+fn usd_ceiling(amount: Option<Usd>) -> Option<u64> {
+    amount
+        .filter(|usd| usd.0 > 0.0)
+        .and_then(|usd| usd_micros(usd.0))
+        .map(|micros| micros.max(1))
 }
 
 /// The range of `policy.resolver_passes` as a number of runs (the schema
@@ -686,15 +723,7 @@ impl Policy {
         {
             return Err(RESOLVER_PASSES_SHAPE.to_owned());
         }
-        if let Some(Usd(usd)) = self.resolver_budget_usd
-            && !(usd > 0.0 && usd_micros(usd).is_some_and(|micros| micros >= 1))
-        {
-            return Err(
-                "policy.resolver_budget_usd must be a positive number of dollars, at least \
-                 0.000001"
-                    .to_owned(),
-            );
-        }
+        check_usd("resolver_budget_usd", self.resolver_budget_usd)?;
         if self.resolver_passes == Some(ResolverPasses::Unlimited)
             && self.resolver_budget_usd.is_none()
         {
@@ -724,12 +753,15 @@ impl Policy {
         ResolverPolicy {
             level: self.resolver_delegation.unwrap_or_default(),
             passes,
-            ceiling_micros: self
-                .resolver_budget_usd
-                .filter(|usd| usd.0 > 0.0)
-                .and_then(|usd| usd_micros(usd.0))
-                .map(|micros| micros.max(1)),
+            ceiling_micros: usd_ceiling(self.resolver_budget_usd),
         }
+    }
+
+    /// The budget on one ticket's runs (OWL-378), in millionths of a
+    /// dollar: `None` without one. An amount below a millionth of a dollar,
+    /// possible only in a configuration built in code, is that millionth.
+    pub fn ticket_budget_micros(&self) -> Option<u64> {
+        usd_ceiling(self.ticket_budget_usd)
     }
 }
 
@@ -843,6 +875,7 @@ impl ProjectConfig {
         }
         self.policy
             .check_resolver()
+            .and_then(|()| check_usd("ticket_budget_usd", self.policy.ticket_budget_usd))
             .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         if let Some(forge) = &self.forge {
             forge
@@ -1356,6 +1389,7 @@ mod tests {
             resolver_delegation: None,
             resolver_passes: None,
             resolver_budget_usd: None,
+            ticket_budget_usd: None,
         };
         assert_eq!(built.quiet_window(), Duration::from_secs(60));
 
@@ -1440,21 +1474,55 @@ mod tests {
     }
 
     /// A ceiling below the millionth of a dollar the gate counts in would
-    /// round to nothing and end every chain before its first resolver run:
-    /// the file is refused, naming the key; the millionth itself is kept.
+    /// round to nothing and end every chain before its first resolver run,
+    /// or park a ticket before its first run: the file is refused, naming
+    /// the key, the amount read as written (0.0000006 would round up to the
+    /// millionth); the millionth itself is kept.
     #[test]
     fn a_ceiling_below_a_millionth_of_a_dollar_is_refused() {
-        for tiny in ["1e-9", "0.0000004"] {
-            let error = project("", &format!("resolver_budget_usd = {tiny}"))
+        for key in ["resolver_budget_usd", "ticket_budget_usd"] {
+            for tiny in ["1e-9", "0.0000004", "0.0000006"] {
+                let error = project("", &format!("{key} = {tiny}"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(&format!("policy.{key}")) && error.contains("at least 0.000001"),
+                    "{key} = {tiny}: {error}"
+                );
+            }
+        }
+        let smallest = project(
+            "",
+            "resolver_budget_usd = 0.000001\nticket_budget_usd = 0.000001",
+        )
+        .unwrap();
+        assert_eq!(smallest.policy.resolver().ceiling_micros, Some(1));
+        assert_eq!(smallest.policy.ticket_budget_micros(), Some(1));
+    }
+
+    /// OWL-378: the ticket budget is optional, a positive number of dollars,
+    /// and does not stand in for the ceiling `"unlimited"` needs.
+    #[test]
+    fn the_ticket_budget_is_optional_and_checked() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.policy.ticket_budget_micros(), None);
+        assert!(!absent.render().contains("ticket_budget"));
+        let set = project("", "ticket_budget_usd = 100").unwrap();
+        assert_eq!(set.policy.ticket_budget_micros(), Some(100_000_000));
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+        for bad in ["0", "-1.5", "nan", "inf", "\"5\""] {
+            let error = project("", &format!("ticket_budget_usd = {bad}"))
                 .unwrap_err()
                 .to_string();
-            assert!(
-                error.contains("policy.resolver_budget_usd") && error.contains("at least 0.000001"),
-                "{tiny}: {error}"
-            );
+            assert!(error.contains("ticket_budget_usd"), "{bad}: {error}");
         }
-        let smallest = project("", "resolver_budget_usd = 0.000001").unwrap();
-        assert_eq!(smallest.policy.resolver().ceiling_micros, Some(1));
+        let error = project(
+            "",
+            "resolver_passes = \"unlimited\"\nticket_budget_usd = 100",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("policy.resolver_budget_usd"), "{error}");
     }
 
     /// A project file whose `[tracker]` admits by `admit` and adds `extra`.

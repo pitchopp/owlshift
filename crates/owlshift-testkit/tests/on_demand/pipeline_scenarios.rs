@@ -581,6 +581,14 @@ fn scenario_a_standard_ticket_walks_to_its_merge_through_a_review_loop() {
         ],
         "Design review's two, then Verify's critic alone, holding conformance"
     );
+    // Every run of the ticket is counted once in its spend, whatever its
+    // role and command (OWL-378).
+    let started = events
+        .iter()
+        .filter(|event| event.kind == EventKind::RunStarted)
+        .count();
+    let cost = bench.record().cost.expect("cost.json");
+    assert_eq!(usize::try_from(cost.runs).unwrap(), started);
     let kept = bench.record().plan.expect("plan.json");
     let builds = bench.briefs_of(Role::Build);
     for build in &builds {

@@ -313,7 +313,8 @@ impl fmt::Display for Effective {
             f.write_str("No configuration value is set.\n")?;
         }
         self.write_always_human(f)?;
-        self.write_resolver(f)
+        self.write_resolver(f)?;
+        self.write_budget(f)
     }
 }
 
@@ -396,6 +397,22 @@ impl Effective {
         match policy.and_then(|p| p.resolver_budget_usd) {
             Some(usd) => writeln!(f, "  resolver_budget_usd = {}  ({})", usd.0, source(true)),
             None => writeln!(f, "  resolver_budget_usd: none, no ceiling  (default)"),
+        }
+    }
+
+    /// The budget on one ticket's runs (OWL-378), with the file it comes
+    /// from, or `default`: none.
+    fn write_budget(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\nbudget (what one ticket's runs may cost):\n")?;
+        match self
+            .resolver()
+            .1
+            .and_then(|(path, policy)| policy.ticket_budget_usd.map(|usd| (path, usd)))
+        {
+            Some((path, usd)) => {
+                writeln!(f, "  ticket_budget_usd = {}  ({})", usd.0, path.display())
+            }
+            None => writeln!(f, "  ticket_budget_usd: none, no budget  (default)"),
         }
     }
 }
@@ -482,6 +499,7 @@ mod tests {
             "  resolver_delegation = \"discoverable\"  (default)".to_owned(),
             "  resolver_passes = 5  (default)".to_owned(),
             "  resolver_budget_usd: none, no ceiling  (default)".to_owned(),
+            "  ticket_budget_usd: none, no budget  (default)".to_owned(),
             "  scope  (delegation level discoverable)".to_owned(),
             "  money  (delegation level discoverable)".to_owned(),
             "  security  (floor)".to_owned(),
@@ -491,12 +509,13 @@ mod tests {
 
         let all = shown(
             "always_human = [\"money\"]\nresolver_delegation = \"all\"\n\
-             resolver_passes = \"unlimited\"\nresolver_budget_usd = 2.5",
+             resolver_passes = \"unlimited\"\nresolver_budget_usd = 2.5\nticket_budget_usd = 100",
         );
         for line in [
             format!("  resolver_delegation = \"all\"  ({path})"),
             format!("  resolver_passes = \"unlimited\"  ({path})"),
             format!("  resolver_budget_usd = 2.5  ({path})"),
+            format!("  ticket_budget_usd = 100  ({path})"),
             "  security  (floor)".to_owned(),
             "  irreversible  (floor)".to_owned(),
             format!("  money  ({path})"),

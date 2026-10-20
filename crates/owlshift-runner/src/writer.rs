@@ -77,6 +77,7 @@ use owlshift_contracts::review::{
 };
 use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
+use owlshift_core::gate::BudgetReached;
 use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status};
 use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
 
@@ -1164,6 +1165,13 @@ impl QuestionsComment {
                                           they are asked here too."
                     .to_owned(),
                 (Fallback::CostUnreported, Some(clause)) => format!("{clause}, and {left}."),
+                // The ticket parks before its next run (OWL-378): the
+                // decider learns now that an answer alone does not go on.
+                (Fallback::TicketBudget(_), Some(clause)) => format!(
+                    "{clause}, so {left}. Once you answer, the ticket stops for its budget \
+                     until a person types {}, which counts its runs afresh.",
+                    code(&format!("owlshift continue {}", self.ticket))
+                ),
                 (_, Some(clause)) => format!("{clause}, so {left}."),
                 (_, None) => format!("Owlshift's resolver stopped, so {left}."),
             });
@@ -1414,7 +1422,35 @@ fn bound_clause(fallback: Fallback) -> Option<String> {
              dollar ceiling (`policy.resolver_budget_usd`) could not be checked"
                 .to_owned(),
         ),
+        Fallback::TicketBudget(reached) => {
+            Some(format!("This ticket's runs {}", budget_figures(reached)))
+        }
     }
+}
+
+/// What a ticket's runs cost against its budget (OWL-378), after "runs":
+/// the spend the budget counts, the budget, and how many runs reported no
+/// cost, which count nothing, when some did.
+fn budget_figures(reached: BudgetReached) -> String {
+    let mut text = format!(
+        "cost {} USD since it started or was last restarted, which reached its budget of {} USD \
+         (`policy.ticket_budget_usd`)",
+        usd(reached.spent_micros),
+        usd(reached.budget_micros)
+    );
+    match reached.unreported {
+        0 => {}
+        1 => text.push_str("; 1 of its runs reported no cost and counts for nothing"),
+        n => text.push_str(&format!(
+            "; {n} of its runs reported no cost and count for nothing"
+        )),
+    }
+    text
+}
+
+/// The PARKED comment's detail for a ticket parked at its budget (OWL-378).
+pub fn budget_line(reached: BudgetReached) -> String {
+    format!("Its runs {}.", budget_figures(reached))
 }
 
 /// Who took the decisions of a DECISION comment.
@@ -3095,7 +3131,8 @@ impl ParkedComment {
             | ParkReason::Blocked
             | ParkReason::FixPasses
             | ParkReason::Repairs
-            | ParkReason::Forge => vec![Fit::capped(
+            | ParkReason::Forge
+            | ParkReason::TicketBudget => vec![Fit::capped(
                 flatten(&self.detail),
                 LONGER,
                 PARKED_DETAIL_CHARS,
@@ -3139,6 +3176,13 @@ impl ParkedComment {
                  on that machine: no other ticket of it is continued, taken in or built either.",
                 park_reason(self.reason)
             )),
+            ParkReason::TicketBudget => {
+                sections.push(format!(
+                    "Parked: {}. {}",
+                    park_reason(self.reason),
+                    texts[0]
+                ));
+            }
             ParkReason::FailedRuns
             | ParkReason::Blocked
             | ParkReason::FixPasses
@@ -3164,6 +3208,12 @@ impl ParkedComment {
             (ParkReason::Reasks, _) => format!(
                 "**To restart it:** answer the questions still open here, then run \
                  {continue_cmd}."
+            ),
+            // OWL-378: the restart counts the budget afresh.
+            (ParkReason::TicketBudget, Restart::Continue) => format!(
+                "**To restart it:** answer the questions it waits for, if any, then run \
+                 {continue_cmd}: its budget then counts its runs afresh. Raising \
+                 `policy.ticket_budget_usd` in owlshift.toml raises every ticket's."
             ),
             (_, Restart::Continue) => format!("**To restart it:** run {continue_cmd}."),
             (_, Restart::Do) => format!(
@@ -3339,6 +3389,7 @@ pub fn park_reason(reason: ParkReason) -> &'static str {
         ParkReason::FixPasses => "the pull request stayed red after its fix passes",
         ParkReason::Repairs => "the pull request reached its limit of repairs",
         ParkReason::Forge => "the forge blocks the pull request",
+        ParkReason::TicketBudget => "the ticket's runs reached its budget",
     }
 }
 
@@ -5850,6 +5901,20 @@ Context.
                 Some(Fallback::CostUnreported),
                 "A resolver run since this command started reported no cost, so this project's \
                  dollar ceiling",
+            ),
+            // The ticket's budget, two of its runs without a cost (OWL-378).
+            (
+                1,
+                Some(Fallback::TicketBudget(BudgetReached {
+                    spent_micros: 5_100_000,
+                    budget_micros: 5_000_000,
+                    unreported: 2,
+                })),
+                "This ticket's runs cost 5.10 USD since it started or was last restarted, which \
+                 reached its budget of 5.00 USD (`policy.ticket_budget_usd`); 2 of its runs \
+                 reported no cost and count for nothing, so the rest of this run's questions come \
+                 to you. Once you answer, the ticket stops for its budget until a person types \
+                 `owlshift continue OWL-18`, which counts its runs afresh.",
             ),
         ] {
             let body = round(decided, fallback);

@@ -11,7 +11,7 @@ use owlshift_adapters::forge::Repo as ForgeRepo;
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{PersistedState, TicketDelivery, TicketQuestions};
+use owlshift_contracts::refs::{PersistedState, TicketCost, TicketDelivery, TicketQuestions};
 use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::executor::Git;
@@ -108,7 +108,16 @@ fn record(state: &str, round: u32) -> TicketRecord {
         intake: None,
         plan: None,
         review: None,
+        cost: None,
     }
+}
+
+/// What three runs cost, one restart after the first (OWL-378).
+fn ticket_cost() -> TicketCost {
+    TicketCost::parse(
+        r#"{"format":1,"runs":3,"unreported_runs":1,"spent_micros":2750000,"restarted_at_micros":2500000}"#,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -193,7 +202,31 @@ fn a_ticket_ref_round_trips_keeps_other_files_and_moves_only_from_where_it_was_r
     };
     let seven = ticket_ref::write(&repo.git, &repo.root, &ticket(), &planned, Some(&six)).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().record, planned);
-    ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&seven)).unwrap();
+    let eight = ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&seven)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, second);
+
+    // So is what the ticket's runs cost (OWL-378): a second write replaces
+    // the file, never keeping a stale one beside it.
+    let costed = TicketRecord {
+        cost: Some(ticket_cost()),
+        ..second.clone()
+    };
+    let nine = ticket_ref::write(&repo.git, &repo.root, &ticket(), &costed, Some(&eight)).unwrap();
+    let mut more = ticket_cost();
+    more.runs += 1;
+    more.spent_micros += 1_000_000;
+    let recosted = TicketRecord {
+        cost: Some(more),
+        ..second.clone()
+    };
+    let ten = ticket_ref::write(&repo.git, &repo.root, &ticket(), &recosted, Some(&nine)).unwrap();
+    assert_eq!(repo.read().unwrap().unwrap().record, recosted);
+    let listed = repo.git(&["ls-tree", "--name-only", &ten]);
+    assert_eq!(
+        listed.lines().filter(|name| *name == "cost.json").count(),
+        1
+    );
+    ticket_ref::write(&repo.git, &repo.root, &ticket(), &second, Some(&ten)).unwrap();
     assert_eq!(repo.read().unwrap().unwrap().record, second);
 }
 
@@ -219,7 +252,7 @@ fn an_invalid_plan_or_review_makes_the_ref_unreadable() {
     let state = repo.blob(r#"{"format":2,"stage":"design","round":0,"reasks":0,"failed_runs":0}"#);
     let questions = repo.blob(&TicketQuestions::new().render());
     let broken = repo.blob("{");
-    for file in ["plan.json", "review.json"] {
+    for file in ["plan.json", "review.json", "cost.json"] {
         repo.plant(&[
             ("100644", &state, "state.json"),
             ("100644", &questions, "questions.json"),
@@ -266,6 +299,7 @@ fn record_of(len: usize) -> TicketRecord {
             intake: None,
             plan: None,
             review: None,
+            cost: None,
         }
     };
     let base = with(1).questions.render().len();
@@ -375,12 +409,14 @@ fn kept_everything() -> TicketRecord {
         intake: Some(intake()),
         plan: Some(ticket_plan()),
         review: Some(ticket_review()),
+        // Forgetting keeps what the runs cost (OWL-378).
+        cost: Some(ticket_cost()),
     }
 }
 
-/// What forgetting a record of `round` whose questions are `questions`
-/// leaves (OWL-202).
-fn forgotten(round: u32, questions: &TicketQuestions) -> TicketRecord {
+/// What forgetting a record of `round` whose questions are `questions` and
+/// whose runs cost `cost` leaves (OWL-202, OWL-378).
+fn forgotten(round: u32, questions: &TicketQuestions, cost: Option<TicketCost>) -> TicketRecord {
     TicketRecord {
         state: PersistedState::parse(&format!(
             r#"{{"format":2,"stage":"ready","round":{round},"reasks":0,"failed_runs":0}}"#
@@ -395,6 +431,7 @@ fn forgotten(round: u32, questions: &TicketQuestions) -> TicketRecord {
         intake: None,
         plan: None,
         review: None,
+        cost,
     }
 }
 
@@ -425,7 +462,7 @@ fn forget_keeps_the_round_count_and_the_refusals_and_drops_the_rest() {
         (
             old.as_str(),
             Previous::Read(Box::new(waiting.clone())),
-            &forgotten(1, &waiting.questions)
+            &forgotten(1, &waiting.questions, waiting.cost.clone())
         )
     );
     assert!(kept.questions.build_refusal.is_some() && kept.questions.resolver_refusal.is_some());
@@ -481,23 +518,28 @@ fn forget_salvages_a_broken_record_and_deletes_a_ref_that_is_no_commit() {
     );
     assert_eq!(
         (previous.as_str(), &kept),
-        (planted.as_str(), &forgotten(3, &TicketQuestions::new()))
+        (
+            planted.as_str(),
+            &forgotten(3, &TicketQuestions::new(), None)
+        )
     );
     assert_eq!(repo.read().unwrap().unwrap().commit, commit);
 
-    // A `state.json` that does not parse, beside a `questions.json` that
-    // does: round 0, the refusals kept.
+    // A `state.json` that does not parse, beside a `questions.json` and a
+    // `cost.json` that do: round 0, the refusals and the cost kept.
     let everything = kept_everything().questions;
     let questions = repo.blob(&everything.render());
+    let cost = repo.blob(&ticket_cost().render());
     let broken = repo.blob("{}");
     repo.plant(&[
         ("100644", &broken, "state.json"),
         ("100644", &questions, "questions.json"),
+        ("100644", &cost, "cost.json"),
     ]);
     let Some(Forgot::Rewritten { kept, .. }) = forget().unwrap() else {
         panic!("not salvaged");
     };
-    assert_eq!(kept, forgotten(0, &everything));
+    assert_eq!(kept, forgotten(0, &everything, Some(ticket_cost())));
 
     // A symbolic ref goes, and the ref it points to stays.
     let other = TicketId::new("DEMO-2").unwrap();
@@ -590,7 +632,8 @@ fn forget_holds_the_project_lock_and_says_what_it_dropped() {
          decision of the resolver, what the last answer check read, its intake record (the drain \
          runs intake again) and its state, waiting for the answers of round 1: those questions \
          are abandoned",
-        "; kept round 1 (the next round is 2), Build's held refusal and the resolver's refusal.",
+        "; kept round 1 (the next round is 2), Build's held refusal, the resolver's refusal and \
+         what its runs cost, against its budget.",
         &format!("refs/owlshift/tickets/DEMO-1 now points to {commit}, whose parent {old}"),
         "its stage on the tracker moves at the next `owlshift do DEMO-1`",
     ] {

@@ -198,6 +198,109 @@ impl Chain {
     }
 }
 
+/// What one ticket's runs cost (OWL-378, architecture section 4, "Ticket
+/// budget"): every run the runner starts for it, counted once as it ends,
+/// whatever its role or command. The whole spend is kept for the record; a
+/// person's restart moves the point the budget counts from
+/// ([`TicketSpend::restarted`]), never the whole. The runner keeps it in the
+/// ticket ref; the core does no I/O.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TicketSpend {
+    runs: u32,
+    unreported: u32,
+    spent_micros: u64,
+    restarted_at_micros: u64,
+}
+
+impl TicketSpend {
+    /// A spend from its kept parts: `None` when they contradict each other,
+    /// more runs without a cost than runs, or a restart past the whole.
+    pub fn restore(
+        runs: u32,
+        unreported: u32,
+        spent_micros: u64,
+        restarted_at_micros: u64,
+    ) -> Option<Self> {
+        (unreported <= runs && restarted_at_micros <= spent_micros).then_some(Self {
+            runs,
+            unreported,
+            spent_micros,
+            restarted_at_micros,
+        })
+    }
+
+    /// The runs counted.
+    pub const fn runs(self) -> u32 {
+        self.runs
+    }
+
+    /// The runs counted that reported no cost, each of which added nothing:
+    /// the spend is then a floor.
+    pub const fn unreported(self) -> u32 {
+        self.unreported
+    }
+
+    /// What every run counted cost, in millionths of a dollar.
+    pub const fn spent_micros(self) -> u64 {
+        self.spent_micros
+    }
+
+    /// The spend when a person last restarted the ticket, 0 before any
+    /// restart.
+    pub const fn restarted_at_micros(self) -> u64 {
+        self.restarted_at_micros
+    }
+
+    /// What the budget counts: the spend since the last restart.
+    pub const fn counted_micros(self) -> u64 {
+        self.spent_micros.saturating_sub(self.restarted_at_micros)
+    }
+
+    /// One more run, with its reported cost in dollars: `None`, or a cost
+    /// that is negative or not a finite number, adds nothing and counts the
+    /// run as unreported. Unlike a chain's ceiling, which a resolver run
+    /// without a cost ends ([`ChainEnd::CostUnreported`]), the budget goes
+    /// on: a run cut off at its deadline reports none, and the failed-run
+    /// breaker bounds those.
+    pub fn ran(&mut self, cost_usd: Option<f64>) {
+        self.runs = self.runs.saturating_add(1);
+        match cost_usd.and_then(usd_micros) {
+            Some(cost) => self.spent_micros = self.spent_micros.saturating_add(cost),
+            None => self.unreported = self.unreported.saturating_add(1),
+        }
+    }
+
+    /// A person restarted the ticket: the budget counts from here.
+    pub fn restarted(&mut self) {
+        self.restarted_at_micros = self.spent_micros;
+    }
+
+    /// Whether what the budget counts reached `budget_micros`: at or above
+    /// it, no run of the ticket starts.
+    pub const fn reached(self, budget_micros: u64) -> Option<BudgetReached> {
+        let spent = self.counted_micros();
+        if spent >= budget_micros {
+            Some(BudgetReached {
+                spent_micros: spent,
+                budget_micros,
+                unreported: self.unreported,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// A ticket's budget reached ([`TicketSpend::reached`]): what its runs cost
+/// since the last restart, the budget, both in millionths of a dollar, and
+/// how many of its runs reported no cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BudgetReached {
+    pub spent_micros: u64,
+    pub budget_micros: u64,
+    pub unreported: u32,
+}
+
 /// Why a chain ends, the next run's questions going to the decider without
 /// the resolver ([`GatePolicy::chain_end`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -770,6 +873,44 @@ mod tests {
         assert_eq!(chain.asking_cost(), ChainCost::Unreported);
         assert_eq!(chain.cost(), ChainCost::Known(300_000));
         assert_eq!(policy.chain_end(chain), None);
+    }
+
+    /// A ticket's spend (OWL-378): every run counted, one without a cost
+    /// adding nothing but counted apart; the budget reached at or above it,
+    /// counted from the last restart, the whole kept; parts that contradict
+    /// each other refused.
+    #[test]
+    fn a_ticket_spend_counts_every_run_and_its_budget_from_the_last_restart() {
+        let mut spend = TicketSpend::default();
+        assert_eq!(spend.reached(1), None);
+        spend.ran(Some(2.0));
+        spend.ran(None);
+        spend.ran(Some(f64::NAN));
+        spend.ran(Some(1.0));
+        assert_eq!((spend.runs(), spend.unreported()), (4, 2));
+        assert_eq!(spend.spent_micros(), 3_000_000);
+        assert_eq!(spend.reached(3_000_001), None);
+        let reached = |spent_micros, budget_micros| BudgetReached {
+            spent_micros,
+            budget_micros,
+            unreported: 2,
+        };
+        assert_eq!(
+            spend.reached(3_000_000),
+            Some(reached(3_000_000, 3_000_000))
+        );
+        spend.restarted();
+        assert_eq!(spend.counted_micros(), 0);
+        assert_eq!(spend.reached(3_000_000), None);
+        spend.ran(Some(0.5));
+        assert_eq!(spend.spent_micros(), 3_500_000);
+        assert_eq!(spend.reached(500_000), Some(reached(500_000, 500_000)));
+        assert_eq!(
+            TicketSpend::restore(5, 2, 3_500_000, 3_000_000),
+            Some(spend)
+        );
+        assert_eq!(TicketSpend::restore(1, 2, 0, 0), None);
+        assert_eq!(TicketSpend::restore(1, 0, 1, 2), None);
     }
 
     /// The roles that took recommendations at the bound, each once and on
