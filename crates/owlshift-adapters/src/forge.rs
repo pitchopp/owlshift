@@ -380,6 +380,34 @@ impl CheckSet {
     }
 }
 
+/// An open pull request of the repository, as the in-flight set reads it
+/// (OWL-410; architecture section 5, "The in-flight set", 2): whoever opened
+/// it, a draft included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenPullRequest {
+    pub number: u64,
+    /// The name of its head branch, in whichever repository it lives.
+    pub head_branch: String,
+    /// The commit its head pointed to when read.
+    pub head: CommitId,
+    /// The branch it merges into, and that branch's commit when read.
+    pub base_branch: String,
+    pub base: CommitId,
+    pub draft: bool,
+    /// How many files GitHub says it changes.
+    pub changed_files: u64,
+}
+
+/// The files a pull request changes (OWL-410).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PullFiles {
+    /// Every file, both paths of a rename, each once, sorted.
+    Listed(Vec<String>),
+    /// More than the forge lists, or more than a read holds: the whole
+    /// repository, since what cannot be read whole is never taken as free.
+    Whole,
+}
+
 /// What a token reads of a repository's default branch (OWL-334): a pull
 /// request opens only on refs the token can read.
 #[derive(Clone, Debug, PartialEq, Eq)]

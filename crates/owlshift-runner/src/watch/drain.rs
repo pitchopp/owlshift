@@ -52,6 +52,7 @@ use owlshift_core::vocab::Stage;
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Watch};
 use crate::events::{EventSink, data};
 use crate::held;
+use crate::in_flight::{self, Kind};
 use crate::on_demand::{self, delivery_followed};
 use crate::quarantine::Held;
 use crate::ticket_ref::{self, RefAt, Stored, text_sha256};
@@ -206,7 +207,7 @@ fn text_state(read: Result<Option<StateType>, Error>) -> BlockerState {
 }
 
 /// What a waiting reason says on watch's line.
-fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
+fn said(wait: &Wait<String>, exclude: Option<&str>, kinds: &HashMap<String, Kind>) -> String {
     let list = |ids: &[String]| ids.join(", ");
     match wait {
         Wait::Duplicate => "the column lists it twice; the first is taken".to_owned(),
@@ -243,10 +244,13 @@ fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
             "the project's slot is held by {} (`owlshift doctor` says how to clear a stale one)",
             list(ids)
         ),
-        Wait::Collision(found) => format!(
-            "{} holds {}, which it would touch: it goes once {} no longer holds it",
-            found.holder, found.resource, found.holder
-        ),
+        Wait::Collision(found) => {
+            let holder = in_flight::named(kinds, &found.holder);
+            format!(
+                "{holder} holds {}, which it would touch: it goes once {holder} no longer holds it",
+                found.resource
+            )
+        }
         Wait::RunCap => "every run of this machine is taken".to_owned(),
     }
 }
@@ -388,7 +392,7 @@ impl Watch<'_> {
         .unwrap_or(u32::MAX);
         // What the project's tickets hold from their dispatch until their
         // pull request ends (OWL-403); an unread ref stops every dispatch.
-        let in_flight = refs
+        let mut in_flight: Vec<_> = refs
             .iter()
             .filter(|(_, stored)| held::holds(stored))
             .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
@@ -401,6 +405,21 @@ impl Watch<'_> {
             .children
             .and_then(|c| c.slots())
             .map_or((1, 0), |slots| (slots.count(), slots.held().unwrap_or(0)));
+        // The work in flight outside Owlshift (OWL-410), read when a ticket
+        // could be dispatched; a failed read dispatches nothing.
+        let outside_unread = !tickets.is_empty() && {
+            let ours = refs
+                .iter()
+                .map(|(ticket, stored)| (ticket, Some(stored)))
+                .chain(unread.iter().map(|ticket| (ticket, None)));
+            match self.outside(memory, sink, out, ours) {
+                Ok(holders) => {
+                    holders.join(&mut in_flight, &named);
+                    false
+                }
+                Err(_) => true,
+            }
+        };
         let ready = schedule::ready_set(
             &tickets,
             Caps {
@@ -436,14 +455,22 @@ impl Watch<'_> {
                 continue;
             }
             let mut event = data([("drain", json!("waits")), ("reason", json!(wait.key()))]);
-            if !wait.tickets().is_empty() {
+            if let Wait::Collision(found) = wait {
+                // A pull request or a person's ticket is named as such
+                // (OWL-410).
+                let holder = in_flight::named(&memory.outside.kinds, &found.holder);
+                for (key, value) in holder.data() {
+                    event.insert(key.to_owned(), value);
+                }
+            } else if !wait.tickets().is_empty() {
                 event.insert("tickets".to_owned(), json!(wait.tickets()));
             }
             if let Some(resource) = wait.resource() {
                 event.insert("resource".to_owned(), held::resource_data(resource));
             }
             sink.emit(row.id(), None, EventKind::Decision, event);
-            self.line(out, &format!("{} waits: {}", row.id(), said(wait, exclude)));
+            let reason = said(wait, exclude, &memory.outside.kinds);
+            self.line(out, &format!("{} waits: {reason}", row.id()));
             memory.drain.waits.insert(row.id().clone(), told);
         }
         let Some(id) = ready.dispatch else {
@@ -452,6 +479,9 @@ impl Watch<'_> {
         let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
             return;
         };
+        if outside_unread {
+            return self.wait_for_outside(memory, sink, out, row.id());
+        }
         // Told again if it waits again for a reason it had before.
         memory
             .drain
@@ -467,6 +497,37 @@ impl Watch<'_> {
             return self.tell(memory, sink, out, row.id(), Held::Ready);
         }
         self.dispatch(memory, row.id(), stored.at(), sink, out, continued);
+    }
+
+    /// Tells that `ticket`, which the ready set would dispatch, waits for
+    /// the work in flight outside Owlshift to read (OWL-410): one `decision`
+    /// event (`drain` = `waits`, `reason` = `in_flight_unread`) and one
+    /// line, unless told last.
+    fn wait_for_outside(
+        &self,
+        memory: &mut WatchMemory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+    ) {
+        let told = "in_flight_unread".to_owned();
+        if memory.drain.waits.get(ticket) == Some(&told) {
+            return;
+        }
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Decision,
+            data([("drain", json!("waits")), ("reason", json!(told))]),
+        );
+        self.line(
+            out,
+            &format!(
+                "{ticket} waits: the work in flight outside Owlshift could not be read, and it \
+                 is dispatched once it reads"
+            ),
+        );
+        memory.drain.waits.insert(ticket.clone(), told);
     }
 
     /// The pass's intake: the first candidate, in the core's order, that its

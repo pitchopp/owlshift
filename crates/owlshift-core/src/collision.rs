@@ -32,7 +32,10 @@ pub struct InFlight<K> {
     pub id: K,
     pub dispatched: Dispatched,
     /// Its pull request is open: it never waits, since its repairs are what
-    /// lets it merge, and every ticket not yet delivered waits for it.
+    /// lets it merge, and every ticket not yet delivered waits for it. Work
+    /// Owlshift does not run, another open pull request or a person's
+    /// ticket, is weighed so too (OWL-410): against it, Owlshift's ticket
+    /// waits.
     pub delivered: bool,
     /// What it holds, closed with the named resources its zones and files
     /// reach.
@@ -148,6 +151,17 @@ mod tests {
         assert_eq!(collision(&delivered, std::slice::from_ref(&early)), None);
         let both = flight("OWL-6", Dispatched::At(5), true, &[zone("app")]);
         assert_eq!(collision(&both, std::slice::from_ref(&delivered)), None);
+        // Work outside Owlshift (OWL-410) holds a ticket dispatched before
+        // its own read, and a ticket with an open pull request goes on.
+        let person = flight("OWL-7", Dispatched::Unrecorded, true, &[zone("app/y")]);
+        assert_eq!(
+            collision(&early, std::slice::from_ref(&person)),
+            Some(Collision {
+                holder: "OWL-7",
+                resource: zone("app/y"),
+            })
+        );
+        assert_eq!(collision(&both, std::slice::from_ref(&person)), None);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod gate_once;
 pub mod github_sign_in;
 pub mod github_token;
 pub mod held;
+pub mod in_flight;
 pub mod init;
 pub mod notify;
 pub mod on_demand;

@@ -119,6 +119,7 @@ use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
 use crate::held;
+use crate::in_flight;
 use crate::on_demand::{self, Delivered, OnDemand, PIPELINE, Stop, delivery_followed};
 use crate::pr_reviews;
 use crate::project::{ProjectLock, TicketLock};
@@ -129,6 +130,7 @@ use crate::ticket_ref::{self, Progress, RefAt, RefRead, Stored, TicketRecord};
 use crate::writer::VisibleStage;
 
 mod drain;
+mod outside;
 
 pub use drain::refusal as drain_refusal;
 
@@ -485,6 +487,8 @@ struct Memory<'c> {
     /// pass's snapshot read them (OWL-403): they leave the slot's turn to
     /// the others.
     collisions: HashMap<TicketId, Collision<String>>,
+    /// The work in flight outside Owlshift, as read (OWL-410).
+    outside: outside::OutsideMemory,
     /// The tickets whose answer check watch ran into a stage that needs the
     /// slot, with their ref's progress after it: the tracker may still show
     /// them needs input when the move to working after the RESUME failed.
@@ -501,6 +505,8 @@ enum StepWait {
     Slot(Vec<TicketId>),
     /// A ticket holds what it would touch (OWL-403).
     Collision(Collision<String>),
+    /// The work in flight outside Owlshift could not be read (OWL-410).
+    Unread,
 }
 
 /// What watch knows of one marker: what its [`Record`] says, joined with
@@ -635,6 +641,8 @@ impl Watch<'_> {
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
     ) {
+        // The work outside Owlshift is read again at each pass (OWL-410).
+        memory.outside.new_pass();
         let read = match self.snapshot(memory, sink) {
             Ok(Snapshot {
                 quarantine: Some(marker),
@@ -653,8 +661,10 @@ impl Watch<'_> {
         // read among the unread, which may hold it.
         let mut holding = Vec::new();
         // Which of them a collision holds back before their next stage step
-        // (OWL-403), from what the refs read hold.
-        memory.collisions = self.collisions(&read);
+        // (OWL-403), from what the refs read hold and the work in flight
+        // outside Owlshift (OWL-410).
+        let outside = self.step_holders(memory, sink, out, &read);
+        memory.collisions = self.collisions(&read, outside.as_ref());
         for (ticket, stored) in read {
             let state = stored.and_then(|stored| {
                 TicketState::try_from(&stored.record.state)
@@ -1918,6 +1928,9 @@ impl Watch<'_> {
         // it, a ticket that would touch what another holds waits (OWL-403),
         // told once per holder and resource.
         if shown == VisibleStage::Working {
+            if memory.outside.unread_steps.contains(ticket) {
+                return self.wait_for_unread(memory, sink, out, ticket);
+            }
             if let Some(found) = memory.collisions.get(ticket).cloned() {
                 return self.wait_for_collision(memory, sink, out, ticket, found);
             }
@@ -2130,23 +2143,23 @@ impl Watch<'_> {
         let StepWait::Collision(found) = &told else {
             unreachable!("made a collision's wait above")
         };
-        sink.emit(
-            ticket,
-            None,
-            EventKind::Decision,
-            data([
-                ("watch", json!("waits")),
-                ("reason", json!("collision")),
-                ("tickets", json!([found.holder])),
-                ("resource", held::resource_data(&found.resource)),
-            ]),
-        );
+        // A pull request or a person's ticket is named as such (OWL-410).
+        let holder = in_flight::named(&memory.outside.kinds, &found.holder);
+        let mut event = data([
+            ("watch", json!("waits")),
+            ("reason", json!("collision")),
+            ("resource", held::resource_data(&found.resource)),
+        ]);
+        for (key, value) in holder.data() {
+            event.insert(key.to_owned(), value);
+        }
+        sink.emit(ticket, None, EventKind::Decision, event);
         self.line(
             out,
             &format!(
-                "{ticket} waits: {} holds {}, which it would touch, and its next stage runs once \
-                 {} no longer holds it",
-                found.holder, found.resource, found.holder
+                "{ticket} waits: {holder} holds {}, which it would touch, and its next stage runs \
+                 once {holder} no longer holds it",
+                found.resource
             ),
         );
         memory.waits.insert(ticket.clone(), told);
@@ -2158,19 +2171,29 @@ impl Watch<'_> {
     /// holds ([`held::holds`]), closed with the named resources of the
     /// project file watch loaded. A ref that cannot be read holds no
     /// ticket back here: it stops every stage step already ([`Turn::Unknown`]).
-    fn collisions(&self, read: &[RefRead]) -> HashMap<TicketId, Collision<String>> {
+    /// The work in flight outside Owlshift, `outside`, holds them too, and
+    /// its pull requests' files join the tickets that delivered them
+    /// (OWL-410).
+    fn collisions(
+        &self,
+        read: &[RefRead],
+        outside: Option<&in_flight::Holders>,
+    ) -> HashMap<TicketId, Collision<String>> {
         let named = self
             .on_demand
             .config
             .stack
             .named_resources()
             .unwrap_or_default();
-        let in_flight: Vec<_> = read
+        let mut in_flight: Vec<_> = read
             .iter()
             .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
             .filter(|(_, stored)| held::holds(stored))
             .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
             .collect();
+        if let Some(outside) = outside {
+            outside.join(&mut in_flight, &named);
+        }
         read.iter()
             .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
             .filter(|(_, stored)| holds(stored) && !delivery_followed(stored))
