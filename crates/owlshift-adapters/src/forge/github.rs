@@ -61,6 +61,20 @@ const MAX_REST_BYTES: u64 = 1024 * 1024;
 /// The most items GitHub returns in one page.
 pub const MAX_PAGE: u32 = 100;
 
+/// The most pages of installations, or of one installation's repositories,
+/// read: 10,000 items, past which the answer is taken as malformed.
+pub const MAX_INSTALLATION_PAGES: u32 = 100;
+
+/// An installation of a GitHub App that lists the repository
+/// ([`GitHubForge::app_installation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Installation {
+    pub id: u64,
+    /// Whether it is suspended (`suspended_at` set); what that refuses is
+    /// C16's, not observed on 2026-10-19.
+    pub suspended: bool,
+}
+
 /// A GitHub token: a fine-grained or classic personal access token, or the
 /// output of `gh auth token`. It never shows in `Debug` output.
 #[derive(Clone)]
@@ -556,6 +570,93 @@ impl GitHubForge {
             .filter(|part| !part.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n\n"))
+    }
+
+    /// The installation of the GitHub App `slug` that lists this repository,
+    /// as the user of this adapter's token sees it (C12, 2026-10-19):
+    /// `user/installations`, each installation's `app_slug` against `slug`,
+    /// then its repositories to the last page. GitHub answers a repository
+    /// the app is not installed on as one that does not exist (C15), so only
+    /// this lookup tells them apart. `None` when no installation of the app
+    /// lists it. Pages are read [`MAX_PAGE`] items at a time, at most
+    /// [`MAX_INSTALLATION_PAGES`] of them per list.
+    pub fn app_installation(&self, slug: &str) -> Result<Option<Installation>, Error> {
+        #[derive(Deserialize)]
+        struct Installations {
+            total_count: usize,
+            installations: Vec<RestInstallation>,
+        }
+        #[derive(Deserialize)]
+        struct RestInstallation {
+            id: u64,
+            app_slug: String,
+            #[serde(default)]
+            suspended_at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Repositories {
+            total_count: usize,
+            repositories: Vec<RestRepository>,
+        }
+        #[derive(Deserialize)]
+        struct RestRepository {
+            full_name: String,
+        }
+        let wanted = format!("{}/{}", self.repo.owner(), self.repo.name());
+        let installations = self.every_page(
+            "user/installations",
+            "the GitHub App's installations",
+            |page: Installations| (page.total_count, page.installations),
+        )?;
+        for installation in installations.iter().filter(|i| i.app_slug == slug) {
+            let repositories = self.every_page(
+                &format!("user/installations/{}/repositories", installation.id),
+                "an installation's repositories",
+                |page: Repositories| (page.total_count, page.repositories),
+            )?;
+            if repositories
+                .iter()
+                .any(|r| r.full_name.eq_ignore_ascii_case(&wanted))
+            {
+                return Ok(Some(Installation {
+                    id: installation.id,
+                    suspended: installation.suspended_at.is_some(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every item of the REST list at `path`, page after page until GitHub's
+    /// total is read or a page comes back empty; `split` gives a page's total
+    /// and items.
+    fn every_page<P: DeserializeOwned, T>(
+        &self,
+        path: &str,
+        what: &str,
+        split: impl Fn(P) -> (usize, Vec<T>),
+    ) -> Result<Vec<T>, Error> {
+        let mut items = Vec::new();
+        for page in 1..=MAX_INSTALLATION_PAGES {
+            let mut answer = self.rest(&format!("{path}?per_page={MAX_PAGE}&page={page}"))?;
+            let mut body = String::new();
+            (&mut answer.body)
+                .take(MAX_REST_BYTES)
+                .read_to_string(&mut body)
+                .map_err(|_| invalid(format!("reading {what} failed")))?;
+            // The answer's own words are not repeated.
+            let read: P = serde_json::from_str(&body)
+                .map_err(|_| invalid(format!("unexpected answer for {what} from GitHub")))?;
+            let (total, more) = split(read);
+            let empty = more.is_empty();
+            items.extend(more);
+            if items.len() >= total || empty {
+                return Ok(items);
+            }
+        }
+        Err(invalid(format!(
+            "{what} run past {MAX_INSTALLATION_PAGES} pages"
+        )))
     }
 
     /// One REST read: a successful answer, or the error its status says.
@@ -2158,5 +2259,103 @@ mod tests {
             ErrorKind::NotFound
         );
         assert_eq!(forge.check_run_output(3).unwrap(), "Coverage\n\n71%");
+    }
+
+    /// Answers REST reads by path, each once.
+    struct Paths(Mutex<Vec<(String, u16, String)>>);
+
+    impl Transport for Paths {
+        fn send(&self, _: &Value) -> Result<Response, String> {
+            Err("no GraphQL here".to_owned())
+        }
+
+        fn get(&self, path: &str) -> Result<RestAnswer, String> {
+            let mut answers = self.0.lock().unwrap();
+            let at = answers
+                .iter()
+                .position(|(p, _, _)| p == path)
+                .unwrap_or_else(|| panic!("unexpected read of {path}"));
+            let (_, status, body) = answers.remove(at);
+            Ok(RestAnswer::new(status, body))
+        }
+    }
+
+    fn paths(answers: &[(&str, u16, &str)]) -> GitHubForge {
+        let answers = answers
+            .iter()
+            .map(|(p, s, b)| ((*p).to_owned(), *s, (*b).to_owned()))
+            .collect();
+        GitHubForge::with_transport(
+            Paths(Mutex::new(answers)),
+            Repo::parse("Owner/Repo").unwrap(),
+        )
+    }
+
+    const INSTALLATIONS: &str = "user/installations?per_page=100&page=1";
+
+    /// C12: the app's installations by slug, each one's repositories to the
+    /// last page; another app's installation is not read.
+    #[test]
+    fn the_apps_installation_is_found_by_slug_then_by_repository() {
+        let two = r#"{"total_count":2,"installations":[{"id":7,"app_slug":"other-app"},{"id":9,"app_slug":"owl-shift","suspended_at":null}]}"#;
+        let others: Vec<String> = (0..100)
+            .map(|i| format!(r#"{{"full_name":"owner/other{i}"}}"#))
+            .collect();
+        let first = format!(
+            r#"{{"total_count":101,"repositories":[{}]}}"#,
+            others.join(",")
+        );
+        let forge = paths(&[
+            (INSTALLATIONS, 200, two),
+            (
+                "user/installations/9/repositories?per_page=100&page=1",
+                200,
+                &first,
+            ),
+            (
+                "user/installations/9/repositories?per_page=100&page=2",
+                200,
+                r#"{"total_count":101,"repositories":[{"full_name":"owner/repo"}]}"#,
+            ),
+        ]);
+        assert_eq!(
+            forge.app_installation("owl-shift").unwrap(),
+            Some(Installation {
+                id: 9,
+                suspended: false
+            })
+        );
+
+        // Not listed by the app's installation, or no installation at all.
+        let forge = paths(&[
+            (INSTALLATIONS, 200, two),
+            (
+                "user/installations/9/repositories?per_page=100&page=1",
+                200,
+                r#"{"total_count":0,"repositories":[]}"#,
+            ),
+        ]);
+        assert_eq!(forge.app_installation("owl-shift").unwrap(), None);
+        let forge = paths(&[(
+            INSTALLATIONS,
+            200,
+            r#"{"total_count":0,"installations":[]}"#,
+        )]);
+        assert_eq!(forge.app_installation("owl-shift").unwrap(), None);
+    }
+
+    /// A refused token is told apart; an answer that does not read repeats
+    /// none of itself.
+    #[test]
+    fn an_installation_lookup_that_fails_says_why_in_owlshifts_words() {
+        let forge = paths(&[(INSTALLATIONS, 401, r#"{"message":"Bad credentials"}"#)]);
+        assert_eq!(
+            forge.app_installation("owl-shift").unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        let forge = paths(&[(INSTALLATIONS, 200, r#"{"installations":"ghu_SENTINEL"}"#)]);
+        let error = forge.app_installation("owl-shift").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert!(!error.message.contains("SENTINEL"), "{error}");
     }
 }

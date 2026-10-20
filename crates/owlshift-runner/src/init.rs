@@ -207,7 +207,9 @@ pub const LINEAR_KEY: SecretSpec = SecretSpec {
     help: "a personal API key, created in Linear's settings under Security & access",
 };
 
-/// The GitHub token.
+/// The personal GitHub token: since OWL-336 the expert option, asked for
+/// only with `--github-token`; otherwise `init` signs in through the GitHub
+/// App ([`crate::github_sign_in`]).
 pub const GITHUB_TOKEN: SecretSpec = SecretSpec {
     account: GITHUB_ACCOUNT,
     per_project: true,

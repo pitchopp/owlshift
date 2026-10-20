@@ -62,15 +62,14 @@ impl GitHubApp {
     }
 }
 
-/// What the GitHub token must allow, as `owlshift init` tells its user.
-/// Contents (read) lets GitHub read the branches a pull request is opened on
+/// What the personal GitHub token of the expert option must allow, as
+/// `owlshift init --github-token` tells its user (OWL-336). Contents (read) lets GitHub read the branches a pull request is opened on
 /// (OWL-334): without it, `createPullRequest` answers "not all refs are
 /// readable". Actions (read) lets watch read a red check's job log for its
 /// fix run (OWL-112): GitHub documents it, and live check (c) of the build
 /// plan is still to confirm it with a stored token.
 pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (write), contents, \
-     checks, commit statuses, actions and metadata (read) on the project's repository; the \
-     output of `gh auth token` also works";
+     checks, commit statuses, actions and metadata (read) on the project's repository";
 
 /// The GitHub adapter for `repo`, with the token `found`: `owlshift do`
 /// opens the pull request and reads the check set the
@@ -90,6 +89,12 @@ fn github_at(
     repo: Repo,
     now: Timestamp,
 ) -> Result<GitHubForge, String> {
+    token_at(found, now).map(|token| GitHubForge::new(token, repo))
+}
+
+/// The token [`github`] sends for `found` at the instant `now`, by the same
+/// rules; `owlshift init` tries a stored app token with it (GA2).
+pub(crate) fn token_at(found: &ForgeSecret<Secret>, now: Timestamp) -> Result<Token, String> {
     let sign_in_again = |what: &str| {
         format!(
             "the GitHub App's token under service `{SERVICE}`, account `{}`, {what}: run \
@@ -104,11 +109,9 @@ fn github_at(
             if token.expired(now) {
                 return Err(sign_in_again("has expired"));
             }
-            Ok(GitHubForge::new(Token::new(token.access()), repo))
+            Ok(Token::new(token.access()))
         }
-        (Some(token), ForgeKind::Personal) => {
-            Ok(GitHubForge::new(Token::new(token.expose()), repo))
-        }
+        (Some(token), ForgeKind::Personal) => Ok(Token::new(token.expose())),
         (None, _) => Err(format!(
             "no GitHub token in the system keychain: run `owlshift init` in a terminal, or \
              store one under service `{SERVICE}`, account `{}`",
