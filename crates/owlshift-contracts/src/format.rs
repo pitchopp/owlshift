@@ -98,6 +98,9 @@ pub const PLAN_FORMAT: u32 = 1;
 /// The format version of a ticket's review record (`review.json` on a ticket
 /// ref, OWL-300).
 pub const REVIEW_FORMAT: u32 = 1;
+/// The format version of what a ticket's runs cost (`cost.json` on a ticket
+/// ref, OWL-378).
+pub const COST_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
 

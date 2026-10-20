@@ -91,8 +91,8 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{FindingId, QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
     self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest,
-    KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketDelivery,
-    TicketQuestions, cut_reason, cut_to,
+    KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketCost,
+    TicketDelivery, TicketQuestions, cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
@@ -101,7 +101,7 @@ use owlshift_contracts::result::{
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
-use owlshift_core::gate::{Chain, ChainCost, GatePolicy};
+use owlshift_core::gate::{BudgetReached, Chain, ChainCost, GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::Resource;
 use owlshift_core::routing::{
@@ -1131,6 +1131,12 @@ struct Prepared {
     /// architecture section 5, "One step a pass"): it stops with
     /// [`Stop::Stepped`] at the next change of stage, its state kept.
     stepping: bool,
+    /// What the ticket's runs cost (OWL-378), as the ticket ref keeps it,
+    /// plus each run of this command as it ends ([`OnDemand::execute`]):
+    /// every write of the ref carries it, as `intake`, but none is made for
+    /// it alone ([`OnDemand::store_proposing`]). A ticket without a ref
+    /// holds it here until a write makes one.
+    cost: TicketSpend,
     /// A Build run of this delivery already integrated late comments
     /// (OWL-139), here or at an earlier step ([`Carried::integrated`]): a
     /// further late comment opens a round instead.
@@ -1246,15 +1252,24 @@ fn run_cost(ran: &Ran) -> Option<f64> {
     ran.report.usage.as_ref().and_then(|usage| usage.cost_usd)
 }
 
+/// An amount in millionths of a dollar, as an event gives it: dollars.
+fn dollars(micros: u64) -> Value {
+    json!(micros as f64 / 1_000_000.0)
+}
+
 /// Adds to a resolver `gate` event what the chain's runs cost so far
 /// (OWL-376): `resolver_spent_usd`, the resolver runs' against the
 /// project's ceiling, `ceiling_usd` when a ceiling is set, and
 /// `asking_spent_usd`, the asking runs whose questions reached the
 /// resolver, not every run of the chain, measured and never bounded; each
 /// `null` once one of its runs reported no cost. The figures are the
-/// chain's: they start again at each stop.
-fn add_spend(event: &mut Data, chain: Chain, policy: &GatePolicy) {
-    let dollars = |micros: u64| json!(micros as f64 / 1_000_000.0);
+/// chain's: they start again at each stop. Then the ticket's (OWL-378):
+/// `ticket_spent_usd`, what every run of the ticket cost, and
+/// `ticket_unreported_runs`, how many reported no cost; with a budget,
+/// `ticket_budget_usd` and `budget_spent_usd`, what the budget counts, the
+/// spend since the ticket's last restart.
+fn add_spend(event: &mut Data, p: &Prepared, budget: Option<u64>) {
+    let (chain, policy, cost) = (p.chain, &p.policy, p.cost);
     let spent = |cost| match cost {
         ChainCost::Known(micros) => dollars(micros),
         ChainCost::Unreported => json!(null),
@@ -1263,6 +1278,18 @@ fn add_spend(event: &mut Data, chain: Chain, policy: &GatePolicy) {
     event.insert("asking_spent_usd".to_owned(), spent(chain.asking_cost()));
     if let Some(ceiling) = policy.resolver().ceiling_micros {
         event.insert("ceiling_usd".to_owned(), dollars(ceiling));
+    }
+    event.insert("ticket_spent_usd".to_owned(), dollars(cost.spent_micros()));
+    event.insert(
+        "ticket_unreported_runs".to_owned(),
+        json!(cost.unreported()),
+    );
+    if let Some(budget) = budget {
+        event.insert("ticket_budget_usd".to_owned(), dollars(budget));
+        event.insert(
+            "budget_spent_usd".to_owned(),
+            dollars(cost.counted_micros()),
+        );
     }
 }
 
@@ -1505,6 +1532,9 @@ impl OnDemand<'_> {
                 Ok(Transition::To(state)) => state,
                 other => return Err(core_error(other)),
             };
+            // The person's restart counts the ticket's budget afresh
+            // (OWL-378), as it resets the breakers' counts.
+            p.cost.restarted();
             self.keep(&mut p, &state)?;
             sink.emit(
                 ticket,
@@ -1737,6 +1767,11 @@ impl OnDemand<'_> {
                 self.config.pipeline.default,
             )),
             chain: Chain::default(),
+            cost: stored
+                .as_ref()
+                .and_then(|stored| stored.record.cost.as_ref())
+                .and_then(|cost| TicketSpend::try_from(cost).ok())
+                .unwrap_or_default(),
             stored,
             heeded: false,
             repairing: false,
@@ -2431,6 +2466,7 @@ impl OnDemand<'_> {
         gathered: &mut Gathered,
         sink: &mut EventSink<'_>,
     ) -> Result<(Ran, Event), Stop> {
+        self.within_budget(p, state, sink)?;
         let ran = self.execute(p, self.executor, (harness, setup), brief, attempt, sink)?;
         if let Some(gate) = &ran.report.gate {
             gathered.gate_failure = gate.failure.clone();
@@ -2663,8 +2699,11 @@ impl OnDemand<'_> {
         };
         let routed = resolver::route(&p.policy, &raised, asked.direct);
         let all = |fallback| Routing::Ask(Round::of(&raised, &[], asked.reopened, fallback));
+        // The ticket's budget reached (OWL-378): no resolver run starts, and
+        // the round, whoever its questions were for, says so.
+        let budget = self.budget_reached(p).map(Fallback::from);
         if routed.to_resolver.is_empty() {
-            return Ok(all(None));
+            return Ok(all(budget));
         }
         let resolved_event = |outcome: &str, run: Option<&str>, decided: &[QuestionId]| {
             let given: Vec<QuestionId> = routed.to_resolver.iter().map(|q| q.id.clone()).collect();
@@ -2686,10 +2725,9 @@ impl OnDemand<'_> {
         };
         // The asking run's cost is measured, then the bound, which only the
         // resolver runs' cost reaches (OWL-376), is checked before the
-        // resolver runs (OWL-328).
+        // resolver runs (OWL-328), the ticket's budget first (OWL-378).
         p.chain.asked(asked.cost);
-        if let Some(end) = p.policy.chain_end(p.chain) {
-            let fallback = Fallback::from(end);
+        if let Some(fallback) = budget.or_else(|| p.policy.chain_end(p.chain).map(Fallback::from)) {
             // At `all`, the asking run's recommendations, once per role and
             // chain, instead of the resolver (OWL-375).
             if level == DelegationLevel::All
@@ -2722,7 +2760,7 @@ impl OnDemand<'_> {
                 let mut event = resolved_event(fallback.as_str(), None, &decided_ids);
                 event.insert("recommended".to_owned(), question_ids(&decided_ids));
                 event.insert("unposted".to_owned(), question_ids(&unposted));
-                add_spend(&mut event, p.chain, &p.policy);
+                add_spend(&mut event, p, self.budget());
                 if let Some(reason) = fallback.reason() {
                     event.insert("reason".to_owned(), json!(reason));
                 }
@@ -2734,7 +2772,7 @@ impl OnDemand<'_> {
                 return Ok(Routing::Ask(left));
             }
             let mut event = resolved_event(fallback.as_str(), None, &[]);
-            add_spend(&mut event, p.chain, &p.policy);
+            add_spend(&mut event, p, self.budget());
             if let Some(reason) = fallback.reason() {
                 event.insert("reason".to_owned(), json!(reason));
             }
@@ -2781,7 +2819,7 @@ impl OnDemand<'_> {
             Resolved::Quarantined => None,
             Resolved::Fallback(fallback) => {
                 let mut event = resolved_event(fallback.as_str(), Some(&ran.run), &[]);
-                add_spend(&mut event, p.chain, &p.policy);
+                add_spend(&mut event, p, self.budget());
                 sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
                 return Ok(all(Some(fallback)));
             }
@@ -2841,7 +2879,7 @@ impl OnDemand<'_> {
             ),
         );
         event.insert("unposted".to_owned(), question_ids(&unposted));
-        add_spend(&mut event, p.chain, &p.policy);
+        add_spend(&mut event, p, self.budget());
         sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
         let left = Round::of(&raised, &decided_ids, asked.reopened, None);
         if left.questions.is_empty() {
@@ -3039,6 +3077,7 @@ impl OnDemand<'_> {
             timeout: ANSWER_CHECK_TIMEOUT,
             ..self.executor.clone()
         };
+        self.within_budget(p, &state, sink)?;
         let ran = self.execute(p, &executor, (self.answer_check, &[]), &brief, 1, sink)?;
         let event = if ran.breaches.is_empty() {
             answer_check::event(&ran.report.outcome, &brief).0
@@ -3461,6 +3500,52 @@ impl OnDemand<'_> {
         )
     }
 
+    /// The project's budget on one ticket's runs (OWL-378), in millionths
+    /// of a dollar, read from the person's project file as every `[policy]`
+    /// key (OWL-331): `None` without one.
+    fn budget(&self) -> Option<u64> {
+        self.config.policy.ticket_budget_micros()
+    }
+
+    /// The ticket's budget reached: what its runs cost since its last
+    /// restart is at or above the project's budget (OWL-378).
+    fn budget_reached(&self, p: &Prepared) -> Option<BudgetReached> {
+        self.budget().and_then(|budget| p.cost.reached(budget))
+    }
+
+    /// Holds the run about to start for the ticket, in `state`, to the
+    /// ticket's budget (OWL-378, architecture section 4, "Ticket budget"):
+    /// once it is reached, no run starts and the ticket parks where it
+    /// stands, waiting for input if it was, its spend kept with the park in
+    /// the ticket ref, which the park makes when the ticket has none. Every
+    /// run but the resolver's is held here, before the executor runs it;
+    /// the resolver's routing checks the budget first ([`Self::resolve`]).
+    fn within_budget(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), Stop> {
+        let Some(reached) = self.budget_reached(p) else {
+            return Ok(());
+        };
+        let parked = match state.apply(p.pipeline, Event::BudgetReached) {
+            Ok(Transition::Parked { state, .. }) => state,
+            other => return Err(core_error(other)),
+        };
+        let questions = p.questions();
+        Err(self.park_with(
+            p,
+            &parked,
+            ParkReason::TicketBudget,
+            None,
+            writer::budget_line(reached),
+            Some(questions),
+            Vec::new(),
+            sink,
+        ))
+    }
+
     /// Keeps `state` in the ticket's ref, when the ticket has one: a ref is
     /// made only once a question round opens, a decision is kept or a Build
     /// or resolver result is refused.
@@ -3649,15 +3734,24 @@ impl OnDemand<'_> {
             intake: p.intake.clone(),
             plan: p.plan.clone(),
             review: p.review.clone(),
+            cost: Some(TicketCost::from(p.cost)),
         };
         let kept = p
             .stored
             .as_ref()
             .and_then(|stored| stored.proposals.clone());
-        if p.stored
-            .as_ref()
-            .is_some_and(|stored| stored.record == record)
-            && proposals.is_none_or(|proposals| kept.as_ref() == Some(proposals))
+        // The spend alone never moves the ref (OWL-378): watch reads a moved
+        // ref as progress ([`crate::watch::Holds::after`]), so a run that
+        // changed nothing else, one cut off by a usage limit, leaves the ref
+        // as it was, and its cost rides on the next write that keeps
+        // something else.
+        if p.stored.as_ref().is_some_and(|stored| {
+            stored.record
+                == TicketRecord {
+                    cost: stored.record.cost.clone(),
+                    ..record.clone()
+                }
+        }) && proposals.is_none_or(|proposals| kept.as_ref() == Some(proposals))
         {
             return Ok(());
         }
@@ -3681,18 +3775,22 @@ impl OnDemand<'_> {
     /// Runs one role through the executor, between the project's marker
     /// and the events: `run_started`, a `warning` for each `zone:` label the
     /// brief leaves out, `run_ended`, and `usage` when the harness reported
-    /// it. `setup` is the project's, for a Build or a rebase run, empty for
-    /// the other roles (OWL-330).
+    /// it, with the ticket's whole spend after the run (`ticket_spent_usd`).
+    /// `setup` is the project's, for a Build or a rebase run, empty for the
+    /// other roles (OWL-330). Every run of every role and command comes
+    /// through here, so this is where the ticket's spend counts it, once, as
+    /// soon as the executor gives its report (OWL-378); the next write of
+    /// the ticket ref that keeps something else keeps it.
     fn execute(
         &self,
-        p: &Prepared,
+        p: &mut Prepared,
         executor: &Executor,
         (harness, setup): (&dyn Harness, &[String]),
         brief: &Brief,
         attempt: u32,
         sink: &mut EventSink<'_>,
     ) -> Result<Ran, Stop> {
-        let ticket = &p.ticket;
+        let ticket = &p.ticket.clone();
         let (run, run_dir) =
             new_run_dir(&self.dirs.runs(ticket)).map_err(|e| refused("the run directory", e))?;
         sink.emit(
@@ -3743,7 +3841,11 @@ impl OnDemand<'_> {
             setup,
         };
         let report = match executor.run(&spec, harness) {
-            Ok(report) => report,
+            Ok(report) => {
+                p.cost
+                    .ran(report.usage.as_ref().and_then(|usage| usage.cost_usd));
+                report
+            }
             Err(error) => {
                 // Nothing was spawned: nothing to verify.
                 let _ = self.dirs.clear_unverified();
@@ -3802,7 +3904,12 @@ impl OnDemand<'_> {
             sink.emit(ticket, Some(&run), EventKind::Warning, warning);
         }
         if let Some(usage) = &report.usage {
-            sink.emit(ticket, Some(&run), EventKind::Usage, usage_data(usage));
+            let mut usage = usage_data(usage);
+            usage.insert(
+                "ticket_spent_usd".to_owned(),
+                dollars(p.cost.spent_micros()),
+            );
+            sink.emit(ticket, Some(&run), EventKind::Usage, usage);
         }
         Ok(Ran {
             run,

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket cost",
+  "description": "What a ticket's runs cost, in [`COST_FILE`] (OWL-378, architecture section\n4, \"Ticket budget\"): every run the runner started for it, counted once as\nit ended. The amounts are in millionths of a dollar, the unit the runner\ncounts in. Convert with `TicketCost::from` to write and\n`TicketSpend::try_from` to read back, which refuses parts that contradict\neach other.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "restarted_at_micros": {
+      "description": "The spend when a person last restarted the ticket, 0 before any\nrestart: the ticket's budget counts what was spent since.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "runs": {
+      "description": "The runs counted.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "spent_micros": {
+      "description": "What every run counted cost.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "unreported_runs": {
+      "description": "Those of them that reported no cost, each of which added nothing.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "runs",
+    "unreported_runs",
+    "spent_micros",
+    "restarted_at_micros"
+  ]
+}

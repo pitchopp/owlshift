@@ -1140,6 +1140,7 @@ mod tests {
             intake: None,
             plan: None,
             review: None,
+            cost: None,
         }
     }
 

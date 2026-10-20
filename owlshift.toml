@@ -62,9 +62,15 @@ fast     = { claude = "claude-haiku-5-5" }
 # Question categories always left to a human, on top of the floor's
 # security, data_loss, money, legal, irreversible and scope.
 always_human = []
-resolver_delegation = "all"   # none | facts | discoverable (par défaut) | ticket | all
-resolver_passes = "unlimited"              # 1 à 50, ou "unlimited"
-resolver_budget_usd = 100.0        # obligatoire avec "unlimited"
+resolver_delegation = "all"   # none | facts | discoverable (the default) | ticket | all
+resolver_passes = "unlimited"              # 1 to 50, or "unlimited"
+resolver_budget_usd = 100.0        # required with "unlimited"
+# What one ticket's runs may cost in all, every run counted across its
+# commands; reached, the ticket parks until a person's `owlshift continue`,
+# which counts its runs afresh (OWL-378). 100 USD sits above every ticket's
+# spend measured on 2026-10-20 for the tickets run since 2026-10-14, the
+# most 79 USD (OWL-330, still open).
+ticket_budget_usd = 100.0
 
 [forge.reviewers]
 # The forge logins whose reviews on a delivered pull request Owlshift reads,

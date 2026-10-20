@@ -36,7 +36,7 @@ use owlshift_contracts::result::{
     Decision, Question, QuestionOption, Resolution, Status, option_letter,
 };
 use owlshift_core::floor::FloorCategory;
-use owlshift_core::gate::{ChainEnd, GatePolicy, Route};
+use owlshift_core::gate::{BudgetReached, ChainEnd, GatePolicy, Route};
 
 use crate::executor::Outcome;
 use crate::writer::{ReopenedChoice, flatten};
@@ -153,6 +153,10 @@ pub enum Fallback {
     /// A resolver run of the chain reported no cost, so the project's
     /// ceiling could not be checked (OWL-337).
     CostUnreported,
+    /// The ticket's runs since its last restart cost its budget or more
+    /// (`policy.ticket_budget_usd`, OWL-378): no resolver run starts, and
+    /// the ticket parks before its next run.
+    TicketBudget(BudgetReached),
 }
 
 impl Fallback {
@@ -162,20 +166,31 @@ impl Fallback {
         match self {
             Self::UsageLimit => "usage_limit",
             Self::Failed => "failed",
-            Self::PassLimit(_) | Self::Budget { .. } | Self::CostUnreported => "pass_limit",
+            Self::PassLimit(_)
+            | Self::Budget { .. }
+            | Self::CostUnreported
+            | Self::TicketBudget(_) => "pass_limit",
         }
     }
 
     /// Why a chain ended at its ceiling, as the `gate` event's `reason`
     /// gives it: `budget` when its cost reached the ceiling,
-    /// `cost_unreported` when a run's cost was not reported. `None` for
-    /// every other fallback, a pass limit reached included.
+    /// `cost_unreported` when a run's cost was not reported,
+    /// `ticket_budget` when the ticket's runs reached its budget (OWL-378).
+    /// `None` for every other fallback, a pass limit reached included.
     pub fn reason(self) -> Option<&'static str> {
         match self {
             Self::Budget { .. } => Some("budget"),
             Self::CostUnreported => Some("cost_unreported"),
+            Self::TicketBudget(_) => Some("ticket_budget"),
             Self::UsageLimit | Self::Failed | Self::PassLimit(_) => None,
         }
+    }
+}
+
+impl From<BudgetReached> for Fallback {
+    fn from(reached: BudgetReached) -> Self {
+        Self::TicketBudget(reached)
     }
 }
 
@@ -903,6 +918,16 @@ mod tests {
                 Fallback::from(ChainEnd::CostUnreported),
                 "pass_limit",
                 Some("cost_unreported"),
+            ),
+            // The ticket's budget (OWL-378).
+            (
+                Fallback::from(BudgetReached {
+                    spent_micros: 2,
+                    budget_micros: 1,
+                    unreported: 0,
+                }),
+                "pass_limit",
+                Some("ticket_budget"),
             ),
             (Fallback::UsageLimit, "usage_limit", None),
             (Fallback::Failed, "failed", None),

@@ -5628,6 +5628,217 @@ fn an_unlimited_chain_ends_at_its_ceiling_or_on_a_run_without_a_cost() {
     assert_eq!(resolved.last().unwrap()["reason"], "cost_unreported");
 }
 
+/// A reply giving `result` after committing `greeting`, when given, whose
+/// run reports `micros` millionths of a dollar.
+fn costed(bench: &Bench, greeting: Option<&str>, result: &str, micros: Option<u64>) -> Reply {
+    let mut reply = bench.reply(greeting, Some(result));
+    reply.cost_micros = micros;
+    reply
+}
+
+/// OWL-378, the ticket's budget through the runner, `ticket_budget_usd =
+/// 5`: two Build runs at $2 and a resolver run at $1 reach it, so the second
+/// Build's question goes to the decider without a resolver run, the round
+/// and the `gate` event saying why. The answer's check would be the next
+/// run: the ticket parks, waiting for input, its spend kept in the ticket
+/// ref. A person's `continue` restarts it, its budget counted afresh: the
+/// check, the Build and Verify run, the whole spend kept.
+#[test]
+fn a_ticket_parks_once_its_runs_reach_its_budget_and_a_restart_counts_afresh() {
+    let bench = Bench::parking();
+    bench.policy("ticket_budget_usd = 5");
+    let (outcome, printed) = bench.run(
+        vec![
+            costed(&bench, None, NAMING, Some(2_000_000)),
+            costed(&bench, None, DECIDED_Q1, Some(1_000_000)),
+            costed(&bench, None, NAMING, Some(2_000_000)),
+        ],
+        None,
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::Resolver, Role::Build]);
+    let round = bench.comments().pop().unwrap();
+    assert!(
+        round.contains(
+            "This ticket's runs cost 5.00 USD since it started or was last restarted, which \
+             reached its budget of 5.00 USD (`policy.ticket_budget_usd`), so this run's \
+             questions all come to you. Once you answer, the ticket stops for its budget until \
+             a person types `owlshift continue DEMO-1`, which counts its runs afresh."
+        ),
+        "{round}"
+    );
+    let resolved = data_of(&bench.events(), EventKind::Gate, "resolver");
+    let last = resolved.last().unwrap();
+    assert_eq!(
+        (&last["resolver"], &last["reason"], &last["run"]),
+        (&json!("pass_limit"), &json!("ticket_budget"), &Value::Null)
+    );
+    assert_eq!(
+        (
+            &last["ticket_spent_usd"],
+            &last["budget_spent_usd"],
+            &last["ticket_budget_usd"]
+        ),
+        (&json!(5.0), &json!(5.0), &json!(5.0))
+    );
+    let cost = bench.record().cost.expect("cost.json");
+    assert_eq!(
+        (cost.runs, cost.spent_micros, cost.restarted_at_micros),
+        (3, 5_000_000, 0)
+    );
+
+    bench.answer("Q1: GREETING.md, at the root. Go.\n");
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::TicketBudget,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 3, "no run started");
+    assert_eq!(
+        state_of(&bench).status(),
+        Status::Parked {
+            at: Stage::Build,
+            awaiting_input: true
+        }
+    );
+    let parked = bench.comments().pop().unwrap();
+    assert!(
+        parked.contains(
+            "Parked: the ticket's runs reached its budget. Its runs cost 5.00 USD since it \
+             started or was last restarted, which reached its budget of 5.00 USD \
+             (`policy.ticket_budget_usd`)."
+        ) && parked.contains("its budget then counts its runs afresh"),
+        "{parked}"
+    );
+    assert_eq!(bench.stage(), "Parked");
+
+    let (delivered, printed) = bench.continue_ticket(vec![
+        costed(
+            &bench,
+            None,
+            &check(&[("Q1", "answered", "GREETING.md, at the root.")]),
+            Some(500_000),
+        ),
+        costed(&bench, Some("Hello"), DONE, Some(2_000_000)),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let roles: Vec<Role> = bench.briefs()[3..].iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::AnswerCheck, Role::Build, Role::Verify]);
+    // Verify's stand-in reports no cost: counted, adding nothing.
+    let cost = bench.record().cost.expect("cost.json");
+    assert_eq!(
+        (
+            cost.runs,
+            cost.unreported_runs,
+            cost.spent_micros,
+            cost.restarted_at_micros
+        ),
+        (6, 1, 7_500_000, 5_000_000)
+    );
+}
+
+/// OWL-378, the spend kept across commands and no run started past the
+/// budget: under a $3 budget, a Build's `security` question goes to the
+/// decider, no resolver involved, at $2.50; the next command reads that
+/// spend back from the ticket ref, and the answer's check at $0.60 passes
+/// the budget, so the Build it resumes does not start: the ticket parks at
+/// Build.
+#[test]
+fn the_spend_is_kept_across_commands_and_no_run_starts_past_the_budget() {
+    let bench = Bench::parking();
+    bench.policy("ticket_budget_usd = 3");
+    let security = NAMING.replace(r#""category":"naming""#, r#""category":"security""#);
+    let (asked, printed) = bench.run(vec![costed(&bench, None, &security, Some(2_500_000))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{asked:?}\n{printed}"
+    );
+    assert!(!bench.comments().pop().unwrap().contains("budget"));
+    bench.answer("Q1: GREETING.md. Go.\n");
+    let (parked, printed) = bench.continue_ticket(vec![costed(
+        &bench,
+        None,
+        &check(&[("Q1", "answered", "GREETING.md.")]),
+        Some(600_000),
+    )]);
+    assert!(
+        matches!(
+            &parked,
+            Err(Stop::Parked {
+                reason: ParkReason::TicketBudget,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
+    assert_eq!(roles, [Role::Build, Role::AnswerCheck]);
+    assert_eq!(
+        state_of(&bench).status(),
+        Status::Parked {
+            at: Stage::Build,
+            awaiting_input: false
+        }
+    );
+    let cost = bench.record().cost.expect("cost.json");
+    assert_eq!((cost.runs, cost.spent_micros), (2, 3_100_000));
+    assert!(
+        bench
+            .comments()
+            .pop()
+            .unwrap()
+            .contains("Its runs cost 3.10 USD since it started"),
+        "{printed}"
+    );
+}
+
+/// OWL-378 at `all`: the budget reached by a Build that asks, the runner
+/// takes its recommendation, as at any bound of the chain (OWL-375), its
+/// DECISION naming the budget, and the Build that would follow it does not
+/// start: the ticket parks at Build.
+#[test]
+fn at_all_the_budget_takes_the_recommendation_then_parks_before_the_next_run() {
+    let bench = Bench::parking();
+    bench.policy("resolver_delegation = \"all\"\nticket_budget_usd = 5");
+    let (parked, printed) = bench.run(vec![costed(&bench, None, NAMING, Some(6_000_000))], None);
+    assert!(
+        matches!(
+            &parked,
+            Err(Stop::Parked {
+                reason: ParkReason::TicketBudget,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 1);
+    let comments = bench.comments();
+    let decision = comments
+        .iter()
+        .find(|c| c.starts_with("[owlshift] DECISION"))
+        .expect("a DECISION comment");
+    assert!(
+        decision.contains(
+            "This ticket's runs cost 6.00 USD since it started or was last restarted, which \
+             reached its budget of 5.00 USD (`policy.ticket_budget_usd`). Owlshift took the \
+             asking run's recommendation"
+        ),
+        "{decision}"
+    );
+    assert!(comments.last().unwrap().starts_with("[owlshift] PARKED"));
+    assert_eq!(bench.record().questions.decisions.len(), 1);
+}
+
 /// The role of each run of a bench and whether its brief was told of a
 /// refused result, oldest first.
 fn runs_of(bench: &Bench) -> Vec<(Role, bool)> {
@@ -6359,6 +6570,9 @@ fn a_red_pull_request_gets_fix_runs_until_the_bound_parks_it() {
     let state = state_of(&bench);
     assert!(matches!(state.status(), Status::Parked { .. }), "{state:?}");
     assert_eq!((state.fix_passes(), state.repairs()), (2, 3));
+    // Every run is counted in the ticket's spend, Watch's fix runs too
+    // (OWL-378): the delivery's Build and Verify, then the three fixes.
+    assert_eq!(bench.record().cost.expect("cost.json").runs, 5);
 
     // Each fix run was the build role at Watch, told the failed check and
     // its excerpt: the job log's lines up to its first error, cleaned.

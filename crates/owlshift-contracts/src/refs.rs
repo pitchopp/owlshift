@@ -5,14 +5,16 @@
 //! tree holds [`STATE_FILE`], [`QUESTIONS_FILE`], once a delivery was made
 //! [`DELIVERY_FILE`] (OWL-209), once the drain took it in or a run proposed a
 //! follow-up [`INTAKE_FILE`] and [`PROPOSALS_FILE`] (OWL-245), once a design
-//! or a review ran [`PLAN_FILE`] and [`REVIEW_FILE`] (OWL-300), and, later,
-//! the ticket's artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
+//! or a review ran [`PLAN_FILE`] and [`REVIEW_FILE`] (OWL-300), once a write
+//! followed a run [`COST_FILE`] (OWL-378), and, later, the ticket's
+//! artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
 //! checkout only; pushing it to the remote comes with claims (P7).
 
 use std::num::NonZeroU32;
 
 use jiff::Timestamp;
 use owlshift_core::decider::DeciderRule;
+use owlshift_core::gate::TicketSpend;
 use owlshift_core::state::{Status, TicketState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,7 +24,7 @@ use crate::brief::{
     ShortQuestion, ThreadEntry, validate_thread,
 };
 use crate::format::{
-    self, CLAIM_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
+    self, CLAIM_FORMAT, COST_FORMAT, ContractError, DELIVERY_FORMAT, Format, QUESTIONS_FORMAT,
     TICKET_STATE_FORMAT,
 };
 use crate::ids::{TicketId, check_name, is_commit_id};
@@ -63,6 +65,9 @@ pub const PROPOSALS_FILE: &str = "proposals.json";
 /// in a ticket ref's tree once a review ran (OWL-300,
 /// [`crate::review::TicketReview`]).
 pub const REVIEW_FILE: &str = "review.json";
+/// What the ticket's runs cost, in a ticket ref's tree once a write followed
+/// a run (OWL-378, [`TicketCost`]).
+pub const COST_FILE: &str = "cost.json";
 
 /// The claim ref of a ticket: `refs/owlshift/claims/<ticket>`.
 pub fn claim_ref(ticket: &TicketId) -> String {
@@ -254,6 +259,74 @@ impl TryFrom<&PersistedState> for TicketState {
         )
         .and_then(|state| state.with_review_passes(persisted.review_passes))
         .map_err(|error| ContractError::invalid(PersistedState::CONTRACT, error.to_string()))
+    }
+}
+
+/// What a ticket's runs cost, in [`COST_FILE`] (OWL-378, architecture section
+/// 4, "Ticket budget"): every run the runner started for it, counted once as
+/// it ended. The amounts are in millionths of a dollar, the unit the runner
+/// counts in. Convert with `TicketCost::from` to write and
+/// `TicketSpend::try_from` to read back, which refuses parts that contradict
+/// each other.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket cost")]
+pub struct TicketCost {
+    pub format: Format<COST_FORMAT>,
+    /// The runs counted.
+    pub runs: u32,
+    /// Those of them that reported no cost, each of which added nothing.
+    pub unreported_runs: u32,
+    /// What every run counted cost.
+    pub spent_micros: u64,
+    /// The spend when a person last restarted the ticket, 0 before any
+    /// restart: the ticket's budget counts what was spent since.
+    pub restarted_at_micros: u64,
+}
+
+impl TicketCost {
+    const CONTRACT: &str = "ticket cost";
+
+    /// Parses a `cost.json`, refusing one whose parts contradict each other.
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let cost: Self = format::parse_json(Self::CONTRACT, COST_FORMAT, input)?;
+        TicketSpend::try_from(&cost)?;
+        Ok(cost)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+impl From<TicketSpend> for TicketCost {
+    fn from(spend: TicketSpend) -> Self {
+        Self {
+            format: Format,
+            runs: spend.runs(),
+            unreported_runs: spend.unreported(),
+            spent_micros: spend.spent_micros(),
+            restarted_at_micros: spend.restarted_at_micros(),
+        }
+    }
+}
+
+impl TryFrom<&TicketCost> for TicketSpend {
+    type Error = ContractError;
+
+    fn try_from(cost: &TicketCost) -> Result<Self, ContractError> {
+        TicketSpend::restore(
+            cost.runs,
+            cost.unreported_runs,
+            cost.spent_micros,
+            cost.restarted_at_micros,
+        )
+        .ok_or_else(|| {
+            ContractError::invalid(
+                TicketCost::CONTRACT,
+                "more runs without a cost than runs, or a restart past the whole spend",
+            )
+        })
     }
 }
 

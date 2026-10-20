@@ -293,6 +293,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(proposals_inbox_check(config, facts.as_ref()));
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
+    checks.extend(budget_check(config));
     checks.extend(drain_slot_check(system, config));
     checks.extend(quarantine_check(system, config, home));
     checks.push(data_dir_check(system, home));
@@ -1290,6 +1291,24 @@ fn resolver_check(config: &Effective) -> Option<Check> {
              decider"
         ),
     ))
+}
+
+/// The budget on one ticket's runs (OWL-378, architecture section 4,
+/// "Ticket budget"), read from the project file `owlshift do` reads: a
+/// note, which blocks nothing. None without a project configuration.
+fn budget_check(config: &Effective) -> Option<Check> {
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let detail = match config.policy.ticket_budget_usd {
+        Some(usd) => format!(
+            "{} USD on each ticket's runs, every run counted across its commands; reached, the \
+             ticket parks until a person's `owlshift continue` counts it afresh",
+            usd.0
+        ),
+        None => "none on a ticket's runs".to_owned(),
+    };
+    Some(Check::info(Section::Project, "budget", detail))
 }
 
 /// Whether each state named under `[tracker].states` is exactly one
@@ -3827,6 +3846,30 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             "{}",
             named.detail
         );
+    }
+
+    /// OWL-378: the `budget` line names the ticket budget, or none, as a
+    /// note that blocks nothing.
+    #[test]
+    fn the_budget_line_names_the_ticket_budget() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        for (policy, detail) in [
+            ("", "none on a ticket's runs"),
+            (
+                "ticket_budget_usd = 100.0",
+                "100 USD on each ticket's runs, every run counted across its commands; reached, \
+                 the ticket parks until a person's `owlshift continue` counts it afresh",
+            ),
+        ] {
+            let (_dir, config) = project_tracked_with(tracker, policy);
+            let report = run(&system, &config);
+            let budget = line(&report, "budget");
+            assert_eq!(budget.status, Status::Info, "{policy}");
+            assert_eq!(budget.detail, detail, "{policy}");
+        }
     }
 
     /// OWL-328: the `resolver` line names the level, the pass limit and the

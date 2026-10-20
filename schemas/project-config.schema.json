@@ -297,6 +297,17 @@
               "type": "null"
             }
           ]
+        },
+        "ticket_budget_usd": {
+          "description": "A budget, in dollars, on what one ticket's runs cost (OWL-378,\narchitecture section 4, \"Ticket budget\"): every run counted once,\nacross every command and stop, since the ticket's first run or a\nperson's last restart of it; reached, no run of the ticket starts and\nit parks. A positive number. Absent: no budget. Independent of\n`resolver_budget_usd`. A file using it requires an Owlshift that\nreads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usd"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,

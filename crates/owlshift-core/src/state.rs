@@ -150,6 +150,7 @@ impl Status {
 /// | A Build run's (at Build, or a fix run's at Watch) or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
+/// | A run is due while the ticket's runs since its last restart cost its budget or more (`policy.ticket_budget_usd`, OWL-378): none starts | `BudgetReached` |
 /// | At Watch, a fix run's push landed on the pull request | `FixPushed` |
 /// | At Watch, a rebase run's push landed on the pull request | `RebasePushed` |
 /// | At Watch, a correction run's push landed, or it found the pull request already following the decider's replies | `Corrected` |
@@ -246,6 +247,11 @@ pub enum Event {
     ResultRefused,
     Interrupted,
     Quarantined,
+    /// A run was due, but what the ticket's runs cost since its last
+    /// restart reached its budget (OWL-378): no run starts and the ticket
+    /// parks where it stands, waiting for input if it was. Valid wherever a
+    /// run can be in flight.
+    BudgetReached,
     /// A fix run's push landed (OWL-55): the ticket stays at Watch, its
     /// failed runs are cleared, and a fix pass and a repair are counted.
     /// The runner gives [`Event::FixDue`] before the run, so a push past a
@@ -295,7 +301,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -315,6 +321,7 @@ impl Event {
         Self::ResultRefused,
         Self::Interrupted,
         Self::Quarantined,
+        Self::BudgetReached,
         Self::FixPushed,
         Self::RebasePushed,
         Self::Corrected,
@@ -382,6 +389,9 @@ pub enum ParkReason {
     /// The forge blocks the pull request: a red no run fixes, or a refused
     /// push.
     Forge,
+    /// A run was due, but the ticket's runs since its last restart cost its
+    /// budget or more (`policy.ticket_budget_usd`, OWL-378).
+    TicketBudget,
 }
 
 /// How a ticket left the machine.
@@ -822,6 +832,9 @@ impl TicketState {
             (status, Event::Quarantined) if status.runs() => {
                 self.park(ParkReason::IsolationBreach, self.failed_runs)
             }
+            (status, Event::BudgetReached) if status.runs() => {
+                self.park(ParkReason::TicketBudget, self.failed_runs)
+            }
 
             (Status::Active(Stage::Watch), Event::FixPushed) => {
                 if self.fix_passes >= MAX_FIX_PASSES || self.repairs >= MAX_REPAIRS {
@@ -1180,6 +1193,9 @@ mod tests {
             (Status::Active(stage), Event::Quarantined) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::IsolationBreach)
             }
+            (Status::Active(stage), Event::BudgetReached) if stage != Ready => {
+                Expect::Parked(parked(stage, false), ParkReason::TicketBudget)
+            }
 
             (Status::NeedsInput { return_to }, Event::Answered) => {
                 Expect::To(Status::Active(return_to))
@@ -1194,6 +1210,9 @@ mod tests {
             ) => Expect::To(status),
             (Status::NeedsInput { return_to }, Event::Quarantined) => {
                 Expect::Parked(parked(return_to, true), ParkReason::IsolationBreach)
+            }
+            (Status::NeedsInput { return_to }, Event::BudgetReached) => {
+                Expect::Parked(parked(return_to, true), ParkReason::TicketBudget)
             }
             (
                 Status::NeedsInput { return_to: Watch } | Status::Parked { at: Watch, .. },

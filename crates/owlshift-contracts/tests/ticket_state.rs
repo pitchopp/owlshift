@@ -11,9 +11,9 @@ use std::fmt::Debug;
 use std::fs;
 use std::path::PathBuf;
 
-use owlshift_contracts::refs::{PersistedState, Waiting};
+use owlshift_contracts::refs::{PersistedState, TicketCost, Waiting};
 use owlshift_contracts::{ContractError, PlanApproval, Stage, Variant};
-use owlshift_core::gate::GatePolicy;
+use owlshift_core::gate::{GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, MAX_REVIEW_PASSES, Status, TicketState, Transition};
 use serde_json::{Value, json};
@@ -258,4 +258,41 @@ fn a_format_2_state_reads_with_no_fix_pass_or_repair() {
         ),
         (&json!(4), &json!(0), &json!(0))
     );
+}
+
+/// What a ticket's runs cost (OWL-378): written and read back as the core's
+/// spend, valid against its schema, and refused when its parts contradict
+/// each other.
+#[test]
+fn a_ticket_cost_reads_back_and_refuses_parts_that_contradict() {
+    let mut spend = TicketSpend::default();
+    spend.ran(Some(2.5));
+    spend.ran(None);
+    spend.restarted();
+    spend.ran(Some(0.25));
+    let rendered = TicketCost::from(spend).render();
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/ticket-cost.schema.json");
+    let schema: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let document: Value = serde_json::from_str(&rendered).unwrap();
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&document)
+    );
+    assert_eq!(
+        document,
+        json!({"format": 1, "runs": 3, "unreported_runs": 1, "spent_micros": 2_750_000,
+               "restarted_at_micros": 2_500_000})
+    );
+    let read = TicketCost::parse(&rendered).unwrap();
+    assert_eq!(TicketSpend::try_from(&read).unwrap(), spend);
+    for (field, value) in [("unreported_runs", 4), ("restarted_at_micros", 2_750_001)] {
+        let mut broken = document.clone();
+        broken[field] = json!(value);
+        match TicketCost::parse(&broken.to_string()) {
+            Err(ContractError::Invalid { contract, .. }) => assert_eq!(contract, "ticket cost"),
+            other => panic!("{field}: expected an invalid ticket cost, got {other:?}"),
+        }
+    }
 }
