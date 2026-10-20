@@ -1,22 +1,28 @@
 //! `owlshift init`: writes the commented project file, then stores the
 //! secrets `owlshift do` needs, asking for them on a terminal only, with
-//! hidden input (`owlshift_runner::init`): the tracker's and the forge's
-//! under the accounts of the project's GitHub repository, read from
-//! `origin`, the Claude Code token for agent runs once per machine
-//! (OWL-308).
+//! hidden input (`owlshift_runner::init`): the tracker's under the accounts
+//! of the project's GitHub repository, read from `origin`, the Claude Code
+//! token for agent runs once per machine (OWL-308). The forge's comes from
+//! signing in to GitHub through Owlshift's GitHub App
+//! (`owlshift_runner::github_sign_in`, OWL-336), or with `--github-token`
+//! from a personal token asked for like the others.
 
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
 use clap::ValueEnum;
+use owlshift_adapters::forge::Repo;
+use owlshift_adapters::forge::github_app::{DeviceFlow, HttpLogin};
 use owlshift_contracts::config::TrackerKind;
-use owlshift_platform::keychain::{Keychain, Secret};
+use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_runner::config::{Effective, FileState};
+use owlshift_runner::forge::GitHubApp;
+use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
-    AppStored, InitOptions, Wanted, Written, project_file, required_secrets, store_app_credentials,
-    store_secrets, wanted_secrets, write_project_file,
+    AppStored, GITHUB_TOKEN, InitOptions, SecretsReport, Wanted, Written, project_file,
+    required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_project_file,
 };
-use owlshift_runner::secrets::TrackerAccounts;
+use owlshift_runner::secrets::{ForgeAccount, TrackerAccounts};
 use owlshift_runner::tracker::{self, app_credentials};
 use owlshift_runner::{on_demand, project};
 
@@ -38,10 +44,15 @@ pub struct Args {
     #[arg(long, conflicts_with = "replace_secrets")]
     skip_secrets: bool,
     /// Ask again for this project's secrets already stored, and replace
-    /// them; a secret shared by every project of this machine is never
-    /// replaced, and an empty answer keeps reading it.
+    /// them, signing in to GitHub again; a secret shared by every project of
+    /// this machine is never replaced, and an empty answer keeps reading it.
     #[arg(long)]
     replace_secrets: bool,
+    /// Ask for a personal GitHub token instead of signing in through
+    /// Owlshift's GitHub App, the expert option: it removes the project's
+    /// GitHub App token, so the personal token is the one used.
+    #[arg(long, conflicts_with = "skip_secrets")]
+    github_token: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -121,11 +132,17 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     let root = file.parent().unwrap_or(file);
     let repo = project::origin_url(&project::runner_git(), root)
         .and_then(|url| on_demand::check_origin(&url));
-    let (wanted, unnamed) =
+    let (mut wanted, unnamed) =
         match wanted_secrets(&keychain, &required_secrets(tracker), repo.as_ref().ok()) {
             Ok(found) => found,
             Err(error) => return fail(&error),
         };
+    // Since OWL-336 the GitHub credential comes from the sign-in below; the
+    // personal token is asked for with `--github-token` only. Without a
+    // repository it stays among the secrets that cannot be named.
+    if !args.github_token {
+        wanted.retain(|one| one.spec != GITHUB_TOKEN);
+    }
     let terminal = io::stdin().is_terminal();
     let mut asked = false;
     let mut ask = |one: &Wanted| {
@@ -194,7 +211,39 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             );
         }
     }
-    if report.missing.is_empty() && report.refused.is_empty() && unnamed.is_empty() && app_ready {
+    let github_ready = match &repo {
+        Ok(repo) if args.github_token => personal_token_chosen(&keychain, repo, &report),
+        Ok(repo) => {
+            let app = GitHubApp::from_personal(match &config.personal {
+                FileState::Loaded { config, .. } => Some(config),
+                _ => None,
+            });
+            let github = GitHub::live(DeviceFlow::new(HttpLogin::new(), &app.client_id), repo);
+            let ask = Ask {
+                replace: args.replace_secrets,
+                terminal,
+            };
+            let outcome = github_sign_in::step(
+                &keychain,
+                repo,
+                &app,
+                &github,
+                &SystemWait,
+                ask,
+                &mut |line| println!("{line}"),
+            );
+            said_sign_in(&outcome, repo);
+            outcome.is_ok()
+        }
+        // Said above, with the other secrets that cannot be named.
+        Err(_) => true,
+    };
+    if report.missing.is_empty()
+        && report.refused.is_empty()
+        && unnamed.is_empty()
+        && app_ready
+        && github_ready
+    {
         return next_steps();
     }
     for one in &report.missing {
@@ -216,6 +265,69 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         );
     }
     ExitCode::FAILURE
+}
+
+/// With `--github-token`: once the project holds a personal token of its
+/// own, stored or kept, removes its GitHub App token, which would otherwise
+/// be used first, and says so; `false` when that removal fails. With no
+/// personal token of its own, nothing is removed, and the token's absence is
+/// in `report` already.
+fn personal_token_chosen(keychain: &Keychain, repo: &Repo, report: &SecretsReport) -> bool {
+    let own = |found: &[Wanted]| found.iter().any(|one| one.spec == GITHUB_TOKEN);
+    if !(own(&report.stored) || own(&report.kept)) {
+        return true;
+    }
+    match github_sign_in::remove_app_token(keychain, repo) {
+        Ok(true) => {
+            println!(
+                "Removed the GitHub App's token this project had stored (account `{}`): the \
+                 personal token is the one used.",
+                ForgeAccount::project_app(repo).token
+            );
+            true
+        }
+        Ok(false) => true,
+        Err(error) => {
+            eprintln!("owlshift: {error}");
+            false
+        }
+    }
+}
+
+/// Says how the GitHub sign-in ended for the project of `repo`; an end that
+/// fails `init` goes to standard error.
+fn said_sign_in(outcome: &Outcome, repo: &Repo) {
+    let account = ForgeAccount::project_app(repo).token;
+    match outcome {
+        Outcome::Kept => println!(
+            "Kept the GitHub App's token already stored (keychain service `{SERVICE}`, account \
+             `{account}`)."
+        ),
+        Outcome::Stored => println!(
+            "Signed in to GitHub: stored the GitHub App's token (keychain service `{SERVICE}`, \
+             account `{account}`)."
+        ),
+        Outcome::NeedsTerminal => eprintln!(
+            "owlshift: missing: the GitHub sign-in (keychain service `{SERVICE}`, account \
+             `{account}`): `owlshift init` signs in to GitHub through Owlshift's GitHub App on a \
+             terminal, or `owlshift init --github-token` stores a personal token."
+        ),
+        Outcome::Denied => eprintln!(
+            "owlshift: the GitHub sign-in was cancelled on GitHub: nothing was stored. Run \
+             `owlshift init` to sign in again."
+        ),
+        Outcome::Expired => eprintln!(
+            "owlshift: the GitHub sign-in code expired before it was entered: nothing was stored. \
+             Run `owlshift init` for a new code."
+        ),
+        Outcome::NotInstalled { link } => eprintln!(
+            "owlshift: Owlshift's GitHub App is not installed on github.com/{repo}: nothing was \
+             stored. Install it at {link}, give it this repository, then run `owlshift init` \
+             again. On an organisation's repository, the installation may be a request waiting \
+             for an owner of the organisation to approve it."
+        ),
+        Outcome::Failed(reason) => eprintln!("owlshift: the GitHub sign-in failed: {reason}."),
+    }
 }
 
 /// Stores the Linear app's pair under the project's accounts `own`, or
@@ -344,5 +456,41 @@ mod tests {
             .store(LINEAR_APP_SECRET_ACCOUNT, &Secret::new("y"))
             .unwrap();
         assert!(linear_app(&keychain, &own, false, &mut ask));
+    }
+
+    /// Criterion 6 (OWL-383): `--github-token` stores the personal token under
+    /// the project's own account and removes the app token, which would be
+    /// used first; with no personal token given, the app token stays.
+    #[test]
+    fn a_personal_token_with_github_token_removes_the_app_token() {
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let keychain = Keychain::in_memory();
+        let app = ForgeAccount::project_app(&repo).token;
+        keychain
+            .store(&app, &Secret::new("{\"v\":1,\"access_token\":\"ghu_x\"}"))
+            .unwrap();
+        let wanted = wanted_secrets(&keychain, &[GITHUB_TOKEN], Some(&repo))
+            .unwrap()
+            .0;
+
+        let report = store_secrets(&keychain, &wanted, false, &mut |_| None).unwrap();
+        assert_eq!(report.missing.len(), 1);
+        assert!(personal_token_chosen(&keychain, &repo, &report));
+        assert!(keychain.contains(&app).unwrap());
+
+        let report = store_secrets(&keychain, &wanted, false, &mut |_| {
+            Some(Secret::new("github_pat_x"))
+        })
+        .unwrap();
+        assert!(personal_token_chosen(&keychain, &repo, &report));
+        assert!(!keychain.contains(&app).unwrap());
+        assert_eq!(
+            keychain
+                .read(&ForgeAccount::project(&repo).token)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "github_pat_x"
+        );
     }
 }

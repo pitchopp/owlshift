@@ -126,7 +126,7 @@ use crate::resolver::{self, Fallback, Quotable, Resolved};
 use crate::reversal;
 use crate::routing::{RouteLabels, Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
-use crate::ticket_ref::{self, ProposalsFile, Stored, TicketRecord};
+use crate::ticket_ref::{self, ProposalsFile, RefAt, Stored, TicketRecord};
 use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
     Gate, MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning,
@@ -1132,10 +1132,11 @@ struct Prepared {
     /// [`Stop::Stepped`] at the next change of stage, its state kept.
     stepping: bool,
     /// What the ticket's runs cost (OWL-378), as the ticket ref keeps it,
-    /// plus each run of this command as it ends ([`OnDemand::execute`]):
-    /// every write of the ref carries it, as `intake`, but none is made for
-    /// it alone ([`OnDemand::store_proposing`]). A ticket without a ref
-    /// holds it here until a write makes one.
+    /// plus each run of this command as it ends ([`OnDemand::execute`]),
+    /// which the ref keeps at once, making the ref of a ticket that has none
+    /// ([`OnDemand::keep_cost`], OWL-397). Every write of the ref carries
+    /// it, as `intake`, so a spend that write could not keep rides on the
+    /// next.
     cost: TicketSpend,
     /// A Build run of this delivery already integrated late comments
     /// (OWL-139), here or at an earlier step ([`Carried::integrated`]): a
@@ -3377,9 +3378,9 @@ impl OnDemand<'_> {
         open: Vec<(Question, AnswerVerdict)>,
         sink: &mut EventSink<'_>,
     ) -> Stop {
-        // A ticket without a ref keeps nothing: a ref is made only once a
-        // question round opens, a decision is kept or a Build or resolver
-        // result is refused.
+        // A ticket without a ref keeps nothing: since OWL-397 only one whose
+        // ref no run made yet, a park before any run or a ref its first run
+        // could not write.
         let questions = questions.or_else(|| p.stored.as_ref().map(|_| p.questions()));
         let kept = match questions {
             Some(questions) => self
@@ -3546,9 +3547,11 @@ impl OnDemand<'_> {
         ))
     }
 
-    /// Keeps `state` in the ticket's ref, when the ticket has one: a ref is
-    /// made only once a question round opens, a decision is kept or a Build
-    /// or resolver result is refused.
+    /// Keeps `state` in the ticket's ref, when the ticket has one: since
+    /// OWL-397 every ticket has one from its first run's end
+    /// ([`Self::keep_cost`]); before it, a ref was made only once a question
+    /// round opened, a decision was kept or a Build or resolver result was
+    /// refused.
     fn keep(&self, p: &mut Prepared, state: &TicketState) -> Result<(), Stop> {
         if p.stored.is_none() {
             return Ok(());
@@ -3740,11 +3743,11 @@ impl OnDemand<'_> {
             .stored
             .as_ref()
             .and_then(|stored| stored.proposals.clone());
-        // The spend alone never moves the ref (OWL-378): watch reads a moved
-        // ref as progress ([`crate::watch::Holds::after`]), so a run that
-        // changed nothing else, one cut off by a usage limit, leaves the ref
-        // as it was, and its cost rides on the next write that keeps
-        // something else.
+        // A write of the spend alone is `keep_cost`'s, right after each run
+        // (OWL-397), whose failure is a warning: here a record that changes
+        // nothing else is not written, so a spend that ref could not keep
+        // rides on the next write that keeps something else, and never
+        // turns into a stop that would hide the one the command makes.
         if p.stored.as_ref().is_some_and(|stored| {
             stored.record
                 == TicketRecord {
@@ -3772,6 +3775,56 @@ impl OnDemand<'_> {
         Ok(())
     }
 
+    /// Keeps the ticket's spend in its ref right after run `run` (OWL-397,
+    /// architecture section 4, "Ticket budget"): the record as the ref keeps
+    /// it, with only `cost.json` new, which watch does not read as progress
+    /// ([`ticket_ref::Progress`]). A ticket without a ref gets one, holding
+    /// what `owlshift forget` leaves of a ticket at round 0 ([`ticket_ref::blank`]),
+    /// so from then on the command keeps its state as any ticket with a ref
+    /// does. A write that fails, a ref locked or moved by the run, is a
+    /// `warning` (`cost_not_kept`), never a stop: the spend stays here and
+    /// rides on the next write that keeps something else.
+    fn keep_cost(&self, p: &mut Prepared, run: &str, sink: &mut EventSink<'_>) {
+        let cost = TicketCost::from(p.cost);
+        let record = match &p.stored {
+            Some(stored) if stored.record.cost.as_ref() == Some(&cost) => return,
+            Some(stored) => TicketRecord {
+                cost: Some(cost),
+                ..stored.record.clone()
+            },
+            None => ticket_ref::blank(Some(cost)),
+        };
+        let previous = p.stored.as_ref().map(|stored| stored.commit.as_str());
+        let written = ticket_ref::write(
+            &self.executor.git,
+            &p.checkout,
+            &p.ticket,
+            &record,
+            previous,
+        );
+        match written {
+            Ok(commit) => {
+                let proposals = p
+                    .stored
+                    .as_ref()
+                    .and_then(|stored| stored.proposals.clone());
+                p.stored = Some(Stored {
+                    record,
+                    commit,
+                    proposals,
+                });
+            }
+            Err(reason) => {
+                sink.emit(
+                    &p.ticket,
+                    Some(run),
+                    EventKind::Warning,
+                    data([("what", json!("cost_not_kept")), ("reason", json!(reason))]),
+                );
+            }
+        }
+    }
+
     /// Runs one role through the executor, between the project's marker
     /// and the events: `run_started`, a `warning` for each `zone:` label the
     /// brief leaves out, `run_ended`, and `usage` when the harness reported
@@ -3779,8 +3832,8 @@ impl OnDemand<'_> {
     /// `setup` is the project's, for a Build or a rebase run, empty for the
     /// other roles (OWL-330). Every run of every role and command comes
     /// through here, so this is where the ticket's spend counts it, once, as
-    /// soon as the executor gives its report (OWL-378); the next write of
-    /// the ticket ref that keeps something else keeps it.
+    /// soon as the executor gives its report (OWL-378), and where the ticket
+    /// ref keeps it at once ([`Self::keep_cost`], OWL-397).
     fn execute(
         &self,
         p: &mut Prepared,
@@ -3844,6 +3897,9 @@ impl OnDemand<'_> {
             Ok(report) => {
                 p.cost
                     .ran(report.usage.as_ref().and_then(|usage| usage.cost_usd));
+                // Kept before anything else the command does, so no stop
+                // after it, nor a crash, loses the run's cost (OWL-397).
+                self.keep_cost(p, &run, sink);
                 report
             }
             Err(error) => {
@@ -6093,10 +6149,11 @@ impl OnDemand<'_> {
     }
 
     /// For `owlshift watch`, once a look at a followed pull request is kept
-    /// at `commit`, the ticket ref's commit: posts the DELIVERY report the
-    /// ref owes, under the project's lock and only while the ref is still
-    /// `commit`, then keeps it as posted (OWL-218). Returns the ref's commit
-    /// after it, or `None` when the head moved since the look: the report
+    /// at `at`, where the ticket ref is: posts the DELIVERY report the ref
+    /// owes, under the project's lock and only while the ref is still at
+    /// `at`'s commit, then keeps it as posted (OWL-218). Returns where the
+    /// ref is after it, its progress with its commit (OWL-397), or `None`
+    /// when the head moved since the look: the report
     /// stays owed and the pass ends, with no repair or correction on a read
     /// that is no longer the pull request's (OWL-238). Nothing is locked or
     /// read unless `stored`, the ref the look started from, owes a report or
@@ -6106,10 +6163,10 @@ impl OnDemand<'_> {
         ticket: &TicketId,
         stored: &Stored,
         seen: &Seen,
-        commit: String,
+        at: RefAt,
         following: &mut Following,
         sink: &mut EventSink<'_>,
-    ) -> Option<String> {
+    ) -> Option<RefAt> {
         let owes = stored
             .record
             .delivery
@@ -6117,19 +6174,19 @@ impl OnDemand<'_> {
             .is_some_and(|delivery| delivery.owed.is_some())
             || (proposals::has_inbox(self.tracker) && proposals::owes(stored.proposals.as_ref()));
         if !owes && !matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
-            return Some(commit);
+            return Some(at);
         }
         let Ok(Some(_lock)) = self.dirs.lock() else {
-            return Some(commit);
+            return Some(at);
         };
         if !matches!(self.dirs.unverified(), Ok(None)) {
-            return Some(commit);
+            return Some(at);
         }
         let git = &self.executor.git;
         let checkout = self.dirs.checkout();
         let current = match ticket_ref::read(git, &checkout, ticket) {
-            Ok(Some(current)) if current.commit == commit => current,
-            _ => return Some(commit),
+            Ok(Some(current)) if current.commit == at.commit => current,
+            _ => return Some(at),
         };
         let settled = self.settle_owed(
             ticket,
@@ -6139,7 +6196,7 @@ impl OnDemand<'_> {
             sink,
         );
         if settled.delivery.is_none() && settled.proposals.is_none() {
-            return settled.moved.is_none().then_some(commit);
+            return settled.moved.is_none().then_some(at);
         }
         let record = TicketRecord {
             delivery: settled.delivery.or(current.record.delivery),
@@ -6149,13 +6206,25 @@ impl OnDemand<'_> {
             .proposals
             .as_ref()
             .map_or(ProposalsFile::Keep, ProposalsFile::Write);
-        let written =
-            ticket_ref::write_proposals(git, &checkout, ticket, &record, proposals, Some(&commit));
+        let written = ticket_ref::write_proposals(
+            git,
+            &checkout,
+            ticket,
+            &record,
+            proposals,
+            Some(&at.commit),
+        );
         if settled.moved.is_some() {
             return None;
         }
         Some(match written {
-            Ok(written) => written,
+            Ok(commit) => RefAt {
+                commit,
+                progress: ticket_ref::progress(
+                    &record,
+                    settled.proposals.as_ref().or(current.proposals.as_ref()),
+                ),
+            },
             Err(reason) => {
                 sink.emit(
                     ticket,
@@ -6166,7 +6235,7 @@ impl OnDemand<'_> {
                         ("reason", json!(reason)),
                     ]),
                 );
-                commit
+                at
             }
         })
     }

@@ -696,6 +696,116 @@ fn scenario_s6_the_human_is_the_bottleneck() {
     );
 }
 
+/// OWL-397: a `do` typed by hand has a ticket ref from its first run's end,
+/// so a running `watch --drain` takes it as it takes its own tickets. DEMO-1's
+/// Build, cut by a usage limit whose reset has passed, is left at Build: watch
+/// resumes it, where it saw no ref before; the resume is cut again, and
+/// although its cost moved DEMO-1's ref, watch holds it for 10 minutes as a
+/// resume that changed nothing else. Meanwhile DEMO-1's ref holds the one
+/// slot: DEMO-2, taken in, waits for it, where it was built before. Once the
+/// hold ends, watch resumes DEMO-1 and delivers it, then DEMO-2 is built.
+#[test]
+fn a_do_typed_by_hand_is_resumed_by_watch_and_holds_the_slot() {
+    let bench = Bench::draining("maintainer");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "Greet once more.",
+    );
+    // Passed when it is read: the limit pauses nothing.
+    let cut = || {
+        let mut reply = bench.reply(None, None);
+        reply.usage_limit = Some("2026-10-01T00:00:00Z".parse().unwrap());
+        reply.cost_micros = Some(1_000_000);
+        reply
+    };
+    let (stopped, printed) = bench.run(vec![cut()], None);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    let at = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!(at.status(), Status::Active(Stage::Build));
+    assert_eq!(bench.stage(), "In Progress");
+    let spent = bench.ref_commit();
+
+    let before = bench.events().len();
+    let intake = bench.reply(None, Some(&intake_result("done", None, "")));
+    let replies = vec![
+        cut(),
+        intake,
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reply(Some("Hello there"), Some(&done_for("DEMO-2"))),
+    ];
+    let ends = RefCell::new(Vec::new());
+    let after_cut = RefCell::new(None);
+    let (outcomes, lines, printed) = bench.drain(replies, 3, |pass| {
+        ends.borrow_mut().push(bench.events().len());
+        if pass == 1 {
+            *after_cut.borrow_mut() = Some((bench.ref_commit(), bench.record()));
+        }
+        if pass == 2 {
+            bench.waited.set(SignedDuration::from_mins(25));
+        }
+    });
+    let events = bench.events();
+    let passes = by_pass(&events, before, &ends.borrow());
+    // Watch resumed DEMO-1's Build twice, the second once the hold ended.
+    let resumes: Vec<usize> = passes
+        .iter()
+        .enumerate()
+        .filter(|(_, pass)| {
+            pass.iter().any(|e| {
+                e.kind == EventKind::Decision
+                    && e.ticket.as_ref().is_some_and(|t| t.as_str() == "DEMO-1")
+                    && e.data.get("watch") == Some(&json!("continue"))
+                    && e.data["stage"] == json!("build")
+            })
+        })
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(resumes, [0, 2], "{lines}\n{printed}");
+    assert!(
+        matches!(&outcomes[0], Err(Stop::UsageLimit { .. })),
+        "{outcomes:?}"
+    );
+    // Cut again: the ref moved by the run's cost alone, and watch held it.
+    let (commit, record) = after_cut.into_inner().expect("read after pass 1");
+    assert_ne!(commit, spent);
+    assert_eq!(TicketState::try_from(&record.state).unwrap(), at);
+    assert_eq!(record.cost.map(|cost| cost.runs), Some(2));
+    assert!(
+        lines.contains("DEMO-1 is at Build as it was before that resume"),
+        "{lines}"
+    );
+    // DEMO-2 waited for the slot DEMO-1's ref held.
+    assert_eq!(
+        waits(&passes[1]),
+        [("DEMO-2".to_owned(), json!("slot"), json!(["DEMO-1"]))],
+        "{lines}"
+    );
+    assert_eq!(
+        bench.runs()[1..],
+        [
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-2".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Verify, "DEMO-1".to_owned()),
+            (Role::Build, "DEMO-2".to_owned()),
+            (Role::Verify, "DEMO-2".to_owned()),
+        ],
+        "{lines}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| o.is_ok()).count(),
+        2,
+        "{outcomes:?}"
+    );
+}
+
 impl Bench {
     /// What the ticket `id` holds on the tracker: its `ticket.md` and its
     /// comments.

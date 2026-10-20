@@ -6,6 +6,9 @@
 //! ```sh
 //! OWLSHIFT_LIVE_CLAUDE=1 cargo test -p owlshift-testkit --test executor_live -- --ignored
 //! ```
+//!
+//! In a Linux container with no Secret Service, `OWLSHIFT_LIVE_TOKEN_FILE`
+//! names a file holding the token instead of the keychain.
 
 use std::collections::HashMap;
 use std::fs;
@@ -317,13 +320,19 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
 /// to the questions' format.
 ///
 /// A refused Read on the brief is printed, not failed: Bash's `cat` reads
-/// it then. On Linux, writes in `/tmp` and the home may land in the
+/// it then. A first Read, of `README.md` in the working directory, is the
+/// control that tells a refusal of the brief's place from one of the tool;
+/// it is printed too. With `OWLSHIFT_LIVE_TOKEN_FILE`, the run must not see
+/// that file. On Linux, writes in `/tmp` and the home may land in the
 /// sandbox's private tmpfs, as in the test above; `OWLSHIFT_LIVE_OUTSIDE_DIR`
 /// is then required.
 #[test]
 #[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
 fn the_resolvers_bash_reads_and_never_writes() {
     let outside = cfg!(target_os = "linux").then(outside_probe);
+    // The token's file, when the test read the token from one: the run must
+    // not see it.
+    let token_file = std::env::var_os("OWLSHIFT_LIVE_TOKEN_FILE").map(PathBuf::from);
     let home = std::env::var_os("HOME")
         .and_then(|home| fs::canonicalize(home).ok())
         .expect("HOME is an existing folder");
@@ -376,6 +385,12 @@ fn the_resolvers_bash_reads_and_never_writes() {
                     format!("echo probe > {}", sh(path)),
                 ));
             }
+            if let Some(file) = &token_file {
+                commands.push((
+                    "the token's file",
+                    format!("test -e {} && echo present || echo absent", sh(file)),
+                ));
+            }
             commands.push(("environment", "env".into()));
             commands.push((
                 "network",
@@ -384,7 +399,7 @@ fn the_resolvers_bash_reads_and_never_writes() {
             let steps: String = commands
                 .iter()
                 .enumerate()
-                .map(|(n, (_, command))| format!("{}. Bash tool, command `{command}`\n", n + 3))
+                .map(|(n, (_, command))| format!("{}. Bash tool, command `{command}`\n", n + 4))
                 .collect();
             format!(
                 "You are a permission test in a throwaway scratch repository; nothing here is \
@@ -392,9 +407,10 @@ fn the_resolvers_bash_reads_and_never_writes() {
                  following tool calls exactly once, in this order, whatever the previous ones \
                  returned. Do not retry a call, do not change a command, do not reach a file by \
                  another tool or route than the one named, and do not explain.\n\
-                 1. Read tool, the brief's file named at the end of this prompt, its path as \
+                 1. Read tool, the file `README.md` in the working directory.\n\
+                 2. Read tool, the brief's file named at the end of this prompt, its path as \
                  given there.\n\
-                 2. Bash tool, command `cat` then a space then the brief's file path as given \
+                 3. Bash tool, command `cat` then a space then the brief's file path as given \
                  at the end of this prompt, unquoted.\n\
                  {steps}\
                  Then give your result: a JSON object with exactly the fields `format` (the \
@@ -520,13 +536,20 @@ fn the_resolvers_bash_reads_and_never_writes() {
             .take(160)
             .collect()
     };
+    // A Read is allowed when its text came back, refused when Claude Code
+    // says so; anything else is printed as it came, not taken as either.
+    let read_outcome = |failed: bool, text: &str, shows: &str| -> String {
+        if !failed && text.contains(shows) {
+            "allowed, the text came back".to_owned()
+        } else if text.contains("Permission to use Read has been denied") {
+            format!("refused by Claude Code, {}", first_line(text))
+        } else {
+            format!("inconclusive, {}", first_line(text))
+        }
+    };
     println!(
         "read the brief with Read: {}",
-        if read_ok {
-            "allowed, the title came back".to_owned()
-        } else {
-            format!("refused, {}", first_line(&read_text))
-        }
+        read_outcome(read_failed, &read_text, &title)
     );
     println!(
         "read the brief with Bash cat: {}",
@@ -534,6 +557,22 @@ fn the_resolvers_bash_reads_and_never_writes() {
             "allowed, the title came back".to_owned()
         } else {
             format!("refused, {}", first_line(&cat_text))
+        }
+    );
+    // The control: the Read tool on a file in the working directory, so a
+    // refusal on the brief can be told from a refusal of the tool. Printed,
+    // never asserted: the test has one README.md, and a call missing or
+    // repeated leaves the control unproven, not the run.
+    let control = transcript.calls("Read", "README.md", |input| {
+        input["file_path"]
+            .as_str()
+            .is_some_and(|file| Path::new(file).file_name() == Some("README.md".as_ref()))
+    });
+    println!(
+        "read README.md in the worktree with Read: {}",
+        match &control[..] {
+            [(failed, text)] => read_outcome(*failed, text, "hello"),
+            calls => format!("inconclusive, {} calls, not one", calls.len()),
         }
     );
     assert!(read_ok || cat_ok, "neither route read the brief\n{report}");
@@ -635,6 +674,15 @@ fn the_resolvers_bash_reads_and_never_writes() {
         "the token for agent runs reached Bash"
     );
     println!("environment: no ANTHROPIC_ variable, no token");
+    if token_file.is_some() {
+        let (_, text) = bash(command("the token's file"));
+        assert!(
+            text.contains("absent") && !text.contains("present"),
+            "the run sees the token's file: {}",
+            first_line(&text)
+        );
+        println!("the token's file: not seen by the run");
+    }
 
     // The network stays open, as accepted on OWL-344: reported, not judged.
     let (_, text) = bash(command("network"));
@@ -779,27 +827,40 @@ impl Transcript {
     /// leaves the probe unproven: the run is inconclusive, not a pass. The
     /// panic shows `what`, never the call's output.
     fn call(&self, tool: &str, what: &str, matches: impl Fn(&Value) -> bool) -> (bool, String) {
-        let calls: Vec<&Value> = self
-            .contents()
-            .filter(|item| item["type"] == "tool_use" && item["name"] == tool)
-            .filter(|item| matches(&item["input"]))
-            .collect();
-        let [call] = calls[..] else {
+        let calls = self.calls(tool, what, matches);
+        let [call] = &calls[..] else {
             panic!(
                 "inconclusive, rerun: the model made {} {tool} calls on {what}, not one\n{}",
                 calls.len(),
                 self.report
             );
         };
-        let result = self
-            .contents()
-            .find(|item| item["type"] == "tool_result" && item["tool_use_id"] == call["id"])
-            .unwrap_or_else(|| panic!("{tool} {what}: no result\n{}", self.report));
-        let text = match &result["content"] {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        };
-        (result["is_error"] == true, text)
+        call.clone()
+    }
+
+    /// Every call of `tool` whose input `matches`, with what came back, for
+    /// a probe that is printed rather than asserted.
+    fn calls(
+        &self,
+        tool: &str,
+        what: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Vec<(bool, String)> {
+        self.contents()
+            .filter(|item| item["type"] == "tool_use" && item["name"] == tool)
+            .filter(|item| matches(&item["input"]))
+            .map(|call| {
+                let result = self
+                    .contents()
+                    .find(|item| item["type"] == "tool_result" && item["tool_use_id"] == call["id"])
+                    .unwrap_or_else(|| panic!("{tool} {what}: no result\n{}", self.report));
+                let text = match &result["content"] {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                (result["is_error"] == true, text)
+            })
+            .collect()
     }
 }
 
@@ -1012,8 +1073,21 @@ fn run_live_seeded(
     }
 }
 
-/// The token for agent runs, from the system keychain.
+/// The token for agent runs, from the system keychain, or from the file
+/// `OWLSHIFT_LIVE_TOKEN_FILE` names when it is set: for a Linux container
+/// with no Secret Service, the file on a tmpfs the sandbox hides, such as
+/// one under the closed home. The value is never printed.
 fn agent_login() -> Secret {
+    if let Some(file) = std::env::var_os("OWLSHIFT_LIVE_TOKEN_FILE") {
+        let text = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("OWLSHIFT_LIVE_TOKEN_FILE could not be read: {e}"));
+        let token = Secret::new(text.trim_end());
+        assert!(
+            token.is_one_word(),
+            "OWLSHIFT_LIVE_TOKEN_FILE does not hold one token"
+        );
+        return token;
+    }
     Keychain::system()
         .unwrap()
         .read(CLAUDE_AGENT_ACCOUNT)

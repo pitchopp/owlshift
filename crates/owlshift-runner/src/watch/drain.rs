@@ -51,7 +51,7 @@ use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Watch};
 use crate::events::{EventSink, data};
 use crate::on_demand::{self, Delivered, DispatchSeen, Stop, Taken, delivery_followed};
 use crate::quarantine::Held;
-use crate::ticket_ref::{self, Stored, text_sha256};
+use crate::ticket_ref::{self, RefAt, Stored, text_sha256};
 
 /// Why `owlshift watch --drain` refuses to start on a project configured
 /// so, from its working tree (architecture section 5, "The gesture", "By
@@ -441,13 +441,13 @@ impl Watch<'_> {
         if !memory.drain.unread.is_empty() {
             return;
         }
-        let Some(commit) = row.commit() else {
+        let Some(stored) = &row.stored else {
             return;
         };
         if quarantined {
             return self.tell(memory, sink, out, row.id(), Held::Ready);
         }
-        self.dispatch(memory, row.id(), commit, sink, out, continued);
+        self.dispatch(memory, row.id(), stored.at(), sink, out, continued);
     }
 
     /// The pass's intake: the first candidate, in the core's order, that its
@@ -473,10 +473,8 @@ impl Watch<'_> {
             {
                 continue;
             }
-            let seen = Seen {
-                commit: row.commit().unwrap_or_default().to_owned(),
-                answer: None,
-            };
+            let at = row.stored.as_ref().map_or_else(RefAt::none, Stored::at);
+            let seen = Seen::at(at, None);
             match memory.holds.admit(ticket, &seen, now) {
                 Admit::Go => {}
                 Admit::Held { .. } => continue,
@@ -502,25 +500,22 @@ impl Watch<'_> {
         Intake::Done(None)
     }
 
-    /// The dispatch of `ticket`, its ref at `commit`, held as a continue is.
+    /// The dispatch of `ticket`, its ref at `at`, held as a continue is.
     fn dispatch(
         &self,
         memory: &mut WatchMemory,
         ticket: &TicketId,
-        commit: &str,
+        at: RefAt,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
     ) {
         let on_demand = self.on_demand;
-        let seen = Seen {
-            commit: commit.to_owned(),
-            answer: None,
-        };
+        let seen = Seen::at(at, None);
         if memory.holds.admit(ticket, &seen, (on_demand.clock)()) != Admit::Go {
             return;
         }
-        match on_demand.dispatch_seen(ticket, commit, sink) {
+        match on_demand.dispatch_seen(ticket, &seen.commit, sink) {
             None => {}
             // A pull request delivered since the snapshot (OWL-313): nothing
             // ran, so nothing is held; the next pass counts again.
@@ -597,10 +592,11 @@ impl Watch<'_> {
         continued(ticket, outcome, sink);
         let git = &on_demand.executor.git;
         let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket).ok();
-        let commit = after.as_ref().map(|stored| {
+        // An absent ref is as one its first run made for its cost alone.
+        let progress = after.as_ref().map(|stored| {
             stored
                 .as_ref()
-                .map_or_else(String::new, |stored| stored.commit.clone())
+                .map_or_else(|| RefAt::none().progress, Stored::progress)
         });
         let holds_now = after.flatten().as_ref().is_some_and(super::holds);
         // A dispatch is its ticket's first stage step (OWL-367): it takes
@@ -612,7 +608,7 @@ impl Watch<'_> {
             ticket,
             seen,
             outcome,
-            commit.as_deref(),
+            progress.as_ref(),
             holds_now,
         );
     }

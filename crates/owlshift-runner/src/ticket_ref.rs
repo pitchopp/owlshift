@@ -7,8 +7,9 @@
 //! `owlshift watch` follows ([`DELIVERY_FILE`], OWL-209); and once intake
 //! ran, its record ([`INTAKE_FILE`], OWL-248); once a design run wrote a
 //! plan, the plan ([`PLAN_FILE`]) and its review passes ([`REVIEW_FILE`],
-//! OWL-303); once a write followed a run, what the ticket's runs cost
-//! ([`COST_FILE`], OWL-378); and once a run proposed a follow-up, the
+//! OWL-303); once a run ended, what the ticket's runs cost ([`COST_FILE`],
+//! OWL-378, written right after each run since OWL-397, which watch's
+//! [`Progress`] leaves out); and once a run proposed a follow-up, the
 //! proposals and what became of them ([`PROPOSALS_FILE`], OWL-253), which no
 //! write drops but [`forget`]'s of an invalid one.
 //!
@@ -101,6 +102,97 @@ pub struct Stored {
     /// tree holds no [`PROPOSALS_FILE`]. Kept out of [`TicketRecord`]: no
     /// write drops it, so a write that does not name it keeps it as it is.
     pub proposals: Option<TicketProposals>,
+}
+
+impl Stored {
+    /// What this record keeps but its runs' cost ([`progress`], OWL-397).
+    pub fn progress(&self) -> Progress {
+        progress(&self.record, self.proposals.as_ref())
+    }
+
+    /// Where this record is: its commit and its progress.
+    pub fn at(&self) -> RefAt {
+        RefAt {
+            commit: self.commit.clone(),
+            progress: self.progress(),
+        }
+    }
+}
+
+/// Where a ticket ref is (OWL-397): its commit, which the reads that make
+/// sure no other command wrote it since compare, and its [`Progress`],
+/// which watch reads as progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefAt {
+    pub commit: String,
+    pub progress: Progress,
+}
+
+impl RefAt {
+    /// Where a ticket without a ref is: no commit, and the progress of
+    /// [`blank`], which keeps nothing either, so the ref a first run makes
+    /// for its cost alone is no progress.
+    pub fn none() -> Self {
+        RefAt {
+            commit: String::new(),
+            progress: progress(&blank(None), None),
+        }
+    }
+}
+
+/// What a ticket ref keeps but what its runs cost (OWL-397, architecture
+/// section 5, "A move that is only the spend"): the runner writes
+/// [`COST_FILE`] right after every run, so watch reads a move of the ref as
+/// progress only when this changes. A type of its own, never a commit: the
+/// reads that make sure no other command wrote the ref since compare the
+/// commit instead. Kept in memory only, so how it is computed may change
+/// with any release.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Progress(pub(crate) String);
+
+/// The [`Progress`] of `record` with `proposals`: the SHA-256, in lowercase
+/// hex, of each file a write renders but [`COST_FILE`], in a fixed order,
+/// each as its name, then a 0 byte when absent, or a 1 byte, its length as
+/// eight little-endian bytes and its text. Entries Owlshift never writes are
+/// left out: no command changes them.
+pub fn progress(record: &TicketRecord, proposals: Option<&TicketProposals>) -> Progress {
+    let files = [
+        (STATE_FILE, Some(record.state.render())),
+        (QUESTIONS_FILE, Some(record.questions.render())),
+        (DELIVERY_FILE, record.delivery.as_ref().map(|d| d.render())),
+        (INTAKE_FILE, record.intake.as_ref().map(|i| i.render())),
+        (PLAN_FILE, record.plan.as_ref().map(|p| p.render())),
+        (REVIEW_FILE, record.review.as_ref().map(|r| r.render())),
+        (PROPOSALS_FILE, proposals.map(|p| p.render())),
+    ];
+    let mut hash = Sha256::new();
+    for (name, text) in files {
+        hash.update(name.as_bytes());
+        match text {
+            None => hash.update([0]),
+            Some(text) => {
+                hash.update([1]);
+                hash.update((text.len() as u64).to_le_bytes());
+                hash.update(text.as_bytes());
+            }
+        }
+    }
+    Progress(
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// The record of a ticket that keeps nothing but what its runs cost
+/// (OWL-397): Ready at round 0, nothing asked, and `cost`, the record
+/// [`forget`] leaves of a ticket at round 0, which `owlshift do` starts
+/// from. The first run of a ticket without a ref makes its ref with it.
+pub fn blank(cost: Option<TicketCost>) -> TicketRecord {
+    // `TicketState::restore` refuses counters a state cannot have; Ready
+    // with every counter at zero has none of them.
+    kept(0, None, cost).expect("Ready at round 0 with no counter is a state of the machine")
 }
 
 /// What a write does with [`PROPOSALS_FILE`].

@@ -404,8 +404,8 @@ pub struct Pipeline {
     pub default: Variant,
     pub plan_approval: PlanApproval,
     /// Who confirms a review finding before it is acted on (OWL-300,
-    /// architecture section 5, "Confirming a finding"): `arbiter`, the
-    /// default when absent, or `author`. A file using it requires an
+    /// architecture section 5, "Confirming a finding"): `author`, the
+    /// default when absent, or `arbiter`. A file using it requires an
     /// Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings: Option<FindingsConfirmation>,
@@ -415,15 +415,19 @@ pub struct Pipeline {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingsConfirmation {
-    /// One arbiter run per review pass rules on all its findings.
-    #[default]
+    /// One arbiter run per review pass rules on all its findings. Opt-in:
+    /// the P5 exit gate's drains ran it 90 times for 22 USD and it rejected
+    /// 18 findings of 516 (OWL-391).
     Arbiter,
     /// The next design or fix run answers each finding, fixed or rejected.
+    /// The default: the author already answers every finding it is given
+    /// (OWL-377), so a ruling in front of it judges the same finding twice.
+    #[default]
     Author,
 }
 
 impl Pipeline {
-    /// Who confirms a finding: the project's choice, or the arbiter.
+    /// Who confirms a finding: the project's choice, or the author.
     pub fn findings(&self) -> FindingsConfirmation {
         self.findings.unwrap_or_default()
     }
