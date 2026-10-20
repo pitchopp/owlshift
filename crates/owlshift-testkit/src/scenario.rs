@@ -1295,6 +1295,8 @@ impl Driver {
             } else {
                 None
             },
+            // The executor's, after a setup it ran (OWL-389).
+            setup_failure: None,
             result_refusal: match role {
                 Role::AnswerCheck => self
                     .questions

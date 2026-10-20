@@ -1545,7 +1545,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(23)),
+        parse(|v| v["format"] = json!(24)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1617,6 +1617,22 @@ fn brief_rejections() {
         "unknown field in the gate failure",
         parse(|v| v["gate_failure"]["exit_code"] = json!(1)),
         "unknown field `exit_code`",
+    );
+    // Build's setup failure, beside its gate failure (OWL-389).
+    let told_both = parse(|v| v["setup_failure"] = v["gate_failure"].clone()).unwrap();
+    assert_eq!(told_both.setup_failure, told_both.gate_failure);
+    rejects(
+        "a setup failure in a brief other than Build's",
+        parse(|v| {
+            v["setup_failure"] = v["gate_failure"].clone();
+            v["role"] = json!("design");
+        }),
+        "a setup failure is given but the role is design, not build",
+    );
+    rejects(
+        "format 22, before Build's brief carried its setup failure",
+        parse(|v| v["format"] = json!(22)),
+        "unknown format 22",
     );
     rejects(
         "missing gate",

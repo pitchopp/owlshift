@@ -103,6 +103,14 @@ pub struct Brief {
     /// when no gate run of the runner has failed since the last green one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_failure: Option<GateFailure>,
+    /// The project's setup (`stack.setup`) failed before this Build run's
+    /// harness, and the harness started anyway, for the run to repair the
+    /// setup its own work broke (OWL-330): what it repairs first, its
+    /// reason starting `setup: `. Beside `gate_failure`, which it never
+    /// replaces (OWL-389): that one is fixed once the setup is repaired. In
+    /// Build's brief only, written by the executor; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_failure: Option<GateFailure>,
     /// Why the runner refused an earlier run's `result.json`, or a file
     /// its `artifacts` name: what this run fixes in its own, such as
     /// questions not numbered from Q1. In Build's brief, the latest refused
@@ -832,8 +840,9 @@ impl Brief {
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
     /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
     /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
-    /// `rebase`; only Build's has a `correction`, which reverses at least one
-    /// decision, each with a reply of at most [`MAX_REPLY_BYTES`].
+    /// `rebase`; only Build's has a `setup_failure`, and a `correction`,
+    /// which reverses at least one decision, each with a reply of at most
+    /// [`MAX_REPLY_BYTES`].
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
         if let Some(failure) = &self.check_failure {
@@ -848,6 +857,16 @@ impl Brief {
                 ));
             }
             failure.validate()?;
+        }
+        if self.setup_failure.is_some() && self.role != Role::Build {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "a setup failure is given but the role is {}, not {}",
+                    self.role.as_str(),
+                    Role::Build.as_str()
+                ),
+            ));
         }
         if let Some(correction) = &self.correction {
             if self.role != Role::Build {

@@ -4274,6 +4274,8 @@ impl OnDemand<'_> {
             delegation: None,
             asked_by: None,
             gate_failure,
+            // The executor's, after a setup it ran (OWL-389).
+            setup_failure: None,
             result_refusal: None,
             decisions_refused: false,
             refused_choices: Vec::new(),
