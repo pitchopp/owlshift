@@ -100,7 +100,7 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
-use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, declared_zones};
+use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, ticket_zones};
 use owlshift_core::gate::{BudgetReached, Chain, ChainCost, GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::{self, Held, Resource};
@@ -1115,7 +1115,8 @@ struct Prepared {
     ticket: TicketId,
     found: Ticket,
     /// The ticket's decider when the command started ([`pending_decider`],
-    /// [`decide`]), or why it has none. `do` refuses a ticket without one;
+    /// [`decide`]), with the zones of the intake record its ref kept then
+    /// ([`decider_zones`]), or why it has none. `do` refuses a ticket without one;
     /// `continue` only once Build is about to run, since waiting, the answer
     /// check and a re-ask need the decider recorded on the latest ask alone.
     decider: Result<AskDecider, String>,
@@ -1752,7 +1753,8 @@ impl OnDemand<'_> {
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
         let takes_in = matches!(command, Command::Do | Command::Intake | Command::Drain);
-        if !takes_in && fs::symlink_metadata(&checkout).is_err() {
+        let cloned = fs::symlink_metadata(&checkout).is_ok();
+        if !takes_in && !cloned {
             return Err(nothing_to_continue(ticket));
         }
         let found = self
@@ -1760,22 +1762,37 @@ impl OnDemand<'_> {
             .ticket(ticket)
             .map_err(|e| refused(&format!("reading {ticket}"), e))?;
         // `do` needs a decider: refused before anything is cloned when the
-        // ticket alone says it has none.
-        let pending = pending_decider(&found);
-        if let (true, Err(why)) = (takes_in, &pending) {
-            return Err(Stop::Refused(why.clone()));
+        // ticket alone says it has none and no ticket ref can add the zones
+        // of an intake record: an intake run counts none, and without a
+        // finished clone there is no ref.
+        let unfinished = fs::symlink_metadata(self.dirs.unfinished_clone_file()).is_ok();
+        if takes_in
+            && (matches!(command, Command::Intake) || !cloned || unfinished)
+            && let Err(why) = pending_decider(&found, &[])
+        {
+            return Err(Stop::Refused(why));
         }
 
         let git = &self.executor.git;
         let base =
             project::sync_checkout(git, self.dirs, self.remote_url).map_err(Stop::Refused)?;
+        let stored = ticket_ref::read(git, &checkout, ticket).map_err(|e| {
+            Stop::Refused(format!(
+                "reading the ticket's ref: {e}. `owlshift forget {ticket}` starts its record \
+                 over, keeping what still reads of its round count and of the refusals its next \
+                 runs are told; its comments stay on the ticket"
+            ))
+        })?;
         // Zone owners come from the project file at the base commit, read
         // only for a ticket without an assignee that declares zones.
-        let decider = pending.and_then(|pending| match pending {
-            Pending::Known(decider) => Ok(decider),
-            Pending::Owners(declared) => project::zone_owners_at(git, &checkout, &base)
-                .and_then(|owners| decide(&found, &declared, &owners)),
-        });
+        let decider =
+            pending_decider(&found, decider_zones(command, stored.as_ref())).and_then(|pending| {
+                match pending {
+                    Pending::Known(decider) => Ok(decider),
+                    Pending::Owners(declared) => project::zone_owners_at(git, &checkout, &base)
+                        .and_then(|owners| decide(&found, &declared, &owners)),
+                }
+            });
         if let (true, Err(why)) = (takes_in, &decider) {
             return Err(Stop::Refused(why.clone()));
         }
@@ -1804,13 +1821,6 @@ impl OnDemand<'_> {
             });
         }
         let labels = route_labels(found.labels.iter().map(String::as_str));
-        let stored = ticket_ref::read(git, &checkout, ticket).map_err(|e| {
-            Stop::Refused(format!(
-                "reading the ticket's ref: {e}. `owlshift forget {ticket}` starts its record \
-                 over, keeping what still reads of its round count and of the refusals its next \
-                 runs are told; its comments stay on the ticket"
-            ))
-        })?;
         Ok(Prepared {
             _lock: lock,
             ticket: ticket.clone(),
@@ -6951,16 +6961,17 @@ enum Pending {
 
 /// The first half of the decider's resolution (architecture section 4),
 /// which needs no project file: the assignee when the ticket has one; else
-/// the zones its `zone:` labels declare, whose owners decide. A malformed
-/// `zone:` label, and a ticket with neither an assignee nor a declared zone,
-/// which no owner could change, have no decider: the reason.
-fn pending_decider(ticket: &Ticket) -> Result<Pending, String> {
+/// the zones `intake` declared ([`decider_zones`]) and those of its `zone:`
+/// labels, whose owners decide. A malformed `zone:` label, and a ticket
+/// with neither an assignee nor a declared zone, which no owner could
+/// change, have no decider: the reason.
+fn pending_decider(ticket: &Ticket, intake: &[String]) -> Result<Pending, String> {
     let assignee = ticket.assignee.as_ref().map(|person| person.id.as_str());
-    // Labels play no part for a ticket with an assignee.
+    // Zones play no part for a ticket with an assignee.
     if let Ok(found) = decider::decider(assignee, &[], &ZoneOwners::default()) {
         return Ok(Pending::Known(recorded(found)));
     }
-    let declared = declared_zones(ticket.labels.iter().map(String::as_str))
+    let declared = ticket_zones(intake, ticket.labels.iter().map(String::as_str))
         .map_err(|error| format!("{} has no decider: {error}", ticket.id))?;
     if declared.is_empty() {
         return decide(ticket, &declared, &ZoneOwners::default()).map(Pending::Known);
@@ -6968,18 +6979,35 @@ fn pending_decider(ticket: &Ticket) -> Result<Pending, String> {
     Ok(Pending::Owners(declared))
 }
 
-/// Whether the ticket alone gives it a decider, for the drain's ready set
+/// The zones of `stored`'s intake record that choose a decider for
+/// `command` (OWL-412): none for an intake run, nor while the ticket is at
+/// Intake, so that intake runs only on a ticket that its assignee or labels
+/// give a decider; the record's once its intake ended.
+fn decider_zones(command: Command, stored: Option<&Stored>) -> &[String] {
+    let Some(stored) = stored else {
+        return &[];
+    };
+    let ended = TicketState::try_from(&stored.record.state)
+        .is_ok_and(|state| state.status() != Status::Active(Stage::Intake));
+    match &stored.record.intake {
+        Some(record) if ended && !matches!(command, Command::Intake) => &record.zones,
+        _ => &[],
+    }
+}
+
+/// Whether the ticket and the zones of its intake record (`intake`, empty
+/// when none counts) give it a decider, for the drain's ready set
 /// (OWL-250): its assignee, or zones whose owners the project file at the
 /// base commit names, which only a command reads.
-pub(crate) fn has_decider(ticket: &Ticket) -> bool {
-    pending_decider(ticket).is_ok()
+pub(crate) fn has_decider(ticket: &Ticket, intake: &[String]) -> bool {
+    pending_decider(ticket, intake).is_ok()
 }
 
 /// The ticket's decider as the ticket alone tells (its assignee), for
 /// `owlshift watch`, which reads no project file: `None` when its zones'
 /// owners decide, or nobody does (OWL-146).
 pub(crate) fn known_decider(ticket: &Ticket) -> Option<Person> {
-    match pending_decider(ticket) {
+    match pending_decider(ticket, &[]) {
         Ok(Pending::Known(decider)) => Some(person(&decider, ticket)),
         _ => None,
     }
