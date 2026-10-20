@@ -12,6 +12,7 @@ use crate::refs::{
 };
 use crate::result::RunResult;
 use crate::review::{TicketPlan, TicketReview};
+use crate::step::{StepEnvelope, StepOutcome, TicketCarry};
 
 /// Every published schema, by file stem: `schemas/<stem>.schema.json`.
 pub fn all() -> Vec<(&'static str, Schema)> {
@@ -32,6 +33,9 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("ticket-cost", schema::<TicketCost>()),
         ("ticket-session", schema::<TicketSession>()),
         ("comment-footer", schema::<Footer>()),
+        ("step-envelope", schema::<StepEnvelope>()),
+        ("step-outcome", schema::<StepOutcome>()),
+        ("ticket-carry", schema::<TicketCarry>()),
     ]
 }
 

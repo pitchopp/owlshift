@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift step outcome",
+  "description": "How a step ended, as the child records it in `outcome-<attempt>.json`,\nwritten last.",
+  "type": "object",
+  "properties": {
+    "after": {
+      "description": "The ticket ref after the step.",
+      "$ref": "#/$defs/RefAfter"
+    },
+    "answer": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "default": null
+    },
+    "at": {
+      "description": "When the step ended.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "attempt": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]{1,80}$"
+    },
+    "commit": {
+      "description": "The ticket ref watch read, as its envelope said.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "end": {
+      "$ref": "#/$defs/StepEnd"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "hold": {
+      "description": "The hold the step calls for, by watch's rule, none when it calls for\nnone.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StepHold"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "kept": {
+      "description": "What watch keeps of the ticket's pull request, as the step left it.",
+      "$ref": "#/$defs/KeptFollowing",
+      "default": {
+        "moved": null,
+        "paused_until": null,
+        "unposted": null
+      }
+    },
+    "progress": {
+      "type": "string"
+    },
+    "ticket": {
+      "$ref": "#/$defs/TicketId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "ticket",
+    "attempt",
+    "progress",
+    "end",
+    "after",
+    "at"
+  ],
+  "$defs": {
+    "KeptFollowing": {
+      "description": "What watch keeps of a ticket's pull request that a repair or a\ncorrection updates (OWL-219, OWL-232), and the forge's pause, which a\nread of the reviews may set: handed to the child and merged back from\nits outcome.",
+      "type": "object",
+      "properties": {
+        "moved": {
+          "description": "The stage last recorded as moved out of Owlshift's states.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "paused_until": {
+          "description": "No forge read before then: a rate-limited answer.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "default": null
+        },
+        "unposted": {
+          "description": "The owed report's refusal last warned of.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeptUnposted"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "KeptUnposted": {
+      "description": "The commit of an owed report and the refusal warned of.",
+      "type": "object",
+      "properties": {
+        "commit": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "reason"
+      ]
+    },
+    "LandedKind": {
+      "description": "What reached the ticket before its state could not be kept.",
+      "type": "string",
+      "enum": [
+        "resume",
+        "questions",
+        "premise_false",
+        "reask",
+        "reply",
+        "parked",
+        "intake",
+        "parked_unposted",
+        "quarantined"
+      ]
+    },
+    "RefAfter": {
+      "description": "The ticket ref after a step.",
+      "oneOf": [
+        {
+          "description": "It is at `commit`, keeping `progress`.",
+          "type": "object",
+          "properties": {
+            "commit": {
+              "type": "string"
+            },
+            "progress": {
+              "type": "string"
+            },
+            "ref": {
+              "type": "string",
+              "const": "present"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ref",
+            "commit",
+            "progress"
+          ]
+        },
+        {
+          "description": "There is none.",
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "const": "absent"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ref"
+          ]
+        },
+        {
+          "description": "It could not be read.",
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "const": "unread"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ref"
+          ]
+        }
+      ]
+    },
+    "Stage": {
+      "description": "A stage of the pipeline, or `ready` for an admitted ticket not yet started.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "ready",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "deliver",
+        "watch"
+      ]
+    },
+    "StepEnd": {
+      "description": "How a step ended, as far as watch tells ends apart.",
+      "oneOf": [
+        {
+          "description": "The ticket ref, or the stage watch read, moved since: nothing ran.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "stale"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end"
+          ]
+        },
+        {
+          "description": "The open pull requests reached their cap: nothing ran.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "capped"
+            },
+            "max_open_prs": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "open_prs": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end",
+            "open_prs",
+            "max_open_prs"
+          ]
+        },
+        {
+          "description": "The admission gesture is not an admitter's: nothing ran.",
+          "type": "object",
+          "properties": {
+            "account": {
+              "type": "string"
+            },
+            "end": {
+              "type": "string",
+              "const": "not_admitted"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end",
+            "account",
+            "reason"
+          ]
+        },
+        {
+          "description": "Another command held the project: nothing ran.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "busy"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end"
+          ]
+        },
+        {
+          "description": "The harness reached its usage limit.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "usage_limit"
+            },
+            "resets_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time",
+              "default": null
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end"
+          ]
+        },
+        {
+          "description": "A comment that makes a person the blocker landed, or a park whose\ncomment did not, and the ticket's state was not kept.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "not_kept"
+            },
+            "landed": {
+              "$ref": "#/$defs/LandedKind"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end",
+            "landed"
+          ]
+        },
+        {
+          "description": "One stage step kept its state: the ticket is at `stage`.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "stepped"
+            },
+            "stage": {
+              "$ref": "#/$defs/Stage"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end",
+            "stage"
+          ]
+        },
+        {
+          "description": "Anything else: a delivery, a refusal, a park, a round, a look.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "other"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end"
+          ]
+        }
+      ]
+    },
+    "StepHold": {
+      "description": "A hold a step calls for.",
+      "oneOf": [
+        {
+          "description": "Every step waits until the usage limit resets.",
+          "type": "object",
+          "properties": {
+            "hold": {
+              "type": "string",
+              "const": "paused"
+            },
+            "until": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "hold",
+            "until"
+          ]
+        },
+        {
+          "description": "The ticket is held until `until`, or until a person acts when none,\nunless its decider edits a comment or its ref makes progress.",
+          "type": "object",
+          "properties": {
+            "hold": {
+              "type": "string",
+              "const": "held"
+            },
+            "until": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time",
+              "default": null
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "hold"
+          ]
+        }
+      ]
+    },
+    "TicketId": {
+      "description": "A tracker's ticket identifier, safe as a git ref component and a file name.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    }
+  }
+}

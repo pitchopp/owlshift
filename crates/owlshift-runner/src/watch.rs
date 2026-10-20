@@ -65,7 +65,18 @@
 //! round 0 too, in its turn of the project's slot ([`schedule::slot_turn`]):
 //! the others wait, told once per holder, while every waiting ticket's
 //! answer is still checked at each pass. What a step carries, the
-//! resolver's chain and the late-comment integration, goes to the next.
+//! resolver's chain and the late-comment integration, goes to the next,
+//! through `carry.json` since OWL-399 ([`crate::step`]).
+//!
+//! Since OWL-399, each step that may run an agent or the gate is an
+//! envelope ([`StepEnvelope`]) carried out by [`step::run`]: in watch's own
+//! process for plain `owlshift watch` and the test bench ([`Watch::run`],
+//! [`Watch::run_drain`]), or in a child process, `owlshift continue <TICKET>
+//! --step <envelope>`, for `owlshift watch --drain`
+//! ([`Watch::run_with_children`]), whose outcome record watch reads when it
+//! reaps the child. A watch that starts applies the holds the records its
+//! predecessor left call for, while each ticket's ref is where its record
+//! says.
 //!
 //! Since OWL-368, a snapshot that finds the `unverified` marker still reads
 //! the ticket refs, through the runner's read-only plumbing, and the pass
@@ -92,9 +103,12 @@ use std::time::Duration;
 use jiff::Timestamp;
 use serde_json::json;
 
+use owlshift_adapters::forge::ReviewsRead;
 use owlshift_adapters::tracker::Person;
 use owlshift_contracts::event::EventKind;
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::step::{LandedKind, RefAfter, StepEnd, StepEnvelope, StepHold, StepKind};
 use owlshift_core::follow::{Action, Decision};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
@@ -103,11 +117,12 @@ use owlshift_core::vocab::Stage;
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
-use crate::on_demand::{self, Carried, Delivered, Landed, OnDemand, PIPELINE, Stop};
+use crate::on_demand::{self, Delivered, OnDemand, PIPELINE, Stop};
 use crate::pr_reviews;
 use crate::project::ProjectLock;
 use crate::quarantine::{self, Held, Record};
 use crate::reversal::{self, Current};
+use crate::step::{self, Children};
 use crate::ticket_ref::{self, Progress, RefAt, Stored, TicketRecord};
 use crate::writer::VisibleStage;
 
@@ -323,16 +338,16 @@ impl Holds {
         &mut self,
         ticket: &TicketId,
         seen: Seen,
-        outcome: &Result<Delivered, Stop>,
+        outcome: &StepEnd,
         progress: Option<&Progress>,
         now: Timestamp,
     ) -> Option<Admit> {
-        if matches!(outcome, Err(Stop::Busy(_))) {
+        if matches!(outcome, StepEnd::Busy) {
             return None;
         }
-        if let Err(Stop::UsageLimit {
+        if let StepEnd::UsageLimit {
             resets_at: Some(at),
-        }) = outcome
+        } = outcome
             && *at > now
         {
             let until = self.paused_until.map_or(*at, |paused| paused.max(*at));
@@ -341,7 +356,7 @@ impl Holds {
         }
         let as_it_was = progress == Some(&seen.progress);
         let until = match outcome {
-            Err(Stop::NotKept { .. }) if as_it_was || progress.is_none() => Until::Person,
+            StepEnd::NotKept { .. } if as_it_was || progress.is_none() => Until::Person,
             _ if as_it_was => Until::At(now.checked_add(RETRY_AFTER).unwrap_or(Timestamp::MAX)),
             _ => {
                 self.held.remove(ticket);
@@ -355,6 +370,44 @@ impl Holds {
     /// Forgets the holds of the tickets `kept` does not name.
     fn retain(&mut self, kept: &[TicketId]) {
         self.held.retain(|ticket, _| kept.contains(ticket));
+    }
+
+    /// Applies `hold`, which a step of `ticket` from `seen` called for, as
+    /// [`Self::after`] would have set it (OWL-399): a record a predecessor
+    /// left.
+    pub fn restore(&mut self, ticket: &TicketId, seen: Seen, hold: &StepHold) {
+        match hold {
+            StepHold::Paused { until } => {
+                self.paused_until = Some(self.paused_until.map_or(*until, |at| at.max(*until)));
+            }
+            StepHold::Held { until } => {
+                let until = until.map_or(Until::Person, Until::At);
+                self.held.insert(ticket.clone(), (seen, until));
+            }
+        }
+    }
+}
+
+/// The hold a step of `ticket` from `seen` that ended `end` calls for, its
+/// ref's progress after it being `progress`, at `now`, by [`Holds::after`]'s
+/// rule: what the child of a step records for a watch that starts after it
+/// (OWL-399).
+pub(crate) fn hold_for(
+    ticket: &TicketId,
+    seen: Seen,
+    end: &StepEnd,
+    progress: Option<&Progress>,
+    now: Timestamp,
+) -> Option<StepHold> {
+    match Holds::default().after(ticket, seen, end, progress, now)? {
+        Admit::Go => None,
+        Admit::Paused { until } => Some(StepHold::Paused { until }),
+        Admit::Held {
+            until: Until::At(until),
+        } => Some(StepHold::Held { until: Some(until) }),
+        Admit::Held {
+            until: Until::Person,
+        } => Some(StepHold::Held { until: None }),
     }
 }
 
@@ -386,7 +439,17 @@ enum Project {
 
 /// What the loop keeps from one pass to the next.
 #[derive(Default)]
-struct Memory {
+struct Memory<'c> {
+    /// The children watch runs its steps in, for `owlshift watch --drain`;
+    /// none: in its own process (OWL-399).
+    children: Option<&'c Children<'c>>,
+    /// When this watch started, in milliseconds, and how many steps it
+    /// started since: its steps' attempt ids.
+    started_ms: i64,
+    attempts: u64,
+    /// The holds a predecessor's records call for, applied once this pass
+    /// has dropped those of the tickets it no longer lists.
+    adopted: Vec<(TicketId, Seen, StepHold)>,
     holds: Holds,
     /// What was last printed about the project.
     project: Option<Project>,
@@ -412,11 +475,6 @@ struct Memory {
     /// keeping it while its ref holds the slot, and taken during a pass by
     /// a ticket whose ref came to hold a free slot.
     turn: Option<Turn<TicketId>>,
-    /// What each ticket's last stage step left for its next one
-    /// ([`Stop::Stepped`]), while its ref holds the slot, with the ref's
-    /// progress then: a ref that made progress since, as a person's `do`
-    /// between two steps does, starts afresh (OWL-411).
-    carried: HashMap<TicketId, (Progress, Carried)>,
     /// The tickets told that they wait for the slot, with the holders told.
     slot_waits: HashMap<TicketId, Vec<TicketId>>,
     /// The tickets whose answer check watch ran into a stage that needs the
@@ -487,7 +545,7 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         sleep: &mut dyn FnMut(Duration) -> bool,
     ) {
-        self.run_passes(false, sink, out, continued, sleep);
+        self.run_passes(false, None, sink, out, continued, sleep);
     }
 
     /// `owlshift watch --drain` (OWL-250): [`Self::run`], each pass then
@@ -500,18 +558,40 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         sleep: &mut dyn FnMut(Duration) -> bool,
     ) {
-        self.run_passes(true, sink, out, continued, sleep);
+        self.run_passes(true, None, sink, out, continued, sleep);
     }
 
-    fn run_passes(
+    /// [`Self::run`], or [`Self::run_drain`] when `draining`, each step
+    /// that may run an agent or the gate run in a child that `children`
+    /// starts (OWL-399): its lines printed on `out` after its ticket, its
+    /// outcome reported by the child, so `continued` is called for none.
+    pub fn run_with_children(
         &self,
         draining: bool,
+        children: &Children<'_>,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
         sleep: &mut dyn FnMut(Duration) -> bool,
     ) {
-        let mut memory = Memory::default();
+        self.run_passes(draining, Some(children), sink, out, continued, sleep);
+    }
+
+    fn run_passes(
+        &self,
+        draining: bool,
+        children: Option<&Children<'_>>,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        continued: &mut Continued<'_>,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) {
+        let mut memory = Memory {
+            children,
+            started_ms: Timestamp::now().as_millisecond(),
+            ..Memory::default()
+        };
+        self.adopt_leftovers(&mut memory, sink);
         loop {
             memory.stepped = false;
             self.pass(&mut memory, sink, out, continued);
@@ -642,6 +722,11 @@ impl Watch<'_> {
             ]
             .concat(),
         );
+        // A predecessor's holds, once the drain's tickets were listed or
+        // not (OWL-399).
+        for (ticket, seen, hold) in std::mem::take(&mut memory.adopted) {
+            memory.holds.restore(&ticket, seen, &hold);
+        }
         memory
             .elsewhere
             .retain(|ticket, _| left.contains(ticket) || unread.contains(ticket));
@@ -657,7 +742,6 @@ impl Watch<'_> {
             _ => None,
         };
         memory.turn = Some(schedule::slot_turn(&holding, &unread, kept));
-        memory.carried.retain(|ticket, _| holding.contains(ticket));
         memory.resumed.retain(|ticket, _| holding.contains(ticket));
         memory
             .slot_waits
@@ -922,7 +1006,9 @@ impl Watch<'_> {
             return;
         }
         let held = Seen::at(at, None);
-        let failing_for = seen.failing_for;
+        let failing_for_ms = seen
+            .failing_for
+            .map(|failing| u64::try_from(failing.as_millis()).unwrap_or(u64::MAX));
         self.held_run(
             memory,
             sink,
@@ -930,18 +1016,18 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            |seen, following, sink| {
-                on_demand.repair_seen(ticket, seen, failing_for, following, sink)
-            },
+            StepKind::Repair { failing_for_ms },
+            None,
         );
     }
 
-    /// Runs what watch decided for `ticket` from `held`, unless a hold or a
-    /// pause keeps it back ([`Holds::admit`]), with watch's memory of the
-    /// pull requests it follows: `run` returns `None` when it ran nothing.
-    /// Its outcome is told, then what it did is held as a continue is
-    /// ([`Holds::after`]), from the ticket ref read after it. Returns
-    /// whether it ran.
+    /// Runs the step `kind` watch decided for `ticket` from `held`, unless
+    /// a hold or a pause keeps it back ([`Holds::admit`]), with watch's
+    /// memory of the pull requests it follows and, for a review loop, the
+    /// reviews watch read ([`Self::step`]): a step that found the ref moved
+    /// ran nothing. Its outcome is told, then what it did is held as a
+    /// continue is ([`Holds::after`]), from the ticket ref read after it.
+    /// Returns whether it ran.
     #[allow(clippy::too_many_arguments)]
     fn held_run(
         &self,
@@ -951,17 +1037,19 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
         ticket: &TicketId,
         held: Seen,
-        run: impl FnOnce(&str, &mut Following, &mut EventSink<'_>) -> Option<Result<Delivered, Stop>>,
+        kind: StepKind,
+        reviews: Option<ReviewsRead>,
     ) -> bool {
         let on_demand = self.on_demand;
         let now = (on_demand.clock)();
         if memory.holds.admit(ticket, &held, now) != Admit::Go {
             return false;
         }
-        let Some(outcome) = run(&held.commit, &mut memory.following, sink) else {
+        let envelope = self.envelope(memory, ticket, kind, &held);
+        let end = self.step(memory, sink, out, continued, envelope, reviews);
+        if end == StepEnd::Stale {
             return false;
-        };
-        continued(ticket, &outcome, sink);
+        }
         // A review loop's ref at Build holds the slot from its start, run or
         // refused after it (OWL-367).
         let after = self.read_after(ticket);
@@ -973,11 +1061,133 @@ impl Watch<'_> {
             out,
             ticket,
             held,
-            &outcome,
+            &end,
             progress.as_ref(),
             holds_now,
         );
         true
+    }
+
+    /// The envelope of a step of `kind` of `ticket` from `seen`, what watch
+    /// read (OWL-399): with the generation of the carry tied to that ref and
+    /// watch's memory of the ticket's pull request.
+    fn envelope(
+        &self,
+        memory: &mut Memory,
+        ticket: &TicketId,
+        kind: StepKind,
+        seen: &Seen,
+    ) -> StepEnvelope {
+        memory.attempts += 1;
+        StepEnvelope {
+            format: Format,
+            ticket: ticket.clone(),
+            attempt: format!(
+                "{}-{}-{}",
+                memory.started_ms,
+                std::process::id(),
+                memory.attempts
+            ),
+            step: kind,
+            commit: (!seen.commit.is_empty()).then(|| seen.commit.clone()),
+            progress: seen.progress.0.clone(),
+            answer: seen.answer,
+            generation: step::carry_generation(self.on_demand.dirs, ticket, &seen.commit),
+            kept: memory.following.kept(ticket),
+        }
+    }
+
+    /// Carries out `envelope`'s step (OWL-399): in watch's own process,
+    /// with its memory of the pull requests it follows and `reviews`, the
+    /// outcome told to `continued` as a continue's; or in a child, whose
+    /// record gives back that memory, the child having reported the outcome
+    /// itself. A child that leaves no record, or one that does not read, is
+    /// a `step_unreported` warning, and the step is held as a refusal is.
+    /// Returns how the step ended.
+    fn step(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        continued: &mut Continued<'_>,
+        envelope: StepEnvelope,
+        reviews: Option<ReviewsRead>,
+    ) -> StepEnd {
+        let on_demand = self.on_demand;
+        let ticket = envelope.ticket.clone();
+        let Some(children) = memory.children else {
+            let stepped = step::run(on_demand, &envelope, &mut memory.following, reviews, sink);
+            if let step::Stepped::Ran(outcome) = &stepped
+                && step::reported(&envelope.step, outcome)
+            {
+                continued(&ticket, outcome, sink);
+            }
+            return step::end(&stepped);
+        };
+        match children.run(on_demand.dirs, &envelope, out) {
+            Ok(record) => {
+                memory.following.keep(&ticket, record.kept);
+                record.end
+            }
+            Err(reason) => {
+                sink.emit(
+                    &ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("step_unreported")),
+                        ("attempt", json!(envelope.attempt)),
+                        ("reason", json!(reason)),
+                    ]),
+                );
+                StepEnd::Other
+            }
+        }
+    }
+
+    /// Reads the outcome records a predecessor left (OWL-399) and keeps the
+    /// hold each calls for while its ticket's ref is where the record says,
+    /// for the first pass to apply; every record is removed. One that does
+    /// not read is a `step_unreported` warning of the project.
+    fn adopt_leftovers(&self, memory: &mut Memory, sink: &mut EventSink<'_>) {
+        let on_demand = self.on_demand;
+        for path in step::leftovers(on_demand.dirs) {
+            let record = match step::take_outcome(&path) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(reason) => {
+                    sink.emit_project(
+                        None,
+                        EventKind::Warning,
+                        data([
+                            ("what", json!("step_unreported")),
+                            (
+                                "reason",
+                                json!(format!(
+                                    "an outcome record an earlier watch left does not read: {reason}"
+                                )),
+                            ),
+                        ]),
+                    );
+                    continue;
+                }
+            };
+            // No dedicated checkout yet: no ticket has a ref.
+            let checkout = on_demand.dirs.checkout();
+            let current = if fs::symlink_metadata(&checkout).is_ok() {
+                ticket_ref::read(&on_demand.executor.git, &checkout, &record.ticket)
+            } else {
+                Ok(None)
+            };
+            let at_ref = match (&record.after, current) {
+                (RefAfter::Present { commit, .. }, Ok(Some(stored))) => stored.commit == *commit,
+                (RefAfter::Absent, Ok(None)) => true,
+                _ => false,
+            };
+            if at_ref && let Some((seen, hold)) = step::hold_of(&record) {
+                memory.adopted.push((record.ticket, seen, hold));
+            }
+        }
     }
 
     /// The reviews on a followed pull request whose read asked for no
@@ -1075,7 +1285,8 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            |seen, _, sink| on_demand.review_seen(ticket, seen, read, sink),
+            StepKind::Review,
+            Some(read),
         );
     }
 
@@ -1396,7 +1607,8 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            |seen, following, sink| on_demand.correct_seen(ticket, seen, following, sink),
+            StepKind::Correct,
+            None,
         )
     }
 
@@ -1550,25 +1762,27 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
         }
-        // Recorded by `continue_seen` once the ticket ref is confirmed under
-        // the lock, so the log never says watch continued a ticket it left.
-        let decision = data([("watch", json!("continue")), ("answer", json!(seen.answer))]);
         // The RESUME names the ticket whose turn the slot is (OWL-367).
         let held_by = match &memory.turn {
             Some(Turn::Holder(holder)) if holder != ticket => Some(holder.clone()),
             _ => None,
         };
-        let Some(outcome) =
-            on_demand.continue_seen(ticket, &seen.commit, held_by.as_ref(), decision, sink)
-        else {
+        // The step records watch's `decision` event once the ticket ref is
+        // confirmed under the lock, so the log never says watch continued a
+        // ticket it left.
+        let kind = StepKind::Answer {
+            slot_held_by: held_by,
+        };
+        let envelope = self.envelope(memory, ticket, kind, &seen);
+        let end = self.step(memory, sink, out, continued, envelope, None);
+        if end == StepEnd::Stale {
             // The ticket ref moved since the snapshot: the next pass reads it.
             return;
-        };
-        continued(ticket, &outcome, sink);
+        }
         let after = self.read_after(ticket);
         // Its move to working after the RESUME may have failed: the stage
         // step that follows takes it as shown needs input too (OWL-367).
-        if matches!(outcome, Err(Stop::Stepped { .. }))
+        if matches!(end, StepEnd::Stepped { .. })
             && let Some(stored) = after.as_ref().filter(|stored| holds(stored))
         {
             memory.resumed.insert(ticket.clone(), stored.progress());
@@ -1581,7 +1795,7 @@ impl Watch<'_> {
             out,
             ticket,
             seen,
-            &outcome,
+            &end,
             progress.as_ref(),
             holds_now,
         ) {
@@ -1600,11 +1814,10 @@ impl Watch<'_> {
                 // A RESUME asks the decider nothing: the remedy is the
                 // operator's, once the ticket ref can be written.
                 let remedy = if matches!(
-                    outcome,
-                    Err(Stop::NotKept {
-                        landed: Landed::Resume,
-                        ..
-                    })
+                    end,
+                    StepEnd::NotKept {
+                        landed: LandedKind::Resume,
+                    }
                 ) {
                     "run `owlshift continue` once the ticket ref can be written; watch also \
                      continues it again once its decider edits a comment or a command moves \
@@ -1702,28 +1915,21 @@ impl Watch<'_> {
             }
         }
         memory.elsewhere.remove(ticket);
-        // Recorded by `continue_shown` once the ticket ref and its stage are
-        // confirmed under the lock.
-        let decision = data([
-            ("watch", json!("continue")),
-            ("stage", json!(on_demand::stage_name(stage))),
-        ]);
-        // What the last step left stands only while the ref is where that
-        // step left it (OWL-411).
-        let carried = memory
-            .carried
-            .get(ticket)
-            .filter(|(left_at, _)| *left_at == seen.progress)
-            .map(|(_, carried)| *carried)
-            .unwrap_or_default();
-        let Some(outcome) =
-            on_demand.continue_shown(ticket, &seen.commit, shown, carried, decision, sink)
-        else {
+        // The step records watch's `decision` event once the ticket ref and
+        // its stage are confirmed under the lock, and goes on from what the
+        // last step left while the ref is where that step left it
+        // (`carry.json`, OWL-399).
+        let kind = StepKind::Resume {
+            shown: step::shown(shown),
+            stage,
+        };
+        let envelope = self.envelope(memory, ticket, kind, &seen);
+        let end = self.step(memory, sink, out, continued, envelope, None);
+        if end == StepEnd::Stale {
             // The ref moved, or the ticket was moved, since the reads: the
             // next pass reads it again.
             return;
-        };
-        continued(ticket, &outcome, sink);
+        }
         let after = self.read_after(ticket);
         let progress = after.as_ref().map(Stored::progress);
         let holds_now = after.as_ref().is_some_and(holds);
@@ -1733,7 +1939,7 @@ impl Watch<'_> {
             out,
             ticket,
             seen,
-            &outcome,
+            &end,
             progress.as_ref(),
             holds_now,
         ) {
@@ -1771,9 +1977,10 @@ impl Watch<'_> {
     /// `outcome` is told, `progress` being its ticket ref's progress read
     /// after it (`None` when gone or unreadable; a move of the spend alone is
     /// none, OWL-397) and `holds_now` whether that ref holds the slot: held
-    /// as a continue is ([`Holds::after`]), and, since OWL-367, what a stage
-    /// step carries, the slot's turn, and whether the next pass is due at
-    /// once. Returns the hold or the pause it set.
+    /// as a continue is ([`Holds::after`]), and, since OWL-367, the slot's
+    /// turn and whether the next pass is due at once; what a stage step
+    /// carries is the step's own, in `carry.json` (OWL-399). Returns the
+    /// hold or the pause it set.
     #[allow(clippy::too_many_arguments)]
     fn after(
         &self,
@@ -1782,13 +1989,13 @@ impl Watch<'_> {
         out: &mut dyn Write,
         ticket: &TicketId,
         seen: Seen,
-        outcome: &Result<Delivered, Stop>,
+        outcome: &StepEnd,
         progress: Option<&Progress>,
         holds_now: bool,
     ) -> Option<Admit> {
         let moved = progress != Some(&seen.progress);
         // A stage step whose ref moved: its next step is due at once.
-        if keep_carried(&mut memory.carried, ticket, outcome, progress, moved) {
+        if moved && matches!(outcome, StepEnd::Stepped { .. }) {
             memory.stepped = true;
         }
         // A ref that holds the slot now takes a free turn, or waits for the
@@ -1947,34 +2154,6 @@ impl Watch<'_> {
     }
 }
 
-/// Keeps in `carried` what a stage step of `ticket` whose `outcome` is
-/// [`Stop::Stepped`] and whose ref `moved` left for its next step (OWL-367),
-/// with the ref's `progress` after it (OWL-411; an unreadable ref keeps
-/// nothing), and returns `true`; any
-/// other outcome drops what an earlier step left, as a person's `continue`
-/// starts afresh, and returns `false`.
-fn keep_carried(
-    carried: &mut HashMap<TicketId, (Progress, Carried)>,
-    ticket: &TicketId,
-    outcome: &Result<Delivered, Stop>,
-    progress: Option<&Progress>,
-    moved: bool,
-) -> bool {
-    match outcome {
-        Err(Stop::Stepped { carried: left, .. }) if moved => {
-            match progress {
-                Some(progress) => carried.insert(ticket.clone(), (progress.clone(), *left)),
-                None => carried.remove(ticket),
-            };
-            true
-        }
-        _ => {
-            carried.remove(ticket);
-            false
-        }
-    }
-}
-
 /// Whether the ticket ref `stored` holds the project's slot
 /// ([`schedule::holds_slot`]); one whose state does not read is no holder
 /// here, its ref being read by the next snapshot.
@@ -2046,8 +2225,13 @@ mod tests {
         }
     }
 
-    fn refused() -> Result<Delivered, Stop> {
-        Err(Stop::Refused("the tracker is down".to_owned()))
+    fn refused() -> StepEnd {
+        end(Err(Stop::Refused("the tracker is down".to_owned())))
+    }
+
+    /// How a step with `outcome` ended, as watch reads it (OWL-399).
+    fn end(outcome: Result<Delivered, Stop>) -> StepEnd {
+        step::end(&step::Stepped::Ran(outcome))
     }
 
     #[test]
@@ -2119,46 +2303,6 @@ mod tests {
         }
     }
 
-    /// OWL-367: what a stage step whose ref moved left is kept for the next
-    /// step; a step that left the ref as it was, or any other outcome, drops
-    /// it.
-    #[test]
-    fn a_step_keeps_its_chain_for_the_next_and_any_other_outcome_drops_it() {
-        let ticket = TicketId::new("OWL-1").unwrap();
-        let mut chain = owlshift_core::gate::Chain::default();
-        chain.settled_once();
-        let left = Carried {
-            chain,
-            integrated: true,
-        };
-        let step = Err(Stop::Stepped {
-            ticket: ticket.clone(),
-            stage: Stage::Build,
-            carried: left,
-        });
-        let at = p("c2");
-        let mut carried = HashMap::new();
-        assert!(keep_carried(&mut carried, &ticket, &step, Some(&at), true));
-        assert_eq!(carried.get(&ticket), Some(&(at.clone(), left)));
-        assert!(!keep_carried(
-            &mut carried,
-            &ticket,
-            &step,
-            Some(&at),
-            false
-        ));
-        assert!(carried.is_empty());
-        carried.insert(ticket.clone(), (at.clone(), left));
-        assert!(!keep_carried(
-            &mut carried,
-            &ticket,
-            &refused(),
-            Some(&at),
-            true
-        ));
-        assert!(carried.is_empty());
-    }
-
     #[test]
     fn the_held_line_names_the_stage() {
         let ticket = TicketId::new("DEMO-1").unwrap();
@@ -2224,7 +2368,7 @@ mod tests {
 
         let busy = Err(Stop::Busy(PathBuf::from("/p")));
         assert_eq!(
-            holds.after(&ticket, seen("c1", 0), &busy, Some(&p("c1")), at(1)),
+            holds.after(&ticket, seen("c1", 0), &end(busy), Some(&p("c1")), at(1)),
             None
         );
         assert_eq!(holds.admit(&ticket, &seen("c1", 0), at(2)), Admit::Go);
@@ -2273,7 +2417,7 @@ mod tests {
             resets_at: Some(at(30)),
         });
         assert_eq!(
-            holds.after(&one, seen("c1", 0), &limited, Some(&p("c1")), at(1)),
+            holds.after(&one, seen("c1", 0), &end(limited), Some(&p("c1")), at(1)),
             Some(Admit::Paused { until: at(30) })
         );
         assert_eq!(
@@ -2284,7 +2428,7 @@ mod tests {
 
         let unknown = Err(Stop::UsageLimit { resets_at: None });
         assert_eq!(
-            holds.after(&one, seen("c1", 0), &unknown, Some(&p("c1")), at(31)),
+            holds.after(&one, seen("c1", 0), &end(unknown), Some(&p("c1")), at(31)),
             Some(Admit::Held {
                 until: Until::At(at(41))
             })
@@ -2319,7 +2463,7 @@ mod tests {
             for progress in [Some(&p("c1")), None] {
                 let outcome = not_kept(landed);
                 assert_eq!(
-                    holds.after(&ticket, seen("c1", 0), &outcome, progress, at(1)),
+                    holds.after(&ticket, seen("c1", 0), &end(outcome), progress, at(1)),
                     person,
                     "{landed:?} {progress:?}"
                 );
@@ -2337,7 +2481,7 @@ mod tests {
         holds.after(
             &ticket,
             seen("c1", 0),
-            &not_kept(Landed::Reask),
+            &end(not_kept(Landed::Reask)),
             None,
             at(2),
         );
@@ -2348,7 +2492,7 @@ mod tests {
             holds.after(
                 &ticket,
                 seen("c1", 0),
-                &not_kept(Landed::Questions),
+                &end(not_kept(Landed::Questions)),
                 Some(&p("c3")),
                 at(4)
             ),
@@ -2384,7 +2528,13 @@ mod tests {
             landed: Landed::Reask,
             message: "the ticket's ref is locked".to_owned(),
         });
-        holds.after(&ticket, seen("p1", 0), &not_kept, Some(&p("p1")), at(6));
+        holds.after(
+            &ticket,
+            seen("p1", 0),
+            &end(not_kept),
+            Some(&p("p1")),
+            at(6),
+        );
         assert_eq!(
             holds.admit(&ticket, &seen_at("spent", "p1", 0), at(24 * 60)),
             Admit::Held {

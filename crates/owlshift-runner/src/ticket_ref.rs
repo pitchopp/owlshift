@@ -156,6 +156,13 @@ impl RefAt {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Progress(pub(crate) String);
 
+impl Progress {
+    /// As a step's envelope and outcome record carry it (OWL-399).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The [`Progress`] of `record` with `proposals`: the SHA-256, in lowercase
 /// hex, of each file a write renders but [`COST_FILE`] and [`SESSION_FILE`]
 /// (OWL-394), which runs write and spend beside what they keep, in a fixed order,

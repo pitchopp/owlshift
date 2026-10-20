@@ -27,6 +27,7 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
     DeliveredPullRequest, Ended, EndedWhy, OwedReport, PushKind, Pushing, TicketDelivery,
 };
+use owlshift_contracts::step::{KeptFollowing, KeptUnposted};
 use owlshift_core::follow::{
     self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
 };
@@ -567,6 +568,41 @@ impl Following {
     /// again (OWL-232).
     pub fn report_settled(&mut self, ticket: &TicketId) {
         self.unposted.remove(ticket);
+    }
+
+    /// What a step of `ticket` in a child process changes of this memory
+    /// (OWL-399): its moved stage (OWL-219), its owed report's refusal
+    /// (OWL-232), and the forge's pause, handed to the child and merged
+    /// back from its outcome ([`Self::keep`]).
+    pub fn kept(&self, ticket: &TicketId) -> KeptFollowing {
+        KeptFollowing {
+            moved: self.moved.get(ticket).cloned(),
+            unposted: self
+                .unposted
+                .get(ticket)
+                .map(|(commit, reason)| KeptUnposted {
+                    commit: commit.clone(),
+                    reason: reason.clone(),
+                }),
+            paused_until: self.paused_until,
+        }
+    }
+
+    /// Takes `kept`, what a step of `ticket` left ([`Self::kept`]): the
+    /// ticket's moved stage and owed report's refusal as it says, and the
+    /// later of the two pauses.
+    pub fn keep(&mut self, ticket: &TicketId, kept: KeptFollowing) {
+        match kept.moved {
+            Some(stage) => self.moved.insert(ticket.clone(), stage),
+            None => self.moved.remove(ticket),
+        };
+        match kept.unposted {
+            Some(KeptUnposted { commit, reason }) => {
+                self.unposted.insert(ticket.clone(), (commit, reason))
+            }
+            None => self.unposted.remove(ticket),
+        };
+        self.paused_until = self.paused_until.max(kept.paused_until);
     }
 
     /// Forgets everything kept of `ticket`.

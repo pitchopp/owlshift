@@ -196,7 +196,49 @@ impl Chain {
     pub const fn recommendations_taken(self, role: Role) -> bool {
         self.recommended & role_bit(role) != 0
     }
+
+    /// The asking roles that took recommendations in this chain, in the
+    /// order [`Role`] declares them: what a step carries to the next keeps
+    /// them (OWL-399).
+    pub fn recommended(self) -> Vec<Role> {
+        ROLES
+            .into_iter()
+            .filter(|role| self.recommendations_taken(*role))
+            .collect()
+    }
+
+    /// A chain from its kept parts (OWL-399): `settled` runs settled in a
+    /// row, its resolver and asking runs' costs, and the roles that took
+    /// recommendations.
+    pub fn restore(
+        settled: u32,
+        cost: ChainCost,
+        asking: ChainCost,
+        recommended: impl IntoIterator<Item = Role>,
+    ) -> Self {
+        Self {
+            settled,
+            cost,
+            asking,
+            recommended: recommended
+                .into_iter()
+                .fold(0, |bits, role| bits | role_bit(role)),
+        }
+    }
 }
+
+/// Every role, in the order [`Role`] declares them.
+const ROLES: [Role; 9] = [
+    Role::Intake,
+    Role::Resolver,
+    Role::AnswerCheck,
+    Role::Design,
+    Role::DesignReview,
+    Role::Build,
+    Role::Verify,
+    Role::Rebase,
+    Role::Arbiter,
+];
 
 /// What one ticket's runs cost (OWL-378, architecture section 4, "Ticket
 /// budget"): every run the runner starts for it, counted once as it ends,
@@ -536,6 +578,28 @@ mod tests {
         PlanApproval::OnFork,
         PlanApproval::Never,
     ];
+
+    /// OWL-399: a chain restored from its kept parts is the chain they
+    /// were taken from, every role's bit included.
+    #[test]
+    fn a_chain_restores_from_its_parts() {
+        let mut chain = Chain::default();
+        chain.settled_once();
+        chain.resolved(Some(0.25));
+        chain.asked(None);
+        chain.took_recommendations(Role::Design);
+        chain.took_recommendations(Role::Arbiter);
+        assert_eq!(chain.recommended(), [Role::Design, Role::Arbiter]);
+        let restored = Chain::restore(
+            chain.settled(),
+            chain.cost(),
+            chain.asking_cost(),
+            chain.recommended(),
+        );
+        assert_eq!(restored, chain);
+        let all = Chain::restore(0, ChainCost::Known(0), ChainCost::Known(0), ROLES);
+        assert_eq!(all.recommended(), ROLES);
+    }
 
     #[test]
     fn floor_categories_go_to_a_human_whatever_the_project_adds() {

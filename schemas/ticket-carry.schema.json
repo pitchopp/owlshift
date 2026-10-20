@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket carry",
+  "description": "What a ticket's last stage step left for its next one\n(architecture section 5, \"What a step carries\"), kept in `carry.json`\nwith the ticket-ref commit that step left and a generation raised at\neach write.",
+  "type": "object",
+  "properties": {
+    "chain": {
+      "$ref": "#/$defs/KeptChain"
+    },
+    "commit": {
+      "type": "string"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "integrated": {
+      "description": "A Build run of the delivery already integrated late comments\n(OWL-139).",
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "commit",
+    "generation",
+    "chain",
+    "integrated"
+  ],
+  "$defs": {
+    "KeptChain": {
+      "description": "The resolver's chain as kept: the runs in a row it settled, what its\nresolver runs and its asking runs cost (none once one reported no cost),\nand the asking roles that took recommendations at its bound (OWL-375).",
+      "type": "object",
+      "properties": {
+        "asking_spent_micros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "recommended": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Role"
+          }
+        },
+        "resolver_spent_micros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "settled": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "settled"
+      ]
+    },
+    "Role": {
+      "description": "What a run executes: a stage's role, or one of the runner's helper roles.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "resolver",
+        "answer_check",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "rebase",
+        "arbiter"
+      ]
+    }
+  }
+}

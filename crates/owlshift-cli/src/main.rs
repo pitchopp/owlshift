@@ -60,6 +60,10 @@ enum Command {
     Continue {
         /// The ticket, such as OWL-12.
         ticket: String,
+        /// The step `owlshift watch --drain` runs in this process, as its
+        /// envelope (OWL-399): watch's own, never typed.
+        #[arg(long, hide = true, value_name = "ENVELOPE")]
+        step: Option<String>,
     },
     /// Watch this project's tickets whose questions wait, in the foreground,
     /// and continue each one as `owlshift continue` would once its decider's
@@ -181,9 +185,13 @@ fn main() -> ExitCode {
         }
         Command::Init(args) => init_cmd::run(&args, &config),
         Command::Do { ticket } => do_cmd::run(&system, &config, do_cmd::Mode::Do(&ticket)),
-        Command::Continue { ticket } => {
+        Command::Continue { ticket, step: None } => {
             do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket))
         }
+        Command::Continue {
+            ticket,
+            step: Some(envelope),
+        } => do_cmd::run(&system, &config, do_cmd::Mode::Step(&ticket, &envelope)),
         Command::Watch { drain: false } => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
         Command::Watch { drain: true } => do_cmd::run(&system, &config, do_cmd::Mode::Drain),
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),

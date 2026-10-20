@@ -969,7 +969,7 @@ impl OnDemand<'_> {
                     // Under watch the stage's run is the step (OWL-367): the
                     // dispatch to Build is the next step's.
                     if p.stepping {
-                        return Err(stepped(p, &next));
+                        return Err(self.stepped(p, &next, sink));
                     }
                     if next.status() == Status::Active(Stage::Build) {
                         dispatched = self.dispatch_to_build(p, command, sink)?;
@@ -978,7 +978,9 @@ impl OnDemand<'_> {
                 }
                 Status::Active(Stage::Build) => match self.build(p, &dispatched, state, sink)? {
                     Built::Delivered(delivered) => return Ok(delivered),
-                    Built::Replan(next) if p.stepping => return Err(stepped(p, &next)),
+                    Built::Replan(next) if p.stepping => {
+                        return Err(self.stepped(p, &next, sink));
+                    }
                     Built::Replan(next) => state = next,
                 },
                 // A Verify pass `continue` runs again on the kept Build
@@ -988,7 +990,9 @@ impl OnDemand<'_> {
                         Verified::Passed(verified) => {
                             return self.deliver_verified(p, &dispatched, &verified, sink);
                         }
-                        Verified::Revise(next) if p.stepping => return Err(stepped(p, &next)),
+                        Verified::Revise(next) if p.stepping => {
+                            return Err(self.stepped(p, &next, sink));
+                        }
                         Verified::Revise(next) => state = next,
                     }
                 }
