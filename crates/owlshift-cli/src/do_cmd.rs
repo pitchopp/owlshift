@@ -449,7 +449,7 @@ fn run_with(
 /// (OWL-409): the personal file's `concurrent_runs`, its default when the
 /// file is absent. An invalid file never gets here: `loaded_project`
 /// refuses it.
-fn concurrent_runs(personal: &FileState<PersonalConfig>) -> u32 {
+pub(crate) fn concurrent_runs(personal: &FileState<PersonalConfig>) -> u32 {
     match personal {
         FileState::Loaded { config, .. } => config.concurrent_runs(),
         _ => DEFAULT_CONCURRENT_RUNS,

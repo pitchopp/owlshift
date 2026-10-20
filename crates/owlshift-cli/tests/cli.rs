@@ -1570,3 +1570,107 @@ fn ci_requires_confinement_on_every_unix_leg() {
         "{step:?}"
     );
 }
+
+/// OWL-407: `owlshift why` on the bench's events, while another process
+/// holds the project's lock, as `owlshift watch` does.
+#[test]
+fn why_tells_each_waiting_ticket_its_reason_while_the_project_is_locked() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let init = ["init", "--tracker", "markdown", "--skip-secrets"];
+    assert!(
+        owlshift(repo.path(), config_dir.path(), &init)
+            .status
+            .success()
+    );
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owlshift/demo.git",
+        ],
+    );
+    let data = config_dir.path().join("data");
+    let project = data.join("projects/github.com/owlshift/demo");
+    fs::create_dir_all(&project).unwrap();
+    let event = |at: &str, ticket: &str, kind: &str, details: &str| {
+        format!(
+            r#"{{"format":2,"at":"{at}","project":"owlshift/demo","ticket":"{ticket}","kind":"{kind}","data":{details}}}"#
+        )
+    };
+    let other = r#"{"format":2,"at":"2026-10-20T10:03:00Z","project":"other/p","ticket":"ZED-1","run":"r9","kind":"run_started","data":{}}"#;
+    let lines = [
+        event(
+            "2026-10-20T10:00:00Z",
+            "OWL-1",
+            "decision",
+            r#"{"drain":"waits","reason":"blocked_by","tickets":["OWL-9"]}"#,
+        ),
+        event(
+            "2026-10-20T10:01:00Z",
+            "OWL-1",
+            "decision",
+            r#"{"drain":"waits","reason":"collision","tickets":["OWL-2"],"resource":{"zone":"leases/"}}"#,
+        ),
+        event(
+            "2026-10-20T10:02:00Z",
+            "OWL-3",
+            "decision",
+            r#"{"drain":"waits","reason":"pr_cap"}"#,
+        ),
+        event("2026-10-20T10:02:30Z", "OWL-3", "dispatch", "{}"),
+        event(
+            "2026-10-20T10:04:00Z",
+            "OWL-5",
+            "warning",
+            r#"{"what":"zones_unknown"}"#,
+        ),
+        other.to_owned(),
+    ];
+    fs::write(data.join("events.jsonl"), lines.join("\n") + "\n").unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(project.join("lock"))
+        .unwrap();
+    lock.lock().unwrap();
+
+    let all = owlshift(repo.path(), config_dir.path(), &["why"]);
+    assert!(all.status.success(), "{}", stderr(&all));
+    let text = stdout(&all);
+    assert!(
+        text.contains("OWL-1 waits since 2026-10-20T10:01:00Z: OWL-2 holds zone `leases/`"),
+        "{text}"
+    );
+    assert!(!text.contains("OWL-3 waits"), "{text}");
+    assert!(text.contains("people's tickets left out"), "{text}");
+    assert!(text.contains("OWL-5: in the working state"), "{text}");
+    assert!(text.contains("machine slots: 0 of 2 in use"), "{text}");
+    assert!(text.contains("no harness is limited"), "{text}");
+
+    let one = owlshift(repo.path(), config_dir.path(), &["why", "OWL-1"]);
+    assert!(one.status.success(), "{}", stderr(&one));
+    let text = stdout(&one);
+    let blocked = text.find("blocked by OWL-9").expect(&text);
+    let held = text.find("OWL-2 holds zone").expect(&text);
+    assert!(blocked < held, "{text}");
+    assert!(text.contains("now: OWL-2 holds zone `leases/`"), "{text}");
+
+    let moved = stdout(&owlshift(repo.path(), config_dir.path(), &["why", "OWL-3"]));
+    assert!(moved.contains("now: not waiting"), "{moved}");
+    let unknown = stdout(&owlshift(
+        repo.path(),
+        config_dir.path(),
+        &["why", "OWL-77"],
+    ));
+    assert!(unknown.contains("no wait recorded"), "{unknown}");
+    assert!(
+        !owlshift(repo.path(), config_dir.path(), &["why", "a b"])
+            .status
+            .success()
+    );
+}
