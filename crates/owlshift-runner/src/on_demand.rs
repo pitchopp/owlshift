@@ -664,11 +664,14 @@ pub enum Stop {
     Watched { ticket: TicketId, seen: Box<Seen> },
     /// `owlshift watch` ran one stage step of the ticket and kept its state
     /// (OWL-367): it is now at `stage`, and its next step runs at a later
-    /// pass, going on from `carried`. Nobody is the blocker.
+    /// pass, going on from `carried`. Nobody is the blocker. `commit` is the
+    /// ticket ref the step left, as it read it under its lock, which
+    /// `carry.json` is tied to (OWL-399); `None` when it kept none.
     Stepped {
         ticket: TicketId,
         stage: Stage,
         carried: Carried,
+        commit: Option<String>,
     },
 }
 
@@ -888,6 +891,7 @@ fn stepped(p: &Prepared, state: &TicketState) -> Stop {
         ticket: p.ticket.clone(),
         stage: state.stage(),
         carried: p.carried(),
+        commit: p.stored.as_ref().map(|stored| stored.commit.clone()),
     }
 }
 
@@ -1350,7 +1354,27 @@ impl OnDemand<'_> {
     /// see the module documentation. Refused while its questions wait.
     pub fn run(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
         let mut p = self.prepare(ticket, Command::Do)?;
+        self.drop_carry(ticket, sink);
         self.run_prepared(&mut p, Command::Do, sink)
+    }
+
+    /// A person's `do` or `continue` starts its ticket afresh, as before
+    /// P6: what watch's steps carried goes (OWL-399, architecture section
+    /// 5, "What it carries"), under the lock the command holds. A removal
+    /// that fails is a `warning` event: the carry stands, but only for a
+    /// ref this command leaves where it is.
+    fn drop_carry(&self, ticket: &TicketId, sink: &mut EventSink<'_>) {
+        if let Err(error) = crate::step::remove_carry(self.dirs, ticket) {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("carry_not_removed")),
+                    ("reason", json!(error.to_string())),
+                ]),
+            );
+        }
     }
 
     /// [`Self::run`] once `command`, `do` or the drain's dispatch, holds the
@@ -1430,6 +1454,7 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let p = self.prepare(ticket, Command::Continue)?;
+        self.drop_carry(ticket, sink);
         self.continue_prepared(p, sink)
     }
 

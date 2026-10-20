@@ -38,6 +38,15 @@
       "default": 0,
       "minimum": 0
     },
+    "kept": {
+      "description": "What watch keeps of the ticket's pull request and the forge's pause,\nwhich the step may change and its outcome gives back.",
+      "$ref": "#/$defs/KeptFollowing",
+      "default": {
+        "moved": null,
+        "paused_until": null,
+        "unposted": null
+      }
+    },
     "progress": {
       "description": "What the ref kept but its runs' cost when watch read it, as watch\ncompares it: the hold the child computes keys on it.",
       "type": "string"
@@ -59,7 +68,7 @@
   ],
   "$defs": {
     "KeptFollowing": {
-      "description": "What watch keeps of a ticket's pull request that a repair or a\ncorrection updates (OWL-219, OWL-232), and the forge's pause: handed to\nthe child and merged back from its outcome.",
+      "description": "What watch keeps of a ticket's pull request that a repair or a\ncorrection updates (OWL-219, OWL-232), and the forge's pause, which a\nread of the reviews may set: handed to the child and merged back from\nits outcome.",
       "type": "object",
       "properties": {
         "moved": {
@@ -226,14 +235,6 @@
               "default": null,
               "minimum": 0
             },
-            "kept": {
-              "$ref": "#/$defs/KeptFollowing",
-              "default": {
-                "moved": null,
-                "paused_until": null,
-                "unposted": null
-              }
-            },
             "kind": {
               "type": "string",
               "const": "repair"
@@ -248,14 +249,6 @@
           "description": "A correction at Watch.",
           "type": "object",
           "properties": {
-            "kept": {
-              "$ref": "#/$defs/KeptFollowing",
-              "default": {
-                "moved": null,
-                "paused_until": null,
-                "unposted": null
-              }
-            },
             "kind": {
               "type": "string",
               "const": "correct"

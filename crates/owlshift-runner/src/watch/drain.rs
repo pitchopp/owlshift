@@ -42,6 +42,7 @@ use owlshift_contracts::config::{Admit as Gesture, ProjectConfig};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::EndedWhy;
+use owlshift_contracts::step::{StepEnd, StepKind};
 use owlshift_core::schedule::{self, Caps, Load, Wait, natural_cmp};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::ticket::{Admission, Blocker, BlockerState, Ticket, text_blockers};
@@ -49,7 +50,7 @@ use owlshift_core::vocab::Stage;
 
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Watch};
 use crate::events::{EventSink, data};
-use crate::on_demand::{self, Delivered, DispatchSeen, Stop, Taken, delivery_followed};
+use crate::on_demand::{self, delivery_followed};
 use crate::quarantine::Held;
 use crate::ticket_ref::{self, RefAt, Stored, text_sha256};
 
@@ -129,10 +130,6 @@ impl Row {
 
     fn id(&self) -> &TicketId {
         &self.listed.ticket.id
-    }
-
-    fn commit(&self) -> Option<&str> {
-        self.stored.as_ref().map(|stored| stored.commit.as_str())
     }
 
     fn intake_hash(&self) -> Option<&str> {
@@ -240,17 +237,6 @@ fn said(wait: &Wait<String>, exclude: Option<&str>) -> String {
             list(ids)
         ),
         Wait::RunCap => "every run of this machine is taken".to_owned(),
-    }
-}
-
-/// How an intake's outcome is reported, as a continue's: a record kept is
-/// the ticket back in the column, waiting for its dispatch.
-fn as_reported(ticket: &TicketId, outcome: Result<impl Sized, Stop>) -> Result<Delivered, Stop> {
-    match outcome {
-        Ok(_) => Err(Stop::Ready {
-            ticket: ticket.clone(),
-        }),
-        Err(stop) => Err(stop),
     }
 }
 
@@ -480,19 +466,17 @@ impl Watch<'_> {
                 Admit::Held { .. } => continue,
                 Admit::Paused { .. } => return Intake::Paused,
             }
-            let Some(taken) = on_demand.intake_seen(ticket, row.commit(), sink) else {
+            let envelope = self.envelope(memory, ticket, StepKind::Intake, &seen);
+            match self.step(memory, sink, out, continued, envelope, None) {
                 // The ref moved, or the ticket left the column: the next
                 // pass reads it again.
-                return Intake::Done(None);
-            };
-            match taken {
-                Taken::NotAdmitted { account, reason } => {
+                StepEnd::Stale => return Intake::Done(None),
+                StepEnd::NotAdmitted { account, reason } => {
                     self.not_admitted(memory, ticket, account, &reason, sink, out);
                 }
-                Taken::Ran(outcome) => {
+                end => {
                     memory.drain.warned.remove(ticket);
-                    let outcome = as_reported(ticket, outcome);
-                    self.ran(memory, ticket, seen, &outcome, sink, out, continued);
+                    self.ran(memory, ticket, seen, &end, sink, out);
                     return Intake::Done(Some(ticket.clone()));
                 }
             }
@@ -515,20 +499,21 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &seen, (on_demand.clock)()) != Admit::Go {
             return;
         }
-        match on_demand.dispatch_seen(ticket, &seen.commit, sink) {
-            None => {}
+        let envelope = self.envelope(memory, ticket, StepKind::Dispatch, &seen);
+        match self.step(memory, sink, out, continued, envelope, None) {
+            StepEnd::Stale => {}
             // A pull request delivered since the snapshot (OWL-313): nothing
             // ran, so nothing is held; the next pass counts again.
-            Some(DispatchSeen::Capped {
+            StepEnd::Capped {
                 open_prs,
                 max_open_prs,
-            }) => self.tell_cap(memory, ticket, open_prs, max_open_prs, sink, out),
-            Some(DispatchSeen::Taken(Taken::NotAdmitted { account, reason })) => {
+            } => self.tell_cap(memory, ticket, open_prs, max_open_prs, sink, out),
+            StepEnd::NotAdmitted { account, reason } => {
                 self.not_admitted(memory, ticket, account, &reason, sink, out);
             }
-            Some(DispatchSeen::Taken(Taken::Ran(outcome))) => {
+            end => {
                 memory.drain.warned.remove(ticket);
-                self.ran(memory, ticket, seen, &outcome, sink, out, continued);
+                self.ran(memory, ticket, seen, &end, sink, out);
             }
         }
     }
@@ -570,26 +555,24 @@ impl Watch<'_> {
         memory.drain.capped = true;
     }
 
-    /// An intake's or a dispatch's outcome reported as a continue's, then
-    /// held as one: a ref left as it was, an absent one included, holds the
-    /// ticket for [`RETRY_AFTER`].
-    #[allow(clippy::too_many_arguments)]
+    /// An intake's or a dispatch's end, its outcome already reported as a
+    /// continue's ([`Watch::step`](super::Watch)), held as one: a ref left
+    /// as it was, an absent one included, holds the ticket for
+    /// [`RETRY_AFTER`].
     fn ran(
         &self,
         memory: &mut WatchMemory,
         ticket: &TicketId,
         seen: Seen,
-        outcome: &Result<Delivered, Stop>,
+        outcome: &StepEnd,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
-        continued: &mut Continued<'_>,
     ) {
         let on_demand = self.on_demand;
         // Another command took the project: the next pass tries again.
-        if matches!(outcome, Err(Stop::Busy(_))) {
+        if matches!(outcome, StepEnd::Busy) {
             return;
         }
-        continued(ticket, outcome, sink);
         let git = &on_demand.executor.git;
         let after = ticket_ref::read(git, &on_demand.dirs.checkout(), ticket).ok();
         // An absent ref is as one its first run made for its cost alone.

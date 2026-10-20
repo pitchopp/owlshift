@@ -59,8 +59,10 @@ impl ProcessTree {
     /// group id is the root's pid, reserved while the root is unreaped, and
     /// once the tree is withdrawn neither the signal handler nor the sentinel
     /// stops it any more. Dropping the handle can block for good when the
-    /// process is being stopped by a signal, by design.
-    pub(super) fn reap(self, child: &mut Child) -> io::Result<ExitStatus> {
+    /// process is being stopped by a signal, by design. A caller that waits
+    /// for the root's end without reaping it ([`ExitWatch`]) stops what the
+    /// tree left, then reaps it here.
+    pub fn reap(self, child: &mut Child) -> io::Result<ExitStatus> {
         drop(self);
         child.wait()
     }
@@ -72,7 +74,7 @@ impl ProcessTree {
     }
 }
 
-pub(super) use imp::ExitWatch;
+pub use imp::ExitWatch;
 #[cfg(unix)]
 pub(super) use imp::kill_group;
 #[cfg(windows)]
@@ -112,11 +114,12 @@ mod imp {
     /// exited never signals a reused pid. `waitid` with `WEXITED | WNOWAIT`
     /// was checked on 2026-10-15 on Linux 6.18; macOS by the CI leg running
     /// the tests of `process`.
-    pub(in crate::process) struct ExitWatch(Receiver<io::Result<()>>);
+    #[derive(Debug)]
+    pub struct ExitWatch(Receiver<io::Result<()>>);
 
     impl ExitWatch {
         /// Starts watching `child`, a root not reaped yet.
-        pub(in crate::process) fn start(child: &Child) -> io::Result<Self> {
+        pub fn start(child: &Child) -> io::Result<Self> {
             let pid = Pid::from_child(child);
             let (sender, receiver) = mpsc::channel();
             thread::Builder::new()
@@ -139,8 +142,8 @@ mod imp {
         }
 
         /// Waits until the root exits, `true`, or the deadline passes,
-        /// `false`. Asked once: the answer is consumed.
-        pub(in crate::process) fn exited_by(
+        /// `false`. The `true` is given once: the answer is consumed.
+        pub fn exited_by(
             &self,
             _child: &Child,
             deadline: Instant,
@@ -313,17 +316,18 @@ mod imp {
     /// timeout on the root's process handle, so no thread is needed. Nothing
     /// here signals a pid: the tree is stopped through its job handle, the
     /// root through its process handle, which keeps the process object.
-    pub(in crate::process) struct ExitWatch;
+    #[derive(Debug)]
+    pub struct ExitWatch;
 
     impl ExitWatch {
         /// Starts watching `child`, a root not reaped yet.
-        pub(in crate::process) fn start(_child: &Child) -> io::Result<Self> {
+        pub fn start(_child: &Child) -> io::Result<Self> {
             Ok(Self)
         }
 
         /// Waits until the root exits, `true`, or the deadline passes,
         /// `false`.
-        pub(in crate::process) fn exited_by(
+        pub fn exited_by(
             &self,
             child: &Child,
             deadline: Instant,

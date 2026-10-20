@@ -48,6 +48,10 @@ pub struct StepEnvelope {
     /// The generation of the carry watch read at `commit`, 0 for none.
     #[serde(default)]
     pub generation: u64,
+    /// What watch keeps of the ticket's pull request and the forge's pause,
+    /// which the step may change and its outcome gives back.
+    #[serde(default)]
+    pub kept: KeptFollowing,
 }
 
 /// The kind of a step, with what each kind needs that watch alone knows.
@@ -73,14 +77,9 @@ pub enum StepKind {
         /// milliseconds.
         #[serde(default)]
         failing_for_ms: Option<u64>,
-        #[serde(default)]
-        kept: KeptFollowing,
     },
     /// A correction at Watch.
-    Correct {
-        #[serde(default)]
-        kept: KeptFollowing,
-    },
+    Correct,
     /// A review loop's start at Watch.
     Review,
 }
@@ -94,8 +93,9 @@ pub enum Shown {
 }
 
 /// What watch keeps of a ticket's pull request that a repair or a
-/// correction updates (OWL-219, OWL-232), and the forge's pause: handed to
-/// the child and merged back from its outcome.
+/// correction updates (OWL-219, OWL-232), and the forge's pause, which a
+/// read of the reviews may set: handed to the child and merged back from
+/// its outcome.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeptFollowing {
@@ -345,19 +345,19 @@ mod tests {
             progress: "p".to_owned(),
             answer: Some("2026-10-20T09:00:00Z".parse().unwrap()),
             generation: 3,
+            kept: KeptFollowing {
+                moved: Some("Backlog".to_owned()),
+                unposted: Some(KeptUnposted {
+                    commit: "b".repeat(40),
+                    reason: "the tracker is down".to_owned(),
+                }),
+                paused_until: Some("2026-10-20T10:00:00Z".parse().unwrap()),
+            },
         }
     }
 
     #[test]
     fn every_envelope_reads_back_as_written() {
-        let kept = KeptFollowing {
-            moved: Some("Backlog".to_owned()),
-            unposted: Some(KeptUnposted {
-                commit: "b".repeat(40),
-                reason: "the tracker is down".to_owned(),
-            }),
-            paused_until: Some("2026-10-20T10:00:00Z".parse().unwrap()),
-        };
         for step in [
             StepKind::Intake,
             StepKind::Answer {
@@ -370,9 +370,8 @@ mod tests {
             },
             StepKind::Repair {
                 failing_for_ms: Some(90_000),
-                kept: kept.clone(),
             },
-            StepKind::Correct { kept: kept.clone() },
+            StepKind::Correct,
             StepKind::Review,
         ] {
             let envelope = envelope(step);

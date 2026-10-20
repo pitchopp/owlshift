@@ -15,6 +15,7 @@
 //!     lock                 held by the one `owlshift do` working the project
 //!     unverified           a run whose isolation check has not passed
 //!     unfinished-clone     a first clone that has not finished
+//!     tickets/<ticket>/    carry.json and outcome-<attempt>.json (OWL-399)
 //! ```
 //!
 //! A first clone stopped part-way, by its deadline, a crash or a Ctrl-C,
@@ -141,6 +142,13 @@ impl ProjectDirs {
     /// The ticket's run directories live here.
     pub fn runs(&self, ticket: &TicketId) -> PathBuf {
         self.root.join("runs").join(component(ticket.as_str()))
+    }
+
+    /// The ticket's own folder, outside its ref (OWL-399): what a step
+    /// carries to the next, `carry.json`, and each step's outcome record,
+    /// `outcome-<attempt>.json` ([`crate::step`]).
+    pub fn ticket_dir(&self, ticket: &TicketId) -> PathBuf {
+        self.root.join("tickets").join(component(ticket.as_str()))
     }
 
     fn lock_file(&self) -> PathBuf {
