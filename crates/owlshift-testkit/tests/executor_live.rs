@@ -9,8 +9,10 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use owlshift_adapters::harness::claude::Effort;
@@ -24,7 +26,10 @@ use owlshift_contracts::result::{RunResult, Status};
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
-use owlshift_runner::executor::{Executor, Git, Outcome, RunReport, RunSpec, Violation};
+use owlshift_runner::executor::{
+    Executor, Git, Harness, HarnessEnd, HarnessError, HarnessRun, Outcome, REDACTED, RunLog,
+    RunReport, RunSpec, SandboxNeeds, Violation,
+};
 use owlshift_testkit::git::{GitEnv, seed};
 use serde_json::Value;
 
@@ -199,57 +204,27 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
                 head.trim()
             )
         },
+        Shape::default(),
         Role::Build,
         PermissionLevel::WriteWorktree,
         "Permission probe",
         None,
     );
-    let report = format!("{:#?}", live.report);
-    let log = fs::read_to_string(&live.report.stdout_log).unwrap();
-    let events: Vec<Value> = log
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    let init = events
-        .iter()
-        .find(|event| event["type"] == "system" && event["subtype"] == "init")
-        .unwrap_or_else(|| panic!("no init event\n{report}"));
-    assert_eq!(init["permissionMode"], "bypassPermissions", "{report}");
+    let transcript = Transcript::of(&live);
+    let report = &transcript.report;
+    assert_eq!(
+        transcript.init()["permissionMode"],
+        "bypassPermissions",
+        "{report}"
+    );
 
     // Each call the prompt names, and what came back.
-    let contents = || {
-        events
-            .iter()
-            .filter_map(|event| event["message"]["content"].as_array())
-            .flatten()
-    };
-    let results: HashMap<&str, &Value> = contents()
-        .filter(|item| item["type"] == "tool_result")
-        .filter_map(|item| Some((item["tool_use_id"].as_str()?, item)))
-        .collect();
     let answer = |tool: &str, path: &Path| -> (bool, String) {
-        let call = contents()
-            .find(|item| {
-                item["type"] == "tool_use"
-                    && item["name"] == tool
-                    && item["input"]["file_path"]
-                        .as_str()
-                        .is_some_and(|file| Path::new(file) == path)
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "inconclusive, rerun: the model made no {tool} call on {}\n{report}",
-                    path.display()
-                )
-            });
-        let result = results
-            .get(call["id"].as_str().unwrap())
-            .unwrap_or_else(|| panic!("{tool} {}: no result\n{report}", path.display()));
-        let text = match &result["content"] {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        };
-        (result["is_error"] == true, text)
+        transcript.call(tool, &path.display().to_string(), |input| {
+            input["file_path"]
+                .as_str()
+                .is_some_and(|file| Path::new(file) == path)
+        })
     };
     let Paths {
         root,
@@ -264,22 +239,11 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
         let (failed, text) = answer(tool, &path);
         assert!(!failed, "{tool} {} was refused: {text}", path.display());
     }
-    // Refused by the sandbox, not by Claude Code: Seatbelt says `EPERM`, a
-    // read-only bind under bwrap `EROFS`.
-    let by_sandbox: &[&str] = if cfg!(target_os = "linux") {
-        &[
-            "EPERM",
-            "operation not permitted",
-            "EROFS",
-            "read-only file system",
-        ]
-    } else {
-        &["EPERM", "operation not permitted"]
-    };
+    // Refused by the sandbox, not by Claude Code.
     let refused = |path: &Path| {
         let (failed, text) = answer("Write", path);
         assert!(
-            failed && by_sandbox.iter().any(|shape| text.contains(shape)),
+            failed && by_sandbox(&text),
             "Write {}: {text}",
             path.display()
         );
@@ -291,7 +255,7 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
         // sandbox; any other error leaves the probe unproven.
         let (failed, text) = answer("Write", &beside);
         assert!(
-            !failed || by_sandbox.iter().any(|shape| text.contains(shape)),
+            !failed || by_sandbox(&text),
             "inconclusive, rerun: Write {}: {text}",
             beside.display()
         );
@@ -334,6 +298,353 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
     );
 }
 
+/// The resolver's run on Claude Code (OWL-344, OWL-386): bare Bash under
+/// `dontAsk`, inside the read-only profile, the result given as the last
+/// message. It replays the probes of OWL-344's live check (build plan,
+/// "The live check, how it was run") and adds one: reading the brief in the
+/// run's own files, outside the working directory, with the Read tool and
+/// with Bash. Run it after each Claude Code update, with `--nocapture`: it
+/// prints one line per probe, for the dated record in the build plan.
+///
+/// Resolver-shaped by its fields: the CLI's `do_cmd::resolver_router` makes
+/// the resolver's harness from the shared one with `bash: true` and nothing
+/// else (pinned by its test `the_resolver_is_built_with_bash`), and the
+/// argv it gives is pinned whole by the adapter's contract test
+/// `the_resolver_argv_allows_bash_without_an_edit_rule`. This test asserts
+/// the parts of the argv the probes rest on, as spawned. The brief is a
+/// read-only Verify brief: the argv and the profile depend on `bash` and the
+/// permission level, not the role, and a resolver brief would tie the test
+/// to the questions' format.
+///
+/// A refused Read on the brief is printed, not failed: Bash's `cat` reads
+/// it then. On Linux, writes in `/tmp` and the home may land in the
+/// sandbox's private tmpfs, as in the test above; `OWLSHIFT_LIVE_OUTSIDE_DIR`
+/// is then required.
+#[test]
+#[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
+fn the_resolvers_bash_reads_and_never_writes() {
+    let outside = cfg!(target_os = "linux").then(outside_probe);
+    let home = std::env::var_os("HOME")
+        .and_then(|home| fs::canonicalize(home).ok())
+        .expect("HOME is an existing folder");
+    let in_home = home.join(format!("owlshift-live-probe-{}.txt", std::process::id()));
+    assert!(!in_home.exists(), "{} exists already", in_home.display());
+    // Only the brief holds the title: the run can give it back only by
+    // reading the brief.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let title = format!("Sundial {nanos}");
+
+    // Each probe: a label, and the exact Bash command the run makes.
+    let mut commands: Vec<(&str, String)> = Vec::new();
+    let live = run_live_seeded(
+        &[],
+        |paths| {
+            let (g, r) = (&paths.git_dir, &paths.root);
+            commands = vec![
+                ("read a file", "cat README.md".into()),
+                ("git log", "git log --oneline -5".into()),
+                ("git blame", "git blame README.md".into()),
+                ("grep", "grep -rn hello README.md".into()),
+                ("write in the worktree", "echo probe > probe.txt".into()),
+                (
+                    "write in .git by a redirection",
+                    format!("echo probe > {}", sh(&g.join("probe-redirect"))),
+                ),
+                (
+                    "write in .git by git update-ref",
+                    "git update-ref refs/heads/probe-ref HEAD".into(),
+                ),
+                (
+                    "write in .git by touch",
+                    r#"touch "$(git rev-parse --git-common-dir)/probe-touch""#.into(),
+                ),
+                (
+                    "write beside the worktree",
+                    format!("echo probe > {}", sh(&r.join("outside.txt"))),
+                ),
+                (
+                    "write in the home",
+                    format!("echo probe > {}", sh(&in_home)),
+                ),
+            ];
+            if let Some(path) = &outside {
+                commands.push((
+                    "write outside every private folder",
+                    format!("echo probe > {}", sh(path)),
+                ));
+            }
+            commands.push(("environment", "env".into()));
+            commands.push((
+                "network",
+                "curl -sS -m 20 -o /dev/null -w '%{http_code}' https://example.com".into(),
+            ));
+            let steps: String = commands
+                .iter()
+                .enumerate()
+                .map(|(n, (_, command))| format!("{}. Bash tool, command `{command}`\n", n + 3))
+                .collect();
+            format!(
+                "You are a permission test in a throwaway scratch repository; nothing here is \
+                 real and every file named below exists only for this test. Make each of the \
+                 following tool calls exactly once, in this order, whatever the previous ones \
+                 returned. Do not retry a call, do not change a command, do not reach a file by \
+                 another tool or route than the one named, and do not explain.\n\
+                 1. Read tool, the brief's file named at the end of this prompt, its path as \
+                 given there.\n\
+                 2. Bash tool, command `cat` then a space then the brief's file path as given \
+                 at the end of this prompt, unquoted.\n\
+                 {steps}\
+                 Then give your result: a JSON object with exactly the fields `format` (the \
+                 number {RESULT_FORMAT}), `status` (the string \"done\") and `summary` (the \
+                 brief's `ticket.title`, verbatim)."
+            )
+        },
+        Shape {
+            model: "sonnet",
+            bash: true,
+            timeout: Duration::from_secs(600),
+        },
+        Role::Verify,
+        PermissionLevel::ReadOnly,
+        &title,
+        Some(ReviewBrief {
+            mandates: vec![owlshift_contracts::review::Mandate::Critic],
+            pass: std::num::NonZeroU32::MIN,
+            diff: None,
+            since: None,
+            earlier: Vec::new(),
+        }),
+    );
+    let transcript = Transcript::of(&live);
+    let report = &transcript.report;
+    // A write that reached the host is the finding: say so before anything
+    // else can stop the test, and clean the home.
+    let Paths {
+        root,
+        worktree,
+        git_dir,
+    } = &live.paths;
+    let mut on_host: Vec<PathBuf> = [
+        worktree.join("probe.txt"),
+        git_dir.join("probe-redirect"),
+        git_dir.join("refs/heads/probe-ref"),
+        git_dir.join("probe-touch"),
+        root.join("outside.txt"),
+        in_home.clone(),
+    ]
+    .into_iter()
+    .chain(outside.clone())
+    .filter(|path| path.exists())
+    .collect();
+    if in_home.exists() {
+        fs::remove_file(&in_home).unwrap();
+    }
+    if let Some(path) = outside.as_ref().filter(|path| path.exists()) {
+        fs::remove_file(path).unwrap();
+    }
+    on_host.sort();
+    assert!(
+        on_host.is_empty(),
+        "written on the host: {on_host:?}\n{report}"
+    );
+
+    // The shape the probes rest on, as spawned and as Claude Code took it.
+    let args = &live.args;
+    let after = |flag: &str| -> Vec<&str> {
+        let at = args.iter().position(|arg| arg == flag);
+        let at = at.unwrap_or_else(|| panic!("no {flag} in {args:?}"));
+        args[at + 1..]
+            .iter()
+            .map(String::as_str)
+            .take_while(|arg| !arg.starts_with("--"))
+            .collect()
+    };
+    assert_eq!(after("--permission-mode"), ["dontAsk"], "{args:?}");
+    assert_eq!(after("--allowedTools"), ["Bash"], "{args:?}");
+    assert!(!args.iter().any(|arg| arg.starts_with("Edit(")), "{args:?}");
+    let disallowed = after("--disallowedTools");
+    assert!(
+        ["WebFetch", "WebSearch"]
+            .iter()
+            .all(|tool| disallowed.contains(tool)),
+        "{args:?}"
+    );
+    let init = transcript.init();
+    assert_eq!(init["permissionMode"], "dontAsk", "{report}");
+    let tools = init["tools"].as_array().expect("init lists its tools");
+    assert!(tools.iter().any(|tool| tool == "Bash"), "{report}");
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool == "WebFetch" || tool == "WebSearch"),
+        "{report}"
+    );
+    println!(
+        "Claude Code {}, model {}",
+        init["claude_code_version"], init["model"]
+    );
+
+    // The brief, in the run's own files, outside the working directory.
+    let brief = &live.brief_file;
+    assert!(
+        !brief.starts_with(worktree),
+        "the brief is in the worktree: {}",
+        brief.display()
+    );
+    let (read_failed, read_text) = transcript.call("Read", &brief.display().to_string(), |input| {
+        input["file_path"]
+            .as_str()
+            .is_some_and(|file| Path::new(file) == brief)
+    });
+    let cat = format!("cat {}", brief.display());
+    let quoted = [
+        cat.clone(),
+        format!("cat {}", sh(brief)),
+        format!("cat \"{}\"", brief.display()),
+    ];
+    let (cat_failed, cat_text) = transcript.call("Bash", &cat, |input| {
+        input["command"]
+            .as_str()
+            .is_some_and(|command| quoted.iter().any(|q| q == command.trim()))
+    });
+    let read_ok = !read_failed && read_text.contains(&title);
+    let cat_ok = !cat_failed && cat_text.contains(&title);
+    let first_line = |text: &str| -> String {
+        text.lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect()
+    };
+    println!(
+        "read the brief with Read: {}",
+        if read_ok {
+            "allowed, the title came back".to_owned()
+        } else {
+            format!("refused, {}", first_line(&read_text))
+        }
+    );
+    println!(
+        "read the brief with Bash cat: {}",
+        if cat_ok {
+            "allowed, the title came back".to_owned()
+        } else {
+            format!("refused, {}", first_line(&cat_text))
+        }
+    );
+    assert!(read_ok || cat_ok, "neither route read the brief\n{report}");
+
+    let bash = |command: &str| -> (bool, String) {
+        transcript.call("Bash", command, |input| input["command"] == command)
+    };
+    let command =
+        |label: &str| -> &str { &commands.iter().find(|(name, _)| *name == label).unwrap().1 };
+    // Allowed, with what each must show.
+    for (label, shows) in [
+        ("read a file", "hello"),
+        ("git log", ""),
+        ("git blame", "hello"),
+        ("grep", "README.md:1:hello"),
+    ] {
+        let (failed, text) = bash(command(label));
+        assert!(!failed && text.contains(shows), "{label}: {text}\n{report}");
+        let last = text.lines().rfind(|line| !line.trim().is_empty());
+        println!("{label}: allowed, {}", first_line(last.unwrap_or("")));
+    }
+    // Refused by the sandbox. The redirection into `.git` may be refused by
+    // Claude Code first, as on OWL-344; any other write that Claude Code
+    // refuses leaves the sandbox unprobed.
+    let claude_refused = |text: &str| text.contains("Permission to use Bash has been denied");
+    let (_, text) = bash(command("write in .git by a redirection"));
+    assert!(
+        by_sandbox(&text) || claude_refused(&text),
+        "write in .git by a redirection: {text}\n{report}"
+    );
+    println!(
+        "write in .git by a redirection: refused by {}",
+        if claude_refused(&text) {
+            "Claude Code"
+        } else {
+            "the sandbox"
+        }
+    );
+    let mut refused = vec![
+        "write in the worktree",
+        "write in .git by git update-ref",
+        "write in .git by touch",
+    ];
+    // In the sandbox's private `/tmp` and home on Linux: written there, or
+    // refused by the sandbox.
+    let private = ["write beside the worktree", "write in the home"];
+    if cfg!(target_os = "linux") {
+        for label in private {
+            let (failed, text) = bash(command(label));
+            assert!(
+                !claude_refused(&text) && (!failed || by_sandbox(&text)),
+                "inconclusive, rerun: {label}: {text}\n{report}"
+            );
+            println!(
+                "{label}: {}",
+                if failed {
+                    "refused by the sandbox"
+                } else {
+                    "written in the sandbox's private folder"
+                }
+            );
+        }
+    } else {
+        refused.extend(private);
+    }
+    if outside.is_some() {
+        refused.push("write outside every private folder");
+    }
+    for label in refused {
+        let (_, text) = bash(command(label));
+        assert!(
+            !claude_refused(&text),
+            "inconclusive, rerun: {label} was refused by Claude Code, the sandbox not probed\n{report}"
+        );
+        assert!(by_sandbox(&text), "{label}: {text}\n{report}");
+        println!(
+            "{label}: refused, {}",
+            first_line(refusal_line(&text).unwrap_or(""))
+        );
+    }
+
+    // No credential reaches Bash. The run's log hides the token, so a token
+    // that reached Bash shows as the marker; the text is never printed.
+    let (failed, env) = bash("env");
+    assert!(
+        !failed && env.contains("PATH="),
+        "inconclusive, rerun: env failed\n{report}"
+    );
+    assert!(
+        !env.contains("ANTHROPIC_"),
+        "an ANTHROPIC_ variable reached Bash"
+    );
+    assert!(
+        !env.contains(REDACTED),
+        "the token for agent runs reached Bash"
+    );
+    assert!(
+        !env.contains(agent_login().expose()),
+        "the token for agent runs reached Bash"
+    );
+    println!("environment: no ANTHROPIC_ variable, no token");
+
+    // The network stays open, as accepted on OWL-344: reported, not judged.
+    let (_, text) = bash(command("network"));
+    println!("network: {}", first_line(&text));
+
+    let result = live.result();
+    assert_eq!(result.status, Status::Done, "{report}");
+    assert_eq!(result.summary, title, "{report}");
+}
+
 /// A file the run is asked to write in `OWLSHIFT_LIVE_OUTSIDE_DIR`, which
 /// must be a folder the user can write outside the folders the Linux sandbox
 /// makes private: there a write meets the sandbox's read-only `/`, and its
@@ -370,6 +681,11 @@ struct Live {
     _tmp: tempfile::TempDir,
     report: RunReport,
     paths: Paths,
+    /// The brief's file the executor gave the harness: in the worktree, or
+    /// under the read-only profile in the run's own files.
+    brief_file: PathBuf,
+    /// The harness command's arguments, as the executor spawned them.
+    args: Vec<String>,
 }
 
 impl Live {
@@ -395,7 +711,165 @@ fn run_live(
     title: &str,
     review: Option<ReviewBrief>,
 ) -> Live {
-    run_live_seeded(&[], |_| prompt.to_owned(), role, level, title, review)
+    run_live_seeded(
+        &[],
+        |_| prompt.to_owned(),
+        Shape::default(),
+        role,
+        level,
+        title,
+        review,
+    )
+}
+
+/// The harness's shape and the run's deadline; by default, the small role
+/// runs': `haiku` without Bash, 300 seconds.
+struct Shape {
+    model: &'static str,
+    /// [`ClaudeHarness::bash`]: the resolver's run.
+    bash: bool,
+    timeout: Duration,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Self {
+            model: "haiku",
+            bash: false,
+            timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+/// A run's stream-json log, read for the tool calls its prompt named.
+struct Transcript {
+    events: Vec<Value>,
+    /// The run's report, for a failure to show.
+    report: String,
+}
+
+impl Transcript {
+    fn of(live: &Live) -> Self {
+        let log = fs::read_to_string(&live.report.stdout_log).unwrap();
+        Self {
+            events: log
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            report: format!("{:#?}", live.report),
+        }
+    }
+
+    fn init(&self) -> &Value {
+        self.events
+            .iter()
+            .find(|event| event["type"] == "system" && event["subtype"] == "init")
+            .unwrap_or_else(|| panic!("no init event\n{}", self.report))
+    }
+
+    fn contents(&self) -> impl Iterator<Item = &Value> {
+        self.events
+            .iter()
+            .filter_map(|event| event["message"]["content"].as_array())
+            .flatten()
+    }
+
+    /// The one call of `tool` whose input `matches`, and what came back:
+    /// whether it failed, and its text. No such call, or more than one,
+    /// leaves the probe unproven: the run is inconclusive, not a pass. The
+    /// panic shows `what`, never the call's output.
+    fn call(&self, tool: &str, what: &str, matches: impl Fn(&Value) -> bool) -> (bool, String) {
+        let calls: Vec<&Value> = self
+            .contents()
+            .filter(|item| item["type"] == "tool_use" && item["name"] == tool)
+            .filter(|item| matches(&item["input"]))
+            .collect();
+        let [call] = calls[..] else {
+            panic!(
+                "inconclusive, rerun: the model made {} {tool} calls on {what}, not one\n{}",
+                calls.len(),
+                self.report
+            );
+        };
+        let result = self
+            .contents()
+            .find(|item| item["type"] == "tool_result" && item["tool_use_id"] == call["id"])
+            .unwrap_or_else(|| panic!("{tool} {what}: no result\n{}", self.report));
+        let text = match &result["content"] {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        (result["is_error"] == true, text)
+    }
+}
+
+/// Whether `text` holds the sandbox's refusal, not Claude Code's: Seatbelt
+/// says `EPERM`, a read-only bind under bwrap `EROFS`. The line of a refused
+/// write; the Xcode shim's warning that it could not write its cache in the
+/// closed shared temporary folder, which every `git` call prints on macOS
+/// under the read-only profile, is no such line.
+fn by_sandbox(text: &str) -> bool {
+    refusal_line(text).is_some()
+}
+
+/// The first line of `text` that is the sandbox's refusal ([`by_sandbox`]).
+fn refusal_line(text: &str) -> Option<&str> {
+    let mut shapes = vec!["eperm", "operation not permitted"];
+    if cfg!(target_os = "linux") {
+        shapes.extend(["erofs", "read-only file system"]);
+    }
+    text.lines().find(|line| {
+        let line = line.to_lowercase();
+        !line.contains("couldn't create cache file")
+            && shapes.iter().any(|shape| line.contains(shape))
+    })
+}
+
+/// `path` quoted for a POSIX shell: the test's folder has spaces.
+fn sh(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// A harness that hands everything to `inner` and keeps what the executor
+/// gave it: the brief's file, which is in a temporary folder of the run's
+/// own under the read-only profile, and the command's arguments.
+struct Kept<H> {
+    inner: H,
+    brief_file: Mutex<Option<PathBuf>>,
+    args: Mutex<Vec<String>>,
+}
+
+impl<H: Harness> Harness for Kept<H> {
+    fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        let command = self.inner.command(run)?;
+        *self.brief_file.lock().unwrap() = Some(run.brief_file.to_owned());
+        *self.args.lock().unwrap() = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        Ok(command)
+    }
+
+    fn drive(
+        &self,
+        run: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        self.inner.drive(run, child, log)
+    }
+
+    fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        self.inner.sandbox_needs(agent)
+    }
+
+    fn login_secrets(&self, login: &[u8]) -> Vec<Secret> {
+        self.inner.login_secrets(login)
+    }
+
+    fn login_kept(&self, original: &[u8], updated: &[u8]) -> Result<(), String> {
+        self.inner.login_kept(original, updated)
+    }
 }
 
 /// Where a live run's files are, resolved, for a prompt to name them.
@@ -409,10 +883,11 @@ struct Paths {
 }
 
 /// [`run_live`], with `files` (path, content) committed beside the README,
-/// and the prompt written from the run's [`Paths`].
+/// the prompt written from the run's [`Paths`], and the harness of `shape`.
 fn run_live_seeded(
     files: &[(&str, &str)],
     prompt: impl FnOnce(&Paths) -> String,
+    shape: Shape,
     role: Role,
     level: PermissionLevel,
     title: &str,
@@ -451,18 +926,22 @@ fn run_live_seeded(
         git: Git::with_setup("git", move |command| runner.apply(command)),
         agent: AgentEnv::from_runner(&[], &[], &[]).unwrap(),
         forge_hosts: vec!["github.com".into()],
-        timeout: Duration::from_secs(300),
+        timeout: shape.timeout,
         gate_timeout: Duration::from_secs(300),
     };
-    let harness = ClaudeHarness {
-        // Found on the PATH.
-        program: "claude".into(),
-        prompt,
-        model: Some("haiku".into()),
-        effort: Some(Effort::Low),
-        max_budget_usd: None,
-        login: Some(agent_login()),
-        bash: false,
+    let harness = Kept {
+        inner: ClaudeHarness {
+            // Found on the PATH.
+            program: "claude".into(),
+            prompt,
+            model: Some(shape.model.into()),
+            effort: Some(Effort::Low),
+            max_budget_usd: None,
+            login: Some(agent_login()),
+            bash: shape.bash,
+        },
+        brief_file: Mutex::new(None),
+        args: Mutex::new(Vec::new()),
     };
     let brief = Brief {
         format: Format,
@@ -523,6 +1002,12 @@ fn run_live_seeded(
         _tmp: tmp,
         report,
         paths,
+        brief_file: harness
+            .brief_file
+            .into_inner()
+            .unwrap()
+            .expect("the executor built the harness's command"),
+        args: harness.args.into_inner().unwrap(),
     }
 }
 
