@@ -1370,7 +1370,7 @@ impl OnDemand<'_> {
                 None,
                 EventKind::Warning,
                 data([
-                    ("what", json!("carry_not_removed")),
+                    ("what", json!("carry_not_kept")),
                     ("reason", json!(error.to_string())),
                 ]),
             );
